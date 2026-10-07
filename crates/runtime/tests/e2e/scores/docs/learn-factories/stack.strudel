@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+stack("g3", "b3", ["e4", "d4"]).note()
+// "g3,b3,[e4 d4]".note()

@@ -1,0 +1,10 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 12
+*/
+// parity fuzz case seed=709 cycles=16 bpm=120
+setcpm(120/4)
+all(x => x.room(0.17))
+$: s("<rim sd> hh:0? sd:0 sd? cp").bank("tr909").pan(-0.13).panspan(0.24)
+$: n("7 1 7 2").scale("f#:minor").euclidRot(5,16,3).chunk(2, (x => x.palindrome()))

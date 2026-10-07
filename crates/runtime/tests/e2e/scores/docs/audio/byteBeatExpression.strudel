@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+s("bytebeat").bbexpr('t*(t>>15^t>>66)')

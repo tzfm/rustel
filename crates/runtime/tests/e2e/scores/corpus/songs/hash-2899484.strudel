@@ -1,0 +1,103 @@
+/*
+  @by Claffystic
+  @origin songs-awesome
+  @duration 4
+  @details : This is an unofficial fanmade content. I made this to learn about Strudel and that's it. Reference: https://soundcloud.com/radixan/undertale-determination-midi-in-description Pulled from YouTube description below. (https://www.youtube.com/watch?v=sRLQnlglfrI) Determination · Toby Fox UNDERTALE Soundtrack ℗ Toby Fox under license to Materia Collective Released on: 2015-09-15 Producer: Toby Fox Music  Publisher: Materia Collective Music Publishing Composer: Toby Fox
+*/
+setcpm(115 / 4)
+
+$lead: note(`<
+[F#5 F5 D#5 C#5 D#5 A#4 C5 ~]
+[G#4 ~ D#5 F5 F#5 ~ G#5 ~]
+[C#6 ~ A#5@5 ~]
+[F#5 F5 D#5 C#5 D#5 A#4 C5 ~]
+[G#4 ~ D#4 F4 F#4 ~ F4 ~]
+[C#4 ~ D#4@5 ~]
+
+[F#5 F5 D#5 C#5 D#5 A#4 C5 ~]
+[G#4 ~ D#5 F5 F#5 ~ G#5 ~]
+[C#6 ~ A#5@5 ~]
+[F#5 F5 D#5 C#5 D#5 A#4 C5 ~]
+[G#4 ~ D#4 F4 F#4 ~ F4 ~]
+[C#4 ~ D#4@5 ~] 
+
+[[G#5,F5] [F#5,D#5] [E5,C#5] [D#5,B4] [C#5,A#4] [E5,C#5] [D#5,A#4] ~]
+[[A#4,F#4] ~ [A#4,F#4] [D#5,A#4] [G#5,E5] [F#5,D#5] [E5,C#5] [D#5,B4]]
+[[C#5,A#4] [E5,C#5] [D#5,A#4]@3 ~ [D#4,A#3] [G#4,D#4]]
+[[C#5,A#4] [C5,G#4] [A#4,F#4] [G#4,F4] [A#4,F#4] [C5,G#4] [A#4,F#4] ~]
+[[D#4,A#3] ~ [D#4,A#3] [F4,C#4] [F#4,D#4] ~ [B4,F#4] ~]
+[[D#5,B4]@2 [D5,A#4]@4 ~@2]
+
+[[G#5,F5] [F#5,D#5] [E5,C#5] [D#5,B4] [C#5,A#4] [E5,C#5] [D#5,A#4] ~]
+[[A#4,F#4] ~ [A#4,F#4] [D#5,A#4] [G#5,E5] [F#5,D#5] [E5,C#5] [D#5,B4]]
+[[C#5,A#4] [E5,C#5] [D#5,A#4]@3 ~ [D#4,A#3] [G#4,D#4]]
+[[C#5,A#4] [C5,G#4] [A#4,F#4] [G#4,F4] [A#4,F#4] [C5,G#4] [A#4,F#4] ~]
+[[D#4,A#3] ~ [D#4,A#3] [F4,C#4] [F#4,D#4] ~ [F4,C#4] ~]
+[[C#4,G#3]@2 [D#4,A#3]@4 ~@2]
+
+[~@8]
+>`).sound("square").room(.5).roomsize(6).gain(.25).detune("[-5, 5]")
+
+$harmony: note(`<
+[~ D#4 F#4 G#4 A#4 F#4 ~ G#4]
+[C5 D#5 C5 G#4 ~ D#4 F4 D#4]
+[G#4 F4 F#4 F4 D#4 C#4 D#4 A#3]
+[~ D#4 F#4 G#4 A#4 F#4 ~ D#4] 
+[F#4 G#4 A#4 F#4 ~ D#4 F4 A#4]
+[F4 C#4 F#4 F4 D#4 C#4 D#4 F4]
+
+[~ D#4 F#4 G#4 A#4 F#4 ~ G#4]
+[C5 D#5 C5 G#4 ~ D#4 F4 D#4]
+[G#4 F4 F#4 F4 D#4 C#4 D#4 A#3]
+[~ D#4 F#4 G#4 A#4 F#4 ~ D#4] 
+[F#4 G#4 A#4 F#4 ~ D#4 F4 A#4]
+[F4 C#4 F#4 F4 D#4 C#4 D#4 A#3]
+
+[G#3 D#4 G#4 F#4 A#4 G#4 F#4 G#4]
+[D#4 F#4 C#4 D#4 G#3 D#4 G#4 F#4]
+[A#4 G#4 F#4@3 ~@3]
+[~ D#3 C#4 A#3 G#4 F4 D#4 F4]
+[F#4 F4 d#4 F4 F#4 ~@3]
+[B4 ~ G#4 F#4 F4 D#4 D4 F4]
+
+[G#3 D#4 G#4 F#4 A#4 G#4 F#4 G#4]
+[D#4 F#4 C#4 D#4 G#3 D#4 G#4 F#4]
+[A#4 G#4 F#4@3 ~@3]
+[~@8]
+[~@2 D#4 F4 F#4 ~ F4 ~]
+[C#4@2 D#4@4 ~@2]
+
+[~@8]
+>`).sound("triangle").gain(.35).shape(.2)
+
+$bass: note(`<
+[D#2@4 F#2@2 G#2@2]
+[G#2@2 G#1@2 B1@2 C#2@2]
+[F#2@2 D#2@4 C#2@2]
+[D#2@4 F#2@2 G#2@2]
+[G#2@2 D#2@2 F#2@2 F2@2]
+[C#2@2 D#2@4 C#2@2]
+
+[D#2@4 F#2@2 G#2@2]
+[G#2@2 G#1@2 B1@2 C#2@2]
+[F#2@2 D#2@4 C#2@2]
+[D#2@4 F#2@2 G#2@2]
+[G#2@2 D#2@2 F#2@2 F2@2]
+[C#2@2 D#2@4 ~@2]
+
+[F2@4 C#2@2 D#2@2]
+[D#2 ~ D#2@2 E2@4]
+[C#2@2 D#2@3 ~@3]
+[A#1@4 C#2@2 D#2@2]
+[D#2@2 C#2@2 B1@2 ~@2]
+[D#3 ~ D3@2 B2@2 A#2@2]
+
+[E2@4 C#2@2 D#2@2]
+[D#2 ~ D#2@2 E2@4]
+[C#2@2 D#2@3 ~@3]
+[G#2@4 ~@2 D#2@2]
+[D#2@2 ~@2 F#2 ~ F2 ~]
+[C#2@2 D#2@6]
+
+[~@8]
+>`).sound("square").gain(.3)

@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+note("{f a c e}%16").s("sawtooth").tremsync(4).tremoloskew("<.5 0 1>")

@@ -1,0 +1,49 @@
+{
+  "name": "webcam-distort",
+  "background": "#090812",
+  "surface": "#12101e",
+  "overlay": "#1d1930",
+  "foreground": "#f0eaff",
+  "muted": "#80769b",
+  "rule": "#382f50",
+  "accent": "#ff63c3",
+  "ok": "#69e6bd",
+  "warn": "#ffe169",
+  "error": "#ff667d",
+  "caret": "#ffffff",
+  "selection": "#50365e",
+  "selection_text": "#ffffff",
+  "mini": "#69e6bd",
+  "mini_fill": null,
+  "event_mark": "tint",
+  "event_fade": 0.5,
+  "event": "#ffe169",
+  "event_inactive": "#8b79c9",
+  "playhead": "#ffb3e1",
+  "grid": "#40345c",
+  "minimap": "#0c0a15",
+  "minimap_viewport": "#392d50",
+  "hydra": "src(s0).scale(1.04).modulate(noise(3, 0.12), 0.09).kaleid(3).colorama(0.012).contrast(1.18).out()",
+  "hydra_camera": true,
+  "hydra_opacity": 25,
+  "opacity": {
+    "backdrop": 66,
+    "interface": 74,
+    "editor": 48
+  },
+  "syntax": {
+    "text": "#f0eaff",
+    "comment": "#80769b",
+    "string": "#69e6bd",
+    "number": "#ffe169",
+    "punctuation": "#ff8cd5"
+  },
+  "meter": {
+    "low": "#69e6bd",
+    "mid": "#b8e876",
+    "high": "#ffe169",
+    "peak": "#ff667d",
+    "track": "#282139",
+    "fader": "#f0eaff"
+  }
+}

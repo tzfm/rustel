@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+s("bd sd [~ bd] sd,hh*8").hpf("<4000 2000 1000 500 200 100>")

@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+s("numbers:0 numbers:1 numbers:2").striate(6).slow(3)

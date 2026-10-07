@@ -1,0 +1,22 @@
+/*
+  @by strudel community bakery
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?7MdFGROS_3uC
+*/
+stack(
+  ratio(`<
+  [1, 5:4, 7:4]!2 [1, 3:2, 5:2] [3:2, 7:6, 2:3]
+  [1, 3:4, 7:4] [1, 3:2, 5:2] [1, 3:4, 5:3] [7:6, 3:2, 2]
+  >`)
+   .arp("[~ [0, 1] ~ [2 1]]*2")
+   .mul("[1, 1.5]@2 [1, 1.005]")
+   .mul(220).freq().s("<gm_synth_bass_1, gm_violin>")
+   .room(0.1),
+  ratio(`<[1 [~ ~ 2] 1] [3:2 [~ ~ 6:2] 3:2] [5:4 [9:4 10:4 9:4] 5:4] [[2:3 ~]!3 3:4]>`)
+   .mul(55).freq().s("gm_synth_bass_1").lpf(600).color("gray"),
+  s("bd:1 [cp ~ hh cp:2] [~ bd] [cp ~ hh:1 hh:2]").bank("RolandTR707")
+).pianoroll({autorange :0})
+
+
+// @version 1.0

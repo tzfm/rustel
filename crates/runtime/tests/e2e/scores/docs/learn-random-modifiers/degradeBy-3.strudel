@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+//beat generator
+s("bd").segment(16).degradeBy(.5).ribbon(16,1)

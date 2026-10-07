@@ -1,0 +1,8 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+setCpm(120/4)
+$: s("sbd").seg(1)
+$: s("sd:1").seg(4)

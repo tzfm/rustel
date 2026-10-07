@@ -1,0 +1,9 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+arrange(
+  [4, "<c a f e>(3,8)"],
+  [2, "<g a>(5,8)"]
+).note()

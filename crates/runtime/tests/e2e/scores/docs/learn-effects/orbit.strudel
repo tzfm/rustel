@@ -1,0 +1,9 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+stack(
+  s("hh*6").delay(.5).delaytime(.25).orbit(1),
+  s("~ sd ~ sd").delay(.5).delaytime(.125).orbit(2)
+)

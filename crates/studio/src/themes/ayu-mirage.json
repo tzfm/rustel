@@ -1,0 +1,43 @@
+{
+  "name": "ayu-mirage",
+  "background": "#1f2430",
+  "surface": "#1a1f29",
+  "overlay": "#232834",
+  "foreground": "#cbccc6",
+  "muted": "#5c6773",
+  "rule": "#33415e",
+  "accent": "#ffcc66",
+  "ok": "#bae67e",
+  "warn": "#ffd580",
+  "error": "#ff6666",
+  "caret": "#ffcc66",
+  "selection": "#33415e",
+  "selection_text": "#ffffff",
+  "mini": "#5ccfe6",
+  "mini_fill": null,
+  "event_mark": "tint",
+  "event_fade": 0.3,
+  "event": "#ffcc66",
+  "event_inactive": "#455066",
+  "playhead": "#5ccfe6",
+  "grid": "#2b3341",
+  "minimap": "#1a1f29",
+  "minimap_viewport": "#33415e",
+  "syntax": {
+    "text": "#cbccc6",
+    "comment": "#5c6773",
+    "string": "#bae67e",
+    "number": "#d4bfff",
+    "punctuation": "#f29e74",
+    "keyword": "#ffa759",
+    "function": "#73d0ff"
+  },
+  "meter": {
+    "low": "#bae67e",
+    "mid": "#5ccfe6",
+    "high": "#ffd580",
+    "peak": "#ff3333",
+    "track": "#232834",
+    "fader": "#cbccc6"
+  }
+}

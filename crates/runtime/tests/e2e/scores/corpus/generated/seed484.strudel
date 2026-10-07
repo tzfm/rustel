@@ -1,0 +1,8 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 4
+*/
+// parity fuzz case seed=484 cycles=6 bpm=126
+setcpm(126/4)
+$: run(9).scale("a:aeolian").sparsity(0.84).transpose("<0 12>").often((x => x.degrade())).fanchor(0.19).size(0.46).tremolodepth(0.52)

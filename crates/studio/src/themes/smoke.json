@@ -1,0 +1,54 @@
+{
+  "name": "smoke",
+  "background": "#07090b",
+  "surface": "#101418",
+  "overlay": "#1a2026",
+  "foreground": "#e9edf1",
+  "muted": "#6d7780",
+  "rule": "#343c44",
+  "accent": "#aeb8c1",
+  "ok": "#aeb8c1",
+  "warn": "#ffca28",
+  "error": "#ff6b6b",
+  "caret": "#e9edf1",
+  "selection": "#293139",
+  "selection_text": "#e9edf1",
+  "mini": "#aeb8c1",
+  "event_mark": "tint",
+  "event_fade": 0.25,
+  "event": "#aeb8c1",
+  "event_inactive": "#6d7780",
+  "playhead": "#e9edf1",
+  "grid": "#343c44",
+  "minimap": "#101418",
+  "minimap_viewport": "#293139",
+  "visual": {
+    "renderer": "tachyonfx",
+    "effect": "smoke",
+    "mode": "text",
+    "density": 70,
+    "speed": 55
+  },
+  "opacity": {
+    "backdrop": 64,
+    "interface": 74,
+    "editor": 42
+  },
+  "syntax": {
+    "text": "#e9edf1",
+    "comment": "#6d7780",
+    "string": "#aeb8c1",
+    "number": "#d8dee4",
+    "punctuation": "#d8dee4",
+    "keyword": "#aeb8c1",
+    "function": "#d8dee4"
+  },
+  "meter": {
+    "low": "#aeb8c1",
+    "mid": "#d8dee4",
+    "high": "#ffca28",
+    "peak": "#ff6b6b",
+    "track": "#1a2026",
+    "fader": "#e9edf1"
+  }
+}

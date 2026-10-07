@@ -1,0 +1,7 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+register('doubled', (pat) => stack(pat, pat.late(0.02).gain(0.5)))
+$: s("bd*4").doubled()

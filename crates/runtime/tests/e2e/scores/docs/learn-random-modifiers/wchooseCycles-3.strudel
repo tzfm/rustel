@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+// The probability can itself be a pattern
+wchooseCycles(["bd(3,8)","<5 0>"], ["hh hh hh",3]).fast(4).s()

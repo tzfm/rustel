@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+n(tri.segment(8).range(0,7)).scale("C:minor")

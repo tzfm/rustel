@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 2
+*/
+s("sine").note("c3").fmi(4).fmwave("square").seg(4)

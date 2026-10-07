@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 2
+*/
+s("sawtooth").note("c2").djf("<0.2 0.8>").seg(4)

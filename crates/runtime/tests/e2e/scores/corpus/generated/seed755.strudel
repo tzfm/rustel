@@ -1,0 +1,9 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 12
+*/
+// parity fuzz case seed=755 cycles=24 bpm=160
+setcpm(160/4)
+$: s("rd <cb cp cp> lt/2 <clap oh cr> hh lt rd clap*2")
+$: chord("<F C Gm>").voicing().s("sawtooth").duration(0.24).tremolodepth(0.74).postgain(0.7).vib(5)

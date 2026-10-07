@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+note("c3*4").s("pulse")

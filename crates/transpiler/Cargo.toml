@@ -1,0 +1,24 @@
+[package]
+name = "rustel-transpiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Score JavaScript syntax rewriting"
+
+[dependencies]
+oxc_allocator = "0.144.0"
+oxc_ast = "0.144.0"
+oxc_ast_visit = "0.144.0"
+oxc_codegen = "0.144.0"
+oxc_parser = "0.144.0"
+oxc_semantic = "0.144.0"
+oxc_span = "0.144.0"
+oxc_syntax = "0.144.0"
+rustel-mini = { path = "../mini" }
+
+[dev-dependencies]
+oxc_ast = { version = "0.144.0", features = ["serialize"] }
+oxc_ast_visit = { version = "0.144.0", features = ["serialize"] }
+serde_json = "1.0"

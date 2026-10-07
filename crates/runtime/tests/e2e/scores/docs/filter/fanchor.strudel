@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+note("{f g g c d a a#}%8").s("sawtooth").lpf("{1000}%2")
+.lpenv(8).fanchor("<0 .5 1>")

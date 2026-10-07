@@ -1,0 +1,10 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 12
+*/
+// parity fuzz case seed=776 cycles=21 bpm=112
+setcpm(112/4)
+all(x => x.room(0.33))
+$: note("c# c4").s("gm_piano")
+$: n("5 [6 2] [3 1] 7 9 6 [2 7] 6").scale("f:altered").density(0.81).delaytime(0.5).penv(7).pattack(0.048)

@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+sound("bd sd cp").pace(4)
+// The same as sound("{bd sd cp}%4") or sound("<bd sd cp>*4")

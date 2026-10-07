@@ -1,0 +1,41 @@
+{
+  "name": "rustel-light",
+  "background": "#fbfbfd",
+  "surface": "#eceef4",
+  "overlay": "#ffffff",
+  "foreground": "#1d2129",
+  "muted": "#78808f",
+  "rule": "#c9cedb",
+  "accent": "#0a7f96",
+  "ok": "#1f8f4d",
+  "warn": "#a66400",
+  "error": "#c62d2d",
+  "caret": "#10141c",
+  "selection": "#bcd4f2",
+  "selection_text": "#10141c",
+  "mini": "#1f8f4d",
+  "mini_fill": null,
+  "event_mark": "tint",
+  "event_fade": 0.25,
+  "event": "#a66400",
+  "event_inactive": "#5a72a8",
+  "playhead": "#c62d2d",
+  "grid": "#d4d9e4",
+  "minimap": "#f2f4f9",
+  "minimap_viewport": "#dbe1ee",
+  "syntax": {
+    "text": "#1d2129",
+    "comment": "#8b93a3",
+    "string": "#1f8f4d",
+    "number": "#a66400",
+    "punctuation": "#8437b8"
+  },
+  "meter": {
+    "low": "#1f8f4d",
+    "mid": "#7f9c1f",
+    "high": "#a66400",
+    "peak": "#c62d2d",
+    "track": "#dde1ea",
+    "fader": "#1d2129"
+  }
+}

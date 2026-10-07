@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+s("<bd sd>,hh*3").fast(2).crush("<16 8 7 6 5 4 3 2>")

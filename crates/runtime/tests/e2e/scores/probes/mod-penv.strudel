@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 2
+*/
+s("sine").note("c3").penv(12).pdecay(0.2).seg(4)

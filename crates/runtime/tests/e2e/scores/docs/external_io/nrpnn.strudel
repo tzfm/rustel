@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+note("c4").nrpnn("1:8").nrpv("123").midichan(1).midi()

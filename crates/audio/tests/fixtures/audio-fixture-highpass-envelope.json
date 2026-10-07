@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "id": "square-highpass-envelope",
+  "events": [
+    {
+      "time_seconds": 0.25,
+      "duration_seconds": 0.6,
+      "value": {
+        "s": "square",
+        "freq": 150,
+        "gain": 0.5,
+        "hcutoff": 400,
+        "hresonance": 3,
+        "hpenv": 2,
+        "hpattack": 0.02,
+        "hpdecay": 0.2,
+        "hpsustain": 0.1,
+        "hprelease": 0.1,
+        "pan": 0.5
+      }
+    }
+  ]
+}

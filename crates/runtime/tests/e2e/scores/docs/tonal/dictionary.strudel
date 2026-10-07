@@ -1,0 +1,12 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+addVoicings('house', {
+'': ['7 12 16', '0 7 16', '4 7 12'],
+'m': ['0 3 7']
+})
+chord("<Am C D F Am E Am E>")
+.dict('house').anchor(66)
+.voicing().room(.5)

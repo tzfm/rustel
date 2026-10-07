@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 2
+*/
+stack(s("bd").duckorbit(2).duckdepth(0.8), s("sawtooth").note("c3").orbit(2).seg(8))

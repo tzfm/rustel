@@ -1,0 +1,9 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+const dbank = "tr909"
+setCps(140/60/4)
+$: s("bd!16?").degradeBy(slider(0.741, 0, 1)).ribbon(40, 2).n(irand(5).ribbon(200, 2)).bank(dbank)
+$: s("sd").bank(dbank).beat("4,11", 16)

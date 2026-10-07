@@ -1,0 +1,24 @@
+/*
+  @title Progressive Lane
+  @by diegodorado
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?5J-vjLwzmZr8
+*/
+//@title Progressive Lane
+//@by diegodorado
+
+$: stack(
+  n("0 [~ <0 0 6 7> ~ <4 6>] 0 ~").dec(0.3).lpd(.2).lpf(1200),
+  n("<2 3 <0 [0 -1]@2>!2>".sub("<21 14> [14|7]").struct("1!12".every(2,slow(2))))
+    .dec(perlin.range(0.4,0.1)).s("supersaw").lpf(800).lpq(0.1).ftype('12db'),
+  n("4 ~ ~ <6!3 [6,8 9 10 12]>").mask("<0 1>".press).slow(2)
+    .s("gm_viola").gain(0.46).delay("0.5:0.5:0.5"),
+).scale("C4:dorian")
+$: stack(
+    s("[bd*4, ~!3 cp]").gain(0.35),
+    s("sd:4/4").hpf(300).room(1).size(3).att(0.01),
+    s("hh ~ [oh hh]").fast(2).cut(9).gain(0.15).delay("0.3:<0.5 0.33>:0.3")
+   ).bank("RolandTR909")
+
+// @version 1.1

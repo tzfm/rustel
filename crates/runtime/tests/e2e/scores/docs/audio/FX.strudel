@@ -1,0 +1,14 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+$: s("[sbd <hh [bd | lt | oh]>]*4").dec(.4)
+  .FX(
+    phaser(0.5).gain(2),
+    bpf(800),
+    distort(1.3),
+    room(0.2),
+    delay(0.5).gain(1.25),
+    distort(0.3),
+  ).fxr(1.7) // sets release time of effects (like delay)

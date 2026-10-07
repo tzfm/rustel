@@ -1,0 +1,31 @@
+/*
+  @title Oleander de Operación Lógica 2024 06 16
+  @by Ángel Jara
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?Ep6rV7YHAkum
+*/
+//"Oleander de Operación Lógica 2024 06 16" @by Ángel Jara
+setcps(143/60/4)
+
+
+  bateria00:
+  s("bd [bd bd - bd], sd(2,4,1), hh*8").color("#939")
+  ._pianoroll({ labels: 1 })
+    // .hush()
+bateria01:
+  s("-!7 [- [sd*12]@3]").gain(rand.range(0.5,0.9)).color("#f39").slow(8)
+  ._pianoroll({ labels: 1, cycles : 8    })
+// .hush()
+
+ElBajo:
+  note("[d3@ a1 a2][a1 e1@2 d1][- cs2 a1 ds1 ][a2 c1@3]").add(note(-0)).s("sawtooth").legato(0.5)
+    .distort(3)
+    .slow(1)
+  .lpf(sine.range("<600!8 400!8 300!8 600!8 800!8 400!8 >","<700!8 800!8 1200!8 1700!8 2400!8 800!8>").slow(2))
+  .lpq(rand.range(4,"<[18 25 36 25 10 20 15 9 32 12 10 20 12 18]!3 [10 25 10 9 10 10 10 10 40 10 32]>")).gain(rand.range(0.5,0.9)).color("#ff9")
+  ._pianoroll({ labels: 1 , vertical: 1, cycles : 1 })
+
+// Am7
+
+// @version 1.1

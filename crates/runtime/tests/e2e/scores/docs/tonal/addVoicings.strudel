@@ -1,0 +1,15 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+addVoicings('cookie', {
+  7: ['3M 7m 9M 12P 15P', '7m 10M 13M 16M 19P'],
+  '^7': ['3M 6M 9M 12P 14M', '7M 10M 13M 16M 19P'],
+  m7: ['8P 11P 14m 17m 19P', '5P 8P 11P 14m 17m'],
+  m7b5: ['3m 5d 8P 11P 14m', '5d 8P 11P 14m 17m'],
+  o7: ['3m 6M 9M 11A 15P'],
+  '7alt': ['3M 7m 10m 13m 15P'],
+  '7#11': ['7m 10m 13m 15P 17m'],
+}, ['C3', 'C6'])
+"<C^7 A7 Dm7 G7>".voicings('cookie').note()

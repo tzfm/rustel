@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+setDefaultJoin('mix') // also try 'in', 'out', 'squeeze', etc.
+s("saw").vel("1 0.5").note("F A C E").delay("0 0.2 0.3")

@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+s("ht*16").pan(0.5).lfo({s: 8, dr: 2, c: "pan"})

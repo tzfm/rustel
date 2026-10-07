@@ -1,0 +1,60 @@
+{
+  "name": "lsd",
+  "background": "#0a0410",
+  "surface": "#150822",
+  "overlay": "#241036",
+  "foreground": "#fff4ff",
+  "muted": "#8d6bb0",
+  "rule": "#4a1f6b",
+  "accent": "#ff2fd0",
+  "ok": "#26ff9c",
+  "warn": "#ffd300",
+  "error": "#ff3355",
+  "caret": "#ffffff",
+  "current_line": "#2a0f44",
+  "selection": "#6a1d8f",
+  "selection_text": "#ffffff",
+  "mini": "#00f0ff",
+  "mini_fill": "#2b0a45",
+  "slider_fill": "#3a1258",
+  "event_mark": "tint",
+  "event_fade": 0.8,
+  "event": "#ff2fd0",
+  "event_inactive": "#6f4a91",
+  "playhead": "#26ff9c",
+  "grid": "#3d1a5c",
+  "minimap": "#12071c",
+  "minimap_viewport": "#5d1a80",
+  "visual": {
+    "renderer": "hydra",
+    "code": "osc(18, 0.08, 1.4)\n  .kaleid(5)\n  .modulate(noise(3.5, 0.12), 0.35)\n  .colorama(0.06)\n  .rotate(0.15, 0.12)\n  .contrast(1.4)\n  .out()",
+    "opacity": 25
+  },
+  "characters": {
+    "effect": "aurora",
+    "strength": 78,
+    "speed": 72
+  },
+  "opacity": {
+    "backdrop": 55,
+    "interface": 74,
+    "editor": 60
+  },
+  "syntax": {
+    "text": "#fff4ff",
+    "comment": "#7b57a0",
+    "string": "#26ff9c",
+    "number": "#ffd300",
+    "punctuation": "#00f0ff",
+    "keyword": "#ff2fd0",
+    "function": "#ff8a3d"
+  },
+  "meter": {
+    "low": "#26ff9c",
+    "mid": "#00f0ff",
+    "high": "#ffd300",
+    "peak": "#ff2fd0",
+    "track": "#241036",
+    "fader": "#fff4ff"
+  }
+}

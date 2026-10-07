@@ -1,0 +1,9 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 4
+*/
+// parity fuzz case seed=154 cycles=10 bpm=90
+setcpm(90/4)
+$: s("mt [<lt bd mt> ht] bd lt cp*4").bank("RolandTR909").sparsity(0.36).every(5, (x => x.fast(2))).sometimes((x => x.palindrome())).off(0.25, (x => x.rev())).decay(0.169)
+$: s("sawtooth").n("9 7 3").scale("c:major:pentatonic").clip(1).bpf(300).coarse(8).adsr("0.077:0.113:0.79:0.106")

@@ -1,0 +1,50 @@
+{
+  "name": "prism",
+  "background": "#080a16",
+  "surface": "#101426",
+  "overlay": "#191d36",
+  "foreground": "#eef2ff",
+  "muted": "#7882a8",
+  "rule": "#30385d",
+  "accent": "#72e7ff",
+  "ok": "#6fffc1",
+  "warn": "#ffe66d",
+  "error": "#ff648b",
+  "caret": "#ffffff",
+  "selection": "#314572",
+  "selection_text": "#ffffff",
+  "mini": "#6fffc1",
+  "mini_fill": null,
+  "event_mark": "tint",
+  "event_fade": 0.45,
+  "event": "#ffe66d",
+  "event_inactive": "#786bb8",
+  "playhead": "#72e7ff",
+  "grid": "#30385d",
+  "minimap": "#090c19",
+  "minimap_viewport": "#314572",
+  "hydra": "osc(7, 0.025, 1.1)\n  .kaleid(9)\n  .modulateScale(noise(2, 0.015), 0.3)\n  .colorama(() => 0.04 + Math.sin(time * 0.12) * 0.025)\n  .add(src(o0).scale(1.008).rotate(-0.003).brightness(-0.045), 0.72)\n  .out()",
+  "hydra_opacity": 25,
+  "opacity": {
+    "backdrop": 66,
+    "interface": 74,
+    "editor": 48
+  },
+  "syntax": {
+    "text": "#eef2ff",
+    "comment": "#7882a8",
+    "string": "#6fffc1",
+    "number": "#ffe66d",
+    "punctuation": "#9a9fe8",
+    "keyword": "#ff78d1",
+    "function": "#72e7ff"
+  },
+  "meter": {
+    "low": "#6fffc1",
+    "mid": "#72e7ff",
+    "high": "#ffe66d",
+    "peak": "#ff648b",
+    "track": "#202641",
+    "fader": "#eef2ff"
+  }
+}

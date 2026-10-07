@@ -1,0 +1,41 @@
+{
+  "name": "powershell",
+  "background": "#012456",
+  "surface": "#0b2d63",
+  "overlay": "#123a75",
+  "foreground": "#eeedf0",
+  "muted": "#8aa0c8",
+  "rule": "#2a4b86",
+  "accent": "#ffff00",
+  "ok": "#7fe08b",
+  "warn": "#ffd75f",
+  "error": "#ff7b72",
+  "caret": "#ffffff",
+  "selection": "#3a5fa0",
+  "selection_text": "#ffffff",
+  "mini": "#a5f3fc",
+  "mini_fill": null,
+  "event_mark": "tint",
+  "event_fade": 0.12,
+  "event": "#ffff00",
+  "event_inactive": "#8aa0c8",
+  "playhead": "#ffff00",
+  "grid": "#2a4b86",
+  "minimap": "#071f4d",
+  "minimap_viewport": "#2a4b86",
+  "syntax": {
+    "text": "#eeedf0",
+    "comment": "#8aa0c8",
+    "string": "#f2c99a",
+    "number": "#b5cea8",
+    "punctuation": "#dcdcaa"
+  },
+  "meter": {
+    "low": "#7fe08b",
+    "mid": "#dfe36a",
+    "high": "#ffd75f",
+    "peak": "#ff7b72",
+    "track": "#123a75",
+    "fader": "#eeedf0"
+  }
+}

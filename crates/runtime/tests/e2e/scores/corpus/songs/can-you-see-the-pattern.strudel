@@ -1,0 +1,52 @@
+/*
+  @title Can you see the pattern?
+  @by yaxu
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?FRyhM9b5iLDm
+*/
+// "Can you see the pattern?"
+// @by yaxu 
+// @license CC-BY-SA
+
+setcps(0.6);
+
+p1: n("0 1 2 3 4 5 6 7".add("<0 1 2 3 4>"))
+  .palindrome()
+  .s_taper("0.5 -1","16 8")
+  // .juxBy(0.25, x => x.add(n(4)).early(1))
+  // .jux(rev)
+  .steps(8)
+  .clip(1)
+  .scale("<C3:mixolydian>/8")
+  .s("supersaw")
+  .distort(0.7)
+  .unison(10).detune(0.5)
+  .off("0.25 0.125", x => x.fast("<0.5 0.25>/8").add(note(24)).gain(0.85).room(1.2).sz(3))
+  .lpenv(perlin.slow(5).range(2,4))
+  .lpf(perlin.slow(4).range(500,2000))
+  ._pianoroll()
+
+p2: s("bd ~ sd [mt ht lt ~]@2 bd sd cp")
+  .s_taper("0.5 -1","16 8")
+  .steps(8)
+  .n(6)
+  .distort(1.5)
+  .gain(0.6)
+  .bank("RolandTR808")
+  .lpf(300)
+  .lpenv(2)
+  ._spiral()
+
+p3: s("bd cp [~ bd*2] bd [~ sd] bd [~ sd]")
+  .s_expand("2 4")
+  .steps(8)
+  .distort(0.9)
+  .hpf(400)
+  .lpenv(10)
+  .bank("YamahaRM50")
+  ._spiral()
+
+
+
+// @version 1.0

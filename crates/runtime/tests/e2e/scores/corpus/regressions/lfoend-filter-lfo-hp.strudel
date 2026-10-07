@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+s("ht*16").hpf(400).hprate(4).hpdepth(0.7)

@@ -1,0 +1,9 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 12
+*/
+// parity fuzz case seed=737 cycles=14 bpm=70
+setcpm(70/4)
+all(x => x.room(0.44))
+$: s("[oh [oh ~ rd]] rd*2").euclid(3,4).adsr("0.09:0.137:0.69:0.379")

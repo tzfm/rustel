@@ -1,0 +1,8 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+// Shorter events are lower in pitch
+sound("saw saw [saw saw] saw")
+  .note(cyclesPer.range(50, 100))

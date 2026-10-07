@@ -1,0 +1,90 @@
+{
+  "total_secs": 322.8595121160004,
+  "per_set_secs": {
+    "corpus": 278.13467080000015,
+    "docs": 40.98947771399999,
+    "probes": 3.7353636020000005
+  },
+  "slowest": [
+    [
+      "corpus/songs/inspire-piano",
+      4.455356018
+    ],
+    [
+      "corpus/generated/seed506",
+      4.260370123
+    ],
+    [
+      "corpus/generated/seed442",
+      3.417895135
+    ],
+    [
+      "corpus/generated/seed727",
+      3.391460195
+    ],
+    [
+      "corpus/generated/seed433",
+      2.787525973
+    ],
+    [
+      "corpus/generated/seed646",
+      2.4467904320000002
+    ],
+    [
+      "corpus/generated/seed143",
+      2.25082869
+    ],
+    [
+      "corpus/generated/seed385",
+      2.194007971
+    ],
+    [
+      "corpus/generated/seed023",
+      2.187047284
+    ],
+    [
+      "corpus/generated/seed647",
+      1.888484941
+    ],
+    [
+      "corpus/generated/seed663",
+      1.8595655720000002
+    ],
+    [
+      "corpus/regressions/custom-register-transposed",
+      1.769218275
+    ],
+    [
+      "corpus/generated/seed102",
+      1.750116354
+    ],
+    [
+      "corpus/generated/seed746",
+      1.7196353530000001
+    ],
+    [
+      "corpus/songs/madeallup",
+      1.475913789
+    ],
+    [
+      "corpus/generated/seed621",
+      1.455920726
+    ],
+    [
+      "corpus/generated/seed606",
+      1.450235108
+    ],
+    [
+      "corpus/generated/seed674",
+      1.444585924
+    ],
+    [
+      "corpus/generated/seed640",
+      1.376250473
+    ],
+    [
+      "corpus/songs/ghostsngoblinsc64",
+      1.370340125
+    ]
+  ]
+}

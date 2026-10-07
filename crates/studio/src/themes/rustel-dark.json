@@ -1,0 +1,41 @@
+{
+  "name": "rustel-dark",
+  "background": "#121419",
+  "surface": "#181b22",
+  "overlay": "#1f2430",
+  "foreground": "#e2e7ef",
+  "muted": "#5b6371",
+  "rule": "#303640",
+  "accent": "#55d6e8",
+  "ok": "#70d98b",
+  "warn": "#ffca28",
+  "error": "#ff6b6b",
+  "caret": "#ffffff",
+  "selection": "#37465e",
+  "selection_text": "#ffffff",
+  "mini": "#70d98b",
+  "mini_fill": null,
+  "event_mark": "tint",
+  "event_fade": 0.25,
+  "event": "#ffca28",
+  "event_inactive": "#7491d2",
+  "playhead": "#ffca28",
+  "grid": "#373d46",
+  "minimap": "#15181d",
+  "minimap_viewport": "#2a3140",
+  "syntax": {
+    "text": "#e2e7ef",
+    "comment": "#5b6371",
+    "string": "#70d98b",
+    "number": "#ffca28",
+    "punctuation": "#d986ff"
+  },
+  "meter": {
+    "low": "#70d98b",
+    "mid": "#c8e06a",
+    "high": "#ffca28",
+    "peak": "#ff6b6b",
+    "track": "#242833",
+    "fader": "#e2e7ef"
+  }
+}

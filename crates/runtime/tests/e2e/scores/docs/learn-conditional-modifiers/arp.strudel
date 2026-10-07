@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+note("<[c,eb,g]!2 [c,f,ab] [d,f,ab]>")
+.arp("0 [0,2] 1 [0,2]")

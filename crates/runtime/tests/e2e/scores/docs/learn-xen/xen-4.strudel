@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+i("0 1 2 3 4 5 6 7").xen("<5edo 10edo 15edo hexany15>")

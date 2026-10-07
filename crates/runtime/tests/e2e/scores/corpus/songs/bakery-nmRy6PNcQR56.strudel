@@ -1,0 +1,29 @@
+/*
+  @by strudel community bakery
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?nmRy6PNcQR56
+*/
+/*
+  @title Kosmiche Disco Comminges
+  @by BuboBubo
+  @details Boomy FM-based kraut-like thing
+*/
+
+bd: s("<[bd*2]!3 bd*8>").bank("RolandTR909").lpf("500 2000")
+cp: s("~ ~ <oh> <~!3 oh>".fast(4)).bank("RolandTR909")
+  .bpf(perlin.range(500, 2000).slow(4))
+sd : s("~ <sd!7 [sd cp ~ cp]>".fast(2)).bank("RolandTR909").lpf(2000)
+
+synth: note("<[c3 c4]!4 [<c5*2 c3*2> c4*2]!4>".fast(4)).decay(.25)
+  .fmdecay(.5).fmi("<1 2 4 8 16 8>").fmh("<0.25!4 0.5!4>").room(0.5)
+  .size(4).gain(1).delay(1/2).delaytime(1/4).vib(0.5).vibmod(0.25)
+
+stab: note("[c3, g4,e5, c5, c7]*8").lpf(saw.range(50, 800).slow(4))
+  .when("<0 0 0 1>", x=>x.superimpose(x=>x.arp("0 1 2 3".fast(4)).add(note(12))))
+  .sound("sine").sub(note(12)).fmdecay(.5).fmi(1.999).fmh(4)
+  .room(0.5).decay(0.2).pan(rand).size(4).mul(gain(0.6))
+  .sometimes(x=>x.superimpose(x=>x.add(note(24))))
+  .when("0|0|1", x=>x.gain(0))
+
+// @version 1.0

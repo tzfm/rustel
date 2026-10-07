@@ -1,0 +1,12 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+// You can also use xen with frequency ratios.
+// This is equivalent to the above:
+i("0 1 2").xen([
+  Math.pow(2, 0/31),
+  Math.pow(2, 8/31),
+  Math.pow(2, 18/31),
+]).piano()

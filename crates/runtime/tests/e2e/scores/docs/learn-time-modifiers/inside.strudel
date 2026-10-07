@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+"0 1 2 3 4 3 2 1".inside(4, rev).scale('C major').note()
+// "0 1 2 3 4 3 2 1".slow(4).rev().fast(4).scale('C major').note()

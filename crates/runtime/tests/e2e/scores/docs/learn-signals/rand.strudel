@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+// randomly change the cutoff
+s("bd*4,hh*8").cutoff(rand.range(500,8000))

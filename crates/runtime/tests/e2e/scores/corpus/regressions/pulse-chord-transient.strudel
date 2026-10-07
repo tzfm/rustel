@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+chord("<Cm F Am7>").rootNotes(2).s("pulse").transient(0.6)

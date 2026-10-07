@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+s("ht*4").lfo({s: 4, da: 1200, c: "note"})

@@ -1,0 +1,8 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+moreduck: n(run(8)).scale("c:minor").s("sawtooth").delay(.7).orbit(2)
+lessduck: s("hh*16").orbit(5)
+ducker: s("bd:4!4").beat("0,4,8,11,14",16).duckorbit("2:5").duckattack("0.4:0.1")

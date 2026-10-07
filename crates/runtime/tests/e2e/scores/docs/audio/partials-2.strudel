@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+s("saw").seg(8).n(irand(12)).scale("G#:minor")
+  .partials(binaryL(irand(256).add("1")))

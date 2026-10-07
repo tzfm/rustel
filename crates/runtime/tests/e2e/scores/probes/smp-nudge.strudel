@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 2
+*/
+s("bd*2").bank("tr909").nudge(0.02)

@@ -1,0 +1,9 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 4
+*/
+// parity fuzz case seed=301 cycles=11 bpm=105
+setcpm(105/4)
+$: note("db c#3").s("z_noise").zrand(0).zmod(20).slide(1).curve(2)
+$: s("<bd sd> rim [cr!2? cr:2] <sd cp> <cr oh cp> sd:3 bd:0").bank("RolandTR808").fit().pan(0.63).begin(0.12).phaser(1).phasersweep(400)

@@ -1,0 +1,8 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 12
+*/
+// parity fuzz case seed=604 cycles=14 bpm=76
+setcpm(76/4)
+$: s("cp*4 cb ~ rd <rim cb clap>?").FX(coarse(2), transient(0.47), chorus(0.29))

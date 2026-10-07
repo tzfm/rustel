@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+"c3 eb3 g3".off(1/8, x=>x.add(7)).note()

@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 2
+*/
+s("wt_digital_basique").note("c3").wtrate(3).wtdepth(0.6).seg(2)

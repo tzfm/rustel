@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+s("bd*4").bank("tr909").distort(2).distorttype("<0 1 2>")

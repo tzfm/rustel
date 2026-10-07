@@ -1,0 +1,8 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 12
+*/
+// parity fuzz case seed=732 cycles=11 bpm=132
+setcpm(132/4)
+$: s("cr clap bd clap clap lt?").room(0.32).detune(0.11).transient(0.37)

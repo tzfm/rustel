@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+n(run(8)).scale("D:pentatonic").s("pulse").pw("0 .75 .5 1")

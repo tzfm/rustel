@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+sound("<0 1 [2,0]>".pick(["bd sd", "cp cp", "hh hh"]))

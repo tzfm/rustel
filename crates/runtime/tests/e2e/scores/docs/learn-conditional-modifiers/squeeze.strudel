@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+note(squeeze("<0@2 [1!2] 2>", ["g a", "f g f g" , "g a c d"]))

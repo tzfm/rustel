@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "id": "triangle-attack-only",
+  "events": [
+    {
+      "time_seconds": 0.2,
+      "duration_seconds": 0.7,
+      "value": {
+        "s": "triangle",
+        "freq": 220,
+        "gain": 0.5,
+        "attack": 0.3,
+        "pan": 0.5
+      }
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+note("g1*4")
+.s("sine").pdec(.5)
+.penv(32)
+.pcurve("<0 1>")

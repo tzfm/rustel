@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+// randomly select scale notes from 0 - 7 (= C to C)
+n(irand(8)).struct("x x*2 x x*3").scale("C:minor")

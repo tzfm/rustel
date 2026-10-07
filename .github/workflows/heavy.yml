@@ -1,0 +1,87 @@
+name: Heavy CI
+
+# This workflow definition is taken from main. A maintainer dispatch selects a
+# PR number and exact full head SHA; a read-only preflight checks both before any
+# PR code is checked out. Main pushes and the cache-warming schedule also run.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Open PR number; leave blank to test main
+        type: string
+        required: false
+      sha:
+        description: Full 40-character PR head SHA; leave blank for main
+        type: string
+        required: false
+  schedule:
+    - cron: '37 4 * * 1,4'
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  validate:
+    name: Validate heavy target
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.target.outputs.ref }}
+      sha: ${{ steps.target.outputs.sha }}
+    steps:
+      - id: target
+        name: Resolve exact revision
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          REQUESTED_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_REF" != refs/heads/main ]]; then
+            echo '::error::Dispatch heavy.yml from main so the workflow definition is trusted.'
+            exit 1
+          fi
+          if [[ -z "$PR_NUMBER" && -z "$REQUESTED_SHA" ]]; then
+            printf 'ref=%s\nsha=%s\n' "$GITHUB_SHA" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            printf 'Testing main revision `%s`\n' "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch || ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ || ! "$REQUESTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::Provide both an open PR number and its full lowercase 40-character head SHA.'
+            exit 1
+          fi
+          pr_json=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")
+          if ! jq -e --arg repo "$GITHUB_REPOSITORY" --arg sha "$REQUESTED_SHA" \
+            '.state == "open" and .base.repo.full_name == $repo and .base.ref == "main" and .head.sha == $sha' \
+            <<< "$pr_json" >/dev/null; then
+            echo '::error::PR must be open against this repository main, with the requested SHA as its current head. Dispatch again after a push.'
+            exit 1
+          fi
+          printf 'ref=refs/pull/%s/head\nsha=%s\n' "$PR_NUMBER" "$REQUESTED_SHA" >> "$GITHUB_OUTPUT"
+          printf 'Testing PR #%s at `%s`\n' "$PR_NUMBER" "$REQUESTED_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+  main:
+    name: Main heavy checks
+    needs: validate
+    if: inputs.pr_number == ''
+    cache-mode: write
+    uses: ./.github/workflows/heavy-checks.yml
+    with:
+      ref: ${{ needs.validate.outputs.ref }}
+      sha: ${{ needs.validate.outputs.sha }}
+      save_cache: true
+
+  pull-request:
+    name: PR heavy checks
+    needs: validate
+    if: inputs.pr_number != ''
+    cache-mode: read
+    uses: ./.github/workflows/heavy-checks.yml
+    with:
+      ref: ${{ needs.validate.outputs.ref }}
+      sha: ${{ needs.validate.outputs.sha }}
+      pr_number: ${{ inputs.pr_number }}
+      save_cache: false

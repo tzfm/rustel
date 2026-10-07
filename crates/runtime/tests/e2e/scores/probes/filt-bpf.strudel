@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 2
+*/
+s("sawtooth").note("c2").bpf(900).bpq(4).bpenv(2).seg(4)

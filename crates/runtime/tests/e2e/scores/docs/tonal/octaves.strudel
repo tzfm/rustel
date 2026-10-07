@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+ chord("<Am C D F Am E Am E>").octaves("<2 4>").voicing()

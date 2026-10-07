@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+s("lt ht mt cp, [hh oh]*2").linger("<1 .5 .25 .125>")

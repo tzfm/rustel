@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+setcpm(140/4) // =140 bpm in 4/4
+$: s("bd*4,[- sd]*2").bank('tr707')

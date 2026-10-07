@@ -1,0 +1,293 @@
+name: CI
+
+# Fast, read-only checks on every PR and main push. Heavy corpus and Studio
+# checks live in heavy.yml and require an exact maintainer-selected PR SHA.
+on:
+  # Branch pushes are covered by the pull_request run.
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # No incremental state to reuse on a clean checkout; keep line tables only.
+  # A little test optimization keeps boundedness fixtures honest.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_OPT_LEVEL: "1"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  check:
+    name: Check (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            runner: ubuntu-latest
+            jobs: "4"
+          - name: macOS Apple Silicon
+            # macos-14 retired on 2026-11-02 with brownouts through October
+            # (actions/runner-images#13518); macos-15 is the same arm64
+            # image, actively supported.
+            runner: macos-15
+            jobs: "3"
+          - name: Windows x64
+            runner: windows-2022
+            jobs: "4"
+    runs-on: ${{ matrix.runner }}
+    concurrency:
+      group: ${{ github.workflow }}-check-${{ matrix.name }}-${{ github.ref }}
+      cancel-in-progress: true
+    # The debug test profile, on a cold cache.
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: ${{ matrix.jobs }}
+    # Every `run` below is POSIX, and Windows runners default to pwsh.
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Must be first: `shell: bash` on Windows resolves through PATH to WSL's
+      # bash, which cannot read a Windows path. Finds the Git Bash belonging to
+      # whichever `git` is already installed, so nothing is hardcoded.
+      # `powershell`, not `pwsh` - pwsh is a separate install.
+      -
+        name: Put Git Bash ahead of WSL's bash on PATH
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $git = (Get-Command git -ErrorAction SilentlyContinue).Source
+          if (-not $git) {
+            throw "git is not on PATH, so Git Bash cannot be located. Install Git for Windows on this runner."
+          }
+          # git.exe sits in <root>\cmd; the bash beside it sits in <root>\bin.
+          $root = Split-Path (Split-Path $git)
+          $bash = Join-Path $root 'bin\bash.exe'
+          if (-not (Test-Path $bash)) {
+            throw "Found git at $git but no bash at $bash. That is MinGit, which ships a git.exe and no shell; install the full Git for Windows."
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $bash)
+          Write-Host "Git Bash: $bash"
+
+      # The hosted image ships toolchains this repository never builds against
+      # and runs out of disk partway through linking the test binaries.
+      - name: Make room on the hosted Linux image
+        if: runner.os == 'Linux' && runner.environment == 'github-hosted'
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown aarch64-apple-darwin
+
+      # Without the Visual Studio C++ tools, rustc falls back to a bare PATH
+      # search and Git Bash's coreutils `link` answers with a spurious
+      # `extra operand`. Probe once and name the repair.
+      -
+        name: Prove the MSVC linker works before the first build
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $probe = Join-Path $env:RUNNER_TEMP "link-probe-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT.rs"
+          Set-Content -Path $probe -Value 'fn main() {}' -Encoding ascii
+          & rustc --edition 2021 -C debuginfo=0 -o "$probe.exe" $probe
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::rustc cannot link with MSVC's link.exe. Repair this runner with: winget install Microsoft.VisualStudio.2022.BuildTools --override `"--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended`". A `link: extra operand` message above means Git Bash's coreutils link answered instead of MSVC's."
+            exit 1
+          }
+          Remove-Item $probe, "$probe.exe" -ErrorAction SilentlyContinue
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux audio build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
+            sudo apt-get update
+            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev
+          fi
+
+      # The Hydra tests render for real and wait for a frame; without an ICD a
+      # GPU-less runner reports "drew nothing" instead of "no device". macOS has
+      # Metal and Windows has WARP.
+      - name: Install a software Vulkan driver
+        if: runner.os == 'Linux'
+        run: |
+          if dpkg -s mesa-vulkan-drivers >/dev/null 2>&1; then
+            echo "mesa-vulkan-drivers already present"
+          else
+            sudo apt-get update
+            sudo apt-get install --yes mesa-vulkan-drivers
+          fi
+          ls /usr/share/vulkan/icd.d/
+
+      # Any test that builds a library fetches the pinned sample manifests.
+      # Without a shared cache, each run starts empty and the studio tests
+      # queue behind those fetches. A stale entry is safe: the loader
+      # re-checks every file against its pinned sha256 and re-fetches what
+      # does not match.
+      - name: Share the sample cache between runs
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rustel-check-sample-cache
+          key: rustel-check-samples-v1-${{ hashFiles('crates/runtime/assets/sample-banks.json', 'crates/runtime/assets/gm-fonts.json') }}
+          restore-keys: rustel-check-samples-v1-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check release panic recovery
+        if: runner.os == 'Linux'
+        run: bash .github/scripts/check-panic-unwind.sh
+
+      - name: Run Clippy
+        run: bash .github/scripts/cargo-ci.sh clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Check standalone engine consumers
+        run: bash .github/scripts/check-engine.sh
+
+      - name: Test headless host APIs
+        run: bash .github/scripts/cargo-ci.sh test -p rustel-runtime --no-default-features --test host_audio --test optional_mp3 -- --test-threads=1
+
+      # The workspace runs below unify device audio and the product's features
+      # into the engine; these build it the way a host's own graph does.
+      - name: Test and lint the lean engine profiles
+        run: |
+          bash .github/scripts/cargo-ci.sh test -p rustel-engine -- --test-threads=1
+          bash .github/scripts/cargo-ci.sh test -p rustel-engine --features session --test embedding -- --test-threads=1
+          bash .github/scripts/cargo-ci.sh clippy -p rustel-engine --no-default-features -- -D warnings
+          bash .github/scripts/cargo-ci.sh clippy -p rustel-engine --features session -- -D warnings
+
+      # SIMD modules belong behind architecture gates; this catches leaked x86
+      # imports while keeping the scalar core available to a WebAssembly host.
+      - name: Check WebAssembly audio core
+        run: bash .github/scripts/cargo-ci.sh rustc --target wasm32-unknown-unknown -p rustel-audio --lib -- -D warnings
+
+      # A browser host builds on the base engine profile; this keeps it
+      # compiling for wasm32. It proves compilation only: `std::thread` and
+      # `std::fs` compile there and fail at run time.
+      - name: Check WebAssembly engine base profile
+        run: bash .github/scripts/cargo-ci.sh rustc --target wasm32-unknown-unknown -p rustel-engine --lib --no-default-features -- -D warnings
+
+      # Type-checks portable and architecture-gated code without a Mac linker;
+      # does not qualify CoreAudio playback or real-time behavior.
+      - name: Check Apple silicon audio core
+        env:
+          RUSTFLAGS: -Dwarnings
+        run: bash .github/scripts/cargo-ci.sh check --target aarch64-apple-darwin -p rustel-audio --lib --tests --no-default-features
+
+      # Everything else runs `--all-features`, so device-gated code could stop
+      # compiling on the advertised default path and stay green. A build, not
+      # `-D warnings`: the default build carries pre-existing dead-code
+      # warnings, and the failure worth blocking on is "does not compile".
+      - name: Build with default features
+        run: bash .github/scripts/cargo-ci.sh build --workspace --bins
+
+      # Keeps the supported lighter combination from silently inheriting
+      # defaults and ceasing to test what its name says.
+      - name: Check Studio without Hydra
+        run: bash .github/scripts/cargo-ci.sh check -p rustel --no-default-features --features mp3-export,studio
+
+      - name: Test Studio without extensions or Hydra
+        env:
+          RUSTEL_SAMPLE_CACHE: ${{ runner.temp }}/rustel-check-sample-cache
+          TMPDIR: ${{ runner.temp }}/rustel-studio-test-tmp-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          mkdir -p "$TMPDIR" "$RUSTEL_SAMPLE_CACHE"
+          bash .github/scripts/cargo-ci.sh test -p rustel-studio --no-default-features --lib -- --test-threads=1
+
+      # The explicit lean binary is the product's promise; build that exact
+      # feature set before checking its dynamic dependencies.
+      - name: Build lean binary
+        run: bash .github/scripts/cargo-ci.sh build -p rustel --no-default-features --features mp3-export
+
+      - name: The lean build links no graphics stack
+        if: runner.os == 'Linux'
+        run: |
+          if ldd target/debug/rustel | grep -qiE 'vulkan|libgtk-3|libEGL|libGLX'; then
+            ldd target/debug/rustel | grep -iE 'vulkan|libgtk-3|libEGL|libGLX'
+            echo "::error::the lean rustel binary links a graphics stack"
+            exit 1
+          fi
+          echo "lean binary links no graphics stack"
+
+      # Serial: several suites assert real wall-clock cancellation and liveness
+      # bounds, and unrelated contention would read as a product timeout. The
+      # studio e2e suite is left to the separate heavy workflow; Clippy
+      # above still type-checks it here, on every platform.
+      - name: Run tests
+        env:
+          RUSTEL_SAMPLE_CACHE: ${{ runner.temp }}/rustel-check-sample-cache
+          # Large fixtures go in runner-managed scratch, isolated per attempt.
+          TMPDIR: ${{ runner.temp }}/rustel-test-tmp-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          mkdir -p "$TMPDIR" "$RUSTEL_SAMPLE_CACHE"
+          bash .github/scripts/cargo-ci.sh test --workspace --all-targets --all-features --exclude rustel-studio-e2e -- --test-threads=1
+
+  build-release-platforms:
+    name: Build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux ARM64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            jobs: "4"
+          - name: macOS Intel
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            jobs: "3"
+    runs-on: ${{ matrix.runner }}
+    concurrency:
+      group: ${{ github.workflow }}-build-${{ matrix.name }}-${{ github.ref }}
+      cancel-in-progress: true
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: ${{ matrix.jobs }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux audio and serial build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
+            sudo apt-get update
+            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev
+          fi
+
+      # Check the remaining release targets without optimized builds or publication.
+      - name: Build binary with release features
+        run: cargo build --locked -p rustel --target ${{ matrix.target }} --features device-audio,midi,serial,studio,gamepad
+
+      - name: Check binary version
+        run: target/${{ matrix.target }}/debug/rustel --version

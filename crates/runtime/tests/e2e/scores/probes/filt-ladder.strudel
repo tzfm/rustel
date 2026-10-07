@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 2
+*/
+s("sawtooth").note("c2").lpf(600).lpq(8).ftype("ladder").drive(2).seg(4)

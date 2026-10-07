@@ -1,0 +1,31 @@
+[package]
+name = "rustel-hydra"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Hydra visuals, composed and rendered natively, drawn behind the code"
+
+# `rustel-runtime` includes this crate through its default-enabled `hydra`
+# feature. A minimal host can omit the GPU stack with default features disabled.
+#
+# The GLSL is composed in `glsl` and rendered in `native`. Shaders are compared
+# against the library's own output character for character rather than taken on
+# trust; see `tests/glsl_parity.rs`.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Headless GPU. No surface, no swapchain, no window: a terminal never shows a
+# GL context, it shows the pixels that came back. Vulkan, Metal and DX12 all
+# render offscreen natively, and lavapipe covers a machine with no GPU at all.
+wgpu = { version = "26", features = ["glsl"] }
+pollster = "0.4"
+
+[dev-dependencies]
+# The reference frames are a megabyte of RGBA that deflates to a tenth of
+# that; the runtime crate already carries this for the kitty graphics path.
+miniz_oxide = "0.8"
+
+

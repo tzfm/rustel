@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+s("bd sd [~ bd] sd").bpf(500).bpq("<0 1 2 3>")

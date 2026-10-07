@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+note("c4").sysex(["0x77", "0x01:0x02:0x03:0x04"]).midichan(1).midi()

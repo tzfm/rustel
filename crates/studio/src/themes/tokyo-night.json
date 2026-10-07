@@ -1,0 +1,50 @@
+{
+  "name": "tokyo-night",
+  "background": "#1a1b26",
+  "surface": "#16161e",
+  "overlay": "#24283b",
+  "foreground": "#c0caf5",
+  "muted": "#565f89",
+  "rule": "#2f334d",
+  "accent": "#7aa2f7",
+  "ok": "#9ece6a",
+  "warn": "#e0af68",
+  "error": "#f7768e",
+  "caret": "#c0caf5",
+  "selection": "#33467c",
+  "selection_text": "#c0caf5",
+  "mini": "#7dcfff",
+  "mini_fill": null,
+  "event_mark": "tint",
+  "event_fade": 0.35,
+  "event": "#bb9af7",
+  "event_inactive": "#3b4261",
+  "playhead": "#7dcfff",
+  "grid": "#2a2e45",
+  "minimap": "#16161e",
+  "minimap_viewport": "#33467c",
+  "hydra": "osc(3, 0.02, 0.9)\n  .color(0.42, 0.55, 0.98)\n  .modulate(noise(2, 0.02), 0.1)\n  .out()",
+  "hydra_opacity": 25,
+  "opacity": {
+    "backdrop": 66,
+    "interface": 74,
+    "editor": 64
+  },
+  "syntax": {
+    "text": "#c0caf5",
+    "comment": "#565f89",
+    "string": "#9ece6a",
+    "number": "#ff9e64",
+    "punctuation": "#89ddff",
+    "keyword": "#bb9af7",
+    "function": "#7aa2f7"
+  },
+  "meter": {
+    "low": "#9ece6a",
+    "mid": "#7dcfff",
+    "high": "#e0af68",
+    "peak": "#f7768e",
+    "track": "#24283b",
+    "fader": "#c0caf5"
+  }
+}

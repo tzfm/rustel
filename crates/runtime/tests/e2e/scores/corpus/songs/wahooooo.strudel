@@ -1,0 +1,51 @@
+/*
+  @title wahooooo
+  @by strudel community bakery
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?rfImqvxsUdJE
+*/
+//"wahooooo"
+sound("bd <sd [sd bd]> [~ bd] sd ").bank("RolandMC303").slow("<1 1 1 1 2 2 2 2>").gain(1)
+.stack(
+  sound("[hh hh*2] [~ ~ hh ~] [~ hh hh hh] [hh hh hh ~]").fast(1).bank("RolandMC303").gain(0.6)
+  .cutoff("<3000 4000 5000>"),
+  sound("cp ~ ~ cp ~ ~ <~ cp> cp").fast(1).bank("RolandMC303").gain(0.1).jux(rev).cutoff(4000)
+)
+.stack(
+ note("[[b3,d#4,gb4,ab4]][db4,f4,ab4,a#4][b3,d#4,gb4,a#4][~[b4,db4,d#4,gb4,bb4][db4,f4,ab4,a#4] [~ [db4,db3]]]")
+  .sound("gm_pizzicato_strings:5")
+  //.rev()
+  .gain(0.8)
+  .slow(4)
+  .cutoff(1000)
+  .release(1)
+  .room(1)
+)
+  .stack(
+    n("[0 ~ <4 7> <1 2>] <0 [~ 0] [0 7]> <[0 7][3 10][1 8][[4 11]]> <0 [2 0] 0 [5 12]>")
+    .scale("<db2:minor f#1:major>")
+     // .sound("gm_electric_guitar_jazz")
+    .sound("gm_acoustic_bass")
+    .slow(1)
+    .gain(1)
+    .room(0.5)
+    .pan(sine.slow(4))
+  )
+    .stack(
+    n("[0 ~ <4 7> <1 2>] <0 [~ 0] [0 7]> <[0 7][3 10][1 8][[4 11]]> <0 [2 0] 0 [5 12]>")
+       // .slow(2)
+      // n(" 0 [~ 0] <[0 7] [7 ~] [7 0]> <[4 2 0][6 4 3 -1]>")
+   .scale("<<[b3:major,b2:minor]> [a#3:minor, a#2:minor] [d#4:minor,d#5:minor] [db3:minor,db4:minor]>")
+     // .sound("gm_piano:11")
+      .sound("gm_vibraphone:5")
+    .gain(0.4)
+    .room(0.8)
+    // .palindrome()
+    .release(0.1)
+    .jux(rev)
+  )
+.cpm(35)
+
+
+// @version 1.0

@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+note("d1!8").s("sine").penv(36).pdecay(.12).decay(.23).distort("8:.4")

@@ -1,0 +1,24 @@
+/*
+  @by strudel community bakery
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?uxV_IwbiNByH
+*/
+typeof setDefaultVoicings !== 'undefined' && setDefaultVoicings('legacy') // https://github.com/tidalcycles/strudel/pull/967
+// "underwater library" @by froos
+
+setcps(.5)
+  
+n("0 .. 9")
+  .segment(8)
+  .chord("<Em9 Em7 Em6 Am69>/2")
+  .dict("<ireal ireal-ext>/2")
+  .voicing().jux(rev)
+  .s("piano")
+  .clip(4)
+  .pan(rand).penv(12).patt(1).pcurve("<1!8 0>")
+  .att(.1).add(note(12))
+  .room(.5).size(6).gain(.5)
+  //.pianoroll()
+
+// @version 1.0

@@ -1,0 +1,8 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+note("c e g b g e")
+.fm("<0 1 2 8 32>")
+._scope()

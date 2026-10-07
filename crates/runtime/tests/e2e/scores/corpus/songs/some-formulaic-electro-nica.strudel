@@ -1,0 +1,46 @@
+/*
+  @title some formulaic electro(nica)
+  @by LukaP
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?SDUxhX6BCFDp
+*/
+// "some formulaic electro(nica)" @by LukaP.
+stack(
+  
+  // trying to make a decent shuffle vibe with drums
+  stack(
+    s("bd ~ sd:10 bd ~ bd sd cp:2").gain(1),
+    s("~@7 [~ cp:4 ~@2 ] ~ [~ cp ~@2] ~@5 cp:3"),
+    s("[hh:4 [~ <hh hh:2>/3 ~@3]]*8" ).gain("<0 0.6>/8"),
+    s("[oh:3 [~ [ ~ [ ~ oh:2 ~@6] ] ] ] ~").gain(0.4), 
+    s("~ rim ~ rim:2 ~ ~ rim:3 [~ rim]").gain(0.4)
+  )
+  .bank("RolandTR909"),
+
+  s("[~ ~ sd:6 ~   ~ sd:9 ~ ~]").bank("RolandTR808").gain(1.5),
+  // squelcy acid line
+  n("[<0 7> ~ <~ 14> 4 ~ <~ ~ 7> 5 <~ ~ ~ 9>]*2")
+      .scale("D:minor")
+      .transpose("<-14@5 -7>")
+      .s("square sawtooth")
+      .lpq(sine.rangex(8,30).slow(6))
+      .cutoff(sine.rangex(500,4000).slow(7))
+      .room(0.2)
+      .delay("<0.1 0.2 0.3 0.2>")
+      .degradeBy("<0.1 0.3 0.4>")
+  .gain("0.6"),
+
+  // bassline
+  n("[~ ~ 0 ~] * 4".add("<0 -2 3 [-3 4 5]>/2"))
+    .scale("D:minor")
+    .transpose("-14")
+    .s("square, sine, sawtooth")
+    //.sustain(10)
+    .release(sine.range(0.1,0.8).slow(12))
+    .cutoff(sine.rangex(400,4000).slow(9))
+    .delay("0.3").gain(0.2)
+
+).cpm(32)
+
+// @version 1.0

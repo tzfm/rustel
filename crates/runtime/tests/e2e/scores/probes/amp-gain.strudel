@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 2
+*/
+s("sawtooth").note("c3").gain(0.4).velocity(0.6).postgain(0.8).seg(4)

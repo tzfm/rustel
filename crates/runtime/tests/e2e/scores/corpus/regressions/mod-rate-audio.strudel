@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+s("bd*2").tremolo(60).lfo({s: 4, dr: 2, c: "tremolo"})

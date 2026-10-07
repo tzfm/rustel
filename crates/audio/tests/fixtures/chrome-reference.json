@@ -1,0 +1,963 @@
+{
+  "schema_version": 2,
+  "scope": "Synth oscillator, envelope, control, biquad-filter, and bundled-sample reference cases; not representative of the complete audio surface",
+  "reference_environment": {
+    "chrome_version": "151.0.7922.110",
+    "chrome_binary_sha256": "1c8a72b0e6b5a4dd1de5ce42a7b11460753d8941baebda208360475f31eb17d2",
+    "strudel_commit": "ebc25467c0f117a7e7b9b11378e21cac94d730fd",
+    "nanostores_version": "0.11.3",
+    "nanostores_module_sha256": "f809ef4bfb43376036df5be59a67dd07a4882fd7fa161768f187df81e97e4c86"
+  },
+  "cases": [
+    {
+      "id": "sine-explicit-adsr",
+      "fixture": "audio-fixture.json",
+      "fixture_sha256": "30f8b59fa4d183d785d5cec8ba4c85a7204bf740b1af6549d582b94a383e77ab",
+      "reference": {
+        "repetitions": 3,
+        "all_pcm_hashes_equal": true,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "a0758a4144a2279d30704974b74bccd3e5d8dc997a310754a8b4f60ef5416922",
+        "peak": 0.14939799904823303,
+        "rms": 0.022237905779350378,
+        "first_audible_frame": 12001,
+        "last_audible_frame": 45599,
+        "channel_metrics": [
+          {
+            "peak": 0.14939799904823303,
+            "rms": 0.03144914795193234
+          },
+          {
+            "peak": 0,
+            "rms": 0
+          }
+        ]
+      },
+      "negative_control": {
+        "perturbation": "multiply the first scheduled event gain by 0.5",
+        "comparison_status": "FAIL",
+        "relative_rms_delta": 0.5,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "6e57134d41ebaa5695c8e85f172520cc2726a0bcd83dc3f36ea50485a0508e3c",
+        "peak": 0.07469899952411652,
+        "rms": 0.011118952889675189,
+        "first_audible_frame": 12001,
+        "last_audible_frame": 45599,
+        "channel_metrics": [
+          {
+            "peak": 0.07469899952411652,
+            "rms": 0.01572457397596617
+          },
+          {
+            "peak": 0,
+            "rms": 0
+          }
+        ]
+      }
+    },
+    {
+      "id": "triangle-default-adsr",
+      "fixture": "audio-fixture-triangle.json",
+      "fixture_sha256": "78ccefeeb63697d1182e6eeb66d92cbb834b1457201fed54c8e092b8c13307be",
+      "reference": {
+        "repetitions": 3,
+        "all_pcm_hashes_equal": true,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "fb253255c1bae7d9b2133a40c790c7e57cb2bd9b2dcf6ffa35fc0530d8a48f94",
+        "peak": 0.07253935188055038,
+        "rms": 0.013424464571272424,
+        "first_audible_frame": 12001,
+        "last_audible_frame": 36479,
+        "channel_metrics": [
+          {
+            "peak": 0.07253935188055038,
+            "rms": 0.013424464571272332
+          },
+          {
+            "peak": 0.07253935188055038,
+            "rms": 0.013424464571272332
+          }
+        ]
+      },
+      "negative_control": {
+        "perturbation": "multiply the first scheduled event gain by 0.5",
+        "comparison_status": "FAIL",
+        "relative_rms_delta": 0.5,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "883f09e94be40a723b88f7460c81ed3f2d31414b781bef1dc65f619ebc3dc9ec",
+        "peak": 0.03626967594027519,
+        "rms": 0.006712232285636212,
+        "first_audible_frame": 12001,
+        "last_audible_frame": 36479,
+        "channel_metrics": [
+          {
+            "peak": 0.03626967594027519,
+            "rms": 0.006712232285636166
+          },
+          {
+            "peak": 0.03626967594027519,
+            "rms": 0.006712232285636166
+          }
+        ]
+      }
+    },
+    {
+      "id": "square-short-envelope",
+      "fixture": "audio-fixture-square.json",
+      "fixture_sha256": "e0485d16d582134e40910bec74ded8771d886c77e938c8c71a463cc760941174",
+      "reference": {
+        "repetitions": 3,
+        "all_pcm_hashes_equal": true,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "de70ebede72e143838867377a345e7e1d246744c61d181cbafc9ea7a5b25e4c5",
+        "peak": 0.05844138190150261,
+        "rms": 0.004915271172549698,
+        "first_audible_frame": 12001,
+        "last_audible_frame": 31199,
+        "channel_metrics": [
+          {
+            "peak": 7.15700488782521e-18,
+            "rms": 8.512817684208279e-19
+          },
+          {
+            "peak": 0.05844138190150261,
+            "rms": 0.006951243154961289
+          }
+        ]
+      },
+      "negative_control": {
+        "perturbation": "multiply the first scheduled event gain by 0.5",
+        "comparison_status": "FAIL",
+        "relative_rms_delta": 0.5,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "9af8c7f513a6b164c5d6c230e773a072a0de3fe0a8f29922cceca1aa5f514048",
+        "peak": 0.029220690950751305,
+        "rms": 0.002457635586274849,
+        "first_audible_frame": 12001,
+        "last_audible_frame": 31199,
+        "channel_metrics": [
+          {
+            "peak": 3.578502443912605e-18,
+            "rms": 4.2564088421041397e-19
+          },
+          {
+            "peak": 0.029220690950751305,
+            "rms": 0.0034756215774806444
+          }
+        ]
+      }
+    },
+    {
+      "id": "sine-gain-velocity-postgain-pan",
+      "fixture": "audio-fixture-controls.json",
+      "fixture_sha256": "e30d34a0813fc419fc2bf50679971b4e241af6b200f0564ac441c9162ba63dd2",
+      "reference": {
+        "repetitions": 3,
+        "all_pcm_hashes_equal": true,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "d233775cfa1c0c601205902de3c41edc3c7b3aa804d08d81430176402b27f384",
+        "peak": 0.046572789549827576,
+        "rms": 0.004295423035345557,
+        "first_audible_frame": 12001,
+        "last_audible_frame": 40799,
+        "channel_metrics": [
+          {
+            "peak": 0.046572789549827576,
+            "rms": 0.005957922902141757
+          },
+          {
+            "peak": 0.009263904765248299,
+            "rms": 0.0011851045512057384
+          }
+        ]
+      },
+      "negative_control": {
+        "perturbation": "multiply the first scheduled event gain by 0.5",
+        "comparison_status": "FAIL",
+        "relative_rms_delta": 0.5,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "89f28702a064af6431d73169d503042265857fc4d63990b2c01ec195060b57b5",
+        "peak": 0.023286394774913788,
+        "rms": 0.0021477115176727784,
+        "first_audible_frame": 12001,
+        "last_audible_frame": 40798,
+        "channel_metrics": [
+          {
+            "peak": 0.023286394774913788,
+            "rms": 0.0029789614510708786
+          },
+          {
+            "peak": 0.004631952382624149,
+            "rms": 0.0005925522756028692
+          }
+        ]
+      }
+    },
+    {
+      "id": "overlapping-sine-triangle",
+      "fixture": "audio-fixture-polyphony.json",
+      "fixture_sha256": "b66aedaa2058689dec56a828db02b20d70a16d235c94c9a7101aef1de7771f53",
+      "reference": {
+        "repetitions": 3,
+        "all_pcm_hashes_equal": true,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "b398fc50239c9cec1ec5335663e341b154af60722b0541b0c597f819660aa643",
+        "peak": 0.06755739450454712,
+        "rms": 0.013256459152664933,
+        "first_audible_frame": 9601,
+        "last_audible_frame": 45599,
+        "channel_metrics": [
+          {
+            "peak": 0.0663965716958046,
+            "rms": 0.014578102550339254
+          },
+          {
+            "peak": 0.06755739450454712,
+            "rms": 0.011787550405590163
+          }
+        ]
+      },
+      "negative_control": {
+        "perturbation": "multiply the first scheduled event gain by 0.5",
+        "comparison_status": "FAIL",
+        "relative_rms_delta": 0.31522811202196555,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "9661bef6890955831ce0fc7d4c6611514c6e4889eb44bd14a985e8d0305182b0",
+        "peak": 0.06121762469410896,
+        "rms": 0.00907765056187406,
+        "first_audible_frame": 9601,
+        "last_audible_frame": 45599,
+        "channel_metrics": [
+          {
+            "peak": 0.03625763952732086,
+            "rms": 0.008027969398764904
+          },
+          {
+            "peak": 0.06121762469410896,
+            "rms": 0.010017943240979058
+          }
+        ]
+      }
+    },
+    {
+      "id": "sawtooth-static-lowpass",
+      "fixture": "audio-fixture-lowpass.json",
+      "fixture_sha256": "9f68f8064b0bc8fc77ca8c8dd41b6ac05a10f9c167f81ff508aa86c6e2619d51",
+      "reference": {
+        "repetitions": 3,
+        "all_pcm_hashes_equal": true,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "b11a6f8dbb05b01750559f78c04fdce1668fbbe5fa632a0a3bba192829a006ac",
+        "peak": 0.21894779801368713,
+        "rms": 0.031218760032574906,
+        "first_audible_frame": 12003,
+        "last_audible_frame": 43590,
+        "channel_metrics": [
+          {
+            "peak": 0.21894779801368713,
+            "rms": 0.0419891395888267
+          },
+          {
+            "peak": 0.07114044576883316,
+            "rms": 0.013643097615022077
+          }
+        ]
+      },
+      "negative_control": {
+        "perturbation": "multiply the first scheduled event gain by 0.5",
+        "comparison_status": "FAIL",
+        "relative_rms_delta": 0.5,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "a68c31472e1ac22bc60a695e7558db9827dfbd1a6bc723a74091c20ed3bd4419",
+        "peak": 0.10947389900684357,
+        "rms": 0.015609380016287453,
+        "first_audible_frame": 12003,
+        "last_audible_frame": 43556,
+        "channel_metrics": [
+          {
+            "peak": 0.10947389900684357,
+            "rms": 0.02099456979441335
+          },
+          {
+            "peak": 0.03557022288441658,
+            "rms": 0.006821548807511038
+          }
+        ]
+      }
+    },
+    {
+      "id": "square-static-highpass",
+      "fixture": "audio-fixture-highpass.json",
+      "fixture_sha256": "688b41e84047e1755d9cd1b38b3a33ddc6c3d3f3271f597d3021b97d45953476",
+      "reference": {
+        "repetitions": 3,
+        "all_pcm_hashes_equal": true,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "7f53116fddf6a566b9cb8cf284e43a73561d70265a963ca1fbdc411d894557de",
+        "peak": 0.2424076795578003,
+        "rms": 0.01400615405299288,
+        "first_audible_frame": 9601,
+        "last_audible_frame": 39987,
+        "channel_metrics": [
+          {
+            "peak": 0.07876302301883698,
+            "rms": 0.006120913410288756
+          },
+          {
+            "peak": 0.2424076795578003,
+            "rms": 0.018838235632247475
+          }
+        ]
+      },
+      "negative_control": {
+        "perturbation": "multiply the first scheduled event gain by 0.5",
+        "comparison_status": "FAIL",
+        "relative_rms_delta": 0.5,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "213ea4a816df2b23be25528b0dd0d3fae5ad0972685b689b96f12966096f29e8",
+        "peak": 0.12120383977890015,
+        "rms": 0.00700307702649644,
+        "first_audible_frame": 9601,
+        "last_audible_frame": 39968,
+        "channel_metrics": [
+          {
+            "peak": 0.03938151150941849,
+            "rms": 0.003060456705144378
+          },
+          {
+            "peak": 0.12120383977890015,
+            "rms": 0.009419117816123737
+          }
+        ]
+      }
+    },
+    {
+      "id": "sawtooth-static-bandpass",
+      "fixture": "audio-fixture-bandpass.json",
+      "fixture_sha256": "480d100e535c119d624dcf39d8ed90372c2df3265b2841c5ab801d8881c1be94",
+      "reference": {
+        "repetitions": 3,
+        "all_pcm_hashes_equal": true,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "20fe6d261ab167b34cf20eb74550ca8aa1bca69a697fbd64df7df8d9a2bbc7ce",
+        "peak": 0.0484677292406559,
+        "rms": 0.004873312033902779,
+        "first_audible_frame": 14402,
+        "last_audible_frame": 41699,
+        "channel_metrics": [
+          {
+            "peak": 0.0484677292406559,
+            "rms": 0.0058763141708715
+          },
+          {
+            "peak": 0.02970106154680252,
+            "rms": 0.003601009875684451
+          }
+        ]
+      },
+      "negative_control": {
+        "perturbation": "multiply the first scheduled event gain by 0.5",
+        "comparison_status": "FAIL",
+        "relative_rms_delta": 0.5,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "68bc5c6737f66b737a20035e4db91c8be6cf73445724a1d074598ede90afee28",
+        "peak": 0.02423386462032795,
+        "rms": 0.0024366560169513897,
+        "first_audible_frame": 14402,
+        "last_audible_frame": 41657,
+        "channel_metrics": [
+          {
+            "peak": 0.02423386462032795,
+            "rms": 0.00293815708543575
+          },
+          {
+            "peak": 0.01485053077340126,
+            "rms": 0.0018005049378422254
+          }
+        ]
+      }
+    },
+    {
+      "id": "sawtooth-static-lowpass-24db",
+      "fixture": "audio-fixture-lowpass-24db.json",
+      "fixture_sha256": "ac10d39a304b9a0b19d01b41c4a206a2a36874b23601bb58bdf13d883f57bf61",
+      "reference": {
+        "repetitions": 3,
+        "all_pcm_hashes_equal": true,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "8d2f20d06fe23e9f016eb0f66a6c84b3ca9eb210c9939da8a6289a3e4f42243b",
+        "peak": 0.24618202447891235,
+        "rms": 0.03676019670374018,
+        "first_audible_frame": 12007,
+        "last_audible_frame": 43530,
+        "channel_metrics": [
+          {
+            "peak": 0.15086053311824799,
+            "rms": 0.027163011641674183
+          },
+          {
+            "peak": 0.24618202447891235,
+            "rms": 0.044326007286349965
+          }
+        ]
+      },
+      "negative_control": {
+        "perturbation": "multiply the first scheduled event gain by 0.5",
+        "comparison_status": "FAIL",
+        "relative_rms_delta": 0.5,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "a568a61789a31c1244919e4ceeef883b5e1361afda9393e594b5b8e65c845b7a",
+        "peak": 0.12309101223945618,
+        "rms": 0.01838009835187009,
+        "first_audible_frame": 12008,
+        "last_audible_frame": 43522,
+        "channel_metrics": [
+          {
+            "peak": 0.07543026655912399,
+            "rms": 0.013581505820837092
+          },
+          {
+            "peak": 0.12309101223945618,
+            "rms": 0.022163003643174983
+          }
+        ]
+      }
+    },
+    {
+      "id": "square-lowpass-envelope",
+      "fixture": "audio-fixture-lowpass-envelope.json",
+      "fixture_sha256": "e5057b49b3f49c2cb67878cc8386fb6e67e471bdf52de52696d7d571b9c14368",
+      "reference": {
+        "repetitions": 3,
+        "all_pcm_hashes_equal": true,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "fcee906e805390786e08f316fa28f0a3ec9d64d2f4f8678a75c25e2f1bd2a504",
+        "peak": 0.16126678884029388,
+        "rms": 0.03877115727723397,
+        "first_audible_frame": 9602,
+        "last_audible_frame": 45283,
+        "channel_metrics": [
+          {
+            "peak": 0.16126678884029388,
+            "rms": 0.044358965316616525
+          },
+          {
+            "peak": 0.11716717481613159,
+            "rms": 0.03222867464341658
+          }
+        ]
+      },
+      "negative_control": {
+        "perturbation": "multiply the first scheduled event gain by 0.5",
+        "comparison_status": "FAIL",
+        "relative_rms_delta": 0.5,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "b468116adf93c5d4be1724490a759213548c7abd3599841b8b520e4cf3525f11",
+        "peak": 0.08063339442014694,
+        "rms": 0.019385578638616986,
+        "first_audible_frame": 9602,
+        "last_audible_frame": 45263,
+        "channel_metrics": [
+          {
+            "peak": 0.08063339442014694,
+            "rms": 0.022179482658308262
+          },
+          {
+            "peak": 0.058583587408065796,
+            "rms": 0.01611433732170829
+          }
+        ]
+      }
+    },
+    {
+      "id": "bundled-bd-speed-slice-pan",
+      "fixture": "audio-fixture-sample-bd.json",
+      "fixture_sha256": "785389406f7bff8ba088b81126994b44373a63ebdb207a00779d65c105abc75c",
+      "reference": {
+        "repetitions": 3,
+        "all_pcm_hashes_equal": true,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "482e47cb0c2ad28b204fd12ed2cec6bcd6d1ba232d543429038e2ab3a7efd4c4",
+        "peak": 0.40341508388519287,
+        "rms": 0.025230168771422302,
+        "first_audible_frame": 9601,
+        "last_audible_frame": 17279,
+        "channel_metrics": [
+          {
+            "peak": 0.40341508388519287,
+            "rms": 0.031791867416529396
+          },
+          {
+            "peak": 0.20555025339126587,
+            "rms": 0.016198765343034903
+          }
+        ]
+      },
+      "negative_control": {
+        "perturbation": "multiply the first scheduled event gain by 0.5",
+        "comparison_status": "FAIL",
+        "relative_rms_delta": 0.5,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "841d31ef2662370997baec7c995252b52d99b7634930bb918d0ec8ae81326d58",
+        "peak": 0.20170754194259644,
+        "rms": 0.012615084385711151,
+        "first_audible_frame": 9601,
+        "last_audible_frame": 17279,
+        "channel_metrics": [
+          {
+            "peak": 0.20170754194259644,
+            "rms": 0.015895933708264698
+          },
+          {
+            "peak": 0.10277512669563293,
+            "rms": 0.008099382671517451
+          }
+        ]
+      }
+    },
+    {
+      "id": "bundled-bd-note-release",
+      "fixture": "audio-fixture-sample-note-release.json",
+      "fixture_sha256": "5b8c4c6408bd6718bff287f81393a2d6018375184068e6c8a196e6431e7814de",
+      "reference": {
+        "repetitions": 3,
+        "all_pcm_hashes_equal": true,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "0ab8d8fb7dfca52b8c2644872c5b6094a2ce5928504afd35f197898ba0a3ba3e",
+        "peak": 0.4048551321029663,
+        "rms": 0.022091154297455104,
+        "first_audible_frame": 7201,
+        "last_audible_frame": 12959,
+        "channel_metrics": [
+          {
+            "peak": 0.2480955272912979,
+            "rms": 0.016323696145804655
+          },
+          {
+            "peak": 0.4048551321029663,
+            "rms": 0.026637851649999232
+          }
+        ]
+      },
+      "negative_control": {
+        "perturbation": "multiply the first scheduled event gain by 0.5",
+        "comparison_status": "FAIL",
+        "relative_rms_delta": 0.5,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "305754030783e688fee1370160015246b7afce888c0e4c701efff0a8744f9ed0",
+        "peak": 0.20242756605148315,
+        "rms": 0.011045577148727552,
+        "first_audible_frame": 7201,
+        "last_audible_frame": 12959,
+        "channel_metrics": [
+          {
+            "peak": 0.12404776364564896,
+            "rms": 0.008161848072902328
+          },
+          {
+            "peak": 0.20242756605148315,
+            "rms": 0.013318925824999616
+          }
+        ]
+      }
+    },
+    {
+      "id": "sine-decay-only-pluck",
+      "fixture": "audio-fixture-decay-only.json",
+      "fixture_sha256": "3be32e45260ac131edc003413a511724d61498739782233d3b74919c7339a7a5",
+      "reference": {
+        "repetitions": 3,
+        "all_pcm_hashes_equal": true,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "9d838cf02ac9803a7c73ac7331cf3a76ae08b0016625aad1e3597c5875ca12c7",
+        "peak": 0.12566234171390533,
+        "rms": 0.011689593857467156,
+        "first_audible_frame": 12001,
+        "last_audible_frame": 41279,
+        "channel_metrics": [
+          {
+            "peak": 0.12566234171390533,
+            "rms": 0.011689593857466965
+          },
+          {
+            "peak": 0.12566234171390533,
+            "rms": 0.011689593857466965
+          }
+        ]
+      },
+      "negative_control": {
+        "perturbation": "multiply the first scheduled event gain by 0.5",
+        "comparison_status": "FAIL",
+        "relative_rms_delta": 0.5,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "c482c4d56007bfb7d04995014353dff240dcb7771f708f67d8982f67c395171f",
+        "peak": 0.06283117085695267,
+        "rms": 0.005844796928733578,
+        "first_audible_frame": 12001,
+        "last_audible_frame": 41279,
+        "channel_metrics": [
+          {
+            "peak": 0.06283117085695267,
+            "rms": 0.005844796928733483
+          },
+          {
+            "peak": 0.06283117085695267,
+            "rms": 0.005844796928733483
+          }
+        ]
+      }
+    },
+    {
+      "id": "triangle-attack-only",
+      "fixture": "audio-fixture-attack-only.json",
+      "fixture_sha256": "9c48b1f8cbc982aa2aba10db2bd1554b87e590c2d94deb5ad8155c6504ead614",
+      "reference": {
+        "repetitions": 3,
+        "all_pcm_hashes_equal": true,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "a78de39f7c1dc40799278837e66bb90b9e880e836674c43e2509799a8e4d9104",
+        "peak": 0.10558527708053589,
+        "rms": 0.03072565288057299,
+        "first_audible_frame": 9601,
+        "last_audible_frame": 43679,
+        "channel_metrics": [
+          {
+            "peak": 0.10558527708053589,
+            "rms": 0.030725652880573086
+          },
+          {
+            "peak": 0.10558527708053589,
+            "rms": 0.030725652880573086
+          }
+        ]
+      },
+      "negative_control": {
+        "perturbation": "multiply the first scheduled event gain by 0.5",
+        "comparison_status": "FAIL",
+        "relative_rms_delta": 0.5,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "ccc9ad82a16182f7a2bbbc2c84f046e10122f35b9dafc901b7abb0fd8e76b8fc",
+        "peak": 0.052792638540267944,
+        "rms": 0.015362826440286494,
+        "first_audible_frame": 9602,
+        "last_audible_frame": 43679,
+        "channel_metrics": [
+          {
+            "peak": 0.052792638540267944,
+            "rms": 0.015362826440286543
+          },
+          {
+            "peak": 0.052792638540267944,
+            "rms": 0.015362826440286543
+          }
+        ]
+      }
+    },
+    {
+      "id": "square-highpass-envelope",
+      "fixture": "audio-fixture-highpass-envelope.json",
+      "fixture_sha256": "4b98b669cf46b4b02e5de496409f795ba768bbd314ed4d4e0d5c65c0985232b4",
+      "reference": {
+        "repetitions": 3,
+        "all_pcm_hashes_equal": true,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "69617e8f03ffca4ad1161fad65f9b910951ceb7dfe61954fae81b0d5216682b6",
+        "peak": 0.17941617965698242,
+        "rms": 0.01423670122841117,
+        "first_audible_frame": 12001,
+        "last_audible_frame": 41720,
+        "channel_metrics": [
+          {
+            "peak": 0.17941617965698242,
+            "rms": 0.014236701228411143
+          },
+          {
+            "peak": 0.17941617965698242,
+            "rms": 0.014236701228411143
+          }
+        ]
+      },
+      "negative_control": {
+        "perturbation": "multiply the first scheduled event gain by 0.5",
+        "comparison_status": "FAIL",
+        "relative_rms_delta": 0.5,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "179a914b06aa32a6d8b3ac38e9c3aee46548424506150eea05d6d8c9e50ff266",
+        "peak": 0.08970808982849121,
+        "rms": 0.007118350614205585,
+        "first_audible_frame": 12001,
+        "last_audible_frame": 41678,
+        "channel_metrics": [
+          {
+            "peak": 0.08970808982849121,
+            "rms": 0.007118350614205572
+          },
+          {
+            "peak": 0.08970808982849121,
+            "rms": 0.007118350614205572
+          }
+        ]
+      }
+    },
+    {
+      "id": "sawtooth-bandpass-envelope",
+      "fixture": "audio-fixture-bandpass-envelope.json",
+      "fixture_sha256": "942dce4714a7eadf6d49d6e08f85ec6997b338c10fbadca95a160a8ab1a24527",
+      "reference": {
+        "repetitions": 3,
+        "all_pcm_hashes_equal": true,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "6b0927b24a36e8cac1a386d8ca9a437648298fd71534e0509a9f10cf06f4921b",
+        "peak": 0.038919780403375626,
+        "rms": 0.0027181812941094695,
+        "first_audible_frame": 12001,
+        "last_audible_frame": 41624,
+        "channel_metrics": [
+          {
+            "peak": 0.038919780403375626,
+            "rms": 0.0027181812941094834
+          },
+          {
+            "peak": 0.038919780403375626,
+            "rms": 0.0027181812941094834
+          }
+        ]
+      },
+      "negative_control": {
+        "perturbation": "multiply the first scheduled event gain by 0.5",
+        "comparison_status": "FAIL",
+        "relative_rms_delta": 0.5,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "a8bb1c996cb2af915c23ac14004615db36489944bd4eb661dbc6dac055c17e21",
+        "peak": 0.019459890201687813,
+        "rms": 0.0013590906470547347,
+        "first_audible_frame": 12001,
+        "last_audible_frame": 41594,
+        "channel_metrics": [
+          {
+            "peak": 0.019459890201687813,
+            "rms": 0.0013590906470547417
+          },
+          {
+            "peak": 0.019459890201687813,
+            "rms": 0.0013590906470547417
+          }
+        ]
+      }
+    },
+    {
+      "id": "sawtooth-lowpass-negative-env-fanchor",
+      "fixture": "audio-fixture-lowpass-negative-env.json",
+      "fixture_sha256": "fc922a5370802a64fd39a8ed53077aabf0c1b2f92b46a0037fc66e09ca575026",
+      "reference": {
+        "repetitions": 3,
+        "all_pcm_hashes_equal": true,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "64d5c8ea632e513f0219dc0197a21b0b94e724ced3496b72e05ae56f155611de",
+        "peak": 0.1688985377550125,
+        "rms": 0.020717229641904124,
+        "first_audible_frame": 12001,
+        "last_audible_frame": 41358,
+        "channel_metrics": [
+          {
+            "peak": 0.1688985377550125,
+            "rms": 0.02071722964190415
+          },
+          {
+            "peak": 0.1688985377550125,
+            "rms": 0.02071722964190415
+          }
+        ]
+      },
+      "negative_control": {
+        "perturbation": "multiply the first scheduled event gain by 0.5",
+        "comparison_status": "FAIL",
+        "relative_rms_delta": 0.5,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "f08605fd0a3e68b0ef595824ce27bb88831edf09264506d9445aaeabc8c4ecc9",
+        "peak": 0.08444926887750626,
+        "rms": 0.010358614820952062,
+        "first_audible_frame": 12001,
+        "last_audible_frame": 41348,
+        "channel_metrics": [
+          {
+            "peak": 0.08444926887750626,
+            "rms": 0.010358614820952076
+          },
+          {
+            "peak": 0.08444926887750626,
+            "rms": 0.010358614820952076
+          }
+        ]
+      }
+    },
+    {
+      "id": "sawtooth-lowpass-24db-envelope",
+      "fixture": "audio-fixture-lowpass-24db-envelope.json",
+      "fixture_sha256": "ddfc0f1f5ea29d50b32cd4cd97ddd88be19a0457325732026c05778a65b2bec0",
+      "reference": {
+        "repetitions": 3,
+        "all_pcm_hashes_equal": true,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "224842b8129ac5af8ee9ce00edd831c97daf708faf07664954f10873e4a17df8",
+        "peak": 0.2062622308731079,
+        "rms": 0.022048087235861272,
+        "first_audible_frame": 12008,
+        "last_audible_frame": 41539,
+        "channel_metrics": [
+          {
+            "peak": 0.2062622308731079,
+            "rms": 0.022048087235861186
+          },
+          {
+            "peak": 0.2062622308731079,
+            "rms": 0.022048087235861186
+          }
+        ]
+      },
+      "negative_control": {
+        "perturbation": "multiply the first scheduled event gain by 0.5",
+        "comparison_status": "FAIL",
+        "relative_rms_delta": 0.5,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "b6855e2ef3791391bb966c6c3d1e7a0f6141d88a6148ac41c05d238452c2afb7",
+        "peak": 0.10313111543655396,
+        "rms": 0.011024043617930636,
+        "first_audible_frame": 12009,
+        "last_audible_frame": 41532,
+        "channel_metrics": [
+          {
+            "peak": 0.10313111543655396,
+            "rms": 0.011024043617930593
+          },
+          {
+            "peak": 0.10313111543655396,
+            "rms": 0.011024043617930593
+          }
+        ]
+      }
+    },
+    {
+      "id": "sine-pan-extremes",
+      "fixture": "audio-fixture-pan-extremes.json",
+      "fixture_sha256": "78b028c508da7847534a76442286922aee99d9504bdc48f6f0e0c3b6565902cb",
+      "reference": {
+        "repetitions": 3,
+        "all_pcm_hashes_equal": true,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "26f22fcc15136f15c5cdc0b1e4eddc830ffd71eb961e099d77507e18e1920e3b",
+        "peak": 0.14901089668273926,
+        "rms": 0.0299842356002812,
+        "first_audible_frame": 9601,
+        "last_audible_frame": 58079,
+        "channel_metrics": [
+          {
+            "peak": 0.14847378432750702,
+            "rms": 0.029988245060494908
+          },
+          {
+            "peak": 0.14901089668273926,
+            "rms": 0.02998022560385445
+          }
+        ]
+      },
+      "negative_control": {
+        "perturbation": "multiply the first scheduled event gain by 0.5",
+        "comparison_status": "FAIL",
+        "relative_rms_delta": 0.20949402020642896,
+        "sample_rate_hz": 48000,
+        "frames": 96000,
+        "channels": 2,
+        "pcm_f32le_interleaved_sha256": "704bab5942137b98a1561336624f42ee0e62defaa6c2430b85ad8c01298800b1",
+        "peak": 0.14901089668273926,
+        "rms": 0.023702717541561565,
+        "first_audible_frame": 9601,
+        "last_audible_frame": 58079,
+        "channel_metrics": [
+          {
+            "peak": 0.07423689216375351,
+            "rms": 0.014994122530247454
+          },
+          {
+            "peak": 0.14901089668273926,
+            "rms": 0.02998022560385445
+          }
+        ]
+      }
+    }
+  ]
+}

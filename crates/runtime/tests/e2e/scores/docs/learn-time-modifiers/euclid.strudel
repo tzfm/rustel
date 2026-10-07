@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+// The Cuban tresillo pattern.
+note("c3").euclid(3,8)

@@ -1,0 +1,55 @@
+{
+  "name": "basketball",
+  "background": "#0f1115",
+  "surface": "#151920",
+  "overlay": "#1c212b",
+  "foreground": "#f2ede4",
+  "muted": "#6b7280",
+  "rule": "#262c38",
+  "accent": "#ff7b29",
+  "ok": "#7ed3a2",
+  "warn": "#ffd166",
+  "error": "#ff5c5c",
+  "caret": "#ffffff",
+  "selection": "#2a3140",
+  "selection_text": "#ffffff",
+  "mini": "#ffd166",
+  "mini_fill": null,
+  "event_mark": "tint",
+  "event_fade": 0.3,
+  "event": "#ffd166",
+  "event_inactive": "#4b5563",
+  "playhead": "#ff7b29",
+  "grid": "#1a1f29",
+  "minimap": "#151920",
+  "minimap_viewport": "#2a3140",
+  "visual": {
+    "renderer": "tachyonfx",
+    "mode": "text",
+    "effect": "basketball",
+    "density": 50,
+    "speed": 50
+  },
+  "opacity": {
+    "backdrop": 68,
+    "interface": 73,
+    "editor": 47
+  },
+  "syntax": {
+    "text": "#f2ede4",
+    "comment": "#6b7280",
+    "string": "#ffd166",
+    "number": "#7fb3ff",
+    "punctuation": "#7ed3a2",
+    "keyword": "#ff7b29",
+    "function": "#7fb3ff"
+  },
+  "meter": {
+    "low": "#7ed3a2",
+    "mid": "#ffd166",
+    "high": "#ff7b29",
+    "peak": "#ff5c5c",
+    "track": "#1c212b",
+    "fader": "#f2ede4"
+  }
+}

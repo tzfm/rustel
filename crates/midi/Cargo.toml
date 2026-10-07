@@ -1,0 +1,17 @@
+[package]
+name = "rustel-midi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "MIDI output: timed note, CC and transport messages to a hardware or virtual port"
+
+[dependencies]
+midir = "0.11"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `access(2)` on the ALSA sequencer device before `midir` opens it.
+libc = "0.2"
+
+[dev-dependencies]

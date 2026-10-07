@@ -1,0 +1,41 @@
+{
+  "name": "mono",
+  "background": "#000000",
+  "surface": "#000000",
+  "overlay": "#111111",
+  "foreground": "#ffffff",
+  "muted": "#8c8c8c",
+  "rule": "#333333",
+  "accent": "#ffffff",
+  "ok": "#ffffff",
+  "warn": "#d0d0d0",
+  "error": "#ffffff",
+  "caret": "#ffffff",
+  "selection": "#ffffff",
+  "selection_text": "#000000",
+  "mini": "#ffffff",
+  "mini_fill": null,
+  "event_mark": "tint",
+  "event_fade": 0.1,
+  "event": "#ffffff",
+  "event_inactive": "#6e6e6e",
+  "playhead": "#ffffff",
+  "grid": "#333333",
+  "minimap": "#050505",
+  "minimap_viewport": "#3a3a3a",
+  "syntax": {
+    "text": "#ffffff",
+    "comment": "#8c8c8c",
+    "string": "#e0e0e0",
+    "number": "#ffffff",
+    "punctuation": "#b0b0b0"
+  },
+  "meter": {
+    "low": "#ffffff",
+    "mid": "#dcdcdc",
+    "high": "#d0d0d0",
+    "peak": "#ffffff",
+    "track": "#111111",
+    "fader": "#ffffff"
+  }
+}

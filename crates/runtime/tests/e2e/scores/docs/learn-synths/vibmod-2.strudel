@@ -1,0 +1,9 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+// change the vibrato frequency with ":"
+note("a e")
+.vibmod("<.25 .5 1 2 12>:8")
+._scope()

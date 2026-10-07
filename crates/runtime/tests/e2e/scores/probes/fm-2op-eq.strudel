@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 2
+*/
+s("sine").note("c3").fmi(3).fmi2(2).seg(4)

@@ -1,0 +1,40 @@
+  File  Edit  Scene  Transport  View  Options  Help                                                                                                   
+ ◉ rustel STOPPED ✓ ready   120.0 bpm · 0.50 cps · cycle 0.00                                 setxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx ▸ first 
+  1 first                                                                                                                                             
+  1 $: s("bd")                                                                                                                                        
+  2                                                                                                                                                   
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+ ready - terminal paste and the internal clipboard are available                      1,1                                                       0.0dB 
+ ♪ no output  ⌁ no midi                                                                                      MASTER ^⇧Up/^⇧Down       pk  --  LUFS -- 

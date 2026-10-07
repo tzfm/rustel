@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "id": "sawtooth-lowpass-negative-env-fanchor",
+  "events": [
+    {
+      "time_seconds": 0.25,
+      "duration_seconds": 0.6,
+      "value": {
+        "s": "sawtooth",
+        "freq": 220,
+        "gain": 0.55,
+        "cutoff": 1200,
+        "resonance": 5,
+        "lpenv": -2,
+        "fanchor": 0.3,
+        "lpattack": 0.02,
+        "lpdecay": 0.2,
+        "lpsustain": 0.3,
+        "lprelease": 0.1,
+        "pan": 0.5
+      }
+    }
+  ]
+}

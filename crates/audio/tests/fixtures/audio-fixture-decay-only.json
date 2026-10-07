@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "id": "sine-decay-only-pluck",
+  "events": [
+    {
+      "time_seconds": 0.25,
+      "duration_seconds": 0.6,
+      "value": {
+        "s": "sine",
+        "freq": 330,
+        "gain": 0.6,
+        "decay": 0.1,
+        "pan": 0.5
+      }
+    }
+  ]
+}

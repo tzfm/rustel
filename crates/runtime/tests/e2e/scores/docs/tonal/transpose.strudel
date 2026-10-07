@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+"c2 c3".fast(2).transpose("<0 -2 5 3>".slow(2)).note()

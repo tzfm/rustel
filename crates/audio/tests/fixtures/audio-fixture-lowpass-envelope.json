@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "id": "square-lowpass-envelope",
+  "events": [
+    {
+      "time_seconds": 0.2,
+      "duration_seconds": 0.65,
+      "value": {
+        "s": "square",
+        "freq": 220,
+        "gain": 0.5,
+        "attack": 0.01,
+        "decay": 0.04,
+        "sustain": 0.7,
+        "release": 0.08,
+        "cutoff": 400,
+        "resonance": 2,
+        "lpenv": 3,
+        "fanchor": 0.25,
+        "lpattack": 0.08,
+        "lpdecay": 0.12,
+        "lpsustain": 0.3,
+        "lprelease": 0.1,
+        "pan": 0.4
+      }
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+samples('github:switchangel/pad')
+s("swpad:0").scrub("{0.1!2 .25@3 0.7!2 <0.8:1.5>}%8")

@@ -1,0 +1,9 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 4
+*/
+// parity fuzz case seed=507 cycles=6 bpm=112
+setcpm(112/4)
+$: s("[rd hh]*2 [cp [oh bd? lt mt? rim*4 bd hh hh*2] rim!2 rim bd [clap/2 clap hh:1 clap sd:0]] sd:2 [[~ clap bd:2 clap] cr] rd:3? <~ cb cr> ~? rd")
+$: n(perlin.seg(8).range(4, 10)).scale("a:pentatonic").euclidRot(3,8,4).euclidRot(2,5,1).fast(0.75).slow(0.75).begin(0.24).delaysync(0.125).delay(0.56).adsr("0.04:0.227:0.59:0.189")

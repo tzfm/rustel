@@ -1,0 +1,9 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 4
+*/
+// parity fuzz case seed=441 cycles=10 bpm=84
+setcpm(84/4)
+$: s("<ht cr bd> clap hh:0 rd oh").FX(hpf(120), octave(12), delaysync(0.5))
+$: chord("<Fmaj7 Ab Em@4>").rootNotes(2).s("triangle").off(0.125, (x => x.gain(0.6))).shape(0.43).orbit(2).penv(7).pattack(0.099)

@@ -1,0 +1,41 @@
+{
+  "name": "strudel",
+  "background": "#0f1020",
+  "surface": "#171a33",
+  "overlay": "#1e2244",
+  "foreground": "#dfe3ff",
+  "muted": "#6b73a8",
+  "rule": "#2c3163",
+  "accent": "#7491d2",
+  "ok": "#41d3a6",
+  "warn": "#ffca28",
+  "error": "#ff5370",
+  "caret": "#ffcc00",
+  "selection": "#33397a",
+  "selection_text": "#ffffff",
+  "mini": "#41d3a6",
+  "mini_fill": null,
+  "event_mark": "tint",
+  "event_fade": 0.25,
+  "event": "#ffca28",
+  "event_inactive": "#7491d2",
+  "playhead": "#ffffff",
+  "grid": "#2c3163",
+  "minimap": "#12142a",
+  "minimap_viewport": "#242a55",
+  "syntax": {
+    "text": "#dfe3ff",
+    "comment": "#5b6396",
+    "string": "#41d3a6",
+    "number": "#ffca28",
+    "punctuation": "#c792ea"
+  },
+  "meter": {
+    "low": "#41d3a6",
+    "mid": "#a8db63",
+    "high": "#ffca28",
+    "peak": "#ff5370",
+    "track": "#20244a",
+    "fader": "#dfe3ff"
+  }
+}

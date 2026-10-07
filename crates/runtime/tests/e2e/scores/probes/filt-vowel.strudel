@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 2
+*/
+s("sawtooth").note("c3").vowel("<a e i o>").seg(4)

@@ -1,0 +1,8 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+"<0 [2 4]>"
+.echoWith(4, 1/8, (p,n) => p.add(n*2))
+.scale("C:minor").note()

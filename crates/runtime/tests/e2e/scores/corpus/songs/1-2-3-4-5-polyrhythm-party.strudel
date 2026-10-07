@@ -1,0 +1,38 @@
+/*
+  @title 1:2:3:4:5 polyrhythm party
+  @by B:EEP
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?jVHQOViLI3Gl
+*/
+// @title 1:2:3:4:5 polyrhythm party
+// @by B:EEP
+// Taken from "5:4:3:2:1 polyrhythm"
+
+stack(
+  stack(
+  "a1".fast(5).sometimesBy(0.05, x=>x.ply("10")),
+  "a2".fast(4).sometimesBy(0.05, x=>x.ply("8")),
+  "c#3".fast(3).sometimesBy(0.05, x=>x.ply("6")),
+  "c#4".fast(2).sometimesBy(0.05, x=>x.ply("4")),
+  "f#5".fast(1).sometimesBy(0.05, x=>x.ply("2"))
+).note()
+  .color("white")
+  .s("<z_sawtooth z_triangle z_sawtooth z_square z_tan>")
+  .adsr("0:0.2:0.2:0.2")
+  .lpf(perlin.range(2500,500).slow(32))
+  .lpq(perlin.range(15,30).slow(32))
+  .clip(0.3)
+  .gain(0.9)
+  .room(.2),
+  stack(
+    s("bd bd bd <bd [bd!3 bd*2]>"),
+    s("[~ hh] [~ hh] [~ hh] [~ hh]"),
+    s("<~!12 [sd [sd sd] [sd sd] [sd sd sd]]>/4")
+  )
+  .bank("RolandTR909")
+  .mask("<0!4 1!8 0 1 1 0>/2")
+)
+  .punchcard({labels:0,vertical:0,fill:0})
+
+// @version 1.0

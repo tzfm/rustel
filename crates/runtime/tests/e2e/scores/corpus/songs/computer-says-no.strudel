@@ -1,0 +1,61 @@
+/*
+  @title Computer says no
+  @by Reinbim
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?rgvSDadZiHq9
+*/
+// @title Computer says no
+// @by Reinbim
+
+p1: stack(s("[[bd bd cp hh*2] | [bd:2 ~ hh lt:2] | [[hh,bd:3] hh:2 hh cp]]")
+      .fast(3)
+      .swing(0.5)
+      .decay("<0.1 .5 .3>*4")
+      .sometimes(x=>x.speed("<0.2 0.5 1>*3"))
+      .velocity(rand.range(0.1,1).fast(20))
+      .sometimesBy(0.01,x=>x.echo(5,1/32,0.5))
+      .room(0.1)
+      .lpf("[1000 2000] <3000 6000 500>*2")
+      .lpe(sine.range(5,20))
+      .gain(2.2)
+    .bank("RolandTR909")
+)
+
+p2: stack(s("[[sh hh*2 [<~ oh>] rim]]").cut(1)
+      .fast(3)
+      .swing(0.5)
+      .decay("<0.1 .5 .3>*4")
+      .velocity(rand.range(0.1,1).fast(10))
+      .sometimesBy(0.2,x=>x.jux(rev))
+      .bpf("<8000 4000>")
+      .room(0.2)
+      .gain(1)
+    .bank("AlesisHR16")
+)
+
+p3: stack(n("0 8 4 7".add("<0 [3 8] 7 4 1>/8")).scale("A:major") 
+    .s("<square supersaw>*2")
+    .off(0.25, x=>x.transpose("-12"))
+    .decay(perlin.range(0.1, 0.5).slow(4))
+    .release(perlin.range(0.7, 2.5).slow(3))
+    .fast(3)
+    .lpf(perlin.range(500, 3000))
+    .lpe(20)
+)
+
+p4: stack(n("[0,9,2,5]! | [~ [4,3,1,12]] | [[0,9,2,5] [7,2,0,4]]".slow(3)
+    .sometimes(x=>x.add("< 1 2 5 8>".slow(4)).transpose("1"))).jux(rev)
+    .scale("A:major") 
+    .swing(4)
+    .s("<triangle>")
+    .off(0.25, x=>x.transpose("24"))
+    .decay(perlin.range(1, 2).slow(4))
+    .release(perlin.range(2, 5).slow(3))
+    .fast(5)
+    .room(2)
+    .gain(0.1)
+    .lpf(tri.range(0, 5000).fast(10))
+    .lpe(20)
+)
+// @version 1.1

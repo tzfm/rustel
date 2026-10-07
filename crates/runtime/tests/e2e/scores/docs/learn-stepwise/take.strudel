@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+"bd cp ht mt".take("2").sound()
+// The same as "bd cp".sound()

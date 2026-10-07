@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+s("gm_lead_6_voice:3").fit().seg(8)

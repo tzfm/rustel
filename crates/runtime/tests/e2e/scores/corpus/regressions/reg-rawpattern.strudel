@@ -1,0 +1,11 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+register('firsthalf', function (pat) {
+  return new Pattern(function (state) {
+    return pat.query(state).filter(hap => hap.whole.begin.valueOf() % 1 < 0.5);
+  });
+});
+$: s("bd*8").firsthalf()

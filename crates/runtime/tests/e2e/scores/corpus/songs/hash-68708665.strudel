@@ -1,0 +1,62 @@
+/*
+  @by awesome-strudel
+  @origin songs-awesome
+  @duration 4
+*/
+// "Feel Good Inc" @by MariaAreadne
+
+setcpm(34.5)
+
+$: sound("crackle")
+
+$: cat(
+
+  note("eb4@2 f4@4 gb4@4 ab4@4 bb4@2"),
+  note("bb4@2 db5@4 bb4@4 ~@4 gb4@2"),
+  note("ab4@4 gb4@2 eb4@4 gb4@4 ab4@2"),
+  note("ab4@4 f4@2 eb4@2 db4@4 ~@4"),
+
+  note("eb4@2 f4@4 gb4@4 ab4@4 bb4@2"),
+  note("bb4@2 db5@4 bb4@6 ~@4"),
+  note("ab4@2 gb4@4 eb4@4 gb4@4 gb4@2"),
+  note("ab4@10 f4@3 db4@3"),
+
+  note("eb4@4 f4@2 gb4@4 ab4@4 bb4@2"),
+  note("bb4@2 db5@4 bb4@4 ab4@2 ~@2 gb4@2"),
+  note("ab4@4 gb4@2 eb4@4 gb4@2 ~@2 ab4@2"),
+  note("ab4@4 f4@2 eb4@2 db4@4 ~@4"),
+
+  note("eb4@2 f4@4 gb4@4 ab4@4 bb4@2"),
+  note("bb4@2 db5@4 bb4@4 ab4@2 ~@2 ab4@2"),
+  note("ab4@2 gb4@4 eb4@4 gb4@4 gb4@2"),
+  note("ab4@16")
+)
+.scale("Eb4:minor").s("gm_overdriven_guitar")
+.lpq(6).room(0.4).delay(0.35).delaytime(0.375)
+.delayfeedback(0.3).gain(0.7).color("cyan")._pianoroll()
+
+
+
+$: chord("<Ebm Db Abm7 Bb7>")
+   .dict("ireal")
+   .voicing()
+   .s("supersaw")
+   .lpf(slider(3000,0, 3000))
+   .room(0.6)
+   .gain(0.3)._pianoroll()
+
+
+$: note("<eb2 db2 ab2 bb2>")
+   .s("gm_electric_guitar_jazz")
+   .lpf(7000)
+   .gain(1.0)
+   .room(0.15).delay(0.4)._pianoroll()
+
+
+$drums:
+stack(
+  s("bd ~ ~ bd ~ ~ bd ~").s("dr550_bd").gain(0.9).lpf(5000).orbit(0.5),
+  s("~ ~ sd ~ ~ ~ sd ~").s("dr550_sd").gain(0.75).room(0.2).lpf(6000),
+  s("hh*8").s("rm50_hh").gain(0.4).late(0.01).lpf(3000),
+  //.gain(0.12).lpf(3500)
+)._pianoroll()

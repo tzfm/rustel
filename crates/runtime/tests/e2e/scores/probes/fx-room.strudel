@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 4
+*/
+s("sawtooth").note("c2").room(0.6).roomsize(3).seg(4)

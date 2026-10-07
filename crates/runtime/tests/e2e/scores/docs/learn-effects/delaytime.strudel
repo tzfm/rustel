@@ -1,0 +1,10 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+note("d d a# a".fast(2))
+.s("sawtooth")
+.delay(.8)
+.delaytime(1/2)
+.delayspeed("<2 .5 -1 -2>")

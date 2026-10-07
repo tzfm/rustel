@@ -1,0 +1,43 @@
+{
+  "name": "solarized-light",
+  "background": "#fdf6e3",
+  "surface": "#eee8d5",
+  "overlay": "#e4ddc8",
+  "foreground": "#657b83",
+  "muted": "#93a1a1",
+  "rule": "#d5cdb6",
+  "accent": "#268bd2",
+  "ok": "#859900",
+  "warn": "#8c6a00",
+  "error": "#c92f2c",
+  "caret": "#475b62",
+  "selection": "#e4ddc8",
+  "selection_text": "#073642",
+  "mini": "#2aa198",
+  "mini_fill": null,
+  "event_mark": "tint",
+  "event_fade": 0.3,
+  "event": "#8c6a00",
+  "event_inactive": "#b6ada0",
+  "playhead": "#268bd2",
+  "grid": "#e4ddc8",
+  "minimap": "#eee8d5",
+  "minimap_viewport": "#d5cdb6",
+  "syntax": {
+    "text": "#657b83",
+    "comment": "#93a1a1",
+    "string": "#2aa198",
+    "number": "#d33682",
+    "punctuation": "#cb4b16",
+    "keyword": "#859900",
+    "function": "#268bd2"
+  },
+  "meter": {
+    "low": "#859900",
+    "mid": "#2aa198",
+    "high": "#8c6a00",
+    "peak": "#dc322f",
+    "track": "#e4ddc8",
+    "fader": "#073642"
+  }
+}

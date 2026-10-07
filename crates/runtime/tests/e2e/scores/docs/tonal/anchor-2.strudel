@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+n("0 .. 7").anchor("<c4 g4 c5 g5>").scale("<C:major F:minor>")

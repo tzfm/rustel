@@ -1,0 +1,12 @@
+[package]
+name = "rustel-fraction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Exact rational arithmetic for pattern cycle time"
+
+[dependencies]
+num-bigint = "0.5"
+num-traits = "0.2"

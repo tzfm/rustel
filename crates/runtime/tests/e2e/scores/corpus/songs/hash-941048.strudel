@@ -1,0 +1,499 @@
+/*
+  @by awesome-strudel
+  @origin songs-awesome
+  @duration 4
+*/
+// Prebake script
+//
+// This is code that is loaded before your pattern is run.
+// You can use it to define custom functions to use in any pattern.
+// 
+// This is an initial example script. You can edit it to add 
+// your own funtions.
+//
+// To use a script shared by some other user you can use
+// the import-button or paste the script in this editor.
+
+const ratchet = register('ratchet', (pat) => pat.sometimes(ply(2)))
+
+/*
+  @title Only for the DMG 101 (In Flames Cover)
+  @author santi.codes
+*/
+
+setcpm(178/4)
+
+register('fade', (start, end, mult, section, pat) => 
+  pat.gain(saw.range(start, end).slow(section).mul(mult))
+)
+
+register('bassenv', (pat) => pat.lpf(200).lpenv(3.5).lpq(12).orbit(2))
+
+
+// Instruments
+
+const LEAD_GUITAR = 1
+const HARMONY_GUITAR = 1
+const RHYTHM_GUITAR = 1
+const BASS = 1
+const DRUMS = 1
+const FX = 1
+
+// 128 cycles
+const GAMEBOY_NOISE  = 1 //1
+const GAMEBOY_PAUSE  = 1 //1
+const INTRO          = 9 //9
+const VERSE_1_CHORDS = 4 //4
+const VERSE_1A       = 8 //8
+const VERSE_1B       = 4 //4
+const PRECHORUS_1    = 8 //8
+const CHORUS_1       = 9 //9
+const VERSE_2A       = 8 //8
+const VERSE_2B       = 4 //4
+const PRECHORUS_2    = 8 //8
+const CHORUS_2       = 16 //16
+const GUITAR_SOLO    = 18 //18
+const CHORUS_3       = 24 //28
+const CHORUS_FADEOUT = 8 //8
+
+const END = 20
+
+
+// LEAD GUITAR
+
+// Intro
+const leadGuitarIntroNotes = note(`<
+   [c3 eb3 g3 eb3 f2 f3 g3 ab3] [~ g3 f3 eb3@2 f3 d3 bb2]
+   [c3 eb3 g3 eb3 f3 eb3 d3 c3] [~ d3@2 bb2@5]
+   [c3 eb3 g3 eb3 f2 f3 g3 ab3] [~ g3 f3 eb3@2 f3 d3 bb2]
+   [c3 eb3 g3 eb3 f3 eb3 d3 c3] [~ d3@2 bb2@5]
+   [c3@3 ~]
+>`)
+
+const leadGuitarIntroClip = "<[1@7 2] [1]>"
+
+const leadGuitarIntro = leadGuitarIntroNotes
+  .clip(leadGuitarIntroClip)
+  .sound("pulse")
+
+// Verse 1 chords
+
+const leadGuitarVerse1Chords = note(`<
+  [c2 [c2,g2,c3] c2 [c2,g2,c3] c2 [c2,g2,c3] [c2 c2] [d3 eb3]] 
+  [c2 eb3        c2 [c2,g2,c3] c2 [c2,g2,c3] [c2 c2] [d3 eb3]]
+  [c2 d3         c2 [c2,g2,c3] c2 [c2,g2,c3] [c2 c2] [d3 eb3]]
+  [c2 eb3        c2 [c2,g2,c3] c2 [c2,g2,c3] [c2 c2] [c2 c2]]
+>`).sound("pulse")
+
+// Verse 1A
+
+const leadGuitarVerse1ANotes = note(`<
+  [eb4 [d4 eb4 d4] c4@4 d4 bb3][~]
+  [eb4 [d4 eb4 d4] c4@4 bb3 d4][~]
+>`)
+
+const leadGuitarVerse1AClip = "<[1@7 9] [1]>"
+
+const leadGuitarVerse1A = leadGuitarVerse1ANotes
+  .clip(leadGuitarVerse1AClip)
+  .sound("pulse")
+
+// Verse 1B
+
+const leadGuitarVerse1B = note(`<
+   [c2 [c2,g2,c3] c2 [c2,g2,c3] eb2       [eb2,bb2,eb3] eb2       [eb2,bb2,eb3]]
+   [g2 [g2,d3,g3] g2 [g2,d3,g3] [ab2 ab2] [ab2,eb3,ab3] [bb2 bb2] [bb2,f3,bb3]]
+>`).sound("pulse")
+
+// Prechorus 1
+
+const leadGuitarPrechorus1Notes = note(`<
+  [~@3 [c4 d4] eb4 [d4 eb4 d4] [c4 bb3] g3]
+  [~@4 f4 g4 [f4 g4 d4] eb4]
+  [eb4@3 [c4 d4] eb4 [d4 eb4 d4] [c4 bb3] g3]
+  [~@2 [g3 ab3] f3@2 [g3 f3] [eb3 d3] c3]
+  [~@3 [c5 d5] eb5 [d5 eb5 d5] [c5 bb4] g4]
+  [~@4 ab4 bb4 [ab4 bb4 ab4] g4]
+  [g4@3 [c5 d5] eb5 [d5 eb5 d5] [c5 bb4] g4]
+  [~@2 [g4 ab4] f4@2 [g4 f4] [eb4 d4] c4]
+>`)
+
+const leadGuitarPrechorus1Clip = "[1@7 <5 1 3 4 5 1 3 17>]"
+
+const leadGuitarPrechorus1 = leadGuitarPrechorus1Notes
+  .clip(leadGuitarPrechorus1Clip)
+  .sound("pulse")
+
+// Chorus is the intro. verse, and pre-chorus are repeated
+
+const leadGuitarChorus     = leadGuitarIntro 
+const leadGuitarVerse2A    = leadGuitarVerse1A
+const leadGuitarVerse2B    = leadGuitarVerse1B
+const leadGuitarPrechorus2 = leadGuitarPrechorus1
+
+// Extended chorus without the pause
+const leadGuitarChorus2    = note(`<
+   [c3 eb3 g3 eb3 f2 f3 g3 ab3] [~ g3 f3 eb3@2 f3 d3 bb2]
+   [c3 eb3 g3 eb3 f3 eb3 d3 c3] [~ d3@2 bb2@5]
+   [c3 eb3 g3 eb3 f2 f3 g3 ab3] [~ g3 f3 eb3@2 f3 d3 bb2]
+   [c3 eb3 g3 eb3 f3 eb3 d3 c3] [~ d3@2 bb2@5]
+>`).clip(leadGuitarIntroClip).sound("pulse")
+
+// Guitar solo
+
+const leadGuitarSoloNotes = note(`<
+[~ c4 g4 c4 f4 eb4 d4 eb4]
+[~ eb4 g4 eb4 ab4 [g4 ab4 g4] f4 eb4]
+[~ c4 g4 c4 f4 eb4 d4 eb4]
+[[d4 eb4 d4] c4 bb3 c4@5]
+[~ c4 g4 c4 f4 [eb4 f4 eb4] d4 eb4]
+[~ eb4 g4 eb4 ab4 [g4 ab4 g4] f4 eb4]
+[~ c5 eb5 f5 [g5 eb5] [c5 eb5] [g5 bb5] [g5 eb5]]
+[[bb4 eb5] [g5 bb5] [g5 eb5] [g5 bb5] [ab5 g5 f5] [eb5 d5 c5] [eb5 d5 c5] [bb4 ab4 g4]]
+[eb5 g4 ab4 eb5 g5 c5 g5 ab5]
+[d5 ab5 bb5 f5 g5 [f5 g5 f5] eb5 d5]
+[eb5 g4 ab4 eb5 bb4 ab4 g4 ab4]
+[~ g4 f4 d4@4 ~]
+[eb5 g4 ab4 eb5 g5 c5 g5 ab5]
+[d5 ab5 bb5 f5 g5 [f5 g5 f5] eb5 d5]
+[eb5 g4 ab4 eb5 g5 c5 g5 bb5]
+[~ ab5 g5 db6@5]
+[~]
+[~]
+>`)
+
+const leadGuitarSoloClip = "[1@7 <2 2 1 1 2 2 1 1 1 1 2 1 1 1 2 1>]"
+
+const leadGuitarSolo = leadGuitarSoloNotes
+  .clip(leadGuitarSoloClip)
+  .penv("<0!15 [0 0 0 3@5] 0 0>") 
+  .pattack(1.2)
+  .pcurve(0)
+  .sound("pulse")
+
+// Last chorus
+
+const leadGuitarLastChorusNotes = note(`<
+   [c3 eb3 g3 eb3 f2 f3 g3 ab3] [~ g3 f3 eb3@2 f3 d3 bb2]
+   [c3 eb3 g3 eb3 f3 eb3 d3 c3] [~ d3@2 bb2@5]
+>`)
+
+const leadGuitarLastChorusClip = "<[1@7 2] [1]>"
+
+const leadGuitarLastChorus = leadGuitarLastChorusNotes
+  .clip(leadGuitarLastChorusClip).sound("pulse")
+
+// HARMONY GUITAR
+
+// Verse 1A
+const harmonyGuitarVerse1ANotes = note(`<
+  [eb3 [d3 eb3 d3] c3@4  d3 bb2] [~]
+  [eb3 [d3 eb3 d3] c3@4  bb2 d3] [~]
+  [g3  [f3 g3 f3]  eb3@4 f3 d3 ] [~]
+  [g3  [f3 g3 f3]  eb3@4 d3 f3 ] [~]
+>`)
+const harmonyGuitarVerse1A = harmonyGuitarVerse1ANotes
+  .clip(leadGuitarVerse1AClip).sound("pulse")
+
+// Prechorus 1
+
+const harmonyGuitarPrechorus1 = leadGuitarPrechorus1Notes.sub(7)
+  .clip(leadGuitarPrechorus1).sound("pulse")
+
+// Verse 2A
+
+const harmonyGuitarVerse2ANotes = note(`<
+  [~][~][~][~]
+  [g4 [f4 g4 f4] eb4@4 f4 d4] [~]
+  [g4 [f4 g4 f4] eb3@4 d4 f4] [~]
+>`)
+
+const harmonyGuitarVerse2A = harmonyGuitarVerse2ANotes
+  .clip(leadGuitarVerse1AClip).sound("pulse")
+
+// Guitar solo
+
+const harmonyGuitarSoloNotes = note(`<
+[~][~][~][~]
+
+[~ eb4 bb4 eb4 ab4 [g4 ab4 g4] f4 g4]
+[~ g4 bb4 g4 c5 [bb4 c5 bb4] ab4 g4]
+[~]
+[~]
+
+[~@6 eb5 f5]
+[bb4 f5 g5 d5 eb5 [d5 eb5 d5] c5 bb4]
+[~@7 f4]
+[~@6 eb5 f5]
+
+[~@6 eb5 f5]
+[bb4 f5 g5 d5 eb5 [d5 eb5 d5] c5 bb4]
+[~]
+[~@3 f5@5]
+[~]
+[~]
+>`)
+
+const harmonyGuitarSoloClip = "[1@7 <1 1 1 1 2 2 1 1 1 1 2 1 1 1 2 1>]"
+const harmonyGuitarSolo = harmonyGuitarSoloNotes.clip(harmonyGuitarSoloClip).sound("pulse")
+
+// RHYTHM GUITAR
+
+const rhythmGuitarIntroChords = note(`<
+  [[c2, g2, c3 ]*4 [f2, c3, f3 ]*4]
+  [[ab2,eb3,ab3]*4 [bb2,f3 ,bb3]*4]
+  [[c2, g2, c3 ]*4 [f2, c3, f3 ]*4]
+  [[eb2,bb3,eb3]*4 [bb2,f3 ,bb3]*4]
+  [[c2, g2, c3 ]*4 [f2, c3, f3 ]*4]
+  [[ab2,eb3,ab3]*4 [bb2,f3 ,bb3]*4]
+  [[c2, g2, c3 ]*4 [f2, c3, f3 ]*4]
+  [[eb2,bb3,eb3]*4 [bb2,f3, bb3]*4]
+  [ab2@3 ~]
+>`).sound("pulse").clip(0.9)
+
+const rhythmGuitarVerse1Chords = note(`<
+  [c2 [c2, g2, c3 ] c2 [c2,g2,c3] c2 [c2,g2,c3] [c2 c2] [bb2 c3]] 
+  [c2 [ab2,eb3,ab3] c2 [c2,g2,c3] c2 [c2,g2,c3] [c2 c2] [bb2 c3]]
+  [c2 [bb2,f3, bb3] c2 [c2,g2,c3] c2 [c2,g2,c3] [c2 c2] [bb2 c3]]
+  [c2 [ab2,eb3,ab3] c2 [c2,g2,c3] c2 [c2,g2,c3] [c2 c2] [c2 c2]]
+>`).sound("pulse").clip(0.9)
+
+const rhythmGuitarVerse1A = note(`<
+  [[c2 [c2,g2,c3]]*4] [[eb2 [eb2,bb2,eb3]]*4]
+  [[c2 [c2,g2,c3]]*4] [[g2  [g2, d3, g3 ]]*4]
+  [[c2 [c2,g2,c3]]*4] [[eb2 [eb2,bb2,eb3]]*4]
+  [[c2 [c2,g2,c3]]*4] [[g2  [g2, d3, g3 ]]*4]
+>`).sound("pulse").clip(0.9)
+
+const rhythmGuitarVerse1B = note(`<
+  [[c2 [c2,g2,c3]]*2 [eb2 [eb2,bb2,eb2]]*2] 
+  [g2 [g2, d3, g3] g2 [g2, d3, g3] [ab2 ab2] [ab2,eb3,ab3] [bb2 bb2] [bb2,f3,bb3]]
+  [[c2 [c2,g2,c3]]*2 [eb2 [eb2,bb2,eb2]]*2] 
+  [g2 [g2, d3, g3] g2 [g2, d3, g3] [ab2 ab2] [ab2,eb3,ab3] [bb2 bb2] [bb2,f3,bb3]]
+>`).sound("pulse").clip(0.9)
+
+const rhythmGuitarPrechorus1 = note(`<
+  [[ab2,eb3,ab3] [ab2,eb3,ab3] [ab2,eb3,ab3]@2 [c2,g2,c3] [c2,g2,c3] [c2,g2,c3] [eb2,bb2,bb3]]
+  [~ [eb2,bb2,eb3] [eb2,bb2,eb3]@2 [bb2,f3,bb3] [bb2,f3,bb3] [bb2,f3,bb3]@2]
+  [[ab2,eb3,ab3] [ab2,eb3,ab3] [ab2,eb3,ab3]@2 [c2,g2,c3] [c2,g2,c3] [c2,g2,c3] [eb2,bb2,eb3]]
+  [~ [eb2,bb2,eb3] [eb2,bb2,eb3] [g2,d3,g3]@2 [g2 g2] [g2,d3,g3] [g2 g2]]
+>`).clip("<[0.9@7 1.8][0.9]>").sound("pulse")
+
+const rhythmGuitarChorus1 = rhythmGuitarIntroChords
+const rhythmGuitarVerse2A = rhythmGuitarVerse1A
+const rhythmGuitarVerse2B = rhythmGuitarVerse1B
+const rhythmGuitarPrechorus2 = rhythmGuitarPrechorus1
+
+const rhythmGuitarChorus2 = note(`<
+  [[c2, g2, c3 ]*4 [f2, c3, f3 ]*4]
+  [[ab2,eb3,ab3]*4 [bb2,f3 ,bb3]*4]
+  [[c2, g2, c3 ]*4 [f2, c3, f3 ]*4]
+  [[eb2,bb3,eb3]*4 [bb2,f3 ,bb3]*4]
+>`).sound("pulse").clip(0.9)
+
+const rhythmGuitarSolo = note(`<
+  [[c2 [c2,g2,c3]]*2 [eb2 [eb2,bb2,eb2]]*2] 
+  [g2 [g2, d3, g3] g2 [g2, d3, g3] [ab2 ab2] [ab2,eb3,ab3] [bb2 bb2] [bb2,f3,bb3]]
+  [[c2 [c2,g2,c3]]*2 [eb2 [eb2,bb2,eb2]]*2] 
+  [g2 [g2, d3, g3] g2 [g2, d3, g3] [ab2 ab2] [ab2,eb3,ab3] [bb2 bb2] [bb2,f3,bb3]]
+  [[c2 [c2,g2,c3]]*2 [eb2 [eb2,bb2,eb2]]*2] 
+  [g2 [g2, d3, g3] g2 [g2, d3, g3] [ab2 ab2] [ab2,eb3,ab3] [bb2 bb2] [bb2,f3,bb3]]
+  [[c2 [c2,g2,c3]]*2 [eb2 [eb2,bb2,eb2]]*2] 
+  [g2 [g2, d3, g3] g2 [g2, d3, g3] [ab2 ab2] [ab2,eb3,ab3] [bb2 bb2] [bb2,f3,bb3]]
+  [[ab2,eb3,ab3] [ab2,eb3,ab3] [ab2,eb3,ab3]@2 [c2,g2,c3] [c2,g2,c3] [c2,g2,c3] [eb2,bb2,bb3]]
+  [~ [eb2,bb2,eb3] [eb2,bb2,eb3]@2 [bb2,f3,bb3] [bb2,f3,bb3] [bb2,f3,bb3]@2]
+  [[ab2,eb3,ab3] [ab2,eb3,ab3] [ab2,eb3,ab3]@2 [c2,g2,c3] [c2,g2,c3] [c2,g2,c3] [eb2,bb2,bb3]]
+  [~ [eb2,bb2,eb3] [eb2,bb2,eb3] [g2,d3,g3]@2 [g2 g2] [g2,d3,g3] [g2 g2]]
+  [[ab2,eb3,ab3] [ab2,eb3,ab3] [ab2,eb3,ab3]@2 [c2,g2,c3] [c2,g2,c3] [c2,g2,c3] [eb2,bb2,bb3]]
+  [~ [eb2,bb2,eb3] [eb2,bb2,eb3]@2 [bb2,f3,bb3] [bb2,f3,bb3] [bb2,f3,bb3]@2]
+  [[ab2,eb3,ab3] [ab2,eb3,ab3] [ab2,eb3,ab3]@2 [c2,g2,c3] [c2,g2,c3] [c2,g2,c3] [eb2,bb2,bb3]]
+  [~ [eb2,bb2,eb3] [eb2,bb2,eb3] [g2,d3,g3]@2 [g2,d3,g3] [g2,d3,g3] [g2,d3,g3]]
+  [~]
+  [~]
+>`).sound("pulse").clip("[0.9@7 <0.9 0.9 0.9 0.9 0.9 0.9 0.9 0.9 1.8 0.9 1.8 0.9 1.8 0.9 1.8 0.9 0.9 0.9>]")
+
+// BASS
+
+const bassIntro = note(`<
+  [c1*4 f1*4] [ab1*4 bb1*4]
+  [c1*4 f1*4] [eb1*4 bb1*4]
+  [c1*4 f1*4] [ab1*4 bb1*4]
+  [c1*4 f1*4] [eb1*4 bb1*4]
+  [ab1 ab1 ab1 ab1 ab1 ab1 ~ ~]
+>`).sound("supersaw").bassenv()
+
+const bassVerseBuildUp = note("[[c1 ~]*4]").sound("supersaw").bassenv()
+
+const bassVerse1A = note("<[c1*8] [eb1*8] [c1*8] [g1*8]>").sound("supersaw").bassenv()
+const bassVerse1B = note("<[c1*4 eb1*4] [g1 g1 g1 g1 [ab1 ab1] ab1 [bb1 bb1] bb1]>").sound("supersaw").bassenv()
+const bassPrechorus1 = note("<[ab1 ab1 ab1 ab1 c1 c1 c1 eb1] [eb1*4 bb1*4] [ab1 ab1 ab1 ab1 c1 c1 c1 eb1] [eb1*4 g1*4]>").sound("supersaw").bassenv()
+const bassChorus1 = bassIntro
+const bassVerse2A = bassVerse1A
+const bassVerse2B = bassVerse1B
+const bassPrechorus2 = bassPrechorus1
+const bassChorus2 = note("<[c1*4 f1*4] [ab1*4 bb1*4] [c1*4 f1*4] [eb1*4 bb1*4]>").sound("supersaw").bassenv()
+const bassGuitarSolo = note(`<
+ [c1 ~ c1 ~ c1 ~ c1 ~]
+ [eb1 ~ eb1 ~ eb1 ~ eb1 ~]
+ [c1*4 eb1*4]
+ [g1 g1 g1 g1 [ab1 ab1] ab1 [bb1 bb1] bb1]
+ [c1 ~ c1 ~ c1 ~ c1 ~]
+ [eb1 ~ eb1 ~ eb1 ~ eb1 ~]
+ [c1*4 eb1*4]
+ [g1 g1 g1 g1 [ab1 ab1] ab1 [bb1 bb1] bb1]
+ [ab1 ab1 ab1 ab1 c1 c1 c1 eb1]
+ [eb1*4 bb1*4]
+ [ab1 ab1 ab1 ab1 c1 c1 c1 eb1]
+ [eb1*4 g1*4]
+ [ab1 ab1 ab1 ab1 c1 c1 c1 eb1]
+ [eb1*4 bb1*4]
+ [ab1 ab1 ab1 ab1 c1 c1 c1 eb1]
+ [eb1*4 g1*4]
+ [~][~]
+>`).sound("supersaw").bassenv()
+
+// DnB babyyyyyyyyyy
+
+const bass_drum = s("bd:4")
+  .beat("0, 10", 16)
+
+const snare_drum = s("sd:3")
+  .beat("4, 12", 16)
+
+const high_hat_fast = s("white!3 ~ white!2 ~ white").bassenv()
+
+// FX
+
+const noiseFx = s("pink(<7>,16)")
+
+const gameboyStartup = n("<[0 7@7 ~@8] [~] [~] [~]>")
+  .scale("C6:major")
+  .sound("pulse")
+  .fade(0.6, 0, 1, 1)
+
+// Verse 1A
+
+// LEAD GUITAR ARRANGEMENT
+
+$leadGuitar: arrange(
+  [GAMEBOY_NOISE,  silence],
+  [GAMEBOY_PAUSE,  silence],
+  [INTRO,          leadGuitarIntro.fade(1, 1, LEAD_GUITAR, INTRO)],
+  [VERSE_1_CHORDS, leadGuitarVerse1Chords.fade(1, 1, LEAD_GUITAR, VERSE_1_CHORDS)],
+  [VERSE_1A,       leadGuitarVerse1A.fade(1, 1, LEAD_GUITAR, VERSE_1A)],
+  [VERSE_1B,       leadGuitarVerse1B.fade(1, 1, LEAD_GUITAR, VERSE_1B)],
+  [PRECHORUS_1,    leadGuitarPrechorus1.fade(1, 1, LEAD_GUITAR, PRECHORUS_1)],
+  [CHORUS_1,       leadGuitarChorus.fade(1, 1, LEAD_GUITAR, CHORUS_1)],
+  [VERSE_2A,       leadGuitarVerse2A.fade(1, 1, LEAD_GUITAR, VERSE_2A)],
+  [VERSE_2B,       leadGuitarVerse2B.fade(1, 1, LEAD_GUITAR, VERSE_2B)],
+  [PRECHORUS_2,    leadGuitarPrechorus2.fade(1, 1, LEAD_GUITAR, PRECHORUS_2)],
+  [CHORUS_2,       leadGuitarChorus2.fade(1, 1, LEAD_GUITAR, CHORUS_2)],
+  [GUITAR_SOLO,    leadGuitarSolo.fade(1, 1, LEAD_GUITAR, GUITAR_SOLO)],
+  [CHORUS_3,       leadGuitarLastChorus.fade(1, 1, LEAD_GUITAR, CHORUS_3)],
+  [CHORUS_FADEOUT, leadGuitarLastChorus.fade(1, 0, LEAD_GUITAR, CHORUS_FADEOUT)],
+  [END, silence]
+).lpenv(3.5).lpf(2500).lpq(2).orbit(2)
+._scope()
+
+// HARMONY GUITAR ARRANGEMENT
+
+$harmonyGuitar: arrange(
+  [GAMEBOY_NOISE,  silence],
+  [GAMEBOY_PAUSE,  silence],
+  [INTRO,          silence],
+  [VERSE_1_CHORDS, silence],
+  [VERSE_1A,       harmonyGuitarVerse1A.fade(1, 1, HARMONY_GUITAR, VERSE_1A)],
+  [VERSE_1B,       silence],
+  [PRECHORUS_1,    harmonyGuitarPrechorus1.fade(1, 1, HARMONY_GUITAR, PRECHORUS_1)],
+  [CHORUS_1,       silence],
+  [VERSE_2A,       harmonyGuitarVerse2A.fade(1, 1, HARMONY_GUITAR, VERSE_2A)],
+  [VERSE_2B,       silence],
+  [PRECHORUS_2,    harmonyGuitarPrechorus1.fade(1, 1, HARMONY_GUITAR, PRECHORUS_2)],
+  [CHORUS_2,       silence],
+  [GUITAR_SOLO,    harmonyGuitarSolo.fade(1, 1, HARMONY_GUITAR, GUITAR_SOLO)],
+  [CHORUS_3,       silence],
+  [CHORUS_FADEOUT, silence],
+  [END, silence]
+).lpenv(3.5).lpf(2500).lpq(2).orbit(2)
+._scope()
+// RHYTHM GUITAR ARRANGEMENT
+
+$rhythmGuitar: arrange(
+  [GAMEBOY_NOISE,  silence],
+  [GAMEBOY_PAUSE,  silence],
+  [INTRO,          rhythmGuitarIntroChords.fade(0.8, 0.8, RHYTHM_GUITAR, INTRO)],
+  [VERSE_1_CHORDS, rhythmGuitarVerse1Chords.fade(0.8, 0.8, RHYTHM_GUITAR, VERSE_1_CHORDS)],
+  [VERSE_1A,       rhythmGuitarVerse1A.fade(0.8, 0.8, RHYTHM_GUITAR, VERSE_1A)],
+  [VERSE_1B,       rhythmGuitarVerse1B.fade(0.8, 0.8, RHYTHM_GUITAR, VERSE_1B)],
+  [PRECHORUS_1,    rhythmGuitarPrechorus1.fade(0.8, 0.8, RHYTHM_GUITAR, PRECHORUS_1)],
+  [CHORUS_1,       rhythmGuitarChorus1.fade(0.8, 0.8, RHYTHM_GUITAR, CHORUS_1)],
+  [VERSE_2A,       rhythmGuitarVerse2A.fade(0.8, 0.8, RHYTHM_GUITAR, VERSE_2A)],
+  [VERSE_2B,       rhythmGuitarVerse2B.fade(0.8, 0.8, RHYTHM_GUITAR, VERSE_2B)],
+  [PRECHORUS_2,    rhythmGuitarPrechorus2.fade(0.8, 0.8, RHYTHM_GUITAR, PRECHORUS_2)],
+  [CHORUS_2,       rhythmGuitarChorus2.fade(0.8, 0.8, RHYTHM_GUITAR, CHORUS_2)],
+  [GUITAR_SOLO,    rhythmGuitarSolo.fade(0.8, 0.8, RHYTHM_GUITAR, GUITAR_SOLO)],
+  [CHORUS_3,       rhythmGuitarChorus2.fade(0.8, 0.8, RHYTHM_GUITAR, CHORUS_3)],
+  [CHORUS_FADEOUT, rhythmGuitarChorus2.fade(0.8, 0, RHYTHM_GUITAR, CHORUS_FADEOUT)],
+  [END,            silence]
+).lpenv(3.5).lpf(2500).lpq(2).orbit(2)
+._scope()
+// BASS ARRANGEMENT
+
+bass: arrange(
+  [GAMEBOY_NOISE,  silence],
+  [GAMEBOY_PAUSE,  silence],
+  [INTRO,          bassIntro.fade(1.2, 1.2, BASS, INTRO)],
+  [VERSE_1_CHORDS, bassVerseBuildUp.fade(1.2, 1.2, BASS, VERSE_1_CHORDS)],
+  [VERSE_1A,       bassVerse1A.fade(1.2, 1.2, BASS, VERSE_1A)],
+  [VERSE_1B,       bassVerse1B.fade(1.2, 1.2, BASS, VERSE_1B)],
+  [PRECHORUS_1,    bassPrechorus1.fade(1.2, 1.2, BASS, PRECHORUS_1)],
+  [CHORUS_1,       bassChorus1.fade(1.2, 1.2, BASS, CHORUS_1)],
+  [VERSE_2A,       bassVerse2A.fade(1.2, 1.2, BASS, VERSE_2A)],
+  [VERSE_2B,       bassVerse2B.fade(1.2, 1.2, BASS, VERSE_2B)],
+  [PRECHORUS_2,    bassPrechorus2.fade(1.2, 1.2, BASS, PRECHORUS_2)],
+  [CHORUS_2,       bassChorus2.fade(1.2, 1.2, BASS, CHORUS_2)],
+  [GUITAR_SOLO,    bassGuitarSolo.fade(1.2, 1.2, BASS, GUITAR_SOLO)],
+  [CHORUS_3,       bassChorus2.fade(1.2, 1.2, BASS, CHORUS_3)],
+  [CHORUS_FADEOUT, bassChorus2.fade(1.2, 0, BASS, CHORUS_FADEOUT)],
+  [END,            silence]
+).lpenv(3.5).lpf(250).lpq(2).orbit(2)
+._scope()
+// DRUMS ARRANGEMENT
+
+$bassDrum: arrange(
+  [GAMEBOY_NOISE,  silence],
+  [GAMEBOY_PAUSE,  silence],
+  [120, bass_drum.fade(1, 1, DRUMS, 120)],
+  [8, bass_drum.fade(1, 0, DRUMS, 8)],
+  [END, silence]
+)._scope()
+
+$snareDrum: arrange(
+  [GAMEBOY_NOISE,  silence],
+  [GAMEBOY_PAUSE,  silence],
+  [120, snare_drum.fade(1, 1, DRUMS, 120)],
+  [8, snare_drum.fade(1, 0, DRUMS, 8)],
+  [END, silence]
+)._scope()
+
+$highHat: arrange(
+  [GAMEBOY_NOISE,  silence],
+  [GAMEBOY_PAUSE,  silence],
+  [120, high_hat_fast.fade(1, 1, DRUMS, 120)],
+  [8, high_hat_fast.fade(1, 0, DRUMS, 8)],
+  [END, silence]
+)._scope()
+// FX ARRANGEMENT
+
+$noiseFx: arrange(
+  [GAMEBOY_NOISE,  silence],
+  [GAMEBOY_PAUSE,  silence],
+  [120, noiseFx.fade(0.8, 0.8, FX, 120)],
+  [8, noiseFx.fade(0.8, 0, FX, 8)],
+  [END, silence]
+).bassenv()._scope()
+$gameboyStartup: arrange(
+  [1, gameboyStartup],
+  [129, silence],
+  [END, silence]
+)._scope()

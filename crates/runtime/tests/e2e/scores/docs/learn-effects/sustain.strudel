@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+note("c3 e3 f3 g3").decay(.2).sustain("<0 .1 .4 .6 1>")

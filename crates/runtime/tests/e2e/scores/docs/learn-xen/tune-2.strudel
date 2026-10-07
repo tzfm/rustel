@@ -1,0 +1,10 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+// You can set your root to be a
+// particular note with getFreq:
+i("4 8 9 10 - - 5 7 9 11 - -").tune("tranh3")
+  .mul(getFreq('c3'))
+  .freq().clip(.5).room(1)

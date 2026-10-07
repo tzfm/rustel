@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 3
+*/
+note("c3 e3").s("gm_lead_1_square").seg(4)

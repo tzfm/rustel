@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "id": "sawtooth-static-lowpass-24db",
+  "events": [
+    {
+      "time_seconds": 0.25,
+      "duration_seconds": 0.6,
+      "value": {
+        "s": "sawtooth",
+        "freq": 330,
+        "gain": 0.6,
+        "attack": 0.01,
+        "decay": 0.04,
+        "sustain": 0.7,
+        "release": 0.05,
+        "cutoff": 800,
+        "resonance": 4,
+        "ftype": "24db",
+        "pan": 0.65
+      }
+    }
+  ]
+}

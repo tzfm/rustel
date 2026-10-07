@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+"<c3 eb3 g3>".scale('C minor').apply(scaleTranspose("0,2,4")).note()

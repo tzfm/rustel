@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+note("{f g c d}%16").tremsync(4).tremoloshape("<sine tri square>").s("sawtooth")

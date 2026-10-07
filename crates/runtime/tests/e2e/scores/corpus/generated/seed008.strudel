@@ -1,0 +1,9 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 4
+*/
+// parity fuzz case seed=8 cycles=9 bpm=90
+setcpm(90/4)
+$: s("lt ht mt*2").bank("RolandTR909").jux((x => x.degrade())).chunk(2, (x => x.slow(2))).adsr("0.03:0.065:0.44:0.08")
+$: chord("<F Dm>").voicing().off(0.125, (x => x.degrade())).add(note(-12)).dry(0.41).velocity(0.9)

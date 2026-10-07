@@ -1,0 +1,8 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 12
+*/
+// parity fuzz case seed=675 cycles=19 bpm=90
+setcpm(90/4)
+$: s("bd*2 rim*4 ~? cb <lt rd>").every(5, (x => x.slow(2))).swing(2).someCyclesBy(0.43, x => x.fast(2))

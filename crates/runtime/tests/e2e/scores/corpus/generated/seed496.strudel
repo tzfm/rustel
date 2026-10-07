@@ -1,0 +1,10 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 4
+*/
+// parity fuzz case seed=496 cycles=11 bpm=140
+setcpm(140/4)
+$: s("[~ <rim lt rd> sd oh [rd mt hh hh:1/2 ht bd] rd bd hh@2]? clap hh").often((x => x.palindrome())).gain(0.72)
+$: s("mt [cr bd*4 [ht lt bd:2]]?").euclidRot(5,16,15).echo(4, 0.25, 0.55).rarely((x => x.degrade())).off(0.25, (x => x.palindrome())).chop(7).decay(0.119)
+$: n("5 [9 9] 4 2").scale("a:aeolian").chunk(3, (x => x.palindrome())).brak().every(3, (x => x.degrade())).spread(0.61).loop(1).lpf(600).lpq(12)

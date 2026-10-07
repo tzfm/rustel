@@ -1,0 +1,41 @@
+{
+  "name": "ember",
+  "background": "#1c1410",
+  "surface": "#24190f",
+  "overlay": "#2f2115",
+  "foreground": "#f1e4d0",
+  "muted": "#8c7a63",
+  "rule": "#3f2d1e",
+  "accent": "#ffa447",
+  "ok": "#b4c96a",
+  "warn": "#ffcf6b",
+  "error": "#ff6f59",
+  "caret": "#fff5e6",
+  "selection": "#4a3420",
+  "selection_text": "#fff5e6",
+  "mini": "#e6c07b",
+  "mini_fill": null,
+  "event_mark": "tint",
+  "event_fade": 0.5,
+  "event": "#ffa447",
+  "event_inactive": "#8c7a63",
+  "playhead": "#ffcf6b",
+  "grid": "#3f2d1e",
+  "minimap": "#17100c",
+  "minimap_viewport": "#3f2d1e",
+  "syntax": {
+    "text": "#f1e4d0",
+    "comment": "#8c7a63",
+    "string": "#e6c07b",
+    "number": "#ffa447",
+    "punctuation": "#d09a6a"
+  },
+  "meter": {
+    "low": "#b4c96a",
+    "mid": "#ffcf6b",
+    "high": "#ffcf6b",
+    "peak": "#ff6f59",
+    "track": "#2f2115",
+    "fader": "#f1e4d0"
+  }
+}

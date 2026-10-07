@@ -1,0 +1,61 @@
+/*
+  @title The Goddess Appears
+  @by Koji Kondo
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?JjMuKuGIauG-
+*/
+// "The Goddess Appears" @by Koji Kondo
+// arranged @by froos
+
+setcpm(100/2)
+
+$: note(`<
+[bb4 eb4 cb4 ab]
+[ab4 eb4 cb4 ab] 
+[g4 eb4 cb4 ab]
+[ab4 eb4 cb4 ab]
+
+[ab4 db4 bb gb]
+[gb4 db4 bb gb]
+[f4 db4 bb gb]
+[gb4 db4 bb gb]
+
+[gb4 cb4 ab f]
+[f4 cb4 ab f] 
+[e4 cb4 ab f]
+[f4 cb4 ab f]
+
+[f4 bb gb eb]
+[eb4 bb gb eb]
+[d4 bb gb eb]
+[eb4 bb gb eb]
+
+
+[bb4 eb4 cb4 ab]
+[ab4 eb4 cb4 ab] 
+[g4 eb4 cb4 ab]
+[ab4 eb4 cb4 ab]
+
+[cb5 fb4 db4 g]
+[bb4 fb4 db4 g]
+[a4 fb4 db4 g]
+[bb4 fb4 db4 g]
+
+[db5 eb4 cb4 ab]
+[cb5 eb4 cb4 ab]
+[bb4 eb4 cb4 ab]
+[cb5 eb4 cb4 ab]
+
+[bb4 cb4 ab f]
+[ab4 cb4 ab f]
+[gb4 cb4 ab f]
+[f4 cb4 ab f]
+>`)
+.clip("<4@3 [4 3 2 2]>")
+.add(note(12))
+.s("gm_orchestral_harp,gm_choir_aahs:1:.3")
+//.vib("6:.05")
+.room(.5)
+
+// @version 1.0

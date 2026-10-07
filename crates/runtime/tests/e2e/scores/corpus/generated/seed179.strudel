@@ -1,0 +1,9 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 4
+*/
+// parity fuzz case seed=179 cycles=7 bpm=174
+setcpm(174/4)
+$: s("ht!2 [cb*2 [hh cr mt ~*2 sd bd:1] mt cb]*4 <rim cr>? oh*4 ~*4*2").chunk(4, (x => x.palindrome())).ftype("ladder").sustain(0.64).phaser(1).phasersweep(1600)
+$: s("[lt*4 hh:0 ~ lt [cr/2 hh rim cr]] ht hh [ht [cp hh ~ sd mt]/2 cr sd? lt*4 oh*2 bd*2*4 mt] <mt lt oh> lt@2*2 sd").bank("RolandTR808").delayfeedback(0.41).bpf(600).fmi(1)

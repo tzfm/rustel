@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+// The same as note("{c eb g, c2 g2}%6")
+polymeter("c eb g", "c2 g2").note()

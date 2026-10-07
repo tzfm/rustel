@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+modulator: s("one").seg(64).gain(slider(0, 0, 1)).bus(1).dry(0)
+carrier: s("saw").bmod({ b: 1 })

@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+s("<a!2 [a,b] b>".pick({a: "bd(3,8)", b: "sd sd"}))

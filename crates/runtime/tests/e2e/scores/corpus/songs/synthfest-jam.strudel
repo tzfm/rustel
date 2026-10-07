@@ -1,0 +1,19 @@
+/*
+  @title synthfest jam
+  @by Switch Angel
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?m1AE7OZZdoLL
+*/
+// @title synthfest jam
+// @by Switch Angel
+const progression = "Am7 Dm C^7 F".slow(4)
+$: chord(progression).voicing().s("supersaw").struct("1!8")
+  .lpf(100).lpenv(4).fanchor(0)
+
+$: n("{0 1 3 5 0 12}%16").chord(progression).voicing().s("sine")
+  .fm(slider(0,0,8))
+  .fmh(2)
+
+
+// @version 1.0

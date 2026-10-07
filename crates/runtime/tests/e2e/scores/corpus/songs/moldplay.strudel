@@ -1,0 +1,37 @@
+/*
+  @title Moldplay
+  @by B:EEP
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?0h6ITu5ae8Be
+*/
+// @title Moldplay
+// @by B:EEP
+// @license CC BY-NC-SA
+
+// Riffing on "a little off" by zebravis, "underwater library" by froos,
+// and a bunch of other stuff from here. Much love to leo and everyone
+// on the last creations panel, you're all amazing
+
+let chords = chord ("<C^7 Dm9 Em9 Bb^7#11>/2")
+
+stack(
+  chords.dict("<ireal ireal-ext>/16")
+    .layer(
+      x=>n("5 8 8 5 7 1 1 3 ").struct("x(13,16)").set(x).mode("root:f2").voicing()
+        .clip(2).s("gm_electric_guitar_muted")
+        .mask("<1!24 0!4 1!4>/2")
+      ,
+      x=>n("0 .. 5").segment(32).struct("x(6,16)").set(x).mode("root:f3").voicing()
+        .jux(rev)
+        .s("gm_acoustic_guitar_nylon")
+      .gain(1.5).mask("<0!16 1!16>/2")
+    ).room(.5),
+  stack(
+    s("bd*4").lastOf(8, x=>x.fast(2)),
+    s("~ rim ~ [rim ~]").lastOf(8, x=>x.sometimesBy(0.5, x=>x.struct("~ x ~ [x x ~ ~]"))),
+    s("~ hh ~ hh [~ hh] hh ~ hh").gain(0.5)
+  ).bank("Linn9000").room(0.15).mask("<0!8 1!16 0!8>/2")
+  )
+
+// @version 1.0

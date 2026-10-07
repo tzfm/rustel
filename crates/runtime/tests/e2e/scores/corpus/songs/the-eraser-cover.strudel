@@ -1,0 +1,114 @@
+/*
+  @title The Eraser (cover)
+  @by shadesDrawn
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?45UBjCko0AuP
+*/
+//"The Eraser (cover)" @by shadesDrawn
+var cpm = 16;
+var pattern1 = `
+[[c,g,a,e4]@2 [c,g,a,e4] [c,g,a,e4]@2 [c,g,a,e4] [c,g,a,e4] [c,g,a,e4]]
+[[b2,d,a,f#4]@2 [b2,d,a,f#4] [b2,d,a,f#4]@2 [b2,d,a,f#4] [b2,d,a,f#4]@2]
+[[b2,e,a,g4]@2 [b2,e,a,g4] [b2,e,a,g4]@2 [b2,e,a,g4] [b2,e,a,g4] [b2,e,a,g4]]
+[[b2,d,a,a4]@2 [b2,d,a,a4] [b2,d,a,a4] [b2,d,a,a4] [b2,d,a,a4] [b2,d,a,f#4]@2]
+`;
+
+var pattern2 = `
+[[c4,g4,a4,e5]@2 [c4,g4,a4,e5] [c4,g4,a4,e5]@2 [c4,g4,a4,g5] [c4,g4,a4,g5]@2]
+[[b3,d4,a4,f#5]@2 [b3,d4,a4,f#5] [b3,d4,a4,f#5]@2 [b3,d4,a4,a5] [b3,d4,a4,a5]@2]
+[[b3,e4,a4,g5]@2 [b3,e4,a4,g5] [b3,e4,a4,g5]@2 [b3,e4,a4,b5] [b3,e4,a4,b5]@2]
+[[b3,d4,a4,a5]@2 [b3,d4,a4,a5] [b3,d4,a4,a5]@2 [b3,d4,a4,c6] [b3,d4,a4,b5]@2]
+`;
+
+stack(
+
+sound("<bd [~ bd]>@2 hh@2 bd <bd ~> [hh bd] [~ hh]")
+  .fast(2)
+  .bank("RolandTR909")
+  .gain(0.15)
+  .room(0.2)
+  .mask("<0!4 1!500>")
+  ,
+
+note(pattern1)
+  .slow(4)
+  .sound("gm_epiano1:4")
+  .room(0.0)
+  .gain(0.5)
+  .release(0.4)
+  .hpf(100)
+  .hpenv(4)
+  .lpf(6000)
+  .lpenv(4)
+  .pan(0.4)
+  .delay("<0 0.25 0.5 0.5 0.25>")
+  //.attack(0.05)
+  //.hush()
+,
+
+note(pattern2)
+  .slow(4)
+  .sound("gm_epiano1:4")
+  //.sound("gm_celesta:4")
+  //.room(0.4)
+  .gain(0.39)
+  .arp("<[0 1 2 3] [2 3 0 1]>".fast(4).sometimesBy(0.2,rev))
+  //.release(1.0)
+  //.attack(0.1)
+  .release(sine.range(0.02,0.2).slow(10))
+  .hpf(100)
+  .hpenv(4)
+  .lpf(3000)
+  .lpenv(4)
+  .pan(0.6)
+  .mask("<0!8 1!500>")
+  //.hush()
+,
+
+note(`
+[<e4 d5>]
+[b4 <a4 e5>]
+[<g4 d5>]
+[f#4]
+`)
+  .slow(4)
+  .sound("sine")
+  //.sound("gm_pad_bowed:1")
+  .gain(0.15)
+  .room(0.5)
+  .vib(1/8).vibmod(1/8)
+  .attack(0.8)
+  .decay(4)
+  .hpf(100)
+  .hpenv(4)
+  .lpf(6000)
+  .lpenv(4)
+  //.phaser(1).phasersweep(2000)
+  .pan(0.7)
+,
+
+note(`
+[<e2 d3>]
+[b2 <a2 e3>]
+[<g2 d3>]
+[f#2]
+`)
+  .slow(4)
+  .sound("sine")
+  //.sound("gm_pad_bowed:1")
+  .gain(0.3)
+  .room(0.5)
+  .vib(1/8).vibmod(1/8)
+  .attack(0.8)
+  .decay(4)
+  .hpf(100)
+  .hpenv(4)
+  .lpf(6000)
+  .lpenv(4)
+  .phaser(1).phasersweep(4000)
+  .pan(0.3)
+,
+
+).cpm(cpm)
+// @version 1.1

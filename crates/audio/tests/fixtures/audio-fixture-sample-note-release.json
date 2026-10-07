@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "id": "bundled-bd-note-release",
+  "events": [
+    {
+      "time_seconds": 0.15,
+      "duration_seconds": 0.1,
+      "value": {
+        "s": "bd",
+        "note": "c3",
+        "gain": 0.6,
+        "begin": 0.0,
+        "end": 0.5,
+        "release": 0.02,
+        "pan": 0.65
+      }
+    }
+  ]
+}

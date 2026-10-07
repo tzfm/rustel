@@ -1,0 +1,104 @@
+/*
+  @title Poliwhirl
+  @by shadesDrawn
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?TmNVyAhoK7nK
+*/
+// "Poliwhirl" @by shadesDrawn
+
+var cpm = 30;
+
+var pattern1 = "[0 ~ ~ 0 ~ ~ 0 ~ ~ 0 ~ ~ 0 ~ ~ 0]";
+var scales = "<g1:minor f1:minor Bb1:minor d1:minor>"
+
+stack(
+
+sound("~ hh ~ hh ~ hh ~ hh")
+  .bank("RolandTR808")
+  .gain(0.8)
+  .room(0.2)
+,
+
+sound("bd ~ bd ~ bd ~ bd ~")
+  .bank("RolandTR909")
+  .gain(0.5)
+  .room(0.2)
+,
+
+sound("~ <~ rim> rim ~ ~ ~ rim <~ ~ rim>")
+  .bank("RolandTR909")
+  .gain(0.2)
+  .room(0.05)
+,
+
+n(pattern1)
+  .scale(scales)
+  .sound("gm_synth_bass_2")
+  .room(1)
+  //.decay(4)
+  .gain(0.6)
+  .cutoff(1500)
+,
+
+note(`
+[g1 ~ ~ g1 ~ ~ g1 ~ ~ g1 ~ ~ g1 ~ ~ g1]
+[a1 ~ ~ a1 ~ ~ a1 ~ ~ a1 ~ ~ a1 ~ ~ a1]
+[Bb1 ~ ~ Bb1 ~ ~ Bb1 ~ ~ Bb1 ~ ~ Bb1 ~ ~ Bb1]
+[c2 ~ ~ c2 ~ ~ c2 ~ ~ c2 ~ ~ c2 ~ ~ c2]
+[d2 ~ ~ d2 ~ ~ d2 ~ ~ d2 ~ ~ d2 ~ ~ d2]
+[f2 ~ ~ f2 ~ ~ f2 ~ ~ f2 ~ ~ f2 ~ ~ f2]
+[a2 ~ ~ a2 ~ ~ a2 ~ ~ a2 ~ ~ a2 ~ ~ a2]
+[c3 ~ ~ c3 ~ ~ c3 ~ ~ c3 ~ ~ c3 ~ ~ c3]
+`)
+  .slow(8)
+  //.sound("gm_synth_bass_2:5")
+  .sound("gm_synth_bass_2")
+  .delay("<0 0 1 2 3 2 1>")
+  .gain(0.6)
+  .cutoff(1500)
+  .room(1)
+,
+
+//Eight note rhythm -- 1/4/7 first loop and then 2/5/7 second loop
+note(`
+[d4 ~ ~ d3 ~ ~ g3 ~ ~ d4 ~ ~ d3 ~ g3 ~]
+[f4 ~ ~ d3 ~ ~ a3 ~ ~ d4 ~ ~ d3 ~ g3 ~]
+[g4 ~ ~ d3 ~ ~ c4 ~ ~ d4 ~ ~ f3 ~ g3 ~]
+[e4 ~ ~ d3 ~ ~ g3 ~ ~ d4 ~ ~ f3 ~ e3 ~]
+`)
+  .slow(4)
+  .sound("sawtooth").lpf(700).adsr(".1:.2:.2:.2")
+  .pan(sine.range(0,1).slow(10))
+  .mask("<0!8 1!500>")
+,
+
+/*
+note(`
+[<d4 ~ f4 ~ g4 ~ e4 ~> <~ d4> ~ <d3 ~> <~ d3> ~ g3 ~]
+`)
+*/
+
+//melody
+note(`
+[d3@7 g2]
+[d3 c3@7]
+[f3]
+[e3 c3]
+[d3@7 a3]
+[f3 e3@7]
+[d3]
+[f3 g3]
+`)
+  .slow(8)
+  .sound("gm_electric_guitar_clean")
+  .room(1)
+  .phaser(2)
+  .distort(0.7)
+  .mask("<0!8 1!500>")
+  .gain(sine.range(1,0).slow(32))
+,
+
+).cpm(cpm)
+
+// @version 1.0

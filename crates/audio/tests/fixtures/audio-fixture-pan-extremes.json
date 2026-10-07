@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "id": "sine-pan-extremes",
+  "events": [
+    {
+      "time_seconds": 0.2,
+      "duration_seconds": 0.4,
+      "value": {
+        "s": "sine",
+        "freq": 330,
+        "gain": 0.5,
+        "pan": 0.0
+      }
+    },
+    {
+      "time_seconds": 0.8,
+      "duration_seconds": 0.4,
+      "value": {
+        "s": "sine",
+        "freq": 415,
+        "gain": 0.5,
+        "pan": 1.0
+      }
+    }
+  ]
+}

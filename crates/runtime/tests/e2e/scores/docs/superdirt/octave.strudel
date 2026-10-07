@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+n("0,4,7").scale("F:minor").s('supersaw').octave("<0 1 2 3>")

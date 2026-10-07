@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+n(run(4)).scale("C4:pentatonic")
+// n("0 1 2 3").scale("C4:pentatonic")

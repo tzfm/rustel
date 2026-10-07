@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+note("c3*8").s("sawtooth").release(0.001).FXrelease(0.5).tremolo(6)

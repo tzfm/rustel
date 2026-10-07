@@ -1,0 +1,36 @@
+/*
+  @by rustel maintainers
+  @origin songs-user
+  @duration 4
+*/
+const dbank = "tr909"
+
+// Set the tempo to 140 BPM
+setCps(140/60/4)
+
+// $: is a shortcut to create and play a pattern on its own line. It serves the same purpose as our stack() function here.
+// This layer creates a pulsing white noise rhythm.
+$: s("white!16")
+  .decay(sine.fast(4).range(0.05, .14))
+  .gain(0.4)
+  .sometimesBy(0.1, x => x.ply("2 | 4"))
+
+// This layer creates a kick pattern that randomly skips notes.
+// .degradeBy() randomly removes events from the pattern.
+$: s("bd!16?")
+  .degradeBy(slider(0.741, 0, 1))
+  .ribbon(40, 2)
+  .n(irand(5).ribbon(200, 2))
+  .bank(dbank)
+
+// This layer places a snare on specific beats of a 16-step sequence.
+$: s("sd")
+  .bank(dbank)
+  .beat("4,11", 16)
+
+// This layer adds a degraded clap pattern.
+$: s("cp:4!16?")
+  .degradeBy(slider(0.423, 0, 1))
+  .ribbon(19, 2)
+  .bank(dbank)
+  .gain(0.5)

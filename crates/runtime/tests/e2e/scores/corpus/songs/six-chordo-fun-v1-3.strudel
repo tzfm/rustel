@@ -1,0 +1,49 @@
+/*
+  @title Six Chordo Fun v1.3
+  @by Prince Lucija <https://prin.lu>
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?mXWWUyFGYvhB
+*/
+// "Six Chordo Fun v1.3" @by Prince Lucija <https://prin.lu>
+stack(
+  // melody
+  n("[[0|1] [2|3] 4 [6 7] 5 3 [~ 1] [7,8]]")
+  .chord("<Eb^7 Ab13 Bb13 Cm9 F13 Bb13>".slow(4))
+  .voicing().slow(1)
+  .sometimesBy(0.5,rev())
+  .degradeBy(0.1)
+  .add(note("-0.1, -24"))
+  .s(choose("square:[4|8|16]".fast(8), "sawtooth:[16|4|9|32]".fast(9)))
+  .distort("2:.4")
+  .lpf(saw.rangex(200, 1000).slow(4))
+  .lpq(saw.rangex(1,20).slow(4))
+  .lpe(saw.rangex(2,9).slow(4))
+  .pan(perlin.range(0.25,0.75))
+  .room(saw.range(0.1,1).slow(4))
+  .delay("0.2:0.6"),
+
+  // beat
+  s(`   bd <~ bd> hh ~ 
+        cp ~ hh [bd|cp] 
+        hh ~ [hh|bd] ~ 
+        [sd|cp] ~ hh [hh|oh], 
+        [hh oh:2]
+        `)
+  .slow(1)
+  // .sometimesBy(0.4,rev())
+  // .degradeBy(0.2)
+  .bank("RolandTR909")
+  .end(perlin.rangex(0.01, 0.3).fast(4))
+  .distort("3:.4")
+  .lpf(perlin.rangex(1500,20000).fast(4))
+  .lpq("0|5|10|15|20".fast(9)) 
+  .delay("<0@3 0.5>")
+  .dt("0.01|0.02|0.03".fast(4))
+  .dfb("0.5")
+  .crush(16)
+  // .hush
+  
+).cpm(150/4)
+
+// @version 1.0

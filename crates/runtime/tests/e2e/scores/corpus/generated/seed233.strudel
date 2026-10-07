@@ -1,0 +1,11 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 4
+*/
+// parity fuzz case seed=233 cycles=6 bpm=132
+setcpm(132/4)
+$: n("9 3 1 3 [4 7] 2 5 1").chord("<Ab Eb>").voicing().duration(0.19).pw(0.19).pw(0.22).pan(0.25).panspan(0.7)
+$: note("c# bb gb2 fb").s("gm_piano")
+$: chord("<Dm7 Am Cmaj7>").anchor("C5").voicing().velocity(0.78).ribbon(1, 2).leslie(6).vowel("u")
+$: note("cb a ab5").s("gm_lead_1_square")

@@ -1,0 +1,9 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+seqPLoop(
+  [0, 2, "bd(3,8)"],
+  [1, 3, "cp(3,8)"]
+).sound()

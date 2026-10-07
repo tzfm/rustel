@@ -1,0 +1,33 @@
+/*
+  @title Onde
+  @by strudel community bakery
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?eRn_hDZ-FeAW
+*/
+//@Leo
+//"Onde"
+setcps(1)
+await initHydra()
+osc(10, 0.1, 10).modulate(osc(10, 0.2, 10)
+ .rotate(H("0.5 1.5 2  "), 0.1), 0.1)
+  .color(H(sine.range(0.1, 1.5).slow(8)), H(sine.range(0, .5).slow(8)), H(sine.range(0.2, 1).slow(8)))
+  .posterize()
+  .out(o0)
+
+let chords = chord("<Cm Dm C#m A7b9>/4").dict('ireal-ext')
+
+stack(
+  //chords:
+  chords.voicing().s("piano").struct("<x ~ ~ x>").lpf(800).vib(2).vibmod(0.25).delay(0.5),
+ // bass:
+ chords.ply(8)
+  .rootNotes(2).s('sawtooth').cutoff(800).gain(".5 1"),
+ //arp: 
+ n("0 1 2").add("<1 2 3>").set(chords).voicing().s(" z_sawtooth").lpf(sine.range(100,4000).slow(8))
+)
+
+
+
+
+// @version 1.0

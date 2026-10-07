@@ -1,0 +1,51 @@
+{
+  "name": "webcam-hacker",
+  "background": "#03070f",
+  "surface": "#071019",
+  "overlay": "#0b1a2a",
+  "foreground": "#c9e7ff",
+  "muted": "#4f7396",
+  "rule": "#123047",
+  "accent": "#22d3ee",
+  "ok": "#34d399",
+  "warn": "#fbbf24",
+  "error": "#fb7185",
+  "caret": "#ffffff",
+  "selection": "#0e3a52",
+  "selection_text": "#ffffff",
+  "mini": "#38bdf8",
+  "mini_fill": null,
+  "event_mark": "tint",
+  "event_fade": 0.4,
+  "event": "#22d3ee",
+  "event_inactive": "#1e5a75",
+  "playhead": "#7dd3fc",
+  "grid": "#0d2438",
+  "minimap": "#071019",
+  "minimap_viewport": "#0e3a52",
+  "hydra": "src(s0)\n  .saturate(0.15)\n  .contrast(1.5)\n  .posterize(6, 0.75)\n  .pixelate(160, 90)\n  .color(0.35, 0.8, 1.3)\n  .add(osc(160, 0, 0).rotate(1.5708).thresh(0.55, 0.02).color(0.05, 0.25, 0.55), 0.3)\n  .modulate(noise(9, 0.2), 0.006)\n  .out()",
+  "hydra_camera": true,
+  "hydra_opacity": 25,
+  "opacity": {
+    "backdrop": 66,
+    "interface": 74,
+    "editor": 48
+  },
+  "syntax": {
+    "text": "#c9e7ff",
+    "comment": "#4f7396",
+    "string": "#7dd3fc",
+    "number": "#a5f3fc",
+    "punctuation": "#22d3ee",
+    "keyword": "#38bdf8",
+    "function": "#67e8f9"
+  },
+  "meter": {
+    "low": "#34d399",
+    "mid": "#22d3ee",
+    "high": "#fbbf24",
+    "peak": "#fb7185",
+    "track": "#0b1a2a",
+    "fader": "#c9e7ff"
+  }
+}

@@ -1,0 +1,41 @@
+/*
+  @title Avril 14th
+  @by strudel community bakery
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?VF2Fc1t3p6bR
+*/
+// "Avril 14th" - Inspired by Lil Data's Happy Avril 14th for TidalCycles
+setcps(1)
+
+let lh = "[0 9 12 16] [4 12 16 19] [5 12 17 19] [2 12 17 16]"
+let rh = "[[4 -3] [0 ~ ~ ~ ~ ~ 0]] [[-3, -8] [7 5 4 0]]"
+let p = "square"
+
+stack(
+  n(lh)
+    .scale("G#1:major")
+    .s(p)
+    .decay(perlin.range(.15,.3)).sustain(0)
+  
+    .room(0.4)
+    .gain(slider(0.693))
+    .color("red")
+  ,
+  n(rh)
+    .scale("<G#3 G#4>:major/2")
+    // .someCyclesBy(0.5, x=>x.ply(perlin.range(0,2)))
+    .s(p)
+    .decay(perlin.range(.1,.25)).sustain(0)
+    .cutoff(cosine.range(500,4000).slow(16))
+    .room(.5)
+    .lpa(.125).lpenv(-2).v("8:.125").fanchor(.25)
+    .gain(slider(0.693))
+    .late("<0*32>")
+    .mask("<0*32 0*32 1*32 1*32 1*32 1*32 1*32 1*32>")
+    .color("lightgreen")
+
+).slow(8)
+ .pianoroll({fold:0})
+
+// @version 1.0

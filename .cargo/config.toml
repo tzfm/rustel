@@ -1,0 +1,6 @@
+[build]
+# Keep build artifacts in the workspace.
+target-dir = "target"
+
+[alias]
+xtask = "run --quiet --package xtask --"

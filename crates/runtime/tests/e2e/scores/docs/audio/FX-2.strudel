@@ -1,0 +1,10 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+$: s("saw").fm(0.5)
+  .delay(0.3) // outer effects are applied *last*
+  .FX(coarse(4)) // first coarse
+  .FX(lpf(500).lpe(4).lpa(1).lpd(2)) // then lpf
+  .FX(distort(1)) // then distort

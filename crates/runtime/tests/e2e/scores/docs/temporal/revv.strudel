@@ -1,0 +1,9 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+// This is the same as `<[g e] [d c]>`. If `rev()` is used, you get
+// the same as `<[d c] [g e]>`, where each cycle reverses, but the order of
+// cycles stays the same.
+note("<[c d] [e g]>").revv()

@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+stepcat([3,"e3"],[1, "g3"]).note()
+// the same as "e3@3 g3".note()

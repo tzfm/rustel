@@ -1,0 +1,10 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+note("c2 e2 f2 g2")
+.sound('sawtooth')
+.bpf(500)
+.bpa(.5)
+.bpenv("<4 2 1 0 -1 -2 -4>/4")

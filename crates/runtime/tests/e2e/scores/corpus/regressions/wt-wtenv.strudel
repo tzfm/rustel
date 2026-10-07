@@ -1,0 +1,7 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+samples('https://strudel.b-cdn.net/uzu-wavetables.json', 'https://strudel.b-cdn.net/uzu-wavetables/')
+s("curses").bank("wt_digital").note("F1*3").wt(0.2).wtenv(0.6).wtattack(0.1)

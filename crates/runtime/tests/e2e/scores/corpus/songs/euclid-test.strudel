@@ -1,0 +1,79 @@
+/*
+  @title Euclid test
+  @by shadesDrawn
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?KQiYAKIDY3r_
+*/
+//"Euclid test" @by shadesDrawn
+
+var cpm = 30;
+
+stack(
+  
+note("<[c2,c1] [ab0,ab1] [f0,f1] [g0,g1]>")
+  .euclidRot(3,16,14)
+  .sound("gm_synth_bass_2:1")
+  .decay(1.2)
+  .room(1)
+  .gain(1.6)
+  .pan(0.5)
+,
+
+note("<eb4 f4 g4 d4>")
+  .euclidLegatoRot(3,16,14)
+  .sound("sine")
+  .fm(1)
+  .crush(sine.range(7,14).slow(20))
+  .release(0.4)
+  .gain(0.35)
+  .pan(0.7)
+,
+
+note(`
+[eb4 g3 d4 c4@2 d4 eb4 c4]
+[d4 eb4 g3 d4 c4@2 d4 eb4]
+[c4 d4 eb4 g3 d4 c4@2 d4]
+[eb4 c4 d4 eb4 g3 d4 c4@2]
+`)
+  .slow(4)
+  .sound("gm_electric_guitar_clean:4")
+  .decay(0.3)
+  .crush(8)
+  .gain(sine.range(0.1,0.5).slow(8))
+  .pan(0.3)
+,
+
+note(`
+[g3 ab3 f3 g3 d4 eb4 c4 d4]
+`)
+  .slow(1)
+  .sound("gm_electric_guitar_clean:4")
+  .decay(0.3)
+  .crush(8)
+  .gain(sine.range(0.4,0.1).slow(8))
+  .pan(0.6)
+,
+
+sound("<bd [bd bd]> <bd ~> bd bd")
+  .bank("RolandTR909")
+  .gain(0.25)
+,
+
+sound("hh*8")
+  .bank("RolandTR909")
+  .gain(0.1)
+  .degradeBy(0.33)
+,
+
+n("<0 1 2 3 4 5 6 7 8 0 0>")
+  .sound("numbers")
+  .crush(10)
+  .delay(0.5)
+  .gain(sine.range(0.1,0.4).slow(15))
+  .pan(sine.range(0,1).slow(10))
+  .mask("<0!11 1!500>")
+,
+
+).cpm(cpm)
+// @version 1.1

@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 4
+*/
+s("oh").bank("tr909").loopAt(2).slow(2)

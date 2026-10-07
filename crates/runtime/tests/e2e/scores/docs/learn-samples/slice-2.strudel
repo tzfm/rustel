@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+samples('github:tidalcycles/dirt-samples')
+s("breaks125").fit().slice([0,.25,.5,.75], "0 1 1 <2 3>")

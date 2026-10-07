@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+"<1 1.5 [1.66, <2 2.33>]>*4".mul(150).freq()

@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+note("<c2 d2>(3,8)").s("square")
+.pickF("<0 2> 1", [jux(rev), fast(2), x=>x.lpf(800)])

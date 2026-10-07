@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 3
+*/
+s("casio crow insect").seg(3)

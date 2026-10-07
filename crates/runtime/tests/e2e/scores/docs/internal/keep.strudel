@@ -1,0 +1,8 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+// notes, already defined, will stay "c a f e",
+// while "s", not defined, will be set to "piano"
+note("c a f e").keep(note("e f a c").s("piano"))

@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+n("0,4,7").s("supersquare").leslie(1).lrate("<1 2 4 8>").osc()

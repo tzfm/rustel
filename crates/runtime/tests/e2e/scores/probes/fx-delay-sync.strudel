@@ -1,0 +1,7 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 4
+*/
+setCpm(120)
+$: s("sawtooth").note("c2").delay(0.4).delaysync(0.25).seg(4)

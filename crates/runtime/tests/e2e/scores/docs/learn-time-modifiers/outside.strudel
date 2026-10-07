@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+"<[0 1] 2 [3 4] 5>".outside(4, rev).scale('C major').note()
+// "<[0 1] 2 [3 4] 5>".fast(4).rev().slow(4).scale('C major').note()

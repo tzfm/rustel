@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 2
+*/
+s("sawtooth").note("c3").attack(0.05).decay(0.2).sustain(0.3).release(0.2).seg(4)

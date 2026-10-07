@@ -1,0 +1,16 @@
+/*
+  @title song for a rainy day.
+  @by strudel community bakery
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?fL0-0dALxv2C
+*/
+// "song for a rainy day."
+setcps(1)
+stack(
+s("east*4").vowel("<o a> u <o e> i").room(2).cpm("20"),
+s("~ ~ <cp cp cp ~> ~").vowel("<i o a ~ ~ ~ ~ ~>"),
+note("~ <c3 c3 c3 c3 c3 c3 <d3 b3> c3> ~ ~").sound("piano").vowel("~ <i o a ~ i u a ~ ~ ~ ~ ~> ~ ~").lpf(400)
+)
+
+// @version 1.0

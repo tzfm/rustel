@@ -1,0 +1,9 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+// change the modulation depth with ":"
+note("a e")
+.vib("<.5 1 2 4 8 16>:12")
+._scope()

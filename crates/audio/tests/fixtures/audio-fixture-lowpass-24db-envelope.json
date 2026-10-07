@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "id": "sawtooth-lowpass-24db-envelope",
+  "events": [
+    {
+      "time_seconds": 0.25,
+      "duration_seconds": 0.6,
+      "value": {
+        "s": "sawtooth",
+        "freq": 110,
+        "gain": 0.55,
+        "cutoff": 500,
+        "resonance": 4,
+        "ftype": "24db",
+        "lpenv": 3,
+        "lpattack": 0.015,
+        "lpdecay": 0.18,
+        "lpsustain": 0.15,
+        "lprelease": 0.1,
+        "pan": 0.5
+      }
+    }
+  ]
+}

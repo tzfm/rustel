@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+s("bd sd hh ht*4").FX(phaser(3), tremolo(5), gain(0.7))

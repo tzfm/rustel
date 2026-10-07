@@ -1,0 +1,39 @@
+[package]
+name = "rustel-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Embeddable Rustel patterns, scheduler, voice resolution, and audio DSP"
+
+[features]
+default = []
+# Evaluate JavaScript scores without the higher-level Session host.
+javascript = ["dep:rustel-jsruntime", "dep:rustel-transpiler"]
+# Session owns score evaluation, sample loading, scheduling, and rendering.
+session = ["javascript", "dep:rustel-runtime"]
+extensions = ["javascript", "rustel-jsruntime/extensions", "rustel-runtime?/extensions"]
+# Hosts with their own audio callback leave this disabled.
+device-audio = ["rustel-audio/device-audio", "rustel-runtime?/device-audio"]
+opus = ["session", "rustel-runtime/opus"]
+mp3-export = ["session", "rustel-runtime/mp3-export"]
+
+[dependencies]
+rustel-audio = { path = "../audio", default-features = false }
+rustel-core = { path = "../core" }
+rustel-fraction = { path = "../fraction" }
+rustel-mini = { path = "../mini" }
+rustel-scheduler = { path = "../scheduler" }
+rustel-voice = { path = "../voice" }
+rustel-jsruntime = { path = "../jsruntime", default-features = false, optional = true }
+rustel-transpiler = { path = "../transpiler", optional = true }
+rustel-runtime = { path = "../runtime", default-features = false, optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+
+[[example]]
+name = "session_callback"
+required-features = ["session"]

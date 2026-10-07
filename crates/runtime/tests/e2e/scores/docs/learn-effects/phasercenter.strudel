@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+n(run(8)).scale("D:pentatonic").s("sawtooth").release(0.5)
+.phaser(2).phasercenter("<800 2000 4000>")

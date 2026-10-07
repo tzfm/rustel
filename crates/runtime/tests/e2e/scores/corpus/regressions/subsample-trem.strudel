@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+s("ht*2").late(0.0013385416666666667).tremolo(4)

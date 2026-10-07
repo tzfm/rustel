@@ -1,0 +1,9 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+s("sine").note("F1*2").release(1)
+  .penv(24).pdecay(0.05)
+  .distort(rand.range(1, 8))
+  .distorttype("<fold chebyshev scurve diode asym sinefold>")

@@ -1,0 +1,43 @@
+{
+  "name": "emacs",
+  "background": "#ffffff",
+  "surface": "#d3d3d3",
+  "overlay": "#e8e8e8",
+  "foreground": "#000000",
+  "muted": "#666666",
+  "rule": "#a0a0a0",
+  "accent": "#0000ff",
+  "ok": "#228b22",
+  "warn": "#966d09",
+  "error": "#b22222",
+  "caret": "#000000",
+  "selection": "#bfd9ff",
+  "selection_text": "#000000",
+  "mini": "#008b8b",
+  "mini_fill": null,
+  "event_mark": "tint",
+  "event_fade": 0.15,
+  "event": "#a020f0",
+  "event_inactive": "#9a9a9a",
+  "playhead": "#0000ff",
+  "grid": "#dcdcdc",
+  "minimap": "#f2f2f2",
+  "minimap_viewport": "#c8c8c8",
+  "syntax": {
+    "text": "#000000",
+    "comment": "#b22222",
+    "string": "#8b2252",
+    "number": "#008b8b",
+    "punctuation": "#483d8b",
+    "keyword": "#a020f0",
+    "function": "#0000ff"
+  },
+  "meter": {
+    "low": "#228b22",
+    "mid": "#008b8b",
+    "high": "#966d09",
+    "peak": "#b22222",
+    "track": "#e8e8e8",
+    "fader": "#000000"
+  }
+}

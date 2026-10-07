@@ -1,0 +1,39 @@
+# Rust build and test output
+**/target/
+**/*.rs.bk
+
+# Local scratch
+**/wip/
+.tmp/
+build/
+
+# Editor, operating-system, and language caches
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+__pycache__/
+*.py[cod]
+*.swp
+*.swo
+
+# Crash dumps
+/core
+/core.*
+
+# Rendered demo videos are local-only, opt-in via
+# RUSTEL_E2E_RECORD_DIR (see crates/studio-e2e/README.md).
+crates/studio-e2e/demo/
+
+# Local stress-run diagnostics.
+stress-reports/
+
+# Session tapes recorded next to the checkout.
+*.rustel-session
+
+# Corpus output that differs from a golden, saved beside it for review.
+crates/runtime/tests/e2e/golden/*.actual
+*.strudel
+# Include corpus and regression scores despite the general `*.strudel` ignore.
+!crates/runtime/tests/e2e/scores/**/*.strudel
+rustel-set.json

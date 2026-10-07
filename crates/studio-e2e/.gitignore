@@ -1,0 +1,4 @@
+*.actual
+# Frame recordings written when RUSTEL_E2E_RECORD_DIR is set; the demo
+# renderer consumes them and they regenerate on every recording run.
+/recordings/

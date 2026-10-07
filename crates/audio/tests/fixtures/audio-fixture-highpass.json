@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "id": "square-static-highpass",
+  "events": [
+    {
+      "time_seconds": 0.2,
+      "duration_seconds": 0.55,
+      "value": {
+        "s": "square",
+        "freq": 220,
+        "gain": 0.55,
+        "attack": 0.015,
+        "decay": 0.03,
+        "sustain": 0.65,
+        "release": 0.08,
+        "hcutoff": 1200,
+        "hresonance": 3,
+        "pan": 0.8
+      }
+    }
+  ]
+}

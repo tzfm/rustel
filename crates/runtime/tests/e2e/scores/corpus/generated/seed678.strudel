@@ -1,0 +1,9 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 12
+*/
+// parity fuzz case seed=678 cycles=18 bpm=76
+setcpm(76/4)
+all(x => x.room(0.17))
+$: chord("<Am7 Dm>").voicing().s("triangle").duration(0.16)

@@ -1,0 +1,32 @@
+[package]
+name = "rustel-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Rust-owned audio backend: scalar renderer, effects, and device output"
+
+[features]
+default = []
+# Real device output is opt-in.
+# PulseAudio is enabled alongside CPAL's ordinary Linux host so WSLg can use
+# its native Pulse socket without routing through an ALSA compatibility shim.
+device-audio = ["dep:cpal", "cpal/pulseaudio"]
+# Deterministic device failures for dependent crates' integration tests.
+test-support = []
+
+[dependencies]
+# Partitioned FFT convolution for the generated-IR room reverb.
+# Plans and scratch are allocated at generation time on the producer side; the
+# audio callback only executes preplanned transforms.
+rustfft = "6"
+cpal = { version = "=0.18.2", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# MMCSS "Pro Audio" registration for the output callback's thread.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

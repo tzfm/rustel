@@ -1,0 +1,350 @@
+/*
+  @title Mario theme
+  @by Flowhacker Original song composed by Koji Kondo
+  @origin songs-awesome
+  @duration 4
+*/
+setcpm(200/4)
+
+const muteSquare1 = false;
+const muteSquare2 = false;
+const muteTriangle = false;
+const muteNoise = false;
+
+let whitenoise = 
+  stack(
+    sound("pink").decay(.03).velocity(3.2),
+    sound("white").struct("- x").fast(2).decay(.02),
+    sound("white").struct("- - - x").lpf(2000).fast(2).decay(.01),
+    sound("white").struct("- - x -").hpf(400).decay(.12)
+    )
+
+let whitenoise_bridge = 
+  stack(
+    sound("white").struct("- <- x> <<x -> <- x>> <- <- x>>").fast(2).decay(.04),
+    sound("white").struct("x [- x] - <x ->").hpf(400).decay(.14)
+    )
+
+if (muteNoise) {
+  whitenoise = whitenoise.postgain(0)
+  whitenoise_bridge = whitenoise_bridge.postgain(0)
+}
+
+// === === === === === === === === === === === === === === === === === === ===
+// Intro
+// === === === === === === === === === === === === === === === === === === ===
+const square1_intro = `<
+[[E E] [- E] [- C] [E -]]
+  [[G -] [- -] [G2 -] [- -]] 
+>`.add("24")
+
+const square2_intro = `<
+  [[Gb2 Gb2] [- Gb2] [- Gb2] [Gb2 -]]
+  [[B2 -] [- -] [- -] [- -]] 
+>`.add("24")
+
+const triangle_intro = `<
+  [[D D] [- D] [- D] [D -]]
+  [[G4 -] [- -] [G -] [- -]] 
+>`
+
+// === === === === === === === === === === === === === === === === === === ===
+// PART A
+// === === === === === === === === === === === === === === === === === === ===
+const square1_A = `<
+  [[C4 -] [- G] - [E -]]
+  [[- A] [- B] [- Bb] [A -]] 
+  [[G E4 G4] [[A4@3 -] [F4 G4]]]
+  [[- E4] [- C4] [D4 B] -]
+>`.add("12")
+
+
+const square2_A = `<
+  [[E -] [- C] - [G2 -]]
+  [[- C] [- D] [- Db] [C -]]
+  [[C G B] [[C4@3 -] [A B]]]
+  [[- A] [- E] [F D] -]
+>`.add("12")
+
+const triangle_A = `<
+  [[G -] [- E] - [C -]]
+  [[- F] [- G] [- Gb] [F -]] 
+  [[E C4 E4] [[F4@3 -] [D4 E4]]]
+  [[- C4] [- A] [B G] -]
+>`
+
+// === === === === === === === === === === === === === === === === === === ===
+// PART B-1
+// === === === === === === === === === === === === === === === === === === ===
+const square1_B = `<
+  [- [G F#] [F D#] [- E]]
+  [[- Ab2] [A2 C] [- A2] [C D]] 
+  [- [G F#] [F D#] [- E]]
+  [[- C4] [- C4] [C4 -] -]
+>`.add("24")
+
+const square2_B = `<
+  [- [E Eb] [D B2] [- C]]
+  [[- E2] [F2 G2] [- C2] [E2 F2]] 
+  [- [E Eb] [D B2] [- C]]
+  [[- F] [- F] [F -] -]
+>`.add("24")
+
+const triangle_B = `<
+  [[C -] [- G] [- -] [C4 -]]
+  [[F -] [- C4] [C4 -] [F -]] 
+  [[C -] [- G] [- B] [C4 -]]
+  [[- G5] [- G5] [G5 -] [G -]]
+>`
+
+// === === === === === === === === === === === === === === === === === === ===
+// PART B-2
+// === === === === === === === === === === === === === === === === === === ===
+const square1_B2 = `<
+  [- [G F#] [F D#] [- E]]
+  [[- Ab2] [A2 C] [- A2] [C D]] 
+  [[- -] [D# -] [- D] -]
+  [C - - -]
+>`.add("24")
+
+const square2_B2 = `<
+  [- [E Eb] [D B2] [- C]]
+  [[- E2] [F2 G2] [- C2] [E2 F2]] 
+  [[- -] [G#2 -] [- F2] -]
+  [E2 - - - ]
+>`.add("24")
+
+const triangle_B2 = `<
+  [[C -] [- G] [- -] [C4 -]]
+  [[F -] [- C4] [C4 -] [F -]] 
+  [[C -] [Ab -] [- Bb] -]
+  [[C4 -] [- G] [G -] [C -]]
+>`
+
+// === === === === === === === === === === === === === === === === === === ===
+// PART C (bridge)
+// === === === === === === === === === === === === === === === === === === ===
+const square1_C = `<
+  [[C C] [- C] [- C] [D -]]
+  [[E C] [- A2] [G2 -] [- -]] 
+  [[C C] [- C] [- C] [D E]]
+  [-]
+>`.add("24")
+
+const square2_C = `<
+  [[Ab2 Ab2] [- Ab2] [- Ab2] [Bb2 -]]
+  [[G2 E2] [- E2] [C2 -] [- -]] 
+  [[Ab2 Ab2] [- Ab2] [- Ab2] [Bb2 G2]]
+  [-]
+>`.add("24")
+
+const triangle_C = `<
+  [[Ab2 -] [- Eb] [- -] [Ab -]]
+  [[G -] [- C] [- -] [G2 -]] 
+  [[Ab2 -] [- Eb] [- -] [Ab -]]
+  [[G -] [- C] [- -] [G2 -]] 
+>`
+
+
+// === === === === === === === === === === === === === === === === === === ===
+// PART C-2 (bridge)
+// === === === === === === === === === === === === === === === === === === ===
+const square1_C2 = `<
+  [[C C] [- C] [- C] [D -]]
+  [[E C] [- A2] [G2 -] [- -]] 
+  [[E E] [- E] [- C] [E -]]
+  [[G -] [- -] [G2 -] [- -]] 
+>`.add("24")
+
+const square2_C2 = `<
+  [[Ab2 Ab2] [- Ab2] [- Ab2] [Bb2 -]]
+  [[G2 E2] [- E2] [C2 -] [- -]] 
+  [[Gb2 Gb2] [- Gb2] [- Gb2] [Gb2 -]]
+  [[B2 -] [- -] [- -] [- -]] 
+>`.add("24")
+
+const triangle_C2 = `<
+  [[Ab2 -] [- Eb] [- -] [Ab -]]
+  [[G -] [- C] [- -] [G2 -]] 
+  [[D D] [- D] [- D] [D -]]
+  [[G4 -] [- -] [G -] [- -]] 
+>`
+
+// === === === === === === === === === === === === === === === === === === ===
+// PART D => Same as Part A
+// === === === === === === === === === === === === === === === === === === ===
+
+// === === === === === === === === === === === === === === === === === === ===
+// PART E
+// === === === === === === === === === === === === === === === === === === ===
+
+const square1_E = `<
+  [[E C] [- G2] [- -] [G#2 -]]
+  [[A2 F] [- F] [A2 -] [- -]] 
+  [[B2 A] [- A@2 -] [A@4 G@2] [- F]]
+  [[E C] [- A2] [G2 -] [- -]] 
+>`.add("24")
+
+const square2_E = `<
+  [[C G2] [- E2] [- -] [E2 -]]
+  [[F2 C] [- C] [F2 -] [- -]] 
+  [[G2 F] [- F@2 -] [F@4 E@2] [- D]]
+  [[C A2] [- F2] [E2 -] [- -]] 
+>`.add("24")
+
+const triangle_E = `<
+  [[C -] [- F#] [G -] [C4 -]]
+  [[F -] [F -] [C4 C4] [F -]] 
+  [[D -] [- F] [G -] [B -]]
+  [[G -] [G -] [C4 C4] [G -]] 
+>`
+
+// === === === === === === === === === === === === === === === === === === ===
+// PART E2
+// === === === === === === === === === === === === === === === === === === ===
+
+const square1_E2 = `<
+  [[E C] [- G2] [- -] [G#2 -]]
+  [[A2 F] [- F] [A2 -] [- -]] 
+  [[B2 F] [- F] [F@4 E@2] [- D]]
+  [[C -] [- -] [- -] [- -]] 
+>`.add("24")
+
+const square2_E2 = `<
+  [[C G2] [- E2] [- -] [E2 -]]
+  [[F2 C] [- C] [F2 -] [- -]] 
+  [[G2 D] [- D] [D@4 C@2] [- B2]]
+  [[G2 E2] [- E2] [C2 -] [- -]] 
+>`.add("24")
+
+const triangle_E2 = `<
+  [[C -] [- F#] [G -] [C4 -]]
+  [[F -] [F -] [C4 C4] [F -]] 
+  [[G -] [- G] [G - A] [- B@2]]
+  [[C4 -] [G -] [C -] [- -]] 
+>`
+
+// === === === === === === === === === === === === === === === === === === ===
+// STRUCTURE
+// === === === === === === === === === === === === === === === === === === ===
+$: arrange(
+  // === Intro ===
+   [2, stack(
+      sqr1Sound(square1_intro),
+      sqr2Sound(square2_intro),
+      triangleSound(triangle_intro),
+      whitenoise_bridge)._scope()],
+  // === Part A ===
+   [8, stack(
+      sqr1Sound(square1_A),
+      sqr2Sound(square2_A),
+      triangleSound(triangle_A),
+      whitenoise)._scope()],
+  // === Part B-1 ===
+   [4, stack(
+      sqr1Sound(square1_B),
+      sqr2Sound(square2_B),
+      triangleSound(triangle_B),
+      whitenoise)._scope()],
+  // === Part B-2 ===
+   [4, stack(
+      sqr1Sound(square1_B2),
+      sqr2Sound(square2_B2),
+      triangleSound(triangle_B2),
+      whitenoise
+   )._scope()],
+  // === Part B-3 (same as B) ===
+   [4, stack(
+      sqr1Sound(square1_B),
+      sqr2Sound(square2_B),
+      triangleSound(triangle_B),
+      whitenoise)._scope()],
+  // === Part B-4 (same as B-2) ===
+   [4, stack(
+      sqr1Sound(square1_B2),
+      sqr2Sound(square2_B2),
+      triangleSound(triangle_B2),
+      whitenoise
+   )._scope()],
+  // === Part C (bridge) ===
+   [4, stack(
+      sqr2Sound(square1_C),
+      sqr2Sound(square2_C),
+      triangleSound(triangle_C),
+      whitenoise_bridge)._scope()],
+  // === Part C-2 (bridge) ===
+   [4, stack(
+      sqr1Sound(square1_C2),
+      sqr2Sound(square2_C2),
+      triangleSound(triangle_C2),
+      whitenoise_bridge)._scope()],
+  // === Part D (same as A) ===
+   [8, stack(
+      sqr1Sound(square1_A),
+      sqr2Sound(square2_A),
+      triangleSound(triangle_A),
+      whitenoise)._scope()],
+  // === Part E ===
+   [4, stack(
+      sqr1Sound(square1_E),
+      sqr2Sound(square2_E),
+      triangleSound(triangle_E),
+      whitenoise)._scope()],
+  // === Part E-2 ===
+   [4, stack(
+      sqr1Sound(square1_E2),
+      sqr2Sound(square2_E2),
+      triangleSound(triangle_E2),
+      whitenoise)._scope()],
+  // === Part E-3 (same as E) ===
+   [4, stack(
+      sqr1Sound(square1_E),
+      sqr2Sound(square2_E),
+      triangleSound(triangle_E),
+      whitenoise)._scope()],
+  // === Part E-4 (same as E-2) ===
+   [4, stack(
+      sqr1Sound(square1_E2),
+      sqr2Sound(square2_E2),
+      triangleSound(triangle_E2),
+      whitenoise)._scope()],
+  // === Part F (brige, same as C) ===
+   [4, stack(
+      sqr1Sound(square1_C),
+      sqr2Sound(square2_C),
+      triangleSound(triangle_C),
+      whitenoise_bridge)._scope()],
+  // === Part F-2 (brige, same as C-2) ===
+   [4, stack(
+      sqr1Sound(square1_C2),
+      sqr2Sound(square2_C2),
+      triangleSound(triangle_C2),
+      whitenoise_bridge)._scope()],
+  // === Part G (same as E) ===
+   [4, stack(
+      sqr1Sound(square1_E),
+      sqr2Sound(square2_E),
+      triangleSound(triangle_E),
+      whitenoise)._scope()],
+  // === Part G-2 (same as E-2) ===
+   [4, stack(
+      sqr1Sound(square1_E2),
+      sqr2Sound(square2_E2),
+      triangleSound(triangle_E2),
+      whitenoise)._scope()],
+)
+
+function sqr1Sound(x){
+  if (muteSquare1) return note(x).gain(0);
+  return note(x).s("square").clip("0.7").release(0).crush(4).gain(0.3);
+}
+
+function sqr2Sound(x){
+  if (muteSquare2) return note(x).gain(0);
+  return note(x).s("square").clip("0.7").release(0).crush(4).gain(0.3);
+}
+
+function triangleSound(x){
+  if (muteTriangle) return note(x).gain(0);
+  return note(x).s("triangle").clip("0.7").decay(0.9).crush(8).gain(0.8);
+}

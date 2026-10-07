@@ -1,0 +1,9 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 12
+*/
+// parity fuzz case seed=600 cycles=19 bpm=96
+setcpm(96/4)
+$: s("bd cr sd:0 [cb [lt cr:0 rd*2 cr sd:1 mt] <cr hh bd> cp hh <cp mt>? <mt ht> oh?] <cp ~ hh>").accelerate(-0.17).room(0.13).octave(12)
+$: s("bd rim cr*2 cr sd*4 mt clap!2?").early(0.125).velocity(0.95).detune(0.17).lpf(4000)

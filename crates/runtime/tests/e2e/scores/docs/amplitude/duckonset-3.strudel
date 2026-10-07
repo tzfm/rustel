@@ -1,0 +1,9 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+// Rhythmic
+noise: s("pink").distort("2:1").orbit(4) // used rhythmically with 0.3 onset below
+hhat: s("hh*16").orbit(7)
+ducker: s("bd*4").bank("tr909").duckorbit("4:7").duckonset("0.3:0.003").duckattack(0.25)

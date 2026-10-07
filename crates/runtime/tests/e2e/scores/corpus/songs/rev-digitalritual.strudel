@@ -1,0 +1,81 @@
+/*
+  @by strudel community
+  @origin songs-community
+  @duration 4
+*/
+// ========================================
+// DIGITAL RITUAL
+// Black Metal/Industrial - Ultra Simple Version
+// Just paste this into https://strudel.cc/ and hit play!
+// ========================================
+
+setcps(0.7)
+
+stack(
+  // Relentless kicks
+  s("bd*4")
+    .crush(5)
+    .gain(1.3),
+
+  // Snare hits
+  s("~ sd ~ sd")
+    .crush(6)
+    .gain(1.0),
+
+  // Chaotic hi-hats
+  s("hh*8")
+    .crush(8)
+    .gain(0.3)
+    .degradeBy(0.2),
+
+  // Main black metal riff (tremolo picking)
+  n("0 0 3 1 0 -2 0 1")
+    .scale("E:phrygian")
+    .sound("sawtooth")
+    .lpf(1200)
+    .crush(4)
+    .fast(2)
+    .gain(0.9),
+
+  // Dissonant harmony
+  n("6 7 9 6 7 9 10 9")
+    .scale("E:phrygian")
+    .sound("square")
+    .lpf(900)
+    .crush(6)
+    .fast(2)
+    .gain(0.6),
+
+  // Sub bass
+  note("e1 ~ e1 ~ e1 e1 ~ ~")
+    .sound("sine")
+    .gain(1.1),
+
+  // 8-bit lead melody
+  n("7 5 3 5 7 8 10 8")
+    .scale("E:phrygian")
+    .add(24)
+    .sound("square")
+    .crush(7)
+    .delay(0.3)
+    .gain(0.7)
+)
+
+// ========================================
+// TRY THESE VARIATIONS:
+// ========================================
+
+// FASTER & HARSHER:
+// Change setcps(0.7) to setcps(1.0)
+// Change .crush(4) to .crush(8)
+
+// SLOWER & DOOMIER:
+// Change setcps(0.7) to setcps(0.4)
+// Add .slow(2) to the riffs
+
+// MORE CHAOTIC:
+// Add .degradeBy(0.5) to drums
+// Add .sometimes(x => x.transpose(7)) to riffs
+
+// STOP EVERYTHING:
+// hush()

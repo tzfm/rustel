@@ -1,0 +1,9 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 4
+*/
+// parity fuzz case seed=537 cycles=11 bpm=140
+setcpm(140/4)
+$: s("mt [bd@2 sd:1*4 rim? <mt clap oh> hh*4 [bd clap rd mt/2] <~ oh>] [<bd ht ht> hh [cr? rd rim sd cp lt] clap*2 sd cb cb*2] cr@2 [[oh mt lt] cb [hh cp ht sd cr rd*2]]").vowel("e").shape(0.44).FX(octave(12), chorus(0.54))
+$: n("1 3 4 2 6 1").scale("a:minor").add(4).add(2).often((x => x.gain(0.6))).bpf(900).bpenv(1)

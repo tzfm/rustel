@@ -1,0 +1,9 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+s("pulse").lpf(500).lfo({ depth: 4 }, 'lpf_mod')
+  .lfo({ c: "s" })
+  .diode(0.3)
+  .sometimes(x => x.lfo({ s: "8" }, 'lpf_mod'))

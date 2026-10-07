@@ -1,0 +1,43 @@
+{
+  "name": "catppuccin-latte",
+  "background": "#eff1f5",
+  "surface": "#e6e9ef",
+  "overlay": "#dce0e8",
+  "foreground": "#4c4f69",
+  "muted": "#8c8fa1",
+  "rule": "#bcc0cc",
+  "accent": "#8839ef",
+  "ok": "#40a02b",
+  "warn": "#b67418",
+  "error": "#d20f39",
+  "caret": "#4c4f69",
+  "selection": "#ccd0da",
+  "selection_text": "#4c4f69",
+  "mini": "#179299",
+  "mini_fill": null,
+  "event_mark": "tint",
+  "event_fade": 0.35,
+  "event": "#c71f9a",
+  "event_inactive": "#9ca0b0",
+  "playhead": "#1e66f5",
+  "grid": "#ccd0da",
+  "minimap": "#e6e9ef",
+  "minimap_viewport": "#bcc0cc",
+  "syntax": {
+    "text": "#4c4f69",
+    "comment": "#8c8fa1",
+    "string": "#40a02b",
+    "number": "#fe640b",
+    "punctuation": "#04a5e5",
+    "keyword": "#8839ef",
+    "function": "#1e66f5"
+  },
+  "meter": {
+    "low": "#40a02b",
+    "mid": "#179299",
+    "high": "#b67418",
+    "peak": "#d20f39",
+    "track": "#dce0e8",
+    "fader": "#4c4f69"
+  }
+}

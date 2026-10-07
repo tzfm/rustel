@@ -1,0 +1,12 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+midimaps({ mymap: {
+  lpf: { ccn: 74, min: 0, max: 20000, exp: 0.5 }
+}})
+$: note("c a f e")
+.lpf(sine.slow(2).range(400,2000))
+.midimap('mymap')
+.midi()

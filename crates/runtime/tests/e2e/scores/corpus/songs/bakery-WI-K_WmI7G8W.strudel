@@ -1,0 +1,45 @@
+/*
+  @by strudel community bakery
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?WI-K_WmI7G8W
+*/
+/*
+  @title Entering the lobby 
+  @by BuboBubo
+  @details Testing Strudel :)
+*/
+
+let chord_prog = "{Cm7 Dm7 Cm7 EbM7}%4"
+
+p1: s("<bd [bd!2]> sd").bank("RolandMT32")
+
+p3: s("~ hh ~ hh*2").bank("RolandMT32")
+  .delay(1/2).delayt(1/8).delayfb(0.5)
+  .gain("0.5 0.3 0.25 0.5")
+
+p5: note("{C3 ~ C4 <C3 C2>@4 C3}%8")
+  .sound("gm_acoustic_bass")
+  .shape(0.3).room(0.2)
+
+p2: chord(chord_prog.slow(4))
+  .sustain(2).room(0.5).size(4)
+  .vib(1/4).vibmod(1/8).voicing()
+  .s("gm_celesta:4")
+  .superimpose(n=> n
+    .add(note(12))
+    .gain(0.4).delay(0.5)
+    .delayt(1/4).delayfb(.5)
+    .arp("0 1 2 3".fast(2)
+         .sometimes(rev)
+         .fast(2)))
+
+p4: chord(chord_prog.slow(4)).voicing()
+  .arp("{0? 3? 2? 4? 5?}%8").room(0.5)
+  .sometimesBy(.2, n=> n
+    .add(note("12"))
+    .vib(8).vibmod(0.25)
+  )
+  .add(note(12)).s("gm_reed_organ:2")
+
+// @version 1.0

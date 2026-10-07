@@ -1,0 +1,40 @@
+  File  Edit  Scene  Transport  View  Options  Help                                                                                                   
+ ◉ rustel STOPPED ✓ ready   120.0 bpm · 0.50 cps · cycle 0.00                                 setxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx ▸ first 
+  1 first                                                                                                                                             
+  1 $: s("bd")                                                                                                                                        
+  2                                                                                                                                                   
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+── mixer ──▶ master gain 0.0 dB───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ master   orbit 1   ⌁ no midi                                                                                                                         
+                    ▣ no gamepad                                                                                                                      
+                                                                                                                                                      
+             ·                                                                                                                                        
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+                                                                                                                                                      
+ 0.0 dB   -inf                                                                                                                                        
+ ←/→ strip · ↑/↓ fader · Tab the score's faders · 0 unity · e top/bottom · +/- size · Esc back                                                        
+ mixer: ←/→ strip · ↑/↓ fader · 0 unity · e top/bottom · Esc back to the score · F4 … 1,1                                                       0.0dB 
+ ♪ no output  ⌁ no midi                                                                                      MASTER ^⇧Up/^⇧Down       pk  --  LUFS -- 

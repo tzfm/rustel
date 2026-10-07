@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 2
+*/
+s("wt_digital_basique").note("c3").wtattack(0.05).wtdecay(0.3).wtsustain(0.2).seg(4)

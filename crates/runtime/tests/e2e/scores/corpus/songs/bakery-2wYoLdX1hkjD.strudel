@@ -1,0 +1,42 @@
+/*
+  @by strudel community bakery
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?2wYoLdX1hkjD
+*/
+/*
+  @title Acid Wasteland
+  @by BuboBubo
+  @details Acid pattern with lots of distortion and delay!
+*/
+
+setcps(0.57)
+let ground = s("bd(<4 4 4 5 4 4 4 7>/4,8)")
+  .bank("RolandTR909").distort(0.4)
+  .gain(0.4).shape(0.7)
+let high_up = s("~ ~ oh ~".fast("<2 4>/2"))
+  .gain("0.3").pan(perlin).room(0.2)
+  .orbit(2).bank("RolandTR909")
+let snare = s("~ sd").bank("RolandTR909").shape(0.5)
+   .every(3, n=>n.sound("~ cp").gain(0.7))
+let hats = s("hh(<12 14 12 16>/4,16)").bank("RolandTR909")
+  .sometimesBy(0.1, ply(2))
+let synth = note("<[C1 G3 C2 C3]*4 [A2 G3 A2 A3]*4>/4".fast("<2 2 4>/4"))
+  .every(5, ply("2|1")).s("square").lpf(sine.range(200, 2500).slow(2)).lpenv(3)
+  .lpattack(0.01).lpdecay("0.6 0.5 0.3 0.2").lpq(sine.range(10, 25).slow(4))
+  .fmi("1 1 2").fmh("1 0.5 2 4").every(3, n=>n.sound("square")).pan("[0,1]")
+let synth2 = synth
+  .rarely(n=>n.add(note("{0 5 7 10 12}%8")))
+  .sometimes(add(note("12|-12"))).sound("sawtooth")
+  .lpf(sine.range(400, 3000).slow(4))
+  .fast(2).pan(perlin).orbit(4).room(0.5)
+  .delay(0.5).delayt(1/8).delayfb(perlin)
+  .size(2).gain(0.6).fmi(sine.range(2, 12).slow(8))
+
+stack(
+  ground.slow("<2 2 1 1>/2"), 
+  high_up, snare, hats,
+  synth, synth2.slow(2),
+)
+
+// @version 1.0

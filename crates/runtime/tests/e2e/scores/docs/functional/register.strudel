@@ -1,0 +1,9 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+const vlpf = register('vlpf', (freq, pat) => {
+  return pat.fmap((v) => ({...v, cutoff: freq * (v.velocity ?? 1) }));
+})
+s("saw").seg(8).velocity(rand).vlpf(800)

@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+// it can also work with frequency values directly
+freq("200 300 400").ftrans("<0 7:31 7>")

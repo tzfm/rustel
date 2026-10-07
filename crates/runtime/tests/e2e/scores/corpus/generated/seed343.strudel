@@ -1,0 +1,9 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 4
+*/
+// parity fuzz case seed=343 cycles=11 bpm=90
+setcpm(90/4)
+$: s("bd*2 hh*4 lt ht <lt ht> hh:1").bank("RolandTR909").euclid(5,8).often((x => x.palindrome())).palindrome()
+$: s("[[cr:2 ~ rim] hh*4 sd!2 [sd cr rim sd oh? hh sd hh]*2 cp hh:3 cr:1]? cr hh <lt mt> <rim hh ht> oh").bank("RolandTR808").euclid(11,16).fit().FX(delaysync(0.375), phaser(0.53), delayfeedback(0.26))

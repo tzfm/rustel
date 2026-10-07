@@ -1,0 +1,9 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 12
+*/
+// parity fuzz case seed=767 cycles=11 bpm=160
+setcpm(160/4)
+all(x => x.gain(0.18))
+$: s("[<rim rim lt> ht cr:0 [bd ht sd:1 ht ~ cp hh bd?] mt <sd mt mt>] cr:0? cp? oh*4").bank("tr909").swing(2).squiz(1)

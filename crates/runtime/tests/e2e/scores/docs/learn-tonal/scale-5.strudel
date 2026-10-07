@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+note("C1*16").transpose(irand(36)).scale('Cb2 major').scaleTranspose(3)

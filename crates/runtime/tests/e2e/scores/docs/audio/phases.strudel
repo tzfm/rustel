@@ -1,0 +1,9 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+// Phase cancellation
+s("saw").seg(8).n(irand(12)).scale("G#1:minor")
+  .partials(partials([1, 1, 1]))
+  .superimpose(x => x.phases([0.5, 0.5, 0.5]))

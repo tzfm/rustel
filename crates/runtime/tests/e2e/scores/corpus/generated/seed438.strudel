@@ -1,0 +1,8 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 4
+*/
+// parity fuzz case seed=438 cycles=12 bpm=90
+setcpm(90/4)
+$: n(irand(9)).scale("a:minor").decay(0.249).release(0.521).vib(5).vibmod(2)

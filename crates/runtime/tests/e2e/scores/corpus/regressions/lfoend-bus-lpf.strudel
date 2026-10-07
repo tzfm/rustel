@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+s("ht*16").lpf(800).lfo({s: 8, dr: 2, c: "lpf"})

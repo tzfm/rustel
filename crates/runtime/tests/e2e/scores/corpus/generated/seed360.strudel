@@ -1,0 +1,8 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 4
+*/
+// parity fuzz case seed=360 cycles=7 bpm=174
+setcpm(174/4)
+$: s("gm_epiano1")

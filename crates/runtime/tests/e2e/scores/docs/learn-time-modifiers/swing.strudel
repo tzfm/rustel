@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+s("hh*8").swing(4)
+// s("hh*8").swingBy(1/3, 4)

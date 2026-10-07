@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 3
+*/
+note("c3 e3 g3").s("gm_piano").seg(4)

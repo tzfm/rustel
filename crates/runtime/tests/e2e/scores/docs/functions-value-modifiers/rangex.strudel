@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+s("[bd sd]*2,hh*8")
+.cutoff(sine.rangex(500,4000))

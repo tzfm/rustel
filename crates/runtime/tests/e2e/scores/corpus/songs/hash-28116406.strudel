@@ -1,0 +1,25 @@
+/*
+  @by awesome-strudel
+  @origin songs-awesome
+  @duration 4
+*/
+// @title Kraid's Lair
+// @by Hirokazu Tanaka
+// transcribed @by tzwaan
+
+setCpm(224/3)
+
+$:note("<e2@2[c2 d2]*2[e2 f#2 f2 b1]*4@2[e2 b2 c3 b2 c2 g2 a2 b2]*2 e1>/8"
+.add.out("<[0 12 _]!24[0 12 24]!16[0 _ 0]!8 0@8>")).s("tri")
+.gain(.7).crush(5).postgain(1.4)
+._scope()
+
+$:note(`<
+[<0 3 1 -3>_<-3 -2 -1 -3b>]*16@2
+[<2 0 1 3>_<-1 -3 -1 0>]*8
+[[2 -3]*3[3# 0]*3[3 -2]*3[3 -1# 1 -1# 4 -1#]]*4@2
+[1 2 3 4 6 4 8 6 3 2 1 6 10 8 6 3 2 1 0 2 3 6 7 -]*2
+[10 9 8 7 8 9]*4
+>/8`).scale("e4:minor").s("sqr").jux(x => x.late(".17"))
+.gain(.7).crush(4).postgain(1.2)
+._scope()

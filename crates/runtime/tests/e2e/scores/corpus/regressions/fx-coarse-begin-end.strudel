@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+s("bd sd").FX(coarse(8), begin(0.23), end(0.71))

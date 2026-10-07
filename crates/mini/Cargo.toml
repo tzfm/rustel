@@ -1,0 +1,17 @@
+[package]
+name = "rustel-mini"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Mini-notation parser and pattern compiler"
+
+# Hand-written krill parser.
+
+[dependencies]
+rustel-core = { path = "../core" }
+rustel-fraction = { path = "../fraction" }
+
+[dev-dependencies]
+serde_json = "1"

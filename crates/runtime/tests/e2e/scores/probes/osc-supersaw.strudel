@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 2
+*/
+s("supersaw").note("c2 g2").spread(0.8).detune(0.4).seg(4)

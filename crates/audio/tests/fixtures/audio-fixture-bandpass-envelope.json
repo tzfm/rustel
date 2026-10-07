@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "id": "sawtooth-bandpass-envelope",
+  "events": [
+    {
+      "time_seconds": 0.25,
+      "duration_seconds": 0.6,
+      "value": {
+        "s": "sawtooth",
+        "freq": 165,
+        "gain": 0.55,
+        "bandf": 900,
+        "bandq": 4,
+        "bpenv": 2.5,
+        "bpattack": 0.01,
+        "bpdecay": 0.15,
+        "bpsustain": 0.2,
+        "bprelease": 0.1,
+        "pan": 0.5
+      }
+    }
+  ]
+}

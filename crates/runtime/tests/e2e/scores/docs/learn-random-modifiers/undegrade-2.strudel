@@ -1,0 +1,9 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+s("hh*10").layer(
+  x => x.degrade().pan(0),
+  x => x.undegrade().pan(1)
+)

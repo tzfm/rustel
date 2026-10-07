@@ -1,0 +1,8 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 12
+*/
+// parity fuzz case seed=605 cycles=21 bpm=84
+setcpm(84/4)
+$: s("bd:3 ht cp <hh ~>? oh hh").bank("tr909").euclid(3,8).chunk(3, (x => x.degrade())).often((x => x.palindrome())).vowel("o")

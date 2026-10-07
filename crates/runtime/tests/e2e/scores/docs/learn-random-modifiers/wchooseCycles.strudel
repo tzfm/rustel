@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+wchooseCycles(["bd",10], ["hh",1], ["sd",1]).s().fast(8)

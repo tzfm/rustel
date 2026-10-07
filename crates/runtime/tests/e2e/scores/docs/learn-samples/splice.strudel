@@ -1,0 +1,8 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+samples('github:tidalcycles/dirt-samples')
+s("breaks165")
+.splice(8,  "0 1 [2 3 0]@2 3 0@2 7")

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "triangle-default-adsr",
+  "events": [
+    {
+      "time_seconds": 0.25,
+      "duration_seconds": 0.5,
+      "value": {
+        "s": "triangle",
+        "note": "c4",
+        "gain": 0.35,
+        "pan": 0.5
+      }
+    }
+  ]
+}

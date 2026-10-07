@@ -1,0 +1,7 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+samples('https://strudel.b-cdn.net/uzu-wavetables.json', 'https://strudel.b-cdn.net/uzu-wavetables/')
+s("basique").bank("wt_digital").seg(8).note("F1").warp("0 0.25 0.5 0.75 1")

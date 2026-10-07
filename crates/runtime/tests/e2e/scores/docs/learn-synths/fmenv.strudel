@@ -1,0 +1,11 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+note("c e g b g e")
+.fm(4)
+.fmdecay(.2)
+.fmsustain(0)
+.fmenv("<exp lin>")
+._scope()

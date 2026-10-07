@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "id": "sine-gain-velocity-postgain-pan",
+  "events": [
+    {
+      "time_seconds": 0.25,
+      "duration_seconds": 0.5,
+      "value": {
+        "s": "sine",
+        "freq": 330,
+        "gain": 0.4,
+        "velocity": 0.5,
+        "postgain": 0.8,
+        "attack": 0.02,
+        "decay": 0.03,
+        "sustain": 0.3,
+        "release": 0.1,
+        "pan": 0.125
+      }
+    }
+  ]
+}

@@ -1,0 +1,314 @@
+name: Heavy checks
+
+# Called from the same trusted revision as heavy.yml. The caller grants read
+# cache access for PR code and write access only when testing main.
+on:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+      sha:
+        type: string
+        required: true
+      pr_number:
+        type: string
+        default: ''
+      save_cache:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_OPT_LEVEL: "1"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  corpus:
+    name: Corpus (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include: &platforms
+          - name: Linux x64
+            runner: ubuntu-latest
+            jobs: "4"
+          - name: macOS Apple Silicon
+            # macos-14 retired on 2026-11-02 with brownouts through October
+            # (actions/runner-images#13518); macos-15 is the same arm64
+            # image, actively supported.
+            runner: macos-15
+            jobs: "3"
+          - name: Windows x64
+            runner: windows-2022
+            jobs: "4"
+    runs-on: ${{ matrix.runner }}
+    concurrency:
+      group: ${{ github.workflow }}-corpus-${{ matrix.name }}-${{ inputs.pr_number || github.ref }}
+      cancel-in-progress: true
+    # A cold release build with fat LTO.
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: ${{ matrix.jobs }}
+    # Every `run` below is POSIX, and Windows runners default to pwsh.
+    defaults:
+      run:
+        shell: bash
+
+    # No disk cleanup and no Vulkan driver, unlike the check job: a release
+    # build of the runtime is a fraction of the debug test binaries, and the
+    # corpus renders audio only.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - &git-bash
+        name: Put Git Bash ahead of WSL's bash on PATH
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $git = (Get-Command git -ErrorAction SilentlyContinue).Source
+          if (-not $git) {
+            throw "git is not on PATH, so Git Bash cannot be located. Install Git for Windows on this runner."
+          }
+          $root = Split-Path (Split-Path $git)
+          $bash = Join-Path $root 'bin\bash.exe'
+          if (-not (Test-Path $bash)) {
+            throw "Found git at $git but no bash at $bash. Install the full Git for Windows."
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $bash)
+          Write-Host "Git Bash: $bash"
+      - name: Confirm checked-out SHA
+        env:
+          EXPECTED_SHA: ${{ inputs.sha }}
+        run: |
+          actual=$(git rev-parse HEAD)
+          if [ "$actual" != "$EXPECTED_SHA" ]; then
+            echo "::error::PR head moved from $EXPECTED_SHA to $actual; dispatch again."
+            exit 1
+          fi
+          printf 'Checked out `%s`\n' "$actual" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      # Without the Visual Studio C++ tools, rustc falls back to a bare PATH
+      # search and Git Bash's coreutils `link` answers with a spurious
+      # `extra operand`. Probe once and name the repair.
+      - &msvc-probe
+        name: Prove the MSVC linker works before the first build
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $probe = Join-Path $env:RUNNER_TEMP "link-probe-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT.rs"
+          Set-Content -Path $probe -Value 'fn main() {}' -Encoding ascii
+          & rustc --edition 2021 -C debuginfo=0 -o "$probe.exe" $probe
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::rustc cannot link with MSVC's link.exe. Repair this runner with: winget install Microsoft.VisualStudio.2022.BuildTools --override `"--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended`". A `link: extra operand` message above means Git Bash's coreutils link answered instead of MSVC's."
+            exit 1
+          }
+          Remove-Item $probe, "$probe.exe" -ErrorAction SilentlyContinue
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ inputs.save_cache }}
+
+      - name: Install Linux audio build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
+            sudo apt-get update
+            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev
+          fi
+
+      # Portable runs before `auto` so that a host-dependent kernel difference
+      # is answered by the result beside it. A cache entry per platform (its
+      # path differs by OS) instead of six cold CDN pulls a run; a stale entry
+      # is safe because the loader re-checks every file's sha256.
+      - name: Restore the corpus sample cache
+        id: corpus-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/rustel-corpus-sample-cache
+          key: rustel-corpus-samples-v1-${{ hashFiles('crates/runtime/tests/e2e/**') }}
+          restore-keys: rustel-corpus-samples-v1-
+
+      # `RUSTEL_SAMPLE_CACHE` is per-step because the `runner` context is not
+      # available in the job's `env`. The hosted cache carries the samples.
+      - name: Run corpus suite with portable engine kernels
+        env:
+          RUSTEL_E2E_ACCELERATION: portable
+          RUSTEL_SAMPLE_CACHE: ${{ runner.temp }}/rustel-corpus-sample-cache
+          TMPDIR: ${{ runner.temp }}/rustel-test-tmp-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          mkdir -p "$TMPDIR" "$RUSTEL_SAMPLE_CACHE"
+          bash .github/scripts/cargo-ci.sh test --release -p rustel-runtime --test e2e
+
+      - name: Run corpus suite
+        env:
+          RUSTEL_E2E_ACCELERATION: auto
+          RUSTEL_SAMPLE_CACHE: ${{ runner.temp }}/rustel-corpus-sample-cache
+          TMPDIR: ${{ runner.temp }}/rustel-test-tmp-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          mkdir -p "$TMPDIR" "$RUSTEL_SAMPLE_CACHE"
+          bash .github/scripts/cargo-ci.sh test --release -p rustel-runtime --test e2e
+
+      - name: Save the corpus sample cache
+        if: inputs.save_cache && steps.corpus-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/rustel-corpus-sample-cache
+          key: ${{ steps.corpus-cache.outputs.cache-primary-key }}
+
+      # The goldens must be captured on the platform that gates them.
+      - name: Keep the actual goldens when the corpus disagrees
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-actual-${{ runner.os }}
+          path: crates/runtime/tests/e2e/golden/*.actual
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # The studio's end-to-end suite paints a real `App` into a test backend, so
+  # a TUI regression fails on the screen that it changes. CI runs the suite
+  # only here; the check job excludes it. The suite uses the default feature
+  # sets of the studio and the runtime, and `pty_smoke` drives the
+  # default-features binary. It has its own job because it is serial and slow,
+  # and so that a failure here does not hide the check job's result.
+  studio:
+    name: Studio (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include: *platforms
+    runs-on: ${{ matrix.runner }}
+    concurrency:
+      group: ${{ github.workflow }}-studio-${{ matrix.name }}-${{ inputs.pr_number || github.ref }}
+      cancel-in-progress: true
+    # A cold debug build of the suite on a hosted macOS or Windows runner, where
+    # linking is slowest; the Linux leg has finished in about a quarter of it.
+    timeout-minutes: 60
+    # Every `run` below is POSIX, and Windows runners default to pwsh.
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      # Run this before any Bash step so Windows uses Git Bash instead of WSL.
+      - *git-bash
+      - name: Confirm checked-out SHA
+        env:
+          EXPECTED_SHA: ${{ inputs.sha }}
+        run: |
+          actual=$(git rev-parse HEAD)
+          if [ "$actual" != "$EXPECTED_SHA" ]; then
+            echo "::error::PR head moved from $EXPECTED_SHA to $actual; dispatch again."
+            exit 1
+          fi
+          printf 'Checked out `%s`\n' "$actual" >> "$GITHUB_STEP_SUMMARY"
+
+      # The suite links test binaries larger than the stock hosted image has
+      # room for.
+      - name: Make room on the hosted Linux image
+        if: runner.os == 'Linux' && runner.environment == 'github-hosted'
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - *msvc-probe
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ inputs.save_cache }}
+
+      # The suite links the default features of the studio and the runtime.
+      # These include `gamepad` (gilrs, so libudev) and `hydra` (wgpu, so a
+      # Vulkan device), not only the audio stack. Without an ICD, the
+      # Hydra-backed panels find no device and their assertions skip. The job
+      # then passes without the coverage that it exists for.
+      - name: Install Linux build and render dependencies
+        if: runner.os == 'Linux'
+        run: |
+          if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
+            sudo apt-get update
+            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev
+          fi
+          if ! dpkg -s mesa-vulkan-drivers >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes mesa-vulkan-drivers
+          fi
+
+      # The check job's sample-cache step, for the check job's reason: every
+      # hermetic fixture pins a fresh temporary config home, so the cache
+      # beside the configuration is empty per test, and each test would queue
+      # the walk of the folder it drops behind the pinned default-manifest
+      # pulls on the one FIFO manifest worker. A stale entry is safe: the
+      # loader re-checks every file against its pinned sha256.
+      - name: Restore the studio sample cache
+        id: studio-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/rustel-studio-sample-cache
+          key: rustel-studio-samples-v1-${{ hashFiles('crates/runtime/assets/sample-banks.json', 'crates/runtime/assets/gm-fonts.json') }}
+          restore-keys: rustel-studio-samples-v1-
+
+      # The pty suites (`pty_smoke` and `pty_alt_chords`) drive the shipped
+      # binary, not the library. They look for `target/debug/rustel` and fail
+      # when it is absent. Build the binary here, with default features, so
+      # that a missing binary does not fail the suites.
+      - name: Build the product binary the pty suite drives
+        run: bash .github/scripts/cargo-ci.sh build -p rustel
+
+      # The suite opens real engines on the headless `silent` output and
+      # asserts on what the terminal would have painted, serially: each
+      # test's studio holds the process-global audio tripwire and
+      # environment, so parallel tests would contend for both.
+      #
+      # `--features pty`, not `--all-features`: `pty` is what compiles
+      # `pty_smoke` in at all, and `demo` is deliberately left out so a test
+      # run never builds the video renderer.
+      - name: Run studio e2e suite
+        env:
+          # Per-step, as in the corpus job; hosted cache carries these files.
+          RUSTEL_SAMPLE_CACHE: ${{ runner.temp }}/rustel-studio-sample-cache
+          TMPDIR: ${{ runner.temp }}/rustel-studio-e2e-tmp-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          mkdir -p "$TMPDIR" "$RUSTEL_SAMPLE_CACHE"
+          bash .github/scripts/cargo-ci.sh test -p rustel-studio-e2e --features pty -- --test-threads=1
+
+      - name: Save the studio sample cache
+        if: inputs.save_cache && steps.studio-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/rustel-studio-sample-cache
+          key: ${{ steps.studio-cache.outputs.cache-primary-key }}
+
+      # A golden failure writes <name>.actual beside the golden; the printed
+      # screens live in the test output. Upload both so the diff needs no
+      # local rerun.
+      - name: Upload golden failures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: studio-e2e-golden-failures-${{ matrix.name }}
+          path: crates/studio-e2e/goldens/**/*.actual
+          if-no-files-found: ignore
+          retention-days: 14

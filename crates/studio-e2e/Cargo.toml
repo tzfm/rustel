@@ -1,0 +1,66 @@
+[package]
+name = "rustel-studio-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "End-to-end suite that drives headless studios and compares their screens with goldens"
+
+[dependencies]
+rustel-studio = { path = "../studio", features = ["harness"] }
+# Session files and the product's paths, which the fixtures name directly.
+rustel-runtime = { path = "../runtime", features = ["session-log"] }
+# The engine refuses to open even the `silent` output unless the process
+# allocator is the audio-callback tripwire (the callback must be provably
+# allocation-free, and only a binary can install a global allocator). Every
+# test binary in this crate installs it; see the harness docs.
+rustel-audio = { path = "../audio" }
+
+# Golden comparisons print a unified diff on failure, the way the corpus
+# suite's do. A dependency, not a dev-dependency: the fixture library's
+# `assert_golden` lives in `src/lib.rs`, which tests import.
+similar = "2"
+
+# The demo renderer reads the harness's frame recordings (JSON lines) and
+# draws the banner text into its frames. Both are workspace-pin-level
+# choices: `serde_json` is the runtime's own serialization crate, and
+# `font8x8` is a dependency-free 8×8 bitmap font - no network font, no
+# system font probe.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+font8x8 = "0.3"
+
+# `image` writes the animated-GIF fallback for a machine without ffmpeg;
+# the same crate and features the runtime pins, so the lockfile does not
+# grow a second copy of the decoder stack. The mp4 itself is encoded by
+# the ffmpeg already on the musician's machine - see `encode_mp4` - which
+# keeps this crate free of an encoder stack.
+image = { version = "=0.25.10", default-features = false, features = ["gif"] }
+
+portable-pty = { version = "0.8", optional = true }
+tempfile = "3"
+
+# Key events in tests. The same crate the studio uses, pinned to the same
+# version through the workspace - the harness sends exactly what a terminal
+# would.
+crossterm = "0.29"
+
+[features]
+default = []
+# `pty`: drive the real `rustel studio` binary under a pseudo-terminal. The
+# in-process suite never needs it; CI turns it on so the binary itself is
+# exercised, not only the library it links.
+pty = ["dep:portable-pty"]
+
+# The demo renderer. Off by default so a plain `cargo test` never builds
+# it; `cargo run -p rustel-studio-e2e --features demo --bin e2e-demo`.
+demo = []
+
+[[bin]]
+name = "e2e-demo"
+path = "src/bin/e2e-demo.rs"
+required-features = ["demo"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(pty_available)'] }

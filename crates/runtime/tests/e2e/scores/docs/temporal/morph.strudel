@@ -1,0 +1,10 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+sound("hh").struct(morph([1,0,1,0,1,0,1,0], // straight rhythm
+                         [1,1,0,1,0,1,0], // wonky rhythm
+                         0.25 // creates a slightly wonky rhythm
+                        )
+                  )

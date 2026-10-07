@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+setMaxPolyphony(4)
+n(irand(24).seg(8)).scale("C#3:minor").room(1).release(4).gain(0.5)

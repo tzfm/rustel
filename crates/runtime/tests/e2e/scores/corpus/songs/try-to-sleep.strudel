@@ -1,0 +1,25 @@
+/*
+  @title Try to sleep
+  @by diegodorado
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?lnvHYrnxwwv-
+*/
+//@title Try to sleep
+//@by diegodorado
+
+let chords =("<[C|C9] Am7 FM7 <Dm9 Dm11>>")
+$: n(run("[6,3,12]"))
+  .chord(chords)
+  .gain(0.25)
+  .voicing()
+  .jux(off(.25,add(4)))
+  .dec(perlin.range(0.05,3).slow(4))
+$: n("[-7,< 4 5 6>,<0 -1>]")
+  .chord(chords).dec(3)
+  .detune(0.1).voicing()
+  .sometimes(press)
+  .s("supersaw").delay("0.4:1:0.4")
+  .lpf(2000).lpq(perlin.range(0.05,0.2))
+  .att(0.08)
+// @version 1.1

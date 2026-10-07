@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+stepcat("bd sd cp","hh hh").sound()
+// the same as "bd sd cp hh hh".sound()

@@ -1,0 +1,10 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+note("c e g b g e")
+.fm(4)
+.fmdecay("<.01 .05 .1 .2>")
+.fmsustain(.4)
+._scope()

@@ -1,0 +1,24 @@
+  File  Edit  Scene  Transport  View  Options  Help                             
+ ◉ rustel STOPPED ✓ ready   120.0 bpm · 0.50 cps · cyc                    first 
+  1 first                                                                       
+  1 $: s("bd")                                                                  
+  2                                                                             
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+ ready - terminal paste an… 1,1                                           0.0dB 
+ ♪ no output  ⌁ no midi                            MASTER       pk  --  LUFS -- 

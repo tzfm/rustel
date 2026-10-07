@@ -1,0 +1,50 @@
+/*
+  @title ACAB Acid
+  @by Enelg
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?O4Un4KQ9WNY4
+*/
+//"ACAB Acid"
+//@by Enelg
+
+
+$: note("{a!4 c a b}%16".sub("<0 12>/2"))
+  .sound("sawtooth")
+  .sometimesBy(.2, add(note(12)))
+  .lpf(300).lpenv(tri.range(2,8).slow(8))
+  .lpq(8)
+  .ftype("ladder")
+  .hpf("[800 0!3]*4")
+  .dist("2:1")
+  // .hush()
+
+$: s("bd:1*4, [- oh:2:.5]*4, hh:1:.3*16")
+  .bank("RolandTR909")
+  .dist("1:1")
+
+$: note("a1")
+  .sound("supersaw")
+  .euclid(7,16)
+  .lpf(800)
+  .lpenv(4)
+  .dist("2:.8")
+  .delay(.3)
+
+$: s("- cowbell")
+  .dist("3:2")
+  .delay(1)
+
+$: s("<-!15 [sd*4]>*4")
+      .clip(1)
+      .bank("RolandTR909")
+      .mul(gain("[.7 .3 .6 1]*4"))  //groove
+      .dist("1:1")
+      .hpf(200)
+      .delay(.2)
+      // .hush()
+
+all(x=>x.mul(gain(.8)))
+
+
+// @version 1.0

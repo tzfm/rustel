@@ -1,0 +1,65 @@
+[package]
+name = "rustel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "The rustel command: play, render, query and check scores, and open the terminal studio"
+
+[features]
+# The ordinary build is the complete product. `--no-default-features` builds
+# the lean command line, and each feature below adds one capability back.
+# `studio` adds the rustel-studio crate, and `remote-control` forwards to the
+# studio only. Every other feature forwards to the runtime feature of the same
+# name, and to the studio's when it has one.
+default = ["mp3-export", "extensions", "opus", "osc", "serial", "hydra", "studio", "gamepad", "remote-control"]
+mp3-export = ["rustel-runtime/mp3-export"]
+extensions = ["rustel-runtime/extensions", "rustel-studio?/extensions"]
+opus = ["rustel-runtime/opus"]
+device-audio = ["rustel-runtime/device-audio"]
+serial = ["dep:rustel-serial", "rustel-runtime/serial", "rustel-studio?/serial"]
+midi = ["dep:rustel-midi", "rustel-runtime/midi"]
+gamepad = ["rustel-runtime/gamepad", "rustel-studio?/gamepad"]
+osc = ["dep:rustel-osc", "rustel-runtime/osc", "rustel-studio?/osc"]
+hydra = ["dep:rustel-hydra", "rustel-runtime/hydra", "rustel-studio?/hydra"]
+remote-control = ["rustel-studio?/remote-control"]
+# The studio plays live and lists MIDI ports, so the command's own device and
+# MIDI code is compiled with it.
+studio = ["device-audio", "midi", "dep:rustel-studio"]
+
+[dependencies]
+# `session-log` backs `--save-session`, `replay` and `watch-code`, which every
+# build of the command has.
+rustel-runtime = { path = "../runtime", default-features = false, features = ["session-log"] }
+# Without defaults, so each studio capability follows the command's feature of
+# the same name.
+rustel-studio = { path = "../studio", optional = true, default-features = false }
+rustel-audio = { path = "../audio" }
+rustel-core = { path = "../core" }
+rustel-fraction = { path = "../fraction" }
+rustel-scheduler = { path = "../scheduler" }
+rustel-voice = { path = "../voice" }
+rustel-midi = { path = "../midi", optional = true }
+rustel-hydra = { path = "../hydra", optional = true }
+rustel-osc = { path = "../osc", optional = true }
+rustel-serial = { path = "../serial", optional = true }
+clap = { version = "4", features = ["derive", "color", "wrap_help"] }
+clap_complete = "4"
+serde = { version = "1", features = ["derive"] }
+# Printed JSON keeps the order its fields are written in.
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[target.'cfg(unix)'.dependencies]
+# Signal handlers for graceful cancellation.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Console control handlers for graceful cancellation.
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+
+[dev-dependencies]
+rustel-audio = { path = "../audio", features = ["test-support"] }
+rustel-jsruntime = { path = "../jsruntime", default-features = false }
+tempfile = "3"
+libc = "0.2"

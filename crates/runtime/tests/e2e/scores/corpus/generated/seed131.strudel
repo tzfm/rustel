@@ -1,0 +1,9 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 4
+*/
+// parity fuzz case seed=131 cycles=9 bpm=100
+setcpm(100/4)
+$: s("rim*2 lt oh*4 <cr oh ~> <bd ht> [sd [cr ht?] cr:1 ht*4 [sd:3 hh:1 bd ht mt*4 lt bd ht] <cr lt ~> [rim hh sd*4] lt] [cr*2 bd hh:0 rim*2?] [<cr mt hh> mt <sd mt hh>? rim sd ~*2 cp]*2").bank("RolandTR909").degradeBy(0.47).slow(1.5).often((x => x.rev())).euclidRot(3,4,3).distort(0.3)
+$: n("-3 -3 4").chord("<Gm G7>").voicing().s("sine").often((x => x.slow(2))).euclidRot(4,16,14).transpose(-12).late(0.25).djf(0.25).tremolodepth(0.28)

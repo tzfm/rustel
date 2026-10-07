@@ -1,0 +1,8 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 4
+*/
+// parity fuzz case seed=230 cycles=6 bpm=140
+setcpm(140/4)
+$: s("rim bd!2 <clap cr> <hh lt> [bd:2 cp sd ~ ~/2 oh*2*2] cr/2 rd:0 ~").rarely((x => x.gain(0.6))).euclid(7,16).squiz(5).legato(0.93).accelerate(-0.45)

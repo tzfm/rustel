@@ -1,0 +1,6 @@
+# Shipped JavaScript assets evaluated on the QuickJS heap.
+#
+# The xen/edo, tonal-voicings, and Fraction implementations have been replaced
+# by Rust. This manifest is intentionally empty.
+
+schema = 1

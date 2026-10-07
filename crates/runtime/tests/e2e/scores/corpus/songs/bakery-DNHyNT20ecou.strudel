@@ -1,0 +1,33 @@
+/*
+  @by strudel community bakery
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?DNHyNT20ecou
+*/
+/*
+  @title Fibonacci party
+  @by Yaxu
+  @license CC BY-SA
+*/
+
+const fib = `{
+1
+2
+3 1
+4 1 2
+5 1 2 3 1
+6 1 2 3 1 4 1 2
+7 1 2 3 1 4 1 2 5 1 2 3 1
+8 1 2 3 1 4 1 2 5 1 2 3 1 6 1 2 3 1 4 1 2
+9 1 2 3 1 4 1 2 5 1 2 3 1 6 1 2 3 1 4 1 2 7 1 2 3 1 4 1 2 5 1 2 3 1
+10 1 2 3 1 4 1 2 5 1 2 3 1 6 1 2 3 1 4 1 2 7 1 2 3 1 4 1 2 5 1 2 3 1 8 1 2 3 1 4 1 2 5 1 2 3 1 6 1 2 3 1 4 1 2
+11 1 2 3 1 4 1 2 5 1 2 3 1 6 1 2 3 1 4 1 2 7 1 2 3 1 4 1 2 5 1 2 3 1 8 1 2 3 1 4 1 2 5 1 2 3 1 6 1 2 3 1 4 1 2 9 1 2 3 1 4 1 2 5 1 2 3 1 6 1 2 3 1 4 1 2 7 1 2 3 1 4 1 2 5 1 2 3 1
+}%16`;
+
+stack(
+  s("bd").struct(fib.fmap(x => x === 2)).color("red").bank("RolandTR909").shape(0.5),
+  s("cp").struct(fib.fmap(x => x % 3 == 0)).color("blue").bank("RolandTR909").room(0.6),
+  note(fib.scale('C:ritusen')).sound("folkharp")
+)
+
+// @version 1.0

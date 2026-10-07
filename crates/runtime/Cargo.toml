@@ -1,0 +1,200 @@
+[package]
+name = "rustel-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Native host library behind the rustel command and studio: Session API, rendering and device playback"
+
+# Session API with optional CPAL playback.
+
+[features]
+# The ordinary build is the complete product. A library host opts out
+# explicitly with `--no-default-features` and adds back only the capabilities
+# it needs. Internal benchmark instrumentation remains opt-in even for the
+# complete product.
+default = ["mp3-export", "extensions", "opus", "osc", "serial", "hydra", "gamepad"]
+# Recording and replaying a live-coding set (`session_log`). The rustel
+# command and the studio record; a host that records nothing leaves it out.
+session-log = []
+# MP3 export uses the vendored LAME encoder. Sample decoding is independent.
+mp3-export = ["dep:mp3lame-encoder"]
+# Credited non-upstream score extensions. The complete product includes them;
+# `--no-default-features` keeps the runtime on the upstream-compatible surface.
+extensions = ["dep:rustel-ext", "rustel-jsruntime/extensions"]
+opus = ["dep:opuscule"]
+device-audio = ["rustel-audio/device-audio"]
+# Producer-side benchmark instrumentation. This never runs in the callback
+# and is deliberately absent from ordinary release builds.
+callback-census = ["rustel-core/callback-census", "rustel-scheduler/callback-census"]
+# Test hooks and fixtures for integration tests in other crates: inert
+# unless a test installs them. Never part of a product build.
+test-support = []
+# Serial output. A minimal/headless build may omit its platform stack.
+serial = ["dep:rustel-serial"]
+# MIDI output. A minimal/headless build may omit its platform MIDI stack.
+midi = ["dep:rustel-midi", "dep:midir", "dep:coremidi", "dep:objc2-core-foundation"]
+# Gamepad input for `gamepad()`. The score-side object is always there;
+# this is the thread that reads the pads through gilrs.
+gamepad = ["dep:gilrs", "dep:log", "dep:objc2", "dep:objc2-foundation", "dep:objc2-core-foundation", "dep:objc2-game-controller"]
+# OSC output. Pure UDP with no dependencies of its own.
+osc = ["dep:rustel-osc"]
+# Hydra visuals, drawn behind the code. A minimal/headless build can omit the
+# GPU stack.
+hydra = [
+  "dep:image",
+  "dep:oximedia-capture",
+  "dep:oximedia-codec",
+  "dep:oximedia-core",
+  "dep:rustel-hydra",
+  "rustel-jsruntime/hydra",
+]
+
+[[test]]
+name = "midi_input"
+path = "tests/semantic/midi_input.rs"
+
+[[test]]
+name = "gamepad"
+path = "tests/semantic/gamepad.rs"
+
+[[test]]
+name = "query_smoke"
+path = "tests/semantic/query_smoke.rs"
+
+[[test]]
+name = "scheduling"
+path = "tests/semantic/scheduling.rs"
+
+[[test]]
+name = "watch"
+path = "tests/semantic/watch.rs"
+
+# The visuals recording is present in the complete default product. Keeping
+# this target valid without `hydra` also protects explicit minimal builds.
+[[test]]
+name = "hydra"
+path = "tests/semantic/hydra.rs"
+
+# The corpus suite: committed scores checked against golden results. Named explicitly
+# so `--test e2e` addresses it without the scores directory beside it being
+# mistaken for test targets.
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# `preserve_order` keeps `serde_json::Map` in document order, which a note
+# bank's closest-key tie-break depends on (see `Bank::Notes`).
+serde_json = { version = "1", features = ["preserve_order"] }
+rustel-core = { path = "../core" }
+rustel-ext = { path = "../ext", optional = true }
+rustel-fraction = { path = "../fraction" }
+rustel-jsruntime = { path = "../jsruntime", default-features = false }
+rustel-mini = { path = "../mini" }
+rustel-scheduler = { path = "../scheduler" }
+rustel-audio = { path = "../audio" }
+rustel-voice = { path = "../voice" }
+rustel-serial = { path = "../serial", optional = true }
+rustel-midi = { path = "../midi", optional = true }
+# Only for `midir::Ignore` on the input path; the MIDI stack itself is behind
+# the `midi` feature via rustel-midi.
+midir = { version = "0.11", optional = true }
+# XInput, not WGI. gilrs defaults to Windows.Gaming.Input, which does not
+# deliver gamepad events to a plain console process: the pad enumerates and
+# then nothing ever arrives, which is exactly what `rustel gamepad-monitor`
+# reported on Windows while the same pad worked in a browser. The xinput
+# backend is the one that reads an Xbox pad from a console. Harmless
+# everywhere else: gilrs picks its backend by target_os first, and the
+# xinput feature's own dependencies are gated to Windows.
+gilrs = { version = "0.11", optional = true, default-features = false, features = ["xinput"] }
+# gilrs reports what it makes of a pad through `log`; the monitor listens.
+log = { version = "0.4", optional = true }
+
+rustel-osc = { path = "../osc", optional = true }
+rustel-hydra = { path = "../hydra", optional = true }
+# Native Hydra sources. OxiMedia is one pure-Rust capture surface across
+# V4L2, AVFoundation and Media Foundation; pin the young API until its frame
+# contract has settled. `image` decodes guarded HTTP images and MJPEG frames.
+oximedia-capture = { version = "=0.2.1", optional = true }
+oximedia-codec = { version = "=0.2.1", default-features = false, optional = true }
+oximedia-core = { version = "=0.2.1", optional = true }
+image = { version = "=0.25.10", default-features = false, features = [
+  "gif",
+  "jpeg",
+  "png",
+  "webp",
+], optional = true }
+rustel-transpiler = { path = "../transpiler" }
+# Blocking HTTP with rustls for sample-bank fetches. Never touches the audio
+# thread.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+url = "2.5.8"
+# Compressed sample decoding, pure Rust, producer-thread only: mp3 for the
+# piano bank (dough-samples ships mp3), and Ogg Vorbis because that is what a
+# phone recording turns into and folders of personal samples are full of it.
+symphonia = { version = "0.5", default-features = false, features = [
+  "mp3",
+  "ogg",
+  "vorbis",
+] }
+# symphonia demuxes Ogg Opus but ships no Opus decoder. opuscule is a pure-Rust,
+# decode-only implementation with no C or CMake dependency. Its MPL-2.0 license
+# omits the Exhibit B notice and is compatible with this project's AGPL.
+opuscule = { version = "0.2", optional = true }
+# mp3 EXPORT (`render --format mp3`): LAME 3.100, vendored and built from
+# source. LGPL, statically linked into the AGPL binary.
+#
+# This build has system dependencies. On unix `mp3lame-sys` drives LAME's
+# autotools build, which runs `sh ./configure` and then `make`, so a unix
+# build of this crate needs both on PATH. (Windows takes a cc-only path and
+# needs neither.) LAME ships a pre-generated `configure`, so autoconf and
+# automake are not needed. It is also the slowest
+# build script in the tree, at roughly 15-20 s of a clean build.
+mp3lame-encoder = { version = "0.2", optional = true }
+sha2 = "0.11.0"
+# Preplanned producer-side FFT for the lossy editor spectrum stream. The
+# audio callback only publishes samples into its fixed atomic tap.
+rustfft = "6"
+
+# macOS hands an Xbox or PlayStation pad on a cable to its GameController
+# framework and gives IOKit readers such as gilrs no reports from it, so
+# on macOS the pads are read through the framework. Keep this table after
+# shared dependencies: TOML tables scope every subsequent dependency.
+[target.'cfg(target_os = "macos")'.dependencies]
+# Maintained Mach bindings for process and machine resource counters.
+mach2 = "0.6"
+# CoreMIDI's endpoint list is a per-process snapshot taken at the process's
+# first CoreMIDI call, and it only moves for a process holding a client on a
+# thread that runs a CFRunLoop. `midir` builds a fresh client per enumeration
+# on threads that run no loop, so nothing plugged in after launch was ever
+# seen. One long-lived client on one pumped thread fixes that for every
+# enumeration in the process, whoever makes it.
+coremidi = { version = "0.9", optional = true }
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSArray", "NSString", "NSEnumerator", "NSObject"] }
+objc2-core-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "CFRunLoop", "CFDate", "CFBase", "CFString"] }
+objc2-game-controller = { version = "0.3", optional = true, default-features = false, features = ["std", "GCController", "GCDevice", "GCExtendedGamepad", "GCPhysicalInputProfile", "GCControllerElement", "GCControllerButtonInput", "GCControllerAxisInput", "GCControllerDirectionPad"] }
+
+[target.'cfg(unix)'.dependencies]
+# Signal handling for graceful cancellation, handle-relative nonblocking
+# opens for the confined local sample routes, and freed heap handed back to
+# the system.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Validate an opened sample handle's final path before serving from it.
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+rustel-audio = { path = "../audio", features = ["test-support"] }
+# Temp directories for session-log and cache tests.
+tempfile = "3"
+libc = "0.2"

@@ -1,0 +1,9 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+n("0 .. 12").scale("C:chromatic")
+.s("sawtooth")
+.lpf(500)
+._pitchwheel()

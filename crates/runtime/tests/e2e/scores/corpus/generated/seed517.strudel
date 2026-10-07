@@ -1,0 +1,11 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 4
+*/
+// parity fuzz case seed=517 cycles=10 bpm=150
+setcpm(150/4)
+$: s("<mt hh ht>*2 ~ bd lt*2 [<lt ~> [rd:1 rd:1*2 hh hh] hh] clap cr <mt lt>").every(2, (x => x.palindrome())).struct("x*2 ~").zoom(0.0,0.5).bpf(3500).drive(0.56)
+$: note("eb b5").s("z_sawtooth").zrand(0).zmod(20).zdelay(0.1).curve(1)
+$: chord("<Ab G7 F G7>").voicing().velocity(0.69).transpose(-5).clip(1).djf(0.55).room(0.62).roomdim(1000)
+$: note("db gb3 f# c").s("gm_string_ensemble_1")

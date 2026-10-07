@@ -1,0 +1,19 @@
+/*
+  @title dumb bass
+  @by tradwife billionare
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?xUe3bZAXawlx
+*/
+// "dumb bass" @by tradwife billionare
+setCps(130/4/60)
+stack(
+note("{a#2}%16".sub(20))
+.s("sine").fm(6).fmh(2.00).fmdecay(0.2).shape(.9).postgain(.3).decay(.1).clip(1)
+.euclidrot(12, 16, "<3>")
+.clip(1),
+  s("white").euclidRot("16",16,2).decay(saw.fast(4).range(.01, .08)).postgain(.4),
+  note("f#1").s("sine").euclid(4, 8).penv(36).pdecay(.05).panchor(0).pattack(0.001).shape(.9).decay(.2).postgain(.5)
+)
+
+// @version 1.0

@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+"0 1 2 3".chunk(4, x=>x.add(7))
+.scale("A:minor").note()

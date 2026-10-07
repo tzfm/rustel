@@ -1,0 +1,10 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 4
+*/
+// parity fuzz case seed=310 cycles=5 bpm=120
+setcpm(120/4)
+$: s("~!2 rd [oh ~ [lt sd cb hh bd:3*2 clap*4]*4 rd cr <ht clap clap> oh [~ rd:0 clap? bd:0? rim rd bd]]/2 rim ht ht bd <hh bd cr>*4").attack(0.032).amp(0.72)
+$: s("~ <rim bd>? lt bd:2 [oh oh bd!2*4] <bd sd cr> hh mt").bank("RolandTR808").zoom(0.0,0.25)
+$: s("cb ~ hh:0 bd? <bd cp> hh:0*4 lt*4").brak().room(0.42).roomfade(1)

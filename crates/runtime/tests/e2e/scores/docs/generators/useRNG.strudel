@@ -1,0 +1,9 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+useRNG('legacy')
+// Repeats every 300 cycles
+$: n(irand(50)).seg(16).scale("C:minor").ribbon(88, 32)
+$: n(irand(50)).seg(16).scale("C:minor").ribbon(388, 32)

@@ -1,0 +1,55 @@
+/*
+  @title Elvens on Mars
+  @by strudel community bakery
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?KzWm4qorFbWF
+*/
+/*  @title Elvens on Mars
+    @by Prince Lucija 
+    @url https://prin.lu            
+    @version 1.0 
+
+    I was watching this 12tone video 
+    https://www.youtube.com/watch?v=pY27JurC1Y0 
+    about 'Life on Mars?' track by David Bowie....
+    some pretty interesting chord progressions there...
+*/
+
+stack(
+  n("[0 .. 11]")
+
+  // .chord("<Fm Fm7 Fm9 Fm11>".slow(2))
+  .chord("<<[Fm7|Fm9|Fm11] <Ab7 Ab9>> Cm7 Ebm9 <F7 Dm7 B>>".slow(2))  
+
+  .voicing()
+  .add(note("-12, -24.2, <.1 [.1, 12.1]>".slow(8)))
+  .s("square, triangle, sawtooth".fast(8))
+  .lpf(saw.rangex(50,cosine.range(10,10).slow(6)).slow(8))
+  .lpe(rand.range(3,6).slow(8))
+  .lpq(saw.range(1,1).slow(8))
+  .room(rand.range(0.1,1.5).slow(1))
+  .gain(".2")
+  .dist("3:.17")
+  .hpf(rand.rangex(10,200).slow(8))
+  .pan(rand)
+  .delay(".1:0.5")
+,
+  // --------------------------------------//
+  s(` bd <~ bd> [~|hh] ~    
+      hh ~ [hh|bd] [~|bd] 
+      [sd|cp] ~ [~|hh|bd] [hh|oh]
+    `)
+  .bank("RolandTR909")
+  .end(rand.rangex(
+    .01, tri.range(.1, .9).slow(4)
+  ))
+  .distort("2:.8")
+  .lpf(saw.rangex(
+    cosine.range(4000,2000).slow(2), 5000).slow(8))
+  
+  .delay("<0.01@3 0.5>")
+  .dt("[0.01|0.02|0.03]*4")
+  .dfb("0.4")
+  .room(saw.rangex(.001,.4).slow(4))
+).cpm(40).scope()

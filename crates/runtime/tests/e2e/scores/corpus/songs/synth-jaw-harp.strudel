@@ -1,0 +1,26 @@
+/*
+  @title Synth Jaw Harp
+  @by Nicop
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?dhSdZuHtJdui
+*/
+// "Synth Jaw Harp" @by Nicop;
+setcps(.5)
+stack(
+  note("e2").superimpose(x=>x.add(note(12))).s("sawtooth").struct("[[x]|[x!2]|[~ x]|[~]|[~!2 x!2]|[x ~ x!2]|[x@2 x!2]|[~ x!3]]*4").clip(.9).bpf("1500").superimpose(x=>x.bpf(600).mul(gain(perlin.slow(2)))).bpq(2).bpa(.2).bpenv(brand.range(-2,2)).decay(1).attack("[.15 0!3]*4").postgain(1.5)
+  ,chord("Em7|Am7|C^7|Cadd9|Emadd9|B7|Bm7|B7b9|Dadd9|B7sus|Am9|G^7|Gadd9|F#m7b5|F^7").layer(
+    x=>x.anchor("e4").voicing().s("piano").release(.1).attack(.2)
+    ,x=>x.rootNotes(1).layer(
+      x=>x.struct("x*8").add(note("[0 12]*4")).s("sine").fmi("0,2").fmdecay(.5)
+      ,x=>x.struct("x*16").add(note("[0 12]*4")).s("supersaw").lpf(300).lpd(.15).lpenv(perlin.range(4,8))
+    ).attack("[.2 0!3]*4")
+  )
+  ,s("bd*4").bank("RolandTR909")
+  ,s("hh*16").bank("RolandTR909").velocity("[.5!2 1 .5!2]*4").gain(.5).pan(.6)
+ 
+  ,s("[~ oh]*4").bank("RolandTR909").decay(.2).gain(.3).pan(.6)
+  ,s("[~ sd]*2").bank("RolandTR909")
+)
+
+// @version 1.0

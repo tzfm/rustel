@@ -1,0 +1,11 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+n("<0 1 2 3>(3,8)")
+  .sound("num")
+  // resets the timeline every two cycles, by negating the timeline.
+  // in a lot of cases this will be edited by a human live coder
+  // rather than patterned!
+  .timeline("<2 -2>".slow(2))

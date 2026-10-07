@@ -1,0 +1,41 @@
+{
+  "name": "solarized",
+  "background": "#002b36",
+  "surface": "#073642",
+  "overlay": "#0a3f4c",
+  "foreground": "#93a1a1",
+  "muted": "#586e75",
+  "rule": "#0f4b59",
+  "accent": "#268bd2",
+  "ok": "#859900",
+  "warn": "#b58900",
+  "error": "#ff5b56",
+  "caret": "#93a1a1",
+  "selection": "#274e5b",
+  "selection_text": "#fdf6e3",
+  "mini": "#2aa198",
+  "mini_fill": null,
+  "event_mark": "tint",
+  "event_fade": 0.3,
+  "event": "#b58900",
+  "event_inactive": "#586e75",
+  "playhead": "#cb4b16",
+  "grid": "#0f4b59",
+  "minimap": "#00252f",
+  "minimap_viewport": "#0f4b59",
+  "syntax": {
+    "text": "#93a1a1",
+    "comment": "#586e75",
+    "string": "#2aa198",
+    "number": "#d33682",
+    "punctuation": "#6c71c4"
+  },
+  "meter": {
+    "low": "#859900",
+    "mid": "#b58900",
+    "high": "#b58900",
+    "peak": "#de3f3c",
+    "track": "#0a3f4c",
+    "fader": "#93a1a1"
+  }
+}

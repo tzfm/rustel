@@ -1,0 +1,36 @@
+/*
+  @title kakofon island
+  @by eddyflux
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?cEmwuofxyevs
+*/
+// "kakofon island" @by eddyflux
+
+note("24*4")
+  .sometimes(add(note(-12)))
+  .almostNever(ply(4))
+  .dec(saw.range(.2,.5))
+  .shape(.8)
+  .stack(
+    s("<pink brown white>*8")
+    .dec(rand.range(.02,.06))
+    .late(.125)
+    .room(.2)
+  )
+  .penv(saw.range(24,36))
+  .pdec(isaw.range(.6,.2))
+  .pcurve(1)
+  .lpf(1000).lpq(8)
+  .stack(
+    n("0,<4 5 6>")
+    .scale("C2:<hirajoshi ritusen>/2")
+    .dec(.1).room(.5).fm(4)
+    .fmh(rand.range(1,1.2))
+    .echo(8,.125,.5)
+    .add(note(run(8).mul(8)))
+    .fastGap(2).gain(.5)
+    .late(.125)
+  )
+
+// @version 1.0

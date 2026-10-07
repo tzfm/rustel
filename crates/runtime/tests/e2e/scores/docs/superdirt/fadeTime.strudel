@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+s("oh*4").end(.1).fadeTime("<0 .2 .4 .8>").osc()

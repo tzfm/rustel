@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "id": "overlapping-sine-triangle",
+  "events": [
+    {
+      "time_seconds": 0.2,
+      "duration_seconds": 0.6,
+      "value": {
+        "s": "sine",
+        "note": "c4",
+        "gain": 0.25,
+        "attack": 0.01,
+        "decay": 0.04,
+        "sustain": 0.5,
+        "release": 0.15,
+        "pan": 0.3
+      }
+    },
+    {
+      "time_seconds": 0.35,
+      "duration_seconds": 0.4,
+      "value": {
+        "s": "triangle",
+        "note": "e4",
+        "gain": 0.2,
+        "attack": 0.005,
+        "decay": 0.05,
+        "sustain": 0.6,
+        "release": 0.1,
+        "pan": 0.75
+      }
+    }
+  ]
+}

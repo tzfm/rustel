@@ -1,0 +1,22 @@
+# The corpus suite reads its scores and goldens back byte for byte, and hashes
+# what they produce. A checkout that rewrote their line endings would change
+# what is measured, so they are LF wherever they land.
+crates/runtime/tests/e2e/** text eol=lf
+
+# Some imported scores intentionally retain upstream trailing whitespace.
+crates/runtime/tests/e2e/scores/** whitespace=-trailing-space,-blank-at-eof
+
+# The studio's ASCII art is read with `include_bytes!` and measured against a
+# stride of WIDTH + 1, so the renderer can index a row without parsing one. A
+# checkout that rewrote these to CRLF adds a byte to every row: eighteen rows,
+# eighteen bytes, and `rustel-logo.txt` arrives 1368 long where the shape says
+# 1350. The picture is data, so its line endings are LF wherever it lands.
+crates/studio/src/themes/** text eol=lf
+
+# The studio e2e suite compares its goldens as text; the comparison also
+# normalises CRLF itself, so a checkout with eol rewriting stays correct.
+crates/studio-e2e/goldens/** text eol=lf
+
+# check-engine.sh compares the base engine profile's dependency snapshot with
+# cargo's output line for line, so the snapshot is LF wherever it lands.
+.github/scripts/engine-base-dependencies.txt text eol=lf

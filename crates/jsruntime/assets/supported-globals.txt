@@ -1,0 +1,59 @@
+# Supported core and mini globals in observable Object.keys insertion order.
+# Source revision: Strudel ebc25467c0f117a7e7b9b11378e21cac94d730fd.
+#
+# This is an availability/identity manifest, not a claim that the complete
+# Pattern or register surface is implemented. A name is added only after its
+# global/scope identity, descriptor, order, and focused semantics are covered by
+# compatibility tests.
+
+pace
+take
+drop
+extend
+replicate
+expand
+contract
+shrink
+grow
+Fraction
+Pattern
+cat
+fastcat
+gap
+growlist
+noteToMidi
+nothing
+pm
+polymeter
+polyrhythm
+pr
+pure
+register
+reify
+s_add
+s_alt
+s_cat
+s_contract
+s_expand
+s_extend
+s_polymeter
+s_sub
+s_taper
+s_taperlist
+s_tour
+s_zip
+seq
+sequence
+setStringParser
+shrinklist
+silence
+slowcat
+stack
+stepalt
+stepcat
+steps
+rustelScope
+timeCat
+timecat
+tour
+zip

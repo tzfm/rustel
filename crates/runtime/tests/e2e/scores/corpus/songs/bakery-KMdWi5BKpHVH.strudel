@@ -1,0 +1,85 @@
+/*
+  @by strudel community bakery
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?KMdWi5BKpHVH
+*/
+typeof setDefaultVoicings !== 'undefined' && setDefaultVoicings('legacy') // https://github.com/tidalcycles/strudel/pull/967
+// "Frozenset Funk" @by superdirtspatz
+setcps(.5)
+let pattern1 =
+note("<[b4, g5, e5]!16 [c#5, a5, g5]!16  [c5, a5, gb5]!12 [cb5, a5, gb5]!4>")
+  .sound("gm_electric_guitar_jazz:2").decay("<1 .05!3 1 .05 1 1 .05 0.5 1!3 .05 .05 1>").sustain(0).fast(8)
+//.bpf(perlin.range(667, 1111))
+.bpf(perlin.range(467, 999).add(-100))
+.bpa("<.01>/4")
+.bpenv("<3 4 5>/7")
+
+let pattern2 =
+note("<[b4, g5, e5]!16 [b4, <g5 e5>, f#5]!6 [b4, a5, g5]!10>")
+  .bpf(perlin.range(967, 1999).add(-100))
+  .sound("sawtooth").decay("<1 .05!3 1 .05 1 1 .05 0.5 1!3 .05 .05 1>").sustain(0).fast(8)
+
+
+
+let pattern3 =
+note("<[b4, g5, e5]!16>")
+  .sound("gm_electric_guitar_jazz:2").decay("<1 .05!3 1 .05 1 1 .05 0.5 1!3 .05 .05 1>").sustain(0).fast(8)
+.bpf(perlin.range(467, 999).add(-100))
+.bpa("<.01>/4")
+.bpenv("<3 4 5>/7")
+
+let drum1 = s("[bd, hh] hh hh [bd] [sd] hh hh bd")
+  .speed("0.808, 1.2, 1.2005")
+  .bank("RolandTR606")
+  .iter("<1 1 2 4>")
+  .shape("{0.7 0.55}%8")
+.lpf("<2333 2001 1888 2001>/3").lpq(3).ftype("12db")
+
+let drum2 = s("[bd, hh] hh hh*<1!5 2> [bd] [sd] hh*1 hh*<1 1 2> bd")
+  .speed("0.808, 1.2, 1.2005")
+  .bank("RolandTR606")
+  .iter("<1 1 2 4>")
+  .iterBack("<1!11 2>")
+  .shape("{0.7 0.55}%8")
+  //.slow(2).ply(2).room(.3)
+.lpf("<2333 2001 1888 2001>/3").lpq(3).ftype("12db")
+//.vowel("<ae ö e>/6").lpf("<777 888 999 888>/3").lpq(.25).ftype("12db")
+
+let waves3 = 
+ // clip for legato
+// sine, cosine, saw for arpeggio
+n(stack(sine,cosine,saw).range(0, 7).round())
+  .segment(8)//.jux(rev)
+.clip("<1.1 1.2 1.3 1.2>/3")  
+  .chord("<Em9 Em7 Em6 Am69>/2").dict("<ireal ireal-ext>/2") // .penv("<0 -.05>*7")
+  .voicing()//.lpf(2222)
+  .velocity(.4)
+  .s("piano")//.rev()
+  .slow(1)
+.lastOf(8, struct("x(5, 8)"))
+
+
+let waves1 = 
+ // clip for legato
+// sine, cosine, saw for arpeggio
+n(stack(sine,cosine,saw).range(0, 7).round())
+  .segment(4)//.jux(rev)
+.clip("<1.1 1.2 1.3 1.2>/3")  
+  .chord("<Em9 A7 [Am6@3 Am69]>/2").dict("<ireal ireal-ext>/2") // .penv("<0 -.05>*7")
+  .voicing().log().lpf(1222)
+  .velocity(.4)
+  .s("piano")//.rev()
+  .slow(1)
+
+
+
+stack(
+pattern3
+  ,waves3,
+  drum2
+  //.color('#ff00ff20').spiral()
+)
+.fast(2)
+
+// @version 1.0

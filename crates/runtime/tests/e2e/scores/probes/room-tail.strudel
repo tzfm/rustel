@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 4
+*/
+s("sine").note("c4").decay(0.05).room(1)

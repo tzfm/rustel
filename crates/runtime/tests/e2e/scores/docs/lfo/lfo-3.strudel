@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+s("saw").lpf(500).diode(0.3)
+  .lfo({ c: "lpf" })

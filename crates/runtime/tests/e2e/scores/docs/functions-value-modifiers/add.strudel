@@ -1,0 +1,9 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+// Here, the triad 0, 2, 4 is shifted by different amounts
+n("0 2 4".add("<0 3 4 0>")).scale("C:major")
+// Without add, the equivalent would be:
+// n("<[0 2 4] [3 5 7] [4 6 8] [0 2 4]>").scale("C:major")

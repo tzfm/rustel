@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+samples({ rhodes: 'https://cdn.freesound.org/previews/132/132051_316502-lq.mp3' })
+s("rhodes").loopAtCps(4,1.5).cps(1.5)

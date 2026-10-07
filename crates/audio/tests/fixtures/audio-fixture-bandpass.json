@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "id": "sawtooth-static-bandpass",
+  "events": [
+    {
+      "time_seconds": 0.3,
+      "duration_seconds": 0.5,
+      "value": {
+        "s": "sawtooth",
+        "freq": 440,
+        "gain": 0.65,
+        "attack": 0.008,
+        "decay": 0.06,
+        "sustain": 0.5,
+        "release": 0.06,
+        "bandf": 1100,
+        "bandq": 4,
+        "pan": 0.35
+      }
+    }
+  ]
+}

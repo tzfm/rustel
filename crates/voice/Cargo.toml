@@ -1,0 +1,15 @@
+[package]
+name = "rustel-voice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Shared control-to-voice resolver for mapping hap values to DSP onset events"
+
+[dependencies]
+# Modulator ids are positions in the score's own control map, so a map keeps
+# document order in every dependency graph, not only the application's.
+serde_json = { version = "1", features = ["preserve_order"] }
+rustel-core = { path = "../core" }
+rustel-audio = { path = "../audio" }

@@ -1,0 +1,17 @@
+[package]
+name = "rustel-ext"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Credited, statically linked extensions beyond upstream Strudel"
+
+[dependencies]
+rustel-core = { path = "../core" }
+rustel-fraction = { path = "../fraction" }
+rustel-mini = { path = "../mini" }
+
+[dev-dependencies]
+rustel-jsruntime = { path = "../jsruntime", features = ["extensions"] }
+rustel-transpiler = { path = "../transpiler" }

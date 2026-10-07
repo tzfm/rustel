@@ -1,0 +1,9 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 4
+*/
+// parity fuzz case seed=28 cycles=6 bpm=76
+setcpm(76/4)
+$: s("sd:1 rim? clap*4*4 rd lt cp!2? cp oh!2?").euclid(11,16).ply(3).euclid(3,8).ftype("ladder").vowel("u").lpf(800).lpenv(1).lpdecay(0.286)
+$: s("mt").n("7 2 3 4").scale("f:altered").ribbon(1, 4).sparsity(0.45).layer(x => x.add(0), x => x.add(3)).compressor(0.37).hpf(80).djf(0.34).lpf(1200).lpenv(-2).lpattack(0.233).lpdecay(0.332)

@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+note("c3*2").s("bytebeat").late(0.0031281250000000003)

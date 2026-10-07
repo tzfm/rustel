@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+// Looping a portion of randomness
+n(irand(8).segment(4)).scale("c:pentatonic").ribbon(1337, 2)

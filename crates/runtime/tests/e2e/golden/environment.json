@@ -1,0 +1,7 @@
+{
+  "arch": "x86_64",
+  "os": "linux",
+  "sample_rate": 48000,
+  "channels": 2,
+  "query_cycles": 4
+}

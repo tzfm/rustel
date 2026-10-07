@@ -1,0 +1,9 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+// As a chained function:
+s("hh*4").cat(
+   note("c4(5,8)")
+)

@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+// ascending arpeggios
+n("0!16".add(berlin.fast(4).mul(14))).scale("d:minor")

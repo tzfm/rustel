@@ -1,0 +1,32 @@
+/*
+  @title Common West African bell v240624
+  @by Prince Lucija
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?DDNzTHyVj6A1
+*/
+// "Common West African bell v240624" @by Prince Lucija
+setcpm(134/4)
+stack(
+  s("bd:3(<4!7 <3 6>>,12)") ,
+  s("sd:3(<2!3 3>,12,3)"),
+  s("hh:3(2,3,1)*4"),
+  s("rim(1,3,2)*4"),
+  s("perc:2(7,12,3)"),  // standard african bell pattern
+  s("perc:0(3,12,3)")
+)
+  .bank("BossDR550")
+  .lpf(rand.rangex(550,20000).fast(12))
+  .lpe(1)
+  .end(rand.rangex(0.1,.5))
+  .lpq(saw.range(1,9).slow(8))
+  .crush(rand.range(4,32))
+  .pan(rand)
+  .room(saw.range(.01,.4).slow(4))
+  .delay(saw.range(.01,.3).slow(4))
+  .dt(rand.range(.001,.1).fast(12))
+  .dfb(".5")
+
+
+
+// @version 1.1

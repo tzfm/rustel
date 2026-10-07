@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+"tha dhi thom nam".shrink("1").sound()
+.bank("mridangam")

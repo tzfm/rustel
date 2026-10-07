@@ -1,0 +1,9 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 4
+*/
+// parity fuzz case seed=508 cycles=10 bpm=120
+setcpm(120/4)
+$: s("[[rd? rim clap sd? oh] rd cp sd] rd:1 rd:1 rim bd@2 <cb cb> <rd ht oh>").iterback(3).struct("x ~ x ~").leslie(6)
+$: s("<bd hh> sd").palindrome().ply(3).leslie(1).bpf(300).hpf(400).hpenv(1)

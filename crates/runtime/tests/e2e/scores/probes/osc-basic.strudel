@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 2
+*/
+s("<sine saw square triangle>").note("c3 e3 g3").seg(4)

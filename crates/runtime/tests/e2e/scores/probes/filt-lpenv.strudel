@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 2
+*/
+s("sawtooth").note("c2").lpf(400).lpenv(4).lpattack(0.01).lpdecay(0.2).seg(4)

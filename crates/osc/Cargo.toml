@@ -1,0 +1,12 @@
+[package]
+name = "rustel-osc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "OSC output over UDP, for SuperDirt and any other OSC listener"
+
+# No dependencies on purpose: OSC 1.0 encoding is a few padding rules, and
+# std::net::UdpSocket is the whole transport.
+[dependencies]

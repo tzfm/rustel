@@ -1,0 +1,18 @@
+/*
+  @title Piano Phase
+  @by Steve Reich, Leo Izzo
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?rWsySZz7k-Pw
+*/
+// "Piano Phase"
+// @by Steve Reich, Leo Izzo
+setcps(1)
+
+stack(
+note("e4 f#4 b4 c#5 d5 f#4 e4 c#5 b4 f#4 d5 c#5").sound("piano").clip(0.7).slow(2).cpm(72).color('green'),
+  note("e4 f#4 b4 c#5 d5 f#4 e4 c#5 b4 f#4 d5 c#5").sound("piano").slow(2).clip(0.7).cpm(72.5).color('blue')
+  ).room(1)
+  .pianoroll({fill:0, fillActive : 1, stroke: 1, vertical:1}) 
+
+// @version 1.0

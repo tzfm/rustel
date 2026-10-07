@@ -1,0 +1,10 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+s("saw!16").note("F1")
+  .lpf(tri.range(40, 80).slow(4)).lpenv(5).lpq(4).lpd(0.15)
+  .when(rand.late(0.1).gte(0.5), x => x.transpose("12").tag('altered'))
+  .when(rand.late(0.2).gte(0.5), x => x.s("square").tag('altered'))
+  .when("<0 1>", x => x.filter((hap) => hap.hasTag('altered')))

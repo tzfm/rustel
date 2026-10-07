@@ -1,0 +1,7 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+register('wobble', (pat) => pat.lpf(sine.range(300, 2000).fast(2)))
+$: s("bd*8").wobble()

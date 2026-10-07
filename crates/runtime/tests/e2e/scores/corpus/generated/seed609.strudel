@@ -1,0 +1,10 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 12
+*/
+// parity fuzz case seed=609 cycles=17 bpm=132
+setcpm(132/4)
+all(x => x.room(0.19))
+$: s("clap rd:0 cp [lt rd rd ht*4 cb!2 [hh rd:0 rd bd:3 ~ rim sd bd/2] cb clap] sd:3 hh:0 ht").every(3, (x => x.palindrome())).rarely((x => x.slow(2))).slow(3).speed(0.75).hpf(200).hpenv(1).hpq(6).penv(7).pcurve(1)
+$: note("c e#2").s("gm_string_ensemble_1")

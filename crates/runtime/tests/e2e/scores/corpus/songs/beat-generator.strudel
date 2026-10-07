@@ -1,0 +1,15 @@
+/*
+  @title beat generator
+  @by Switch Angel
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?mJijjkH1iFxf
+*/
+// @title beat generator
+// @by Switch Angel
+const selectBeat = slider(519, 0, 1000, 1)
+
+p1: chooseCycles("bd",  "sd", "hh".cut(1), "oh".cut(1), "perc").s().fast(16).ribbon(selectBeat, 1).bank("RhythmAce")
+
+
+// @version 1.0

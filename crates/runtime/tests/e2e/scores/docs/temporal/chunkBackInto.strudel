@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+sound("bd sd ht lt bd - cp lt").chunkInto(4, hurry(2))
+  .bank("tr909")

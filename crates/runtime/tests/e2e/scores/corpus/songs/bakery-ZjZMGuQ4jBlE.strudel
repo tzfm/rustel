@@ -1,0 +1,38 @@
+/*
+  @by strudel community bakery
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?ZjZMGuQ4jBlE
+*/
+/*
+  @title Euclid Workout
+  @by Switch Angel
+  @license CC BY-NC-SA
+*/
+
+setCps(128/60/4)
+
+const kickFill = slider(3, 0, 16, 1)
+const kickRot = slider(0,0,8,2)
+const snareFill = slider(2, 0, 16, 1)
+const melodyseed = slider(396, 0, 1000, 1)
+const melodyFill = slider(5, 0, 16, 1)
+const bassFilter = slider(215, 20, 10000, 1)
+
+const drums = stack(
+  s("bd:17").euclidrot(kickFill, 16, kickRot).cut(1),
+  s("sd").euclidrot(snareFill, 16, 4),
+  s("hh!2 oh hh".fast(4)).gain(.14).cut(2),
+).bank("RolandMC303").shape(.2).postgain(.7)
+
+const bass = note("<f@4 a@4>".sub("{24 12 5 12}%16")).s("sawtooth").euclidrot(5, 16, "<3 1>").lpf(bassFilter).release(1).cut(2)
+
+const mel = note(irand(14).segment(16).add(3).scale('C:pentatonic')).ribbon(melodyseed, 1)
+  .euclidRot(melodyFill, 16, 4)
+  // .n affects the number of partials in the sawtooth synth
+  .s("sawtooth").n(rand.range(1, 10))
+  .gain(.2).clip(0.01).release(0.9).pan(sine.fast(2))
+
+stack(drums, bass, mel).room(.1)
+
+// @version 1.0

@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 2
+*/
+s("wt_digital_basique").note("c3").warp(0.5).warpmode(1).seg(4)

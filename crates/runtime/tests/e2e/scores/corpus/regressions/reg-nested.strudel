@@ -1,0 +1,8 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+register('half2', (pat) => pat.slow(2))
+register('halfquiet', (pat) => pat.half2().gain(0.4))
+$: s("bd sd hh cp").halfquiet()

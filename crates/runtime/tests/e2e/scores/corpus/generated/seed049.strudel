@@ -1,0 +1,9 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 4
+*/
+// parity fuzz case seed=49 cycles=9 bpm=76
+setcpm(76/4)
+$: s("bd bd ht!2 oh? <cr clap cp> ht*2 [cr mt cp rd cr*2 oh] bd").delayfeedback(0.55).transient(0.34).leslie(4)
+$: s("ht [oh@2 [rim*4 cr] rim hh@2 <cr hh ~> hh:3 ~*4?]? ht <mt lt> oh?").bank("tr808").brak().ply(2).euclidRot(5,8,4).rev().phaser(1).phaserdepth(0.75)

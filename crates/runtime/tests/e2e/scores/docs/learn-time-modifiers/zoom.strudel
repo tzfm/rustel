@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+s("bd*2 hh*3 [sd bd]*2 perc").zoom(0.25, 0.75)
+// s("hh*3 [sd bd]*2") // equivalent

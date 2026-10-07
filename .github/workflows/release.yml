@@ -1,0 +1,125 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.os_name }} ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            os_name: linux
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            os_name: linux
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            os_name: darwin
+            arch: amd64
+            target: x86_64-apple-darwin
+          - runner: macos-latest
+            os_name: darwin
+            arch: arm64
+            target: aarch64-apple-darwin
+          - runner: windows-latest
+            os_name: win32
+            arch: amd64
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Linux audio and serial headers
+        if: matrix.os_name == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+      - name: Check release panic recovery
+        shell: bash
+        run: bash .github/scripts/check-panic-unwind.sh --target ${{ matrix.target }}
+      - name: Build
+        run: cargo build --locked --release -p rustel --target ${{ matrix.target }} --features device-audio,midi,serial,studio,gamepad
+      # NOTICE.md cites the third-party notices in crates/*/LICENSE-*, so they
+      # ship beside it at the same paths.
+      - name: Package (unix)
+        if: matrix.os_name != 'win32'
+        run: |
+          tar czf "rustel_${GITHUB_REF_NAME}_${{ matrix.os_name }}_${{ matrix.arch }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" rustel \
+            -C "$GITHUB_WORKSPACE" LICENSE NOTICE.md crates/*/LICENSE-*
+      - name: Package (windows)
+        if: matrix.os_name == 'win32'
+        shell: bash
+        run: |
+          tar czf "rustel_${GITHUB_REF_NAME}_${{ matrix.os_name }}_${{ matrix.arch }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" rustel.exe \
+            -C "$GITHUB_WORKSPACE" LICENSE NOTICE.md crates/*/LICENSE-*
+      - name: Verify package contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="rustel_${GITHUB_REF_NAME}_${{ matrix.os_name }}_${{ matrix.arch }}.tar.gz"
+          binary=rustel
+          if [ "${{ matrix.os_name }}" = win32 ]; then binary=rustel.exe; fi
+          tar tzf "$archive" > package-contents.txt
+          for member in "$binary" LICENSE NOTICE.md crates/*/LICENSE-*; do
+            grep -Fxq "$member" package-contents.txt || {
+              echo "$archive is missing $member" >&2
+              exit 1
+            }
+          done
+      - name: Preserve package for publication
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rustel-${{ matrix.os_name }}-${{ matrix.arch }}
+          path: rustel_${{ github.ref_name }}_${{ matrix.os_name }}_${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish verified release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: rustel-*
+          merge-multiple: true
+          path: dist
+      - name: Prepare assets and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          for archive in dist/*.tar.gz; do
+            [ -f "$archive" ] || { echo "No release archives found" >&2; exit 1; }
+            sha256sum "$archive" | cut -d ' ' -f1 > "$archive.sha256"
+          done
+          cp rustelup/rustelup dist/rustelup
+          cp rustelup/rustelup.ps1 dist/rustelup.ps1
+          sha256sum dist/rustelup | cut -d ' ' -f1 > dist/rustelup.sha256
+          sha256sum dist/rustelup.ps1 | cut -d ' ' -f1 > dist/rustelup.ps1.sha256
+      - name: Publish release after all assets are ready
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        # gh keeps the release a draft until every asset is uploaded, and
+        # deletes the draft if an upload fails.
+        run: |
+          set -euo pipefail
+          bash .github/scripts/release-notes.sh "$GITHUB_REF_NAME" > "$RUNNER_TEMP/release-notes.md"
+          notes=(--generate-notes)
+          if [ -s "$RUNNER_TEMP/release-notes.md" ]; then
+            notes=(--notes-file "$RUNNER_TEMP/release-notes.md")
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 dist/rustelup dist/rustelup.ps1 \
+            --verify-tag "${notes[@]}"

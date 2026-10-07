@@ -1,0 +1,43 @@
+{
+  "name": "github-light",
+  "background": "#ffffff",
+  "surface": "#f6f8fa",
+  "overlay": "#eaeef2",
+  "foreground": "#24292f",
+  "muted": "#6e7781",
+  "rule": "#d0d7de",
+  "accent": "#0969da",
+  "ok": "#1a7f37",
+  "warn": "#9a6700",
+  "error": "#cf222e",
+  "caret": "#24292f",
+  "selection": "#b6e3ff",
+  "selection_text": "#24292f",
+  "mini": "#0550ae",
+  "mini_fill": null,
+  "event_mark": "tint",
+  "event_fade": 0.25,
+  "event": "#8250df",
+  "event_inactive": "#afb8c1",
+  "playhead": "#0969da",
+  "grid": "#eaeef2",
+  "minimap": "#f6f8fa",
+  "minimap_viewport": "#d0d7de",
+  "syntax": {
+    "text": "#24292f",
+    "comment": "#6e7781",
+    "string": "#0a3069",
+    "number": "#0550ae",
+    "punctuation": "#cf222e",
+    "keyword": "#cf222e",
+    "function": "#8250df"
+  },
+  "meter": {
+    "low": "#1a7f37",
+    "mid": "#0969da",
+    "high": "#9a6700",
+    "peak": "#cf222e",
+    "track": "#eaeef2",
+    "fader": "#24292f"
+  }
+}

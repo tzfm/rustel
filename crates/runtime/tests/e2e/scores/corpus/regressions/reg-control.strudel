@@ -1,0 +1,7 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+register('bright', (amt, pat) => pat.lpf(amt).lpq(8))
+$: s("bd*4").bright(900)

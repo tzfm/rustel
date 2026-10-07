@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+ratio("1, 5:4, 3:2").mul(110)
+.freq().s("piano")

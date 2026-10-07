@@ -1,0 +1,30 @@
+/*
+  @title Swinging Bass
+  @by SOMEHOAX
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?JIMT1KSO2Vss
+*/
+// "Swinging Bass" @by SOMEHOAX
+
+setcps(140/60/4)
+
+
+stack(
+  s("hh:1*16").bank("RolandTR808").n(irand(3)).swingBy(1/16, 8|16).layer(
+    x => x.degradeBy(0.3).pan(0.2),
+    x => x.undegradeBy(0.7).pan(0.8)
+  )
+  ,s("bd(5,16)").bank("RolandTR909").n(run(4)).when("<0 1>/4", x=>x.zoom(0.25, 1.25))
+  .lpf(tri.rangex(600,3000))
+  ,s("cp(1,4)").bank("RolandTR909").n(run(4))
+  .outside(4, rev)
+  .when("<0 1>/2", x=>x.ply("2").jux(press))
+  ,n("{[4@2 4] [5@2 5] [8@2 6] [3@2 5]}%8").clip(tri.rangex(0.5, 1.25)).off("<1/4 1/8 1/2>", x=>x.add(3))
+  .scale("<C2:mixolydian F2:mixolydian>/4").vib(3)
+  .s("gm_synth_bass_2:1").swingBy(1/8, 16).early(1/8).coarse("<8 4 2>")
+  .lpf(sine.range(400,1000)).lpa(.2).dec(.6)
+  .gain(0.75).pan(brandBy(tri.range(0.8, 0.2)))
+)
+
+// @version 1.0

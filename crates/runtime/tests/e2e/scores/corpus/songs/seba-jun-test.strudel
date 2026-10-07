@@ -1,0 +1,81 @@
+/*
+  @title Seba Jun test
+  @by shadesDrawn
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?CnJJPQDihidu
+*/
+//"Seba Jun test" @by shadesDrawn
+var cpm = 22;
+
+//drums
+drum1: s("bd ~ [sd:1, rim] [bd rim] [~ rim] bd [sd:1, rim] ~")
+  .bank("RolandTR909")
+  .gain("<~@4 0.4@500>")
+  .cpm(cpm)
+
+drum2: s("[hh ~]*16").bank("RolandTR808")
+  .gain("<~@4 0.4@500>")
+  .cpm(cpm)
+  
+bass1: note(`
+[c3,e3,g3,b3]
+[[d3,e3,g3,b3] [c3,e3,g3,b3]]
+[b2,d3,f#3,a3]
+[[b2,d3,f#3,a3] [a2,d3,f#3,a3] ]
+`)
+    .slow(4)  
+    .s("sine")
+    //.sustain(10)
+    .gain(0.7)
+    .room(0.4)
+    .decay(2)
+    //.release(sine.range(0.3,0.6).slow(12))
+    //.cutoff(sine.rangex(400,4000).slow(9))
+    //.delay("0.3")
+    .cpm(cpm)
+
+accent1: note(`
+[~ ~ [b e@2]@1.5 e@1 [e d e]@1.5 b e]
+[~ ~ [d4 b@2]@1.5 b@1 [b c b]@1.5 d4 b]
+[~ ~ [a d@2]@1.5 d@1 [d e d]@1.5 a d]
+[~ ~ [f# b2@2]@1.5 b2@1 [b2 a2 b2]@1.5 f# b2]
+`).sound("piano")
+  .slow(4)
+  .gain("<0@16 0.4@16>")
+  .cpm(cpm)
+
+lead1: note(`
+[[c,e,g,b] d@0.25 e@0.25 g@0.25 [e,g,b]@0.5 [e,g,b]@0.5 d@0.25 [e,g,b]@0.5 d@0.5]
+[[c,e,g,b] d@0.25 e@0.25 g@0.25 [e,g,b]@0.5 [e,g,b]@0.5 d@0.25 [e,g,b]@0.5 d@0.5]
+[[b2,d,f#,a] c#@0.25 d@0.25 f#@0.25 [d,f#,a]@0.5 [d,f#,a]@0.5 d@0.25 [d,f#,a]@0.5 d@0.5]
+[[d,f#,a] d@0.25 d@0.25 f#@0.25 [d,f#,a]@0.5 [d,f#,d4]@0.5 [d,f#,a]@0.5 [d,g]@0.5 d@0.25]
+`)
+  .slow(4).sound("<~@8 gm_epiano1:1@500>")
+  .gain("<1@4 0@4 1@4 1@4>")
+  .room(0.5)
+  .decay(2)
+  .cpm(cpm)
+  //.hush()
+
+lead2: note(`
+[[c,e,g,b] g@0.25 a@0.25 b@0.25 [g,b,d4]@0.5 [g,b,e4]@0.5 d@0.25 [g,b,d4]@0.5 d@0.5]
+[[g,b,e4,g4] d4@0.25 e4@0.25 f#4@0.25 [b,e4,g4]@0.5 [b,e4,g4]@0.5 d4@0.25 [b,e4,a4]@0.5 d4@0.5]
+[[b3,d4,f#4] d4@0.25 e4@0.25 f#4@0.25 [d4,f#4,a4]@0.5 [d4,f#4,a4]@0.5 d4@0.25 [d4,f#4,b4]@0.5 d4@0.5]
+[[b3,d4,f#4] g@0.25 f#@0.25 e@0.25 [f#,a,d4]@0.5 [a,d4,f#4]@0.5 [f#,a,d4]@0.5 [d,g,b]@0.5 e@0.25]
+`)
+  .slow(4).sound("<~@8 gm_epiano1:2@500>")
+  .gain("<0.0@4 0.75@4 .0@4 0.75@4>")
+  .room(0.5)
+  .decay(2)
+  .cpm(cpm)
+  //.hush()
+
+/*
+//Drum 2
+sound("<[bd bd sd [bd sd] bd bd sd <sd [bd sd]>] [bd bd sd [bd sd] ~ sd ~ [sd sd]]>")
+  .bank("RolandCompurhythm8000").gain("1 0.6 0.8 0.6")
+,
+*/
+
+// @version 1.0

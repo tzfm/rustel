@@ -1,0 +1,18 @@
+[package]
+name = "rustel-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Generation-aware pattern event scheduling"
+
+[features]
+callback-census = ["rustel-core/callback-census"]
+
+[dependencies]
+rustel-core = { path = "../core" }
+rustel-fraction = { path = "../fraction" }
+
+[dev-dependencies]
+rustel-jsruntime = { path = "../jsruntime", default-features = false }

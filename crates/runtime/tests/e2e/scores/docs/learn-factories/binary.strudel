@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+"hh".s().struct(binary(5))
+// "hh".s().struct("1 0 1")

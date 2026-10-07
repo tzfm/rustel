@@ -1,0 +1,83 @@
+/*
+  @by awesome-strudel
+  @origin songs-awesome
+  @duration 4
+*/
+// @title boulders compact
+// @by tzwaan
+
+setCpm(148/4)
+
+all(x=>stack(x.filterWhen(t=>t<13),x.rib(13,40).late(13).filterWhen(t=>t>=13)))
+
+$: note("<0@4 1@8 2 3@4[3,4]@36>".pickRestart([
+  `<0[0 0 - 0]0*2[0!3 -]0*2[0 0*2][0 0 0*2]*2@6 0*2[0 0*2]0 0>*4`,
+  `<0!4 0*2[0 0*2]0 0>*4`,
+  `0!5 - 0 - 0!8`,
+  `<0 - 0!5 - 0!3 0*2 0!5[- 0!3]*3@12 0 0 ->*8`,
+  `<- 0 -!30>*8`
+]).add("d2"))
+  .s("gm_melodic_tom")
+  .dist(1)
+  .lpf(900)
+  .release(.5)
+  .room(.4)
+
+$: note("<-@4 0@8 0 0@40>".pickRestart([
+  `<0*4[2 0][- 2][2*2 0]2*2[- 0][[2 0]0][- 2][0 2][2 -][- 2]0*2[[2 2]2][[- 2]0]2*2[- 2]>*4`
+]).add("d3,d2"))
+  .s("gm_melodic_tom,sin")
+  .lpf(400)
+
+$: note("<-@8 0@4 0 0@40>".pickRestart([
+  `<4[- 0]4 -[- 0][4*2 -]4[- 0]4 -[0 4]4 -[4*2 -]0[- 4*2]>*4`
+]).add("f#5"))
+  .s("gm_melodic_tom")
+  .rel(.2)
+  .room(.8)
+
+$: note("<-@13 0@28 1@8 0@4>".pickRestart([
+  `<0!6[0 3][5 3]>*4`,
+  `[0 0 - 0]*2`
+]).add("<d1@23 g1@2 d1@6 g1@4 d1@2 a1@2 g1@2 d1@12>"))
+  .s("saw").lpf(400).clip(.8).rel(.1)
+
+$: note("<-@17 0@6 1@4 -@2 0@2 1@2 2@4 -@16>".pickRestart([
+  `<0 3 7[3 5][- 3][- 0]3[7 10]7 5 3[0 5][- 0]3 5 -2*2 0 -!15>*8`,
+  `<-5!2[-5 -2][- 0]!2[- -5][-2 0][-2 -5*2]-5 -!7>*4`,
+  `<0 0[0 3][- 5][- 5 - 0 3 5 3 0]@4[-5*2 -5 -<[- 2]->]*2@8>*4`
+]).add("d6")).s("gm_kalimba")
+  .dec(.2)
+  .room(.6)
+
+$: note("<-@37[0 1 0 1<1 ->@4]*2@16>".pickRestart([
+`[- 1!3]`,
+`[- 1]*2`
+]).add("c2"))
+.s("sd:3").lpf(3000).gain(.7).dec(.2)
+
+
+$: note("<-@41[d1,a1,d2]@4 ab2@4 -@4>")
+  .s("<[sin,gm_overdriven_guitar:3]@45 saw@8>")
+  .struct("[1 1 - 1]*2")
+  .decay(.25)
+  .set("<.1:800:0:0:0:.7@45 0:400:3:.1:1:0@8>".as("rel:lp:lpq:lpdecay:fm:room"))
+  .dist("1")
+  .fmh(.5)
+
+$: note("<-@37[e3,g3,e4,e5]-@15>").clip(4).s("triangle")
+  .fmwave("white").fm(1).fmh(0.4)
+  .pattack(.2).pdecay(7).penv(5).panchor(0)
+  .attack(.05)
+  .dist(1).room(1)
+  .lpf(1000).lpq(2)
+  .gain(.7)
+  .vowel("oe")
+
+$: note("<-@25 1 -@27>").add(note("b1"))
+  .s("didgeridoo:3")
+  .attack(1).release(3).dist(2).panchor(0).pattack(8).penv(-3).room(1)
+
+$: note("<-@15 1 -@11 1 -@15 1 -@9>").add(note("b1"))
+.s("didgeridoo:[1,2]")
+.decay(2.5).dist(1).lpf(2000).room(1)

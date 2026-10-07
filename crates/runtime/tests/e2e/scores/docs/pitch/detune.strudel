@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+note("d f a a# a d3").fast(2).s("supersaw").detune("<.1 .2 .5 24.1>")

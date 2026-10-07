@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+samples({ rave: 'rave/AREUREADY.wav' }, 'github:tidalcycles/dirt-samples')
+s("rave").begin("<0 .25 .5 .75>").fast(2)

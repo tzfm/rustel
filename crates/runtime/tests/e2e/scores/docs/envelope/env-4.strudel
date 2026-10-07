@@ -1,0 +1,9 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+s("pulse").lpf(500).env({ a: 1 })
+  .env({ c: "s", a: 1 })
+  .diode(0.3)
+  .sometimes(x => x.env({ a: "0.5" }, 1)) // envelope #1 (0-indexed)

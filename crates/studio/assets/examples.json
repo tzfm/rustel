@@ -1,0 +1,3699 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "id": "music-parts-first-groove-four-on-the-floor",
+      "name": "Four on the floor",
+      "kind": "music",
+      "section": "parts",
+      "category": "First groove",
+      "tags": [
+        "music",
+        "parts",
+        "first-groove"
+      ],
+      "source": null,
+      "code": "$: s(\"bd*4, [~ cp]*2, hh*8\").bank(\"RolandTR909\")",
+      "explanation": "Four on the floor is a compact first groove music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-first-groove-two-against-three",
+      "name": "Two against three",
+      "kind": "music",
+      "section": "parts",
+      "category": "First groove",
+      "tags": [
+        "music",
+        "parts",
+        "first-groove"
+      ],
+      "source": "https://strudel.cc/workshop/first-sounds/",
+      "code": "$: s(\"bd*2, hh*3\").bank(\"RolandTR808\")",
+      "explanation": "Two against three is a compact first groove music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-first-groove-polymeter",
+      "name": "Polymeter",
+      "kind": "music",
+      "section": "parts",
+      "category": "First groove",
+      "tags": [
+        "music",
+        "parts",
+        "first-groove"
+      ],
+      "source": null,
+      "code": "$: s(\"<bd rim, hh hh oh>*4\").bank(\"LinnDrum\")",
+      "explanation": "Polymeter is a compact first groove music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-first-groove-boom-bap",
+      "name": "Boom bap",
+      "kind": "music",
+      "section": "parts",
+      "category": "First groove",
+      "tags": [
+        "music",
+        "parts",
+        "first-groove"
+      ],
+      "source": null,
+      "code": "$: s(\"bd ~ [~ bd] ~, ~ sd ~ sd, hh*8\").bank(\"RolandTR808\").gain(\"1 .7 .8 .7\")",
+      "explanation": "Boom bap is a compact first groove music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-first-groove-swing",
+      "name": "Swing",
+      "kind": "music",
+      "section": "parts",
+      "category": "First groove",
+      "tags": [
+        "music",
+        "parts",
+        "first-groove"
+      ],
+      "source": null,
+      "code": "$: s(\"bd*4, ~ cp ~ cp, hh*8\").swingBy(1/3, 4).bank(\"AkaiLinn\")",
+      "explanation": "Swing is a compact first groove music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-first-groove-off-the-break",
+      "name": "Off the break",
+      "kind": "music",
+      "section": "parts",
+      "category": "First groove",
+      "tags": [
+        "music",
+        "parts",
+        "first-groove"
+      ],
+      "source": null,
+      "code": "$: s(\"brk/2\").fit().chop(16).cut(1).sometimesBy(.3, ply(2)).room(.2)",
+      "explanation": "Off the break is a compact first groove music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-drum-machines-909",
+      "name": "909",
+      "kind": "music",
+      "section": "parts",
+      "category": "Drum machines",
+      "tags": [
+        "music",
+        "parts",
+        "drum-machines"
+      ],
+      "source": "https://club.tidalcycles.org/t/2921",
+      "code": "$: s(\"bd*4, [~ cp]*2, hh*8, ~ ~ ~ oh\").bank(\"RolandTR909\").gain(\"1 .8\").room(.15)",
+      "explanation": "909 is a compact drum machines music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-drum-machines-808",
+      "name": "808",
+      "kind": "music",
+      "section": "parts",
+      "category": "Drum machines",
+      "tags": [
+        "music",
+        "parts",
+        "drum-machines"
+      ],
+      "source": "https://club.tidalcycles.org/t/2921",
+      "code": "$: s(\"bd ~ ~ bd ~ ~ bd ~, ~ ~ cp ~\").bank(\"RolandTR808\")\n$: s(\"hh*8\").bank(\"RolandTR808\").sometimesBy(.4, ply(\"2 3\")).gain(.7)",
+      "explanation": "808 is a compact drum machines music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-drum-machines-linndrum",
+      "name": "LinnDrum",
+      "kind": "music",
+      "section": "parts",
+      "category": "Drum machines",
+      "tags": [
+        "music",
+        "parts",
+        "drum-machines"
+      ],
+      "source": null,
+      "code": "$: s(\"bd ~ sd ~, hh(7,16), ~ ~ ~ [~ cb]\").bank(\"LinnDrum\").swingBy(1/4, 8)",
+      "explanation": "LinnDrum is a compact drum machines music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-drum-machines-dmx",
+      "name": "DMX",
+      "kind": "music",
+      "section": "parts",
+      "category": "Drum machines",
+      "tags": [
+        "music",
+        "parts",
+        "drum-machines"
+      ],
+      "source": null,
+      "code": "$: s(\"bd ~ ~ bd, ~ sd, hh*16\").bank(\"OberheimDMX\").crush(8).gain(\"1 .6\")",
+      "explanation": "DMX is a compact drum machines music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-drum-machines-mpc60",
+      "name": "MPC60",
+      "kind": "music",
+      "section": "parts",
+      "category": "Drum machines",
+      "tags": [
+        "music",
+        "parts",
+        "drum-machines"
+      ],
+      "source": null,
+      "code": "$: s(\"bd ~ [~ bd] ~, ~ sd ~ sd, hh*8\").bank(\"AkaiMPC60\").gain(\"1 .7\")",
+      "explanation": "MPC60 is a compact drum machines music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-drum-machines-606",
+      "name": "606",
+      "kind": "music",
+      "section": "parts",
+      "category": "Drum machines",
+      "tags": [
+        "music",
+        "parts",
+        "drum-machines"
+      ],
+      "source": null,
+      "code": "$: s(\"bd*4, sd(3,8), hh*16\").bank(\"RolandTR606\").gain(\".9 .6\")",
+      "explanation": "606 is a compact drum machines music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-drum-machines-707",
+      "name": "707",
+      "kind": "music",
+      "section": "parts",
+      "category": "Drum machines",
+      "tags": [
+        "music",
+        "parts",
+        "drum-machines"
+      ],
+      "source": null,
+      "code": "$: s(\"hh hh, bd rim [~ cp] rim\").bank(\"RolandTR707\").ply(2)",
+      "explanation": "707 is a compact drum machines music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-breaks-chops-chop",
+      "name": "Chop",
+      "kind": "music",
+      "section": "parts",
+      "category": "Breaks & chops",
+      "tags": [
+        "music",
+        "parts",
+        "breaks-chops"
+      ],
+      "source": "https://strudel.cc/recipes/recipes/",
+      "code": "$: s(\"brk/2\").fit().chop(32).cut(1).rarely(mul(speed(\"-1\")))",
+      "explanation": "Chop is a compact breaks & chops music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-breaks-chops-slice",
+      "name": "Slice",
+      "kind": "music",
+      "section": "parts",
+      "category": "Breaks & chops",
+      "tags": [
+        "music",
+        "parts",
+        "breaks-chops"
+      ],
+      "source": "https://strudel.cc/recipes/recipes/",
+      "code": "$: s(\"brk/2\").fit().slice(8, \"0 1 <2 6> 3 [4 0] 5 6 7\").cut(1).rarely(ply(\"2\"))",
+      "explanation": "Slice is a compact breaks & chops music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-breaks-chops-splice",
+      "name": "Splice",
+      "kind": "music",
+      "section": "parts",
+      "category": "Breaks & chops",
+      "tags": [
+        "music",
+        "parts",
+        "breaks-chops"
+      ],
+      "source": "https://strudel.cc/recipes/recipes/",
+      "code": "$: s(\"brk/2\").splice(8, \"0 1 [2 3 0]@2 3 0@2 7\").cut(1)",
+      "explanation": "Splice is a compact breaks & chops music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-breaks-chops-bite",
+      "name": "Bite",
+      "kind": "music",
+      "section": "parts",
+      "category": "Breaks & chops",
+      "tags": [
+        "music",
+        "parts",
+        "breaks-chops"
+      ],
+      "source": null,
+      "code": "$: s(\"bd ~ bd bd*2, ~ sd ~ sd:1 sd ~ [~ sd:2] ~, hh [~ cp]\").bank(\"RolandTR909\").bite(4, \"0 0 [1 2] <3 2> 0 0 [2 1] 3\")",
+      "explanation": "Bite is a compact breaks & chops music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-breaks-chops-cut-group",
+      "name": "Cut group",
+      "kind": "music",
+      "section": "parts",
+      "category": "Breaks & chops",
+      "tags": [
+        "music",
+        "parts",
+        "breaks-chops"
+      ],
+      "source": null,
+      "code": "$: s(\"[oh hh]*4\").cut(1).bank(\"RolandTR909\")",
+      "explanation": "Cut group is a compact breaks & chops music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-chord-progressions-four-chords",
+      "name": "Four chords",
+      "kind": "music",
+      "section": "parts",
+      "category": "Chord progressions",
+      "tags": [
+        "music",
+        "parts",
+        "chord-progressions"
+      ],
+      "source": null,
+      "code": "$: chord(\"<C G Am F>\").voicing().s(\"gm_piano\").clip(1).room(.3)",
+      "explanation": "Four chords is a compact chord progressions music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-chord-progressions-ii-v-i",
+      "name": "ii V I",
+      "kind": "music",
+      "section": "parts",
+      "category": "Chord progressions",
+      "tags": [
+        "music",
+        "parts",
+        "chord-progressions"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Dm7 G7 C^7 C^7>\").voicing().s(\"gm_epiano1\").clip(.9).room(.4)",
+      "explanation": "ii V I is a compact chord progressions music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-chord-progressions-andalusian",
+      "name": "Andalusian",
+      "kind": "music",
+      "section": "parts",
+      "category": "Chord progressions",
+      "tags": [
+        "music",
+        "parts",
+        "chord-progressions"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am G F E>\").voicing().s(\"gm_acoustic_guitar_nylon\").clip(2).room(.35)",
+      "explanation": "Andalusian is a compact chord progressions music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-chord-progressions-ninths",
+      "name": "Ninths",
+      "kind": "music",
+      "section": "parts",
+      "category": "Chord progressions",
+      "tags": [
+        "music",
+        "parts",
+        "chord-progressions"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am9 Dm9 Em9 Am9>\").voicing().anchor(\"c5\").s(\"gm_epiano1\").struct(\"~ x ~ x\").room(.5)",
+      "explanation": "Ninths is a compact chord progressions music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-chord-progressions-left-hand",
+      "name": "Left hand",
+      "kind": "music",
+      "section": "parts",
+      "category": "Chord progressions",
+      "tags": [
+        "music",
+        "parts",
+        "chord-progressions"
+      ],
+      "source": null,
+      "code": "$: chord(\"<F^7 Em7 Dm7 G7>\").voicing().dict(\"lefthand\").anchor(\"a4\").s(\"gm_epiano1\").clip(1).room(.4)",
+      "explanation": "Left hand is a compact chord progressions music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-chord-progressions-giant-steps",
+      "name": "Giant steps",
+      "kind": "music",
+      "section": "parts",
+      "category": "Chord progressions",
+      "tags": [
+        "music",
+        "parts",
+        "chord-progressions"
+      ],
+      "source": null,
+      "code": "$: chord(\"<B^7 D7 G^7 Bb7 Eb^7 [Am7 D7]>\").voicing().s(\"gm_epiano1\").clip(.9).room(.3)",
+      "explanation": "Giant steps is a compact chord progressions music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-chord-progressions-with-a-bass",
+      "name": "With a bass",
+      "kind": "music",
+      "section": "parts",
+      "category": "Chord progressions",
+      "tags": [
+        "music",
+        "parts",
+        "chord-progressions"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Dm7 G7 C^7 A7b9>\").voicing().s(\"gm_epiano1\").room(.4)\n$: note(\"<d2 g2 c2 a2>\").s(\"gm_acoustic_bass\").clip(.9)",
+      "explanation": "With a bass is a compact chord progressions music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-chord-progressions-choir",
+      "name": "Choir",
+      "kind": "music",
+      "section": "parts",
+      "category": "Chord progressions",
+      "tags": [
+        "music",
+        "parts",
+        "chord-progressions"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Cm9 Ab^9 Eb^9 Bb>\").voicing().s(\"gm_choir_aahs\").slow(2).clip(2).room(.7)",
+      "explanation": "Choir is a compact chord progressions music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-basslines-acid",
+      "name": "Acid",
+      "kind": "music",
+      "section": "parts",
+      "category": "Basslines",
+      "tags": [
+        "music",
+        "parts",
+        "basslines"
+      ],
+      "source": "https://strudel.cc/recipes/recipes/",
+      "code": "$: note(\"c1 [~ c2] eb1 g1\").s(\"sawtooth\").lpf(sine.range(300,2200).slow(4)).lpq(12).lpenv(3).lpa(.05)",
+      "explanation": "Acid is a compact basslines music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-basslines-walking",
+      "name": "Walking",
+      "kind": "music",
+      "section": "parts",
+      "category": "Basslines",
+      "tags": [
+        "music",
+        "parts",
+        "basslines"
+      ],
+      "source": null,
+      "code": "$: n(\"0 2 4 5\").scale(\"<C2:major F2:major G2:major C2:major>\").s(\"gm_acoustic_bass\").clip(.9)",
+      "explanation": "Walking is a compact basslines music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-basslines-detuned",
+      "name": "Detuned",
+      "kind": "music",
+      "section": "parts",
+      "category": "Basslines",
+      "tags": [
+        "music",
+        "parts",
+        "basslines"
+      ],
+      "source": null,
+      "code": "$: note(\"<c1 eb1 f1 g1>\").s(\"sawtooth, sawtooth\").add(note(\"0,.12\")).lpf(500).lpq(6).room(.2)",
+      "explanation": "Detuned is a compact basslines music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-basslines-wavetable",
+      "name": "Wavetable",
+      "kind": "music",
+      "section": "parts",
+      "category": "Basslines",
+      "tags": [
+        "music",
+        "parts",
+        "basslines"
+      ],
+      "source": null,
+      "code": "$: note(\"c1*8\").s(\"wt_digital\").n(run(8)).lpf(perlin.range(200,1400).slow(8)).lpenv(-3).lpa(.1).room(.3)",
+      "explanation": "Wavetable is a compact basslines music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-basslines-sub-and-hats",
+      "name": "Sub and hats",
+      "kind": "music",
+      "section": "parts",
+      "category": "Basslines",
+      "tags": [
+        "music",
+        "parts",
+        "basslines"
+      ],
+      "source": null,
+      "code": "$: note(\"<c1 c1 eb1 f1>\").s(\"sine\").clip(.9).gain(.9)\n$: s(\"hh*8\").bank(\"RolandTR909\").gain(.5)",
+      "explanation": "Sub and hats is a compact basslines music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-basslines-chord-bass",
+      "name": "Chord bass",
+      "kind": "music",
+      "section": "parts",
+      "category": "Basslines",
+      "tags": [
+        "music",
+        "parts",
+        "basslines"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Fm7 Db^7 Ab Eb>\").voicing().s(\"supersaw\").struct(\"~ x ~ x ~ x x ~\").lpf(2500).room(.3)",
+      "explanation": "Chord bass is a compact basslines music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-melody-arpeggios-strummed-chords",
+      "name": "Strummed chords",
+      "requires_extensions": true,
+      "kind": "music",
+      "section": "parts",
+      "category": "Melody & arpeggios",
+      "tags": [
+        "music",
+        "parts",
+        "melody-arpeggios",
+        "switch angel",
+        "strum"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am7 F^7 C^7 G7>\").voicing().fast(2)\n  .strum(0.015).late(0.015).s(\"gm_acoustic_guitar_nylon\")\n  .clip(.85).gain(.55).room(.25)",
+      "explanation": "Switch Angel's strum spreads each chord into a quick guitar stroke over a four-chord progression.",
+      "change": "Try a negative strum amount for a downstroke, or increase it slightly for a slower roll.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-melody-arpeggios-trance-arpeggio",
+      "name": "Trance arpeggio",
+      "requires_extensions": true,
+      "kind": "music",
+      "section": "parts",
+      "category": "Melody & arpeggios",
+      "tags": [
+        "music",
+        "parts",
+        "melody-arpeggios",
+        "switch angel",
+        "trancearp"
+      ],
+      "source": null,
+      "code": "$: trancearp([\"a3\", \"c4\", \"e4\", \"g4\", \"a4\", \"e5\"], 4, 1).note()\n  .s(\"sawtooth\").lpf(sine.range(1100, 3600).slow(8))\n  .attack(.005).decay(.12).sustain(0).release(.08).gain(.22)\n  .delay(.25).delaytime(.1875).delayfeedback(.3).room(.2)",
+      "explanation": "Switch Angel's trancearp turns six chord tones into a sixteen-step phrase with alternating directions, a syncopated rhythm, and a slowly opening filter.",
+      "change": "Change the second argument (0-5) for a different direction pattern, or the third (0-2) for a different rhythm.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-melody-arpeggios-run",
+      "name": "Run",
+      "kind": "music",
+      "section": "parts",
+      "category": "Melody & arpeggios",
+      "tags": [
+        "music",
+        "parts",
+        "melody-arpeggios"
+      ],
+      "source": null,
+      "code": "$: n(run(8)).scale(\"D:minor:pentatonic\").s(\"gm_kalimba\").room(.6).clip(2)",
+      "explanation": "Run is a compact melody & arpeggios music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-melody-arpeggios-arpeggiated-chords",
+      "name": "Arpeggiated chords",
+      "kind": "music",
+      "section": "parts",
+      "category": "Melody & arpeggios",
+      "tags": [
+        "music",
+        "parts",
+        "melody-arpeggios"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am7 D7 G^7 C^7>\").voicing().arp(\"0 [0,2] 1 [0,2]\").s(\"gm_electric_guitar_clean\").clip(1.2).room(.3)",
+      "explanation": "Arpeggiated chords is a compact melody & arpeggios music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-melody-arpeggios-phasing",
+      "name": "Phasing",
+      "kind": "music",
+      "section": "parts",
+      "category": "Melody & arpeggios",
+      "tags": [
+        "music",
+        "parts",
+        "melody-arpeggios"
+      ],
+      "source": "https://strudel.cc/recipes/recipes/",
+      "code": "$: note(\"<C D G A Bb D C A G D Bb A>*[6,6.1]\").s(\"piano\").room(.4)",
+      "explanation": "Phasing is a compact melody & arpeggios music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-melody-arpeggios-chunked",
+      "name": "Chunked",
+      "kind": "music",
+      "section": "parts",
+      "category": "Melody & arpeggios",
+      "tags": [
+        "music",
+        "parts",
+        "melody-arpeggios"
+      ],
+      "source": null,
+      "code": "$: n(\"0 1 2 3\".chunk(4, x => x.add(7))).scale(\"A:minor\").s(\"gm_marimba\").room(.4)",
+      "explanation": "Chunked is a compact melody & arpeggios music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-melody-arpeggios-bebop",
+      "name": "Bebop",
+      "kind": "music",
+      "section": "parts",
+      "category": "Melody & arpeggios",
+      "tags": [
+        "music",
+        "parts",
+        "melody-arpeggios"
+      ],
+      "source": null,
+      "code": "$: n(\"0 .. 7\").scale(\"C4:bebop:major\").scaleTranspose(\"<0 -1 -2 -3>\").s(\"gm_vibraphone\").clip(1.2).room(.4)",
+      "explanation": "Bebop is a compact melody & arpeggios music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-melody-arpeggios-music-box",
+      "name": "Music box",
+      "kind": "music",
+      "section": "parts",
+      "category": "Melody & arpeggios",
+      "tags": [
+        "music",
+        "parts",
+        "melody-arpeggios"
+      ],
+      "source": null,
+      "code": "$: n(\"0 [3 5] 7 [5 3]\").scale(\"F#4:major:pentatonic\").s(\"gm_music_box\").room(.7).clip(2)",
+      "explanation": "Music box is a compact melody & arpeggios music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-euclid-world-rhythm-tresillo",
+      "name": "Tresillo",
+      "kind": "music",
+      "section": "parts",
+      "category": "Euclid & world rhythm",
+      "tags": [
+        "music",
+        "parts",
+        "euclid-world-rhythm"
+      ],
+      "source": "Toussaint, The Euclidean Algorithm Generates Traditional Musical Rhythms (2005)",
+      "code": "$: s(\"bd(3,8), ~ cp, hh*8\").bank(\"RolandTR808\")",
+      "explanation": "Tresillo is a compact euclid & world rhythm music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-euclid-world-rhythm-cinquillo",
+      "name": "Cinquillo",
+      "kind": "music",
+      "section": "parts",
+      "category": "Euclid & world rhythm",
+      "tags": [
+        "music",
+        "parts",
+        "euclid-world-rhythm"
+      ],
+      "source": "Toussaint, The Euclidean Algorithm Generates Traditional Musical Rhythms (2005)",
+      "code": "$: s(\"rim(5,8), bd ~ ~ bd, hh*4\").bank(\"RolandTR808\")",
+      "explanation": "Cinquillo is a compact euclid & world rhythm music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-euclid-world-rhythm-bossa-nova",
+      "name": "Bossa nova",
+      "kind": "music",
+      "section": "parts",
+      "category": "Euclid & world rhythm",
+      "tags": [
+        "music",
+        "parts",
+        "euclid-world-rhythm"
+      ],
+      "source": "Toussaint, The Euclidean Algorithm Generates Traditional Musical Rhythms (2005)",
+      "code": "$: s(\"rim(5,16,2), bd ~ [~ bd] ~, hh*8\").bank(\"RolandTR707\").gain(\".9 .7\")",
+      "explanation": "Bossa nova is a compact euclid & world rhythm music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-euclid-world-rhythm-gahu",
+      "name": "Gahu",
+      "kind": "music",
+      "section": "parts",
+      "category": "Euclid & world rhythm",
+      "tags": [
+        "music",
+        "parts",
+        "euclid-world-rhythm"
+      ],
+      "source": "Toussaint, The Euclidean Algorithm Generates Traditional Musical Rhythms (2005)",
+      "code": "$: s(\"cb(7,12), bd*3, hh(5,12)\").bank(\"LinnDrum\").gain(\".8 1 .8\")",
+      "explanation": "Gahu is a compact euclid & world rhythm music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-euclid-world-rhythm-aksak",
+      "name": "Aksak",
+      "kind": "music",
+      "section": "parts",
+      "category": "Euclid & world rhythm",
+      "tags": [
+        "music",
+        "parts",
+        "euclid-world-rhythm"
+      ],
+      "source": "Toussaint, The Euclidean Algorithm Generates Traditional Musical Rhythms (2005)",
+      "code": "$: s(\"bd(7,16), sd(9,16,4), hh*16\").bank(\"RolandTR909\").gain(\"1 .7 .5\")",
+      "explanation": "Aksak is a compact euclid & world rhythm music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-parts-euclid-world-rhythm-rotating",
+      "name": "Rotating",
+      "kind": "music",
+      "section": "parts",
+      "category": "Euclid & world rhythm",
+      "tags": [
+        "music",
+        "parts",
+        "euclid-world-rhythm"
+      ],
+      "source": null,
+      "code": "$: s(\"bd(3,8,<0 2 4>), hh(11,16), ~ cp\").bank(\"RolandTR909\").room(.2)",
+      "explanation": "Rotating is a compact euclid & world rhythm music starting point. It shows one pattern idea that can be pasted into a playing set.",
+      "change": "Change the pattern density or the sound name, then keep the rest of the chain so the musical effect is easy to hear.",
+      "assets": []
+    },
+    {
+      "id": "music-tracks-house-house-kit",
+      "name": "House kit",
+      "kind": "music",
+      "section": "tracks",
+      "category": "House",
+      "tags": [
+        "music",
+        "tracks",
+        "house"
+      ],
+      "source": null,
+      "code": "$: stack(s(\"bd*4\").gain(1), s(\"[~ cp]*2\").gain(.8), s(\"[~ oh]*4\").gain(.5), s(\"hh*8\").gain(.4)).bank(\"RolandTR909\")",
+      "explanation": "House kit is a house part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 124,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-house-offbeat-bass",
+      "name": "Offbeat bass",
+      "kind": "music",
+      "section": "tracks",
+      "category": "House",
+      "tags": [
+        "music",
+        "tracks",
+        "house"
+      ],
+      "source": null,
+      "code": "$: n(\"0\").struct(\"[~ x]*4\").scale(\"A2:minor\").s(\"sawtooth\").lpf(900).lpq(8).clip(.4)",
+      "explanation": "Offbeat bass is a house part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 124,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-house-filtered-stab",
+      "name": "Filtered stab",
+      "kind": "music",
+      "section": "tracks",
+      "category": "House",
+      "tags": [
+        "music",
+        "tracks",
+        "house"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am7 D9>\").voicing().struct(\"[~ x]*4\").s(\"gm_epiano1\").lpf(sine.range(600,3000).slow(8))",
+      "explanation": "Filtered stab is a house part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 124,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-house-piano-riff",
+      "name": "Piano riff",
+      "kind": "music",
+      "section": "tracks",
+      "category": "House",
+      "tags": [
+        "music",
+        "tracks",
+        "house"
+      ],
+      "source": null,
+      "code": "$: n(\"0 ~ 2 ~ 4 ~ <7 5> ~\").scale(\"A4:minor\").s(\"gm_piano\").clip(.4).room(.3)",
+      "explanation": "Piano riff is a house part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 124,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-house-warm-pad",
+      "name": "Warm pad",
+      "kind": "music",
+      "section": "tracks",
+      "category": "House",
+      "tags": [
+        "music",
+        "tracks",
+        "house"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am7 Dm7 G7 C^7>\").voicing().s(\"gm_pad_warm\").slow(2).clip(2).room(.6).gain(.5)",
+      "explanation": "Warm pad is a house part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 124,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-house-filter-sweep",
+      "name": "Filter sweep",
+      "kind": "music",
+      "section": "tracks",
+      "category": "House",
+      "tags": [
+        "music",
+        "tracks",
+        "house"
+      ],
+      "source": null,
+      "code": "$: s(\"white*16\").gain(saw.range(.03,.28).slow(8)).hpf(5000).pan(sine.slow(3))",
+      "explanation": "Filter sweep is a house part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 124,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-techno-hard-kick",
+      "name": "Hard kick",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Techno",
+      "tags": [
+        "music",
+        "tracks",
+        "techno"
+      ],
+      "source": null,
+      "code": "$: s(\"bd*4\").bank(\"RolandTR909\").distort(\"2:.4\").lpf(240).room(.25).size(.9)",
+      "explanation": "Hard kick is a techno part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 128,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-techno-rolling-hats",
+      "name": "Rolling hats",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Techno",
+      "tags": [
+        "music",
+        "tracks",
+        "techno"
+      ],
+      "source": null,
+      "code": "$: s(\"hh*16\").bank(\"RolandTR909\").gain(\"[.4 .75]*8\").pan(sine.range(.35,.65))\n$: s(\"[~ oh]*4\").bank(\"RolandTR909\").gain(.55).room(.15)",
+      "explanation": "Rolling hats is a techno part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 128,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-techno-acid-line",
+      "name": "Acid line",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Techno",
+      "tags": [
+        "music",
+        "tracks",
+        "techno"
+      ],
+      "source": null,
+      "code": "$: note(\"a1 a2 c2 a1 g1 a1 c2 e2\").s(\"sawtooth\").lpf(saw.range(300,2400).slow(6)).lpq(14).lpenv(4)",
+      "explanation": "Acid line is a techno part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 128,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-techno-metal-loop",
+      "name": "Metal loop",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Techno",
+      "tags": [
+        "music",
+        "tracks",
+        "techno"
+      ],
+      "source": null,
+      "code": "$: s(\"basique\").bank(\"wt_digital\").note(\"a2*8\").wt(saw.slow(4)).warpmode(\"spin\").delay(\".4:.19:.6\")",
+      "explanation": "Metal loop is a techno part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 128,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-techno-sub-bass",
+      "name": "Sub bass",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Techno",
+      "tags": [
+        "music",
+        "tracks",
+        "techno"
+      ],
+      "source": null,
+      "code": "$: note(\"<a1 a1 f1 g1>\").s(\"sine\").clip(.95).gain(.95).shape(.2)",
+      "explanation": "Sub bass is a techno part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 128,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-techno-rave-stab",
+      "name": "Rave stab",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Techno",
+      "tags": [
+        "music",
+        "tracks",
+        "techno"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am7 Am7 F^7 G7>\").voicing().s(\"supersaw\").unison(5).struct(\"~ x ~ x\").lpf(3000).room(.4)",
+      "explanation": "Rave stab is a techno part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 128,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-uplifting-trance-trance-kick",
+      "name": "Trance kick",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Uplifting trance",
+      "tags": [
+        "music",
+        "tracks",
+        "uplifting-trance"
+      ],
+      "source": null,
+      "code": "$: stack(s(\"bd*4\").gain(.95), s(\"[~ cp]*2\").gain(.8), s(\"[~ oh]*4\").gain(.5)).bank(\"RolandTR909\")\n$: s(\"hh*16\").bank(\"RolandTR909\").gain(saw.range(.25,.5).fast(2))",
+      "explanation": "Trance kick is a uplifting trance part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 138,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-uplifting-trance-offbeat-bass",
+      "name": "Offbeat bass",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Uplifting trance",
+      "tags": [
+        "music",
+        "tracks",
+        "uplifting-trance"
+      ],
+      "source": null,
+      "code": "$: n(\"<0 0 3 2>\").struct(\"[~ x]*4\").scale(\"A2:minor\").s(\"sawtooth\").lpf(1000).decay(.08).sustain(0)",
+      "explanation": "Offbeat bass is a uplifting trance part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 138,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-uplifting-trance-supersaw-lead",
+      "name": "Supersaw lead",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Uplifting trance",
+      "tags": [
+        "music",
+        "tracks",
+        "uplifting-trance"
+      ],
+      "source": null,
+      "code": "$: n(\"0 2 3 5 7 5 3 2\").scale(\"A4:minor\").s(\"supersaw\").unison(9).detune(.2).delay(.4).room(.4)",
+      "explanation": "Supersaw lead is a uplifting trance part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 138,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-uplifting-trance-big-pad",
+      "name": "Big pad",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Uplifting trance",
+      "tags": [
+        "music",
+        "tracks",
+        "uplifting-trance"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am F C G>\").voicing().s(\"supersaw\").attack(.8).release(2).room(.8).gain(.5).unison(7)",
+      "explanation": "Big pad is a uplifting trance part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 138,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-uplifting-trance-gated-chords",
+      "name": "Gated chords",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Uplifting trance",
+      "tags": [
+        "music",
+        "tracks",
+        "uplifting-trance"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am F C G>\").voicing().struct(\"x*16\").s(\"supersaw\").clip(.35).lpf(3000).gain(.5).room(.3)",
+      "explanation": "Gated chords is a uplifting trance part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 138,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-uplifting-trance-snare-roll",
+      "name": "Snare roll",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Uplifting trance",
+      "tags": [
+        "music",
+        "tracks",
+        "uplifting-trance"
+      ],
+      "source": null,
+      "code": "$: s(\"~ ~ ~ sd*8\").bank(\"RolandTR909\").gain(range(.3,1,saw)).room(.2)",
+      "explanation": "Snare roll is a uplifting trance part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 138,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-psytrance-psy-kick",
+      "name": "Psy kick",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Psytrance",
+      "tags": [
+        "music",
+        "tracks",
+        "psytrance"
+      ],
+      "source": null,
+      "code": "$: stack(s(\"bd*4\").gain(1), s(\"[~ oh]*4\").gain(.4), s(\"hh*16\").gain(.25)).bank(\"RolandTR909\").distort(\".3:.6\")",
+      "explanation": "Psy kick is a psytrance part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 145,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-psytrance-rolling-bass",
+      "name": "Rolling bass",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Psytrance",
+      "tags": [
+        "music",
+        "tracks",
+        "psytrance"
+      ],
+      "source": null,
+      "code": "$: s(\"bd*4\").bank(\"RolandTR909\").distort(\".3:.6\")\n$: n(\"[~ 0 0]*4\").scale(\"A1:minor\").s(\"sawtooth\").lpf(640).lpq(9).clip(.3).gain(.95)",
+      "explanation": "Rolling bass is a psytrance part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 145,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-psytrance-acid-lead",
+      "name": "Acid lead",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Psytrance",
+      "tags": [
+        "music",
+        "tracks",
+        "psytrance"
+      ],
+      "source": null,
+      "code": "$: n(\"0 ~ 0 3 7 5 3 0\").fast(2).scale(\"A3:minor\").s(\"sawtooth\").lpf(saw.range(400,3200)).lpq(16)",
+      "explanation": "Acid lead is a psytrance part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 145,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-psytrance-dark-pad",
+      "name": "Dark pad",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Psytrance",
+      "tags": [
+        "music",
+        "tracks",
+        "psytrance"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am9 Fm9>\").voicing().s(\"gm_pad_sweep\").slow(4).clip(4).hpf(300).room(.8).gain(.45)",
+      "explanation": "Dark pad is a psytrance part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 145,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-psytrance-delay-blip",
+      "name": "Delay blip",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Psytrance",
+      "tags": [
+        "music",
+        "tracks",
+        "psytrance"
+      ],
+      "source": null,
+      "code": "$: n(\"~ ~ 12 ~\").fast(2).scale(\"A4:minor\").s(\"square\").clip(.08).delay(\".5:.1875:.6\").orbit(2)",
+      "explanation": "Delay blip is a psytrance part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 145,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-psytrance-noise-riser",
+      "name": "Noise riser",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Psytrance",
+      "tags": [
+        "music",
+        "tracks",
+        "psytrance"
+      ],
+      "source": null,
+      "code": "$: s(\"white*4\").hpf(saw.range(400,8000).slow(8)).gain(.22).room(.5)",
+      "explanation": "Noise riser is a psytrance part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 145,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-mainstage-edm-mainstage-kick",
+      "name": "Mainstage kick",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Mainstage Edm",
+      "tags": [
+        "music",
+        "tracks",
+        "mainstage-edm"
+      ],
+      "source": null,
+      "code": "$: s(\"bd*4, ~ cp ~ cp, [~ oh]*4\").bank(\"RolandTR909\").shape(.35).gain(1)",
+      "explanation": "Mainstage kick is a mainstage edm part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 128,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-mainstage-edm-sidechain-sub",
+      "name": "Sidechain sub",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Mainstage Edm",
+      "tags": [
+        "music",
+        "tracks",
+        "mainstage-edm"
+      ],
+      "source": null,
+      "code": "$: n(\"[~ 0]*4\").scale(\"A1:minor\").s(\"sine\").clip(.4).gain(1)",
+      "explanation": "Sidechain sub is a mainstage edm part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 128,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-mainstage-edm-offbeat-stab",
+      "name": "Offbeat stab",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Mainstage Edm",
+      "tags": [
+        "music",
+        "tracks",
+        "mainstage-edm"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am F C G>\").voicing().anchor(\"c5\").struct(\"[~ x]*4\").s(\"supersaw\").decay(.12).sustain(0)",
+      "explanation": "Offbeat stab is a mainstage edm part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 128,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-mainstage-edm-drop-lead",
+      "name": "Drop lead",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Mainstage Edm",
+      "tags": [
+        "music",
+        "tracks",
+        "mainstage-edm"
+      ],
+      "source": null,
+      "code": "$: n(\"0 [~ 0] 3 [2 ~] <7 5> ~\").scale(\"A4:minor\").s(\"supersaw\").unison(7).detune(.2).room(.25)",
+      "explanation": "Drop lead is a mainstage edm part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 128,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-mainstage-edm-big-room-pad",
+      "name": "Big room pad",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Mainstage Edm",
+      "tags": [
+        "music",
+        "tracks",
+        "mainstage-edm"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am F C G>\").voicing().s(\"supersaw\").unison(5).detune(.15).lpf(2200).clip(1).room(.5)",
+      "explanation": "Big room pad is a mainstage edm part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 128,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-mainstage-edm-the-build",
+      "name": "The build",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Mainstage Edm",
+      "tags": [
+        "music",
+        "tracks",
+        "mainstage-edm"
+      ],
+      "source": null,
+      "code": "$: s(\"white\").slow(2).hpf(saw.range(300,9000).slow(2)).gain(.35).room(.4)\n$: s(\"sd*8 sd*16 sd*32 sd*64\").bank(\"RolandTR909\").gain(saw.range(.3,.9))",
+      "explanation": "The build is a mainstage edm part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 128,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-synthwave-gated-drums",
+      "name": "Gated drums",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Synthwave",
+      "tags": [
+        "music",
+        "tracks",
+        "synthwave"
+      ],
+      "source": null,
+      "code": "$: stack(s(\"bd*4\").gain(1), s(\"hh*8\").gain(.5), s(\"~ ~ ~ oh\").gain(.5)).bank(\"LinnDrum\")\n$: s(\"~ sd ~ sd\").bank(\"LinnDrum\").room(.85).size(.3).clip(.5).gain(.95)",
+      "explanation": "Gated drums is a synthwave part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 100,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-synthwave-octave-bass",
+      "name": "Octave bass",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Synthwave",
+      "tags": [
+        "music",
+        "tracks",
+        "synthwave"
+      ],
+      "source": null,
+      "code": "$: n(\"0 0 0 7 0 0 4 0\").scale(\"A2:minor\").s(\"sawtooth\").fast(2).lpf(750).resonance(9).clip(.4)",
+      "explanation": "Octave bass is a synthwave part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 100,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-synthwave-neon-lead",
+      "name": "Neon lead",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Synthwave",
+      "tags": [
+        "music",
+        "tracks",
+        "synthwave"
+      ],
+      "source": null,
+      "code": "$: n(\"<0 2> 4 [7 ~] <9 7>\").scale(\"A4:minor\").s(\"supersaw\").delay(.4).delaytime(.375).room(.55)",
+      "explanation": "Neon lead is a synthwave part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 100,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-synthwave-warm-pad",
+      "name": "Warm pad",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Synthwave",
+      "tags": [
+        "music",
+        "tracks",
+        "synthwave"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am F C G>\").voicing().s(\"gm_pad_warm\").attack(.5).clip(2).room(.7).size(.8)",
+      "explanation": "Warm pad is a synthwave part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 100,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-synthwave-dx-bells",
+      "name": "DX bells",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Synthwave",
+      "tags": [
+        "music",
+        "tracks",
+        "synthwave"
+      ],
+      "source": null,
+      "code": "$: n(\"0 4 7 4 0 4\").scale(\"A5:minor\").s(\"gm_epiano2\").fast(2).delay(.5).delaytime(.1875).room(.5)",
+      "explanation": "DX bells is a synthwave part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 100,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-synthwave-brass-stabs",
+      "name": "Brass stabs",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Synthwave",
+      "tags": [
+        "music",
+        "tracks",
+        "synthwave"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am F C G>\").voicing().struct(\"~ x ~ [~ x]\").s(\"gm_synth_brass_1\").clip(.5).room(.4)",
+      "explanation": "Brass stabs is a synthwave part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 100,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-synthwave-bell-lead",
+      "name": "Bell lead",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Synthwave",
+      "tags": [
+        "music",
+        "tracks",
+        "synthwave"
+      ],
+      "source": null,
+      "code": "$: n(\"0 [~ 3] 7 ~\").scale(\"C5:minor:pentatonic\").s(\"gm_music_box\").delay(.35).room(.7).clip(2)",
+      "explanation": "Bell lead is a synthwave part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 100,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-ambient-distant-kick",
+      "name": "Distant kick",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Ambient",
+      "tags": [
+        "music",
+        "tracks",
+        "ambient"
+      ],
+      "source": null,
+      "code": "$: s(\"bd ~ ~ ~\").bank(\"AkaiLinn\").gain(.45).lpf(400).room(.85).size(.9).slow(2)",
+      "explanation": "Distant kick is a ambient part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 80,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-ambient-sub-drone",
+      "name": "Sub drone",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Ambient",
+      "tags": [
+        "music",
+        "tracks",
+        "ambient"
+      ],
+      "source": null,
+      "code": "$: note(\"c1,c2\").s(\"sine\").attack(2).release(4).gain(.85).room(.5).slow(4)",
+      "explanation": "Sub drone is a ambient part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 80,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-ambient-slow-chorale",
+      "name": "Slow chorale",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Ambient",
+      "tags": [
+        "music",
+        "tracks",
+        "ambient"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Cm9 Ab^9 Eb^9 Bb>\").voicing().s(\"gm_pad_warm\").slow(4).clip(2).attack(2).room(.9)",
+      "explanation": "Slow chorale is a ambient part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 80,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-ambient-music-box",
+      "name": "Music box",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Ambient",
+      "tags": [
+        "music",
+        "tracks",
+        "ambient"
+      ],
+      "source": null,
+      "code": "$: n(\"0 ~ 4 ~ 2 ~ ~ 7\").scale(\"C5:minor:pentatonic\").s(\"gm_music_box\").slow(4).room(.85).delay(.5)",
+      "explanation": "Music box is a ambient part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 80,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-ambient-bell-echo",
+      "name": "Bell echo",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Ambient",
+      "tags": [
+        "music",
+        "tracks",
+        "ambient"
+      ],
+      "source": null,
+      "code": "$: n(\"<0 4>\").scale(\"C5:minor\").s(\"gm_tubular_bells\").slow(4).delay(.6).delayfeedback(.7).room(.9)",
+      "explanation": "Bell echo is a ambient part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 80,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-ambient-tape-hiss",
+      "name": "Tape hiss",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Ambient",
+      "tags": [
+        "music",
+        "tracks",
+        "ambient"
+      ],
+      "source": null,
+      "code": "$: s(\"pink\").gain(.12).lpf(sine.range(300,1600).slow(24)).room(.9).slow(8)\n$: s(\"crackle\").gain(.25).room(.6)",
+      "explanation": "Tape hiss is a ambient part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 80,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-ambient-dark-pad",
+      "name": "Dark pad",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Ambient",
+      "tags": [
+        "music",
+        "tracks",
+        "ambient"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Cm9 Ab^7 Eb^7 Gm7>\").voicing().s(\"gm_pad_warm\").slow(2).clip(2).room(.75).gain(.45)",
+      "explanation": "Dark pad is a ambient part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 80,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-dubstep-half-time-kit",
+      "name": "Half-time kit",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Dubstep",
+      "tags": [
+        "music",
+        "tracks",
+        "dubstep"
+      ],
+      "source": null,
+      "code": "$: stack(s(\"bd ~ ~ ~\").gain(1).duckorbit(2).duckattack(.12).duckdepth(.5), s(\"~ ~ [sd,cp] ~\").gain(1).room(.3), s(\"hh*8\").gain(.4)).bank(\"RolandTR909\").shape(.25)",
+      "explanation": "Half-time kit is a dubstep part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 140,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-dubstep-wobble-bass",
+      "name": "Wobble bass",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Dubstep",
+      "tags": [
+        "music",
+        "tracks",
+        "dubstep"
+      ],
+      "source": null,
+      "code": "$: stack(note(\"c1\").clip(1).s(\"sawtooth\").lpf(800).lpsync(\"<4 8 16 8>\").lpdepth(1.6).lpshape(1).lpq(8).distort(\"2:.5\"), note(\"c1\").s(\"sine\").clip(1).gain(.9)).orbit(2)",
+      "explanation": "Wobble bass is a dubstep part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 140,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-dubstep-stepped-wobble",
+      "name": "Stepped wobble",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Dubstep",
+      "tags": [
+        "music",
+        "tracks",
+        "dubstep"
+      ],
+      "source": null,
+      "code": "$: stack(note(\"c1\").seg(32).s(\"sawtooth\").lpf(sine.range(150,2200).fast(\"<4 8 4 8>\")).lpq(10).distort(\"2:.5\"), note(\"c1\").s(\"sine\").clip(1).gain(.9)).orbit(2)",
+      "explanation": "Stepped wobble is a dubstep part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 140,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-dubstep-neuro-drop",
+      "name": "Neuro drop",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Dubstep",
+      "tags": [
+        "music",
+        "tracks",
+        "dubstep"
+      ],
+      "source": null,
+      "code": "$: stack(note(\"c1\").clip(1).s(\"sawtooth\").penv(-7).pdecay(.18).pcurve(1).lpf(500).lpsync(\"<8 16>\").lpdepth(1.8).lpskew(.8).lpq(14).ftype(\"ladder\").distort(\"3:.35\").crush(7), note(\"c1\").s(\"sine\").clip(1).gain(.9)).orbit(2)",
+      "explanation": "Neuro drop is a dubstep part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 140,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-dubstep-screech-over-the-sub",
+      "name": "Screech over the sub",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Dubstep",
+      "tags": [
+        "music",
+        "tracks",
+        "dubstep"
+      ],
+      "source": null,
+      "code": "$: stack(note(\"c3\").seg(16).s(\"sawtooth\").vowel(\"<i e a i>*4\").lpf(sine.range(900,6500).fast(8)).lpq(16).ftype(\"ladder\").distort(\"2:.45\").coarse(\"<1 2 4 2>\").gain(.3).room(.2), note(\"c1\").s(\"sine\").clip(1).gain(.9)).orbit(2)",
+      "explanation": "Screech over the sub is a dubstep part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 140,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-dubstep-talking-growl",
+      "name": "Talking growl",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Dubstep",
+      "tags": [
+        "music",
+        "tracks",
+        "dubstep"
+      ],
+      "source": null,
+      "code": "$: stack(note(\"c1\").seg(16).s(\"basique\").bank(\"wt_digital\").wt(saw.fast(4)).warp(\"<.3 .6>\").warpmode(\"spin\").vowel(\"<a o e u>*4\").distort(\"1.5:.6\").phaser(4), note(\"c1\").s(\"sine\").clip(1).gain(.9)).orbit(2)",
+      "explanation": "Talking growl is a dubstep part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 140,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-dubstep-fm-growl",
+      "name": "FM growl",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Dubstep",
+      "tags": [
+        "music",
+        "tracks",
+        "dubstep"
+      ],
+      "source": null,
+      "code": "$: stack(note(\"c1*8\").s(\"square\").fm(\"[2 6]*2\").fmh(\"<1 .5 2 1.5>\").lpf(1400).lpsync(8).lpdepth(1.4).vowel(\"[o a]*4\").distort(\"1.5:.6\"), note(\"c1\").s(\"sine\").clip(1).gain(.9)).orbit(2)",
+      "explanation": "FM growl is a dubstep part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 140,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-dubstep-call-and-response",
+      "name": "Call and response",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Dubstep",
+      "tags": [
+        "music",
+        "tracks",
+        "dubstep"
+      ],
+      "source": null,
+      "code": "$: stack(note(\"c1*4\").mask(\"<1 0>\").s(\"sawtooth\").lpf(700).lpsync(4).lpdepth(1.6).lpshape(1).distort(\"2:.5\"), note(\"c1 c1 bb0 [c1 eb1]\").seg(16).mask(\"<0 1>\").s(\"curses\").bank(\"wt_digital\").wt(saw.fast(8)).warp(perlin).warpmode(\"asym\").vowel(\"[a e i o]*2\").distort(\"1.5:.6\"), note(\"<[c1*4] [c1 c1 bb0 [c1 eb1]]>\").s(\"sine\").clip(1).gain(.9)).orbit(2)",
+      "explanation": "Call and response is a dubstep part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 140,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-dubstep-riser-and-drop",
+      "name": "Riser and drop",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Dubstep",
+      "tags": [
+        "music",
+        "tracks",
+        "dubstep"
+      ],
+      "source": null,
+      "code": "$: note(\"c2\").add(note(saw.range(0,24))).seg(16).mask(\"<0 0 0 1>\").s(\"sawtooth\").lpf(saw.range(600,6000)).hpf(200).room(.5)\n$: s(\"white\").seg(16).mask(\"<0 0 0 1>\").gain(saw.range(.05,.5)).hpf(saw.range(300,8000)).room(.6)\n$: s(\"<cr ~ ~ ~>\").bank(\"RolandTR909\").gain(.5).room(.5)\n$: s(\"<bd ~ ~ ~>\").bank(\"RolandTR808\").speed(.5).distort(\"1.5:.6\")",
+      "explanation": "Riser and drop is a dubstep part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 140,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-dubstep-pinch-harmonic",
+      "name": "Pinch harmonic",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Dubstep",
+      "tags": [
+        "music",
+        "tracks",
+        "dubstep"
+      ],
+      "source": null,
+      "code": "$: note(\"c4 ~ ~ ~ c4 ~ ~ ~\").s(\"sawtooth\").distort(\"8:.2\").vib(\"7:14\").room(.5).gain(.4)",
+      "explanation": "Pinch harmonic is a dubstep part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 140,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-drum-bass-two-step",
+      "name": "Two step",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Drum & bass",
+      "tags": [
+        "music",
+        "tracks",
+        "drum-bass"
+      ],
+      "source": null,
+      "code": "$: stack(s(\"bd ~ [~ bd] ~\").gain(1), s(\"~ sd ~ sd\").gain(.9), s(\"hh*8\").gain(.45)).bank(\"RolandTR909\")",
+      "explanation": "Two step is a drum & bass part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 174,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-drum-bass-chopped-break",
+      "name": "Chopped break",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Drum & bass",
+      "tags": [
+        "music",
+        "tracks",
+        "drum-bass"
+      ],
+      "source": null,
+      "code": "$: s(\"brk/2\").fit().slice(8, \"0 1 2 3 <4 6> 5 [6 7] 3\").cut(1).rarely(mul(speed(\"-1\")))",
+      "explanation": "Chopped break is a drum & bass part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 174,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-drum-bass-beating-saws",
+      "name": "Beating saws",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Drum & bass",
+      "tags": [
+        "music",
+        "tracks",
+        "drum-bass"
+      ],
+      "source": null,
+      "code": "$: note(\"<a1 a1 c2 g1>\").s(\"supersaw\").unison(3).detune(.16).lpf(sine.range(300,1300).slow(8))",
+      "explanation": "Beating saws is a drum & bass part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 174,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-drum-bass-liquid-keys",
+      "name": "Liquid keys",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Drum & bass",
+      "tags": [
+        "music",
+        "tracks",
+        "drum-bass"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am9 Dm9 F^7 E7>\").voicing().s(\"gm_epiano1\").struct(\"~ x ~ [~ x]\").room(.5).clip(.9)",
+      "explanation": "Liquid keys is a drum & bass part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 174,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-drum-bass-halo-pad",
+      "name": "Halo pad",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Drum & bass",
+      "tags": [
+        "music",
+        "tracks",
+        "drum-bass"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am9 F^9 Dm9 E7>\").voicing().s(\"gm_fx_atmosphere\").slow(2).clip(2).room(.8).gain(.5)",
+      "explanation": "Halo pad is a drum & bass part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 174,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-drum-bass-sub-under",
+      "name": "Sub under",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Drum & bass",
+      "tags": [
+        "music",
+        "tracks",
+        "drum-bass"
+      ],
+      "source": null,
+      "code": "$: note(\"<a0 a0 c1 g0>\").s(\"sine\").clip(.95).gain(.95).orbit(2)",
+      "explanation": "Sub under is a drum & bass part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 174,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-drum-bass-scrubbed-break",
+      "name": "Scrubbed break",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Drum & bass",
+      "tags": [
+        "music",
+        "tracks",
+        "drum-bass"
+      ],
+      "source": null,
+      "code": "$: s(\"brk/2\").fit().scrub(\"{0 4 2 6 0 8 4 2}%8\".div(16)).cut(1).gain(.9)",
+      "explanation": "Scrubbed break is a drum & bass part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 174,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-jungle-amen-chop",
+      "name": "Amen chop",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Jungle",
+      "tags": [
+        "music",
+        "tracks",
+        "jungle"
+      ],
+      "source": null,
+      "code": "$: s(\"brk/2\").fit().slice(8, \"0 1 2 3 [4 4] 5 <6 2> [7 3]\").cut(1).sometimesBy(.25, ply(2))\n$: stack(s(\"bd ~ ~ bd ~ ~ bd ~\").gain(1), s(\"~ ~ sd ~\").gain(.85)).bank(\"RolandTR909\")",
+      "explanation": "Amen chop is a jungle part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 165,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-jungle-deep-sub",
+      "name": "Deep sub",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Jungle",
+      "tags": [
+        "music",
+        "tracks",
+        "jungle"
+      ],
+      "source": null,
+      "code": "$: note(\"a1 ~ ~ ~ <a1 c2> ~ ~ ~\").s(\"sine\").lpf(200).clip(.95).gain(1)",
+      "explanation": "Deep sub is a jungle part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 165,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-jungle-detuned-saws",
+      "name": "Detuned saws",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Jungle",
+      "tags": [
+        "music",
+        "tracks",
+        "jungle"
+      ],
+      "source": null,
+      "code": "$: note(\"<a1 a1 c2 d2>\").s(\"sawtooth, sawtooth\").add(note(\"0,.15\")).lpf(320).lpq(9).gain(.9)",
+      "explanation": "Detuned saws is a jungle part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 165,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-jungle-ragga-stab",
+      "name": "Ragga stab",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Jungle",
+      "tags": [
+        "music",
+        "tracks",
+        "jungle"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am7 Dm7 G7 C^7>\").voicing().s(\"gm_rock_organ\").struct(\"~ x ~ ~ ~ x ~ ~\").delay(.4)",
+      "explanation": "Ragga stab is a jungle part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 165,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-jungle-dub-strings",
+      "name": "Dub strings",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Jungle",
+      "tags": [
+        "music",
+        "tracks",
+        "jungle"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am9 Dm9 Em9 Am9>\").voicing().s(\"gm_string_ensemble_1\").slow(2).clip(2).room(.7)",
+      "explanation": "Dub strings is a jungle part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 165,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-jungle-stretched-break",
+      "name": "Stretched break",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Jungle",
+      "tags": [
+        "music",
+        "tracks",
+        "jungle"
+      ],
+      "source": null,
+      "code": "$: s(\"brk/2\").fit().slow(4).chop(8).cut(2).lpf(900).gain(.45).room(.6)",
+      "explanation": "Stretched break is a jungle part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 165,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-jungle-scrubbed-break",
+      "name": "Scrubbed break",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Jungle",
+      "tags": [
+        "music",
+        "tracks",
+        "jungle"
+      ],
+      "source": null,
+      "code": "$: s(\"brk/2\").fit().scrub(\"{0 4 2 6 0 8 4 2}%8\".div(16)).cut(1).gain(.9)",
+      "explanation": "Scrubbed break is a jungle part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 165,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-uk-garage-two-step-kit",
+      "name": "Two-step kit",
+      "kind": "music",
+      "section": "tracks",
+      "category": "UK garage",
+      "tags": [
+        "music",
+        "tracks",
+        "uk-garage"
+      ],
+      "source": null,
+      "code": "$: stack(s(\"bd ~ [~ bd] ~\").gain(1), s(\"~ cp ~ cp\").gain(.8), s(\"hh*16\").gain(.45)).bank(\"RolandTR909\").swingBy(1/3, 8)",
+      "explanation": "Two-step kit is a uk garage part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 132,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-uk-garage-skippy-hats",
+      "name": "Skippy hats",
+      "kind": "music",
+      "section": "tracks",
+      "category": "UK garage",
+      "tags": [
+        "music",
+        "tracks",
+        "uk-garage"
+      ],
+      "source": null,
+      "code": "$: s(\"hh*16\").bank(\"RolandTR909\").swingBy(1/3, 8).gain(\".6 .35\").pan(\"<.45 .55>\")\n$: s(\"rim*16?\").bank(\"RolandTR909\").swingBy(1/3, 8).gain(.3)",
+      "explanation": "Skippy hats is a uk garage part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 132,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-uk-garage-clipped-sub",
+      "name": "Clipped sub",
+      "kind": "music",
+      "section": "tracks",
+      "category": "UK garage",
+      "tags": [
+        "music",
+        "tracks",
+        "uk-garage"
+      ],
+      "source": null,
+      "code": "$: note(\"a1 ~ [~ a1] ~\").s(\"sine\").add(note(\"<0 0 3 5>\")).clip(.45).postgain(1.1)",
+      "explanation": "Clipped sub is a uk garage part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 132,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-uk-garage-organ-stab",
+      "name": "Organ stab",
+      "kind": "music",
+      "section": "tracks",
+      "category": "UK garage",
+      "tags": [
+        "music",
+        "tracks",
+        "uk-garage"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am7 Dm7 G7 C>\").voicing().anchor(\"c3\").s(\"gm_rock_organ\").struct(\"~ x ~ [x x]\").clip(.2)",
+      "explanation": "Organ stab is a uk garage part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 132,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-uk-garage-vocal-chop",
+      "name": "Vocal chop",
+      "kind": "music",
+      "section": "tracks",
+      "category": "UK garage",
+      "tags": [
+        "music",
+        "tracks",
+        "uk-garage"
+      ],
+      "source": null,
+      "code": "$: n(\"0 ~ [~ 3] [2 ~] 0 ~\").scale(\"A4:minor\").s(\"gm_voice_oohs\").vowel(\"<a e o>\").clip(.35).room(.3)",
+      "explanation": "Vocal chop is a uk garage part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 132,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-uk-garage-warm-pad",
+      "name": "Warm pad",
+      "kind": "music",
+      "section": "tracks",
+      "category": "UK garage",
+      "tags": [
+        "music",
+        "tracks",
+        "uk-garage"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am7 Dm7 G7 C^7>\").voicing().s(\"gm_pad_warm\").slow(2).clip(2).room(.6).gain(.45)",
+      "explanation": "Warm pad is a uk garage part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 132,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-hip-hop-boom-bap-kit",
+      "name": "Boom bap kit",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Hip hop",
+      "tags": [
+        "music",
+        "tracks",
+        "hip-hop"
+      ],
+      "source": null,
+      "code": "$: stack(s(\"bd ~ [~ bd] ~\").gain(1), s(\"~ sd ~ sd\").gain(.8), s(\"hh*8\").gain(.5)).bank(\"AkaiMPC60\").swingBy(1/3, 8)",
+      "explanation": "Boom bap kit is a hip hop part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 92,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-hip-hop-upright-bass",
+      "name": "Upright bass",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Hip hop",
+      "tags": [
+        "music",
+        "tracks",
+        "hip-hop"
+      ],
+      "source": null,
+      "code": "$: n(\"0 ~ [~ 0] 5\").scale(\"A2:minor\").s(\"gm_acoustic_bass\").clip(.9).gain(.9)",
+      "explanation": "Upright bass is a hip hop part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 92,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-hip-hop-rhodes-chops",
+      "name": "Rhodes chops",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Hip hop",
+      "tags": [
+        "music",
+        "tracks",
+        "hip-hop"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am9 Dm9 G13 C^9>\").voicing().s(\"gm_epiano2\").struct(\"~ x ~ [~ x]\").room(.4).lpf(2600)",
+      "explanation": "Rhodes chops is a hip hop part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 92,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-hip-hop-muted-trumpet",
+      "name": "Muted trumpet",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Hip hop",
+      "tags": [
+        "music",
+        "tracks",
+        "hip-hop"
+      ],
+      "source": null,
+      "code": "$: n(\"<0 4> ~ [2 3] ~\").scale(\"A4:minor\").s(\"gm_muted_trumpet\").off(1/8, x => x.add(n(2))).room(.4)",
+      "explanation": "Muted trumpet is a hip hop part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 92,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-hip-hop-sampler-stab",
+      "name": "Sampler stab",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Hip hop",
+      "tags": [
+        "music",
+        "tracks",
+        "hip-hop"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am9 Dm9 G13 C^9>\").voicing().anchor(\"c5\").s(\"piano\").struct(\"~ x ~ x\").coarse(4).crush(8)",
+      "explanation": "Sampler stab is a hip hop part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 92,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-hip-hop-vinyl-crackle",
+      "name": "Vinyl crackle",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Hip hop",
+      "tags": [
+        "music",
+        "tracks",
+        "hip-hop"
+      ],
+      "source": null,
+      "code": "$: s(\"crackle\").gain(.4).room(.3)",
+      "explanation": "Vinyl crackle is a hip hop part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 92,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-lo-fi-beats-dusty-beat",
+      "name": "Dusty beat",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Lo-fi beats",
+      "tags": [
+        "music",
+        "tracks",
+        "lo-fi-beats"
+      ],
+      "source": null,
+      "code": "$: stack(s(\"bd ~ [~ bd] ~\").gain(1), s(\"~ sd ~ sd\").gain(.55), s(\"hh*8\").gain(.4)).bank(\"AkaiMPC60\").swingBy(1/3, 4).lpf(6000)",
+      "explanation": "Dusty beat is a lo-fi beats part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 78,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-lo-fi-beats-upright-bass",
+      "name": "Upright bass",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Lo-fi beats",
+      "tags": [
+        "music",
+        "tracks",
+        "lo-fi-beats"
+      ],
+      "source": null,
+      "code": "$: note(\"<a1 a1 f1 g1>\").s(\"gm_acoustic_bass\").clip(.9).lpf(900).room(.15)",
+      "explanation": "Upright bass is a lo-fi beats part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 78,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-lo-fi-beats-rhodes-comp",
+      "name": "Rhodes comp",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Lo-fi beats",
+      "tags": [
+        "music",
+        "tracks",
+        "lo-fi-beats"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am9 Dm9 G13 C^9>\").voicing().anchor(\"a4\").s(\"gm_epiano1\").vib(\"0.6:0.12\").room(.4)",
+      "explanation": "Rhodes comp is a lo-fi beats part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 78,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-lo-fi-beats-tape-wobble",
+      "name": "Tape wobble",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Lo-fi beats",
+      "tags": [
+        "music",
+        "tracks",
+        "lo-fi-beats"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am9 Dm9 G13 C^9>\").voicing().s(\"gm_pad_warm\").slow(2).speed(perlin.range(.99,1.01))",
+      "explanation": "Tape wobble is a lo-fi beats part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 78,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-lo-fi-beats-vinyl-and-hiss",
+      "name": "Vinyl and hiss",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Lo-fi beats",
+      "tags": [
+        "music",
+        "tracks",
+        "lo-fi-beats"
+      ],
+      "source": null,
+      "code": "$: s(\"crackle*4\").gain(.3).pan(\"<.4 .6>\").room(.2)\n$: s(\"pink\").gain(.1).lpf(2500)",
+      "explanation": "Vinyl and hiss is a lo-fi beats part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 78,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-lo-fi-beats-muted-trumpet",
+      "name": "Muted trumpet",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Lo-fi beats",
+      "tags": [
+        "music",
+        "tracks",
+        "lo-fi-beats"
+      ],
+      "source": null,
+      "code": "$: n(\"<0 2> [4 ~] <7 5> [~ 3]\").scale(\"A4:minor\").s(\"gm_muted_trumpet\").vib(\"0.5:0.1\").room(.5)",
+      "explanation": "Muted trumpet is a lo-fi beats part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 78,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-funk-funk-kit",
+      "name": "Funk kit",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Funk",
+      "tags": [
+        "music",
+        "tracks",
+        "funk"
+      ],
+      "source": null,
+      "code": "$: stack(s(\"bd ~ [~ bd] ~\").gain(1), s(\"~ sd ~ sd\").gain(.8), s(\"hh*16\").gain(\"[.55 .3]*8\")).bank(\"AkaiLinn\")",
+      "explanation": "Funk kit is a funk part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 108,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-funk-slap-bass",
+      "name": "Slap bass",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Funk",
+      "tags": [
+        "music",
+        "tracks",
+        "funk"
+      ],
+      "source": null,
+      "code": "$: n(\"0 ~ [0 7] ~ 0 [~ 0] [3 5] ~\").scale(\"A2:minor\").s(\"gm_slap_bass_1\").clip(.3)",
+      "explanation": "Slap bass is a funk part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 108,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-funk-clav-riff",
+      "name": "Clav riff",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Funk",
+      "tags": [
+        "music",
+        "tracks",
+        "funk"
+      ],
+      "source": null,
+      "code": "$: n(\"0 ~ [0 3] ~ 4 ~ [3 0] ~\").scale(\"A3:minor\").s(\"gm_clavinet\").clip(.25).lpf(2800).lpq(9)",
+      "explanation": "Clav riff is a funk part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 108,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-funk-guitar-chank",
+      "name": "Guitar chank",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Funk",
+      "tags": [
+        "music",
+        "tracks",
+        "funk"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am7 D9>\").voicing().s(\"gm_electric_guitar_muted\").struct(\"x*16\").gain(\"[1 .5]*8\")",
+      "explanation": "Guitar chank is a funk part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 108,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-funk-horn-stabs",
+      "name": "Horn stabs",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Funk",
+      "tags": [
+        "music",
+        "tracks",
+        "funk"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am7 D9 Am7 E7#9>\").voicing().s(\"gm_brass_section\").struct(\"~ ~ x ~ ~ x ~ ~\").clip(.3)",
+      "explanation": "Horn stabs is a funk part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 108,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-funk-talkbox-lead",
+      "name": "Talkbox lead",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Funk",
+      "tags": [
+        "music",
+        "tracks",
+        "funk"
+      ],
+      "source": null,
+      "code": "$: n(\"0 ~ 7 ~ 4 ~ 5 ~\").scale(\"A4:minor\").s(\"sawtooth\").vowel(\"<a e i o>\").clip(.4).lpf(1800)",
+      "explanation": "Talkbox lead is a funk part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 108,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-disco-four-on-the-floor",
+      "name": "Four on the floor",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Disco",
+      "tags": [
+        "music",
+        "tracks",
+        "disco"
+      ],
+      "source": null,
+      "code": "$: stack(s(\"bd*4\").gain(1), s(\"[~ oh]*4\").gain(.8), s(\"~ cp ~ cp\").gain(.9), s(\"hh*16\").gain(.7)).bank(\"RolandTR909\")",
+      "explanation": "Four on the floor is a disco part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 118,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-disco-octave-bass",
+      "name": "Octave bass",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Disco",
+      "tags": [
+        "music",
+        "tracks",
+        "disco"
+      ],
+      "source": null,
+      "code": "$: n(\"[0 7]*4\").scale(\"A2:minor\").s(\"gm_electric_bass_finger\").clip(.5).gain(.95)",
+      "explanation": "Octave bass is a disco part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 118,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-disco-string-line",
+      "name": "String line",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Disco",
+      "tags": [
+        "music",
+        "tracks",
+        "disco"
+      ],
+      "source": null,
+      "code": "$: n(\"0 [7 5] 4 [2 0]\").add(n(\"0,7\")).scale(\"A4:minor\").s(\"gm_string_ensemble_1\").room(.4)",
+      "explanation": "String line is a disco part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 118,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-disco-brass-stabs",
+      "name": "Brass stabs",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Disco",
+      "tags": [
+        "music",
+        "tracks",
+        "disco"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am7 Dm7 G7 C^7>\").voicing().struct(\"~ x ~ x\").s(\"gm_brass_section\").room(.3)",
+      "explanation": "Brass stabs is a disco part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 118,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-disco-guitar-chank",
+      "name": "Guitar chank",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Disco",
+      "tags": [
+        "music",
+        "tracks",
+        "disco"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am7 Dm7>\").voicing().struct(\"[~ x]*8\").s(\"gm_electric_guitar_muted\").gain(.65)",
+      "explanation": "Guitar chank is a disco part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 118,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-disco-harp-sweep",
+      "name": "Harp sweep",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Disco",
+      "tags": [
+        "music",
+        "tracks",
+        "disco"
+      ],
+      "source": null,
+      "code": "$: n(\"0 .. 7\").scale(\"A5:minor\").s(\"gm_orchestral_harp\").fast(2).gain(.55).room(.6)",
+      "explanation": "Harp sweep is a disco part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 118,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-reggae-dub-one-drop",
+      "name": "One drop",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Reggae & dub",
+      "tags": [
+        "music",
+        "tracks",
+        "reggae-dub"
+      ],
+      "source": null,
+      "code": "$: stack(s(\"~ ~ bd ~\").gain(1), s(\"~ ~ sd ~\").gain(.9), s(\"[~ hh]*4\").gain(.5)).bank(\"RolandTR808\").room(.25)\n$: s(\"~ ~ ~ [~ rim]\").bank(\"RolandTR808\").delay(.7).delaytime(.6).delayfeedback(.7).gain(.5)",
+      "explanation": "One drop is a reggae & dub part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 88,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-reggae-dub-deep-bass",
+      "name": "Deep bass",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Reggae & dub",
+      "tags": [
+        "music",
+        "tracks",
+        "reggae-dub"
+      ],
+      "source": null,
+      "code": "$: note(\"a1 ~ [a1 c2] ~ d2 ~ [c2 a1] ~\").s(\"sine\").lpf(400).clip(.9).gain(.95)",
+      "explanation": "Deep bass is a reggae & dub part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 88,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-reggae-dub-skank-guitar",
+      "name": "Skank guitar",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Reggae & dub",
+      "tags": [
+        "music",
+        "tracks",
+        "reggae-dub"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am7 D7>\").voicing().struct(\"~ x ~ x\").s(\"gm_clavinet\").clip(.2).delay(.6).delaytime(.6)",
+      "explanation": "Skank guitar is a reggae & dub part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 88,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-reggae-dub-organ-bubble",
+      "name": "Organ bubble",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Reggae & dub",
+      "tags": [
+        "music",
+        "tracks",
+        "reggae-dub"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Am7 D7>\").voicing().anchor(\"c5\").struct(\"[~ x]*4\").s(\"gm_rock_organ\").clip(.15).room(.3)",
+      "explanation": "Organ bubble is a reggae & dub part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 88,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-reggae-dub-melodica-lead",
+      "name": "Melodica lead",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Reggae & dub",
+      "tags": [
+        "music",
+        "tracks",
+        "reggae-dub"
+      ],
+      "source": null,
+      "code": "$: n(\"0 ~ 2 [4 2] ~ 0 ~ ~\").scale(\"A4:minor\").s(\"gm_harmonica\").delay(.6).delaytime(.6).room(.4)",
+      "explanation": "Melodica lead is a reggae & dub part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 88,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-reggae-dub-dub-siren",
+      "name": "Dub siren",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Reggae & dub",
+      "tags": [
+        "music",
+        "tracks",
+        "reggae-dub"
+      ],
+      "source": null,
+      "code": "$: note(\"a4 ~ ~ ~\").s(\"square\").vib(6).delay(.8).delaytime(.4).delayfeedback(.8).gain(.45).slow(2)",
+      "explanation": "Dub siren is a reggae & dub part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 88,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-rock-backbeat-kit",
+      "name": "Backbeat kit",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Rock",
+      "tags": [
+        "music",
+        "tracks",
+        "rock"
+      ],
+      "source": null,
+      "code": "$: stack(s(\"bd ~ ~ bd\").gain(1), s(\"~ sd ~ sd\").gain(.85), s(\"hh*8\").gain(.5)).bank(\"AkaiMPC60\").room(.2)",
+      "explanation": "Backbeat kit is a rock part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 120,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-rock-driving-bass",
+      "name": "Driving bass",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Rock",
+      "tags": [
+        "music",
+        "tracks",
+        "rock"
+      ],
+      "source": null,
+      "code": "$: note(\"<e1 e1 g1 d1>*8\").s(\"gm_electric_bass_pick\").clip(.85).gain(.95)",
+      "explanation": "Driving bass is a rock part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 120,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-rock-power-chord-riff",
+      "name": "Power chord riff",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Rock",
+      "tags": [
+        "music",
+        "tracks",
+        "rock"
+      ],
+      "source": null,
+      "code": "$: n(\"0 0 [~ 0] 3 0 0 4 3\").add(n(\"0,4\")).scale(\"E3:minor\").s(\"gm_overdriven_guitar\").distort(2)",
+      "explanation": "Power chord riff is a rock part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 120,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-rock-rock-organ",
+      "name": "Rock organ",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Rock",
+      "tags": [
+        "music",
+        "tracks",
+        "rock"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Em G D C>\").voicing().s(\"gm_rock_organ\").struct(\"~ x ~ x\").gain(.55).room(.3)",
+      "explanation": "Rock organ is a rock part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 120,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-rock-twin-lead",
+      "name": "Twin lead",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Rock",
+      "tags": [
+        "music",
+        "tracks",
+        "rock"
+      ],
+      "source": null,
+      "code": "$: n(\"7 ~ 5 4 ~ 3 2 0\").scale(\"E4:minor:pentatonic\").s(\"gm_overdriven_guitar\").off(1/8, add(n(2)))",
+      "explanation": "Twin lead is a rock part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 120,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-rock-chorus-chords",
+      "name": "Chorus chords",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Rock",
+      "tags": [
+        "music",
+        "tracks",
+        "rock"
+      ],
+      "source": null,
+      "code": "$: chord(\"<C G D Em>\").voicing().s(\"gm_distortion_guitar\").struct(\"x ~ ~ x ~ ~ x ~\").clip(.8)",
+      "explanation": "Chorus chords is a rock part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 120,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-metal-double-kick",
+      "name": "Double kick",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Metal",
+      "tags": [
+        "music",
+        "tracks",
+        "metal"
+      ],
+      "source": null,
+      "code": "$: stack(s(\"bd*16\").gain(1), s(\"~ sd ~ sd\").gain(.95), s(\"hh*8\").gain(.35)).bank(\"RolandTR909\").distort(\"1.5:.6\")",
+      "explanation": "Double kick is a metal part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 140,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-metal-gallop-riff",
+      "name": "Gallop riff",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Metal",
+      "tags": [
+        "music",
+        "tracks",
+        "metal"
+      ],
+      "source": null,
+      "code": "$: n(\"[0 [0 0]]!3 [3 2]\").add(n(\"0,4\")).scale(\"E1:minor\").s(\"gm_distortion_guitar\").clip(.3)",
+      "explanation": "Gallop riff is a metal part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 140,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-metal-tight-bass",
+      "name": "Tight bass",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Metal",
+      "tags": [
+        "music",
+        "tracks",
+        "metal"
+      ],
+      "source": null,
+      "code": "$: note(\"e1*16\").s(\"gm_electric_bass_pick\").clip(.4).distort(\"2:.5\").gain(.9)",
+      "explanation": "Tight bass is a metal part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 140,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-metal-twin-lead",
+      "name": "Twin lead",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Metal",
+      "tags": [
+        "music",
+        "tracks",
+        "metal"
+      ],
+      "source": null,
+      "code": "$: n(\"7 5 4 2 4 5 7 9\").add(n(\"0,2\")).scale(\"E4:minor\").s(\"gm_distortion_guitar\").clip(.9).room(.2)",
+      "explanation": "Twin lead is a metal part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 140,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-metal-blast-beat",
+      "name": "Blast beat",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Metal",
+      "tags": [
+        "music",
+        "tracks",
+        "metal"
+      ],
+      "source": null,
+      "code": "$: stack(s(\"[bd sd]*8\").gain(1), s(\"hh*16\").gain(.35), s(\"oh ~ ~ ~\").gain(.5)).bank(\"AlesisHR16\")",
+      "explanation": "Blast beat is a metal part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 140,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-metal-breakdown",
+      "name": "Breakdown",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Metal",
+      "tags": [
+        "music",
+        "tracks",
+        "metal"
+      ],
+      "source": null,
+      "code": "$: stack(s(\"bd ~ bd bd ~ bd ~ ~\").gain(1), s(\"~ ~ sd ~\").gain(.95)).bank(\"EmuSP12\")\n$: n(\"0!6 3 2\").add(n(\"0,4\")).scale(\"E1:minor\").s(\"gm_distortion_guitar\").clip(.35)",
+      "explanation": "Breakdown is a metal part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 140,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-djent-odd-grouping-riff",
+      "name": "Odd grouping riff",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Djent",
+      "tags": [
+        "music",
+        "tracks",
+        "djent"
+      ],
+      "source": null,
+      "code": "$: note(\"f#1 f#1 g1 f#1\").s(\"sawtooth\").struct(\"{x x ~ x x ~ x}%16\").clip(.18).distort(\"7:.3\")",
+      "explanation": "Odd grouping riff is a djent part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 130,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-djent-tight-kick",
+      "name": "Tight kick",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Djent",
+      "tags": [
+        "music",
+        "tracks",
+        "djent"
+      ],
+      "source": null,
+      "code": "$: s(\"bd*16\").bank(\"RolandTR909\").clip(.12).distort(\"2:.5\").gain(\".95 .6\")\n$: stack(s(\"~ sd\").gain(.9), s(\"hh*8\").gain(.4)).bank(\"RolandTR909\")",
+      "explanation": "Tight kick is a djent part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 130,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-djent-low-chug",
+      "name": "Low chug",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Djent",
+      "tags": [
+        "music",
+        "tracks",
+        "djent"
+      ],
+      "source": null,
+      "code": "$: note(\"f#1*16\").s(\"sine, square\").clip(.2).distort(\"4:.4\").lpf(800).gain(.95)",
+      "explanation": "Low chug is a djent part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 130,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-djent-clean-lead",
+      "name": "Clean lead",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Djent",
+      "tags": [
+        "music",
+        "tracks",
+        "djent"
+      ],
+      "source": null,
+      "code": "$: n(\"0 3 7 <10 12>\").scale(\"F#4:minor\").s(\"gm_electric_guitar_clean\").delay(\".5:.1875\").room(.6)",
+      "explanation": "Clean lead is a djent part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 130,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-djent-ambient-pad",
+      "name": "Ambient pad",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Djent",
+      "tags": [
+        "music",
+        "tracks",
+        "djent"
+      ],
+      "source": null,
+      "code": "$: chord(\"<F#m7 D^7 A^7 E7>\").voicing().s(\"gm_pad_halo\").slow(2).room(.85).gain(.35)",
+      "explanation": "Ambient pad is a djent part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 130,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-orchestra-timpani-and-taiko",
+      "name": "Timpani and taiko",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Orchestra",
+      "tags": [
+        "music",
+        "tracks",
+        "orchestra"
+      ],
+      "source": null,
+      "code": "$: s(\"gm_timpani ~ ~ gm_timpani, ~ gm_taiko_drum ~ gm_taiko_drum\").note(\"d1\").room(.7)",
+      "explanation": "Timpani and taiko is a orchestra part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 90,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-orchestra-low-strings",
+      "name": "Low strings",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Orchestra",
+      "tags": [
+        "music",
+        "tracks",
+        "orchestra"
+      ],
+      "source": null,
+      "code": "$: n(\"0 ~ <5 4> ~\").scale(\"D2:minor\").s(\"gm_cello\").clip(2).room(.5)\n$: n(\"0 ~ 0 ~\").scale(\"D1:minor\").s(\"gm_contrabass\").clip(1.8).room(.5)",
+      "explanation": "Low strings is a orchestra part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 90,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-orchestra-brass-chorale",
+      "name": "Brass chorale",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Orchestra",
+      "tags": [
+        "music",
+        "tracks",
+        "orchestra"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Dm Bb F C>\").voicing().anchor(\"g4\").s(\"gm_brass_section\").clip(1.9).room(.6)",
+      "explanation": "Brass chorale is a orchestra part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 90,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-orchestra-violin-melody",
+      "name": "Violin melody",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Orchestra",
+      "tags": [
+        "music",
+        "tracks",
+        "orchestra"
+      ],
+      "source": null,
+      "code": "$: n(\"0 2 <4 3> [2 ~]\").scale(\"D4:minor\").s(\"gm_violin\").clip(1.6).room(.6)",
+      "explanation": "Violin melody is a orchestra part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 90,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-orchestra-harp-run",
+      "name": "Harp run",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Orchestra",
+      "tags": [
+        "music",
+        "tracks",
+        "orchestra"
+      ],
+      "source": null,
+      "code": "$: n(\"0 2 4 7 9 11 14\").scale(\"D4:minor\").s(\"gm_orchestral_harp\").fast(2).clip(.5).room(.7)",
+      "explanation": "Harp run is a orchestra part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 90,
+      "assets": []
+    },
+    {
+      "id": "music-tracks-orchestra-choir-and-bells",
+      "name": "Choir and bells",
+      "kind": "music",
+      "section": "tracks",
+      "category": "Orchestra",
+      "tags": [
+        "music",
+        "tracks",
+        "orchestra"
+      ],
+      "source": null,
+      "code": "$: chord(\"<Dm Bb F C>\").voicing().anchor(\"c5\").s(\"gm_choir_aahs\").slow(2).clip(2).room(.8)\n$: n(\"<0 4>\").scale(\"D5:minor\").s(\"gm_tubular_bells\").slow(2).room(.8).gain(.7)",
+      "explanation": "Choir and bells is a orchestra part from the bundled music examples. Use it as a readable starting point for a larger arrangement.",
+      "change": "Change the pattern first, then try a different bank or synth while keeping its timing and gain under control.",
+      "bpm": 90,
+      "assets": []
+    },
+    {
+      "id": "music-sound-design-wavetable-growls-wormhole-bass",
+      "name": "Wormhole bass",
+      "kind": "music",
+      "section": "sound-design",
+      "category": "Wavetable growls",
+      "tags": [
+        "music",
+        "sound-design",
+        "wavetable-growls"
+      ],
+      "source": null,
+      "code": "$: note(\"a1\").s(\"bad_day\").bank(\"wt_digital\").seg(16).warp(\"0 .4 .8\").warpmode(\"wormhole\").lpf(1400)",
+      "explanation": "Wormhole bass is a wavetable growls sound-design study. Listen for how the source and a small number of effects shape its character.",
+      "change": "Change one synthesis or filter parameter at a time and listen for the point where the texture becomes too busy.",
+      "assets": []
+    },
+    {
+      "id": "music-sound-design-wavetable-growls-talking-bass",
+      "name": "Talking bass",
+      "kind": "music",
+      "section": "sound-design",
+      "category": "Wavetable growls",
+      "tags": [
+        "music",
+        "sound-design",
+        "wavetable-growls"
+      ],
+      "source": null,
+      "code": "$: note(\"a1\").s(\"basique\").bank(\"wt_digital\").seg(16).wt(saw.fast(2)).vowel(\"<a e i o u>\").shape(.6)",
+      "explanation": "Talking bass is a wavetable growls sound-design study. Listen for how the source and a small number of effects shape its character.",
+      "change": "Change one synthesis or filter parameter at a time and listen for the point where the texture becomes too busy.",
+      "assets": []
+    },
+    {
+      "id": "music-sound-design-wavetable-growls-warpmode-growl",
+      "name": "Warpmode growl",
+      "kind": "music",
+      "section": "sound-design",
+      "category": "Wavetable growls",
+      "tags": [
+        "music",
+        "sound-design",
+        "wavetable-growls"
+      ],
+      "source": null,
+      "code": "$: note(\"a1*2\").s(\"curses\").bank(\"wt_digital\").seg(16).warp(perlin).warpmode(\"<asym bendp spin fold>\")",
+      "explanation": "Warpmode growl is a wavetable growls sound-design study. Listen for how the source and a small number of effects shape its character.",
+      "change": "Change one synthesis or filter parameter at a time and listen for the point where the texture becomes too busy.",
+      "assets": []
+    },
+    {
+      "id": "music-sound-design-wavetable-growls-metal-screech",
+      "name": "Metal screech",
+      "kind": "music",
+      "section": "sound-design",
+      "category": "Wavetable growls",
+      "tags": [
+        "music",
+        "sound-design",
+        "wavetable-growls"
+      ],
+      "source": null,
+      "code": "$: note(\"a3\").s(\"crickets\").bank(\"wt_digital\").seg(16).wt(saw).lpf(sine.range(300,4000)).resonance(20)",
+      "explanation": "Metal screech is a wavetable growls sound-design study. Listen for how the source and a small number of effects shape its character.",
+      "change": "Change one synthesis or filter parameter at a time and listen for the point where the texture becomes too busy.",
+      "assets": []
+    },
+    {
+      "id": "music-sound-design-wavetable-growls-warped-drone",
+      "name": "Warped drone",
+      "kind": "music",
+      "section": "sound-design",
+      "category": "Wavetable growls",
+      "tags": [
+        "music",
+        "sound-design",
+        "wavetable-growls"
+      ],
+      "source": null,
+      "code": "$: note(\"a3\").s(\"echoes\").bank(\"wt_digital\").seg(4).warp(sine).warpmode(\"fold\").clip(2).room(.7)",
+      "explanation": "Warped drone is a wavetable growls sound-design study. Listen for how the source and a small number of effects shape its character.",
+      "change": "Change one synthesis or filter parameter at a time and listen for the point where the texture becomes too busy.",
+      "assets": []
+    },
+    {
+      "id": "music-sound-design-wavetable-growls-riser-and-stab",
+      "name": "Riser and stab",
+      "kind": "music",
+      "section": "sound-design",
+      "category": "Wavetable growls",
+      "tags": [
+        "music",
+        "sound-design",
+        "wavetable-growls"
+      ],
+      "source": null,
+      "code": "$: note(\"a2\").add(note(saw.range(0,36))).s(\"crickets\").bank(\"wt_digital\").seg(16).warp(saw).hpf(300)\n$: note(\"a2 ~ a2 ~\").s(\"echoes\").bank(\"wt_digital\").seg(8).wt(\"0 1\").crush(6).coarse(4).shape(.6)",
+      "explanation": "Riser and stab is a wavetable growls sound-design study. Listen for how the source and a small number of effects shape its character.",
+      "change": "Change one synthesis or filter parameter at a time and listen for the point where the texture becomes too busy.",
+      "assets": []
+    },
+    {
+      "id": "music-sound-design-noise-harsh-noise-wall",
+      "name": "Harsh noise wall",
+      "kind": "music",
+      "section": "sound-design",
+      "category": "Noise",
+      "tags": [
+        "music",
+        "sound-design",
+        "noise"
+      ],
+      "source": null,
+      "code": "$: s(\"white\").clip(1).distort(\"7:.18\").hpf(120).lpf(7000).room(.15).size(.9)",
+      "explanation": "Harsh noise wall is a noise sound-design study. Listen for how the source and a small number of effects shape its character.",
+      "change": "Change one synthesis or filter parameter at a time and listen for the point where the texture becomes too busy.",
+      "assets": []
+    },
+    {
+      "id": "music-sound-design-noise-feedback-howl",
+      "name": "Feedback howl",
+      "kind": "music",
+      "section": "sound-design",
+      "category": "Noise",
+      "tags": [
+        "music",
+        "sound-design",
+        "noise"
+      ],
+      "source": null,
+      "code": "$: s(\"brown*2\").clip(1).bpf(700).bpq(6).delay(.85).delaytime(\"<.01 .03>\").dfb(.9).distort(\"5:.3\")",
+      "explanation": "Feedback howl is a noise sound-design study. Listen for how the source and a small number of effects shape its character.",
+      "change": "Change one synthesis or filter parameter at a time and listen for the point where the texture becomes too busy.",
+      "assets": []
+    },
+    {
+      "id": "music-sound-design-noise-junk-metal",
+      "name": "Junk metal",
+      "kind": "music",
+      "section": "sound-design",
+      "category": "Noise",
+      "tags": [
+        "music",
+        "sound-design",
+        "noise"
+      ],
+      "source": null,
+      "code": "$: s(\"rim*8, oh(5,16)\").bank(\"AlesisHR16\").crush(2).coarse(9).distort(\"7:.18\").pan(irand(1))",
+      "explanation": "Junk metal is a noise sound-design study. Listen for how the source and a small number of effects shape its character.",
+      "change": "Change one synthesis or filter parameter at a time and listen for the point where the texture becomes too busy.",
+      "assets": []
+    },
+    {
+      "id": "music-sound-design-noise-tape-damage",
+      "name": "Tape damage",
+      "kind": "music",
+      "section": "sound-design",
+      "category": "Noise",
+      "tags": [
+        "music",
+        "sound-design",
+        "noise"
+      ],
+      "source": null,
+      "code": "$: s(\"crackle\").density(90).clip(1).crush(3).coarse(\"<1 6 20>\").distort(\"6:.3\").hpf(200)",
+      "explanation": "Tape damage is a noise sound-design study. Listen for how the source and a small number of effects shape its character.",
+      "change": "Change one synthesis or filter parameter at a time and listen for the point where the texture becomes too busy.",
+      "assets": []
+    },
+    {
+      "id": "music-sound-design-noise-formant-voice",
+      "name": "Formant voice",
+      "kind": "music",
+      "section": "sound-design",
+      "category": "Noise",
+      "tags": [
+        "music",
+        "sound-design",
+        "noise"
+      ],
+      "source": null,
+      "code": "$: s(\"white*8\").clip(1).vowel(\"<a e i o ae>\").distort(\"9:.24\").hpf(300).pan(\"0 1\")",
+      "explanation": "Formant voice is a noise sound-design study. Listen for how the source and a small number of effects shape its character.",
+      "change": "Change one synthesis or filter parameter at a time and listen for the point where the texture becomes too busy.",
+      "assets": []
+    },
+    {
+      "id": "music-sound-design-noise-concrete-cut-up",
+      "name": "Concrete cut-up",
+      "kind": "music",
+      "section": "sound-design",
+      "category": "Noise",
+      "tags": [
+        "music",
+        "sound-design",
+        "noise"
+      ],
+      "source": null,
+      "code": "$: s(\"gm_applause\").gain(.8).striate(16).speed(\"<1 -1 2 -.5>\").clip(1).distort(\"5:.2\").pan(perlin)",
+      "explanation": "Concrete cut-up is a noise sound-design study. Listen for how the source and a small number of effects shape its character.",
+      "change": "Change one synthesis or filter parameter at a time and listen for the point where the texture becomes too busy.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-oscillators-oscillator-lattice",
+      "name": "Oscillator Lattice",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Oscillators",
+      "tags": [
+        "hydra",
+        "oscillators"
+      ],
+      "source": null,
+      "code": "osc(24, 0.02, 0.9)\n  .rotate(0, 0.12)\n  .diff(osc(24, 0.02, 0.9).rotate(1.57, -0.12))\n  .colorama(0.02)\n  .out()",
+      "explanation": "Oscillator Lattice is a oscillators visual sketch. Read the chain from left to right to see how a source becomes motion and colour.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-oscillators-moir-drift",
+      "name": "Moiré Drift",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Oscillators",
+      "tags": [
+        "hydra",
+        "oscillators"
+      ],
+      "source": null,
+      "code": "osc(9, 0.05, 0.8)\n  .modulate(osc(11, -0.03, 0.6), 0.35)\n  .contrast(1.6)\n  .colorama(0.012)\n  .out()",
+      "explanation": "Moiré Drift is a oscillators visual sketch. Read the chain from left to right to see how a source becomes motion and colour.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-oscillators-standing-ripple",
+      "name": "Standing Ripple",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Oscillators",
+      "tags": [
+        "hydra",
+        "oscillators"
+      ],
+      "source": null,
+      "code": "osc(18, 0.01, 1.1)\n  .kaleid(2)\n  .modulateScale(osc(3, 0.05), 0.4)\n  .rotate(() => time * 0.05)\n  .out()",
+      "explanation": "Standing Ripple is a oscillators visual sketch. Read the chain from left to right to see how a source becomes motion and colour.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-kaleidoscope-six-fold",
+      "name": "Six-Fold",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Kaleidoscope",
+      "tags": [
+        "hydra",
+        "kaleidoscope"
+      ],
+      "source": null,
+      "code": "noise(3, 0.08)\n  .kaleid(6)\n  .colorama(0.08)\n  .scale(1.2)\n  .rotate(() => time * 0.08)\n  .out()",
+      "explanation": "Six-Fold is a kaleidoscope visual sketch. Read the chain from left to right to see how a source becomes motion and colour.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-kaleidoscope-rosette",
+      "name": "Rosette",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Kaleidoscope",
+      "tags": [
+        "hydra",
+        "kaleidoscope"
+      ],
+      "source": null,
+      "code": "shape(6, 0.5, 0.1)\n  .scrollX(0.5)\n  .scrollY(0.5)\n  .kaleid(12)\n  .scale(() => 1 + Math.sin(time * 0.4) * 0.3)\n  .colorama(0.05)\n  .out()",
+      "explanation": "Rosette is a kaleidoscope visual sketch. Read the chain from left to right to see how a source becomes motion and colour.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-kaleidoscope-shatter",
+      "name": "Shatter",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Kaleidoscope",
+      "tags": [
+        "hydra",
+        "kaleidoscope"
+      ],
+      "source": null,
+      "code": "voronoi(14, 0.3, 0.2)\n  .thresh(0.4)\n  .kaleid(4)\n  .colorama(0.05)\n  .modulateRotate(osc(2), 0.3)\n  .out()",
+      "explanation": "Shatter is a kaleidoscope visual sketch. Read the chain from left to right to see how a source becomes motion and colour.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-feedback-feedback-tunnel",
+      "name": "Feedback Tunnel",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Feedback",
+      "tags": [
+        "hydra",
+        "feedback"
+      ],
+      "source": null,
+      "code": "shape(4, () => 0.2 + Math.sin(time * 0.7) * 0.08, 0.1)\n  .color(0.2, 0.8, 1.0)\n  .add(src(o0).scale(1.04).rotate(0.03).brightness(-0.02), 0.94)\n  .out()",
+      "explanation": "Feedback Tunnel is a feedback visual sketch. Read the chain from left to right to see how a source becomes motion and colour.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-feedback-slow-bloom",
+      "name": "Slow Bloom",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Feedback",
+      "tags": [
+        "hydra",
+        "feedback"
+      ],
+      "source": null,
+      "code": "osc(6, 0.08, 0.6)\n  .kaleid(5)\n  .add(src(o0).scale(1.02).colorama(0.006), 0.88)\n  .modulateRotate(src(o0), 0.02)\n  .out()",
+      "explanation": "Slow Bloom is a feedback visual sketch. Read the chain from left to right to see how a source becomes motion and colour.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-feedback-chroma-smear",
+      "name": "Chroma Smear",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Feedback",
+      "tags": [
+        "hydra",
+        "feedback"
+      ],
+      "source": null,
+      "code": "noise(2, 0.05)\n  .colorama(0.1)\n  .add(src(o0).scrollX(0.004).scale(1.005).brightness(-0.02), 0.7)\n  .contrast(1.2)\n  .out()",
+      "explanation": "Chroma Smear is a feedback visual sketch. Read the chain from left to right to see how a source becomes motion and colour.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-noise-noise-flow",
+      "name": "Noise Flow",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Noise",
+      "tags": [
+        "hydra",
+        "noise"
+      ],
+      "source": null,
+      "code": "noise(4, 0.03)\n  .modulate(noise(2, 0.01), 0.4)\n  .colorama(0.04)\n  .contrast(1.4)\n  .brightness(-0.1)\n  .out()",
+      "explanation": "Noise Flow is a noise visual sketch. Read the chain from left to right to see how a source becomes motion and colour.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-noise-drifting-cells",
+      "name": "Drifting Cells",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Noise",
+      "tags": [
+        "hydra",
+        "noise"
+      ],
+      "source": null,
+      "code": "voronoi(8, 0.15, 0.4)\n  .color(0.4, 0.9, 0.8)\n  .modulateScale(osc(1.5, 0.03), 0.15)\n  .luma(0.35, 0.1)\n  .out()",
+      "explanation": "Drifting Cells is a noise visual sketch. Read the chain from left to right to see how a source becomes motion and colour.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-noise-sediment",
+      "name": "Sediment",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Noise",
+      "tags": [
+        "hydra",
+        "noise"
+      ],
+      "source": null,
+      "code": "noise(6, 0.02)\n  .posterize(5, 0.6)\n  .diff(noise(3, 0.01).posterize(3))\n  .colorama(0.03)\n  .out()",
+      "explanation": "Sediment is a noise visual sketch. Read the chain from left to right to see how a source becomes motion and colour.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-colour-signal-bars",
+      "name": "Signal Bars",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Colour",
+      "tags": [
+        "hydra",
+        "colour"
+      ],
+      "source": null,
+      "code": "gradient(0.3)\n  .posterize(7, 0.5)\n  .pixelate(28, 1)\n  .modulateScrollY(osc(2, 0.02), 0.05)\n  .out()",
+      "explanation": "Signal Bars is a colour visual sketch. Read the chain from left to right to see how a source becomes motion and colour.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-colour-spectrum-wash",
+      "name": "Spectrum Wash",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Colour",
+      "tags": [
+        "hydra",
+        "colour"
+      ],
+      "source": null,
+      "code": "gradient(0.05)\n  .colorama(() => 0.3 + Math.sin(time * 0.2) * 0.3)\n  .modulateRotate(osc(1, 0.02), 0.4)\n  .saturate(1.4)\n  .out()",
+      "explanation": "Spectrum Wash is a colour visual sketch. Read the chain from left to right to see how a source becomes motion and colour.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-colour-duotone-fold",
+      "name": "Duotone Fold",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Colour",
+      "tags": [
+        "hydra",
+        "colour"
+      ],
+      "source": null,
+      "code": "osc(12, 0.03, 0)\n  .thresh(0.5)\n  .color(1.0, 0.35, 0.5)\n  .diff(osc(12, -0.03, 0).thresh(0.5).color(0.2, 0.6, 1.0))\n  .kaleid(3)\n  .out()",
+      "explanation": "Duotone Fold is a colour visual sketch. Read the chain from left to right to see how a source becomes motion and colour.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-digital-rain-matrix-rain",
+      "name": "Matrix Rain",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Digital rain",
+      "tags": [
+        "hydra",
+        "digital-rain"
+      ],
+      "source": null,
+      "code": "noise(40, 0.6)\n  .thresh(0.62)\n  .mult(gradient(0).invert())\n  .scrollY(0, 0.18)\n  .pixelate(48, 96)\n  .color(0.15, 1.0, 0.35)\n  .add(src(o0).scrollY(0, 0.18).brightness(-0.055), 0.92)\n  .contrast(1.5)\n  .out()",
+      "explanation": "Matrix Rain is a digital rain visual sketch. Read the chain from left to right to see how a source becomes motion and colour.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-digital-rain-cascade",
+      "name": "Cascade",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Digital rain",
+      "tags": [
+        "hydra",
+        "digital-rain"
+      ],
+      "source": null,
+      "code": "noise(60, 1.2)\n  .thresh(0.7)\n  .pixelate(64, 128)\n  .mult(osc(1, 0, 0).luma(0.02))\n  .scrollY(0, 0.25)\n  .color(0.1, 0.95, 0.4)\n  .add(src(o0).scrollY(0, 0.25).brightness(-0.07), 0.9)\n  .out()",
+      "explanation": "Cascade is a digital rain visual sketch. Read the chain from left to right to see how a source becomes motion and colour.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-digital-rain-terminal-glow",
+      "name": "Terminal Glow",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Digital rain",
+      "tags": [
+        "hydra",
+        "digital-rain"
+      ],
+      "source": null,
+      "code": "noise(30, 0.3)\n  .thresh(0.6)\n  .color(0.2, 1.0, 0.4)\n  .mult(osc(220, 0, 0).thresh(0.5).brightness(0.35))\n  .add(src(o0).scale(1.01).brightness(-0.03), 0.85)\n  .out()",
+      "explanation": "Terminal Glow is a digital rain visual sketch. Read the chain from left to right to see how a source becomes motion and colour.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-audio-reactive-pulse-field",
+      "name": "Pulse Field",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Audio-reactive",
+      "tags": [
+        "hydra",
+        "audio-reactive"
+      ],
+      "source": null,
+      "code": "shape(6, 0.3, 0.05)\n  .scale(() => 0.8 + a.fft[0] * 1.4)\n  .repeat(2, 2)\n  .colorama(() => a.fft[1] * 0.3)\n  .modulateRotate(osc(2), () => a.fft[2] * 0.5)\n  .out()",
+      "explanation": "Pulse Field is a audio-reactive visual sketch. Read the chain from left to right to see how a source becomes motion and colour.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-audio-reactive-spectral-kaleid",
+      "name": "Spectral Kaleid",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Audio-reactive",
+      "tags": [
+        "hydra",
+        "audio-reactive"
+      ],
+      "source": null,
+      "code": "osc(10, 0.05, 0.8)\n  .kaleid(() => 3 + Math.floor(a.fft[1] * 6))\n  .modulateScale(noise(2), () => a.fft[0])\n  .colorama(() => 0.02 + a.fft[3] * 0.1)\n  .out()",
+      "explanation": "Spectral Kaleid is a audio-reactive visual sketch. Read the chain from left to right to see how a source becomes motion and colour.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-audio-reactive-fugitive-geometry",
+      "name": "Fugitive Geometry",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Audio-reactive",
+      "tags": [
+        "hydra",
+        "audio-reactive"
+      ],
+      "source": "after hydra-synth dev/examples.js",
+      "code": "solid()\n  .add(gradient(3, 0.05).rotate(0.05, -0.2).posterize(2).contrast(0.6), 0.6)\n  .add(shape(4, 0.3, 0.05).scrollX(() => Math.sin(time * 0.3) * 0.4).scrollY(0.1, 0.05))\n  .mult(shape(4, 0.24, 0.05).scale(0.8).scrollX(0.01).rotate(0.2, 0.06)\n    .add(gradient(3).contrast(0.6), 0.5)\n    .mult(src(o0).scale(0.98), () => 0.6 + a.fft[0] * 9))\n  .diff(shape(4, 0.3, 0.05).modulate(shape(500), 0.2).scale(1.4))\n  .out()",
+      "explanation": "Fugitive Geometry is a audio-reactive visual sketch. Read the chain from left to right to see how a source becomes motion and colour.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-community-trailheads-prism-current",
+      "name": "Prism Current",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Kaleidoscope",
+      "tags": [
+        "hydra",
+        "kaleidoscope"
+      ],
+      "source": "original Rustel study · @hydra_patterns post 1357006624519503882",
+      "code": "osc(7, 0.025, 1.1)\n  .kaleid(9)\n  .modulateScale(noise(2, 0.015), 0.3)\n  .colorama(() => 0.04 + Math.sin(time * 0.12) * 0.025)\n  .add(src(o0).scale(1.008).rotate(-0.003).brightness(-0.045), 0.72)\n  .out()",
+      "explanation": "A nine-fold oscillator pattern with shifting colour and slow feedback.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-community-trailheads-orbit-garden",
+      "name": "Orbit Garden",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Kaleidoscope",
+      "tags": [
+        "hydra",
+        "kaleidoscope"
+      ],
+      "source": "original Rustel study · @hydra_patterns post 1342867111585193984",
+      "code": "solid(0.01, 0.03, 0.08)\n  .layer(shape(99, 0.12, 0.03).repeat(3, 2).scrollX(0, 0.025).color(0.1, 0.8, 1).luma(0.2, 0.05))\n  .layer(shape(6, 0.28, 0.08).scrollX(0.5).scrollY(0.5).kaleid(6).rotate(() => time * 0.04).color(0.8, 0.2, 1).luma(0.25, 0.08))\n  .modulate(noise(2, 0.02), 0.06)\n  .out()",
+      "explanation": "Layered circles and a rotating six-fold shape drift through soft noise distortion.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-community-trailheads-topographic-pulse",
+      "name": "Topographic Pulse",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Noise",
+      "tags": [
+        "hydra",
+        "noise"
+      ],
+      "source": "original Rustel study · @hydra_patterns post 1365912877182427136",
+      "code": "voronoi(6, 0.08, 0.25)\n  .posterize(9, 0.55)\n  .thresh(0.45, 0.08)\n  .modulateRotate(osc(3, 0.01), 0.2)\n  .color(0.15, 0.85, 0.55)\n  .diff(gradient(0.15).posterize(6))\n  .out()",
+      "explanation": "Posterized Voronoi cells form moving contours with contrasting gradient colours.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-community-trailheads-signal-aperture",
+      "name": "Signal Aperture",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Feedback",
+      "tags": [
+        "hydra",
+        "feedback"
+      ],
+      "source": "original Rustel study · @hydra_patterns post 1375769015772139521",
+      "code": "noise(4, 0.04)\n  .pixelate(48, 27)\n  .mult(osc(8, 0.02, 1.4))\n  .mask(shape(4, 0.62, 0.05).scale(1, 0.75))\n  .add(src(o0).scale(0.99).rotate(0.005).brightness(-0.08), 0.62)\n  .contrast(1.3)\n  .out()",
+      "explanation": "Pixelated noise and oscillator bands leave rotating trails inside a square mask.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    },
+    {
+      "id": "hydra-hydra-community-trailheads-petal-engine",
+      "name": "Petal Engine",
+      "kind": "hydra",
+      "section": "hydra",
+      "category": "Feedback",
+      "tags": [
+        "hydra",
+        "feedback"
+      ],
+      "source": "original Rustel study · @hydra_patterns post 1347511744143511553",
+      "code": "shape(5, 0.3, 0.06)\n  .repeat(3, 3)\n  .rotate(() => time * 0.08)\n  .modulate(osc(5, 0.03), 0.14)\n  .color(0.95, 0.35, 0.65)\n  .layer(shape(99, 0.08, 0.02).repeat(5, 4).color(0.15, 0.75, 1).luma(0.2, 0.05))\n  .add(src(o0).scale(1.01).rotate(-0.006).brightness(-0.065), 0.68)\n  .out()",
+      "explanation": "Repeating petals and small circles leave slowly expanding feedback trails.",
+      "change": "Change one number in the first source or the nearest transform, then compare the amount of motion before changing another stage.",
+      "assets": []
+    }
+  ]
+}

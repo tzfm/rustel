@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+samples('github:tidalcycles/dirt-samples');
+s("[bd ~]*2, [~ hh]*2, ~ sd")

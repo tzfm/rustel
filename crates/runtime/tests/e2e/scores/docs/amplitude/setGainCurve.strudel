@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+setGainCurve((x) => x * x) // quadratic gain
+s("bd*4").gain(0.5) // equivalent to 0.25 gain normally

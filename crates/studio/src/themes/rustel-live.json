@@ -1,0 +1,55 @@
+{
+  "name": "rustel-live",
+  "background": "#000000",
+  "surface": "#121419",
+  "overlay": "#181b22",
+  "foreground": "#ffffff",
+  "muted": "#5b6371",
+  "rule": "#303640",
+  "accent": "#00eefb",
+  "ok": "#70d98b",
+  "warn": "#ffca28",
+  "error": "#ff6b6b",
+  "caret": "#ffffff",
+  "selection": "#303640",
+  "selection_text": "#ffffff",
+  "mini": "#00eefb",
+  "mini_fill": null,
+  "event_mark": "tint",
+  "event_fade": 0.15,
+  "event": "#00eefb",
+  "event_inactive": "#5b6371",
+  "playhead": "#f202f7",
+  "grid": "#303640",
+  "minimap": "#121419",
+  "minimap_viewport": "#303640",
+  "visual": {
+    "renderer": "tachyonfx",
+    "mode": "image",
+    "effect": "rustelbrand",
+    "density": 82,
+    "speed": 64
+  },
+  "opacity": {
+    "backdrop": 61,
+    "interface": 75,
+    "editor": 51
+  },
+  "syntax": {
+    "text": "#ffffff",
+    "comment": "#5b6371",
+    "string": "#70d98b",
+    "number": "#ffca28",
+    "punctuation": "#f202f7",
+    "keyword": "#f202f7",
+    "function": "#00eefb"
+  },
+  "meter": {
+    "low": "#00eefb",
+    "mid": "#70d98b",
+    "high": "#ffca28",
+    "peak": "#ff6b6b",
+    "track": "#181b22",
+    "fader": "#ffffff"
+  }
+}

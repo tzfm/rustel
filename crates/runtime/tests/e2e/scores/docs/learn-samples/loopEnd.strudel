@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+s("space").loop(1)
+.loopEnd("<1 .75 .5 .25>")._scope()

@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+xfade(s("bd*2"), "<0 .25 .5 .75 1>", s("hh*8"))

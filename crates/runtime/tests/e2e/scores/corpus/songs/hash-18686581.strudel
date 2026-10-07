@@ -1,0 +1,1180 @@
+/*
+  @title Slaughter of the Toad (At the Gates - Slaughter of the Soul cover with the Battletoads soundfont)
+  @by awesome-strudel
+  @origin songs-awesome
+  @duration 4
+*/
+setcpm(157/4)
+
+// Mute controls
+
+const LEAD_GUITAR    = 1
+const HARMONY_GUITAR = 1
+const BASS           = 1
+const DRUMS          = 1
+const FX             = 1
+
+// Sections
+
+const INTRO = 13 //13
+const V1    = 8  //8
+const C1    = 4  //4
+const PC1   = 8  //8
+const V2    = 8  //8
+const C2    = 4  //4
+const B1    = 16 //16
+const SOLO  = 16 //16
+const C3    = 8  //8
+const V3    = 8  //8
+const C4    = 25 //25
+const END   = 20
+
+// ==================== KICK ====================
+const k1 = note("[c2 ~ c2][~ c2 ~][c2 ~ c2][~ c2 ~]")
+const k2 = note("[c2*3]*4")
+const k3 = note("[c2 ~@3]")
+const k4 = note("[~ c2 c2][c2*3]")
+const k5 = note("[c2*3]!3 [c2 c2 [c2 c2]]")
+const k6 = note("[c2*3][c2 c2 [c2 c2]] ~ c2")
+const k7 = note("[c2@2 c2][c2*3]!3")
+const k8 = note("[~ ~ c2][c2 c2@2][c2@2 [c2 c2]] ~")
+const k9 = note("[c2@2 c2] ~ [c2@2 c2] ~")
+const k10 = note("c2 c2 c2 c2")
+const k11 = note("[c2 ~ c2][~ c2 ~] ~@2")
+const k12 = note("c2 ~@2 [~@2 [c2 c2]]")
+const k13 = note("c2")
+const k14 = note("[c2 ~ c2][~ c2 ~][c2 ~@2] ~")
+const k15 = note("[c2@2 c2] ~ [c2@2 c2][~@2 [c2 c2]]")
+const k16 = note("[c2 ~@2] ~@3")
+const k17 = note("[c2 ~ c2][~ c2 ~] c2 c2")
+const k18 = note("[c2*3]!2 [c2 ~@2] ~")
+const k19 = note("[c2@2 c2] c2 ~@2")
+
+// Bars 1-13 (Intro)
+const kIntro = arrange(
+  [3, silence],
+  [1, k10],
+  [1, k13],
+  [7, k1],
+  [1, k14]
+)
+// Bars 14-21 (Verse 1)
+const kV1 = arrange(
+  [7, k1],
+  [1, k11]
+)
+// Bars 22-25 (Chorus 1)
+const kC1 = arrange(
+  [1, k7],
+  [2, k2],
+  [1, k6]
+)
+// Bars 26-33 (Post-Chorus)
+const kPC1 = arrange(
+  [6, k1],
+  [1, k10],
+  [1, k3]
+)
+// Bars 46-61 (Bridge)
+const kB1 = arrange(
+  [7, k2],
+  [1, k6],
+  [2, k3],
+  [1, k12],
+  [1, k8],
+  [2, k3],
+  [1, k12],
+  [1, k4]
+)
+// Bars 62-77 (Solo)
+const kSolo = arrange(
+  [1, k9],
+  [1, k2],
+  [1, k9],
+  [1, k2],
+  [1, k9],
+  [1, k2],
+  [1, k15],
+  [1, k4],
+  [1, k7],
+  [6, k2],
+  [1, k6]
+)
+// Bars 78-85 (Chorus 3)
+const kC3 = arrange(
+  [2, k2],
+  [1, k5],
+  [1, k8],
+  [2, k2],
+  [1, k5],
+  [1, k4]
+)
+// Bars 86-93 (Verse 3)
+const kV3 = arrange(
+  [7, k1],
+  [1, k16]
+)
+// Bars 94-118 (Chorus 4)
+const kC4 = arrange(
+  [3, k1],
+  [1, k17],
+  [7, k2],
+  [1, k18],
+  [2, k2],
+  [1, k5],
+  [1, k4],
+  [2, k2],
+  [1, k5],
+  [1, k8],
+  [2, k2],
+  [1, k5],
+  [1, k4],
+  [1, k19]
+)
+
+$kick: arrange(
+  [INTRO, kIntro],
+  [V1,    kV1],
+  [C1,    kC1],
+  [PC1,   kPC1],
+  [V2,    kV1],
+  [C2,    kC1],
+  [B1,    kB1],
+  [SOLO,  kSolo],
+  [C3,    kC3],
+  [V3,    kV3],
+  [C4,    kC4],
+  [END,   silence]
+).sound("bd").gain(0.6)
+
+
+// ==================== SNARE ====================
+const s1 = note("~ [c2 ~ ~] ~ [c2 ~ ~]")
+const s2 = note("[~ c2 ~][c2 ~ c2][~ c2 ~][c2 ~ c2]")
+const s3 = note("[c2@2 ~] ~@3")
+const s4 = note("~@2 c2 ~")
+const s5 = note("~ [c2 ~ ~] c2 ~")
+const s6 = note("~ c2 ~ c2")
+const s7 = note("[~ c2 ~] [c2 ~ [c2 c2]] [c2 c2 ~] ~")
+const s8 = note("[~ c2 ~] [c2 ~ c2] [~ c2 c2] [c2 c2 c2]")
+const s9 = note("~ [c2*3]!3")
+const s10 = note("~ c2 ~ [c2@2 ~]")
+const s11 = note("[~ c2 c2] [c2*3]!3")
+const s12 = note("[~ c2 ~] [c2 ~ c2] ~ ~")
+const s13 = note("~ [c2 ~ ~] [~ c2 c2] [c2*3]")
+
+// Bars 1-13 (Intro)
+const sIntro = arrange(
+  [5, silence],
+  [7, s2],
+  [1, s8]
+)
+// Bars 14-21 (Verse 1)
+const sV1 = arrange(
+  [7, s2],
+  [1, s7]
+)
+// Bars 22-25 (Chorus 1)
+const sC1 = arrange(
+  [3, s1],
+  [1, s5]
+)
+// Bars 26-33 (Post-Chorus)
+const sPC1 = arrange(
+  [6, s2],
+  [1, silence],
+  [1, s9]
+)
+// Bars 46-61 (Bridge)
+const sB1 = arrange(
+  [7, s1],
+  [1, s5],
+  [3, s4],
+  [1, s3],
+  [3, s4],
+  [1, s3]
+)
+// Bars 62-77 (Solo)
+const sSolo = arrange(
+  [1, s6],
+  [1, s1],
+  [1, s6],
+  [1, s1],
+  [1, s6],
+  [1, s1],
+  [1, s10],
+  [1, s3],
+  [7, s1],
+  [1, s5]
+)
+// Bars 78-85 (Chorus 3)
+const sC3 = arrange(
+  [3, s1],
+  [1, s3],
+  [3, s1],
+  [1, s3]
+)
+// Bars 86-93 (Verse 3)
+const sV3 = arrange(
+  [7, s2],
+  [1, s11]
+)
+// Bars 94-118 (Chorus 4)
+const sC4 = arrange(
+  [3, s2],
+  [1, s12],
+  [7, s1],
+  [1, s13],
+  [3, s1],
+  [1, s3],
+  [3, s1],
+  [1, s3],
+  [3, s1],
+  [1, s3],
+  [1, silence]
+)
+
+$snare: arrange(
+  [INTRO, sIntro],
+  [V1,    sV1],
+  [C1,    sC1],
+  [PC1,   sPC1],
+  [V2,    sV1],
+  [C2,    sC1],
+  [B1,    sB1],
+  [SOLO,  sSolo],
+  [C3,    sC3],
+  [V3,    sV3],
+  [C4,    sC4],
+  [END,   silence]
+).sound("sd").gain(0.6)
+
+// ==================== HAT (open -> white noise) ====================
+const h1 = s("[pink*3]!4")
+const h2 = s("[~ pink pink][pink*3]!3")
+const h3 = s("[pink ~@2]!4")
+const h4 = s("[pink@2 ~][pink@3][pink@2 ~][pink@3]")
+const h5 = s("[pink*3]!2 [pink ~@2] ~")
+const h6 = s("~ [pink@3][pink@2 ~][pink@3]")
+const h7 = s("[pink@2 ~][pink@3][pink@2 ~]!2")
+const h8 = s("[pink ~ ~] ~ ~ ~")
+
+// Bars 1-13 (Intro)
+const hIntro = arrange(
+  [5, silence],
+  [1, h2],
+  [6, h1],
+  [1, h5]
+)
+// Bars 26-33 (Post-Chorus)
+const hPC1 = arrange(
+  [1, h2],
+  [5, h1],
+  [2, silence]
+)
+// Bars 62-77 (Solo)
+const hSolo = arrange(
+  [1, h6],
+  [1, h3],
+  [1, h4],
+  [1, h3],
+  [1, h4],
+  [1, h3],
+  [1, h7],
+  [9, silence]
+)
+// Bars 86-93 (Verse 3)
+const hV3 = arrange(
+  [1, h2],
+  [6, h1],
+  [1, h8]
+)
+
+$hat: arrange(
+  [INTRO, hIntro],
+  [V1,    silence], // No hat
+  [C1,    silence], // No hat
+  [PC1,   hPC1],
+  [V2,    silence], // No hat
+  [C2,    silence], // No hat
+  [B1,    silence], // No hat
+  [SOLO,  hSolo],
+  [C3,    silence], // No hat
+  [V3,    hV3],
+  [C4,    silence], // No hat
+  [END,   silence]
+).sound("hh").clip(0.5)
+
+// ==================== CRASH ====================
+const c1 = note("[c2 ~@2]!4") 
+const c2 = note("c2 ~@3")
+const c3 = note("c2!4")
+const c4 = note("[c2*3]!2")
+const c5 = note("[c2 ~@2]!2 c2!2")
+const c6 = note("[c2*3] [c2 ~@2]")
+const c7 = note("[c2@2 ~] [c2 ~@2]!3")
+const c8 = note("c2!3 [c2@2 ~]")
+const c9 = note("[c2@2 ~] ~@3")
+const c10 = note("~@2 c2!2")
+const c11 = note("c2 ~@3")
+const c12 = note("[c2 ~ ~]!3 ~")
+
+// Bars 1-13 (Intro)
+const cIntro = arrange(
+  [3, silence],
+  [1, c3],
+  [1, c11],
+  [1, c2],
+  [7, silence]
+)
+// Bars 14-21 (Verse 1)
+const cV1 = arrange(
+  [1, c2],
+  [7, silence]
+)
+// Bars 22-25 (Chorus 1)
+const cC1 = arrange(
+  [1, c7],
+  [2, c1],
+  [1, c5]
+)
+// Bars 26-33 (Post-Chorus)
+const cPC1 = arrange(
+  [1, c2],
+  [5, silence],
+  [1, c3],
+  [1, c11]
+)
+// Bars 46-61 (Bridge)
+const cB1 = arrange(
+  [7, c1],
+  [1, c5],
+  [2, c3],
+  [1, c8],
+  [1, c6],
+  [2, c3],
+  [1, c8],
+  [1, c4] 
+)
+// Bars 62-77 (Solo)
+const cSolo = arrange(
+  [1, c9],
+  [6, silence],
+  [1, c4],
+  [1, c9],
+  [6, silence],
+  [1, c10]
+)
+// Bars 78-85 (Chorus 3)
+const cC3 = arrange(
+  [3, c1],
+  [1, c6],
+  [3, c1],
+  [1, c4]
+)
+// Bars 86-93 (Verse 3)
+const cV3 = arrange(
+  [1, c2],
+  [7, silence]
+)
+// Bars 94-118 (Chorus 4)
+const cC4 = arrange(
+  [1, c2],
+  [2, silence],
+  [1, c10],
+  [7, c1],
+  [1, c12],
+  [3, c1],
+  [1, c4],
+  [3, c1],
+  [1, c6],
+  [3, c1],
+  [1, c4],
+  [1, silence]
+)
+
+$crash: arrange(
+  [INTRO, cIntro],
+  [V1,    cV1],
+  [C1,    cC1],
+  [PC1,   cPC1],
+  [V2,    cV1],
+  [C2,    cC1],
+  [B1,    cB1],
+  [SOLO,  cSolo],
+  [C3,    cC3],
+  [V3,    cV3],
+  [C4,    cC4],
+  [END,   silence]
+).sound("cr")
+
+// ==================== RIDE ====================
+const r1 = note("[c2!3]!4")
+const r2 = note("[~ c2 c2][c2*3]!3")
+const r3 = note("[c2!3][c2 c2 ~] ~ ~")
+const r4 = note("[c2!3]!2 ~ ~")
+
+// Bars 14-21 (Verse 1)
+const rV1 = arrange(
+  [1, r2],
+  [6, r1],
+  [1, r3]
+)
+// Bars 94-118 (Chorus 4, first 4 bars only)
+const rC4 = arrange(
+  [1, r2],
+  [2, r1],
+  [1, r4],
+  [21, silence]
+)
+
+$ride: arrange(
+  [INTRO, silence], // No ride
+  [V1,    rV1],
+  [C1,    silence], // No ride
+  [PC1,   silence], // No ride
+  [V2,    rV1],
+  [C2,    silence], // No ride
+  [B1,    silence], // No ride
+  [SOLO,  silence], // No ride
+  [C3,    silence], // No ride
+  [V3,    silence], // No ride
+  [C4,    rC4],
+  [END,   silence]
+).sound("rd").clip(0.6).gain(0.5)
+
+
+// ==================== RIDE BELL ====================
+const b1 = note("[c4 ~ ~]!4")
+const b2 = note("~ [c4 ~ ~]!3")
+const b3 = note("[c4 ~ ~]!2 ~ ~")
+
+// Bars 62-77 (Solo)
+const bSolo = arrange(
+  [8, silence],
+  [1, b2],
+  [3, b1],
+  [1, b2],
+  [2, b1],
+  [1, b3]
+)
+
+$bell: arrange(
+  [INTRO, silence], // No ride bell
+  [V1,    silence], // No ride bell
+  [C1,    silence], // No ride bell
+  [PC1,   silence], // No ride bell
+  [V2,    silence], // No ride bell
+  [C2,    silence], // No ride bell
+  [B1,    silence], // No ride bell
+  [SOLO,  bSolo],
+  [C3,    silence], // No ride bell
+  [V3,    silence], // No ride bell
+  [C4,    silence], // No ride bell
+  [END,   silence]
+).sound("cr")
+
+// ==================== TOM  ====================
+const t1 = note("~@3 g2")
+const t2 = note("~@2 [~ ~ c3][c3 b2 b2]")
+const t3 = note("[g2@2 g2] g2 ~ ~")
+
+// Bars 14-21 (Verse 1)
+const tV1 = arrange(
+  [7, silence], 
+  [1, t2]
+)
+// Bars 46-61 (Bridge)
+const tB1 = arrange(
+  [11, silence],
+  [1, t1],
+  [4, silence]
+)
+// Bars 78-85 (Chorus 3)
+const tC3 = arrange(
+  [3, silence],
+  [1, t1],
+  [4, silence]
+)
+// Bars 94-118 (Chorus 4)
+const tC4 = arrange(
+  [19, silence],
+  [1, t1],
+  [4, silence],
+  [1, t3]
+)
+
+$tom: arrange(
+  [INTRO, silence], // No tom
+  [V1,    tV1],
+  [C1,    silence], // No tom
+  [PC1,   silence], // No tom
+  [V2,    tV1],
+  [C2,    silence], // No tom
+  [B1,    tB1],
+  [SOLO,  silence], // No tom
+  [C3,    tC3],
+  [V3,    silence], // No tom
+  [C4,    tC4],
+  [END,   silence]
+).sound("mt")
+
+// ==================== BASS ====================
+const bs2 = note("[[b1,b2] ~ ~]*4")
+const bs3 = note("[[b1,b2] ~ ~] ~@3")
+const bs4 = note("[b2*3]!4")
+const bs5 = note("[a2*3]!2 [f#3*3] [g3 d2 c#3]")
+const bs6 = note("[a2*3]!2 [f#3 a2 f#3] [a#3@3]")
+const bs7 = note("[b1*3]!4")
+const bs8 = note("[g3*3]!4")
+const bs9 = note("[e2*3]!4")
+const bs10 = note("[d2*3] [c#3 d2!2] [c2*3]!2")
+const bs11 = note("[b1*3]!2 [g3*3]!2")
+const bs12 = note("[b1*3]!2 [f#3 g3 a#3] [b2 c#4 d4]")
+const bs13 = note("[b1*3]!2 [a#3] [c#4]")
+const bs14 = note("[[b1,b2] ~]!4")
+const bs15 = note("b1,b2")
+const bs16 = note("[b2*3]!2 [g3*3]!2")
+const bs17 = note("[b2*3]!2 [g3*3] [b2*3]")
+const bs18 = note("[e2*3] [f#3*3]!3")
+const bs19 = note("[[b2,e2] b2!2] [b2*3]!3")
+const bs20 = note("[d2@2 d2] [f2 f#3 f2] f2 ~")
+const bs21 = note("[b1@2 f#3] [~ f2@2] e2 ~")
+const bs22 = note("[d2@2 e2] [~ f2@2] [f#3@2 a2] [~ a#3@2]")
+const bs23 = note("[b1@2 b1] ~@3")
+const bs24 = note("[f#3*3]!2 [f#3 a2 f#3] a#3")
+const bs25 = note("[b1!2 g3] [g3*3]!3")
+
+// Bars 1-13 (Intro)
+const bsIntro = arrange(
+  [3, silence],
+  [1, bs2],
+  [1, bs3],
+  [1, bs4],
+  [1, bs5],
+  [1, bs4],
+  [1, bs6],
+  [1, bs4],
+  [1, bs5],
+  [1, bs4],
+  [1, bs6]
+)
+// Bars 14-21 (Verse 1)
+const bsV1 = arrange(
+  [1, bs7],
+  [1, bs8],
+  [1, bs9],
+  [1, bs10],
+  [1, bs7],
+  [1, bs8],
+  [1, bs9],
+  [1, bs10]
+)
+// Bars 22-25 (Chorus 1)
+const bsC1 = arrange(
+  [1, bs11],
+  [1, bs12],
+  [1, bs11],
+  [1, bs13]
+)
+// Bars 26-33 (Post-Chorus)
+const bsPC1 = arrange(
+  [1, bs4],
+  [1, bs5],
+  [1, bs4],
+  [1, bs6],
+  [1, bs4],
+  [1, bs5],
+  [1, bs14],
+  [1, bs15]
+)
+// Bars 46-61 (Bridge)
+const bsB1 = arrange(
+  [1, bs16],
+  [1, bs17],
+  [1, bs16],
+  [1, bs18],
+  [1, bs16],
+  [1, bs17],
+  [1, bs16],
+  [1, bs19],
+  [1, bs7],
+  [1, bs20],
+  [1, bs7],
+  [1, bs21],
+  [1, bs7],
+  [1, bs20],
+  [1, bs7],
+  [1, bs22]
+)
+// Bars 62-77 (Solo)
+const bsSolo = arrange(
+  [1, bs23],
+  [1, bs20],
+  [1, bs23],
+  [1, bs21],
+  [1, bs23],
+  [1, bs20],
+  [1, bs23],
+  [1, bs22],
+  [1, bs7],
+  [1, bs8],
+  [1, bs7],
+  [1, bs24],
+  [1, bs7],
+  [1, bs25],
+  [1, bs7],
+  [1, bs24]
+)
+// Bars 78-85 (Chorus 3)
+const bsC3 = arrange(
+  [1, bs23],
+  [1, bs20],
+  [1, bs23],
+  [1, bs21],
+  [1, bs23],
+  [1, bs20],
+  [1, bs23],
+  [1, bs22]
+)
+// Bars 86-93 (Verse 3)
+const bsV3 = arrange(
+  [1, bs7],
+  [1, bs8],
+  [1, bs9],
+  [1, bs10],
+  [1, bs7],
+  [1, bs8],
+  [1, bs9],
+  [1, bs10]
+)
+// Bars 94-118 (Chorus 4)
+const bsC4 = arrange(
+  [1, bs11],
+  [1, bs12],
+  [1, bs11],
+  [1, bs13],
+  [1, bs16],
+  [1, bs17],
+  [1, bs16],
+  [1, bs18],
+  [1, bs16],
+  [1, bs17],
+  [1, bs16],
+  [1, bs19],
+  [1, bs7],
+  [1, bs20],
+  [1, bs7],
+  [1, bs21],
+  [1, bs7],
+  [1, bs20],
+  [1, bs7],
+  [1, bs22],
+  [1, bs7],
+  [1, bs20],
+  [1, bs7],
+  [1, bs22],
+  [1, bs23]
+)
+
+$bass: arrange(
+  [INTRO, bsIntro],
+  [V1,    bsV1],
+  [C1,    bsC1],
+  [PC1,   bsPC1],
+  [V2,    bsV1],
+  [C2,    bsC1],
+  [B1,    bsB1],
+  [SOLO,  bsSolo],
+  [C3,    bsC3],
+  [V3,    bsV3],
+  [C4,    bsC4],
+  [END,   silence]
+).sound("supersaw").gain(0.6)
+
+// ==================== LEAD GUITAR ====================
+const lg1 = note("~@3 b3")
+const lg2 = note("[b2!3] [b3 b2!2] [a3 b3 b2] [b3 b2!2]")
+const lg3 = note("[d4 b2!2] [c#4 b2!2] [f#3@2 f#3!2 f#3@2] [g3 d3 c#3]")
+const lg4 = note("[b2@2 b2!2 b2@2] [b3 b2!2] [a3 b3 b2] [b3 b2!2]")
+const lg5 = note("[[b2,f#3]] ~@3")
+const lg6 = note("[d4 b2!2] [c#4 b2!2] [f#3 a3 f#3] a#3")
+const lg7 = note("[b2@2 b2!2 b2@2] [b3 b2!2] [b3 b2!2] [f#4 b3 f#3]")
+const lg8 = note("[g3@2 g3!2 g3@2] [d4 g3!2] [c#4 d4 g3] [b3 g3!2]")
+const lg9 = note("[e3@2 e3!2 e3@2] [g3 e3!2] [f#3 g3 e3] [e3@2 e3!2 e3@2]")
+const lg10 = note("[d3@2 d3!2 d3@2] [f#3 d3!2] [c3@2 c3!2 c3@2] [c3@2 c3!2 c3@2]")
+const lg11 = note("[b2@2 b2!2 b2@2] [f#4 b2 e4] [g3@2 g3!2 g3@2] [e4 g3 d4]")
+const lg12 = note("[b2@2 b2!2 b2@2] [f#4 b2 e4] [f#3 g3 a#3] [b3 c#4 d4]")
+const lg13 = note("[b2@2 b2!2 b2@2] [f#4 b2 e4] a#3 c#4")
+const lg14 = note("b2,f#3")
+const lg15 = note("[d4!4] [c#4!4]!2 [b3!4]")
+const lg16 = note("[d4!4] [c#4!4] [f#4!4] [e4!4]")
+const lg17 = note("b3 [a#3 b3 a#3] f#3 ~")
+const lg18 = note("b3 [a#3 b3 a#3] [f#3 a3 f#3] a#3")
+const lg19 = note("[d3@2 ~ d3] [f3 f#3 f3] f3 ~")
+const lg20 = note("[[b2,f#3] [c#4,f#3] [c4,f3]] [b3,e3]")
+const lg21 = note("[d3 e3 f3] [f#3 a3 a#3]")
+const lg22 = note("f#4@3 f#4")
+const lg23 = note("f4")
+const lg24 = note("[f#4 f#4@2] [a4@4 g#4 a4 g#4@2]")
+const lg25 = note("[d4 d3!3]!4")
+const lg26 = note("d4@3 f#3")
+const lg27 = note("[b3!4] [f#4!4] [b4!4] [f#4!4]")
+const lg28 = note("[[a5,b5] [a5,b5] [a5,b5]]")
+const lg29 = note("b3@2 b3 d4")
+const lg30 = note("c#4@3 e4")
+const lg31 = note("d4@3 b3")
+const lg32 = note("a#3@3 e4")
+const lg33 = note("d4@3 c#4")
+const lg34 = note("b3@3 a#3")
+const lg35 = note("b3")
+const lg36 = note("[a#3 b3 c#4@4] [c#4 d4 e4@4]")
+const lg37 = note("[[b2,f#3]@2 [b2,f#3]] ~")
+const lg38 = note("[b2@2 ~ b2] ~@3")
+const lg39 = note("[[b2,f#3] [c#4,f#3] [c4,f3]] [[b3,e3] [a3,d3] [c#3,g#3]]")
+
+// Bars 1-13 (Intro)
+const lgIntro = arrange(
+  [1, lg1],
+  [1, lg2],
+  [1, lg3],
+  [1, lg4],
+  [1, lg5],
+  [1, lg2],
+  [1, lg3],
+  [1, lg4],
+  [1, lg6],
+  [1, lg4],
+  [1, lg3],
+  [1, lg4],
+  [1, lg6]
+)
+// Bars 14-21 (Verse 1)
+const lgV1 = arrange(
+  [1, lg7],
+  [1, lg8],
+  [1, lg9],
+  [1, lg10],
+  [1, lg7],
+  [1, lg8],
+  [1, lg9],
+  [1, lg10]
+)
+// Bars 22-25 (Chorus 1)
+const lgC1 = arrange(
+  [1, lg11],
+  [1, lg12],
+  [1, lg11],
+  [1, lg13]
+)
+// Bars 26-33 (Post-Chorus)
+const lgPC1 = arrange(
+  [1, lg2],
+  [1, lg3],
+  [1, lg4],
+  [1, lg6],
+  [1, lg4],
+  [1, lg3],
+  [1, lg4],
+  [1, lg14]
+)
+// Bars 34-41 (V2)
+const lgV2 = arrange(
+  [1, lg7],
+  [1, lg8],
+  [1, lg9],
+  [1, lg10],
+  [1, lg7],
+  [1, lg8],
+  [1, lg9],
+  [1, lg10]
+)
+// Bars 42-45 (C2)
+const lgC2 = arrange(
+  [1, lg11],
+  [1, lg12],
+  [1, lg11],
+  [1, lg13]
+)
+// Bars 46-61 (Bridge)
+const lgB1 = arrange(
+  [1, lg15],
+  [1, lg16],
+  [1, lg15],
+  [1, lg17],
+  [1, lg15],
+  [1, lg16],
+  [1, lg15],
+  [1, lg18],
+  [1, lg2],
+  [1, lg19],
+  [1, lg2],
+  [1, lg20],
+  [1, lg2],
+  [1, lg19],
+  [1, lg2],
+  [1, lg21]
+)
+// Bars 62-77 (Solo)
+const lgSolo = arrange(
+  [1, lg22],
+  [1, lg23],
+  [1, lg24],
+  [1, lg23],
+  [1, lg25],
+  [1, lg26],
+  [1, lg27],
+  [1, lg28],
+  [1, lg29],
+  [1, lg30],
+  [1, lg31],
+  [1, lg32],
+  [1, lg33],
+  [1, lg34],
+  [1, lg35],
+  [1, lg36]
+)
+// Bars 78-85 (Chorus 3)
+const lgC3 = arrange(
+  [1, lg37],
+  [1, lg19],
+  [1, lg37],
+  [1, lg20],
+  [1, lg37],
+  [1, lg19],
+  [1, lg38],
+  [1, lg21]
+)
+// Bars 86-93 (Verse 3)
+const lgV3 = arrange(
+  [1, lg7],
+  [1, lg8],
+  [1, lg9],
+  [1, lg10],
+  [1, lg7],
+  [1, lg8],
+  [1, lg9],
+  [1, lg10]
+)
+// Bars 94-118 (Chorus 4)
+const lgC4 = arrange(
+  [1, lg11],
+  [1, lg12],
+  [1, lg11],
+  [1, lg13],
+  [1, lg15],
+  [1, lg16],
+  [1, lg15],
+  [1, lg17],
+  [1, lg15],
+  [1, lg16],
+  [1, lg15],
+  [1, lg18],
+  [1, lg2],
+  [1, lg19],
+  [1, lg2],
+  [1, lg39],
+  [1, lg2],
+  [1, lg19],
+  [1, lg2],
+  [1, lg20],
+  [1, lg2],
+  [1, lg19],
+  [1, lg2],
+  [1, lg21],
+  [1, lg37]
+)
+
+$leadGuitar: arrange(
+  [INTRO,   lgIntro],
+  [V1,      lgV1],
+  [C1,      lgC1],
+  [PC1,     lgPC1],
+  [V2,      lgV2],
+  [C2,      lgC2],
+  [B1,      lgB1],
+  [SOLO,    lgSolo],
+  [C3,      lgC3],
+  [V3,      lgV3],
+  [C4,      lgC4],
+  [END,    silence]
+).sound("pulse").gain(1.2).clip(0.8)
+  .hpf(100)
+._scope()
+
+// ==================== HARMONY GUITAR ====================
+const hg1 = note("a4@6 a4@2")
+const hg2 = note("g#4@6")
+const hg3 = note("a4@8 a4@16 c#5@12 a4@3 b4@3 a4@6")
+const hg4 = note("[d4 d3!3]!4")
+const hg5 = note("d3@6 f#3@2")
+const hg6 = note("[b3!4] [f#4!4] [b4!4] [f#4!4]")
+const hg7 = note("[a4,b4]@2!3")
+const hg8 = note("d3@4 d3@2 f#3@2")
+const hg9 = note("e3@6 g3@2")
+const hg10 = note("f#3@6 d3@2")
+const hg11 = note("c#3@6 g3@2")
+const hg12 = note("f#3@6 e3@2")
+const hg13 = note("d3@6 c#3@2")
+const hg14 = note("b2@6")
+const hg15 = note("f#2 e2 f#2@4 f#2 e2 f#2@4")
+// Harmony plays only during the Solo (bars 62-77)
+const hgSolo = arrange(
+  [1, hg1],
+  [1, hg2],
+  [1, hg3],
+  [1, hg2],
+  [1, hg4],
+  [1, hg5],
+  [1, hg6],
+  [1, hg7],
+  [1, hg8],
+  [1, hg9],
+  [1, hg10],
+  [1, hg11],
+  [1, hg12],
+  [1, hg13],
+  [1, hg14],
+  [1, hg15]
+)
+
+$harmonyGuitar: arrange(
+  // Bars 1-13 (Intro)
+  [INTRO,    silence],
+  // Bars 14-21 (Verse 1)
+  [V1,       silence],
+  // Bars 22-25 (Chorus 1)
+  [C1,       silence],
+  // Bars 26-33 (Post-Chorus)
+  [PC1,      silence],
+  // Bars 34-41 (Verse 2)
+  [V2,       silence],
+  // Bars 42-45 (Chorus 2)
+  [C2,       silence],
+  // Bars 46-61 (Bridge)
+  [B1,       silence],
+  // Bars 62-77 (Solo)
+  [SOLO,     hgSolo],
+  // Bars 78-85 (Chorus 3)
+  [C3,       silence],
+  // Bars 86-93 (Verse 3)
+  [V3,       silence],
+  // Bars 94-118 (Chorus 4)
+  [C4,       silence]
+).sound("pulse").gain(1.0).clip(0.8).hpf(100)
+
+// ==================== RHYTHM GUITAR ====================
+const rg2 = note("[[b1,f#2] ~@2]!4")
+const rg3 = note("[[b1,f#2] ~@2] ~@3")
+const rg4 = note("[b1!3] [b2 b1!2] [a2 b2 b1] [b2 b1!2]")
+const rg5 = note("[d3 b1!2] [c#3 b1!2] [f#2!3] [g2 d2 c#2]")
+const rg6 = note("[d3 b1!2] [c#3 b1!2] [f#2 a2 f#2] a#2")
+const rg7 = note("[b1!3] [b2 b1!2] [b2 b1!2] [f#3 b2 f#2]")
+const rg8 = note("[g2!3] [b2 g2!2] [c#3 d3 g2] [b2 g2!2]")
+const rg9 = note("[e2!3] [g2 e2!2] [f#2 g2 e2] [e2!3]")
+const rg10 = note("[d2!3] [f#2 d2!2] [c2!3] [c2!3]")
+const rg11 = note("[g2!3] [b2 g2!2] [c#3 d3 g2] [f#3 g2!2]")
+const rg12 = note("[b1!3] [d3 b1 c#3] [g2!3] [c#3 g2 b2]")
+const rg13 = note("[b1!3] [d3 b1 c#3] [f#2 g2 a#2] [b2 c#3 d3]")
+const rg14 = note("[b1!3] [d3 b1 c#3] f#2 a#2")
+const rg15 = note("b1,f#2")
+const rg16 = note("[[b2,f#3] [d3,g2]]")
+const rg17 = note("[[b2,f#3] [[a2,d2] [c#3,f#2]]]")
+const rg18 = note("[[e2 f#2] f#2]")
+const rg19 = note("e2 f#2 [f#2 a2 f#2] a#2")
+const rg20 = note("[[d2@2 d2 f2 f#2 f2] f2]")
+const rg21 = note("[[[b1,f#2] [c#3,f#2] [c3,f2]] [b2,e2]]")
+const rg22 = note("[[d2 e2 f2] [f#2 a2 a#2]]")
+const rg23 = note("[[[b1,f#2] [b1,f#2]@2] ~]")
+const rg24 = note("[[b1 b1@2] ~]")
+const rg25 = note("[b1@2 b1] [b1!3] [b1@2 b1] [b1!3]")
+const rg26 = note("[g2@2 g2] [g2!3] [g2@2 g2] [g2!3]")
+const rg27 = note("[f#2@2 f#2] [f#2!3] [f#2 a2 f#2] a#2")
+const rg28 = note("[[[b1,f#2] [c#3,f#2] [c3,f2]] [[b2,e2] [a2,d2] [c#2,g#2]]]")
+// Bars 1-13 (Intro)
+const rgIntro = arrange(
+  [3, silence],
+  [1, rg2],
+  [1, rg3],
+  [1, rg4],
+  [1, rg5],
+  [1, rg4],
+  [1, rg6],
+  [1, rg4],
+  [1, rg5],
+  [1, rg4],
+  [1, rg6]
+)
+// Bars 14-21 (Verse 1)
+const rgV1 = arrange(
+  [1, rg7],
+  [1, rg8],
+  [1, rg9],
+  [1, rg10],
+  [1, rg7],
+  [1, rg11],
+  [1, rg9],
+  [1, rg10]
+)
+// Bars 22-25 (Chorus 1)
+const rgC1 = arrange(
+  [1, rg12],
+  [1, rg13],
+  [1, rg12],
+  [1, rg14]
+)
+// Bars 26-33 (Post-Chorus)
+const rgPC1 = arrange(
+  [1, rg4],
+  [1, rg5],
+  [1, rg4],
+  [1, rg6],
+  [1, rg4],
+  [1, rg5],
+  [1, rg2],
+  [1, rg15]
+)
+// Bars 34-41 (V2)
+const rgV2 = arrange(
+  [1, rg7],
+  [1, rg11],
+  [1, rg9],
+  [1, rg10],
+  [1, rg7],
+  [1, rg11],
+  [1, rg9],
+  [1, rg10]
+)
+// Bars 42-45 (C2)
+const rgC2 = arrange(
+  [1, rg12],
+  [1, rg13],
+  [1, rg12],
+  [1, rg14]
+)
+// Bars 46-61 (Bridge)
+const rgB1 = arrange(
+  [1, rg16],
+  [1, rg17],
+  [1, rg16],
+  [1, rg18],
+  [1, rg16],
+  [1, rg17],
+  [1, rg16],
+  [1, rg19],
+  [1, rg4],
+  [1, rg20],
+  [1, rg4],
+  [1, rg21],
+  [1, rg4],
+  [1, rg20],
+  [1, rg4],
+  [1, rg22]
+)
+// Bars 62-77 (Solo)
+const rgSolo = arrange(
+  [1, rg23],
+  [1, rg20],
+  [1, rg24],
+  [1, rg21],
+  [1, rg23],
+  [1, rg20],
+  [1, rg24],
+  [1, rg22],
+  [1, rg25],
+  [1, rg26],
+  [1, rg25],
+  [1, rg27],
+  [1, rg25],
+  [1, rg26],
+  [1, rg25],
+  [1, rg27]
+)
+// Bars 78-85 (Chorus 3)
+const rgC3 = arrange(
+  [1, rg23],
+  [1, rg20],
+  [1, rg23],
+  [1, rg21],
+  [1, rg23],
+  [1, rg20],
+  [1, rg24],
+  [1, rg22]
+)
+// Bars 86-93 (Verse 3)
+const rgV3 = arrange(
+  [1, rg7],
+  [1, rg11],
+  [1, rg9],
+  [1, rg10],
+  [1, rg7],
+  [1, rg11],
+  [1, rg9],
+  [1, rg10]
+)
+// Bars 94-118 (Chorus 4)
+const rgC4 = arrange(
+  [1, rg12],
+  [1, rg13],
+  [1, rg12],
+  [1, rg14],
+  [1, rg16],
+  [1, rg17],
+  [1, rg16],
+  [1, rg18],
+  [1, rg16],
+  [1, rg17],
+  [1, rg16],
+  [1, rg19],
+  [1, rg4],
+  [1, rg20],
+  [1, rg4],
+  [1, rg28],
+  [1, rg4],
+  [1, rg20],
+  [1, rg4],
+  [1, rg21],
+  [1, rg4],
+  [1, rg20],
+  [1, rg4],
+  [1, rg22],
+  [1, rg23]
+)
+
+$rhythmGuitar: arrange(
+  [INTRO,    rgIntro],
+  [V1,       rgV1],
+  [C1,       rgC1],
+  [PC1,      rgPC1],
+  [V2,       rgV2],
+  [C2,       rgC2],
+  [B1,       rgB1],
+  [SOLO,     rgSolo],
+  [C3,       rgC3],
+  [V3,       rgV3],
+  [C4,       rgC4],
+  [END,      silence],
+).sound("sawtooth").gain(0.5)
+
+
+// ==================== GO SHOUT ====================
+const go1 = note("~@3 1")
+const goIntro = arrange(
+  [4, silence],
+  [1, go1],
+  [8, silence]
+)
+$goShout: arrange(
+  [INTRO,    goIntro],
+  [V1,       silence],
+  [C1,       silence],
+  [PC1,      silence],
+  [V2,       silence],
+  [C2,       silence],
+  [B1,       silence],
+  [SOLO,     silence],
+  [C3,       silence],
+  [V3,       silence],
+  [C4,       silence],
+  [END,      silence]
+).sound("white").gain(1.5).clip(0.9).lpf(1400).hpf(180).attack(0.005).release(0.08)

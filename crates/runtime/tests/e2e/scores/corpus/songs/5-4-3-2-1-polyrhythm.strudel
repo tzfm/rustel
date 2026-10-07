@@ -1,0 +1,22 @@
+/*
+  @title 5:4:3:2:1 polyrhythm
+  @by strudel community bakery
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?adXGOH5VB6mQ
+*/
+// "5:4:3:2:1 polyrhythm"
+
+stack(
+  "c5".fast(5),
+  "c4".fast(4),
+  "c3".fast(3),
+  "c2".fast(2),
+  "c1".fast(1)
+).note()
+  .color("white")
+  .s("ht")
+  .room(.2)
+  .punchcard({labels:0,vertical:0,fill:0})
+
+// @version 1.0

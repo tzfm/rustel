@@ -1,0 +1,8 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 12
+*/
+// parity fuzz case seed=616 cycles=22 bpm=70
+setcpm(70/4)
+$: s("cp? lt [oh!2 bd@2 bd:3]").drive(0.53).vowel("o")

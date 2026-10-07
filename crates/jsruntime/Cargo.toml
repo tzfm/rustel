@@ -1,0 +1,47 @@
+[package]
+name = "rustel-jsruntime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "QuickJS integration and JavaScript callback ownership"
+
+# QuickJS boundary:
+#   * pattern nodes hold an opaque CallbackId, never a JSValue
+#   * callbacks live in a trace-managed sidecar, never a Persistent
+#   * the JS wrapper marks its subtree's reachable callbacks via Trace
+#
+# QuickJS builds from source and therefore requires a C toolchain.
+
+[features]
+default = ["extensions"]
+# Credited non-upstream score extensions. Enabled by default for the complete
+# product; library consumers can build the upstream-compatible surface alone
+# with `--no-default-features`.
+extensions = ["dep:rustel-ext"]
+# The score-realm half of the feature-removable visuals: globals that RECORD a
+# Hydra sketch instead of drawing it. Nothing graphical is linked here - the
+# complete `rustel-runtime` turns this on alongside `rustel-hydra`, which owns
+# the renderer; lean consumers may leave both out.
+hydra = ["dep:serde_json"]
+
+[dependencies]
+rustel-core = { path = "../core" }
+rustel-ext = { path = "../ext", optional = true }
+rustel-fraction = { path = "../fraction" }
+rustel-mini = { path = "../mini" }
+rustel-transpiler = { path = "../transpiler" }
+num-bigint = "0.5"
+num-traits = "0.2"
+# Only for the recorded Hydra program, which crosses to the window crate as
+# data rather than as a shared type: see `install/hydra.rs`.
+serde_json = { version = "1", optional = true }
+rquickjs = { version = "=0.14.0", git = "https://github.com/tzfm/rquickjs", rev = "ed2337c6f187996ef97f7e4e44458cfbc33266f4", features = [
+    "classes",
+    "properties",
+    "macro",
+    "allocator",
+    # The rejecting module resolver needs the loader machinery.
+    "loader",
+] }

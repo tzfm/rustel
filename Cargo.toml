@@ -1,0 +1,76 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/engine",
+    "crates/fraction",
+    "crates/core",
+    "crates/ext",
+    "crates/mini",
+    "crates/transpiler",
+    "crates/jsruntime",
+    "crates/scheduler",
+    "crates/runtime",
+    "crates/cli",
+    "crates/studio",
+    "crates/audio",
+    "crates/voice",
+    "crates/serial",
+    "crates/midi",
+    "crates/osc",
+    "crates/hydra",
+    "crates/studio-e2e",
+    "xtask",
+]
+
+# `cargo build` at the root builds the complete product, the `rustel` binary
+# of `crates/cli`. Its default features include Studio and Hydra, so the path
+# dependency is pulled in even though `rustel-hydra` is not itself a top-level
+# default member. A lean build is `-p rustel --no-default-features`, with
+# `--features mp3-export` to keep MP3 export.
+default-members = [
+    "crates/engine",
+    "crates/fraction",
+    "crates/core",
+    "crates/ext",
+    "crates/mini",
+    "crates/transpiler",
+    "crates/jsruntime",
+    "crates/scheduler",
+    "crates/runtime",
+    "crates/cli",
+    "crates/studio",
+    "crates/audio",
+    "crates/voice",
+    "crates/serial",
+    "crates/midi",
+    "crates/osc",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+# The toolchain rust-toolchain.toml pins, the only one tested.
+rust-version = "1.98.1"
+# The public repository. Members inherit this for their published metadata.
+repository = "https://github.com/tzfm/rustel"
+
+[profile.release]
+# Score panic recovery needs unwinding; see .github/scripts/check-panic-unwind.sh.
+panic = "unwind"
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
+
+# Local iteration
+[profile.local]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+incremental = true
+
+[patch.crates-io]
+# iTerm2 alternate codes and Unix F15-F20 offsets; return to crates.io after
+# a release includes crossterm-rs/crossterm PRs #1125 and #1127.
+crossterm = { git = "https://github.com/tzfm/crossterm", rev = "519c3ed7b9b561b8bbb1a3fa15ccc93b81fe8892" }

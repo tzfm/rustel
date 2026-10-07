@@ -1,0 +1,43 @@
+/*
+  @title Bad Apple!! ~ Touhou 4: Lotus Land Story
+  @by orin
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?nYgyU2vQ8R5o
+*/
+
+// @by orin
+// @title Bad Apple!! ~ Touhou 4: Lotus Land Story
+
+setcpm(30)
+  stack(
+
+    //drums
+
+    sound("<[hh hh hh hh]>*8").lpf(2200).fast(4),
+    sound("<[bd bd]>*4").bank("AlesisSR16").lpf(3200).fast(4),
+
+  //melodia
+  note(`
+  
+  [eb3 f3 gb3 ab3] [bb3@2 eb4 db4] 
+  [bb3@2 eb3@2] [bb3 ab3 gb3 f3]
+  [eb3 f3 gb3 ab3] [bb3@2 ab3 gb3]
+  [f3 bb2 f3 gb3] [f3 eb3 d3 f3]
+  
+       [eb3 f3 gb3 ab3] [bb3@2 ab3 db4]
+       [eb4@2 eb4@2] [f4@2 gb4@2]
+       [eb4 f4 gb4 ab4] [bb4@2 ab4 gb4]
+       [ab4@2 f4@2] [gb4@2 ab4@2]
+       
+       `)
+    .sound("sawtooth").room(0.15).color("#ff00ff"),
+
+  // v2
+  note("<[eb3 bb3]*4 [b2 gb3]*4>")
+  .sound("triangle").fast(8).color("#ff99ff")
+
+    ).slow(6)
+.pianoroll()
+
+// @version 1.0

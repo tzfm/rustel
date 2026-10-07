@@ -1,0 +1,10 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+note("c f g g a c d4").fast(2)
+.sound('sawtooth')
+.lpf(200).fanchor(0)
+.lpenv(3).lpq(1)
+.ftype("<ladder 12db 24db>")

@@ -1,0 +1,6 @@
+/*
+  @by rustel maintainers
+  @origin probes
+  @duration 2
+*/
+s("pulse").note("c3 e3").pw(0.2).seg(4)

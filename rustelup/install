@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+# Bootstrap for rustelup: puts the updater on your machine, then rustelup
+# fetches the engine.
+REPO="${RUSTELUP_REPO:-tzfm/rustel}"
+
+RUSTEL_DIR="${RUSTEL_DIR:-$HOME/.rustel}"
+BIN_DIR="$RUSTEL_DIR/bin"
+
+say() { printf 'rustelup-init: %s\n' "$1"; }
+err() { say "$1" >&2; exit 1; }
+command -v curl >/dev/null 2>&1 || err "need 'curl'"
+
+sha256_file() {
+  local digest
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest="$(sha256sum "$1")" || return 1
+    printf '%s\n' "${digest%% *}"
+  elif command -v shasum >/dev/null 2>&1; then
+    digest="$(shasum -a 256 "$1")" || return 1
+    printf '%s\n' "${digest%% *}"
+  else
+    err "need 'sha256sum' or 'shasum' to verify downloads"
+  fi
+}
+
+verify_sha256() {
+  local expected actual
+  expected="$(cat "$2")" || err "cannot read checksum for $1"
+  case "$expected" in
+    *[!0-9a-f]*|"") err "invalid checksum for $1" ;;
+  esac
+  [ "${#expected}" -eq 64 ] || err "invalid checksum for $1"
+  actual="$(sha256_file "$1")" || err "cannot hash $1"
+  [ "$expected" = "$actual" ] || err "checksum mismatch for $1"
+}
+
+TAG="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+  | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*"\(v[^"]*\)"/\1/')" \
+  || err "could not find the latest release at $REPO"
+case "$TAG" in
+  v[0-9]*) ;;
+  *) err "invalid release tag: $TAG" ;;
+esac
+case "$TAG" in
+  *[!A-Za-z0-9._-]*) err "invalid release tag: $TAG" ;;
+esac
+RUSTELUP_URL="https://github.com/$REPO/releases/download/$TAG/rustelup"
+
+mkdir -p "$BIN_DIR"
+TMP="$(mktemp -d)"
+STAGE=""
+cleanup() {
+  rm -rf "$TMP"
+  [ -z "$STAGE" ] || rm -rf "$STAGE"
+}
+trap cleanup EXIT
+curl -fL --progress-bar "$RUSTELUP_URL" -o "$TMP/rustelup" \
+  || err "download failed: $RUSTELUP_URL"
+curl -fsSL "$RUSTELUP_URL.sha256" -o "$TMP/rustelup.sha256" \
+  || err "checksum download failed: $RUSTELUP_URL.sha256"
+verify_sha256 "$TMP/rustelup" "$TMP/rustelup.sha256"
+STAGE="$(mktemp -d "$BIN_DIR/.rustelup-init.XXXXXXXX")"
+cp "$TMP/rustelup" "$STAGE/rustelup"
+chmod +x "$STAGE/rustelup"
+bash -n "$STAGE/rustelup" || err "downloaded updater failed syntax check"
+"$STAGE/rustelup" --help >/dev/null 2>&1 \
+  || err "downloaded updater failed its help check"
+[ ! -e "$BIN_DIR/rustelup" ] || cp -p "$BIN_DIR/rustelup" "$STAGE/previous"
+if ! mv -f "$STAGE/rustelup" "$BIN_DIR/rustelup"; then
+  if [ -f "$STAGE/previous" ] && [ ! -e "$BIN_DIR/rustelup" ]; then
+    mv -f "$STAGE/previous" "$BIN_DIR/rustelup" || err "could not restore previous updater"
+  fi
+  err "could not replace $BIN_DIR/rustelup"
+fi
+if ! "$BIN_DIR/rustelup" --help >/dev/null 2>&1; then
+  if [ -f "$STAGE/previous" ]; then
+    mv -f "$STAGE/previous" "$BIN_DIR/rustelup" || err "could not restore previous updater"
+    err "installed updater failed its help check; previous updater restored"
+  fi
+  rm -f "$BIN_DIR/rustelup"
+  err "installed updater failed its help check and was removed"
+fi
+say "installed rustelup to $BIN_DIR/rustelup"
+
+# Put the bin dir on PATH for the shells people live in.
+case "$SHELL" in
+  */zsh)  PROFILE="${ZDOTDIR:-$HOME}/.zshenv" ;;
+  */bash) PROFILE="$HOME/.bashrc" ;;
+  */fish) PROFILE="" ;;
+  *)      PROFILE="$HOME/.profile" ;;
+esac
+if [ -n "$PROFILE" ]; then
+  if ! grep -qs "$BIN_DIR" "$PROFILE"; then
+    printf '\nexport PATH="%s:$PATH"\n' "$BIN_DIR" >> "$PROFILE"
+    say "added $BIN_DIR to PATH in $PROFILE"
+  fi
+else
+  if command -v fish >/dev/null 2>&1; then
+    fish -c "fish_add_path $BIN_DIR" >/dev/null 2>&1 \
+      && say "added $BIN_DIR to fish PATH" \
+      || say "add $BIN_DIR to your fish PATH by hand"
+  fi
+fi
+
+say "open a new terminal (or 'source' your profile), then run: rustelup"

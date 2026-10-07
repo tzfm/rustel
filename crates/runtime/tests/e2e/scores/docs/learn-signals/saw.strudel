@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+note("<c3 [eb3,g3] g2 [g3,bb3]>*8")
+.clip(saw.slow(2))

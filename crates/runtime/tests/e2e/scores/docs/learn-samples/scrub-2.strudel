@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+samples('github:yaxu/clean-breaks/main');
+s("amen/4").fit().scrub("{0@3 0@2 4@3}%8".div(16))

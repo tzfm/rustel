@@ -1,0 +1,30 @@
+/*
+  @title Clapping Music
+  @by Steve Reich
+  @origin songs-bakery
+  @duration 4
+  @source https://strudel.cc/?2dDpZIFXd085
+*/
+// "Clapping Music" @by Steve Reich (1972)
+// https://www.youtube.com/watch?v=hH1j06bMHDQ
+// converted in Strudel by πr
+setcpm(30)
+stack(
+  s("clap:4").struct("x x x ~ x x ~ x ~ x x ~").mask("<1@8 1@8 1@8 1@8 1@8 1@8 1@8 1@8 1@8 1@8 1@8 1@8 1@8 0@80>").gain(.5),
+  s("clap:1").struct("x x x ~ x x ~ x ~ x x ~").mask("<1@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@80>").gain(.5),
+  s("clap:1").struct("x x ~ x x ~ x ~ x x ~ x").mask("<0@8 1@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@80>").gain(.5),
+  s("clap:1").struct("x ~ x x ~ x ~ x x ~ x x").mask("<0@8 0@8 1@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@80>").gain(.5),
+  s("clap:1").struct("~ x x ~ x ~ x x ~ x x x").mask("<0@8 0@8 0@8 1@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@80>").gain(.5),
+  s("clap:1").struct("x x ~ x ~ x x ~ x x x ~").mask("<0@8 0@8 0@8 0@8 1@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@80>").gain(.5),
+  s("clap:1").struct("x ~ x ~ x x ~ x x x ~ x").mask("<0@8 0@8 0@8 0@8 0@8 1@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@80>").gain(.5),
+  s("clap:1").struct("~ x ~ x x ~ x x x ~ x x").mask("<0@8 0@8 0@8 0@8 0@8 0@8 1@8 0@8 0@8 0@8 0@8 0@8 0@8 0@80>").gain(.5),
+  s("clap:1").struct("x ~ x x ~ x x x ~ x x ~").mask("<0@8 0@8 0@8 0@8 0@8 0@8 0@8 1@8 0@8 0@8 0@8 0@8 0@8 0@80>").gain(.5),
+  s("clap:1").struct("~ x x ~ x x x ~ x x ~ x").mask("<0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 1@8 0@8 0@8 0@8 0@8 0@80>").gain(.5),
+  s("clap:1").struct("x x ~ x x x ~ x x ~ x ~").mask("<0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 1@8 0@8 0@8 0@8 0@80>").gain(.5),
+  s("clap:1").struct("x ~ x x x ~ x x ~ x ~ x").mask("<0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 1@8 0@8 0@8 0@80>").gain(.5),
+  s("clap:1").struct("~ x x x ~ x x ~ x ~ x x").mask("<0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 1@8 0@8 0@80>").gain(.5),
+  s("clap:1").struct("x x x ~ x x ~ x ~ x x ~").mask("<0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 0@8 1@8 0@80>").gain(.5),
+)
+
+
+// @version 1.0

@@ -1,0 +1,8 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+sound("bd - bd bd*2, - sd:6 - sd:5 sd:1 - [- sd:2] -, hh [- cp:7]")
+  .bank("RolandTR909").speed(1.2)
+  .bite(4, "0 0 [1 2] <3 2> 0 0 [2 1] 3")

@@ -1,0 +1,110 @@
+[package]
+name = "rustel-studio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "The terminal studio behind `rustel studio`: editor, visuals, mixer and its live engine"
+
+[features]
+# The complete studio. `--no-default-features` keeps the editor and live
+# playback; each feature below adds one capability back and turns on the
+# runtime feature of the same name.
+default = ["extensions", "gamepad", "hydra", "osc", "serial", "remote-control"]
+extensions = ["dep:rustel-ext", "rustel-runtime/extensions"]
+gamepad = ["rustel-runtime/gamepad"]
+hydra = ["dep:rustel-hydra", "rustel-runtime/hydra"]
+osc = ["dep:rustel-osc", "rustel-runtime/osc"]
+serial = ["dep:rustel-serial", "rustel-runtime/serial"]
+# Included in ordinary builds; enable the listener with the flag or Studio menu.
+remote-control = ["dep:getrandom"]
+# The end-to-end harness for the studio suite (`crates/studio-e2e`): a test
+# can open a real `App`, press real keys, and render the real frame into a
+# test backend. Not in `default` - the product must not depend on its own
+# test scaffolding, and this keeps the surface out of ordinary builds.
+harness = []
+
+[dependencies]
+# Every studio plays live, lists MIDI ports so a score can name one without
+# leaving the editor, and records its set.
+rustel-runtime = { path = "../runtime", default-features = false, features = [
+  "device-audio",
+  "midi",
+  "session-log",
+] }
+rustel-audio = { path = "../audio" }
+rustel-core = { path = "../core" }
+rustel-ext = { path = "../ext", optional = true }
+rustel-hydra = { path = "../hydra", optional = true }
+rustel-jsruntime = { path = "../jsruntime", default-features = false }
+rustel-midi = { path = "../midi" }
+rustel-osc = { path = "../osc", optional = true }
+rustel-scheduler = { path = "../scheduler" }
+rustel-serial = { path = "../serial", optional = true }
+rustel-transpiler = { path = "../transpiler" }
+rustel-voice = { path = "../voice" }
+# Only for `midir::Ignore` on a pad's MIDI input.
+midir = "0.11"
+serde = { version = "1", features = ["derive"] }
+# Written JSON keeps the order its fields are written in.
+serde_json = { version = "1", features = ["preserve_order"] }
+tempfile = "3"
+getrandom = { version = "0.4", optional = true }
+url = "2.5.8"
+# The terminal studio is intentionally a Rust-only surface. Ratatui shares the
+# exact Crossterm 0.29 event types used for enhanced-keyboard negotiation.
+arboard = { version = "3.6", default-features = false }
+crossterm = "0.29"
+# zlib for the kitty graphics protocol: a frame of pixels is a few hundred
+# kilobytes raw and a few tens compressed, forty times a second.
+miniz_oxide = "0.8"
+# `underline-color` lets an active event outline its source range instead
+# of filling the cell background behind it.
+ratatui = { version = "0.30", default-features = false, features = [
+  "crossterm_0_29",
+  "underline-color",
+] }
+# Native, cell-precise theme effects. The DSL is intentionally omitted:
+# theme files select a bounded Rustel preset rather than executing code.
+tachyonfx = { version = "=0.25.1", default-features = false, features = [
+  "std",
+] }
+ropey = "1.6"
+unicode-segmentation = "1.12"
+unicode-width = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+# Terminal polling and size, and standard error pointed at the studio log.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+termina = { version = "0.3.3", default-features = false }
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  # Atomically create a private remote-control credential on Windows.
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_SystemServices",
+  "Win32_Storage_FileSystem",
+  # Bring COM up before ShellExecuteW, as its documentation asks.
+  "Win32_System_Com",
+  # Point standard error at the studio log, where a panic message is found.
+  "Win32_System_Console",
+  "Win32_System_Threading",
+  "Win32_UI_Input_KeyboardAndMouse",
+  # Open a web address with the shell's own `open` verb (ShellExecuteW),
+  # never through cmd.
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+# Without `default-features = false` a test build would unify the runtime's
+# product defaults back in, and the lean studio test would not be lean.
+rustel-runtime = { path = "../runtime", default-features = false, features = [
+  "test-support",
+] }
+rustel-audio = { path = "../audio", features = ["test-support"] }
+rustel-fraction = { path = "../fraction" }
+rustel-mini = { path = "../mini" }

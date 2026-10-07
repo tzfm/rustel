@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "id": "sine-explicit-adsr",
+  "events": [
+    {
+      "time_seconds": 0.25,
+      "duration_seconds": 0.5,
+      "value": {
+        "s": "sine",
+        "note": "a4",
+        "gain": 0.5,
+        "attack": 0.01,
+        "decay": 0.1,
+        "sustain": 0.5,
+        "release": 0.2,
+        "pan": 0
+      }
+    }
+  ]
+}

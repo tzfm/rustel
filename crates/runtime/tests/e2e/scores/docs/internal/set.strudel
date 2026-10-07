@@ -1,0 +1,8 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+// because input pattern has `s` set,
+// it overrides the "sine" declared earlier
+note("c a f e").s("sine").set(s("triangle"))

@@ -1,0 +1,8 @@
+/*
+  @by rustel corpus generator
+  @origin generated
+  @duration 12
+*/
+// parity fuzz case seed=652 cycles=24 bpm=84
+setcpm(84/4)
+$: s("rim [bd sd] sd:1*2 hh:0? lt <lt hh> sd").bank("RolandTR909").echo(2, 0.125, 0.52).late(0.125).euclidRot(5,8,1).struct("x*4").slice(4, "3 2 2 1").accelerate(-0.15).cut(2).distort(0.58)

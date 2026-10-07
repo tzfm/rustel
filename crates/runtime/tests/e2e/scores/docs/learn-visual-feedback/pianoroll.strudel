@@ -1,0 +1,10 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+note("c2 a2 eb2")
+.euclid(5,8)
+.s('sawtooth')
+.lpenv(4).lpf(300)
+.pianoroll({ labels: 1 })

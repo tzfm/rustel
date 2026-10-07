@@ -1,0 +1,7 @@
+/*
+  @by rustel maintainers
+  @origin regressions
+  @duration 4
+*/
+register('pushed', (n, pat) => pat.late(n))
+$: s("bd*4").pushed(0.125)

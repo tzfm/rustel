@@ -1,0 +1,6 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+note("<0 1 2!2 3>".pick(["g a", "e f", "f g f g" , "g c d"]))
