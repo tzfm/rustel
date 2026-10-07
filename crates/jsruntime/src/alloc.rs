@@ -312,6 +312,11 @@ unsafe impl Allocator for BudgetedAllocator {
     /// # Safety
     /// `ptr` must have come from this allocator.
     unsafe fn dealloc(&mut self, ptr: *mut u8) {
+        // QuickJS never passes a null `ptr` here. A null `ptr` has no header,
+        // so there is nothing to release.
+        if ptr.is_null() {
+            return;
+        }
         // SAFETY: the caller guarantees `ptr` is ours, so the header is intact.
         unsafe {
             let base = ptr.sub(HEADER_SIZE);
@@ -325,6 +330,11 @@ unsafe impl Allocator for BudgetedAllocator {
     /// # Safety
     /// `ptr` must have come from this allocator.
     unsafe fn realloc(&mut self, ptr: *mut u8, new_size: usize) -> *mut u8 {
+        // QuickJS never passes a null `ptr` here. A null `ptr` has no header,
+        // so the call fails with no charge and no refusal flag.
+        if ptr.is_null() {
+            return std::ptr::null_mut();
+        }
         let Some(new_size) = round_size(new_size) else {
             note_exhausted();
             return std::ptr::null_mut();

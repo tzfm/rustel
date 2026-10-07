@@ -114,10 +114,10 @@ unsafe fn portable_multiply_accumulate(
 mod tests {
     use super::*;
 
-    fn value(index: usize, salt: usize) -> Complex<f32> {
+    fn value(index: usize, series: usize) -> Complex<f32> {
         Complex {
-            re: ((index * 17 + salt * 11) as f32 * 0.03125).sin(),
-            im: ((index * 13 + salt * 7) as f32 * 0.0625).cos(),
+            re: ((index * 17 + series * 11) as f32 * 0.03125).sin(),
+            im: ((index * 13 + series * 7) as f32 * 0.0625).cos(),
         }
     }
 

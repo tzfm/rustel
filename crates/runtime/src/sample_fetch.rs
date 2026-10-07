@@ -1292,7 +1292,7 @@ mod tests {
             "GET https://user:pass@images.example/a.png?token=secret#private: failed";
         let safe = safe_hydra_request_error(library_error);
         assert_eq!(safe, "Hydra image request failed");
-        for secret in [
+        for url_part in [
             "user",
             "pass",
             "token",
@@ -1300,7 +1300,7 @@ mod tests {
             "private",
             "images.example",
         ] {
-            assert!(!safe.contains(secret), "leaked {secret}: {safe}");
+            assert!(!safe.contains(url_part), "leaked {url_part}: {safe}");
         }
     }
 
