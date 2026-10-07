@@ -27,11 +27,13 @@ jobs:
             os_name: darwin
             arch: amd64
             target: x86_64-apple-darwin
-          - runner: macos-latest
+          # macos-15 and windows-2022 are the images CI builds on. The
+          # `-latest` labels move to images no CI job has built on.
+          - runner: macos-15
             os_name: darwin
             arch: arm64
             target: aarch64-apple-darwin
-          - runner: windows-latest
+          - runner: windows-2022
             os_name: win32
             arch: amd64
             target: x86_64-pc-windows-msvc
@@ -44,6 +46,9 @@ jobs:
         shell: bash
         run: bash .github/scripts/check-panic-unwind.sh --target ${{ matrix.target }}
       - name: Build
+        env:
+          # `rustel doctor` and session tapes report this revision.
+          BUILD_REVISION: ${{ github.sha }}
         run: cargo build --locked --release -p rustel --target ${{ matrix.target }} --features device-audio,midi,serial,studio,gamepad
       # NOTICE.md cites the third-party notices in crates/*/LICENSE-*, so they
       # ship beside it at the same paths.
