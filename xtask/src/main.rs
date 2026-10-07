@@ -117,9 +117,11 @@ fn main_result() -> Result<()> {
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<String> {
+    // UTC keeps the local time zone out of the release commit and tag.
     let output = Command::new("git")
         .args(args)
         .current_dir(root)
+        .env("TZ", "UTC")
         .output()
         .map_err(|e| format!("cannot run git: {e}"))?;
     if !output.status.success() {
@@ -910,5 +912,15 @@ mod tests {
                 .unwrap()
                 .contains("prepare v0.1.1")
         );
+        let dates = git(
+            repo.root(),
+            &[
+                "for-each-ref",
+                "--format=%(taggerdate:iso) %(*committerdate:iso)",
+                "refs/tags/v0.1.1",
+            ],
+        )
+        .unwrap();
+        assert_eq!(dates.matches("+0000").count(), 2, "{dates}");
     }
 }
