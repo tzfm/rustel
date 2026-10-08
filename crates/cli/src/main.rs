@@ -3814,9 +3814,15 @@ impl Cli {
             None => {
                 !self.musician.ui_events && !self.musician.announce_score && !self.musician.follow
             }
-            Some(Command::Config { .. } | Command::Completions { .. } | Command::WatchCode) => {
-                false
-            }
+            // `samples` draws a progress bar or a prompt, and `serve-samples`
+            // writes only JSON. A late notice breaks each of them.
+            Some(
+                Command::Config { .. }
+                | Command::Completions { .. }
+                | Command::WatchCode
+                | Command::Samples { .. }
+                | Command::ServeSamples { .. },
+            ) => false,
             Some(Command::Replay {
                 follow,
                 score_events,
@@ -4243,6 +4249,9 @@ mod live_output_contract_tests {
                 "--score-events",
             ],
             vec!["watch-code"],
+            vec!["samples", "cache"],
+            vec!["samples", "clear"],
+            vec!["serve-samples"],
             vec!["completions", "bash"],
             vec!["config", "get", "check_updates"],
             vec!["config", "set", "check_updates", "false"],

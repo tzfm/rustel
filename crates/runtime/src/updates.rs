@@ -318,11 +318,16 @@ mod tests {
     fn cache_and_release_reads_are_bounded() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("update-check.json");
-        for bytes in [b"{".to_vec(), vec![b' '; MAX_CACHE_BYTES as usize + 1]] {
-            std::fs::write(&path, bytes).unwrap();
-            assert!(read_cache(&path).is_none());
-        }
-        let oversized = io::repeat(b' ').take(MAX_RELEASE_BYTES + 1);
-        assert!(release_version(oversized).is_none());
+        // Valid JSON with space padding, so only the size limit refuses it.
+        let mut cache = br#"{"checked_at":1}"#.to_vec();
+        std::fs::write(&path, &cache).unwrap();
+        assert!(read_cache(&path).is_some());
+        cache.resize(MAX_CACHE_BYTES as usize + 1, b' ');
+        std::fs::write(&path, &cache).unwrap();
+        assert!(read_cache(&path).is_none());
+
+        let release = br#"{"tag_name":"v1.2.3","draft":false,"prerelease":false}"#;
+        let padded = release.chain(io::repeat(b' ').take(MAX_RELEASE_BYTES));
+        assert!(release_version(padded).is_none());
     }
 }

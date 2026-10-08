@@ -69,6 +69,7 @@ impl Terminal {
         command.env_remove("RUSTEL_THEME");
         command.env_remove("RUSTEL_THEME_DIR");
         command.env("RUSTEL_CONFIG_DIR", cwd);
+        command.env("RUSTEL_NO_UPDATE_CHECK", "1");
         // Headless: this probe presses Alt+O, whose whole job is to ask the
         // desktop to open something. Without the pin the ask reaches the
         // machine running the test - real browser tabs on the developer's

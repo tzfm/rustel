@@ -38611,7 +38611,9 @@ pub fn run(options: StudioOptions) -> Result<(), RuntimeError> {
     if let Some(receiver) = update_check
         && let Ok(message) = receiver.try_recv()
     {
-        eprintln!("{message}");
+        // The terminal can be gone here. `eprintln!` panics on a failed write.
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "{message}");
     }
     result
 }
