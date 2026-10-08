@@ -244,6 +244,14 @@ pub fn is_stray_control(character: char) -> bool {
     character.is_control() && !matches!(character, '\n' | '\r' | '\t')
 }
 
+/// Whether a click keeps the anchor of the selection and moves its head.
+///
+/// Shift is the usual key. kitty keeps Shift+click for its own selection
+/// and never reports it, so Alt and Ctrl extend too.
+pub fn click_extends(modifiers: KeyModifiers) -> bool {
+    modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL)
+}
+
 fn plain_text_character(key: &KeyEvent) -> Option<char> {
     if key.kind != KeyEventKind::Press
         || !(key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)

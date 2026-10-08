@@ -13,7 +13,7 @@ use ratatui::widgets::Widget;
 use unicode_width::UnicodeWidthStr;
 
 use super::editor::KeyboardCapabilities;
-use super::keybinds::{BindAction, Keybinds};
+use super::keybinds::{BindAction, KeyCombo, Keybinds};
 use super::theme::Theme;
 
 /// What owns the keyboard underneath the help overlay.
@@ -80,6 +80,8 @@ impl HelpContext {
         }
     }
 
+    /// A summary names a panel chord as `{timeline}`, `{rename}` or
+    /// `{show}`. The sheet fills in the chord the table holds.
     fn summary(self) -> &'static str {
         match self {
             Self::Editor => "Type normally; this is a modeless source editor.",
@@ -87,7 +89,7 @@ impl HelpContext {
             Self::SceneLearn => "The current scene is waiting for a MIDI pad press.",
             Self::Slider => "The last pointer-touched slider owns the plain left/right arrows.",
             Self::Timeline => {
-                "Alt+T focuses the tape timeline; its arrows choose the block shown in the editor."
+                "{timeline} focuses the tape timeline; its arrows choose the block shown in the editor."
             }
             Self::ThemePicker => {
                 "Moving the selection previews each theme immediately; on the chance row \
@@ -114,7 +116,7 @@ impl HelpContext {
             Self::Devices => "Select audio input/output hardware or copy a MIDI port call.",
             Self::Set => {
                 "The set's folder: its scores, numbered when open on the strip, and under \
-                 the sessions fold the tapes recorded from it. Alt+R renames a tape; Alt+O reveals its file."
+                 the sessions fold the tapes recorded from it. {rename} renames a tape; {show} reveals its file."
             }
             Self::Viz => {
                 "Widgets that move with the music, in two docks - a column down a side or a \
@@ -559,6 +561,20 @@ fn shortcut_rows_with_keybinds(
             "copy / cut / paste",
         ),
         HelpRow::new("Shift+movement", "extend the text selection"),
+        HelpRow::new(
+            "Shift+Home/End",
+            // Ghostty on Linux scrolls its history with these two keys and
+            // sends neither of them to the studio.
+            if keybinds.delivers(&KeyCombo {
+                code: KeyCode::End,
+                control: false,
+                shift: true,
+            }) {
+                "select to the start / end of the line"
+            } else {
+                "not sent by this terminal - free them in its config"
+            },
+        ),
         HelpRow::new("Alt+Left/Right", "move by word"),
         HelpRow::new(
             hint(BindAction::Quit),
@@ -768,6 +784,9 @@ impl Widget for HelpView<'_> {
             format!(
                 "NOW  {}",
                 super::keybinds::shortcut_label(self.context.summary())
+                    .replace("{timeline}", &self.keybinds.hint(BindAction::FocusTimeline))
+                    .replace("{rename}", &self.keybinds.hint(BindAction::RenameFile))
+                    .replace("{show}", &self.keybinds.hint(BindAction::ShowFile))
             ),
             usize::from(inner.width),
             Style::default().fg(theme.ok).add_modifier(Modifier::BOLD),
@@ -1018,6 +1037,28 @@ mod tests {
                     .iter()
                     .all(|row| !row.action.contains("find in"))
             );
+        }
+    }
+
+    #[test]
+    fn shortcut_help_says_when_the_terminal_does_not_send_shift_home_and_end() {
+        use super::super::keybinds::Reach;
+        use super::super::terminal::conflicts::{ForceDesktopForTest, ForcePlatformForTest};
+
+        let _platform = ForcePlatformForTest::set("linux");
+        let _desktop = ForceDesktopForTest::set("");
+        for (terminal, sent) in [("kitty", true), ("Ghostty", false)] {
+            let mut keybinds = Keybinds::default();
+            keybinds.set_reach(Reach {
+                enhanced: true,
+                terminal: terminal.to_owned(),
+            });
+            let rows = shortcut_rows_with_keybinds(KeyboardCapabilities::enhanced(), &keybinds);
+            let row = rows
+                .iter()
+                .find(|row| row.keys.ends_with("Home/End"))
+                .expect("help has the row");
+            assert_eq!(row.action.starts_with("select"), sent, "{terminal}");
         }
     }
 

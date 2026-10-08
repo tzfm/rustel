@@ -393,7 +393,6 @@ impl App {
         // tab clicked, never a key pressed - must still find its
         // rows, or the page reads fine and clicks like a wall.
         if let Some(sheet) = self.settings_sheet.as_mut() {
-            // The learnable rows plus the fixed ones past them.
             sheet.keybind_count = super::super::settings::RESET_KEYBINDS_ROW + 1;
         }
         if let Some(row) = self
@@ -973,8 +972,14 @@ impl App {
                     }) => {
                         self.keybind_learn = None;
                         self.learn_keybind(action, Some(chord));
+                        // A panel action that loses a learnt chord goes
+                        // back to its Alt letter.
+                        let left = match self.keybinds.hint(held_by) {
+                            hint if hint.is_empty() => "was unbound".to_owned(),
+                            hint => format!("is back on {hint}"),
+                        };
                         self.status = format!(
-                            "{} is now {} - {} was unbound",
+                            "{} is now {} - {} {left}",
                             action.label(),
                             chord.hint(),
                             held_by.label()
@@ -1148,51 +1153,6 @@ impl App {
                     }
                 }),
         )
-        // Past the learnable table, the panel chords the table cannot
-        // hold: `KeyCombo` has no alt modifier, so these are listed as
-        // fixed information - visible, and out of every learn's reach.
-        .chain([
-            super::super::settings::KeybindRow {
-                action: "Show selected file",
-                chord: super::super::keybinds::shortcut_label("Alt+O").into_owned(),
-                also: String::new(),
-                learnt: false,
-                learning: false,
-                confirm: false,
-            },
-            super::super::settings::KeybindRow {
-                action: "Rename sample / bank / session",
-                chord: super::super::keybinds::shortcut_label("Alt+R").into_owned(),
-                also: String::new(),
-                learnt: false,
-                learning: false,
-                confirm: false,
-            },
-            super::super::settings::KeybindRow {
-                action: "Delete local sample",
-                chord: super::super::keybinds::shortcut_label("Alt+D").into_owned(),
-                also: String::new(),
-                learnt: false,
-                learning: false,
-                confirm: false,
-            },
-            super::super::settings::KeybindRow {
-                action: "Trim sample silence",
-                chord: super::super::keybinds::shortcut_label("Alt+T").into_owned(),
-                also: String::new(),
-                learnt: false,
-                learning: false,
-                confirm: false,
-            },
-            super::super::settings::KeybindRow {
-                action: "Focus tape timeline",
-                chord: super::super::keybinds::shortcut_label("Alt+T").into_owned(),
-                also: String::new(),
-                learnt: false,
-                learning: false,
-                confirm: false,
-            },
-        ])
         .chain(std::iter::once(super::super::settings::KeybindRow {
             action: "Reset all shortcuts",
             chord: "Enter".into(),

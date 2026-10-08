@@ -110,21 +110,21 @@ pub enum BindAction {
     MasterDown,
     OpenSet,
     Quit,
+    // Panels. Each one acts only where its panel has the keyboard, and
+    // ships on an Alt letter: see `panel_letter`.
+    /// Show a sample, score or tape file in the file manager.
+    ShowFile,
+    /// Rename a sample or a tape, or alias a bank.
+    RenameFile,
+    DeleteSample,
+    /// Trim the silence around a take.
+    TrimSample,
+    FocusTimeline,
 }
 
 impl BindAction {
-    /// Rows the Keybinds page lists past the learnable table: the panels'
-    /// own Alt chords. They are shown so they can be found; `KeyCombo` has
-    /// no alt modifier (alt is how a Mac types, so the table never claims
-    /// it), which means a learn cannot hold one - the page lists them as
-    /// fixed information a rebind can neither take nor move. One row each
-    /// for Alt+O (show a sample, score or tape file), Alt+R (alias a bank),
-    /// Alt+D (delete a local sample), and Alt+T (trim a take's silence),
-    /// plus Alt+T in a tape (focus its timeline).
-    pub const CONTEXTUAL_ROWS: usize = 5;
-
     /// Every action, in the order the Keybinds page lists them.
-    pub const ALL: [BindAction; 49] = [
+    pub const ALL: [BindAction; 54] = [
         // Transport
         Self::Evaluate,
         Self::Stop,
@@ -179,6 +179,12 @@ impl BindAction {
         Self::MasterDown,
         Self::OpenSet,
         Self::Quit,
+        // Panels
+        Self::ShowFile,
+        Self::RenameFile,
+        Self::DeleteSample,
+        Self::TrimSample,
+        Self::FocusTimeline,
     ];
 
     /// The name the preferences file keeps, and what a row is found by.
@@ -234,6 +240,11 @@ impl BindAction {
             Self::MasterDown => "master-down",
             Self::OpenSet => "open-set",
             Self::Quit => "quit",
+            Self::ShowFile => "show-file",
+            Self::RenameFile => "rename-file",
+            Self::DeleteSample => "delete-sample",
+            Self::TrimSample => "trim-sample",
+            Self::FocusTimeline => "focus-timeline",
         }
     }
 
@@ -296,6 +307,11 @@ impl BindAction {
             Self::MasterDown => "master volume down",
             Self::OpenSet => "open another set",
             Self::Quit => "quit",
+            Self::ShowFile => "show selected file",
+            Self::RenameFile => "rename sample / bank / session",
+            Self::DeleteSample => "delete local sample",
+            Self::TrimSample => "trim sample silence",
+            Self::FocusTimeline => "focus tape timeline",
         }
     }
 
@@ -397,6 +413,29 @@ impl BindAction {
             Self::MasterDown => ctrl_shift(KeyCode::Down),
             Self::OpenSet => ctrl_shift(Char('o')),
             Self::Quit => ctrl(Char('q')),
+            // unused: a panel action ships on its Alt letter, outside the table
+            Self::ShowFile
+            | Self::RenameFile
+            | Self::DeleteSample
+            | Self::TrimSample
+            | Self::FocusTimeline => plain(F(12)),
+        }
+    }
+
+    /// The letter a panel reads with Alt for this action.
+    ///
+    /// The table holds no Alt chord, so a panel action ships with no chord
+    /// in the table. The panel answers to Alt and this letter until the
+    /// player learns a chord for the action. Trim and the timeline share
+    /// `t`: the first belongs to the samples browser and the second to a
+    /// tape, so the two never meet.
+    pub fn panel_letter(self) -> Option<char> {
+        match self {
+            Self::ShowFile => Some('o'),
+            Self::RenameFile => Some('r'),
+            Self::DeleteSample => Some('d'),
+            Self::TrimSample | Self::FocusTimeline => Some('t'),
+            _ => None,
         }
     }
 
@@ -1015,7 +1054,18 @@ pub enum KeybindCapture {
 /// every plain function key and Ctrl letter already means something a set
 /// is performed with; a player who wants one learns it in Settings ▸
 /// Keybinds.
-pub const SHIPS_UNBOUND: &[BindAction] = &[BindAction::Jobs, BindAction::Memory];
+///
+/// The panel actions ship with no chord in the table too. Each one answers
+/// to its [`BindAction::panel_letter`] with Alt until a chord is learnt.
+pub const SHIPS_UNBOUND: &[BindAction] = &[
+    BindAction::Jobs,
+    BindAction::Memory,
+    BindAction::ShowFile,
+    BindAction::RenameFile,
+    BindAction::DeleteSample,
+    BindAction::TrimSample,
+    BindAction::FocusTimeline,
+];
 
 /// The keybinding table: what every action answers to, once the learner
 /// has had its say. With no overrides it is the studio's own chords.
@@ -1286,11 +1336,16 @@ impl Keybinds {
     }
 
     /// The chord as every surface spells it: `^S`, `F4` - or nothing for
-    /// an unbound action, which every surface reads as no shortcut.
+    /// an unbound action, which every surface reads as no shortcut. A
+    /// panel action with no learnt chord is spelled as its Alt letter.
     pub fn hint(&self, action: BindAction) -> String {
-        self.binding(action)
-            .map(|combo| combo.hint())
-            .unwrap_or_default()
+        match (self.binding(action), action.panel_letter()) {
+            (Some(combo), _) => combo.hint(),
+            (None, Some(letter)) => {
+                shortcut_label(&format!("Alt+{}", letter.to_ascii_uppercase())).into_owned()
+            }
+            (None, None) => String::new(),
+        }
     }
 
     /// Whether the action has been told to mean nothing: no chord is
@@ -2408,6 +2463,34 @@ mod tests {
         let mut reread = Keybinds::default();
         reread.restore(&prefs);
         assert_eq!(reread.binding(BindAction::Memory), Some(chord));
+    }
+
+    #[test]
+    fn a_panel_action_ships_on_its_alt_letter_and_takes_a_learnt_chord() {
+        let mut binds = Keybinds::default();
+        assert_eq!(binds.binding(BindAction::TrimSample), None);
+        assert_eq!(binds.hint(BindAction::TrimSample), shortcut_label("Alt+T"));
+        assert!(binds.prefs().is_empty());
+
+        let chord = KeyCombo::parse("ctrl+shift+f8").expect("the chord parses");
+        binds.learn(BindAction::TrimSample, Some(chord));
+        assert_eq!(binds.hint(BindAction::TrimSample), chord.hint());
+        assert_eq!(
+            binds.override_action_for(&combo_event(chord)),
+            Some(BindAction::TrimSample)
+        );
+        // The tape timeline keeps the letter the two actions share.
+        assert_eq!(
+            binds.hint(BindAction::FocusTimeline),
+            shortcut_label("Alt+T")
+        );
+        let mut reread = Keybinds::default();
+        reread.restore(&binds.prefs());
+        assert_eq!(reread.binding(BindAction::TrimSample), Some(chord));
+
+        binds.learn(BindAction::TrimSample, None);
+        assert_eq!(binds.hint(BindAction::TrimSample), shortcut_label("Alt+T"));
+        assert!(binds.prefs().is_empty());
     }
 
     /// Delete on the row of an action shipped with no key puts back its
