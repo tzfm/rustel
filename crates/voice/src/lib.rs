@@ -2128,14 +2128,13 @@ pub fn resolve_voice_with_samples_detailed(
                 .map(|s| checked_f32(s, "stretch"))
                 .transpose()?;
             let fm = fm_controls(object)?;
-            // Envelope defaults are per SOURCE KIND: synth oscillators use
-            // [0.001, 0.05, 0.6, 0.01]; samples and wavetables use
-            // [0.001, 0.001, 1, 0.01]. Using the oscillator defaults for a
-            // wavetable would incorrectly reduce its sustain to 0.6.
+            // Oscillator defaults are [0.001, 0.05, 0.6, 0.01].
+            // Bus receivers keep full sustain: [0.001, 0.05, 1, 0.01].
+            // Samples and wavetables use [0.001, 0.001, 1, 0.01].
             let envelope = if sample.is_some() || wavetable.is_some() {
                 sample_envelope(object)?
             } else {
-                oscillator_envelope(object)?
+                synth_envelope(object)?
             };
             // Resolved BEFORE the modulators: an `fmh` modulator rides an
             // operator frequency, which is a multiple of this.
@@ -3339,7 +3338,7 @@ fn oscillator_waveform(
     }
 }
 
-fn oscillator_envelope(
+fn synth_envelope(
     object: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<rustel_audio::Envelope, String> {
     let attack = optional_f64(object.get("attack"), "attack")?;
@@ -3348,7 +3347,12 @@ fn oscillator_envelope(
     let release = optional_f64(object.get("release"), "release")?;
     let (attack, decay, sustain, release) =
         if attack.is_none() && decay.is_none() && sustain.is_none() && release.is_none() {
-            (0.001, 0.05, 0.6, 0.01)
+            let sustain = if object.get("s").and_then(serde_json::Value::as_str) == Some("bus") {
+                1.0
+            } else {
+                0.6
+            };
+            (0.001, 0.05, sustain, 0.01)
         } else {
             let resolved_sustain = sustain.unwrap_or(
                 if (attack.is_some() && decay.is_none()) || (attack.is_none() && decay.is_none()) {
@@ -6300,5 +6304,86 @@ mod zzfx_resolve_tests {
             params.shape_curve, 0.0,
             "square forces curve 0 over the control"
         );
+    }
+}
+
+#[cfg(test)]
+mod envelope_resolve_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn adsr(envelope: rustel_audio::Envelope) -> [f32; 4] {
+        [
+            envelope.attack_secs,
+            envelope.decay_secs,
+            envelope.sustain,
+            envelope.release_secs,
+        ]
+    }
+
+    fn resolved_adsr(value: &serde_json::Value) -> [f32; 4] {
+        let event = resolve_voice(value, 1, 0.5, 0.0, 48_000, 0.5).expect("resolves");
+        adsr(event.controls.envelope)
+    }
+
+    #[test]
+    fn bus_defaults_keep_full_sustain() {
+        assert_eq!(
+            resolved_adsr(&json!({ "s": "bus", "n": 1 })),
+            [0.001, 0.05, 1.0, 0.01]
+        );
+    }
+
+    #[test]
+    fn explicit_bus_adsr_keeps_the_shared_control_rules() {
+        for (mut controls, expected) in [
+            (
+                json!({ "attack": 0.02, "decay": 0.3, "sustain": 0.4, "release": 0.5 }),
+                [0.02, 0.3, 0.4, 0.5],
+            ),
+            (json!({ "attack": 0.2 }), [0.2, 0.001, 1.0, 0.01]),
+            (json!({ "decay": 0.2 }), [0.001, 0.2, 0.001, 0.01]),
+            (json!({ "sustain": 0.7 }), [0.001, 0.001, 0.7, 0.01]),
+            (json!({ "release": 0.2 }), [0.001, 0.001, 1.0, 0.2]),
+            (
+                json!({ "attack": 0, "decay": 0, "sustain": 0, "release": 0 }),
+                [0.001, 0.001, 0.0, 0.01],
+            ),
+        ] {
+            controls["s"] = json!("bus");
+            assert_eq!(resolved_adsr(&controls), expected, "controls: {controls}");
+        }
+    }
+
+    #[test]
+    fn a_banked_sample_named_bus_keeps_sample_envelope_defaults() {
+        struct BankedBus;
+
+        impl SampleLookup for BankedBus {
+            fn resolve(&self, sound: &str, _index: f64, _midi: f64) -> SampleResolution {
+                assert_eq!(sound, "fixture_bus");
+                SampleResolution::Found {
+                    id: rustel_audio::SampleId(7),
+                    transpose: 0.0,
+                    duration_secs: 2.0,
+                    loop_secs: None,
+                    envelope_peak: 1.0,
+                    soundfont: false,
+                }
+            }
+        }
+
+        let event = resolve_voice_with_samples(
+            &json!({ "s": "bus", "bank": "fixture" }),
+            1,
+            0.5,
+            0.0,
+            48_000,
+            0.5,
+            &BankedBus,
+        )
+        .expect("banked sample resolves");
+        assert!(event.sample.is_some());
+        assert_eq!(adsr(event.controls.envelope), [0.001, 0.001, 1.0, 0.01]);
     }
 }
