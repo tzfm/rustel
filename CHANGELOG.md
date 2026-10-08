@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A key pressed at the same moment as a terminal resize reaches Studio at once. The key stayed unread until the next key, and Studio used one full CPU core while it waited.
 - Rustel announces new stable releases with a `rustelup` hint. Studio prints the notice after you quit. Disable checks with `rustel config set check_updates false`.
 - Theme effects keep `//`, `=>` and other punctuation ligatures whole. The waves themes split them while a wave passed.
 - Alt+click and Ctrl+click extend the selection, as Shift+click does. kitty keeps Shift+click and does not send it to Studio.
