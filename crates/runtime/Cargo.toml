@@ -89,6 +89,7 @@ serde = { version = "1", features = ["derive"] }
 # `preserve_order` keeps `serde_json::Map` in document order, which a note
 # bank's closest-key tie-break depends on (see `Bank::Notes`).
 serde_json = { version = "1", features = ["preserve_order"] }
+semver = "1"
 rustel-core = { path = "../core" }
 rustel-ext = { path = "../ext", optional = true }
 rustel-fraction = { path = "../fraction" }

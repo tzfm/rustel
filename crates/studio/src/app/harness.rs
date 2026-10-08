@@ -149,6 +149,7 @@ impl Studio {
             cancellation: None,
             recording: options.recording,
             build_features: &[],
+            check_updates: false,
             performance_events: false,
             #[cfg(feature = "remote-control")]
             remote_control: None,

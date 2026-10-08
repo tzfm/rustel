@@ -23,7 +23,9 @@ use std::process::{Child, Command, Output};
 mod function_score;
 
 fn rustel() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_rustel"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rustel"));
+    command.env("RUSTEL_NO_UPDATE_CHECK", "1");
+    command
 }
 
 /// Run with a hard wall-clock bound.
@@ -215,6 +217,55 @@ fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("rustel-cli-tests-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch dir");
     dir.join(name)
+}
+
+#[test]
+fn config_get_and_set_use_the_user_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config");
+    let invoke = |args: &[&str]| {
+        let child = rustel()
+            .args(args)
+            .env("RUSTEL_CONFIG_DIR", &config)
+            .current_dir(directory.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        wait_for_output(child, args)
+    };
+    let output = invoke(&["config", "get", "check_updates"]);
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"true\n");
+    assert!(output.stderr.is_empty());
+    assert!(!config.exists());
+
+    for value in ["false", "true"] {
+        let output = invoke(&["config", "set", "check_updates", value]);
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+        let output = invoke(&["config", "get", "check_updates"]);
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{value}\n")
+        );
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(config.join("rustel.json")).unwrap()).unwrap();
+        assert_eq!(settings["check_updates"], value == "true");
+    }
+    assert!(!directory.path().join(".rustel").exists());
+    let before = std::fs::read(config.join("rustel.json")).unwrap();
+    for args in [
+        vec!["config", "set", "check_updates", "yes"],
+        vec!["config", "set", "unknown", "false"],
+        vec!["config", "get", "check_updates", "--global"],
+    ] {
+        let output = invoke(&args);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert_eq!(std::fs::read(config.join("rustel.json")).unwrap(), before);
+    }
 }
 
 /// A scratch tape recording each `(at, status, source)` save in `mode`. A

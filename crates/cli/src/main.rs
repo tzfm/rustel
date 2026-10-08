@@ -133,6 +133,9 @@ struct Cli {
     /// Never prompt for input; cache deletion requires --force.
     #[arg(long, global = true)]
     no_input: bool,
+    /// Disable release checks and update notices for this run.
+    #[arg(long, global = true)]
+    no_update_check: bool,
     /// Disable ANSI styling and animated progress.
     #[arg(long, global = true)]
     plain: bool,
@@ -850,7 +853,35 @@ impl From<SessionModeArg> for rustel_runtime::session_log::SessionMode {
 }
 
 #[derive(Subcommand, Debug)]
+enum ConfigCommand {
+    /// Print the saved value, or its default when unset.
+    Get {
+        #[arg(value_enum)]
+        key: ConfigKey,
+    },
+    /// Save a value for every Rustel command, including Studio.
+    Set {
+        #[arg(value_enum)]
+        key: ConfigKey,
+        #[arg(action = clap::ArgAction::Set)]
+        value: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum ConfigKey {
+    /// Check for new stable releases during interactive use.
+    #[value(name = "check_updates")]
+    CheckUpdates,
+}
+
+#[derive(Subcommand, Debug)]
 enum Command {
+    /// Read or write user-wide settings in rustel.json.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Remove score-selected network responses from the bounded disk cache.
     /// Pinned and host-trusted sample files are kept.
     ClearScoreCache {
@@ -1889,9 +1920,20 @@ fn run() -> Result<(), RuntimeError> {
     rustel_runtime::set_progress_json(json);
     let verbosity = cli.verbose;
     let dispatch = cli.acceleration.dispatch();
+    let check_updates = cli.checks_for_updates(
+        std::io::stdin().is_terminal()
+            && std::io::stdout().is_terminal()
+            && std::io::stderr().is_terminal(),
+        std::env::var_os("CI").is_some_and(|value| !value.is_empty()),
+    );
     match cli.command {
-        Some(command) => run_command(command, verbosity, dispatch),
-        None => run_musician(cli.musician, verbosity, dispatch),
+        Some(command) => run_command(command, verbosity, dispatch, check_updates),
+        None => {
+            if check_updates {
+                rustel_runtime::updates::check_for_updates(|message| eprintln!("{message}"));
+            }
+            run_musician(cli.musician, verbosity, dispatch)
+        }
     }
 }
 
@@ -1929,8 +1971,28 @@ fn run_command(
     command: Command,
     verbosity: u8,
     dispatch: rustel_audio::DspDispatch,
+    check_updates: bool,
 ) -> Result<(), RuntimeError> {
+    if check_updates {
+        match &command {
+            #[cfg(feature = "studio")]
+            Command::Studio { .. } => {}
+            _ => rustel_runtime::updates::check_for_updates(|message| eprintln!("{message}")),
+        }
+    }
     match command {
+        Command::Config { command } => {
+            match command {
+                ConfigCommand::Get {
+                    key: ConfigKey::CheckUpdates,
+                } => println!("{}", rustel_runtime::settings::check_updates()?),
+                ConfigCommand::Set {
+                    key: ConfigKey::CheckUpdates,
+                    value,
+                } => rustel_runtime::settings::set_check_updates(value)?,
+            }
+            Ok(())
+        }
         #[cfg(feature = "studio")]
         Command::Studio {
             file,
@@ -2012,6 +2074,7 @@ fn run_command(
                 recording,
                 build_features: BUILD_FEATURES,
                 performance_events,
+                check_updates,
                 #[cfg(feature = "remote-control")]
                 remote_control,
                 #[cfg(feature = "remote-control")]
@@ -3736,6 +3799,47 @@ fn json_asked() -> bool {
 }
 
 impl Cli {
+    fn checks_for_updates(&self, terminal: bool, ci: bool) -> bool {
+        if !terminal
+            || ci
+            || self.no_update_check
+            || self.no_input
+            || self.quiet
+            || self.verbose >= LiveOutput::JSON_VERBOSITY
+            || self.wants_json()
+        {
+            return false;
+        }
+        match &self.command {
+            None => {
+                !self.musician.ui_events && !self.musician.announce_score && !self.musician.follow
+            }
+            // `samples` draws a progress bar or a prompt, and `serve-samples`
+            // writes only JSON. A late notice breaks each of them.
+            Some(
+                Command::Config { .. }
+                | Command::Completions { .. }
+                | Command::WatchCode
+                | Command::Samples { .. }
+                | Command::ServeSamples { .. },
+            ) => false,
+            Some(Command::Replay {
+                follow,
+                score_events,
+                ..
+            }) => !follow && !score_events,
+            Some(Command::Trace { score_events, .. }) => !score_events,
+            #[cfg(feature = "studio")]
+            Some(Command::Studio {
+                list_themes,
+                probe_terminal,
+                performance_events,
+                ..
+            }) => !list_themes && !probe_terminal && !performance_events,
+            _ => true,
+        }
+    }
+
     /// Whether this run speaks JSON: the chosen command's own `--json` - or
     /// the bare musician form's, which has no subcommand to ask - and the
     /// live playback/replay verbosity that means the JSON event stream.
@@ -3932,7 +4036,7 @@ mod dsp_selection_tests {
                 let dispatch = cli.acceleration.dispatch();
                 BUILT_DISPATCH.set(None);
                 match cli.command {
-                    Some(command) => run_command(command, cli.verbose, dispatch),
+                    Some(command) => run_command(command, cli.verbose, dispatch, false),
                     None => run_musician(cli.musician, cli.verbose, dispatch),
                 }
                 .expect("selected export");
@@ -4118,6 +4222,54 @@ mod live_polyphony_tests {
 mod live_output_contract_tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn update_checks_require_an_interactive_human_command() {
+        let human = Cli::try_parse_from(["rustel", "check", "-e", "silence"]).unwrap();
+        assert!(human.checks_for_updates(true, false));
+        assert!(!human.checks_for_updates(false, false));
+        assert!(!human.checks_for_updates(true, true));
+
+        for args in [
+            vec!["check", "-e", "silence", "--no-update-check"],
+            vec!["check", "-e", "silence", "--quiet"],
+            vec!["check", "-e", "silence", "--no-input"],
+            vec!["check", "-e", "silence", "--json"],
+            vec!["check", "-e", "silence", "-vvv"],
+            vec!["song.strudel", "--ui-events"],
+            vec!["song.strudel", "--score-events"],
+            vec!["song.strudel", "--follow"],
+            vec!["replay", "set.rustel-session", "--score-events"],
+            vec!["replay", "set.rustel-session", "--follow"],
+            vec![
+                "trace",
+                "song.strudel",
+                "--device-audio",
+                "--watch",
+                "--score-events",
+            ],
+            vec!["watch-code"],
+            vec!["samples", "cache"],
+            vec!["samples", "clear"],
+            vec!["serve-samples"],
+            vec!["completions", "bash"],
+            vec!["config", "get", "check_updates"],
+            vec!["config", "set", "check_updates", "false"],
+        ] {
+            let cli = Cli::try_parse_from(std::iter::once("rustel").chain(args.clone()))
+                .unwrap_or_else(|error| panic!("{args:?}: {error}"));
+            assert!(!cli.checks_for_updates(true, false), "{args:?}");
+        }
+        #[cfg(feature = "studio")]
+        {
+            let studio = Cli::try_parse_from(["rustel", "studio"]).unwrap();
+            assert!(studio.checks_for_updates(true, false));
+            for flag in ["--list-themes", "--probe-terminal", "--performance-events"] {
+                let cli = Cli::try_parse_from(["rustel", "studio", flag]).unwrap();
+                assert!(!cli.checks_for_updates(true, false), "{flag}");
+            }
+        }
+    }
 
     fn fixture() -> Vec<(LiveDetail, serde_json::Value)> {
         vec![
@@ -4974,6 +5126,7 @@ mod tests {
             .expect("command"),
             0,
             rustel_audio::DspDispatch::automatic(),
+            false,
         )
         .expect_err("the studio has no --prebake");
         let message = error.to_string();

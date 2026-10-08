@@ -38496,6 +38496,9 @@ pub struct StudioOptions {
     pub recording: Option<RecordingOptions>,
     /// The Cargo features the binary was built with, for the About page.
     pub build_features: &'static [&'static str],
+    /// Allow a background release check and print its notice after quitting.
+    /// Interactive CLI sessions enable this. Embedders skip it by default.
+    pub check_updates: bool,
     /// Emit bounded frame and input-to-paint measurements on stderr.
     #[doc(hidden)]
     pub performance_events: bool,
@@ -38541,6 +38544,7 @@ impl StudioOptions {
             cancellation: None,
             recording: None,
             build_features: &[],
+            check_updates: false,
             performance_events: false,
             #[cfg(feature = "remote-control")]
             remote_control: None,
@@ -38571,10 +38575,18 @@ pub fn run(options: StudioOptions) -> Result<(), RuntimeError> {
         }
     }
     crash::watch_for_panics();
-    loop {
-        match run_once(options.clone())? {
-            Session::Ended(result) => return result,
-            Session::Crashed { file } => {
+    let update_check = options.check_updates.then(|| {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        rustel_runtime::updates::check_for_updates(move |message| {
+            let _ = sender.send(message);
+        });
+        receiver
+    });
+    let result = loop {
+        match run_once(options.clone()) {
+            Err(error) => break Err(error),
+            Ok(Session::Ended(result)) => break result,
+            Ok(Session::Crashed { file }) => {
                 let log = rustel_runtime::session_log::default_session_dir()
                     .join(super::log::LOG_FILE_NAME);
                 let answer = crash::report_and_ask(
@@ -38589,13 +38601,21 @@ pub fn run(options: StudioOptions) -> Result<(), RuntimeError> {
                     &mut std::io::stdin().lock(),
                 );
                 if answer == crash::AfterCrash::Quit {
-                    return Err(RuntimeError::Message(
+                    break Err(RuntimeError::Message(
                         "the studio stopped on a fault of its own".into(),
                     ));
                 }
             }
         }
+    };
+    if let Some(receiver) = update_check
+        && let Ok(message) = receiver.try_recv()
+    {
+        // The terminal can be gone here. `eprintln!` panics on a failed write.
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "{message}");
     }
+    result
 }
 
 /// How one studio ended.

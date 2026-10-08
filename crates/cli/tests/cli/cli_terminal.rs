@@ -82,6 +82,65 @@ impl Terminal {
 }
 
 #[test]
+fn release_notices_use_stderr_and_respect_opt_outs() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("cache/update-check.json");
+    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let cached = serde_json::json!({"checked_at": now, "latest_version": "99.0.0"}).to_string();
+    std::fs::write(&cache, &cached).unwrap();
+
+    for mode in ["interactive", "flag", "environment", "setting", "pipe"] {
+        std::fs::write(
+            directory.path().join("rustel.json"),
+            serde_json::json!({"check_updates": mode != "setting"}).to_string(),
+        )
+        .unwrap();
+        let mut stdout = Terminal::new();
+        let mut stderr = Terminal::new();
+        let args = ["validate", "-e", "silence"];
+        let mut command = rustel();
+        command
+            .args(args)
+            .env("RUSTEL_CONFIG_DIR", directory.path())
+            .env(
+                "RUSTEL_NO_UPDATE_CHECK",
+                if mode == "environment" { "0" } else { "" },
+            )
+            .env_remove("CI")
+            .stdin(stderr.stream())
+            .stderr(stderr.stream())
+            .stdout(if mode == "pipe" {
+                Stdio::piped()
+            } else {
+                stdout.stream()
+            });
+        if mode == "flag" {
+            command.arg("--no-update-check");
+        }
+        let mut child = command.spawn().unwrap();
+        let errors = stderr.read_until(&mut child, |_, child| child.try_wait().unwrap().is_some());
+        let output = stdout.read_until(&mut child, |_, _| true);
+        let result = wait_for_output(child, &args);
+        assert!(result.status.success(), "{mode}: {errors}");
+        assert_eq!(
+            errors.contains("99.0.0"),
+            mode == "interactive",
+            "{mode}: {errors}"
+        );
+        if mode == "interactive" {
+            assert!(errors.contains("rustelup"));
+        }
+        assert!(!output.contains("rustelup"));
+        assert!(!String::from_utf8_lossy(&result.stdout).contains("rustelup"));
+        assert_eq!(std::fs::read_to_string(&cache).unwrap(), cached);
+    }
+}
+
+#[test]
 fn terminal_cache_confirmation_accepts_only_yes_and_can_be_interrupted() {
     for command in [vec!["samples", "clear"], vec!["clear-score-cache"]] {
         for response in ["no", "yes", "interrupt"] {
