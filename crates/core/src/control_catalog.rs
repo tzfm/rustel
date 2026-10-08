@@ -3339,7 +3339,7 @@ pub static CONTROLS: &[ControlRow] = &[
             name: "tremolophase",
             synonyms: &["tremphase"],
             summary: "Phase offset of an enabled tremolo, in turns.",
-            description: "Defaults to 0; 1 is a full turn. The LFO follows the audio clock with this added phase. Requires tremolo or tremolosync; phase alone creates no tremolo.",
+            description: "Defaults to 0. A value of 1 is a full turn. The LFO follows the musical time of the event (its cycle divided by cycles per second) with this added phase. Requires tremolo or tremolosync. Phase alone creates no tremolo.",
             params: &[
                 ReferenceParam {
                     name: "offset",

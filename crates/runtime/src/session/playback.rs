@@ -492,6 +492,14 @@ impl Session {
     /// `setMaxPolyphony` module setting, the final accepted value applies to
     /// the entire bounce. The flat event stream does not yet carry a voice
     /// budget automation timeline.
+    ///
+    /// The bounce also resolves the tempo once. The cps in force after the
+    /// last save resolves each onset of the bounce. In a tape with a tempo
+    /// change, an onset before the last change takes its tempo-synced
+    /// controls from the final cps. Its tremolo, the LFO of each filter and
+    /// each `lfo()` modulator with no `retrig` start at the phase the final
+    /// cps gives. The clock time and the gate length of each onset keep the
+    /// cps of their own window.
     pub fn render_session(
         &mut self,
         saves: &[(f64, impl AsRef<str>)],
@@ -914,7 +922,14 @@ impl Session {
             failed_save: None,
             duration_secs: match written_bytes {
                 Some(bytes) => {
-                    let frames = bytes / (usize::from(self.config.channels.max(1)) * 2);
+                    // Only the float WAV stores 4-byte samples. The mp3 stage
+                    // is a 16-bit WAV.
+                    let sample_bytes = if format == RenderFormat::ScalarF32Wav {
+                        4
+                    } else {
+                        2
+                    };
+                    let frames = bytes / (usize::from(self.config.channels.max(1)) * sample_bytes);
                     frames as f64 / f64::from(self.config.sample_rate)
                 }
                 None => duration_secs,

@@ -1326,10 +1326,9 @@ fn apply_fx_stage(
             let raw = lfo_waveshape(tr.shape, phase, tr.skew) * tr.depth;
             let next = phase + f64::from(tr.frequency_hz) / f64::from(sample_rate);
             state.tremolo_phase = Some(if next > 1.0 { next - 1.0 } else { next });
-            let shaped = raw.powf(1.5).clamp(0.0, 1.0);
-            // A NaN gain falls back to the gain node's default, 1.0. Mirrors
-            // the main chain's tremolo.
-            if shaped.is_nan() { 1.0 } else { base + shaped }
+            let gain = base + raw.powf(1.5).clamp(0.0, 1.0);
+            // A NaN sum gives the gain its default.
+            if gain.is_nan() { 1.0 } else { gain }
         } else {
             base
         };
@@ -2501,14 +2500,112 @@ impl ModAdds {
 /// `min = dcoffset·depth`, `max = dcoffset·depth + depth` then arrive
 /// inverted. This form returns `max` in that case.
 ///
-/// A NaN input - reachable only through `pow(negative, fractional)`, i.e.
-/// modulating an LFO's `curve` while its `dcoffset` lets `modval` go
-/// negative - degrades to the bound rather than propagating: keeping the
-/// voice alive outranks fidelity, and there is no defined behaviour to
-/// match there.
+/// A NaN input gives a bound and does not propagate. The `lfo()` site tests
+/// its sample for NaN before this clamp. See [`nan_param_default`].
 #[inline]
 fn js_clamp(value: f32, min: f32, max: f32) -> f32 {
     value.max(min).min(max)
+}
+
+/// The default value of the AudioParam a modulator target names.
+///
+/// An `lfo()` sample is NaN when a fractional `curve` meets a negative value.
+/// The sum on the target param is then NaN. WebAudio replaces a NaN param
+/// value with the param default. `source` selects the param where the source
+/// nodes differ.
+///
+/// The caller adds `default - base` in place of the NaN sample. The param
+/// lands on the default when no other signal feeds the param. A second
+/// modulator still adds. So do FM on a synth, vibrato and a pitch envelope on
+/// a sample, and the LFO or envelope of a source param. An orbit param gets
+/// one such sum from each voice. The five vowel filters share one base, so
+/// the first one alone lands on 350 Hz.
+///
+/// The function returns NaN for a filter frequency and for the tremolo gain.
+/// The sum stays NaN, and the reader of the sum takes the default alone.
+#[cold]
+fn nan_param_default(target: crate::backend::ModTarget, source: &VoiceSource) -> f32 {
+    use crate::backend::{EnvelopeParam, ModTarget, ModulatorParam};
+    // The wavetable and the supersaw worklets have different spread defaults.
+    let (freqspread, panspread) = if matches!(source, VoiceSource::Supersaw { .. }) {
+        (0.2, 0.4)
+    } else {
+        (0.18, 0.7)
+    };
+    match target {
+        // The filter stage takes 350 Hz, or the 500 Hz of the ladder worklet.
+        // The tremolo takes 1.
+        ModTarget::LowpassFreq
+        | ModTarget::HighpassFreq
+        | ModTarget::BandFreq
+        | ModTarget::TremoloDepth => f32::NAN,
+        // BiquadFilterNode `frequency`.
+        ModTarget::VowelFreq | ModTarget::PhaserCenter => 350.0,
+        // A sample has no `frequency` param. Its pitch modulator rides
+        // `detune`.
+        ModTarget::Frequency if matches!(source, VoiceSource::Sample { .. }) => 0.0,
+        // The `frequency` of an OscillatorNode and of each synth worklet.
+        ModTarget::Frequency | ModTarget::FmFreq(_) | ModTarget::VibratoRate => 440.0,
+        // BiquadFilterNode `Q`.
+        ModTarget::LowpassQ | ModTarget::HighpassQ | ModTarget::BandQ | ModTarget::PhaserDepth => {
+            1.0
+        }
+        // GainNode `gain`.
+        ModTarget::Gain
+        | ModTarget::Postgain
+        | ModTarget::Dry
+        | ModTarget::DelaySend
+        | ModTarget::RoomSend
+        | ModTarget::DelayFeedback
+        | ModTarget::VibratoDepth
+        | ModTarget::FmIndex(_) => 1.0,
+        // StereoPannerNode `pan` and DelayNode `delayTime`.
+        ModTarget::Pan | ModTarget::DelayTime => 0.0,
+        ModTarget::CompressorThreshold => -24.0,
+        ModTarget::CompressorRatio => 12.0,
+        ModTarget::CompressorKnee => 30.0,
+        ModTarget::CompressorAttack => 0.003,
+        ModTarget::CompressorRelease => 0.25,
+        // The effect and source worklets.
+        ModTarget::Coarse | ModTarget::ShapeVol | ModTarget::DistortVol | ModTarget::PulseWidth => {
+            1.0
+        }
+        ModTarget::Crush
+        | ModTarget::Shape
+        | ModTarget::Distort
+        | ModTarget::WavetablePosition
+        | ModTarget::WavetableWarp => 0.0,
+        ModTarget::Djf => 0.5,
+        ModTarget::SourceFreqspread => freqspread,
+        ModTarget::SourcePanspread => panspread,
+        // The LFO worklet: `frequency` and `skew` 0.5, `depth` and `curve` 1,
+        // `dcoffset` and `shape` 0.
+        ModTarget::PhaserRate
+        | ModTarget::TremoloRate
+        | ModTarget::TremoloSkew
+        | ModTarget::PulseWidthLfoRate
+        | ModTarget::WtLfoRate
+        | ModTarget::WtLfoSkew
+        | ModTarget::WarpLfoRate
+        | ModTarget::WarpLfoSkew
+        | ModTarget::FilterLfoSkew(_)
+        | ModTarget::LfoParam(_, ModulatorParam::Rate | ModulatorParam::Skew) => 0.5,
+        ModTarget::PhaserSweep
+        | ModTarget::PulseWidthLfoDepth
+        | ModTarget::WtLfoDepth
+        | ModTarget::WarpLfoDepth
+        | ModTarget::FilterLfoDepth(_)
+        | ModTarget::LfoParam(_, ModulatorParam::Depth | ModulatorParam::Curve) => 1.0,
+        ModTarget::TremoloShape
+        | ModTarget::FilterLfoDc(_)
+        | ModTarget::LfoParam(_, ModulatorParam::Dcoffset) => 0.0,
+        // The envelope worklet.
+        ModTarget::EnvParam(_, EnvelopeParam::Depth) => 1.0,
+        ModTarget::EnvParam(_, EnvelopeParam::Attack) => 0.005,
+        ModTarget::EnvParam(_, EnvelopeParam::Decay) => 0.14,
+        ModTarget::EnvParam(_, EnvelopeParam::Sustain) => 0.0,
+        ModTarget::EnvParam(_, EnvelopeParam::Release) => 0.1,
+    }
 }
 
 /// One-time LFO phase seeding: `frac(time · frequency + phaseoffset)`.
@@ -2547,8 +2644,13 @@ fn lfo_phase0(time_secs: f32, frequency_hz: f32, phase_offset: f32) -> f64 {
 /// `1 - skew`. `Infinity - Infinity` is NaN, and 14 of them reached the output
 /// of `s("sawtooth").tremolo(4).tremolodepth(0.8)`.
 fn lfo_waveshape(shape: u8, phase: f64, skew: f32) -> f32 {
+    lfo_waveshape_f64(shape, phase, skew) as f32
+}
+
+/// [`lfo_waveshape`] before the cast to f32.
+fn lfo_waveshape_f64(shape: u8, phase: f64, skew: f32) -> f64 {
     let skew = f64::from(skew);
-    let value = match shape {
+    match shape {
         // tri
         0 => {
             let x = 1.0 - skew;
@@ -2583,8 +2685,7 @@ fn lfo_waveshape(shape: u8, phase: f64, skew: f32) -> f32 {
             }
         }
         _ => 0.0,
-    };
-    value as f32
+    }
 }
 
 /// Envelope curve warp: curvature −1..1 bends the segment phase.
@@ -3031,7 +3132,8 @@ impl PreparedSupersaw {
         if addition.to_bits() == 0 {
             self.pan_gains
         } else {
-            supersaw_pan_gains(self.panspread + addition)
+            // Outside -1..1 a gain is the square root of a negative value.
+            supersaw_pan_gains((self.panspread + addition).clamp(-1.0, 1.0))
         }
     }
 }
@@ -6488,9 +6590,9 @@ impl AudioBackend for ScalarBackend {
                     // is based on the sample slice's potentially longer duration.
                     let filter_lfo_alive =
                         lfo_quantum_alive(quantum_start, sr, v.controls.filter_lfo_end_secs);
-                    // LFOs, pulse and wavetable oscillators share the
-                    // f32-rounded begin gate. The transient shaper uses the
-                    // fractional-frame comparison above instead.
+                    // LFOs and the pulse, wavetable and supersaw oscillators
+                    // share the f32-rounded begin gate. The transient shaper
+                    // uses the fractional-frame comparison above instead.
                     let source_open =
                         lfo_quantum_open(quantum_start, sr, v.controls.worklet_begin_secs);
                     let lfo_live = source_open
@@ -6573,15 +6675,25 @@ impl AudioBackend for ScalarBackend {
                                     curve += hold.curve;
                                     rate += hold.rate;
                                 }
-                                let raw =
-                                    (lfo_waveshape(lfo.shape, *phase, skew) + dcoffset) * depth;
+                                let wave = lfo_waveshape_f64(lfo.shape, *phase, skew);
+                                let raw = (wave as f32 + dcoffset) * depth;
                                 let shaped = raw.powf(curve);
-                                mod_adds.bucket_at(
-                                    lfo.fxi,
-                                    lfo.target,
-                                    js_clamp(shaped, lfo.min, lfo.max),
-                                    lfo.param_base,
-                                );
+                                // The reference computes the sample in f64.
+                                // A small negative value rounds to zero in
+                                // f32 and hides the NaN.
+                                let nan = shaped.is_nan()
+                                    || (raw == 0.0 && {
+                                        let exact = (wave + f64::from(dcoffset)) * f64::from(depth);
+                                        exact < 0.0 && exact.powf(f64::from(curve)).is_nan()
+                                    });
+                                // A NaN sample makes the summed param NaN.
+                                // The param then takes its default value.
+                                let value = if nan {
+                                    nan_param_default(lfo.target, &v.source) - lfo.param_base
+                                } else {
+                                    js_clamp(shaped, lfo.min, lfo.max)
+                                };
+                                mod_adds.bucket_at(lfo.fxi, lfo.target, value, lfo.param_base);
                                 *phase += f64::from(rate) / sr;
                                 if *phase > 1.0 {
                                     *phase -= 1.0;
@@ -6870,10 +6982,9 @@ impl AudioBackend for ScalarBackend {
                                 let shaped = raw.powf(1.5).clamp(0.0, 1.0);
                                 let next = phase + f64::from(freq) / sr;
                                 v.tremolo_phase = Some(if next > 1.0 { next - 1.0 } else { next });
-                                // `powf` returns NaN for a negative `raw`, and
-                                // `clamp` keeps NaN. A NaN gain falls back to
-                                // the gain node's default, 1.0.
-                                if shaped.is_nan() { 1.0 } else { base + shaped }
+                                // A NaN sum gives the gain its default.
+                                let gain = base + shaped;
+                                if gain.is_nan() { 1.0 } else { gain }
                             } else {
                                 base
                             }
@@ -6959,6 +7070,10 @@ impl AudioBackend for ScalarBackend {
                             };
                             (wave, wave)
                         }
+                        // The supersaw has the same begin gate as the pulse
+                        // oscillator: no output and no phase advance until
+                        // the gate opens.
+                        VoiceSource::Supersaw { .. } if !source_open => (0.0, 0.0),
                         VoiceSource::Supersaw { plan, phases } => {
                             // `detune` and `spread` are params the supersaw
                             // shares with the wavetable, so a modulator on
@@ -7734,7 +7849,9 @@ impl AudioBackend for ScalarBackend {
                         bus.write,
                         delay_frames + FEEDBACK_QUANTUM as f32,
                     );
-                    let feedback = bus.feedback + delay_feedback_mods[orbit];
+                    // Each voice adds its modulator sum. A feedback above 1
+                    // makes the delay line grow without limit.
+                    let feedback = (bus.feedback + delay_feedback_mods[orbit]).clamp(-1.0, 1.0);
                     bus.store(
                         orbit_inputs[orbit][0] + feedback * feedback_left,
                         orbit_inputs[orbit][1] + feedback * feedback_right,

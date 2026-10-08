@@ -133,7 +133,8 @@ pub struct OscillatorControls {
     pub noise: f32,
     pub waveform: Waveform,
     pub envelope: Envelope,
-    /// Begin time in seconds for LFO, pulse, wavetable and bytebeat gates.
+    /// Begin time in seconds for LFO, pulse, wavetable, supersaw and bytebeat
+    /// gates.
     ///
     /// These gates compare an f64 render-quantum time with a begin time
     /// rounded to f32, preserving the original AudioParam timing semantics.
@@ -351,7 +352,7 @@ pub struct TremoloControls {
     /// 0 tri, 1 sine, 2 ramp, 3 saw, 4 square.
     pub shape: u8,
     pub phase_offset: f32,
-    /// `cycle / cps` - the musical onset anchoring phase0.
+    /// `cycle / cps` - the musical time anchoring phase0.
     pub time_secs: f32,
 }
 
@@ -638,8 +639,8 @@ pub struct BusMod {
     pub dc: f32,
     pub min: f32,
     pub max: f32,
-    /// The target param's value at connect time. A modulated param that SCALES
-    /// its signal (gain) needs it as the divisor, exactly like `LfoMod`.
+    /// The target param's value at connect time, with 0 read as 1. This value
+    /// is the divisor when the modulated param scales the signal (gain).
     pub param_base: f32,
 }
 
@@ -666,8 +667,9 @@ pub struct LfoMod {
     pub shape: u8,
     pub min: f32,
     pub max: f32,
-    /// The target param's value at connect time - the divisor when the
-    /// modulated param scales the signal (gain).
+    /// The target param's value at connect time, zero included. This value is
+    /// the divisor when the modulated param scales the signal (gain). A NaN
+    /// sample subtracts this value from the param default.
     pub param_base: f32,
     /// Set when this LFO is the one a filter built for itself rather than one
     /// the pattern asked for with `lfo()`. `lpdepth` and its relatives aim at

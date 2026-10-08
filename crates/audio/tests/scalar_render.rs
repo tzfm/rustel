@@ -938,6 +938,58 @@ fn supersaw_source_modulation_keeps_using_dynamic_lane_values() {
 }
 
 #[test]
+fn a_supersaw_spread_modulator_above_one_stays_finite() {
+    let mut event = OnsetEvent::new(0, 110.0, 0.8, 0.4);
+    event.synth = Some(rustel_audio::SynthSource::Supersaw {
+        voices: 8.0,
+        freqspread: 0.35,
+        panspread: 0.7,
+    });
+    // The LFO holds 2, so the spread param sums to 2.7.
+    event.controls.lfos[0] = Some(held_lfo(
+        rustel_audio::ModTarget::SourcePanspread,
+        0.7,
+        1.0,
+        2.0,
+        1.0,
+    ));
+    let pcm = render_pcm(&mut ScalarBackend::new(), 48_000, 4_096, &[event]).expect("render");
+    assert!(
+        pcm.iter().all(|sample| sample.is_finite()),
+        "a NaN reached the output"
+    );
+}
+
+#[test]
+fn supersaw_waits_for_the_begin_gate_and_holds_its_phases() {
+    let render = |begin_secs: f32| {
+        let mut c = controls(Waveform::Sawtooth, None);
+        c.worklet_begin_secs = begin_secs;
+        let event = OnsetEvent::new(1_000, 110.0, 0.8, 0.5)
+            .with_controls(c)
+            .with_optional_synth(Some(rustel_audio::SynthSource::Supersaw {
+                voices: 5.0,
+                freqspread: 0.6,
+                panspread: 0.6,
+            }));
+        render_pcm(&mut ScalarBackend::new(), 48_000, 4_096, &[event]).expect("render")
+    };
+    // A begin at frame 1000 opens the gate on quantum 1024.
+    let gated = render((1_000.0 / 48_000.0_f64) as f32);
+    assert!(
+        gated[..1_024 * 2].iter().all(|s| *s == 0.0),
+        "supersaw sounded before its begin gate opened"
+    );
+    // A begin of zero opens the gate on the onset frame. After the attack
+    // and decay, the gated voice plays the same samples 24 frames later.
+    let open = render(0.0);
+    assert!(
+        gated[1_224 * 2..] == open[1_200 * 2..(4_096 - 24) * 2],
+        "supersaw phases advanced while the gate was closed"
+    );
+}
+
+#[test]
 fn sbd_replays_the_cached_noise_attack_for_each_hit() {
     let sr = 48_000;
     // Far enough apart that the first 510 ms voice has ended.
@@ -1401,6 +1453,154 @@ fn lfo_modulator_sweeps_the_filter_after_the_first_quantum() {
         .map(|(a, b)| f64::from(a - b).abs())
         .sum();
     assert!(diff > 1.0, "LFO produced no modulation, |diff| = {diff}");
+}
+
+/// A stopped ramp at phase 0. Its sample is `(dcoffset * depth).powf(curve)`.
+fn held_lfo(
+    target: rustel_audio::ModTarget,
+    param_base: f32,
+    dcoffset: f32,
+    depth: f32,
+    curve: f32,
+) -> rustel_audio::LfoMod {
+    rustel_audio::LfoMod {
+        fxi: None,
+        target,
+        frequency_hz: 0.0,
+        phase0: 0.0,
+        depth,
+        dcoffset,
+        skew: 0.5,
+        curve,
+        shape: 2,
+        min: -1e9,
+        max: 1e9,
+        param_base,
+        filter: None,
+        id: None,
+    }
+}
+
+/// A negative value under a fractional curve is NaN.
+fn nan_lfo(target: rustel_audio::ModTarget, param_base: f32) -> rustel_audio::LfoMod {
+    held_lfo(target, param_base, -0.5, 1.0, 0.5)
+}
+
+#[test]
+fn a_nan_lfo_sample_gives_the_target_its_audio_param_default() {
+    use rustel_audio::{FilterStages, ModTarget};
+    let render = |stages, lfos: [Option<rustel_audio::LfoMod>; 2]| {
+        let mut c = controls(Waveform::Sawtooth, None);
+        c.filters = FilterControls {
+            lowpass: Some(rustel_audio::StaticBiquad {
+                frequency_hz: 800.0,
+                q: 1.0,
+            }),
+            stages,
+            ..FilterControls::default()
+        };
+        c.lfos[..2].copy_from_slice(&lfos);
+        let event = OnsetEvent::new(0, 110.0, 0.5, 0.5).with_controls(c);
+        render_pcm(&mut ScalarBackend::new(), 48_000, 24_000, &[event]).expect("render")
+    };
+    for (target, stages, base, default) in [
+        (ModTarget::LowpassFreq, FilterStages::One, 800.0, 350.0),
+        (ModTarget::LowpassFreq, FilterStages::Ladder, 800.0, 500.0),
+        (ModTarget::Gain, FilterStages::One, 0.5, 1.0),
+    ] {
+        let nan = render(stages, [Some(nan_lfo(target, base)), None]);
+        // This LFO holds `default - base` without a NaN.
+        let held = held_lfo(target, base, 1.0, default - base, 1.0);
+        assert!(
+            nan.iter().all(|sample| sample.is_finite()),
+            "{target:?} let a NaN reach the output"
+        );
+        assert!(
+            nan == render(stages, [Some(held), None]),
+            "{target:?} with {stages:?} did not take its default"
+        );
+    }
+    // The NaN sum hides a second modulator on the filter frequency.
+    let target = ModTarget::LowpassFreq;
+    let nan = nan_lfo(target, 800.0);
+    let second = held_lfo(target, 800.0, 1.0, 200.0, 1.0);
+    let held = held_lfo(target, 800.0, 1.0, 350.0 - 800.0, 1.0);
+    assert!(
+        render(FilterStages::One, [Some(nan), Some(second)])
+            == render(FilterStages::One, [Some(held), None]),
+        "the second modulator moved the default"
+    );
+}
+
+#[test]
+fn a_nan_lfo_sample_is_found_in_f64() {
+    use rustel_audio::{LfoMod, ModTarget};
+    let render = |lfo| {
+        let mut c = controls(Waveform::Sawtooth, None);
+        c.lfos[0] = Some(lfo);
+        let event = OnsetEvent::new(0, 110.0, 0.5, 0.5).with_controls(c);
+        render_pcm(&mut ScalarBackend::new(), 48_000, 4_096, &[event]).expect("render")
+    };
+    // 3000 steps of 4 Hz give a triangle value slightly under 0.5 in f64.
+    // The f32 value is 0.5.
+    let nan = render(LfoMod {
+        frequency_hz: 4.0,
+        shape: 0,
+        ..nan_lfo(ModTarget::Gain, 0.5)
+    });
+    let held = render(held_lfo(ModTarget::Gain, 0.5, 1.0, 1.0 - 0.5, 1.0));
+    // The LFO starts on quantum 128.
+    let sample = (128 + 3_000) * 2;
+    assert!(held[sample] != 0.0);
+    assert_eq!(nan[sample], held[sample]);
+}
+
+#[test]
+fn nan_feedback_modulators_on_one_orbit_keep_the_delay_bounded() {
+    use rustel_audio::{DelayControls, ModTarget};
+    let mut c = controls(Waveform::Sawtooth, None);
+    c.delay = Some(DelayControls {
+        wet: 1.0,
+        time_secs: 0.01,
+        feedback: 0.5,
+    });
+    c.lfos[0] = Some(nan_lfo(ModTarget::DelayFeedback, 0.5));
+    // Each voice adds `1 - 0.5` to the feedback of the shared delay.
+    let events = [110.0, 165.0, 220.0].map(|hz| OnsetEvent::new(0, hz, 0.5, 0.5).with_controls(c));
+    let pcm = render_pcm(&mut ScalarBackend::new(), 48_000, 48_000, &events).expect("render");
+    let peak = pcm.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+    assert!(peak < 100.0, "the orbit feedback went above 1, peak {peak}");
+}
+
+#[test]
+fn a_nan_tremolodepth_modulator_gives_the_gain_its_default() {
+    use rustel_audio::{ModTarget, TremoloControls};
+    let render = |tremolo: bool| {
+        let mut c = controls(Waveform::Sawtooth, None);
+        if tremolo {
+            c.tremolo = Some(TremoloControls {
+                frequency_hz: 4.0,
+                depth: 0.5,
+                skew: 1.0,
+                shape: 0,
+                phase_offset: 0.0,
+                time_secs: 0.0,
+            });
+            c.lfos[0] = Some(nan_lfo(ModTarget::TremoloDepth, 0.5));
+        }
+        let event = OnsetEvent::new(0, 110.0, 0.8, 0.5).with_controls(c);
+        render_pcm(&mut ScalarBackend::new(), 48_000, 24_000, &[event]).expect("render")
+    };
+    let pcm = render(true);
+    assert!(
+        pcm.iter().all(|sample| sample.is_finite()),
+        "a NaN reached the output"
+    );
+    // The LFO starts on quantum 128.
+    assert!(
+        pcm[128 * 2..] == render(false)[128 * 2..],
+        "the gain did not take its default"
+    );
 }
 
 #[test]

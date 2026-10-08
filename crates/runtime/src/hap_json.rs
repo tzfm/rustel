@@ -105,6 +105,8 @@ pub struct OnsetEventJson {
     pub live_controls: [u64; 2],
     pub onset_id: u64,
     pub generation: u64,
+    /// The begin of the onset's whole as `n/d`. The audio path reads the
+    /// cycle of the onset from this text.
     pub whole_begin: String,
     /// Gate length derived from the exact whole span and the active CPS.
     pub duration_secs: f64,

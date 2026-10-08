@@ -44,7 +44,7 @@ fn both(
 ) -> (Resolved, Resolved) {
     (
         resolve_hap_value(value, 3, 0.25, 1.5, 48_000, 0.5, samples),
-        resolve_voice_with_samples_detailed(&json, 3, 0.25, 1.5, 48_000, 0.5, samples),
+        resolve_voice_with_samples_detailed(&json, 3, 0.25, 1.5, 0.75, 48_000, 0.5, samples),
     )
 }
 

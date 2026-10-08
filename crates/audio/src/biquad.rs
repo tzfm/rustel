@@ -128,9 +128,11 @@ struct Ladder {
 impl Ladder {
     #[inline]
     fn process(&mut self, x: f32, cutoff_hz: f32, q: f32, drive: f64, sample_rate: u32) -> f32 {
-        let cutoff =
-            (f64::from(cutoff_hz) * std::f64::consts::TAU / f64::from(sample_rate)).min(1.0);
-        let k = (f64::from(q) * 0.13).min(8.0);
+        // A negative cutoff makes the four stages diverge.
+        let cutoff_hz = f64::from(cutoff_hz.max(0.0));
+        let cutoff = (cutoff_hz * std::f64::consts::TAU / f64::from(sample_rate)).min(1.0);
+        // Below -7.69 the feedback gain passes 1 and the four stages diverge.
+        let k = (f64::from(q.max(-7.0)) * 0.13).min(8.0);
         let makeup = (1.0 / drive) * (1.0 + k).min(1.75);
         let out = self.p[3] * 0.360891
             + self.history[0] * 0.41729
@@ -274,7 +276,9 @@ impl FilterStage {
                         Some(envelope) => Self::frequency_at(envelope, t, gate_secs),
                         None => self.base_hz,
                     };
-                    base + add_hz
+                    // A NaN sum gives the worklet param its default.
+                    let sum = base + add_hz;
+                    if sum.is_nan() { 500.0 } else { sum }
                 } else {
                     self.base_hz
                 };
@@ -290,7 +294,9 @@ impl FilterStage {
                 Some(envelope) => Self::frequency_at(envelope, t, gate_secs),
                 None => self.base_hz,
             };
-            self.controls.frequency_hz = base + add_hz;
+            // A NaN sum gives the BiquadFilterNode param its default.
+            let sum = base + add_hz;
+            self.controls.frequency_hz = if sum.is_nan() { 350.0 } else { sum };
             self.controls.q = self.base_q + add_q;
             self.first
                 .configure(self.kind, self.controls, self.sample_rate);
@@ -467,6 +473,31 @@ mod tests {
             worst < 1e-4,
             "a filter whose modulation stopped never came back to its base: worst {worst}"
         );
+    }
+
+    #[test]
+    fn a_ladder_with_a_negative_cutoff_or_resonance_stays_finite() {
+        for (add_hz, add_q) in [(-5_000.0, 0.0), (0.0, -5_000.0)] {
+            let mut ladder = FilterStage::new(
+                Kind::Lowpass,
+                StaticBiquad {
+                    frequency_hz: 800.0,
+                    q: 1.0,
+                },
+                None,
+                FilterStages::Ladder,
+                0.0,
+                48_000,
+            );
+            for n in 0..48_000 {
+                let input = ((n as f32 * 55.0 / 48_000.0).fract() * 2.0 - 1.0) * 0.5;
+                let output = ladder.process(input, 0.0, 1.0, add_hz, add_q);
+                assert!(
+                    output.is_finite(),
+                    "add_hz {add_hz}, add_q {add_q}: sample {n} is {output}"
+                );
+            }
+        }
     }
 
     #[test]
