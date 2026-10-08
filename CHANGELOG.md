@@ -17,6 +17,7 @@
 - `rustel render --format scalar-f32` reports the real length. `--duration 8` printed `16.0 s, 8 cycles`.
 - CI runs the tests of the hand-written `unsafe` code under [Miri](https://github.com/rust-lang/miri) on each pull request. Miri stops on a memory error or a data race in the audio rings, the AVX2 kernels, the callback host pointers and the QuickJS allocator.
 - The QuickJS allocator reports 0 usable bytes for a null pointer. The size read had no null check.
+- Rustel plays through and records from devices with a 24-bit sample format. The output stayed silent with `sample format i24 is not supported`.
 
 ## v0.1.0
 
