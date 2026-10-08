@@ -23,8 +23,40 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  # A pull request with only Markdown changes needs no build and no test. Four
+  # Markdown files are test inputs, so a change to one of them is code. A push
+  # to main always counts as code.
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - id: diff
+        name: Look for a change outside the prose
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          code=true
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            tested='^(SECURITY\.md|docs/(cli|hardware|studio)\.md)$'
+            changed=$(git diff --name-only "$BASE_SHA"...HEAD)
+            printf '%s\n' "$changed"
+            if ! grep -qvE '\.md$' <<< "$changed" && ! grep -qE "$tested" <<< "$changed"; then
+              code=false
+            fi
+          fi
+          echo "code=$code" | tee -a "$GITHUB_OUTPUT"
+
   check:
     name: Check (${{ matrix.name }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -245,6 +277,8 @@ jobs:
   # undefined behavior. The script holds the pinned nightly and the test list.
   miri:
     name: Miri (Linux x64)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     concurrency:
       group: ${{ github.workflow }}-miri-${{ github.ref }}
@@ -265,6 +299,8 @@ jobs:
 
   build-release-platforms:
     name: Build (${{ matrix.name }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -313,3 +349,22 @@ jobs:
 
       - name: Check binary version
         run: target/${{ matrix.target }}/debug/rustel --version
+
+
+  # The one required check of the main ruleset. A skipped matrix job reports
+  # no check with its own name, so the ruleset does not name those jobs.
+  # Miri is not in this list. A Miri failure does not block a merge.
+  result:
+    name: CI result
+    needs: [changes, check, build-release-platforms]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail when a required job failed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "$RESULTS"
+          case " $RESULTS " in
+            *" failure "* | *" cancelled "*) exit 1 ;;
+          esac

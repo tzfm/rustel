@@ -248,6 +248,8 @@ source-location span count, duration and frame count exactly.
 
 The workflows use GitHub-hosted Linux, macOS and Windows runners. `.github/workflows/ci.yml` runs ordinary checks on every pull request and push to `main`. It checks formatting, Clippy, supported feature sets and the serial workspace tests, and runs the tests of the hand-written `unsafe` code under Miri. `.github/workflows/heavy.yml` runs the release-mode corpus in portable and automatic acceleration modes and the Studio end-to-end suite. Heavy CI runs on pushes to `main`, twice weekly for cache warming, and when a maintainer dispatches it for an exact pull request commit.
 
+A pull request with only Markdown changes skips the build and test jobs. Four Markdown files are test inputs, so a change to `SECURITY.md`, `docs/cli.md`, `docs/hardware.md` or `docs/studio.md` runs the full checks. The `main` ruleset requires one check, `CI result`. This job passes when the build and test jobs pass or are skipped.
+
 The CI workflows declare read-only repository tokens. Checkouts do not persist credentials, and the jobs do not receive repository secrets. No CI workflow uses a self-hosted runner.
 
 Heavy CI calls `.github/workflows/heavy-checks.yml` from the same trusted revision for both targets. PR jobs have enforced `cache-mode: read` and restore caches without saving. Main jobs have `cache-mode: write` and can refresh caches. [Cache permissions](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#controlling-cache-access-with-cache-mode) are separate from the repository token: checking out a PR during a dispatch from `main` does not give that job a PR-scoped cache. The read-only mode keeps PR code from writing caches later consumed by main jobs.
