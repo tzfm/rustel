@@ -769,20 +769,24 @@ fn release_notice_appears_once_after_leaving_the_studio() {
         status.success(),
         "a keyboard quit is a clean exit: {status:?}"
     );
-    let restored = output
-        .rfind("\x1b[?1049l")
-        .expect("the terminal left the alternate screen");
-    assert!(
-        !contains_plain(&output[..restored], "99.0.0"),
-        "the release appeared before terminal restoration:\n{}",
-        printable(&output)
-    );
-    assert!(contains_plain(&output[restored..], notice));
-    assert_eq!(
-        output.matches("99.0.0").count(),
-        1,
-        "{}",
-        printable(&output)
-    );
+    // ConPTY writes the screen again in its own bytes. The raw sequence and
+    // the single copy of the notice hold only on a Unix pty.
+    if !cfg!(windows) {
+        let restored = output
+            .rfind("\x1b[?1049l")
+            .expect("the terminal left the alternate screen");
+        assert!(
+            !contains_plain(&output[..restored], "99.0.0"),
+            "the release appeared before terminal restoration:\n{}",
+            printable(&output)
+        );
+        assert!(contains_plain(&output[restored..], notice));
+        assert_eq!(
+            output.matches("99.0.0").count(),
+            1,
+            "{}",
+            printable(&output)
+        );
+    }
     assert_eq!(std::fs::read_to_string(cache).unwrap(), cached);
 }
