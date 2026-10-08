@@ -48,7 +48,7 @@ mod classification_tests {
         value: &Value,
         lookup: &dyn SampleLookup,
     ) -> Result<rustel_audio::OnsetEvent, VoiceError> {
-        resolve_voice_with_samples_detailed(value, 9, 0.25, 0.125, 48_000, 0.5, lookup)
+        resolve_voice_with_samples_detailed(value, 9, 0.25, 0.125, 0.0625, 48_000, 0.5, lookup)
     }
 
     fn refusal(value: &Value, lookup: &dyn SampleLookup) -> VoiceError {
@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn a_diode_modulator_rides_the_distortion_amount() {
         let mods = |json: &str| {
-            modulator_controls(&object(json), 1.0, 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
+            modulator_controls(&object(json), 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
         };
         let lfo = |extra: &str| {
             format!(r#"{{{extra}"lfo": {{"a": {{"control": "diode", "rate": 2}}}}}}"#)
@@ -903,7 +903,7 @@ mod tests {
     #[test]
     fn the_distortion_worklet_params_are_modulatable_when_their_node_exists() {
         let mods = |json: &str| {
-            modulator_controls(&object(json), 1.0, 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
+            modulator_controls(&object(json), 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
         };
         let lfo = |control: &str, extra: &str| {
             format!(r#"{{{extra}"lfo": {{"a": {{"control": "{control}", "rate": 2}}}}}}"#)
@@ -935,7 +935,7 @@ mod tests {
     #[test]
     fn a_pitch_modulator_rides_detune_on_a_sample_and_frequency_on_a_synth() {
         let mods = |json: &str| {
-            modulator_controls(&object(json), 1.0, 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
+            modulator_controls(&object(json), 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
         };
         let lfo = |sound: &str, control: &str| {
             format!(r#"{{"s": "{sound}", "lfo": {{"a": {{"control": "{control}", "rate": 2}}}}}}"#)
@@ -952,10 +952,10 @@ mod tests {
 
             let (lfos, _, _) = mods(&lfo("bd", control));
             let slot = lfos[0].expect("a sample resolves the pitch target too");
-            // detune reads 0, and a param that reads 0 counts as 1. A
-            // relative depth of 2 is then two cents, not two notes.
+            // detune reads 0, and a relative depth counts a param at 0 as 1.
+            // A relative depth of 2 is then two cents, not two notes.
             assert_eq!(
-                slot.param_base, 1.0,
+                slot.param_base, 0.0,
                 "{control} on a sample rides detune, which reads 0"
             );
             // 1 is under the 30 the frequency clamp needs, so no clamp is
@@ -971,7 +971,7 @@ mod tests {
     #[test]
     fn a_bus_modulator_takes_no_frequency_range_where_an_lfo_does() {
         let mods = |json: &str| {
-            modulator_controls(&object(json), 1.0, 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
+            modulator_controls(&object(json), 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
         };
 
         let (_, _, buses) =
@@ -994,7 +994,7 @@ mod tests {
     #[test]
     fn the_vowel_formants_share_a_modulator_based_on_the_first_filter() {
         let mods = |json: &str| {
-            modulator_controls(&object(json), 1.0, 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
+            modulator_controls(&object(json), 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
         };
         let lfo = |extra: &str| {
             format!(r#"{{{extra}"lfo": {{"a": {{"control": "vowel", "rate": 2}}}}}}"#)
@@ -1022,7 +1022,7 @@ mod tests {
         let mods = |control: &str, extra: &str| {
             let json =
                 format!(r#"{{{extra}"lfo": {{"a": {{"control": "{control}", "rate": 2}}}}}}"#);
-            modulator_controls(&object(&json), 1.0, 1.0, 0.1, 2.0, 0.5, 220.0)
+            modulator_controls(&object(&json), 1.0, 0.1, 2.0, 0.5, 220.0)
                 .expect("no refusal")
                 .0[0]
         };
@@ -1063,9 +1063,10 @@ mod tests {
     }
 
     /// A modulator on the tremolo's depth, skew or shape rides the value the
-    /// node holds: the carrier gain's floor `max(1 − depth, 0)` (0 counting as
-    /// 1), the skew after its shape-dependent default, and the shape's index; with
-    /// no tremolo in the chain there is nothing to modulate.
+    /// node holds: the carrier gain's floor `max(1 − depth, 0)`, the skew after
+    /// its shape-dependent default, and the shape's index. The modulator's
+    /// relative depth counts a param at 0 as 1. With no tremolo in the chain
+    /// there is nothing to modulate.
     #[test]
     fn tremolo_modulators_ride_the_param_values_not_the_controls() {
         use rustel_audio::ModTarget::{TremoloDepth, TremoloShape, TremoloSkew};
@@ -1073,14 +1074,14 @@ mod tests {
             let json = format!(
                 r#"{{{extra}"lfo": {{"a": {{"control": "{control}", "rate": 2, "depth": 0.5}}}}}}"#
             );
-            let (lfos, _, _) = modulator_controls(&object(&json), 1.0, 1.0, 0.1, 0.0, 0.5, 220.0)
-                .expect("no refusal");
+            let (lfos, _, _) =
+                modulator_controls(&object(&json), 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal");
             lfos[0]
         };
 
         let tremolo = r#""tremolo": 4, "#;
         for (extra, control, target, base) in [
-            (tremolo, "tremolodepth", TremoloDepth, 1.0),
+            (tremolo, "tremolodepth", TremoloDepth, 0.0),
             (
                 r#""tremolo": 4, "tremolodepth": 0.25, "#,
                 "tremolodepth",
@@ -1121,8 +1122,9 @@ mod tests {
                 "{control} for {extra} rode {} instead of {base}",
                 slot.param_base
             );
+            let current = if base == 0.0 { 1.0 } else { base };
             assert!(
-                (f64::from(slot.depth) - 0.5 * base).abs() < 1e-6,
+                (f64::from(slot.depth) - 0.5 * current).abs() < 1e-6,
                 "{control} for {extra}: a relative depth of 0.5 spans half the base"
             );
         }
@@ -1142,7 +1144,7 @@ mod tests {
     #[test]
     fn the_orbit_delay_time_is_modulatable_under_both_control_names() {
         let mods = |json: &str| {
-            modulator_controls(&object(json), 1.0, 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
+            modulator_controls(&object(json), 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
         };
         let lfo = |control: &str, extra: &str| {
             format!(r#"{{{extra}"lfo": {{"a": {{"control": "{control}", "rate": 2}}}}}}"#)
@@ -1179,7 +1181,7 @@ mod tests {
     #[test]
     fn the_orbit_delay_feedback_gain_is_modulatable_when_built() {
         let mods = |json: &str| {
-            modulator_controls(&object(json), 1.0, 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
+            modulator_controls(&object(json), 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
         };
         let lfo = |extra: &str| {
             format!(r#"{{{extra}"lfo": {{"a": {{"control": "delayfeedback", "rate": 2}}}}}}"#)
@@ -1212,8 +1214,8 @@ mod tests {
         let lfo = |extra: &str, control: &str| {
             let json =
                 format!(r#"{{{extra}"lfo": {{"a": {{"control": "{control}", "rate": 2}}}}}}"#);
-            let (lfos, _, _) = modulator_controls(&object(&json), 1.0, 1.0, 0.1, 0.0, 0.5, 220.0)
-                .expect("no refusal");
+            let (lfos, _, _) =
+                modulator_controls(&object(&json), 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal");
             lfos[0]
         };
 
@@ -1269,7 +1271,7 @@ mod tests {
     #[test]
     fn the_fm_operator_params_are_modulatable_where_their_operator_exists() {
         let mods = |json: &str| {
-            modulator_controls(&object(json), 1.0, 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
+            modulator_controls(&object(json), 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
         };
         let lfo = |control: &str, extra: &str| {
             format!(r#"{{{extra}"lfo": {{"a": {{"control": "{control}", "rate": 2}}}}}}"#)
@@ -1314,7 +1316,7 @@ mod tests {
     #[test]
     fn a_filters_own_lfo_params_are_modulatable_and_the_broken_ones_are_not() {
         let mods = |json: &str| {
-            modulator_controls(&object(json), 1.0, 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
+            modulator_controls(&object(json), 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
         };
         let lfo = |control: &str, extra: &str| {
             format!(r#"{{{extra}"lfo": {{"a": {{"control": "{control}", "rate": 2}}}}}}"#)
@@ -1363,7 +1365,7 @@ mod tests {
     fn filter_lfo_shape_names_select_the_documented_waveforms() {
         let shape = |gate: &str, control: &str, value: &str| {
             let json = format!(r#"{{"{gate}": 800, "{control}": "{value}"}}"#);
-            let (lfos, _, _) = modulator_controls(&object(&json), 1.0, 1.0, 0.1, 0.0, 0.5, 220.0)
+            let (lfos, _, _) = modulator_controls(&object(&json), 1.0, 0.1, 0.0, 0.5, 220.0)
                 .expect("documented filter LFO shape");
             lfos[0].expect("the filter shape builds its LFO")
         };
@@ -1384,7 +1386,6 @@ mod tests {
         let error = modulator_controls(
             &object(r#"{"cutoff": 800, "lpshape": "hexagon"}"#),
             1.0,
-            1.0,
             0.1,
             0.0,
             0.5,
@@ -1404,7 +1405,7 @@ mod tests {
     #[test]
     fn a_modulator_can_aim_at_another_modulator_except_where_strudel_cannot() {
         let mods = |json: &str| {
-            modulator_controls(&object(json), 1.0, 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
+            modulator_controls(&object(json), 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
         };
         // `cut` sweeps the cutoff; `a` rides one of `cut`'s own params.
         let aimed = |sub: &str| {
@@ -1474,7 +1475,7 @@ mod tests {
     #[test]
     fn a_stage_carries_the_whole_effects_chain() {
         let stages =
-            |json: &str| fx_stages(&object(json), 0.0, 0.5, &BundledOnly).expect("resolve");
+            |json: &str| fx_stages(&object(json), 0.0, 0.0, 0.5, &BundledOnly).expect("resolve");
         let stage = stages(
             r#"{"s": "sine", "FX": [{
             "vowel": "a", "tremolo": 4, "compressor": -20,
@@ -1503,6 +1504,7 @@ mod tests {
         let stage = fx_stages(
             &object(r#"{"s": "sine", "FX": [{"orbit": 2, "duckorbit": 1}]}"#),
             0.0,
+            0.0,
             0.5,
             &BundledOnly,
         )
@@ -1518,6 +1520,7 @@ mod tests {
         let at_cps = |cps: f64| {
             fx_stages(
                 &object(r#"{"s": "sine", "FX": [{"tremolosync": 2}]}"#),
+                0.0,
                 0.0,
                 cps,
                 &BundledOnly,
@@ -1538,7 +1541,7 @@ mod tests {
     #[test]
     fn fx_stages_resolve_in_order_and_carry_the_default_gain() {
         let stages =
-            |json: &str| fx_stages(&object(json), 0.0, 0.5, &BundledOnly).expect("resolve");
+            |json: &str| fx_stages(&object(json), 0.0, 0.0, 0.5, &BundledOnly).expect("resolve");
 
         let none = stages(r#"{"s": "sine"}"#);
         assert!(none.iter().all(Option::is_none), "no FX means no stages");
@@ -1576,7 +1579,7 @@ mod tests {
     #[test]
     fn an_fxi_selects_the_chain_a_modulator_aims_at() {
         let mods = |json: &str| {
-            modulator_controls(&object(json), 1.0, 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
+            modulator_controls(&object(json), 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
         };
         let with_fxi = |fxi: &str| {
             format!(
@@ -1601,6 +1604,23 @@ mod tests {
         );
     }
 
+    /// The gain node of each chain holds `gain × velocity`.
+    #[test]
+    fn a_gain_modulator_rides_gain_times_velocity_of_its_chain() {
+        let base = |json: &str| {
+            modulator_controls(&object(json), 1.0, 0.1, 0.0, 0.5, 220.0)
+                .expect("no refusal")
+                .0[0]
+                .expect("a gain modulator")
+                .param_base
+        };
+        let lfo = |fxi: &str| format!(r#""lfo": {{"a": {{"control": "gain", "fxi": {fxi}}}}}"#);
+        let main = format!(r#"{{"gain": 0.6, "velocity": 0.5, {}}}"#, lfo("null"));
+        assert_eq!(base(&main), 0.3);
+        let stage = format!(r#"{{"FX": [{{"gain": 0.5}}], {}}}"#, lfo("0"));
+        assert_eq!(base(&stage), 0.5);
+    }
+
     /// Each filter carries its own LFO on its frequency, built from the
     /// lp/hp/bp controls rather than from `lfo()`. It exists when any of rate,
     /// sync, depth, depthfrequency, shape or skew is set, and only when the
@@ -1608,7 +1628,7 @@ mod tests {
     #[test]
     fn each_filter_builds_its_own_frequency_lfo() {
         let mods = |json: &str| {
-            modulator_controls(&object(json), 1.0, 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
+            modulator_controls(&object(json), 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
         };
 
         // depth is relative to the cutoff: 0.8 of 500 Hz.
@@ -2004,10 +2024,11 @@ pub fn resolve_voice_with_samples(
     cps: f64,
     samples: &dyn SampleLookup,
 ) -> Result<rustel_audio::OnsetEvent, String> {
-    resolve_voice_with_samples_detailed(
+    resolve_voice_at(
         value,
         onset_id,
         duration_secs,
+        target_time,
         target_time,
         sample_rate,
         cps,
@@ -2020,8 +2041,9 @@ pub fn resolve_voice_with_samples(
 ///
 /// The mapping, failure order and result are those of
 /// [`resolve_voice_with_samples_detailed`] given the value's
-/// `JSON.stringify` form. A value with no JSON form, such as `undefined`, is
-/// refused like any other value that is not an object.
+/// `JSON.stringify` form, with `target_time` as the musical time. A value
+/// with no JSON form, such as `undefined`, is refused like any other value
+/// that is not an object.
 pub fn resolve_hap_value(
     value: &rustel_core::Value,
     onset_id: u64,
@@ -2036,10 +2058,11 @@ pub fn resolve_hap_value(
     };
     let json = serde_json::from_str(&json)
         .map_err(|error| format!("the hap value's JSON form does not parse: {error}"))?;
-    resolve_voice_with_samples_detailed(
+    resolve_voice_at(
         &json,
         onset_id,
         duration_secs,
+        target_time,
         target_time,
         sample_rate,
         cps,
@@ -2059,11 +2082,48 @@ fn not_an_object(shown: &str) -> VoiceError {
 
 /// Resolve an onset with the same mapping and failure order as
 /// [`resolve_voice_with_samples`], retaining the failure category for the host.
+///
+/// `target_time` is the clock time of the onset, in seconds. `cycle` is the
+/// begin of the onset's whole, in cycles. The musical time of the onset is
+/// `cycle / cps`. The tremolo, the LFO of each filter and each `lfo()`
+/// modulator with no `retrig` take their start phase from the musical time.
+/// The start of the clock does not move their phase. Each other time comes
+/// from `target_time`.
+///
+/// An entry point with no `cycle` uses `target_time` as the musical time.
+/// The two times are equal when the clock reads 0 on cycle 0.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_voice_with_samples_detailed(
     value: &serde_json::Value,
     onset_id: u64,
     duration_secs: f64,
     target_time: f64,
+    cycle: f64,
+    sample_rate: u32,
+    cps: f64,
+    samples: &dyn SampleLookup,
+) -> Result<rustel_audio::OnsetEvent, VoiceError> {
+    resolve_voice_at(
+        value,
+        onset_id,
+        duration_secs,
+        target_time,
+        cycle / cps,
+        sample_rate,
+        cps,
+        samples,
+    )
+}
+
+/// [`resolve_voice_with_samples_detailed`] with the musical time, in seconds,
+/// in place of the cycle.
+#[allow(clippy::too_many_arguments)]
+fn resolve_voice_at(
+    value: &serde_json::Value,
+    onset_id: u64,
+    duration_secs: f64,
+    target_time: f64,
+    musical_time: f64,
     sample_rate: u32,
     cps: f64,
     samples: &dyn SampleLookup,
@@ -2198,10 +2258,9 @@ pub fn resolve_voice_with_samples_detailed(
             };
             let (lfos, envs, bus_mods) = modulator_controls(
                 object,
-                gain,
                 duration_secs,
                 envelope.release_secs,
-                target_time,
+                musical_time,
                 cps,
                 frequency,
             )?;
@@ -2291,9 +2350,9 @@ pub fn resolve_voice_with_samples_detailed(
                 phaser: phaser_controls(object, target_time)?,
                 // The shaper is built whenever `transient` is
                 // present, letting `transsustain` default to 0.
-                fx_stages: fx_stages(object, target_time, cps, samples)?,
+                fx_stages: fx_stages(object, target_time, musical_time, cps, samples)?,
                 transient: transient_controls(object)?,
-                tremolo: tremolo_controls(object, target_time, cps)?,
+                tremolo: tremolo_controls(object, musical_time, cps)?,
                 vowel: vowel_controls(object)?,
                 vibrato: match optional_f64(object.get("vib"), "vib")? {
                     Some(vib) if vib > 0.0 => Some(rustel_audio::VibratoControls {
@@ -3772,10 +3831,11 @@ type VoiceModulators = (
 /// notice; the voice still plays.
 fn modulator_controls(
     object: &serde_json::Map<String, serde_json::Value>,
-    gain: f64,
     duration_secs: f64,
     release_secs: f32,
-    target_time: f64,
+    // The musical time of the onset, in seconds. An LFO built here with no
+    // `retrig` starts at the phase of this time.
+    musical_time: f64,
     cps: f64,
     // The carrier's frequency - what an FM operator's own frequency is a
     // multiple of, and so the base an `fmh` modulator rides.
@@ -3853,7 +3913,20 @@ fn modulator_controls(
                     true,
                 ))
             }
-            "gain" => Some((rustel_audio::ModTarget::Gain, gain, false)),
+            // The gain node of each chain holds `gain × velocity`.
+            "gain" => {
+                let read = |key, default| {
+                    optional_f64(object.get(key), key)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(default)
+                };
+                Some((
+                    rustel_audio::ModTarget::Gain,
+                    read("gain", 0.8) * read("velocity", 1.0),
+                    false,
+                ))
+            }
             // The orbit's DJ filter, which exists only once a `djf` trigger
             // has made it - `orbitBus.getDjf` is create-on-first-use.
             "djf" => Some((
@@ -4313,7 +4386,7 @@ fn modulator_controls(
             // each base is the value `tremolo_controls` puts there, defaults
             // included; `tremolodepth` names the carrier gain's floor.
             "tremolodepth" => {
-                let tremolo = tremolo_controls(object, target_time, cps).ok().flatten()?;
+                let tremolo = tremolo_controls(object, musical_time, cps).ok().flatten()?;
                 Some((
                     rustel_audio::ModTarget::TremoloDepth,
                     f64::from(tremolo.gain_floor()),
@@ -4321,7 +4394,7 @@ fn modulator_controls(
                 ))
             }
             "tremoloskew" => {
-                let tremolo = tremolo_controls(object, target_time, cps).ok().flatten()?;
+                let tremolo = tremolo_controls(object, musical_time, cps).ok().flatten()?;
                 Some((
                     rustel_audio::ModTarget::TremoloSkew,
                     f64::from(tremolo.skew),
@@ -4329,7 +4402,7 @@ fn modulator_controls(
                 ))
             }
             "tremoloshape" => {
-                let tremolo = tremolo_controls(object, target_time, cps).ok().flatten()?;
+                let tremolo = tremolo_controls(object, musical_time, cps).ok().flatten()?;
                 Some((
                     rustel_audio::ModTarget::TremoloShape,
                     f64::from(tremolo.shape),
@@ -4371,7 +4444,8 @@ fn modulator_controls(
                 if object.get("s").and_then(serde_json::Value::as_str) != Some("pulse") {
                     return None;
                 }
-                let lfo = pulse_width_lfo_controls(object, target_time)
+                // This arm reads only the rate and the depth. The time has no effect.
+                let lfo = pulse_width_lfo_controls(object, musical_time)
                     .ok()
                     .flatten()?;
                 if control == "pwrate" {
@@ -4463,7 +4537,7 @@ fn modulator_controls(
         // relative to that: the absolute cutoff stays within 30..20000.
         let min = -frequency + 30.0;
         let max = 20_000.0 - frequency;
-        let phase0 = (target_time * frequency_hz).rem_euclid(1.0);
+        let phase0 = (musical_time * frequency_hz).rem_euclid(1.0);
         lfos[*slot] = Some(rustel_audio::LfoMod {
             fxi: None,
             target,
@@ -4657,7 +4731,7 @@ fn modulator_controls(
                         None => entry_f64(entry, "rate").unwrap_or(1.0),
                     };
                     let retrig = entry_f64(entry, "retrig").unwrap_or(0.0);
-                    let time = if retrig > 0.5 { 0.0 } else { target_time };
+                    let time = if retrig > 0.5 { 0.0 } else { musical_time };
                     let phaseoffset = entry_f64(entry, "phaseoffset").unwrap_or(0.0);
                     let phase0 = (time * frequency + phaseoffset).rem_euclid(1.0);
                     let shape = match entry.get("shape") {
@@ -4687,7 +4761,9 @@ fn modulator_controls(
                         shape,
                         min: checked_f32(min, "lfo min")?,
                         max: checked_f32(max, "lfo max")?,
-                        param_base: checked_f32(current, "lfo base")?,
+                        // The value the param holds, zero included. A NaN
+                        // sample restores the param default from this value.
+                        param_base: checked_f32(base, "lfo base")?,
                         // A pattern's own `lfo()`, not a filter's: `lpdepth` and
                         // its relatives must not reach this one even when it
                         // happens to modulate the same filter frequency.
@@ -5042,10 +5118,10 @@ fn phaser_controls(
 
 /// Tremolo frequency comes from `tremolosync·cps` when
 /// sync is set, else `tremolo`. Skew defaults to 1 (a ramp) unless a shape
-/// was given; phase0 anchors on the musical onset (`cycle/cps`).
+/// was given. The start phase comes from the musical time (`cycle / cps`).
 fn tremolo_controls(
     object: &serde_json::Map<String, serde_json::Value>,
-    target_time: f64,
+    musical_time: f64,
     cps: f64,
 ) -> Result<Option<rustel_audio::TremoloControls>, String> {
     let sync = optional_f64(object.get("tremolosync"), "tremolosync")?;
@@ -5086,7 +5162,7 @@ fn tremolo_controls(
         skew: checked_f32(skew, "tremoloskew")?,
         shape,
         phase_offset: checked_f32(phase_offset, "tremolophase")?,
-        time_secs: checked_f32(target_time, "tremolo time")?,
+        time_secs: checked_f32(musical_time, "tremolo time")?,
     }))
 }
 
@@ -5375,6 +5451,7 @@ fn diode_controls(value: serde_json::Value) -> Result<rustel_audio::DistortContr
 fn fx_stage_controls(
     object: &serde_json::Map<String, serde_json::Value>,
     target_time: f64,
+    musical_time: f64,
     cps: f64,
     samples: &dyn SampleLookup,
 ) -> Result<rustel_audio::FxStage, String> {
@@ -5397,7 +5474,7 @@ fn fx_stage_controls(
             .transpose()?,
         transient: transient_controls(object)?,
         vowel: vowel_controls(object)?,
-        tremolo: tremolo_controls(object, target_time, cps)?,
+        tremolo: tremolo_controls(object, musical_time, cps)?,
         compressor: compressor_controls(object)?,
         // StereoPanner axis, the same conversion the main chain makes.
         pan_x: optional_f64(object.get("pan"), "pan")?
@@ -5435,6 +5512,7 @@ fn fx_stage_controls(
 fn fx_stages(
     object: &serde_json::Map<String, serde_json::Value>,
     target_time: f64,
+    musical_time: f64,
     cps: f64,
     samples: &dyn SampleLookup,
 ) -> Result<[Option<rustel_audio::FxStage>; rustel_audio::MAX_FX_STAGES], String> {
@@ -5457,7 +5535,13 @@ fn fx_stages(
             ));
             continue;
         }
-        stages[index] = Some(fx_stage_controls(entry, target_time, cps, samples)?);
+        stages[index] = Some(fx_stage_controls(
+            entry,
+            target_time,
+            musical_time,
+            cps,
+            samples,
+        )?);
     }
     Ok(stages)
 }
@@ -6385,5 +6469,65 @@ mod envelope_resolve_tests {
         .expect("banked sample resolves");
         assert!(event.sample.is_some());
         assert_eq!(adsr(event.controls.envelope), [0.001, 0.001, 1.0, 0.01]);
+    }
+}
+
+#[cfg(test)]
+mod lfo_time_base_tests {
+    use super::*;
+
+    /// The clock reads 10.4 s on cycle 3/4. At 0.5 cps the musical time is
+    /// 1.5 s.
+    #[test]
+    fn tremolo_filter_lfo_and_lfo_modulator_start_on_the_musical_time_and_the_rest_on_the_clock() {
+        let value = serde_json::json!({
+            "s": "pulse", "note": 36, "pwrate": 2,
+            "cutoff": 800, "lprate": 3, "tremolo": 5, "phaserrate": 2,
+            "lfo": {
+                "free": { "control": "cutoff", "rate": 7 },
+                "held": { "control": "cutoff", "rate": 7, "retrig": 1 }
+            },
+            "FX": [{ "tremolo": 5, "phaserrate": 2 }]
+        });
+        let event = resolve_voice_with_samples_detailed(
+            &value,
+            1,
+            0.25,
+            10.4,
+            0.75,
+            48_000,
+            0.5,
+            &BundledOnly,
+        )
+        .expect("resolve");
+        let controls = &event.controls;
+        let stage = controls.fx_stages[0].expect("stage");
+        let phase0 = |pick: &dyn Fn(&rustel_audio::LfoMod) -> bool| {
+            let lfo = controls.lfos.iter().flatten().find(|lfo| pick(lfo));
+            lfo.expect("lfo").phase0
+        };
+
+        // frac(1.5 * 7) and frac(1.5 * 3) are 0.5. A `retrig` starts at 0.
+        assert_eq!(phase0(&|lfo| lfo.id == Some(0)), 0.5);
+        assert_eq!(phase0(&|lfo| lfo.id == Some(1)), 0.0);
+        assert_eq!(phase0(&|lfo| lfo.filter.is_some()), 0.5);
+        assert_eq!(controls.tremolo.expect("tremolo").time_secs, 1.5);
+        assert_eq!(stage.tremolo.expect("stage tremolo").time_secs, 1.5);
+
+        assert_eq!(controls.phaser.expect("phaser").time_secs, 10.4);
+        assert_eq!(stage.phaser.expect("stage phaser").time_secs, 10.4);
+        let Some(rustel_audio::SynthSource::Pulse {
+            width_lfo: Some(width_lfo),
+            ..
+        }) = event.synth
+        else {
+            panic!("no pulse-width LFO")
+        };
+        assert_eq!(width_lfo.time_secs, 10.4);
+        assert_eq!(controls.worklet_begin_secs, 10.4);
+
+        // An entry point with no cycle takes the musical time from the clock.
+        let clocked = resolve_voice(&value, 1, 0.25, 10.4, 48_000, 0.5).expect("resolve");
+        assert_eq!(clocked.controls.tremolo.expect("tremolo").time_secs, 10.4);
     }
 }

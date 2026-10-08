@@ -52,8 +52,8 @@ pub enum RenderFormat {
 pub const MP3_EXPORT: bool = cfg!(feature = "mp3-export");
 
 /// Convert a scheduled onset through the shared `rustel-voice` resolver. All
-/// hosts use the same mapping; this adapter only translates the runtime's
-/// `ValueJson` into plain JSON.
+/// hosts use the same mapping. This adapter translates the runtime's
+/// `ValueJson` into a JSON value and reads the cycle from `whole_begin`.
 ///
 /// The event comes back with no live binding on it. Only [`bind_live_controls`]
 /// attaches one, and only the live device path calls it.
@@ -81,11 +81,15 @@ pub(crate) fn scalar_event_detailed(
         crate::ValueJson::String(note) => serde_json::Value::String(note.clone()),
         crate::ValueJson::Raw(raw) => raw.clone(),
     };
+    // An onset with no readable `whole_begin` has no cycle of its own. The
+    // clock time then serves as the musical time.
+    let cycle = whole_begin_cycle(&onset.whole_begin).unwrap_or(onset.target_time * cps);
     rustel_voice::resolve_voice_with_samples_detailed(
         &value,
         onset.onset_id,
         onset.duration_secs,
         onset.target_time,
+        cycle,
         sample_rate,
         cps,
         samples,
@@ -101,6 +105,15 @@ pub(crate) fn scalar_event_detailed(
             .with_generation(onset.generation)
             .with_ui_visuals(onset.ui_visuals)
     })
+}
+
+/// The cycle `whole_begin` names. The text is the scheduler's fraction in its
+/// `n/d` form. The result equals the fraction's `to_f64`. The parse does not
+/// allocate.
+fn whole_begin_cycle(whole_begin: &str) -> Option<f64> {
+    let (numer, denom) = whole_begin.split_once('/')?;
+    let cycle = rustel_fraction::Fraction::checked_new(numer.parse().ok()?, denom.parse().ok()?)?;
+    Some(cycle.to_f64())
 }
 
 /// Hand the voice the slider tokens its gain and cutoff came from, so that a
@@ -1110,7 +1123,7 @@ mod tests {
                     pcm.extend_from_slice(tick.block);
                 };
                 BUILT_DISPATCH.set(None);
-                native_render_session(dispatch)
+                let report = native_render_session(dispatch)
                     .render_controlled(
                         DISPATCH_DURATION,
                         &path,
@@ -1121,6 +1134,7 @@ mod tests {
                     )
                     .expect("controlled render");
                 assert_built_dispatch(dispatch);
+                assert_eq!(report.duration_secs, DISPATCH_DURATION, "{name}");
                 assert_exact_render(&expected, &pcm);
                 let bytes = std::fs::read(path).expect("encoded audio");
                 assert!(!bytes.is_empty());
@@ -1590,6 +1604,39 @@ mod tests {
                 cut: None,
             })
         );
+    }
+
+    #[test]
+    fn a_live_onset_seeds_its_lfo_from_the_cycle_and_gates_on_the_clock() {
+        let lfo_onset = |whole_begin: &str| OnsetEventJson {
+            whole_begin: whole_begin.into(),
+            target_time: 10.4,
+            ..onset(serde_json::json!({
+                "s": "sawtooth",
+                "cutoff": 800.0,
+                "lfo": { "a": { "control": "cutoff", "rate": 7.0 } }
+            }))
+        };
+        let event = |whole_begin: &str| {
+            live_audio_event(
+                &lfo_onset(whole_begin),
+                48_000,
+                0.5,
+                &rustel_voice::BundledOnly,
+            )
+            .expect("live event")
+        };
+        let phase0 = |event: &rustel_audio::AudioEvent| {
+            event.controls.lfos[0].expect("the lfo() modulator").phase0
+        };
+
+        // Cycle 3/4 at 0.5 cps is 1.5 s, and frac(1.5 * 7) is 0.5.
+        let live = event("3/4");
+        assert_eq!(phase0(&live), 0.5);
+        assert_eq!(live.target_frame, 499_200);
+
+        // No readable cycle: the clock time gives frac(10.4 * 7).
+        assert!((phase0(&event("")) - 0.8).abs() < 1e-4);
     }
 
     #[test]
