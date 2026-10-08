@@ -158,7 +158,44 @@ on normal completion. Argument errors use text diagnostics, even with `--json`.
 
 Data is stored in `~/.rustel`. Override it with `RUSTEL_CONFIG_DIR`, or use
 `RUSTEL_SAMPLE_CACHE` and `RUSTEL_SESSION_DIR` for those directories alone.
-There is no separate CLI settings file.
+
+On startup, interactive commands check for a new stable release in the
+background, at most once every 24 hours. A newer version prints a notice on
+stderr. Studio prints the notice only after you quit and return to the
+terminal. Run `rustelup` to update both.
+On Windows, use `rustelup.cmd` if PowerShell blocks scripts.
+
+Checks use GitHub's public release API. Network failures stay silent and do
+not delay startup or exit. Results are cached in `~/.rustel/cache/update-check.json`.
+The worker ends when Rustel exits. If a command exits before its request
+finishes, the next eligible launch tries again.
+Pipes, CI, JSON output, completion scripts, `--quiet`, and `--no-input` skip
+checks and notices.
+
+Read or change the preference with:
+
+```sh
+rustel config get check_updates
+rustel config set check_updates false
+rustel config set check_updates true
+```
+
+Settings always apply to your user account, so there is no `--global` flag.
+`get` prints the saved value, or `true` when unset. `set` writes
+`~/.rustel/rustel.json`, preserving other settings:
+
+```json
+{
+  "check_updates": false
+}
+```
+
+Disable checks for one command with `--no-update-check`, or set
+`RUSTEL_NO_UPDATE_CHECK` to any nonempty value. These overrides take precedence
+over the saved setting. `get` still reports the saved value.
+
+`RUSTEL_CONFIG_DIR` moves this file and the update cache too. The settings file
+is optional. Remove the setting or set it to `true` to restore checks.
 
 ```sh
 rustel completions --install

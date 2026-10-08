@@ -61,6 +61,16 @@ struct Terminal {
 
 impl Terminal {
     fn open(binary: &std::path::Path, rows: u16, cols: u16, cwd: &std::path::Path) -> Self {
+        Self::open_with_update_checks(binary, rows, cols, cwd, false)
+    }
+
+    fn open_with_update_checks(
+        binary: &std::path::Path,
+        rows: u16,
+        cols: u16,
+        cwd: &std::path::Path,
+        check_updates: bool,
+    ) -> Self {
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize {
@@ -87,6 +97,13 @@ impl Terminal {
         command.env_remove("RUSTEL_THEME");
         command.env_remove("RUSTEL_THEME_DIR");
         command.env("RUSTEL_CONFIG_DIR", cwd);
+        command.env(
+            "RUSTEL_NO_UPDATE_CHECK",
+            if check_updates { "" } else { "1" },
+        );
+        if check_updates {
+            command.env_remove("CI");
+        }
         // Headless: the smoke must never start a process the studio's
         // desktop commands would reach - no file manager, no browser - on
         // whatever machine runs the pty suite.
@@ -692,4 +709,80 @@ fn the_real_binary_paints_resizes_and_quits_cleanly() {
         status.success(),
         "a keyboard quit is a clean exit: {status:?}"
     );
+}
+
+#[test]
+fn release_notice_appears_once_after_leaving_the_studio() {
+    let binary = rustel_binary().expect("build `rustel` before the feature=pty suite");
+    let home = set_directory();
+    let cache = home.path().join("cache/update-check.json");
+    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let cached = serde_json::json!({"checked_at": now, "latest_version": "99.0.0"}).to_string();
+    std::fs::write(&cache, &cached).unwrap();
+    let mut terminal = Terminal::open_with_update_checks(&binary, 24, 80, home.path(), true);
+    assert!(
+        terminal.wait_for(" ready", BOOT_BUDGET),
+        "the studio did not load:\n{}",
+        terminal.diagnostics()
+    );
+    let active = terminal.text();
+    assert!(!contains_plain(&active, "99.0.0"), "{}", printable(&active));
+    assert!(
+        !contains_plain(&active, "rustelup"),
+        "{}",
+        printable(&active)
+    );
+
+    terminal.write(&[0x11]);
+    assert!(
+        terminal.wait_for("quit", REPAINT_BUDGET),
+        "the first Ctrl+Q did not arm the quit:\n{}",
+        terminal.diagnostics()
+    );
+    assert!(terminal.child.try_wait().expect("child polls").is_none());
+    terminal.write(&[0x11]);
+    let notice = if cfg!(windows) {
+        "Rustel 99.0.0 is available. Run rustelup.cmd to update."
+    } else {
+        "Rustel 99.0.0 is available. Run rustelup to update."
+    };
+    let deadline = Instant::now() + QUIT_BUDGET;
+    let (output, status) = loop {
+        let output = terminal.text();
+        if let Some(status) = terminal.child.try_wait().expect("child polls")
+            && contains_plain(&output, notice)
+        {
+            break (output, status);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the studio did not quit with an update notice:\n{}",
+            terminal.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "a keyboard quit is a clean exit: {status:?}"
+    );
+    let restored = output
+        .rfind("\x1b[?1049l")
+        .expect("the terminal left the alternate screen");
+    assert!(
+        !contains_plain(&output[..restored], "99.0.0"),
+        "the release appeared before terminal restoration:\n{}",
+        printable(&output)
+    );
+    assert!(contains_plain(&output[restored..], notice));
+    assert_eq!(
+        output.matches("99.0.0").count(),
+        1,
+        "{}",
+        printable(&output)
+    );
+    assert_eq!(std::fs::read_to_string(cache).unwrap(), cached);
 }

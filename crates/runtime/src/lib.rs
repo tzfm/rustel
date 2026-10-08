@@ -61,6 +61,7 @@ mod session;
 /// Recording and replaying a live-coding set (`--save-session` / `replay`).
 #[cfg(feature = "session-log")]
 pub mod session_log;
+pub mod settings;
 /// Reading sound names out of score TEXT, so warming covers what a query
 /// cannot see: lanes commented out for later, and muted `_$:` lanes.
 pub mod sounds;
@@ -73,6 +74,7 @@ pub mod test_support;
 pub mod ui_analysis;
 /// Bounded, versioned live-editor event protocol.
 pub mod ui_events;
+pub mod updates;
 mod watch;
 
 pub use capabilities::{
