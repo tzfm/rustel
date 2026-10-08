@@ -1454,6 +1454,65 @@ fn default_tremolo_at_a_dyadic_rate_stays_finite() {
     assert!(peak > 1e-3, "tremolo silenced the whole note, peak {peak}");
 }
 
+/// A negative depth drives the LFO's 1.5 exponent to NaN. The tremolo gain
+/// is then 1.0, on the main chain and in an `.FX()` stage.
+#[test]
+fn negative_depth_tremolo_stays_finite_at_unity_gain() {
+    use rustel_audio::TremoloControls;
+    let negative = Some(TremoloControls {
+        frequency_hz: 4.0,
+        depth: -1.0,
+        skew: 1.0,
+        shape: 0,
+        phase_offset: 0.0,
+        time_secs: 0.0,
+    });
+    let render = |in_stage: bool, tremolo: Option<TremoloControls>| {
+        let mut c = controls(Waveform::Sawtooth, None);
+        if in_stage {
+            c.fx_stages[0] = Some(rustel_audio::FxStage {
+                stretch: None,
+                transient: None,
+                gain: 1.0,
+                filters: FilterControls::default(),
+                vowel: None,
+                coarse: None,
+                crush: None,
+                shape: None,
+                distort: None,
+                tremolo,
+                compressor: None,
+                pan_x: None,
+                phaser: None,
+                delay: None,
+                dry: 1.0,
+                room: None,
+            });
+        } else {
+            c.tremolo = tremolo;
+        }
+        let event = OnsetEvent::new(0, 110.0, 0.8, 0.5).with_controls(c);
+        render_pcm(&mut ScalarBackend::new(), 48_000, 24_000, &[event]).expect("render")
+    };
+    for (site, in_stage) in [("main chain", false), ("FX stage", true)] {
+        let pcm = render(in_stage, negative);
+        let bad = pcm.iter().filter(|s| !s.is_finite()).count();
+        assert_eq!(
+            bad,
+            0,
+            "{site}: {bad} of {} samples are not finite",
+            pcm.len()
+        );
+        // The LFO starts at frame 128 with a zero sample. Each later LFO
+        // sample is NaN, so the voice matches a voice with no tremolo.
+        let from = 129 * 2; // stereo interleaved
+        assert!(
+            pcm[from..] == render(in_stage, None)[from..],
+            "{site}: the tremolo gain is not 1.0"
+        );
+    }
+}
+
 #[test]
 fn phaser_changes_the_spectrum_over_time() {
     use rustel_audio::PhaserControls;
