@@ -21,8 +21,9 @@ use crate::pressure::{REALTIME_POOL_COUNT, RealtimePool};
 /// On x86_64, flush subnormal inputs and results to zero so quiet filter and
 /// reverb tails avoid denormal arithmetic costs. These flags are per-thread;
 /// set them at every `process_block` because init may run on another thread.
+/// Miri has no inline assembly, so a Miri run keeps the default flags.
 fn enable_denormal_flush() {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
     {
         const FTZ: u32 = 1 << 15;
         const DAZ: u32 = 1 << 6;

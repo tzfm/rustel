@@ -246,7 +246,7 @@ source-location span count, duration and frame count exactly.
 
 ## How CI runs, and why
 
-The workflows use GitHub-hosted Linux, macOS and Windows runners. `.github/workflows/ci.yml` runs ordinary checks on every pull request and push to `main`. It checks formatting, Clippy, supported feature sets and the serial workspace tests. `.github/workflows/heavy.yml` runs the release-mode corpus in portable and automatic acceleration modes and the Studio end-to-end suite. Heavy CI runs on pushes to `main`, twice weekly for cache warming, and when a maintainer dispatches it for an exact pull request commit.
+The workflows use GitHub-hosted Linux, macOS and Windows runners. `.github/workflows/ci.yml` runs ordinary checks on every pull request and push to `main`. It checks formatting, Clippy, supported feature sets and the serial workspace tests, and runs the tests of the hand-written `unsafe` code under Miri. `.github/workflows/heavy.yml` runs the release-mode corpus in portable and automatic acceleration modes and the Studio end-to-end suite. Heavy CI runs on pushes to `main`, twice weekly for cache warming, and when a maintainer dispatches it for an exact pull request commit.
 
 The CI workflows declare read-only repository tokens. Checkouts do not persist credentials, and the jobs do not receive repository secrets. No CI workflow uses a self-hosted runner.
 
@@ -264,6 +264,16 @@ gh workflow run heavy.yml --ref main -f pr_number=<number> -f sha=<full-40-chara
 The Actions page offers the same operation: choose **Heavy CI → Run workflow**, select `main`, then enter the PR number and full SHA. The workflow definition comes from `main`. Its first job checks that the PR is open, targets this repository's `main`, and still has the requested SHA. Each test job checks the SHA again after checkout, before running PR code. The run summary records the SHA. A later push changes the PR head; dispatch a new heavy run for the new SHA. A prior run does not qualify the new commit.
 
 Maintainers should dispatch heavy CI for changes to the engine, scheduler, audio rendering, corpus goldens, Studio behavior or any other release-critical path. The ordinary checks run regardless of this choice. The heavy jobs are optional PR checks, so do not make them unconditional required status checks.
+
+### Unsafe code and Miri
+
+[Miri](https://github.com/rust-lang/miri) interprets Rust code and stops on undefined behavior: a read outside a buffer, a freed pointer, uninitialized memory, a data race or a leak. `.github/scripts/miri.sh` runs the tests of the hand-written `unsafe` code under Miri: the audio rings, the unchecked sample reads, the AVX2 kernels, the callback host pointers, the QuickJS allocator and the bridge frame stack.
+
+```sh
+bash .github/scripts/miri.sh
+```
+
+The script installs the nightly toolchain named at its top. Miri does not run C code or inline assembly, so a test with QuickJS, an audio device or an OS call stays out of the list. When you add `unsafe` code, write a test with no such call and add the module to the script. Miri is 50 to 300 times slower than a native run, so keep the test small. `cfg!(miri)` cuts a loop count for the Miri run only.
 
 ### Build and test behavior
 

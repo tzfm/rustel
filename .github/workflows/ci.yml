@@ -241,6 +241,28 @@ jobs:
           mkdir -p "$TMPDIR" "$RUSTEL_SAMPLE_CACHE"
           bash .github/scripts/cargo-ci.sh test --workspace --all-targets --all-features --exclude rustel-studio-e2e -- --test-threads=1
 
+  # Miri interprets the tests of the hand-written unsafe code and stops on
+  # undefined behavior. The script holds the pinned nightly and the test list.
+  miri:
+    name: Miri (Linux x64)
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-miri-${{ github.ref }}
+      cancel-in-progress: true
+    timeout-minutes: 30
+    env:
+      # Miri does not optimize, and warns about a profile with an opt-level.
+      CARGO_PROFILE_TEST_OPT_LEVEL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run Miri
+        run: bash .github/scripts/miri.sh
+
   build-release-platforms:
     name: Build (${{ matrix.name }})
     strategy:

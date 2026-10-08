@@ -518,3 +518,19 @@ impl JsRuntime {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These frames hold no JavaScript value, so the test needs no runtime.
+    #[test]
+    fn a_scan_of_empty_stacked_frames_finds_no_callback_and_no_value() {
+        let outer = BridgeFrame::new(std::rc::Rc::new(Cell::new(1)));
+        let _outer_scope = BridgeScope::push(&outer);
+        let inner = BridgeFrame::new(std::rc::Rc::new(Cell::new(1)));
+        let _inner_scope = BridgeScope::push(&inner);
+        assert!(JsRuntime::pending_callback(1).is_none());
+        assert!(JsRuntime::pending_js_value(1).is_none());
+    }
+}

@@ -289,7 +289,8 @@ mod tests {
 
     #[test]
     fn observed_depth_stays_bounded_while_both_sides_advance() {
-        const ITEMS: u32 = 100_000;
+        // Miri runs each step of the two threads, so the count is small there.
+        const ITEMS: u32 = if cfg!(miri) { 300 } else { 100_000 };
         let ring = std::sync::Arc::new(AssetRing::new());
         let producer_ring = std::sync::Arc::clone(&ring);
         let producer = std::thread::spawn(move || {
@@ -327,20 +328,50 @@ mod tests {
         assert_eq!(ring.len(), 0);
     }
 
-    #[test]
-    fn channel_drop_frees_undelivered_installs() {
-        let channel = SampleChannel::new();
-        let sample = Box::into_raw(Box::new(
+    fn boxed_sample() -> *mut DecodedSample {
+        Box::into_raw(Box::new(
             crate::sample::decode_wav(include_bytes!("../assets/bd.wav")).expect("bundled bd"),
-        ));
-        channel
-            .installs
-            .push(SampleInstall {
-                id: SampleId(7),
-                sample,
-            })
-            .ok()
-            .expect("push");
+        ))
+    }
+
+    /// An 8 frame room, so the build stays short.
+    fn boxed_room() -> *mut crate::reverb::OrbitReverb {
+        Box::into_raw(Box::new(crate::reverb::OrbitReverb::generate(
+            8_000,
+            crate::reverb::ReverbParams {
+                size_secs: 0.001,
+                fade_secs: 0.0,
+                lp_start_hz: 15_000.0,
+                lp_end_hz: 1_000.0,
+                ir: None,
+            },
+        )))
+    }
+
+    #[test]
+    fn channel_drop_frees_each_queued_baton() {
+        let channel = SampleChannel::new();
+        for sample in [boxed_sample(), std::ptr::null_mut()] {
+            let id = SampleId(7);
+            let install = SampleInstall { id, sample };
+            channel.installs.push(install).ok().expect("push");
+        }
+        let orbit = ReverbInstall {
+            orbit: 1,
+            reverb: boxed_room(),
+        };
+        channel.reverb_installs.push(orbit).ok().expect("push");
+        let stage = FxReverbInstall {
+            reverb: boxed_room(),
+        };
+        channel.fx_reverb_installs.push(stage).ok().expect("push");
+
+        let sample = ReturnedSample(boxed_sample());
+        channel.returns.push(sample).ok().expect("push");
+        let orbit = ReturnedReverb(boxed_room());
+        channel.reverb_returns.push(orbit).ok().expect("push");
+        let stage = ReturnedFxReverb(boxed_room());
+        channel.fx_reverb_returns.push(stage).ok().expect("push");
         drop(channel); // must not leak (miri/asan would flag)
     }
 }

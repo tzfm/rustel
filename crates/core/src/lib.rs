@@ -8635,4 +8635,41 @@ mod callback_query_metrics_tests {
         assert_eq!(metrics.calls(), 1);
         assert!(metrics.kind_sample().is_none());
     }
+
+    #[test]
+    fn each_host_call_reads_the_installed_host_and_counts_its_kind() {
+        let host = NestedHost;
+        let mut metrics = CallbackQueryMetrics::default();
+        let value = Value::F64(1.0);
+        let haps = pure(value.clone()).query_arc(Fraction::ZERO, Fraction::ONE);
+        let span = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
+        let program = callback_ir::PatternTransformProgram::new([]).unwrap();
+        with_callback_host(&host, || {
+            with_callback_query_metrics_policy(&mut metrics, true, || {
+                let _ = host_call_value(1, &value);
+                let _ = host_call_value_predicate(1, &value);
+                let _ = host_call_ref(1);
+                let _ = host_call_pick_lookup(1);
+                let _ = host_call_pattern(1, pure(value.clone()));
+                let _ = host_call_pattern_ir(1, &program, pure(value.clone()));
+                let _ = host_call_pattern_indexed_batch(1, vec![(pure(value.clone()), 0)]);
+                let _ = host_call_haps(1, &haps);
+                let _ = host_call_hap_predicate(1, &haps[0]);
+                let _ = host_call_time_predicate(1, Fraction::ZERO);
+                let _ = host_call_span_transform(1, span);
+                let _ = host_call_bind(1, BindArg::Value(&value));
+                let _ = host_call_query(1, &State::new(span));
+            });
+        });
+        let kinds = metrics.kind_sample().expect("forced callback-kind sample");
+        for kind in CallbackQueryKind::ALL {
+            let expected = match kind {
+                // The value call and the value predicate share this kind.
+                CallbackQueryKind::Value => 2,
+                CallbackQueryKind::MaterializeValue => 0,
+                _ => 1,
+            };
+            assert_eq!(kinds.get(kind), expected, "{kind:?}");
+        }
+    }
 }

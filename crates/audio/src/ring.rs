@@ -434,7 +434,8 @@ mod tests {
 
     #[test]
     fn observed_depth_stays_bounded_while_both_sides_advance() {
-        const ITEMS: u64 = 100_000;
+        // Miri runs each step of the two threads, so the count is small there.
+        const ITEMS: u64 = if cfg!(miri) { 300 } else { 100_000 };
         let ring = std::sync::Arc::new(Ring::new(8));
         let producer_ring = std::sync::Arc::clone(&ring);
         let producer = std::thread::spawn(move || {
