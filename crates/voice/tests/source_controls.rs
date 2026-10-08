@@ -428,6 +428,49 @@ fn frequency_overrides_note_and_octave_only_reaches_its_supported_sources() {
 }
 
 #[test]
+fn repeated_bus_receivers_keep_the_sender_level_after_the_attack_and_release() {
+    let sender = |routed| {
+        let mut fields = json!({"freq": 200, "gain": 0.2, "sustain": 1});
+        if routed {
+            fields["bus"] = json!(1);
+            fields["dry"] = json!(0);
+        }
+        resolve(&value("sine", fields), 0.0, 0.5)
+    };
+    let receiver = |id, onset| {
+        resolve_voice_with_samples(
+            &json!({"s": "bus", "n": 1, "gain": 1}),
+            id,
+            0.2,
+            onset,
+            SAMPLE_RATE,
+            0.5,
+            &Samples,
+        )
+        .expect("bus receiver resolves")
+    };
+    let direct = render_events(&[sender(false)]);
+    let routed = render_events(&[sender(true), receiver(2, 0.0), receiver(3, 0.2)]);
+    assert!(audible(&direct));
+    for onset in [0, SAMPLE_RATE as usize / 5] {
+        // Skip the 1 ms attack and the previous receiver's 10 ms release.
+        for (start, end) in [(0.012, 0.04), (0.06, 0.15)] {
+            let start = (onset + (start * f64::from(SAMPLE_RATE)) as usize) * 2;
+            let end = (onset + (end * f64::from(SAMPLE_RATE)) as usize) * 2;
+            let error = direct[start..end]
+                .iter()
+                .zip(&routed[start..end])
+                .map(|(direct, routed)| (direct - routed).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                error < 1e-6,
+                "bus receiver changed the sender level: {error}"
+            );
+        }
+    }
+}
+
+#[test]
 fn amplitude_defaults_follow_the_source_and_sbd_uses_its_own_envelope() {
     let env = |sound, fields| resolve(&value(sound, fields), 0.0, 0.5).controls.envelope;
     assert_eq!(env("sine", json!({})), rustel_audio::Envelope::default());
