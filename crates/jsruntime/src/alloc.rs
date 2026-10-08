@@ -386,6 +386,11 @@ unsafe impl Allocator for BudgetedAllocator {
     /// # Safety
     /// `ptr` must have come from this allocator.
     unsafe fn usable_size(ptr: *mut u8) -> usize {
+        // QuickJS never passes a null `ptr` here. A null `ptr` has no header,
+        // so no byte is usable.
+        if ptr.is_null() {
+            return 0;
+        }
         // SAFETY: the caller guarantees `ptr` is ours.
         unsafe { ptr.sub(HEADER_SIZE).cast::<Header>().read().size }
     }

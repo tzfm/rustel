@@ -16,6 +16,7 @@
 - A ladder filter with a cutoff below 0 or a resonance below -7.69 went to infinity. Both are bounded. Delay feedback and the supersaw spread stay in -1..1 under modulation.
 - `rustel render --format scalar-f32` reports the real length. `--duration 8` printed `16.0 s, 8 cycles`.
 - CI runs the tests of the hand-written `unsafe` code under [Miri](https://github.com/rust-lang/miri) on each pull request. Miri stops on a memory error or a data race in the audio rings, the AVX2 kernels, the callback host pointers and the QuickJS allocator.
+- The QuickJS allocator reports 0 usable bytes for a null pointer. The size read had no null check.
 
 ## v0.1.0
 
