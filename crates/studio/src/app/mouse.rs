@@ -272,7 +272,7 @@ impl App {
         // the settings rows outrank the reference column and the
         // blanket sheet claims, or their clicks are eaten by
         // whatever they happen to overlap.
-        let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+        let extend = super::super::editor::click_extends(mouse.modifiers);
         // Nothing the pointer does plays a scene.
         //
         // A modified click cannot be relied on for it: macOS turns
@@ -282,9 +282,9 @@ impl App {
         // work on some machines, do nothing on others, and look like
         // the click that merely chooses a scene. A pad plays a scene,
         // and so does an update; a click chooses, and only chooses.
-        if self.click_set_prompt(x, y, shift)
+        if self.click_set_prompt(x, y, extend)
             || self.click_viz_add_sheet(x, y)
-            || self.click_viz_prompt(x, y, shift)
+            || self.click_viz_prompt(x, y, extend)
         {
             return Ok(true);
         }

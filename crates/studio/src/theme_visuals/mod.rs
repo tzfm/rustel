@@ -589,8 +589,10 @@ pub(super) fn composite_effect(
         .intersection(buffer.area)
         .intersection(effect_buffer.area);
     for y in area.y..area.bottom() {
+        let mut run: Option<PunctuationRun> = None;
         for x in area.x..area.right() {
             if inside_any(protected, x, y) {
+                run = None;
                 continue;
             }
             let is_interface = inside_any(interface, x, y);
@@ -600,36 +602,64 @@ pub(super) fn composite_effect(
                 editor_strength
             }
             .clamp(0.0, 1.0);
-            let Some(effect) = effect_buffer.cell((x, y)) else {
+            let (Some(effect), Some(cell)) = (effect_buffer.cell((x, y)), buffer.cell_mut((x, y)))
+            else {
+                run = None;
                 continue;
             };
-            let Some(cell) = buffer.cell_mut((x, y)) else {
-                continue;
-            };
+            let source = (cell.fg, cell.modifier);
+            let joins = effect.symbol() == cell.symbol() && is_punctuation(cell.symbol());
             if cell == effect || strength <= 0.0 {
-                continue;
-            }
-            if is_interface && cell.symbol() != " " {
+                // The effect left this cell alone.
+            } else if is_interface && cell.symbol() != " " {
                 // Controls must keep their labels, colours and emphasis even
                 // when a text effect decrypts or dims the score. Opacity can
                 // soften a colour, but cannot make a substituted menu letter
                 // readable. Keep its moving ground and let blank interface
                 // cells carry particles, while preserving the control itself.
                 cell.bg = blend_rgb(cell.bg, effect.bg, strength);
-                continue;
-            }
-            if strength >= 1.0 {
+            } else if strength >= 1.0 {
                 cell.clone_from(effect);
-                continue;
+            } else {
+                fade_cell(
+                    cell,
+                    effect,
+                    strength,
+                    hash_unit(hash(u64::from(x), u64::from(y), 0xfade)),
+                );
             }
-            fade_cell(
-                cell,
-                effect,
-                strength,
-                hash_unit(hash(u64::from(x), u64::from(y), 0xfade)),
-            );
+            // A coding font draws `//` or `=>` as one ligature. A terminal
+            // breaks the ligature where the foreground or the weight
+            // changes, so an effect edge between the two cells shows
+            // `/ /`. The first cell of a run sets both for the whole run.
+            match run {
+                Some(lead) if joins && lead.source == source => {
+                    cell.fg = lead.fg;
+                    cell.modifier = lead.modifier;
+                }
+                _ => {
+                    run = joins.then_some(PunctuationRun {
+                        source,
+                        fg: cell.fg,
+                        modifier: cell.modifier,
+                    });
+                }
+            }
         }
     }
+}
+
+/// The first cell of a run of punctuation that shares one source style:
+/// that style, and the foreground and weight the effect left on the cell.
+#[derive(Clone, Copy)]
+struct PunctuationRun {
+    source: (Color, Modifier),
+    fg: Color,
+    modifier: Modifier,
+}
+
+fn is_punctuation(symbol: &str) -> bool {
+    matches!(symbol.as_bytes(), [byte] if byte.is_ascii_punctuation())
 }
 
 pub(super) fn effect_image(
@@ -1086,6 +1116,33 @@ mod tests {
             },
         );
         assert_eq!(solid, baseline, "a solid interface remains untouched");
+    }
+
+    #[test]
+    fn an_effect_edge_does_not_split_a_run_of_punctuation() {
+        let area = Rect::new(0, 0, 6, 1);
+        let comment = Color::Rgb(74, 120, 148);
+        let glow = Color::Rgb(226, 245, 255);
+        for strength in [0.5, 1.0] {
+            let mut buffer = Buffer::empty(area);
+            buffer.set_string(
+                0,
+                0,
+                "//ab=>",
+                Style::default().fg(comment).bg(Color::Rgb(3, 9, 18)),
+            );
+            // The edge of the effect falls inside `//`, `ab` and `=>`.
+            let mut effect = buffer.clone();
+            for x in [1, 3, 4] {
+                effect.cell_mut((x, 0)).unwrap().set_fg(glow);
+            }
+            composite_effect(&mut buffer, &effect, area, strength, strength, &[], &[]);
+            let fg = |x: u16| buffer.cell((x, 0)).unwrap().fg;
+            assert_eq!((fg(0), fg(1)), (comment, comment), "{strength}");
+            assert_ne!(fg(2), fg(3), "letters keep the edge at {strength}");
+            assert_ne!(fg(4), comment, "{strength}");
+            assert_eq!(fg(4), fg(5), "{strength}");
+        }
     }
 
     #[test]

@@ -71,6 +71,31 @@ F1 opens keyboard help when the menu bar is hidden. Menus show available
 actions and shortcuts. Press Esc to return to the editor. To cancel the first
 Quit key, press another key. File ▸ Quit exits directly. Normal quit saves edits.
 
+### Selecting text
+
+Hold Shift with a movement key to select. Shift+Home and Shift+End select to
+the start and the end of the line. Shift+click moves the end of the selection
+to the pointer.
+
+Some terminals keep these keys and do not send them to Studio:
+
+- Ghostty on Linux keeps Shift+Home, Shift+End, Shift+PageUp and
+  Shift+PageDown to scroll its history. Add these lines to the Ghostty config
+  to free them:
+
+  ```text
+  keybind = shift+home=unbind
+  keybind = shift+end=unbind
+  keybind = shift+page_up=unbind
+  keybind = shift+page_down=unbind
+  ```
+
+- kitty keeps Shift+click for its own selection. Use Alt+click or Ctrl+click
+  in Studio.
+
+Keyboard help (F1) says when the terminal does not send Shift+Home and
+Shift+End.
+
 ## Scenes
 
 A scene is a `.strudel` score file. A set can have up to 16 open scenes.
@@ -388,6 +413,10 @@ status line says so too, and the Log has a warning when Studio starts with
 such a selection. Studio then does not avoid the shortcuts that your terminal
 takes, so some of them can stop working. Press Del on the row to return to
 automatic.
+
+To change a shortcut, select its row, press Enter, then press the new chord.
+Del restores the default. The panel shortcuts Alt+O, Alt+R, Alt+D and Alt+T
+are at the end of the list. The panel footers show the chord you set.
 
 Studio saves preferences in `<rustel-config>/studio.json`. The default config
 folder is `~/.rustel`, including `%USERPROFILE%\.rustel` on Windows.

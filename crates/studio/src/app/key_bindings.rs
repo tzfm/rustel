@@ -301,7 +301,59 @@ impl App {
                 self.request_quit();
                 Ok(true)
             }
+            // A panel reads its own action as an Alt letter: see
+            // `panel_spelling`.
+            Do::ShowFile
+            | Do::RenameFile
+            | Do::DeleteSample
+            | Do::TrimSample
+            | Do::FocusTimeline => Ok(false),
         }
+    }
+
+    /// The panel action an Alt letter means where the keyboard is now.
+    fn panel_action_at(&self, letter: char) -> Option<BindAction> {
+        use PanelKind::{Reference, Set, Settings};
+        let score = matches!(self.focus, Focus::Editor | Focus::Timeline);
+        let tape = score && self.current_replay().is_some();
+        match (letter, self.focus) {
+            ('o', Focus::Panel(Reference | Set | Settings)) => Some(BindAction::ShowFile),
+            ('r', Focus::Panel(Reference | Set)) => Some(BindAction::RenameFile),
+            ('d', Focus::Panel(Reference)) => Some(BindAction::DeleteSample),
+            ('t', Focus::Panel(Reference)) => Some(BindAction::TrimSample),
+            ('o', _) if tape => Some(BindAction::ShowFile),
+            ('r', _) if tape => Some(BindAction::RenameFile),
+            ('t', _) if score && self.timeline_visible() => Some(BindAction::FocusTimeline),
+            _ => None,
+        }
+    }
+
+    /// A press as the panels read their own actions, or `None` for a
+    /// press that does nothing here.
+    ///
+    /// Each panel answers to Alt and a letter. A chord learnt for a panel
+    /// action arrives as that letter. The letter does nothing while its
+    /// action holds a learnt chord, and the learnt chord does nothing
+    /// where the action has no panel.
+    pub(super) fn panel_spelling(&self, key: &KeyEvent) -> Option<KeyEvent> {
+        if let Some(action) = self.keybinds.override_action_for(key)
+            && let Some(letter) = action.panel_letter()
+        {
+            return (self.panel_action_at(letter) == Some(action))
+                .then(|| KeyEvent::new(KeyCode::Char(letter), KeyModifiers::ALT));
+        }
+        if key.modifiers.contains(KeyModifiers::ALT)
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+            && let KeyCode::Char(character) = key.code
+            && self
+                .panel_action_at(character.to_ascii_lowercase())
+                .is_some_and(|action| self.keybinds.overridden(action))
+        {
+            return None;
+        }
+        Some(*key)
     }
 
     /// Editing commands belong to whichever text surface owns the keyboard.

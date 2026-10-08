@@ -51,7 +51,10 @@ impl App {
             .as_ref()
             .is_none_or(|(name, index)| name != &bank || *index != variant)
         {
-            self.status = "sample selection changed - select the file and press Alt+D again".into();
+            self.status = format!(
+                "sample selection changed - select the file and press {} again",
+                self.keybinds.hint(BindAction::DeleteSample)
+            );
         } else if self.sample_file_busy(&expected) {
             self.status = "finish recording or trimming before deleting this sample".into();
         } else if let Some(library) = self.worker.library() {

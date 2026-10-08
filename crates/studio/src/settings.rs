@@ -1942,9 +1942,8 @@ pub(super) const SOURCE_CONTROL_COUNT: usize = SOURCES_CONTROLS.len();
 /// The terminal profile belongs with the bindings it determines.
 pub(super) const TERMINAL_PROFILE_ROW: usize = 0;
 pub(super) const KEYBIND_ACTION_START: usize = 1;
-/// The final keybind row is an action, after global and contextual bindings.
-pub(super) const RESET_KEYBINDS_ROW: usize =
-    KEYBIND_ACTION_START + BindAction::ALL.len() + BindAction::CONTEXTUAL_ROWS;
+/// The final keybind row is an action, after every binding.
+pub(super) const RESET_KEYBINDS_ROW: usize = KEYBIND_ACTION_START + BindAction::ALL.len();
 
 pub(super) fn keybind_action_at(row: usize) -> Option<BindAction> {
     row.checked_sub(KEYBIND_ACTION_START)
@@ -3764,11 +3763,7 @@ fn keybinds_footer_hint(
         }
         return format!("Enter: reset all to {profile} defaults · Esc: close");
     }
-    if sheet.selected >= KEYBIND_ACTION_START + BindAction::ALL.len() {
-        "Contextual shortcut · Tab: pages · Esc: close".to_owned()
-    } else {
-        "Enter: rebind · Del: terminal default · Tab: pages · Esc: close".to_owned()
-    }
+    "Enter: rebind · Del: terminal default · Tab: pages · Esc: close".to_owned()
 }
 
 /// A line on the sources page: a group border, air, a cache control, a
@@ -4626,11 +4621,6 @@ mod tests {
             sheet.key(KeyCode::Delete, &mut settings, &features),
             SettingsAction::ClearKeybind(*BindAction::ALL.last().unwrap())
         );
-        sheet.key(KeyCode::Down, &mut settings, &features);
-        assert_eq!(
-            sheet.key(KeyCode::Enter, &mut settings, &features),
-            SettingsAction::Nothing
-        );
     }
 
     #[test]
@@ -4693,8 +4683,8 @@ mod tests {
     }
 
     #[test]
-    fn reset_all_footer_names_the_selected_profile_and_contextual_rows_cannot_rebind() {
-        let mut settings = UiSettings {
+    fn reset_all_footer_names_the_selected_profile() {
+        let settings = UiSettings {
             terminal_profile: Some("kitty".into()),
             ..Default::default()
         };
@@ -4711,16 +4701,9 @@ mod tests {
         assert!(keybinds_footer_hint(sheet, &settings, &features).contains("kitty defaults"));
         sheet.confirm_reset_keybinds = true;
         assert!(keybinds_footer_hint(sheet, &settings, &features).ends_with("Esc: cancel"));
-        sheet.select(KEYBIND_ACTION_START + BindAction::ALL.len());
-        assert!(!keybinds_footer_hint(sheet, &settings, &features).contains("rebind"));
-        assert_eq!(
-            sheet.key(KeyCode::Enter, &mut settings, &features),
-            SettingsAction::Nothing
-        );
-        assert_eq!(
-            sheet.key(KeyCode::Delete, &mut settings, &features),
-            SettingsAction::Nothing
-        );
+        // The panel rows close the table and rebind like the rest.
+        sheet.select(RESET_KEYBINDS_ROW - 1);
+        assert!(keybinds_footer_hint(sheet, &settings, &features).contains("rebind"));
     }
 
     #[test]

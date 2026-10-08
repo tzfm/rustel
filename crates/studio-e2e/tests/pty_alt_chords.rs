@@ -432,11 +432,9 @@ fn probe_alt_chords_through_a_real_pty() {
         std::thread::sleep(Duration::from_millis(500));
     }
     // Walk by what the page shows rather than by Alt+O's position. More
-    // contextual rows may be added after it, and that must not turn this
+    // rows may be added around it, and that must not turn this
     // terminal-input probe into a count of today's settings list.
-    let rows = rustel_studio::keybinds::BindAction::ALL.len()
-        + rustel_studio::keybinds::BindAction::CONTEXTUAL_ROWS
-        + 2; // terminal profile and reset-all rows
+    let rows = rustel_studio::keybinds::BindAction::ALL.len() + 2; // terminal profile and reset-all rows
     // The input bytes are the same across platforms, but macOS displays
     // the Option symbol while Linux and Windows display Alt.
     let reveal_shortcut = if cfg!(target_os = "macos") {
@@ -458,15 +456,16 @@ fn probe_alt_chords_through_a_real_pty() {
         "the keybinds page never put the selector on the {reveal_shortcut} row:\n{}",
         terminal.diagnostics()
     );
-    // Enter on the fixed row must NOT arm a learn: the chord is not the
-    // table's to take.
+    // Enter on the row arms a learn, as on every other row.
     terminal.write(b"\r");
     std::thread::sleep(Duration::from_millis(600));
     assert!(
-        !contains_plain(&terminal.text(), "press the chord"),
-        "Enter on the fixed Alt+O row armed a learn:\n{}",
+        contains_plain(&terminal.text(), "press the chord"),
+        "Enter on the Alt+O row did not arm a learn:\n{}",
         terminal.diagnostics()
     );
+    terminal.write(&[0x1b]); // Esc: the learn is called off
+    std::thread::sleep(Duration::from_millis(400));
     terminal.write(&[0x1b]); // Esc: the sheet goes
     std::thread::sleep(Duration::from_millis(400));
 

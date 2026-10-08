@@ -905,6 +905,7 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
                     super::replay::TimelineShortcuts {
                         focused: pane.timeline_focus,
                         theme,
+                        keybinds: chrome.keybinds,
                     },
                     shortcuts,
                 );
@@ -1113,6 +1114,7 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
                 sidebar: layout.sidebar,
                 on_right: layout.sidebar_side == Side::Right,
                 focused: view.focused_panel == Some(PanelKind::Set),
+                keybinds: chrome.keybinds,
             },
             area,
         );

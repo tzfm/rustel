@@ -557,6 +557,7 @@ pub struct SetPanelView<'a> {
     /// The panel docks at the right of the editor.
     pub on_right: bool,
     pub focused: bool,
+    pub keybinds: &'a super::keybinds::Keybinds,
 }
 
 impl ratatui::widgets::Widget for SetPanelView<'_> {
@@ -739,23 +740,26 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
                 Style::default().fg(theme.muted),
             );
         }
-        let rename_hint = super::keybinds::shortcut_label("Alt+R rename · Enter open");
-        let reveal_hint = super::keybinds::shortcut_label("Alt+O reveal · Del delete · +/- size");
-        let live_tape_hint = super::keybinds::shortcut_label("Alt+O reveal · n new first");
-        let folder_hint = super::keybinds::shortcut_label("Alt+O reveal · +/- size");
+        use super::keybinds::BindAction;
+        let rename = self.keybinds.hint(BindAction::RenameFile);
+        let reveal = self.keybinds.hint(BindAction::ShowFile);
+        let rename_hint = format!("{rename} rename · Enter open");
+        let reveal_hint = format!("{reveal} reveal · Del delete · +/- size");
+        let live_tape_hint = format!("{reveal} reveal · n new first");
+        let folder_hint = format!("{reveal} reveal · +/- size");
         let hints = if let Some(tape) = self.panel.selected_tape() {
             [
-                rename_hint.as_ref(),
+                rename_hint.as_str(),
                 if tape.recording {
-                    live_tape_hint.as_ref()
+                    live_tape_hint.as_str()
                 } else {
-                    reveal_hint.as_ref()
+                    reveal_hint.as_str()
                 },
             ]
         } else if self.panel.selected_file().is_some() {
-            ["Enter open · n new", reveal_hint.as_ref()]
+            ["Enter open · n new", reveal_hint.as_str()]
         } else {
-            ["←/→ fold · n new", folder_hint.as_ref()]
+            ["←/→ fold · n new", folder_hint.as_str()]
         };
         for (row, text) in hints.iter().enumerate().take(usize::from(hint.height)) {
             buffer.set_stringn(
@@ -850,6 +854,7 @@ mod tests {
             sidebar: area,
             on_right: true,
             focused,
+            keybinds: &crate::keybinds::Keybinds::default(),
         }
         .render(area, &mut buffer);
         (0..area.height)
@@ -981,6 +986,7 @@ mod tests {
                 sidebar: area,
                 on_right: false,
                 focused: true,
+                keybinds: &crate::keybinds::Keybinds::default(),
             }
             .render(area, &mut buffer);
             (0..area.height)

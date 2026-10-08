@@ -9301,6 +9301,9 @@ mod tests {
             TERMINAL_PROFILE_ROW,
         };
 
+        /// The first of the five panel rows, which close the table.
+        const SHOW_FILE_ROW: usize = crate::settings::RESET_KEYBINDS_ROW - 5;
+
         /// A studio with the settings sheet open on the Keybinds page, focused,
         /// and the frame sized the way a painted one would be - the sheet's
         /// hit-tests read `self.frame`, so that is all they need.
@@ -9474,87 +9477,58 @@ mod tests {
             );
         }
 
-        /// The Keybinds page also lists the panel chords the table cannot hold
-        /// (KeyCombo has no alt modifier): Alt+O, Alt+R, Alt+D and Alt+T, fixed, in that
-        /// order, shown so each command can be found.
+        /// The panel actions close the table. Each row shows the Alt chord
+        /// the panel answers to until a chord is learnt.
         #[test]
-        fn the_fixed_alt_o_row_is_listed_after_the_learnable_table() {
+        fn the_panel_rows_close_the_table_on_their_alt_chords() {
             let directory = tempfile::tempdir().unwrap();
             let app = keybinds_page_app(directory.path());
 
             let rows = app.keybind_rows();
-            assert_eq!(
-                rows.len(),
-                crate::settings::RESET_KEYBINDS_ROW + 1,
-                "the fixed rows ride behind the learnable table"
-            );
-            let fixed = &rows
-                [KEYBIND_ACTION_START + BindAction::ALL.len()..crate::settings::RESET_KEYBINDS_ROW];
-            let chords: Vec<&str> = fixed.iter().map(|row| row.chord.as_str()).collect();
+            assert_eq!(rows.len(), crate::settings::RESET_KEYBINDS_ROW + 1);
+            let panel = &rows[SHOW_FILE_ROW..crate::settings::RESET_KEYBINDS_ROW];
+            let chords: Vec<&str> = panel.iter().map(|row| row.chord.as_str()).collect();
             assert_eq!(
                 chords,
                 ["Alt+O", "Alt+R", "Alt+D", "Alt+T", "Alt+T"].map(crate::keybinds::shortcut_label),
                 "the row names the chord"
             );
             assert!(
-                fixed[0].action.contains("file"),
+                panel[0].action.contains("file"),
                 "the row says what the chord does: {}",
-                fixed[0].action
+                panel[0].action
             );
-            assert!(
-                fixed.iter().all(|row| !row.learning),
-                "a fixed row never waits for a chord"
-            );
+            assert!(panel.iter().all(|row| !row.learnt && !row.learning));
         }
 
-        /// A click on the fixed row selects it - every row is a button - but arms
-        /// no learn: there is nothing the table could hold the chord on.
+        /// Enter or a click on a panel row arms a learn, as on every other row.
         #[test]
-        fn clicking_the_fixed_alt_o_row_selects_without_arming() {
+        fn enter_or_a_click_on_a_panel_row_arms_a_learn() {
             let directory = tempfile::tempdir().unwrap();
             let mut app = keybinds_page_app(directory.path());
-            let last = KEYBIND_ACTION_START + BindAction::ALL.len(); // the fixed row's index
-            // Selecting it first scrolls the page, since at 140x40 the fixed row
-            // sits past the last visible one; the click then lands where the
-            // page's own hit-test says the row is.
+            // Selecting the row first scrolls the page, since at 140x40 the
+            // row sits past the last visible one.
             if let Some(sheet) = app.settings_sheet.as_mut() {
-                sheet.selected = last;
+                sheet.selected = SHOW_FILE_ROW;
             }
-            let sheet = *app.settings_sheet.as_ref().expect("the sheet is up");
-            let (_, rows) = SettingsSheetView::geometry(app.frame).expect("the sheet fits");
-            let point = (rows.y..rows.bottom())
-                .map(|y| (rows.x + 2, y))
-                .find(|&(x, y)| sheet.keybind_row_at(app.frame, x, y) == Some(last))
-                .expect("the selected fixed row is on screen after the scroll");
-
-            click(&mut app, point.0, point.1);
-
-            assert!(app.keybind_learn.is_none(), "no learn arms on a fixed row");
-            let sheet = app.settings_sheet.as_ref().expect("the sheet is up");
-            assert_eq!(sheet.selected, last, "the click still chose the row");
-        }
-
-        /// Enter on the fixed row arms nothing either: the page's keys answer for
-        /// the learnable rows only.
-        #[test]
-        fn enter_on_the_fixed_alt_o_row_does_not_arm_a_learn() {
-            let directory = tempfile::tempdir().unwrap();
-            let mut app = keybinds_page_app(directory.path());
-            let last = KEYBIND_ACTION_START + BindAction::ALL.len(); // the fixed row's index
-            if let Some(sheet) = app.settings_sheet.as_mut() {
-                sheet.selected = last;
-            }
+            let armed = Some(KeybindLearn::arm(BindAction::ShowFile));
 
             app.handle_terminal_event(Event::Key(KeyEvent::new(
                 KeyCode::Enter,
                 KeyModifiers::NONE,
             )))
             .expect("Enter is handled");
+            assert_eq!(app.keybind_learn, armed);
+            app.keybind_learn = None;
 
-            assert!(
-                app.keybind_learn.is_none(),
-                "Enter on a fixed row arms no learn"
-            );
+            let sheet = *app.settings_sheet.as_ref().expect("the sheet is up");
+            let (_, rows) = SettingsSheetView::geometry(app.frame).expect("the sheet fits");
+            let point = (rows.y..rows.bottom())
+                .map(|y| (rows.x + 2, y))
+                .find(|&(x, y)| sheet.keybind_row_at(app.frame, x, y) == Some(SHOW_FILE_ROW))
+                .expect("the selected row is on screen after the scroll");
+            click(&mut app, point.0, point.1);
+            assert_eq!(app.keybind_learn, armed);
         }
 
         /// The Sources page too: a click on a row selects it, exactly as the
@@ -24135,8 +24109,44 @@ mod tests {
             assert!(
                 app.keybind_rows()
                     .iter()
-                    .any(|row| row.action == "Focus tape timeline"
+                    .any(|row| row.action == "focus tape timeline"
                         && row.chord == crate::keybinds::shortcut_label("Alt+T"))
+            );
+
+            // A learnt chord takes the place of Alt+T, here and in the hint.
+            let chord = crate::keybinds::KeyCombo::parse("ctrl+shift+f8").unwrap();
+            app.learn_keybind(BindAction::FocusTimeline, Some(chord));
+            let press = |app: &mut App, code, modifiers| {
+                app.focus = Focus::Editor;
+                app.handle_terminal_event(Event::Key(KeyEvent::new(code, modifiers)))
+                    .unwrap();
+                app.focus
+            };
+            let source = app.editor().source();
+            assert_eq!(
+                press(&mut app, KeyCode::Char('t'), KeyModifiers::ALT),
+                Focus::Editor
+            );
+            assert_eq!(
+                app.editor().source(),
+                source,
+                "the dead chord types nothing"
+            );
+            assert_eq!(
+                press(
+                    &mut app,
+                    KeyCode::F(8),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT
+                ),
+                Focus::Timeline
+            );
+            assert!(app.keybind_rows().iter().any(|row| {
+                row.action == "focus tape timeline" && row.chord == chord.hint() && row.learnt
+            }));
+            app.learn_keybind(BindAction::FocusTimeline, None);
+            assert_eq!(
+                press(&mut app, KeyCode::Char('t'), KeyModifiers::ALT),
+                Focus::Timeline
             );
             app.focus = Focus::Editor;
             app.regions.panes[0].timeline = Rect::default();

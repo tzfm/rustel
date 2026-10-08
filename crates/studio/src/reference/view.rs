@@ -1243,16 +1243,23 @@ impl ReferenceView<'_> {
                 usize::from(inner.width),
                 Style::default().fg(theme.muted),
             );
-            let mut actions = vec!["Alt+O shows file"];
+            use super::super::keybinds::BindAction;
+            let hint = |action, does: &str| format!("{} {does}", self.keybinds.hint(action));
+            let show = hint(BindAction::ShowFile, "shows file");
+            let rename_file = hint(BindAction::RenameFile, "renames file");
+            let rename_bank = hint(BindAction::RenameFile, "bank alias");
+            let trim = hint(BindAction::TrimSample, "trims");
+            let delete = hint(BindAction::DeleteSample, "deletes file");
+            let mut actions = vec![show.as_str()];
             if self.panel.selected_bank_is_editable() {
                 match self.panel.rename() {
-                    PanelAction::RenameSample { .. } => actions.push("Alt+R renames file"),
-                    PanelAction::RenameBank { .. } => actions.push("Alt+R bank alias"),
+                    PanelAction::RenameSample { .. } => actions.push(&rename_file),
+                    PanelAction::RenameBank { .. } => actions.push(&rename_bank),
                     _ => {}
                 }
-                actions.push("Alt+T trims");
+                actions.push(&trim);
                 if self.panel.selected_sample_file().is_some() {
-                    actions.push("Alt+D deletes file");
+                    actions.push(&delete);
                 }
             }
             actions.extend([

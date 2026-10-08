@@ -1046,8 +1046,8 @@ impl App {
                         Ok(_) => {
                             panel.confirm_trim = Some(row);
                             self.status = format!(
-                                "{} {name} · Esc cancels",
-                                super::super::keybinds::shortcut_label("Alt+T again trims")
+                                "{} again trims {name} · Esc cancels",
+                                self.keybinds.hint(BindAction::TrimSample)
                             );
                         }
                     },
@@ -1580,7 +1580,10 @@ impl App {
         let Some(panel) = self.reference_panel.as_mut() else {
             return false;
         };
-        let selection = match (&panel.selection, modifiers.contains(KeyModifiers::SHIFT)) {
+        let selection = match (
+            &panel.selection,
+            super::super::editor::click_extends(modifiers),
+        ) {
             // Shift extends the selection already held in this block.
             (Some(held), true) if held.target == target => TextSelection {
                 anchor: held.selection.anchor,

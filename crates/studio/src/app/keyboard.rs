@@ -450,9 +450,16 @@ impl App {
         self.latch_keyboard_capabilities(&terminal_event);
         if let Event::Key(key) = &terminal_event
             && key.kind == KeyEventKind::Press
-            && self.route_key_press(key)?
         {
-            return Ok(());
+            // A chord learnt for a panel action stops here even when the
+            // panel has no use for the press.
+            match self.panel_spelling(key) {
+                None => return Ok(()),
+                Some(spelling) if self.route_key_press(&spelling)? || spelling != *key => {
+                    return Ok(());
+                }
+                Some(_) => {}
+            }
         }
 
         // `route_key_press` is offered presses alone, so a held key and a

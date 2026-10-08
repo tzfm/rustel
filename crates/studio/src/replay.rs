@@ -71,6 +71,7 @@ pub fn shortcut_area(editor: Rect) -> Option<Rect> {
 pub struct TimelineShortcuts<'a> {
     pub focused: bool,
     pub theme: &'a Theme,
+    pub keybinds: &'a super::keybinds::Keybinds,
 }
 
 impl Widget for TimelineShortcuts<'_> {
@@ -80,6 +81,10 @@ impl Widget for TimelineShortcuts<'_> {
             area,
             Style::default().bg(self.theme.surface).fg(self.theme.muted),
         );
+        use super::keybinds::BindAction;
+        let rename = format!("{} rename", self.keybinds.hint(BindAction::RenameFile));
+        let reveal = format!("{} reveal", self.keybinds.hint(BindAction::ShowFile));
+        let timeline = format!("{} timeline", self.keybinds.hint(BindAction::FocusTimeline));
         let segments = if self.focused {
             [
                 "Esc editor",
@@ -88,15 +93,15 @@ impl Widget for TimelineShortcuts<'_> {
                 "T duration",
                 "Del delete",
                 "Home/End ends",
-                "Alt+R rename",
-                "Alt+O reveal",
+                &rename,
+                &reveal,
             ]
         } else {
             [
-                "Alt+T timeline",
+                &timeline,
                 "Alt+←/→ blocks",
-                "Alt+R rename",
-                "Alt+O reveal",
+                &rename,
+                &reveal,
                 "",
                 "",
                 "",
@@ -986,6 +991,7 @@ mod tests {
                 TimelineShortcuts {
                     focused,
                     theme: &theme,
+                    keybinds: &crate::keybinds::Keybinds::default(),
                 }
                 .render(footer, &mut buffer);
                 let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();

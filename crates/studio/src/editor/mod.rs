@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 
-use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ropey::Rope;
 
 pub use clipboard::{Clipboard, ClipboardError, MemoryClipboard, PlatformClipboard};
@@ -27,8 +27,8 @@ pub use history::{
     EditOrigin, HistoryConfig, HistoryMoment, Transaction,
 };
 pub use input::{
-    EditorInput, KeyboardCapabilities, PRIMARY_MODIFIER, event_to_input, event_to_input_with_binds,
-    is_stray_control, key_to_command,
+    EditorInput, KeyboardCapabilities, PRIMARY_MODIFIER, click_extends, event_to_input,
+    event_to_input_with_binds, is_stray_control, key_to_command,
 };
 pub(crate) use input::{TerminalEventBatch, is_plain_text_key_event};
 pub use layout::{
@@ -1642,7 +1642,7 @@ impl Editor {
                 // selection grows, shrinks or inverts. It is never part of
                 // a double click: a second one near the first must not snap
                 // the head to a word on release.
-                let (selection, granularity) = if event.modifiers.contains(KeyModifiers::SHIFT) {
+                let (selection, granularity) = if click_extends(event.modifiers) {
                     self.last_click = None;
                     (
                         Selection::range(self.selections.primary().anchor, offset),
@@ -1870,6 +1870,7 @@ fn normalize_paste_line_endings(text: &str, line_ending: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyModifiers;
 
     fn dispatch(editor: &mut Editor, command: Command, at: u64) {
         editor
@@ -2736,11 +2737,17 @@ mod tests {
             }
         };
         press(&mut editor, 5, KeyModifiers::NONE);
-        for (column, head) in [(13, 13), (9, 9), (1, 1), (16, 16)] {
-            press(&mut editor, column, KeyModifiers::SHIFT);
+        // kitty keeps Shift+click, so Alt and Ctrl extend as Shift does.
+        for (column, modifiers) in [
+            (13, KeyModifiers::SHIFT),
+            (9, KeyModifiers::ALT),
+            (1, KeyModifiers::CONTROL),
+            (16, KeyModifiers::SHIFT),
+        ] {
+            press(&mut editor, column, modifiers);
             assert_eq!(
                 editor.primary_selection(),
-                Selection::range(ByteOffset(5), ByteOffset(head))
+                Selection::range(ByteOffset(5), ByteOffset(column.into()))
             );
         }
         // A second Shift+click on the same cell is not a double click.

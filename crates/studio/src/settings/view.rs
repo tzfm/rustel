@@ -875,7 +875,7 @@ fn source_control_explain(view: &SettingsSheetView<'_>, row: Row) -> String {
     row.explain().to_owned()
 }
 
-fn sources_footer_hint(sheet: &SettingsSheet, sources: &[SourceRow]) -> String {
+fn sources_footer_hint(sheet: &SettingsSheet, sources: &[SourceRow], show_file: &str) -> String {
     let at = sheet.selected;
     let hint = if at < SOURCE_CONTROL_COUNT {
         match SOURCES_CONTROLS[at] {
@@ -900,8 +900,7 @@ fn sources_footer_hint(sheet: &SettingsSheet, sources: &[SourceRow]) -> String {
                 .to_owned()
         } else {
             format!(
-                "Tab pages · e edits · Space on/off · Enter refetches · r aliases · {} opens folder · d removes",
-                crate::keybinds::shortcut_label("Alt+O")
+                "Tab pages · e edits · Space on/off · Enter refetches · r aliases · {show_file} opens folder · d removes"
             )
         }
     } else {
@@ -1093,10 +1092,20 @@ fn render_sources(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer:
             }
         }
     }
+    // The chord on the Keybinds row for the action. The row is empty
+    // while a learn waits for the chord.
+    let show_file = view
+        .bindings
+        .iter()
+        .find(|row| row.action == BindAction::ShowFile.label() && !row.chord.is_empty())
+        .map_or_else(
+            || crate::keybinds::shortcut_label("Alt+O").into_owned(),
+            |row| row.chord.clone(),
+        );
     buffer.set_stringn(
         rows.x,
         panel.bottom().saturating_sub(2),
-        sources_footer_hint(&view.sheet, &view.sources),
+        sources_footer_hint(&view.sheet, &view.sources, &show_file),
         width,
         Style::default().fg(theme.muted),
     );
