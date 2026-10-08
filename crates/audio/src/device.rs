@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
-    BufferSize, FromSample, Sample, SampleFormat, SizedSample, StreamInstant, SupportedBufferSize,
+    BufferSize, FromSample, I24, Sample, SampleFormat, SizedSample, StreamInstant,
+    SupportedBufferSize, U24,
 };
 
 use crate::{
@@ -3207,10 +3208,12 @@ fn sample_format_from_cpal(format: SampleFormat) -> Option<AudioSampleFormat> {
     match format {
         SampleFormat::I8 => Some(AudioSampleFormat::I8),
         SampleFormat::I16 => Some(AudioSampleFormat::I16),
+        SampleFormat::I24 => Some(AudioSampleFormat::I24),
         SampleFormat::I32 => Some(AudioSampleFormat::I32),
         SampleFormat::I64 => Some(AudioSampleFormat::I64),
         SampleFormat::U8 => Some(AudioSampleFormat::U8),
         SampleFormat::U16 => Some(AudioSampleFormat::U16),
+        SampleFormat::U24 => Some(AudioSampleFormat::U24),
         SampleFormat::U32 => Some(AudioSampleFormat::U32),
         SampleFormat::U64 => Some(AudioSampleFormat::U64),
         SampleFormat::F32 => Some(AudioSampleFormat::F32),
@@ -3424,9 +3427,11 @@ fn build_input_stream(
         SampleFormat::F64 => build!(f64),
         SampleFormat::I8 => build!(i8),
         SampleFormat::I16 => build!(i16),
+        SampleFormat::I24 => build!(I24),
         SampleFormat::I32 => build!(i32),
         SampleFormat::U8 => build!(u8),
         SampleFormat::U16 => build!(u16),
+        SampleFormat::U24 => build!(U24),
         SampleFormat::U32 => build!(u32),
         format => Err(DevicePlaybackError::Unavailable(format!(
             "audio input sample format {format} is not supported"
@@ -4023,10 +4028,12 @@ fn build_stream(
         SampleFormat::F64 => build!(f64),
         SampleFormat::I8 => build!(i8),
         SampleFormat::I16 => build!(i16),
+        SampleFormat::I24 => build!(I24),
         SampleFormat::I32 => build!(i32),
         SampleFormat::I64 => build!(i64),
         SampleFormat::U8 => build!(u8),
         SampleFormat::U16 => build!(u16),
+        SampleFormat::U24 => build!(U24),
         SampleFormat::U32 => build!(u32),
         SampleFormat::U64 => build!(u64),
         format => Err(DevicePlaybackError::Unavailable(format!(
@@ -4086,10 +4093,12 @@ fn build_live_stream(
         SampleFormat::F64 => build!(f64),
         SampleFormat::I8 => build!(i8),
         SampleFormat::I16 => build!(i16),
+        SampleFormat::I24 => build!(I24),
         SampleFormat::I32 => build!(i32),
         SampleFormat::I64 => build!(i64),
         SampleFormat::U8 => build!(u8),
         SampleFormat::U16 => build!(u16),
+        SampleFormat::U24 => build!(U24),
         SampleFormat::U32 => build!(u32),
         SampleFormat::U64 => build!(u64),
         format => Err(DevicePlaybackError::Unavailable(format!(
@@ -7745,8 +7754,13 @@ mod tests {
         fn pending_callbacks_write_silence_in_every_host_format() {
             fn check<T>()
             where
-                T: Sample + FromSample<f32> + PartialEq + std::fmt::Debug,
+                T: SizedSample + FromSample<f32> + PartialEq + std::fmt::Debug,
             {
+                assert!(
+                    sample_format_from_cpal(T::FORMAT).is_some(),
+                    "{}",
+                    T::FORMAT
+                );
                 let gate = CallbackGate::new();
                 let mut output = [T::from_sample(0.5); 7];
                 gate.render_or_silence(&mut output, |_| panic!("pending callback entered DSP"));
@@ -7756,10 +7770,12 @@ mod tests {
             check::<f64>();
             check::<i8>();
             check::<i16>();
+            check::<I24>();
             check::<i32>();
             check::<i64>();
             check::<u8>();
             check::<u16>();
+            check::<U24>();
             check::<u32>();
             check::<u64>();
         }
