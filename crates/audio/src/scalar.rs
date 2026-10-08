@@ -1326,7 +1326,10 @@ fn apply_fx_stage(
             let raw = lfo_waveshape(tr.shape, phase, tr.skew) * tr.depth;
             let next = phase + f64::from(tr.frequency_hz) / f64::from(sample_rate);
             state.tremolo_phase = Some(if next > 1.0 { next - 1.0 } else { next });
-            base + raw.powf(1.5).clamp(0.0, 1.0)
+            let shaped = raw.powf(1.5).clamp(0.0, 1.0);
+            // A NaN gain falls back to the gain node's default, 1.0. Mirrors
+            // the main chain's tremolo.
+            if shaped.is_nan() { 1.0 } else { base + shaped }
         } else {
             base
         };
@@ -6867,7 +6870,10 @@ impl AudioBackend for ScalarBackend {
                                 let shaped = raw.powf(1.5).clamp(0.0, 1.0);
                                 let next = phase + f64::from(freq) / sr;
                                 v.tremolo_phase = Some(if next > 1.0 { next - 1.0 } else { next });
-                                base + shaped
+                                // `powf` returns NaN for a negative `raw`, and
+                                // `clamp` keeps NaN. A NaN gain falls back to
+                                // the gain node's default, 1.0.
+                                if shaped.is_nan() { 1.0 } else { base + shaped }
                             } else {
                                 base
                             }
