@@ -207,6 +207,8 @@ mod tests {
             return;
         }
         let ratios = ratios();
+        // Miri interprets each frame, so the count is small there.
+        let frames = if cfg!(miri) { 8 } else { 4096 };
         for count in [8, 9, 15, 16, 31, 32] {
             for (frequency_hz, sample_rate, pan_gains) in [
                 (55.0, 44_100.0, (0.2, 0.9)),
@@ -215,7 +217,7 @@ mod tests {
             ] {
                 let mut expected_phases = phases();
                 let mut actual_phases = expected_phases;
-                for frame in 0..4096 {
+                for frame in 0..frames {
                     let expected = scalar_render_static_lanes(
                         &mut expected_phases,
                         &ratios,

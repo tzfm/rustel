@@ -487,6 +487,23 @@ mod tests {
     }
 
     #[test]
+    fn calloc_zeroes_the_block_and_usable_size_covers_the_request() {
+        let (mut alloc, budget) = allocator(1024 * 1024);
+        let ptr = alloc.calloc(3, 5);
+        assert!(!ptr.is_null());
+        // SAFETY: from this allocator.
+        let usable = unsafe { BudgetedAllocator::usable_size(ptr) };
+        assert!(usable >= 15);
+        // SAFETY: the allocator reports `usable` bytes at `ptr`.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, usable) };
+        assert!(bytes.iter().all(|byte| *byte == 0));
+        bytes.fill(0xA5);
+        // SAFETY: from this allocator.
+        unsafe { alloc.dealloc(ptr) };
+        assert_eq!(budget.live(), 0);
+    }
+
+    #[test]
     fn realloc_accounting_survives_shrink_and_regrow() {
         let (mut alloc, budget) = allocator(1024 * 1024);
         let ptr = alloc.alloc(BLOCK);
