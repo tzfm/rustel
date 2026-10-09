@@ -213,6 +213,7 @@ if ($FromSource) {
 
 $Tmp = $null
 $Stage = $null
+$KeepStage = $false
 try {
     if ($FromSource) {
         # Build in $SrcDir with the release profile. The checkout and its
@@ -301,7 +302,8 @@ try {
     if (-not (Move-InstalledFile $staged $dest)) {
         if ((Test-Path -LiteralPath $previous) -and -not (Test-Path -LiteralPath $dest)) {
             if (-not (Move-InstalledFile $previous $dest)) {
-                err "could not restore previous $Bin"
+                $KeepStage = $true
+                err "could not restore previous $Bin; backup kept at $previous"
             }
         }
         err "could not replace $dest"
@@ -318,7 +320,8 @@ try {
     if (-not $ok) {
         if (Test-Path -LiteralPath $previous) {
             if (-not (Move-InstalledFile $previous $dest)) {
-                err "could not restore previous $Bin"
+                $KeepStage = $true
+                err "could not restore previous $Bin; backup kept at $previous"
             }
             err "installed $Bin failed its version check; previous binary restored"
         }
@@ -337,7 +340,7 @@ try {
     if ($Tmp -and (Test-Path -LiteralPath $Tmp)) {
         Remove-Item -LiteralPath $Tmp -Recurse -Force -ErrorAction SilentlyContinue
     }
-    if ($Stage -and (Test-Path -LiteralPath $Stage)) {
+    if ($Stage -and -not $KeepStage -and (Test-Path -LiteralPath $Stage)) {
         Remove-Item -LiteralPath $Stage -Recurse -Force -ErrorAction SilentlyContinue
     }
 }

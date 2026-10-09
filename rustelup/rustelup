@@ -191,9 +191,10 @@ BIN="rustel"
 
 TMP="$(mktemp -d)"
 STAGE=""
+KEEP_STAGE=""
 cleanup() {
   rm -rf "$TMP"
-  [ -z "$STAGE" ] || rm -rf "$STAGE"
+  if [ -n "$STAGE" ] && [ -z "$KEEP_STAGE" ]; then rm -rf "$STAGE"; fi
 }
 trap cleanup EXIT
 
@@ -213,15 +214,21 @@ chmod +x "$STAGE/$BIN"
 "$STAGE/$BIN" --version >/dev/null \
   || err "$ORIGIN $BIN failed its version check"
 [ ! -e "$BIN_DIR/$BIN" ] || cp -p "$BIN_DIR/$BIN" "$STAGE/previous"
+restore_previous() {
+  if ! mv -f "$STAGE/previous" "$BIN_DIR/$BIN"; then
+    KEEP_STAGE=1
+    err "could not restore previous $BIN; backup kept at $STAGE/previous"
+  fi
+}
 if ! mv -f "$STAGE/$BIN" "$BIN_DIR/$BIN"; then
   if [ -f "$STAGE/previous" ] && [ ! -e "$BIN_DIR/$BIN" ]; then
-    mv -f "$STAGE/previous" "$BIN_DIR/$BIN" || err "could not restore previous $BIN"
+    restore_previous
   fi
   err "could not replace $BIN_DIR/$BIN"
 fi
 if ! VERSION="$("$BIN_DIR/$BIN" --version 2>/dev/null)"; then
   if [ -f "$STAGE/previous" ]; then
-    mv -f "$STAGE/previous" "$BIN_DIR/$BIN" || err "could not restore previous $BIN"
+    restore_previous
     err "installed $BIN failed its version check; previous binary restored"
   fi
   rm -f "$BIN_DIR/$BIN"
