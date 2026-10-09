@@ -298,8 +298,8 @@ pub struct LiveDeviceReport {
     /// so exact attribution requires a single live stream.
     pub callback_allocations: u64,
     pub callback_frees: u64,
-    /// At least one callback that entered after Stop filled its host buffer
-    /// with silence and acknowledged the request.
+    /// A callback entered after Stop and rendered the end of the 10 ms stop
+    /// ramp. Stays false when the stream closes before the ramp is out.
     pub stop_acknowledged: bool,
     pub ring_refusals: u64,
     /// Pushes or pops refused because a second thread tried to take a ring
@@ -2070,7 +2070,8 @@ impl LiveScalarDevice {
         self.shared.stopped.store(true, Ordering::Release);
     }
 
-    /// Request silence and wait for one data callback to acknowledge it.
+    /// Request silence and wait until a data callback has rendered the whole
+    /// stop ramp.
     ///
     /// This is an off-callback wait used by the product's graceful Stop path;
     /// it does not infer when already-submitted host buffers reach speakers.
@@ -2522,7 +2523,9 @@ impl ManualLiveOutput {
         self.gate.render_or_silence(output, |output| {
             let stop_requested = shared.stopped.load(Ordering::Acquire);
             write_live_output(&mut self.backend, &mut self.meters, output, 2, shared);
-            if stop_requested {
+            // The ramp spans several callbacks at a short buffer. An earlier
+            // acknowledgement lets the owner close the stream inside the ramp.
+            if stop_requested && self.backend.stop_ramp_complete() {
                 shared.stop_acknowledged.store(true, Ordering::Release);
             }
         });
@@ -2611,7 +2614,7 @@ fn spawn_silent_output(
                         );
                         shared.playback_latency_nanos.store(0, Ordering::Release);
                         write_live_output(&mut backend, &mut meters, output, 2, &shared);
-                        if stop_requested {
+                        if stop_requested && backend.stop_ramp_complete() {
                             shared.stop_acknowledged.store(true, Ordering::Release);
                         }
                     });
@@ -4214,7 +4217,7 @@ where
                         .max_playback_latency_nanos
                         .fetch_max(latency_nanos, Ordering::Relaxed);
                     write_live_output(&mut backend, &mut meters, output, channels, &shared);
-                    if stop_requested {
+                    if stop_requested && backend.stop_ramp_complete() {
                         shared.stop_acknowledged.store(true, Ordering::Release);
                     }
                 });
@@ -6019,13 +6022,24 @@ mod tests {
             assert!(tripwire::allocator_is_armed());
             let before = tripwire::Violations::capture();
             shared.stopped.store(true, Ordering::Release);
-            tripwire::audio_scope(|| {
-                write_live_output(&mut backend, &mut meters, &mut output, 2, &shared)
-            });
+            // The 10 ms ramp spans four 128-frame callbacks. The last one
+            // resets the voices and returns the lease.
+            for _ in 0..4 {
+                tripwire::audio_scope(|| {
+                    write_live_output(&mut backend, &mut meters, &mut output, 2, &shared)
+                });
+            }
             let violations = tripwire::Violations::capture().since(before);
             assert!(
                 violations.clean(),
                 "stop freed a pooled voice inside the callback: {violations:?}"
+            );
+            assert!(backend.stop_ramp_complete());
+            let pressure = backend.pressure_observation();
+            assert_eq!(pressure.active_voices, 0);
+            assert_eq!(
+                pressure.active_pool_leases[crate::pressure::RealtimePool::Stretch.index()],
+                0
             );
         }
 
@@ -7697,8 +7711,10 @@ mod tests {
             manual.device().stop();
             assert!(!manual.device().report().stop_acknowledged);
             let before = tripwire::Violations::capture();
-            for _ in 0..3 {
+            for buffer in 0..3 {
                 manual.render(&mut output);
+                // The first 256 frames sit inside the 480-frame ramp.
+                assert_eq!(manual.device().report().stop_acknowledged, buffer > 0);
             }
             assert!(tripwire::Violations::capture().since(before).clean());
             let report = manual.device().report();

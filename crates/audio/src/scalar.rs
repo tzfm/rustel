@@ -4782,8 +4782,9 @@ impl ScalarBackend {
             reverb.reset();
         }
         for bus in &mut self.orbit_delays {
-            // Skip inactive lines: reset_at runs once per stopped block, and
-            // re-zeroing 16 one-second stereo lines would write 6 MB per block.
+            // Skip inactive lines: after the stop ramp reset_at runs on every
+            // stopped block, and re-zeroing 16 one-second stereo lines would
+            // write 6 MB per block.
             if bus.active {
                 bus.left.fill(0.0);
                 bus.right.fill(0.0);
@@ -4798,6 +4799,9 @@ impl ScalarBackend {
     /// sounding keep ringing through their envelopes. Live-update
     /// semantics: voices are independent, and a new evaluation never cuts
     /// one - a full reset would audibly click on every edit.
+    ///
+    /// The stop ramp calls this for each of its blocks, so nothing new
+    /// starts under the ramp. The call also sets the clock to `frame`.
     pub fn retire_pending_at(&mut self, frame: u64) {
         self.pending.clear();
         self.frame = frame;
