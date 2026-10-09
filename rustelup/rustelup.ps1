@@ -25,6 +25,7 @@ if (-not $HomeDir) { $HomeDir = $HOME }
 $RustelDir = $env:RUSTEL_DIR
 if (-not $RustelDir) { $RustelDir = Join-Path $HomeDir '.rustel' }
 $BinDir = Join-Path $RustelDir 'bin'
+$SrcDir = Join-Path $RustelDir 'src'
 $BaseUrl = "https://github.com/$Repo"
 
 function Show-Usage {
@@ -35,9 +36,11 @@ USAGE:
     rustelup [OPTIONS]
 
 OPTIONS:
-    -v, --version TAG   Install a specific release tag (default: latest)
-    -l, --list          List available releases
-    -h, --help          Print this help
+    -v, --version TAG     Install a specific release tag (default: latest)
+    -b, --branch BRANCH   Build and install a branch from source
+    -c, --commit HASH     Build and install a commit from source
+    -l, --list            List available releases
+    -h, --help            Print this help
 '@)
 }
 
@@ -108,23 +111,31 @@ function Move-InstalledFile([string]$From, [string]$To) {
 }
 
 $Tag = ''
+$Branch = ''
+$Commit = ''
 $scriptArgs = @($args)
 $i = 0
 while ($i -lt $scriptArgs.Count) {
     $arg = [string]$scriptArgs[$i]
-    if ($arg -eq '-v' -or $arg -eq '--version') {
+    if ($arg -in '-v', '--version', '-b', '--branch', '-c', '--commit') {
         $flag = $arg
         $i++
         if ($i -ge $scriptArgs.Count) {
             Show-Usage
-            err "$flag requires a release tag"
+            err "$flag requires a value"
         }
         $next = [string]$scriptArgs[$i]
         if ($next -eq '' -or $next.StartsWith('-')) {
             Show-Usage
-            err "$flag requires a release tag"
+            err "$flag requires a value"
         }
-        $Tag = $next
+        if ($flag -in '-v', '--version') {
+            $Tag = $next
+        } elseif ($flag -in '-b', '--branch') {
+            $Branch = $next
+        } else {
+            $Commit = $next
+        }
     } elseif ($arg -eq '-l' -or $arg -eq '--list') {
         $releases = Get-RemoteJson "https://api.github.com/repos/$Repo/releases?per_page=20"
         foreach ($release in @($releases)) {
@@ -144,7 +155,18 @@ while ($i -lt $scriptArgs.Count) {
     $i++
 }
 
-Need-Command tar
+if (@($Tag, $Branch, $Commit | Where-Object { $_ }).Count -gt 1) {
+    Show-Usage
+    err 'use one of --version, --branch and --commit'
+}
+
+$FromSource = [bool]($Branch -or $Commit)
+if ($FromSource) {
+    Need-Command git
+    Need-Command cargo
+} else {
+    Need-Command tar
+}
 
 $archEnv = $env:PROCESSOR_ARCHITECTURE
 $wowArch = $env:PROCESSOR_ARCHITEW6432
@@ -155,54 +177,120 @@ if ($archEnv -eq 'AMD64' -or $wowArch -eq 'AMD64') {
     err "windows builds ship for x86_64 only"
 }
 
-if (-not $Tag) {
-    $latest = Get-RemoteJson "https://api.github.com/repos/$Repo/releases/latest"
-    $Tag = [string]$latest.tag_name
-    if (-not $Tag) { err "no releases found at $Repo" }
-}
-if ($Tag -notmatch '^v[0-9]') {
-    err "invalid release tag: $Tag"
-}
-if ($Tag -notmatch '^[A-Za-z0-9._-]+$') {
-    err "invalid release tag: $Tag"
-}
-
-$Archive = "rustel_${Tag}_win32_${Arch}.tar.gz"
-$Url = "$BaseUrl/releases/download/$Tag/$Archive"
 $Bin = 'rustel.exe'
+$Revision = ''
 
-say "installing rustel $Tag (win32 $Arch)"
-if (-not (Test-Path -LiteralPath $BinDir)) {
-    New-Item -ItemType Directory -Path $BinDir | Out-Null
+if ($FromSource) {
+    $Name = $Commit
+    $Ref = $Commit
+    if ($Branch) {
+        $Name = $Branch
+        $Ref = "refs/heads/$Branch"
+    }
+    if ($Branch -notmatch '^[A-Za-z0-9._/-]*$') {
+        err "invalid branch name: $Branch"
+    }
+    # A shallow fetch finds a commit by its full hash only.
+    if ($Commit -cnotmatch '^[0-9a-f]*$') {
+        err "invalid commit hash: $Commit"
+    }
+    if ($Commit -and $Commit.Length -ne 40) {
+        err '--commit requires the full 40-character hash'
+    }
+} else {
+    if (-not $Tag) {
+        $latest = Get-RemoteJson "https://api.github.com/repos/$Repo/releases/latest"
+        $Tag = [string]$latest.tag_name
+        if (-not $Tag) { err "no releases found at $Repo" }
+    }
+    if ($Tag -notmatch '^v[0-9]') {
+        err "invalid release tag: $Tag"
+    }
+    if ($Tag -notmatch '^[A-Za-z0-9._-]+$') {
+        err "invalid release tag: $Tag"
+    }
 }
 
 $Tmp = $null
 $Stage = $null
 try {
-    $Tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("rustelup-" + [guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $Tmp | Out-Null
+    if ($FromSource) {
+        # Build in $SrcDir with the release profile. The checkout and its
+        # `target` directory stay, so the next build compiles the changes only.
+        $origin = 'built'
+        say "building rustel $Name from source (win32 $Arch)"
+        if (-not (Test-Path -LiteralPath (Join-Path $SrcDir '.git'))) {
+            & git init -q $SrcDir
+            if ($LASTEXITCODE -ne 0) { err "could not create $SrcDir" }
+        }
+        & git -C $SrcDir fetch --depth 1 "$BaseUrl.git" $Ref
+        if ($LASTEXITCODE -ne 0) { err "could not fetch $Name from $BaseUrl" }
+        & git -C $SrcDir checkout -q --detach FETCH_HEAD
+        if ($LASTEXITCODE -ne 0) { err "could not check out $Name in $SrcDir" }
+        # A local edit would build under the hash of the commit.
+        if (& git -C $SrcDir status --porcelain --untracked-files=no) {
+            err "$SrcDir has local changes"
+        }
+        $Revision = ([string](& git -C $SrcDir rev-parse HEAD)).Trim()
 
-    $archivePath = Join-Path $Tmp $Archive
-    $sidecarPath = Join-Path $Tmp ($Archive + '.sha256')
-    Invoke-RustelFetch $Url $archivePath "download failed: $Url"
-    Invoke-RustelFetch ($Url + '.sha256') $sidecarPath "checksum download failed: $Url.sha256"
-    Test-Sha256 $archivePath $sidecarPath
+        # rustup reads the pinned toolchain from the working directory.
+        # `--target` and `--target-dir` keep the binary in one place when the
+        # Cargo environment or configuration sets another. `rustel doctor`
+        # and session tapes report BUILD_REVISION.
+        $triple = ''
+        $built = $false
+        $env:BUILD_REVISION = $Revision
+        Push-Location -LiteralPath $SrcDir
+        try {
+            $triple = ([string](& rustc -vV | Where-Object { $_ -like 'host: *' })) -replace '^host: ', ''
+            if ($triple) {
+                & cargo build --locked --release -p rustel --target $triple --target-dir target
+                $built = ($LASTEXITCODE -eq 0)
+            }
+        } finally {
+            Pop-Location
+            Remove-Item Env:\BUILD_REVISION -ErrorAction SilentlyContinue
+        }
+        if (-not $triple) { err 'could not read the host target from rustc' }
+        if (-not $built) { err "build failed in $SrcDir" }
+        $newBin = Join-Path $SrcDir "target\$triple\release\$Bin"
+        if (-not (Test-Path -LiteralPath $newBin -PathType Leaf)) {
+            err "build did not produce $newBin"
+        }
+    } else {
+        $origin = 'downloaded'
+        $Archive = "rustel_${Tag}_win32_${Arch}.tar.gz"
+        $Url = "$BaseUrl/releases/download/$Tag/$Archive"
+        say "installing rustel $Tag (win32 $Arch)"
 
-    & tar.exe -xzf $archivePath -C $Tmp
-    if ($LASTEXITCODE -ne 0) { err "failed to extract $Archive" }
-    $extracted = Join-Path $Tmp $Bin
-    if (-not (Test-Path -LiteralPath $extracted -PathType Leaf)) {
-        err "archive did not contain $Bin"
+        $Tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("rustelup-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $Tmp | Out-Null
+
+        $archivePath = Join-Path $Tmp $Archive
+        $sidecarPath = Join-Path $Tmp ($Archive + '.sha256')
+        Invoke-RustelFetch $Url $archivePath "download failed: $Url"
+        Invoke-RustelFetch ($Url + '.sha256') $sidecarPath "checksum download failed: $Url.sha256"
+        Test-Sha256 $archivePath $sidecarPath
+
+        & tar.exe -xzf $archivePath -C $Tmp
+        if ($LASTEXITCODE -ne 0) { err "failed to extract $Archive" }
+        $newBin = Join-Path $Tmp $Bin
+        if (-not (Test-Path -LiteralPath $newBin -PathType Leaf)) {
+            err "archive did not contain $Bin"
+        }
     }
 
+    if (-not (Test-Path -LiteralPath $BinDir)) {
+        New-Item -ItemType Directory -Path $BinDir | Out-Null
+    }
     $stageName = '.rustelup.' + [guid]::NewGuid().ToString('N').Substring(0, 8)
     $Stage = Join-Path $BinDir $stageName
     New-Item -ItemType Directory -Path $Stage | Out-Null
     $staged = Join-Path $Stage $Bin
-    Copy-Item -LiteralPath $extracted -Destination $staged -Force
+    Copy-Item -LiteralPath $newBin -Destination $staged -Force
     & $staged --version > $null
     if ($LASTEXITCODE -ne 0) {
-        err "downloaded $Bin failed its version check"
+        err "$origin $Bin failed its version check"
     }
 
     $dest = Join-Path $BinDir $Bin
@@ -238,6 +326,7 @@ try {
         err "installed $Bin failed its version check and was removed"
     }
 
+    if ($Revision) { $version = "$version at " + $Revision.Substring(0, 12) }
     say "installed: $version"
     say "run 'rustel studio' to open the studio, or 'rustel' for the CLI"
     $pathMatch = ';' + $env:Path + ';'

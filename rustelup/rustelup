@@ -6,6 +6,7 @@ REPO="${RUSTELUP_REPO:-tzfm/rustel}"
 
 RUSTEL_DIR="${RUSTEL_DIR:-$HOME/.rustel}"
 BIN_DIR="$RUSTEL_DIR/bin"
+SRC_DIR="$RUSTEL_DIR/src"
 BASE_URL="https://github.com/$REPO"
 
 usage() {
@@ -16,9 +17,11 @@ USAGE:
     rustelup [OPTIONS]
 
 OPTIONS:
-    -v, --version TAG   Install a specific release tag (default: latest)
-    -l, --list          List available releases
-    -h, --help          Print this help
+    -v, --version TAG     Install a specific release tag (default: latest)
+    -b, --branch BRANCH   Build and install a branch from source
+    -c, --commit HASH     Build and install a commit from source
+    -l, --list            List available releases
+    -h, --help            Print this help
 USAGE
 }
 
@@ -51,20 +54,96 @@ verify_sha256() {
   [ "$expected" = "$actual" ] || err "checksum mismatch for $1"
 }
 
+# Download and verify the release archive for $TAG, or for the latest release.
+download_release() {
+  if [ -z "$TAG" ]; then
+    TAG="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+      | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*"\(v[^"]*\)"/\1/')"
+    [ -n "$TAG" ] || err "no releases found at $REPO"
+  fi
+  case "$TAG" in
+    v[0-9]*) ;;
+    *) err "invalid release tag: $TAG" ;;
+  esac
+  case "$TAG" in
+    *[!A-Za-z0-9._-]*) err "invalid release tag: $TAG" ;;
+  esac
+
+  local archive="rustel_${TAG}_${PLATFORM}_${ARCH}.tar.gz"
+  local url="$BASE_URL/releases/download/$TAG/$archive"
+
+  say "installing rustel $TAG ($PLATFORM $ARCH)"
+  curl -fL --progress-bar "$url" -o "$TMP/$archive" \
+    || err "download failed: $url"
+  curl -fsSL "$url.sha256" -o "$TMP/$archive.sha256" \
+    || err "checksum download failed: $url.sha256"
+  verify_sha256 "$TMP/$archive" "$TMP/$archive.sha256"
+  tar -xzf "$TMP/$archive" -C "$TMP"
+  [ -f "$TMP/$BIN" ] || err "archive did not contain $BIN"
+  NEW_BIN="$TMP/$BIN"
+}
+
+# Build $BRANCH or $COMMIT in $SRC_DIR with the release profile. The checkout
+# and its `target` directory stay, so the next build compiles the changes only.
+build_from_source() {
+  local name="${COMMIT:-$BRANCH}"
+  local ref="${COMMIT:-refs/heads/$BRANCH}"
+
+  case "$BRANCH" in
+    *[!A-Za-z0-9._/-]*) err "invalid branch name: $BRANCH" ;;
+  esac
+  # A shallow fetch finds a commit by its full hash only.
+  case "$COMMIT" in
+    *[!0-9a-f]*) err "invalid commit hash: $COMMIT" ;;
+  esac
+  [ -z "$COMMIT" ] || [ "${#COMMIT}" -eq 40 ] \
+    || err "--commit requires the full 40-character hash"
+
+  say "building rustel $name from source ($PLATFORM $ARCH)"
+  [ -d "$SRC_DIR/.git" ] || git init -q "$SRC_DIR"
+  git -C "$SRC_DIR" fetch --depth 1 "$BASE_URL.git" "$ref" \
+    || err "could not fetch $name from $BASE_URL"
+  git -C "$SRC_DIR" checkout -q --detach FETCH_HEAD \
+    || err "could not check out $name in $SRC_DIR"
+  # A local edit would build under the hash of the commit.
+  [ -z "$(git -C "$SRC_DIR" status --porcelain --untracked-files=no)" ] \
+    || err "$SRC_DIR has local changes"
+  REVISION="$(git -C "$SRC_DIR" rev-parse HEAD)"
+  # rustup reads the pinned toolchain from the working directory. `--target`
+  # and `--target-dir` keep the binary in one place when the Cargo
+  # environment or configuration sets another. `rustel doctor` and session
+  # tapes report BUILD_REVISION.
+  local triple
+  triple="$(cd "$SRC_DIR" && rustc -vV | sed -n 's/^host: //p')" \
+    && [ -n "$triple" ] || err "could not read the host target from rustc"
+  (cd "$SRC_DIR" && BUILD_REVISION="$REVISION" \
+    cargo build --locked --release -p rustel --target "$triple" --target-dir target) \
+    || err "build failed in $SRC_DIR"
+  NEW_BIN="$SRC_DIR/target/$triple/release/$BIN"
+  [ -f "$NEW_BIN" ] || err "build did not produce $NEW_BIN"
+}
+
 TAG=""
+BRANCH=""
+COMMIT=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    -v|--version)
+    -v|--version|-b|--branch|-c|--commit)
       flag="$1"
       shift
-      # An empty tag would select the latest release below. Refuse it, a missing
-      # argument, or another option: release tags never start with `-`.
+      # An empty value would select the latest release below. Refuse it, a
+      # missing argument, or another option: no tag, branch or hash starts
+      # with `-`.
       case "${1-}" in
         ""|-*)
           usage
-          err "$flag requires a release tag" ;;
+          err "$flag requires a value" ;;
       esac
-      TAG="$1" ;;
+      case "$flag" in
+        -v|--version) TAG="$1" ;;
+        -b|--branch) BRANCH="$1" ;;
+        *) COMMIT="$1" ;;
+      esac ;;
     -l|--list)
       need_cmd curl
       curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=20" \
@@ -76,8 +155,18 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-need_cmd curl
-need_cmd tar
+case "${TAG:+x}${BRANCH:+x}${COMMIT:+x}" in
+  xx*) usage; err "use one of --version, --branch and --commit" ;;
+esac
+
+SOURCE="$BRANCH$COMMIT"
+if [ -n "$SOURCE" ]; then
+  need_cmd git
+  need_cmd cargo
+else
+  need_cmd curl
+  need_cmd tar
+fi
 
 PLATFORM="$(uname -s)"
 case "$PLATFORM" in
@@ -97,26 +186,9 @@ if [ "$PLATFORM" = "win32" ] && [ "$ARCH" != "amd64" ]; then
   err "windows builds ship for x86_64 only"
 fi
 
-if [ -z "$TAG" ]; then
-  TAG="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-    | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*"\(v[^"]*\)"/\1/')"
-  [ -n "$TAG" ] || err "no releases found at $REPO"
-fi
-case "$TAG" in
-  v[0-9]*) ;;
-  *) err "invalid release tag: $TAG" ;;
-esac
-case "$TAG" in
-  *[!A-Za-z0-9._-]*) err "invalid release tag: $TAG" ;;
-esac
-
-ARCHIVE="rustel_${TAG}_${PLATFORM}_${ARCH}.tar.gz"
-URL="$BASE_URL/releases/download/$TAG/$ARCHIVE"
 BIN="rustel"
 [ "$PLATFORM" = "win32" ] && BIN="rustel.exe"
 
-say "installing rustel $TAG ($PLATFORM $ARCH)"
-mkdir -p "$BIN_DIR"
 TMP="$(mktemp -d)"
 STAGE=""
 cleanup() {
@@ -124,18 +196,22 @@ cleanup() {
   [ -z "$STAGE" ] || rm -rf "$STAGE"
 }
 trap cleanup EXIT
-curl -fL --progress-bar "$URL" -o "$TMP/$ARCHIVE" \
-  || err "download failed: $URL"
-curl -fsSL "$URL.sha256" -o "$TMP/$ARCHIVE.sha256" \
-  || err "checksum download failed: $URL.sha256"
-verify_sha256 "$TMP/$ARCHIVE" "$TMP/$ARCHIVE.sha256"
-tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
-[ -f "$TMP/$BIN" ] || err "archive did not contain $BIN"
+
+REVISION=""
+if [ -n "$SOURCE" ]; then
+  ORIGIN="built"
+  build_from_source
+else
+  ORIGIN="downloaded"
+  download_release
+fi
+
+mkdir -p "$BIN_DIR"
 STAGE="$(mktemp -d "$BIN_DIR/.rustelup.XXXXXXXX")"
-cp "$TMP/$BIN" "$STAGE/$BIN"
+cp "$NEW_BIN" "$STAGE/$BIN"
 chmod +x "$STAGE/$BIN"
 "$STAGE/$BIN" --version >/dev/null \
-  || err "downloaded $BIN failed its version check"
+  || err "$ORIGIN $BIN failed its version check"
 [ ! -e "$BIN_DIR/$BIN" ] || cp -p "$BIN_DIR/$BIN" "$STAGE/previous"
 if ! mv -f "$STAGE/$BIN" "$BIN_DIR/$BIN"; then
   if [ -f "$STAGE/previous" ] && [ ! -e "$BIN_DIR/$BIN" ]; then
@@ -152,6 +228,7 @@ if ! VERSION="$("$BIN_DIR/$BIN" --version 2>/dev/null)"; then
   err "installed $BIN failed its version check and was removed"
 fi
 
+[ -z "$REVISION" ] || VERSION="$VERSION at ${REVISION:0:12}"
 say "installed: $VERSION"
 say "run 'rustel studio' to open the studio, or 'rustel' for the CLI"
 case ":$PATH:" in
