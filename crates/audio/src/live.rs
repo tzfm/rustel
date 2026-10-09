@@ -97,7 +97,7 @@ pub struct LiveScalarBackend {
     held: Option<QueuedAudioEvent>,
     generation: u64,
     sample_rate: u32,
-    /// Frames of the stop declick already rendered; `None` once complete.
+    /// Frames of the stop ramp already rendered; `None` while not stopped.
     /// A counter is required because hosts may deliver any block size.
     stop_fade_pos: Option<usize>,
     /// The last onset whose sidechain was armed at ring intake, so re-held
@@ -446,6 +446,21 @@ impl LiveScalarBackend {
         self.generation
     }
 
+    /// Length of the stop ramp in frames: 10 ms.
+    fn stop_ramp_frames(&self) -> usize {
+        (self.sample_rate / 100).max(1) as usize
+    }
+
+    /// True from the block which ends the stop ramp and clears the voices,
+    /// until the first block after the flag clears.
+    ///
+    /// A host waits for this before closing its stream. A stream closed
+    /// earlier cuts the ramp and leaves a step in the output.
+    pub fn stop_ramp_complete(&self) -> bool {
+        self.stop_fade_pos
+            .is_some_and(|rendered| rendered >= self.stop_ramp_frames())
+    }
+
     /// Consume one stereo block at an absolute sample-clock position.
     ///
     /// Besides the event `ring`, it reads the producer's side of the
@@ -462,6 +477,10 @@ impl LiveScalarBackend {
     /// after the last event has been judged still retires the onsets it
     /// replaces before DSP runs, and its restart floor lands on the next
     /// block, whose drain carries the replacement's events.
+    ///
+    /// The stop ramp carries across blocks shorter than 10 ms and runs to
+    /// its end also when `stopped` clears inside the ramp.
+    /// [`Self::stop_ramp_complete`] tells a host when to close its stream.
     pub fn process_block_with(
         &mut self,
         output: &mut [f32],
@@ -494,13 +513,21 @@ impl LiveScalarBackend {
                 consumer.begin_block(start_frame, start_frame.saturating_add(frames as u64));
             }
         }
-        if is_stopped {
+        // A stop runs its whole ramp, also when the flag clears inside the
+        // ramp. The voices then end on zero and never return at full level.
+        let fade_total = self.stop_ramp_frames();
+        let ramping = self
+            .stop_fade_pos
+            .is_some_and(|rendered| rendered < fade_total);
+        if is_stopped || ramping {
             self.held = None;
             // Ramp running voices to exactly zero over 10 ms, carrying the
             // fade across as many host blocks as necessary.
-            let fade_total = (self.sample_rate / 100).max(1) as usize;
             let fade_pos = self.stop_fade_pos.get_or_insert(0);
             if *fade_pos < fade_total {
+                // A stop admits nothing: an onset still pending must not
+                // start a voice under the ramp.
+                self.scalar.retire_pending_at(start_frame);
                 self.scalar.process_block(&mut output[..samples], frames);
                 for frame in 0..frames {
                     let position = *fade_pos + frame;
@@ -514,11 +541,16 @@ impl LiveScalarBackend {
                 }
                 *fade_pos += frames;
             }
-            // reset_at is idempotent-cheap once voices are gone (orbit lines
-            // clear only while still active), so the clock stays aligned for
-            // hosts that resume without tearing the device down.
-            self.scalar
-                .reset_at(start_frame.saturating_add(frames as u64));
+            // The voices live until the ramp ends. A reset after the first
+            // block would end a 10 ms ramp at the block edge with a step.
+            // After the ramp, reset_at runs on every stopped block. The
+            // call is cheap once the voices are gone (orbit lines clear only
+            // while still active) and keeps the clock aligned for a host
+            // which resumes without tearing the device down.
+            if *fade_pos >= fade_total {
+                self.scalar
+                    .reset_at(start_frame.saturating_add(frames as u64));
+            }
             return LiveBlockReport::default();
         }
         self.stop_fade_pos = None;

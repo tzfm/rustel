@@ -129,7 +129,9 @@ results   <------  diagnostics                    interleaved stereo f32
 
 The example pre-fills one fixed window and has no live reload or transport UI.
 A complete player must keep scheduling ahead and coordinate generation flips
-and stop/restart with the audio consumer.
+and stop/restart with the audio consumer. After you set the stop flag, keep
+calling `process_block_with` until `stop_ramp_complete()` returns true, then
+close the stream. The stop fades the sound over 10 ms.
 
 Hosts can lower the per-query event limit with
 `Session::set_query_hap_budget(limit)`. The limit must be between 1 and
