@@ -54,6 +54,42 @@ fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
     a
 }
 
+/// Components below this magnitude take the 64-bit path.
+///
+/// A product of two such values is below 2^62, and a sum of two such
+/// products fits in `i64`. The 64-bit path therefore needs no overflow check
+/// and no 128-bit multiply or divide.
+///
+/// A cycle time on the 1/1000 query grid stays below the limit for about
+/// 2.1 million cycles. A time from `from_f64` has a denominator up to 10^7
+/// and passes the limit after about 214 cycles. Such values take the `i128`
+/// path.
+const SMALL_LIMIT: i128 = 1 << 31;
+
+#[inline]
+fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a
+}
+
+/// Reduce a numerator and a positive denominator from the 64-bit path.
+#[inline]
+fn reduced_small(n: i64, d: i64) -> Fraction {
+    debug_assert!(d > 0);
+    if n == 0 {
+        return Fraction::ZERO;
+    }
+    let divisor = gcd_u64(n.unsigned_abs(), d as u64) as i64;
+    Fraction {
+        n: i128::from(n / divisor),
+        d: i128::from(d / divisor),
+    }
+}
+
 fn gcd_biguint(mut a: BigUint, mut b: BigUint) -> BigUint {
     while b != BigUint::from(0u8) {
         let remainder = &a % &b;
@@ -315,6 +351,13 @@ impl Fraction {
         Fraction { n, d: 1 }
     }
 
+    /// Both components as `i64` when each is below [`SMALL_LIMIT`].
+    #[inline]
+    fn small(self) -> Option<(i64, i64)> {
+        (self.n > -SMALL_LIMIT && self.n < SMALL_LIMIT && self.d < SMALL_LIMIT)
+            .then_some((self.n as i64, self.d as i64))
+    }
+
     #[inline]
     pub const fn numer(&self) -> i128 {
         self.n
@@ -399,6 +442,9 @@ impl Fraction {
     /// Exact addition, returning `None` if the reduced result cannot fit in
     /// `i128` components.
     pub fn checked_add(self, o: Self) -> Option<Self> {
+        if let (Some((n, d)), Some((on, od))) = (self.small(), o.small()) {
+            return Some(reduced_small(n * od + on * d, d * od));
+        }
         let native = || {
             let divisor = gcd_u128(self.d as u128, o.d as u128) as i128;
             let left_scale = o.d / divisor;
@@ -421,6 +467,9 @@ impl Fraction {
     /// Checked exact subtraction; unlike `self.add(o.neg())`, this can inspect
     /// `i128::MIN` without first negating it.
     pub fn checked_sub(self, o: Self) -> Option<Self> {
+        if let (Some((n, d)), Some((on, od))) = (self.small(), o.small()) {
+            return Some(reduced_small(n * od - on * d, d * od));
+        }
         let native = || {
             let divisor = gcd_u128(self.d as u128, o.d as u128) as i128;
             let left_scale = o.d / divisor;
@@ -440,8 +489,12 @@ impl Fraction {
         })
     }
 
-    /// Checked multiplication with cross-cancellation before either product.
+    /// Checked multiplication. The `i128` path cancels across the operands
+    /// before either product.
     pub fn checked_mul(self, o: Self) -> Option<Self> {
+        if let (Some((n, d)), Some((on, od))) = (self.small(), o.small()) {
+            return Some(reduced_small(n * on, d * od));
+        }
         let left_cancel = gcd_u128(self.n.unsigned_abs(), o.d as u128);
         let right_cancel = gcd_u128(o.n.unsigned_abs(), self.d as u128);
         let left_n = div_signed_by_u128(self.n, left_cancel)?;
@@ -451,14 +504,24 @@ impl Fraction {
         checked_normalised(left_n.checked_mul(right_n)?, left_d.checked_mul(right_d)?)
     }
 
-    /// Checked division with cross-cancellation. `None` includes division by
-    /// zero and an exact result outside the native `i128/i128` representation.
+    /// Checked division, with cross-cancellation on the `i128` path. `None`
+    /// includes division by zero and an exact result outside the native
+    /// `i128/i128` representation.
     pub fn checked_div(self, o: Self) -> Option<Self> {
         if o.n == 0 {
             return None;
         }
         if self.n == 0 {
             return Some(Fraction::ZERO);
+        }
+        if let (Some((n, d)), Some((on, od))) = (self.small(), o.small()) {
+            // The divisor's sign moves to the numerator.
+            let (numerator, denominator) = (n * od, d * on);
+            return Some(if denominator < 0 {
+                reduced_small(-numerator, -denominator)
+            } else {
+                reduced_small(numerator, denominator)
+            });
         }
         let numerator_cancel = gcd_u128(self.n.unsigned_abs(), o.n.unsigned_abs());
         let denominator_cancel = gcd_u128(self.d as u128, o.d as u128);
@@ -579,6 +642,12 @@ impl Fraction {
     /// Rounds toward negative infinity: `(-1/4).floor() == -1`, so negative
     /// times map to the start of their containing cycle.
     pub fn floor(self) -> Self {
+        if let Some((n, d)) = self.small() {
+            return Fraction {
+                n: i128::from(n.div_euclid(d)),
+                d: 1,
+            };
+        }
         let q = self.n.div_euclid(self.d);
         Fraction { n: q, d: 1 }
     }
@@ -712,7 +781,10 @@ impl PartialOrd for Fraction {
 
 impl Ord for Fraction {
     fn cmp(&self, o: &Self) -> Ordering {
-        // Cross-multiply on the ordinary path; both denominators are positive
+        if let (Some((n, d)), Some((on, od))) = (self.small(), o.small()) {
+            return (n * od).cmp(&(on * d));
+        }
+        // Cross-multiply on the `i128` path; both denominators are positive
         // by normalisation. Fall back to the exact continued-fraction compare
         // when either product is outside i128.
         match (self.n.checked_mul(o.d), o.n.checked_mul(self.d)) {
