@@ -1318,7 +1318,7 @@ impl LiveFileProducer {
 
     /// Advance continuous playback without polling or applying file changes.
     ///
-    /// Plain `rustel FILE` and `rustel FILE --watch` share the exact same
+    /// `rustel play FILE` and `rustel play FILE --watch` share the exact same
     /// scheduling/back-pressure path; only the latter is allowed to produce a
     /// replacement generation. Keeping this distinction here prevents plain
     /// playback from becoming an undocumented watcher merely because it uses

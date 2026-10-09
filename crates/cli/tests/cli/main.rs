@@ -475,7 +475,7 @@ fn query_time_cli_cases(
             QUERY_TIME_RUNAWAY.into(),
         ],
         vec![
-            "play".into(),
+            "trace".into(),
             "--json".into(),
             "-e".into(),
             QUERY_TIME_RUNAWAY.into(),
@@ -503,6 +503,7 @@ fn query_time_cli_cases(
             "1".into(),
         ],
         vec![
+            "play".into(),
             score.to_string_lossy().into_owned(),
             "-vvv".into(),
             "--export".into(),
@@ -1008,7 +1009,7 @@ fn stepwise_query_and_play_keep_exact_window_sensitive_output() {
         "CLI query did not select factor two when the window begins at cycle one"
     );
 
-    let play = ok_stdout(&["play", "--json", "-e", SOURCE, "--duration", "4"]);
+    let play = ok_stdout(&["trace", "--json", "-e", SOURCE, "--duration", "4"]);
     let play: serde_json::Value = serde_json::from_str(&play).expect("stepwise play JSON");
     let onsets = play["onsets"]
         .as_array()
@@ -1166,7 +1167,7 @@ fn canonical_take_drop_scalar_forms_emit_exact_cli_haps() {
     }
 
     let play_view = |source: &str| {
-        let out = ok_stdout(&["play", "--json", "-e", source, "--duration", "2"]);
+        let out = ok_stdout(&["trace", "--json", "-e", source, "--duration", "2"]);
         let json: serde_json::Value = serde_json::from_str(&out).expect("scalar play JSON");
         json["onsets"]
             .as_array()
@@ -1269,7 +1270,7 @@ fn raw_take_drop_reach_cli_query_play_without_stepwise_expansion_charge() {
             "{source}: CLI raw take/drop query timing changed"
         );
 
-        let play = ok_stdout(&["play", "--json", "-e", source, "--duration", "2"]);
+        let play = ok_stdout(&["trace", "--json", "-e", source, "--duration", "2"]);
         let play: serde_json::Value = serde_json::from_str(&play).expect("raw take/drop play JSON");
         assert_eq!(
             play["onsets"]
@@ -1372,7 +1373,7 @@ fn raw_extend_replicate_reach_cli_query_play_without_stepwise_expansion_charge()
             "{name}: CLI query timing changed"
         );
 
-        let play = ok_stdout(&["play", "--json", "-e", &source, "--duration", "2"]);
+        let play = ok_stdout(&["trace", "--json", "-e", &source, "--duration", "2"]);
         let play: serde_json::Value =
             serde_json::from_str(&play).expect("raw extend/replicate play JSON");
         assert_eq!(
@@ -1471,7 +1472,7 @@ fn raw_expand_contract_and_with_steps_reach_cli_query_play_without_charge() {
             "{name}: CLI query timing changed"
         );
 
-        let play = ok_stdout(&["play", "--json", "-e", &source, "--duration", "2"]);
+        let play = ok_stdout(&["trace", "--json", "-e", &source, "--duration", "2"]);
         let play: serde_json::Value = serde_json::from_str(&play).expect("raw metadata play JSON");
         assert_eq!(
             play["onsets"]
@@ -1564,7 +1565,7 @@ fn raw_range_pair_reaches_cli_query_play_without_resource_charge() {
             "{name}: CLI raw range query changed"
         );
 
-        let play = ok_stdout(&["play", "--json", "-e", &source, "--duration", "2"]);
+        let play = ok_stdout(&["trace", "--json", "-e", &source, "--duration", "2"]);
         let play: serde_json::Value = serde_json::from_str(&play).expect("raw range play JSON");
         assert_eq!(
             play["onsets"]
@@ -1644,7 +1645,7 @@ fn raw_apply_reaches_cli_query_play_and_preserves_nested_resource_limits() {
         "CLI raw apply query changed"
     );
 
-    let play = ok_stdout(&["play", "--json", "-e", source, "--duration", "2"]);
+    let play = ok_stdout(&["trace", "--json", "-e", source, "--duration", "2"]);
     let play: serde_json::Value = serde_json::from_str(&play).expect("raw apply play JSON");
     assert_eq!(
         play["onsets"]
@@ -1762,7 +1763,7 @@ fn raw_when_reaches_cli_branches_and_preserves_nested_resource_limits() {
         "CLI raw when query changed"
     );
 
-    let play = ok_stdout(&["play", "--json", "-e", source, "--duration", "2"]);
+    let play = ok_stdout(&["trace", "--json", "-e", source, "--duration", "2"]);
     let play: serde_json::Value = serde_json::from_str(&play).expect("raw when play JSON");
     assert_eq!(
         play["onsets"]
@@ -1891,7 +1892,7 @@ fn raw_never_always_reach_cli_and_preserve_selected_resource_limits() {
         "CLI raw never/always query changed"
     );
 
-    let play = ok_stdout(&["play", "--json", "-e", source, "--duration", "2"]);
+    let play = ok_stdout(&["trace", "--json", "-e", source, "--duration", "2"]);
     let play: serde_json::Value = serde_json::from_str(&play).expect("raw never/always play JSON");
     assert_eq!(
         play["onsets"]
@@ -2020,7 +2021,7 @@ fn raw_swing_reaches_cli_query_play_and_preserves_existing_resource_attribution(
         "CLI raw swing query changed"
     );
 
-    let play = ok_stdout(&["play", "--json", "-e", source, "--duration", "2"]);
+    let play = ok_stdout(&["trace", "--json", "-e", source, "--duration", "2"]);
     let play: serde_json::Value = serde_json::from_str(&play).expect("raw swing play JSON");
     assert_eq!(
         play["onsets"]
@@ -2154,7 +2155,7 @@ fn raw_signal_quartet_reaches_cli_query_play_and_preserves_nested_attribution() 
             "{raw_name}: CLI scalar RNG query changed"
         );
 
-        let play = ok_stdout(&["play", "--json", "-e", &source, "--duration", "4"]);
+        let play = ok_stdout(&["trace", "--json", "-e", &source, "--duration", "4"]);
         let play: serde_json::Value = serde_json::from_str(&play)
             .unwrap_or_else(|error| panic!("{raw_name}: CLI play JSON: {error}"));
         assert_eq!(
@@ -2273,7 +2274,7 @@ fn raw_set_reaches_cli_query_play_and_preserves_source_resource_attribution() {
         "CLI raw set query changed"
     );
 
-    let play = ok_stdout(&["play", "--json", "-e", SOURCE, "--duration", "4"]);
+    let play = ok_stdout(&["trace", "--json", "-e", SOURCE, "--duration", "4"]);
     let play: serde_json::Value = serde_json::from_str(&play).expect("raw set CLI play JSON");
     assert_eq!(
         play["onsets"]
@@ -2381,7 +2382,7 @@ fn raw_keep_reaches_cli_query_play_without_executing_ignored_graphs() {
         "CLI raw keep query changed or executed its ignored graph"
     );
 
-    let play = ok_stdout(&["play", "--json", "-e", SOURCE, "--duration", "4"]);
+    let play = ok_stdout(&["trace", "--json", "-e", SOURCE, "--duration", "4"]);
     let play: serde_json::Value = serde_json::from_str(&play).expect("raw keep CLI play JSON");
     assert_eq!(
         play["onsets"]
@@ -2506,7 +2507,7 @@ fn raw_keepif_reaches_cli_query_play_and_preserves_source_resource_attribution()
         "CLI raw keepif false values did not serialize as null"
     );
 
-    let play = ok_stdout(&["play", "--json", "-e", FALSE_SOURCE, "--duration", "4"]);
+    let play = ok_stdout(&["trace", "--json", "-e", FALSE_SOURCE, "--duration", "4"]);
     let play: serde_json::Value = serde_json::from_str(&play).expect("raw keepif CLI play JSON");
     assert_eq!(
         play["onsets"]
@@ -2648,7 +2649,7 @@ fn raw_eqt_reaches_cli_query_play_and_preserves_source_resource_attribution() {
         "CLI raw eqt values changed"
     );
 
-    let play = ok_stdout(&["play", "--json", "-e", SOURCE, "--duration", "4"]);
+    let play = ok_stdout(&["trace", "--json", "-e", SOURCE, "--duration", "4"]);
     let play: serde_json::Value = serde_json::from_str(&play).expect("raw eqt CLI play JSON");
     assert_eq!(
         play["onsets"]
@@ -2773,7 +2774,7 @@ fn raw_net_reaches_cli_query_play_and_preserves_source_resource_attribution() {
         "CLI raw net values changed"
     );
 
-    let play = ok_stdout(&["play", "--json", "-e", SOURCE, "--duration", "4"]);
+    let play = ok_stdout(&["trace", "--json", "-e", SOURCE, "--duration", "4"]);
     let play: serde_json::Value = serde_json::from_str(&play).expect("raw net CLI play JSON");
     assert_eq!(
         play["onsets"]
@@ -2892,7 +2893,7 @@ fn raw_and_reaches_cli_query_play_and_preserves_source_resource_attribution() {
         "CLI raw and values changed"
     );
 
-    let play = ok_stdout(&["play", "--json", "-e", SOURCE, "--duration", "4"]);
+    let play = ok_stdout(&["trace", "--json", "-e", SOURCE, "--duration", "4"]);
     let play: serde_json::Value = serde_json::from_str(&play).expect("raw and CLI play JSON");
     assert_eq!(
         play["onsets"]
@@ -3012,7 +3013,7 @@ fn raw_or_reaches_cli_query_play_and_preserves_source_resource_attribution() {
         "CLI raw or values changed"
     );
 
-    let play = ok_stdout(&["play", "--json", "-e", SOURCE, "--duration", "4"]);
+    let play = ok_stdout(&["trace", "--json", "-e", SOURCE, "--duration", "4"]);
     let play: serde_json::Value = serde_json::from_str(&play).expect("raw or CLI play JSON");
     assert_eq!(
         play["onsets"]
@@ -3100,7 +3101,7 @@ fn canonical_take_drop_patterned_windows_reach_cli_query_and_play() {
         query(TAKE, "1", "2"),
         ["[ 1/1 → 3/2 | 0 ]", "[ 3/2 → 2/1 | 1 ]"]
     );
-    let take_play = ok_stdout(&["play", "--json", "-e", TAKE, "--duration", "4"]);
+    let take_play = ok_stdout(&["trace", "--json", "-e", TAKE, "--duration", "4"]);
     let take_play: serde_json::Value = serde_json::from_str(&take_play).expect("take play JSON");
     let take_onsets = take_play["onsets"]
         .as_array()
@@ -3137,7 +3138,7 @@ fn canonical_take_drop_patterned_windows_reach_cli_query_and_play() {
         ]
     );
     assert_eq!(query(DROP, "1", "2"), ["[ 1/1 → 2/1 | 2 ]"]);
-    let drop_play = ok_stdout(&["play", "--json", "-e", DROP, "--duration", "4"]);
+    let drop_play = ok_stdout(&["trace", "--json", "-e", DROP, "--duration", "4"]);
     let drop_play: serde_json::Value = serde_json::from_str(&drop_play).expect("drop play JSON");
     let drop_onsets = drop_play["onsets"]
         .as_array()
@@ -3426,7 +3427,7 @@ fn canonical_pair_forms_emit_exact_cli_query_and_play_products() {
             ],
         ),
     ] {
-        let out = ok_stdout(&["play", "--json", "-e", source, "--duration", "2"]);
+        let out = ok_stdout(&["trace", "--json", "-e", source, "--duration", "2"]);
         let json: serde_json::Value = serde_json::from_str(&out).expect("pair play JSON");
         assert_eq!(
             json["onsets"]
@@ -3526,7 +3527,7 @@ fn raw_shrink_grow_reach_cli_query_play_and_typed_resource_products() {
             expected,
             "{source}: CLI raw query timing changed"
         );
-        let out = ok_stdout(&["play", "--json", "-e", source, "--duration", "2"]);
+        let out = ok_stdout(&["trace", "--json", "-e", source, "--duration", "2"]);
         let json: serde_json::Value = serde_json::from_str(&out).expect("raw play JSON");
         assert_eq!(
             json["onsets"]
@@ -3613,7 +3614,7 @@ fn patterned_mutable_shrinklist_dispatch_reaches_cli_query_and_play() {
     }
 
     let source = source("shrink");
-    let out = ok_stdout(&["play", "--json", "-e", &source, "--duration", "2"]);
+    let out = ok_stdout(&["trace", "--json", "-e", &source, "--duration", "2"]);
     let json: serde_json::Value = serde_json::from_str(&out).expect("mutable play JSON");
     let onsets = json["onsets"].as_array().expect("mutable play onsets");
     assert!(!onsets.is_empty(), "mutable canonical CLI play was silent");
@@ -3641,7 +3642,7 @@ fn canonical_shrink_grow_patterned_windows_reach_cli_query_and_play() {
             .collect::<Vec<_>>()
     };
     let onset_view = |source: &str| {
-        let out = ok_stdout(&["play", "--json", "-e", source, "--duration", "4"]);
+        let out = ok_stdout(&["trace", "--json", "-e", source, "--duration", "4"]);
         let json: serde_json::Value = serde_json::from_str(&out).expect("play JSON");
         json["onsets"]
             .as_array()
@@ -3962,7 +3963,7 @@ fn canonical_tour_forms_reach_cli_query_play_and_the_documented_example() {
         );
     }
 
-    let play = ok_stdout(&["play", "--json", "-e", forms[0], "--duration", "2"]);
+    let play = ok_stdout(&["trace", "--json", "-e", forms[0], "--duration", "2"]);
     let play: serde_json::Value = serde_json::from_str(&play).expect("tour play JSON");
     assert_eq!(
         play["onsets"]
@@ -4045,7 +4046,7 @@ fn canonical_stepalt_and_s_alt_reach_cli_query_play_and_the_documented_example()
         );
     }
 
-    let play = ok_stdout(&["play", "--json", "-e", forms[0], "--duration", "2"]);
+    let play = ok_stdout(&["trace", "--json", "-e", forms[0], "--duration", "2"]);
     let play: serde_json::Value = serde_json::from_str(&play).expect("stepalt play JSON");
     assert_eq!(
         play["onsets"]
@@ -4153,7 +4154,7 @@ fn canonical_polymeter_aliases_reach_cli_query_play_and_the_documented_example()
         "CLI legacy polymeter used modern LCM pacing"
     );
 
-    let play = ok_stdout(&["play", "--json", "-e", modern_forms[0], "--duration", "2"]);
+    let play = ok_stdout(&["trace", "--json", "-e", modern_forms[0], "--duration", "2"]);
     let play: serde_json::Value = serde_json::from_str(&play).expect("polymeter play JSON");
     assert_eq!(
         play["onsets"]
@@ -4232,7 +4233,7 @@ fn canonical_zip_and_s_zip_reach_cli_query_play_and_the_documented_example() {
         );
     }
 
-    let play = ok_stdout(&["play", "--json", "-e", forms[0], "--duration", "2"]);
+    let play = ok_stdout(&["trace", "--json", "-e", forms[0], "--duration", "2"]);
     let play: serde_json::Value = serde_json::from_str(&play).expect("zip play JSON");
     assert_eq!(
         play["onsets"]
@@ -4322,7 +4323,7 @@ fn shrinklist_growlist_and_s_taperlist_reach_cli_query_and_play() {
         "CLI growlist did not reverse the same helper Array"
     );
 
-    let play = ok_stdout(&["play", "--json", "-e", SHRINK, "--duration", "2"]);
+    let play = ok_stdout(&["trace", "--json", "-e", SHRINK, "--duration", "2"]);
     let play: serde_json::Value = serde_json::from_str(&play).expect("shrinklist play JSON");
     assert_eq!(
         play["onsets"]
@@ -4766,7 +4767,7 @@ fn iter_and_chunk_at_the_limit_still_play() {
 
 #[test]
 fn play_emits_an_onset_timeline_without_requesting_device_audio() {
-    let out = ok_stdout(&["play", "--json", "-e", r#"s("bd sd")"#, "--duration", "2"]);
+    let out = ok_stdout(&["trace", "--json", "-e", r#"s("bd sd")"#, "--duration", "2"]);
     let json: serde_json::Value = serde_json::from_str(&out).expect("json");
     assert_eq!(
         json["device_audio"], "not-requested",
@@ -4786,7 +4787,7 @@ fn play_emits_an_onset_timeline_without_requesting_device_audio() {
 #[cfg(not(feature = "device-audio"))]
 fn device_audio_request_is_explicit_when_the_default_build_omits_it() {
     let out = run(&[
-        "play",
+        "trace",
         "--json",
         "-e",
         r#"note("c4")"#,
@@ -4813,7 +4814,7 @@ fn live_watch_request_is_explicit_when_device_audio_is_not_compiled() {
     let path = scratch("watch-device-unavailable.js");
     std::fs::write(&path, r#"note("c4")"#).expect("write watch source");
     let out = run(&[
-        "play",
+        "trace",
         "--json",
         path.to_str().expect("utf-8 path"),
         "--watch",
@@ -4835,8 +4836,8 @@ fn live_watch_request_is_explicit_when_device_audio_is_not_compiled() {
 #[test]
 fn live_watch_requires_a_rereadable_file_and_has_no_finite_duration() {
     for args in [
-        vec!["play", "--json", "--watch", "--device-audio"],
-        vec!["play", "--json", "-", "--watch", "--device-audio"],
+        vec!["trace", "--json", "--watch", "--device-audio"],
+        vec!["trace", "--json", "-", "--watch", "--device-audio"],
     ] {
         let out = run(&args);
         assert_eq!(out.status.code(), Some(1), "{args:?}");
@@ -4855,7 +4856,7 @@ fn live_watch_requires_a_rereadable_file_and_has_no_finite_duration() {
     let path = scratch("watch-duration-conflict.js");
     std::fs::write(&path, r#"note("c4")"#).expect("write watch source");
     let out = run(&[
-        "play",
+        "trace",
         "--json",
         path.to_str().expect("utf-8 path"),
         "--watch",
@@ -4916,6 +4917,7 @@ fn a_virtual_midi_port_is_refused_for_an_offline_export() {
     let output = scratch("virtual-midi-export.wav");
     std::fs::write(&score, "note('c4')").expect("write score");
     let result = run(&[
+        "play",
         score.to_str().expect("UTF-8 score"),
         "--export",
         output.to_str().expect("UTF-8 output"),
@@ -4946,7 +4948,7 @@ fn a_virtual_midi_port_is_refused_for_an_offline_export() {
 fn play_does_not_panic_for_host_required_sources() {
     // In-process tests cover routing; the subprocess verifies the exit code.
     for source in HOST_REQUIRED_SOURCES {
-        let out = run(&["play", "--json", "-e", source, "--duration", "2"]);
+        let out = run(&["trace", "--json", "-e", source, "--duration", "2"]);
         assert_ne!(
             out.status.code(),
             Some(101),
@@ -5047,6 +5049,7 @@ fn the_bounce_success_line_names_the_sample_rate_without_truncating_it() {
     let out = scratch("rate-44100-export.wav");
     std::fs::write(&score, r#"note("c4").gain(0.2)"#).expect("write score");
     let stdout = ok_stdout(&[
+        "play",
         score.to_str().expect("UTF-8 score"),
         "--export",
         out.to_str().expect("UTF-8 output"),
@@ -5198,6 +5201,7 @@ fn musician_export_is_a_deterministic_audible_wav_and_cycles_control_length() {
 
     for output in [&first, &second] {
         let args = [
+            "play",
             score.to_str().expect("UTF-8 score"),
             "-vvv",
             "--export",
@@ -5286,6 +5290,7 @@ fn an_export_whose_score_threw_fails_the_exit_status() {
             let _ = std::fs::remove_file(&out);
             assert_reported_failure(
                 &[
+                    "play",
                     score_path.to_str().expect("UTF-8 score"),
                     "--export",
                     out.to_str().expect("UTF-8 output"),
@@ -5398,7 +5403,7 @@ fn an_export_whose_filter_failed_open_is_complete_and_exits_zero() {
         ),
         (
             "filter-open-export.wav",
-            vec![score.as_str(), "-vvv", "--cycles", "2", "--export"],
+            vec!["play", score.as_str(), "-vvv", "--cycles", "2", "--export"],
             report_onsets,
         ),
         (
@@ -5453,6 +5458,7 @@ fn musician_score_tempo_overrides_cli_baseline_and_controls_cycle_export() {
     .expect("write tempo score");
 
     let args = [
+        "play",
         score.to_str().expect("UTF-8 score"),
         "-vvv",
         "--export",
@@ -5810,6 +5816,7 @@ fn musician_prebake_runs_before_the_score_on_the_same_heap() {
     .expect("write score");
 
     let args = [
+        "play",
         score.to_str().expect("UTF-8 score"),
         "-vvv",
         "--prebake",
@@ -6078,6 +6085,7 @@ fn projected_elementals_reach_query_and_same_heap_musician_export() {
     .expect("write elemental score");
 
     let args = [
+        "play",
         score.to_str().expect("UTF-8 score"),
         "-vvv",
         "--prebake",
@@ -6128,6 +6136,7 @@ fn musician_prebake_failures_are_structured_and_no_file_is_auto_discovered() {
     let score_text = score.to_str().expect("UTF-8 score");
     let output_text = output.to_str().expect("UTF-8 output");
     let missing_result = run(&[
+        "play",
         score_text,
         "-vvv",
         "--prebake",
@@ -6141,6 +6150,7 @@ fn musician_prebake_failures_are_structured_and_no_file_is_auto_discovered() {
     assert_eq!(missing_error["error"]["kind"], "io");
 
     let invalid_result = run(&[
+        "play",
         score_text,
         "-vvv",
         "--prebake",
@@ -6160,7 +6170,14 @@ fn musician_prebake_failures_are_structured_and_no_file_is_auto_discovered() {
     );
     assert!(!output.exists(), "failed prebake still rendered a score");
 
-    let no_discovery = run(&[score_text, "--export", output_text, "--duration", "0.1"]);
+    let no_discovery = run(&[
+        "play",
+        score_text,
+        "--export",
+        output_text,
+        "--duration",
+        "0.1",
+    ]);
     assert!(
         no_discovery.status.success(),
         "an adjacent prebake.js was auto-loaded: {}",
@@ -6178,6 +6195,7 @@ fn musician_prebake_cpu_deadline_is_a_typed_resource_refusal() {
     std::fs::write(&prebake, "while (true) {}").expect("write runaway setup");
     std::fs::write(&score, "note('c4')").expect("write score");
     let result = run(&[
+        "play",
         score.to_str().expect("UTF-8 score"),
         "-vvv",
         "--prebake",
@@ -6207,7 +6225,7 @@ fn synchronous_score_cpu_deadline_is_typed_on_every_initial_cli_route() {
     let cases = vec![
         vec!["query".into(), "--json".into(), "-e".into(), source.into()],
         vec![
-            "play".into(),
+            "trace".into(),
             "--json".into(),
             "-e".into(),
             source.into(),
@@ -6234,7 +6252,11 @@ fn synchronous_score_cpu_deadline_is_typed_on_every_initial_cli_route() {
             "--iterations".into(),
             "1".into(),
         ],
-        vec![score.to_string_lossy().into_owned(), "-vvv".into()],
+        vec![
+            "play".into(),
+            score.to_string_lossy().into_owned(),
+            "-vvv".into(),
+        ],
     ];
     for case in cases {
         let args = case.iter().map(String::as_str).collect::<Vec<_>>();
@@ -6399,6 +6421,7 @@ fn musician_prebake_job_budget_is_a_typed_resource_refusal() {
     .expect("write over-budget setup");
     std::fs::write(&score, "note('c4')").expect("write score");
     let result = run(&[
+        "play",
         score.to_str().expect("UTF-8 score"),
         "-vvv",
         "--prebake",
@@ -6434,6 +6457,7 @@ fn musician_prebake_file_limit_accepts_exactly_four_mib_and_refuses_one_more_byt
     std::fs::write(&score, "note('c4')").expect("write score");
 
     let exact = run(&[
+        "play",
         score.to_str().expect("UTF-8 score"),
         "-vvv",
         "--prebake",
@@ -6450,6 +6474,7 @@ fn musician_prebake_file_limit_accepts_exactly_four_mib_and_refuses_one_more_byt
     );
 
     let over = run(&[
+        "play",
         score.to_str().expect("UTF-8 score"),
         "-vvv",
         "--prebake",
@@ -6475,6 +6500,7 @@ fn musician_prebake_file_limit_accepts_exactly_four_mib_and_refuses_one_more_byt
     let stdin_run = |size: usize| {
         use std::io::Write;
         let args = [
+            "play",
             "-",
             "-vvv",
             "--export",
@@ -6525,6 +6551,7 @@ fn musician_prebake_is_loaded_before_plain_and_watched_device_routing() {
     std::fs::write(&score, "liveHelper()").expect("write score");
     for watch in [false, true] {
         let mut args = vec![
+            "play",
             score.to_str().expect("UTF-8 score"),
             "--prebake",
             prebake.to_str().expect("UTF-8 prebake"),
@@ -6559,7 +6586,7 @@ fn musician_plain_and_watch_do_not_auto_discover_adjacent_prebake() {
     )
     .expect("write adjacent setup");
     for watch in [false, true] {
-        let mut args = vec![score.to_str().expect("UTF-8 score")];
+        let mut args = vec!["play", score.to_str().expect("UTF-8 score")];
         if watch {
             args.push("--watch");
         }
@@ -6586,7 +6613,7 @@ fn musician_play_and_watch_reach_the_live_product_route_without_a_subcommand() {
     let score = scratch("musician-live-unavailable.strudel");
     std::fs::write(&score, r#"note("c4")"#).expect("write score");
     for suffix in [Vec::<&str>::new(), vec!["--watch"]] {
-        let mut args = vec![score.to_str().expect("UTF-8 score")];
+        let mut args = vec!["play", score.to_str().expect("UTF-8 score")];
         args.extend(suffix);
         let output = run(&args);
         assert_eq!(output.status.code(), Some(5), "{args:?}");
@@ -6624,8 +6651,8 @@ fn unwatched_musician_refuses_an_unplayable_score_before_opening_audio() {
         // The bare musician route has no --json; -vvv is how it is asked for
         // the structured stderr this test reads.
         let args = match extra {
-            Some(flag) => vec![path, "-vvv", flag],
-            None => vec![path, "-vvv"],
+            Some(flag) => vec!["play", path, "-vvv", flag],
+            None => vec!["play", path, "-vvv"],
         };
         let started = std::time::Instant::now();
         let output = run(&args);
@@ -6663,8 +6690,8 @@ fn playable_and_explicitly_watched_scores_still_reach_audio_startup() {
         // The bare musician route has no --json; -vvv is how it is asked for
         // the structured stderr this test reads.
         let args = match extra {
-            Some(flag) => vec![path, "-vvv", flag],
-            None => vec![path, "-vvv"],
+            Some(flag) => vec!["play", path, "-vvv", flag],
+            None => vec!["play", path, "-vvv"],
         };
         let output = run(&args);
         assert_eq!(
@@ -6692,9 +6719,10 @@ fn musician_surface_rejects_ambiguous_shapes_as_usage_errors() {
     let score = score.to_str().expect("UTF-8 score");
     let output = output.to_str().expect("UTF-8 output");
     for args in [
-        vec![score, "--watch", "--export", output],
-        vec![score, "--cycles", "2"],
+        vec!["play", score, "--watch", "--export", output],
+        vec!["play", score, "--cycles", "2"],
         vec![
+            "play",
             score,
             "--export",
             output,
@@ -6703,7 +6731,7 @@ fn musician_surface_rejects_ambiguous_shapes_as_usage_errors() {
             "--duration",
             "1",
         ],
-        vec![score, "query", "--json", "-e", "pure(1)"],
+        vec!["play", score, "query", "--json", "-e", "pure(1)"],
     ] {
         let result = run(&args);
         assert_eq!(
@@ -6738,16 +6766,17 @@ fn musician_export_preserves_structured_failure_exit_classes() {
     std::fs::write(&score, "note(").expect("write malformed score");
     let score_text = score.to_str().expect("UTF-8 score");
 
-    let malformed = run(&[score_text, "-vvv", "--export", unused_output_text]);
+    let malformed = run(&["play", score_text, "-vvv", "--export", unused_output_text]);
     assert_eq!(malformed.status.code(), Some(1));
     assert_error_kind(&malformed.stderr, "evaluation");
 
     std::fs::write(&score, r#"note("c4")"#).expect("write valid score");
-    let io = run(&[score_text, "-vvv", "--export", missing_output]);
+    let io = run(&["play", score_text, "-vvv", "--export", missing_output]);
     assert_eq!(io.status.code(), Some(4));
     assert_error_kind(&io.stderr, "io");
 
     let limit = run(&[
+        "play",
         score_text,
         "-vvv",
         "--export",
@@ -6773,6 +6802,7 @@ fn musician_export_refuses_names_it_cannot_write_and_keeps_bouncing_wav() {
     for extension in ["mp3", "json"] {
         let output = scratch(&format!("musician-export-mismatch.{extension}"));
         let refused = run(&[
+            "play",
             score_text,
             "-vvv",
             "--export",
@@ -6804,6 +6834,7 @@ fn musician_export_refuses_names_it_cannot_write_and_keeps_bouncing_wav() {
     }
     let wav = scratch("musician-export-mismatch.wav");
     let bounced = run(&[
+        "play",
         score_text,
         "--export",
         wav.to_str().expect("UTF-8 output"),
@@ -6859,7 +6890,7 @@ fn malformed_source_is_reported_not_crashed() {
     assert_reported_failure(&["query", "--json", "-e", "s(\"bd\""], "error");
     assert_reported_failure(&["query", "--json", "-e", "))))"], "error");
     assert_reported_failure(
-        &["play", "--json", "-e", "s(\"bd\"", "--duration", "1"],
+        &["trace", "--json", "-e", "s(\"bd\"", "--duration", "1"],
         "error",
     );
 }
@@ -6906,12 +6937,12 @@ fn non_finite_and_negative_durations_and_rates_are_rejected() {
     let render_output = scratch("non-finite.wav");
     let render_output = render_output.to_str().expect("UTF-8 output");
     for args in [
-        vec!["play", "--json", "-e", r#"s("bd")"#, "--duration", "inf"],
-        vec!["play", "--json", "-e", r#"s("bd")"#, "--duration", "NaN"],
-        vec!["play", "--json", "-e", r#"s("bd")"#, "--duration", "-1"],
-        vec!["play", "--json", "-e", r#"s("bd")"#, "--cps", "0"],
-        vec!["play", "--json", "-e", r#"s("bd")"#, "--cps", "NaN"],
-        vec!["play", "--json", "-e", r#"s("bd")"#, "--cps", "inf"],
+        vec!["trace", "--json", "-e", r#"s("bd")"#, "--duration", "inf"],
+        vec!["trace", "--json", "-e", r#"s("bd")"#, "--duration", "NaN"],
+        vec!["trace", "--json", "-e", r#"s("bd")"#, "--duration", "-1"],
+        vec!["trace", "--json", "-e", r#"s("bd")"#, "--cps", "0"],
+        vec!["trace", "--json", "-e", r#"s("bd")"#, "--cps", "NaN"],
+        vec!["trace", "--json", "-e", r#"s("bd")"#, "--cps", "inf"],
         vec![
             "render",
             "-e",
@@ -6935,9 +6966,9 @@ fn an_enormous_but_finite_duration_is_refused_not_run() {
     let render_output = scratch("enormous-duration.json");
     let render_output = render_output.to_str().expect("UTF-8 output");
     for args in [
-        vec!["play", "--json", "-e", r#"s("bd")"#, "--duration", "1e300"],
-        vec!["play", "--json", "-e", r#"s("bd")"#, "--duration", "1e12"],
-        vec!["play", "--json", "-e", r#"s("bd")"#, "--duration", "86401"],
+        vec!["trace", "--json", "-e", r#"s("bd")"#, "--duration", "1e300"],
+        vec!["trace", "--json", "-e", r#"s("bd")"#, "--duration", "1e12"],
+        vec!["trace", "--json", "-e", r#"s("bd")"#, "--duration", "86401"],
         vec![
             "render",
             "-e",
@@ -7036,7 +7067,7 @@ fn an_unbounded_onset_count_is_refused_not_accumulated() {
     // bound it.
     assert_reported_failure(
         &[
-            "play",
+            "trace",
             "--json",
             "-e",
             r#"s("bd*16 sd*16")"#,
@@ -7113,7 +7144,7 @@ fn invalid_numeric_arguments_are_reported_not_crashed() {
         "out of range",
     );
     assert_reported_failure(
-        &["play", "--json", "-e", "s(\"bd\")", "--duration", "banana"],
+        &["trace", "--json", "-e", "s(\"bd\")", "--duration", "banana"],
         "",
     );
     assert_reported_failure(
@@ -7149,7 +7180,7 @@ fn a_callback_that_throws_is_reported_or_empty_never_a_crash() {
     // result is correct here. What must not happen is a panic. The `query`
     // form has its own test with an exact exit status.
     let command = [
-        "play",
+        "trace",
         "--json",
         "-e",
         r#"s("bd").polyBind(x => { throw new Error('boom'); })"#,
@@ -7380,7 +7411,7 @@ fn play_terminates_on_its_own_within_the_requested_duration() {
     // never returns would hang CI rather than fail it, so this is asserted with
     // a wall-clock bound well above the 2-cycle workload.
     let started = std::time::Instant::now();
-    let out = run(&["play", "--json", "-e", r#"s("bd sd")"#, "--duration", "2"]);
+    let out = run(&["trace", "--json", "-e", r#"s("bd sd")"#, "--duration", "2"]);
     assert!(out.status.success());
     assert!(
         started.elapsed() < std::time::Duration::from_secs(60),
@@ -7600,7 +7631,7 @@ fn every_command_reports_failures_in_the_same_structured_shape() {
     for (args, kind, code) in [
         (vec!["query", "--json", "-e", "s(\"bd\""], "evaluation", 1),
         (
-            vec!["play", "--json", "-e", "s(\"bd\"", "--duration", "1"],
+            vec!["trace", "--json", "-e", "s(\"bd\"", "--duration", "1"],
             "evaluation",
             1,
         ),
@@ -7626,7 +7657,7 @@ fn every_command_reports_failures_in_the_same_structured_shape() {
             1,
         ),
         (
-            vec!["play", "--json", "-e", "s(\"bd\")", "--duration", "1e12"],
+            vec!["trace", "--json", "-e", "s(\"bd\")", "--duration", "1e12"],
             "resource-limit",
             3,
         ),
@@ -7682,7 +7713,7 @@ fn exit_codes_are_a_stable_contract() {
         Some(2)
     );
     assert_eq!(
-        run(&["play", "--json", "-e", r#"s("bd")"#, "--duration", "1e12"])
+        run(&["trace", "--json", "-e", r#"s("bd")"#, "--duration", "1e12"])
             .status
             .code(),
         Some(3)
@@ -7707,7 +7738,7 @@ fn signal_a_running_play(signal: i32) -> (Option<i32>, std::time::Duration) {
         // The longest legal window, so the process is certainly still running
         // when the signal lands.
         .args([
-            "play",
+            "trace",
             "--json",
             "-e",
             r#"s("bd*8")"#,
@@ -7791,6 +7822,7 @@ fn sigint_during_musician_prebake_wins_over_the_evaluation_deadline() {
     std::fs::write(&prebake, "while (true) {}").expect("write runaway setup");
     std::fs::write(&score, "note('c4')").expect("write score");
     let args = [
+        "play",
         score.to_str().expect("UTF-8 score"),
         "-vvv",
         "--prebake",
@@ -7811,7 +7843,7 @@ fn signals_cancel_initial_score_evaluation_on_every_cli_route() {
     let commands = vec![
         vec!["query".into(), "--json".into(), "-e".into(), source.into()],
         vec![
-            "play".into(),
+            "trace".into(),
             "--json".into(),
             "-e".into(),
             source.into(),
@@ -7837,7 +7869,7 @@ fn signals_cancel_initial_score_evaluation_on_every_cli_route() {
             "--iterations".into(),
             "1".into(),
         ],
-        vec![score.to_string_lossy().into_owned()],
+        vec!["play".into(), score.to_string_lossy().into_owned()],
     ];
     for (signal, code) in [(libc::SIGINT, 130), (libc::SIGTERM, 143)] {
         for command in &commands {
@@ -7944,7 +7976,7 @@ fn long_running_commands() -> Vec<Vec<String>> {
             "1000000".into(),
         ],
         vec![
-            "play".into(),
+            "trace".into(),
             "--json".into(),
             "-e".into(),
             r#"s("bd*8")"#.into(),
@@ -7991,7 +8023,7 @@ fn a_signal_arriving_before_the_work_starts_is_not_cleared() {
     // the watcher's persistent reassertion of that request.
     use std::io::Write;
     let mut child = rustel()
-        .args(["play", "--json", "-", "--duration", "86400"])
+        .args(["trace", "--json", "-", "--duration", "86400"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -8107,7 +8139,7 @@ fn a_query_span_refusal_exits_three() {
 fn a_zero_length_window_schedules_nothing() {
     // A zero-length window is legal and schedules nothing, not even the onset
     // at time zero.
-    let out = ok_stdout(&["play", "--json", "-e", r#"s("bd")"#, "--duration", "0"]);
+    let out = ok_stdout(&["trace", "--json", "-e", r#"s("bd")"#, "--duration", "0"]);
     let json: serde_json::Value = serde_json::from_str(&out).expect("json");
     assert_eq!(
         json["onsets"].as_array().expect("onsets").len(),
@@ -8424,7 +8456,7 @@ fn a_replay_export_writes_the_chained_timeline_to_mp3() {
 /// An unknown recording mode names the real ones rather than failing blankly.
 #[test]
 fn an_unknown_session_mode_lists_the_real_ones() {
-    let output = run(&["song.strudel", "--watch", "--save-session=verbose"]);
+    let output = run(&["play", "song.strudel", "--watch", "--save-session=verbose"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("normal") && stderr.contains("debug"),
@@ -8437,6 +8469,7 @@ fn an_unknown_session_mode_lists_the_real_ones() {
 #[test]
 fn no_save_session_conflicts_with_asking_for_one() {
     let output = run(&[
+        "play",
         "song.strudel",
         "--watch",
         "--no-save-session",
@@ -9083,13 +9116,18 @@ mod terminal;
 fn misspelled_commands_with_arguments_offer_a_hint() {
     let output = run(&["sampls", "cache", "--json"]);
     assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("did you mean the `samples` command"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("a similar subcommand exists: 'samples'")
+    );
 
     let output = run(&["samples", "--bogus"]);
     assert_eq!(output.status.code(), Some(2));
-    assert!(
-        !String::from_utf8_lossy(&output.stderr).contains("did you mean the `samples` command")
-    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("a similar subcommand exists"));
+
+    // A score in the place of a command is not a misspelling.
+    let output = run(&["song.strudel", "--watch"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("run `rustel play song.strudel`"));
 }
 
 mod diagnostics;

@@ -118,10 +118,8 @@ fn help_styles() -> clap::builder::Styles {
     about = "Headless pattern runtime and local file-to-speakers loop",
     long_about = product::CLI_LONG_ABOUT,
     styles = help_styles(),
-    after_help = "Example: rustel song.strudel --watch\n\nDocumentation: https://github.com/tzfm/rustel/blob/main/docs/cli.md\nReport a bug: https://github.com/tzfm/rustel/issues",
-    disable_help_flag = true,
-    args_conflicts_with_subcommands = true,
-    subcommand_negates_reqs = true
+    after_help = "Example: rustel play song.strudel --watch\n\nDocumentation: https://github.com/tzfm/rustel/blob/main/docs/cli.md\nReport a bug: https://github.com/tzfm/rustel/issues",
+    disable_help_flag = true
 )]
 struct Cli {
     /// Print full help, including examples.
@@ -167,10 +165,8 @@ struct Cli {
         help_heading = "Diagnostics"
     )]
     acceleration: AccelerationPreference,
-    #[command(flatten)]
-    musician: MusicianArgs,
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -877,6 +873,12 @@ enum ConfigKey {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Play a score through the audio device until Ctrl-C.
+    ///
+    /// `--watch` reloads each stable save with no restart of the audio
+    /// stream. `--export out.wav` opens no device and bounces the score to a
+    /// file.
+    Play(Box<MusicianArgs>),
     /// Read or write user-wide settings in rustel.json.
     Config {
         #[command(subcommand)]
@@ -1223,9 +1225,8 @@ enum Command {
     ///
     /// Nothing is heard unless `--device-audio` opens the system's default
     /// device: this is the headless harness that tests and scripts drive. To
-    /// simply hear a score, use the bare `rustel <score>` form, which opens a
-    /// device for you. Named `play` until it grew into this.
-    #[command(alias = "play")]
+    /// simply hear a score, use `rustel play <score>`, which opens a device
+    /// for you.
     Trace {
         #[command(flatten)]
         input: SourceInput,
@@ -1884,26 +1885,10 @@ fn run() -> Result<(), RuntimeError> {
         return Ok(());
     }
     let cli = Cli::try_parse_from(&args).unwrap_or_else(|mut error| {
-        // A misspelled command is parsed as a score path. Additional words
-        // then fail before run_musician can offer its usual spelling hint.
-        if matches!(
-            error.kind(),
-            clap::error::ErrorKind::UnknownArgument | clap::error::ErrorKind::ArgumentConflict
-        ) && let Some(word) = args.get(1).and_then(|arg| arg.to_str())
-            && !word.starts_with('-')
-            && !word.contains(['/', '\\', '.'])
-            && !std::path::Path::new(word).exists()
-            && let Some(suggestion) = did_you_mean(word)
-            && suggestion != word
-        {
+        if let Some(tip) = play_tip(&error) {
             error.insert(
                 clap::error::ContextKind::Suggested,
-                clap::error::ContextValue::StyledStrs(vec![
-                    format!(
-                        "did you mean the `{suggestion}` command? Try `rustel {suggestion} --help`."
-                    )
-                    .into(),
-                ]),
+                clap::error::ContextValue::StyledStrs(vec![tip.into()]),
             );
         }
         error.exit()
@@ -1926,15 +1911,7 @@ fn run() -> Result<(), RuntimeError> {
             && std::io::stderr().is_terminal(),
         std::env::var_os("CI").is_some_and(|value| !value.is_empty()),
     );
-    match cli.command {
-        Some(command) => run_command(command, verbosity, dispatch, check_updates),
-        None => {
-            if check_updates {
-                rustel_runtime::updates::check_for_updates(|message| eprintln!("{message}"));
-            }
-            run_musician(cli.musician, verbosity, dispatch)
-        }
-    }
+    run_command(cli.command, verbosity, dispatch, check_updates)
 }
 
 // The test-only observer reads the constructed config before it is returned.
@@ -1981,6 +1958,7 @@ fn run_command(
         }
     }
     match command {
+        Command::Play(musician) => run_musician(*musician, verbosity, dispatch),
         Command::Config { command } => {
             match command {
                 ConfigCommand::Get {
@@ -2020,7 +1998,7 @@ fn run_command(
                     "the studio keeps its own prebakes: open the settings sheet (^O) and \
                      press Enter on \"global prebake\" or \"local prebake\". The global one is \
                      a file beside studio.json, the local one lives in the set's \
-                     rustel-set.json. --prebake belongs to `rustel <score>`"
+                     rustel-set.json. --prebake belongs to `rustel play <score>`"
                         .into(),
                 ));
             }
@@ -2672,60 +2650,22 @@ fn run_command(
     }
 }
 
-/// Suggest a subcommand for a mistyped bare word, if one is close enough.
+/// The tip for a score path in the place of a command, as in
+/// `rustel song.strudel`.
 ///
-/// The bare form `rustel <word>` treats `<word>` as a score file, so clap
-/// never gets a chance to offer "did you mean". When the word is not an
-/// existing file but is close to a known subcommand, name it.
-fn did_you_mean(word: &str) -> Option<String> {
-    let names: Vec<String> = Cli::command()
-        .get_subcommands()
-        .map(|sub| sub.get_name().to_string())
-        .collect();
-    let mut best: Option<(usize, &str)> = None;
-    for name in &names {
-        let distance = rustel_runtime::lint::levenshtein_distance(word, name);
-        // Only suggest a close match, scaled a little by the name's length.
-        let threshold = (name.len() / 3).max(1) + 1;
-        if distance <= threshold && best.is_none_or(|(best_distance, _)| distance < best_distance) {
-            best = Some((distance, name));
-        }
+/// clap names the closest command for a misspelled one. A word with a dot or
+/// a path separator, or the name of a file on disk, is a score.
+fn play_tip(error: &clap::Error) -> Option<String> {
+    if error.kind() != clap::error::ErrorKind::InvalidSubcommand {
+        return None;
     }
-    best.map(|(_, name)| name.to_string())
-}
-
-#[cfg(test)]
-mod did_you_mean_tests {
-    use super::*;
-
-    #[test]
-    fn a_word_one_slip_from_a_command_names_it() {
-        // One letter missing, extra or wrong, or two neighbours swapped.
-        for (word, command) in [
-            ("sampls", "samples"),
-            ("rendr", "render"),
-            ("doctr", "doctor"),
-            ("valdate", "validate"),
-            ("qurey", "query"),
-            ("chekc", "check"),
-            ("tarce", "trace"),
-            ("rpelay", "replay"),
-        ] {
-            assert_eq!(did_you_mean(word).as_deref(), Some(command), "{word}");
-        }
-    }
-
-    #[test]
-    fn a_swap_counts_as_two_edits() {
-        // Two swaps are four edits, past the two a five-letter command allows.
-        assert_eq!(did_you_mean("qeuyr"), None);
-        assert_eq!(did_you_mean("cehkc"), None);
-    }
-
-    #[test]
-    fn a_word_far_from_every_command_names_none() {
-        assert_eq!(did_you_mean("xylophone"), None);
-    }
+    let Some(clap::error::ContextValue::String(word)) =
+        error.get(clap::error::ContextKind::InvalidSubcommand)
+    else {
+        return None;
+    };
+    (word.contains(['/', '\\', '.']) || std::path::Path::new(word).exists())
+        .then(|| format!("to play a score, run `rustel play {word}`"))
 }
 
 /// Print the reference entry for a name: the very body the studio's panel
@@ -2844,7 +2784,7 @@ fn run_watch_code() -> Result<(), RuntimeError> {
     let stdin = std::io::stdin();
     if stdin.is_terminal() {
         return Err(RuntimeError::Message(
-            "watch-code expects piped score events; try `rustel song.strudel --watch --score-events 2>&1 | rustel watch-code`".into()
+            "watch-code expects piped score events; try `rustel play song.strudel --watch --score-events 2>&1 | rustel watch-code`".into()
         ));
     }
     for line in stdin.lock().lines() {
@@ -3811,47 +3751,48 @@ impl Cli {
             return false;
         }
         match &self.command {
-            None => {
-                !self.musician.ui_events && !self.musician.announce_score && !self.musician.follow
+            Command::Play(musician) => {
+                !musician.ui_events && !musician.announce_score && !musician.follow
             }
             // `samples` draws a progress bar or a prompt, and `serve-samples`
             // writes only JSON. A late notice breaks each of them.
-            Some(
-                Command::Config { .. }
-                | Command::Completions { .. }
-                | Command::WatchCode
-                | Command::Samples { .. }
-                | Command::ServeSamples { .. },
-            ) => false,
-            Some(Command::Replay {
+            Command::Config { .. }
+            | Command::Completions { .. }
+            | Command::WatchCode
+            | Command::Samples { .. }
+            | Command::ServeSamples { .. } => false,
+            Command::Replay {
                 follow,
                 score_events,
                 ..
-            }) => !follow && !score_events,
-            Some(Command::Trace { score_events, .. }) => !score_events,
+            } => !follow && !score_events,
+            Command::Trace { score_events, .. } => !score_events,
             #[cfg(feature = "studio")]
-            Some(Command::Studio {
+            Command::Studio {
                 list_themes,
                 probe_terminal,
                 performance_events,
                 ..
-            }) => !list_themes && !probe_terminal && !performance_events,
+            } => !list_themes && !probe_terminal && !performance_events,
             _ => true,
         }
     }
 
-    /// Whether this run speaks JSON: the chosen command's own `--json` - or
-    /// the bare musician form's, which has no subcommand to ask - and the
-    /// live playback/replay verbosity that means the JSON event stream.
-    ///
-    /// One function decides for the bare form and for every subcommand, so
-    /// both accept `--json` the same way.
+    /// Whether this run speaks JSON: the chosen command's own `--json`, and
+    /// the live playback/replay verbosity that means the JSON event stream.
     fn wants_json(&self) -> bool {
-        self.command
-            .as_ref()
-            .map_or(self.musician.json, Command::wants_json)
+        self.command.wants_json()
             || (self.verbose >= LiveOutput::JSON_VERBOSITY
-                && matches!(self.command, None | Some(Command::Replay { .. })))
+                && matches!(self.command, Command::Play(_) | Command::Replay { .. }))
+    }
+
+    /// The flags of a parsed `play` line.
+    #[cfg(test)]
+    fn play(&self) -> &MusicianArgs {
+        match &self.command {
+            Command::Play(musician) => musician,
+            other => panic!("not a play command: {other:?}"),
+        }
     }
 }
 
@@ -3860,6 +3801,7 @@ impl Command {
     /// the command has no other form.
     fn wants_json(&self) -> bool {
         match self {
+            Self::Play(musician) => musician.json,
             Self::MidiMonitor { json, .. }
             | Self::Devices { json, .. }
             | Self::Doctor { json, .. }
@@ -3917,10 +3859,12 @@ mod dsp_selection_tests {
                 product::COMMAND_NAME,
                 "--acceleration",
                 "portable",
+                "play",
                 "song.strudel",
             ],
             vec![
                 product::COMMAND_NAME,
+                "play",
                 "song.strudel",
                 "--acceleration",
                 "portable",
@@ -4008,6 +3952,7 @@ mod dsp_selection_tests {
                         output.display().to_string(),
                     ]),
                     "musician" => args.extend([
+                        "play".into(),
                         fixture.display().to_string(),
                         "--export".into(),
                         output.display().to_string(),
@@ -4035,11 +3980,7 @@ mod dsp_selection_tests {
                 let cli = Cli::try_parse_from(args).expect("export command");
                 let dispatch = cli.acceleration.dispatch();
                 BUILT_DISPATCH.set(None);
-                match cli.command {
-                    Some(command) => run_command(command, cli.verbose, dispatch, false),
-                    None => run_musician(cli.musician, cli.verbose, dispatch),
-                }
-                .expect("selected export");
+                run_command(cli.command, cli.verbose, dispatch, false).expect("selected export");
                 let actual = BUILT_DISPATCH
                     .take()
                     .expect("command constructed its SessionConfig");
@@ -4236,9 +4177,9 @@ mod live_output_contract_tests {
             vec!["check", "-e", "silence", "--no-input"],
             vec!["check", "-e", "silence", "--json"],
             vec!["check", "-e", "silence", "-vvv"],
-            vec!["song.strudel", "--ui-events"],
-            vec!["song.strudel", "--score-events"],
-            vec!["song.strudel", "--follow"],
+            vec!["play", "song.strudel", "--ui-events"],
+            vec!["play", "song.strudel", "--score-events"],
+            vec!["play", "song.strudel", "--follow"],
             vec!["replay", "set.rustel-session", "--score-events"],
             vec!["replay", "set.rustel-session", "--follow"],
             vec![
@@ -4352,16 +4293,22 @@ mod live_output_contract_tests {
         ]
     }
 
-    /// `--json` selects structured live events for the bare score command,
+    /// `--json` selects structured live events for the play command,
     /// including watched scores.
     #[test]
     fn json_on_a_watched_score_emits_the_live_stream_as_json() {
-        let cli = Cli::try_parse_from([product::COMMAND_NAME, "foo.strudel", "--watch", "--json"])
-            .expect("a watched score in json");
-        assert!(cli.wants_json(), "the flag is read off the musician form");
+        let cli = Cli::try_parse_from([
+            product::COMMAND_NAME,
+            "play",
+            "foo.strudel",
+            "--watch",
+            "--json",
+        ])
+        .expect("a watched score in json");
+        assert!(cli.wants_json(), "the flag is read off the play command");
         // What `run_play` builds from it: the hidden `--ui-events` is not
         // the only way to ask for a structured stream.
-        let output = LiveOutput::new(cli.verbose, cli.musician.ui_events, cli.wants_json());
+        let output = LiveOutput::new(cli.verbose, cli.play().ui_events, cli.wants_json());
         assert!(output.structured());
         let lines = rendered(output);
         assert!(!lines.is_empty(), "a structured run says something");
@@ -4372,10 +4319,10 @@ mod live_output_contract_tests {
 
         // And without it the same run stays human, so the flag is what
         // decides rather than the verbosity that happens to be set.
-        let plain = Cli::try_parse_from([product::COMMAND_NAME, "foo.strudel", "--watch"])
+        let plain = Cli::try_parse_from([product::COMMAND_NAME, "play", "foo.strudel", "--watch"])
             .expect("a watched score");
         assert!(!plain.wants_json());
-        let output = LiveOutput::new(plain.verbose, plain.musician.ui_events, plain.wants_json());
+        let output = LiveOutput::new(plain.verbose, plain.play().ui_events, plain.wants_json());
         assert!(!output.structured());
         assert_human(&rendered(output));
     }
@@ -4392,14 +4339,19 @@ mod live_output_contract_tests {
         ])
         .expect("a replay in json");
         assert!(replay.wants_json());
-        let watched =
-            Cli::try_parse_from([product::COMMAND_NAME, "foo.strudel", "--watch", "--json"])
-                .expect("a watched score in json");
+        let watched = Cli::try_parse_from([
+            product::COMMAND_NAME,
+            "play",
+            "foo.strudel",
+            "--watch",
+            "--json",
+        ])
+        .expect("a watched score in json");
         assert!(watched.wants_json());
         // And neither is JSON without being asked.
         for args in [
             vec![product::COMMAND_NAME, "replay", "set.rustel-session"],
-            vec![product::COMMAND_NAME, "foo.strudel", "--watch"],
+            vec![product::COMMAND_NAME, "play", "foo.strudel", "--watch"],
         ] {
             assert!(
                 !Cli::try_parse_from(args).expect("plain").wants_json(),
@@ -4464,7 +4416,7 @@ mod live_output_contract_tests {
     }
 
     #[test]
-    fn compact_verbosity_counts_work_after_subcommands_and_around_the_root_file() {
+    fn compact_verbosity_counts_work_before_and_after_a_subcommand() {
         for (args, expected) in [
             (
                 vec![product::COMMAND_NAME, "query", "-v", "-e", "pure(1)"],
@@ -4482,36 +4434,53 @@ mod live_output_contract_tests {
             let parsed = Cli::try_parse_from(&args)
                 .unwrap_or_else(|error| panic!("could not parse {args:?}: {error}"));
             assert_eq!(parsed.verbose, expected, "{args:?}");
-            assert!(matches!(parsed.command, Some(Command::Query { .. })));
+            assert!(matches!(parsed.command, Command::Query { .. }));
         }
 
         for args in [
-            vec![product::COMMAND_NAME, "-vv", "song.strudel", "--watch"],
-            vec![product::COMMAND_NAME, "song.strudel", "--watch", "-vv"],
+            vec![
+                product::COMMAND_NAME,
+                "-vv",
+                "play",
+                "song.strudel",
+                "--watch",
+            ],
+            vec![
+                product::COMMAND_NAME,
+                "play",
+                "song.strudel",
+                "--watch",
+                "-vv",
+            ],
         ] {
             let parsed = Cli::try_parse_from(&args)
                 .unwrap_or_else(|error| panic!("could not parse {args:?}: {error}"));
             assert_eq!(parsed.verbose, 2, "{args:?}");
-            assert!(parsed.command.is_none());
-            assert_eq!(parsed.musician.file, Some(PathBuf::from("song.strudel")));
-            assert!(parsed.musician.watch);
-            assert!(!parsed.musician.announce_score);
+            assert_eq!(parsed.play().file, Some(PathBuf::from("song.strudel")));
+            assert!(parsed.play().watch);
+            assert!(!parsed.play().announce_score);
         }
 
         let score_events = Cli::try_parse_from([
             product::COMMAND_NAME,
+            "play",
             "song.strudel",
             "--watch",
             "--score-events",
         ])
         .expect("explicit score event transport");
-        assert!(score_events.musician.announce_score);
+        assert!(score_events.play().announce_score);
 
-        let finite_live =
-            Cli::try_parse_from([product::COMMAND_NAME, "song.strudel", "--duration", "40"])
-                .expect("finite live playback");
-        assert_eq!(finite_live.musician.duration, Some(40.0));
-        assert_eq!(finite_live.musician.export, None);
+        let finite_live = Cli::try_parse_from([
+            product::COMMAND_NAME,
+            "play",
+            "song.strudel",
+            "--duration",
+            "40",
+        ])
+        .expect("finite live playback");
+        assert_eq!(finite_live.play().duration, Some(40.0));
+        assert_eq!(finite_live.play().export, None);
 
         let help = Cli::command().render_long_help().to_string();
         // Phrase assertions match the whitespace-normalised help: clap rewraps
@@ -4519,6 +4488,13 @@ mod live_output_contract_tests {
         // across a soft wrap is still the same phrase.
         let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(flat.contains("-v, -vv, -vvv"), "{help}");
+        assert!(flat.contains("per-second engine-pressure"), "{help}");
+        let mut command = Cli::command();
+        let play = command
+            .find_subcommand_mut("play")
+            .expect("the play subcommand");
+        let help = play.render_long_help().to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
         // The buffer knob is not a callback size everywhere: on Windows the
         // callback keeps the device period and the size is queued ahead.
         assert!(
@@ -4526,9 +4502,9 @@ mod live_output_contract_tests {
             "{help}"
         );
         assert!(!flat.contains("frames per callback"), "{help}");
+        assert!(help.contains("--score-events"), "{help}");
         #[cfg(feature = "studio")]
         {
-            let mut command = Cli::command();
             let studio = command
                 .find_subcommand_mut("studio")
                 .expect("the studio subcommand");
@@ -4540,8 +4516,6 @@ mod live_output_contract_tests {
             );
             assert!(!flat.contains("frames per callback"), "{help}");
         }
-        assert!(flat.contains("per-second engine-pressure"), "{help}");
-        assert!(help.contains("--score-events"), "{help}");
     }
 
     #[test]
@@ -5067,23 +5041,26 @@ mod tests {
     fn internal_ui_event_flag_is_accepted_but_hidden_from_help() {
         let parsed = Cli::try_parse_from([
             product::COMMAND_NAME,
+            "play",
             "score.strudel",
             "--watch",
             "--ui-events",
         ])
         .expect("internal UI flag");
-        assert!(parsed.musician.ui_events);
+        assert!(parsed.play().ui_events);
 
-        let help = Cli::command().render_long_help().to_string();
-        assert!(
-            help.contains("--watch"),
-            "root help omitted musician options"
-        );
+        let help = Cli::command()
+            .find_subcommand_mut("play")
+            .expect("the play subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--watch"), "play help omitted its options");
         assert!(!help.contains("--ui-events"));
 
         assert!(
             Cli::try_parse_from([
                 product::COMMAND_NAME,
+                "play",
                 "score.strudel",
                 "--watch",
                 "--follow",
@@ -5108,7 +5085,7 @@ mod tests {
             "setup.js",
         ])
         .expect("the flag parses so the refusal can explain itself");
-        let Some(Command::Studio { prebake, .. }) = parsed.command else {
+        let Command::Studio { prebake, .. } = parsed.command else {
             panic!("expected the studio command");
         };
         assert_eq!(prebake.as_deref(), Some(std::path::Path::new("setup.js")));
@@ -5122,8 +5099,7 @@ mod tests {
                 "setup.js",
             ])
             .expect("parse")
-            .command
-            .expect("command"),
+            .command,
             0,
             rustel_audio::DspDispatch::automatic(),
             false,
@@ -5147,10 +5123,10 @@ mod tests {
             .expect("internal Studio performance flag");
         assert!(matches!(
             parsed.command,
-            Some(Command::Studio {
+            Command::Studio {
                 performance_events: true,
                 ..
-            })
+            }
         ));
 
         let help = Cli::try_parse_from([product::COMMAND_NAME, "studio", "--help"])
@@ -5181,8 +5157,7 @@ mod tests {
     fn studio_remote_control_is_off_unless_asked() {
         let absent = Cli::try_parse_from([product::COMMAND_NAME, "studio"])
             .expect("studio")
-            .command
-            .expect("command");
+            .command;
         assert!(matches!(
             absent,
             Command::Studio {
@@ -5194,8 +5169,7 @@ mod tests {
 
         let parsed = Cli::try_parse_from([product::COMMAND_NAME, "studio", "--remote-control"])
             .expect("default port")
-            .command
-            .expect("command");
+            .command;
         assert!(matches!(
             parsed,
             Command::Studio {
@@ -5211,8 +5185,7 @@ mod tests {
             "--remote-control=9000",
         ])
         .expect("chosen port")
-        .command
-        .expect("command");
+        .command;
         match chosen {
             Command::Studio {
                 file,
@@ -5237,8 +5210,7 @@ mod tests {
                 &format!("--remote-control={address}"),
             ])
             .expect("explicit address")
-            .command
-            .expect("command");
+            .command;
             assert!(matches!(
                 parsed,
                 Command::Studio {
@@ -5269,8 +5241,7 @@ mod tests {
             token,
         ])
         .expect("explicit token")
-        .command
-        .expect("command");
+        .command;
         assert!(matches!(
             with_token,
             Command::Studio {
@@ -6347,14 +6318,14 @@ mod tests {
         let cli = Cli::try_parse_from([product::COMMAND_NAME, "export", "song.strudel"])
             .expect("a bare export");
         match cli.command {
-            Some(Command::Render {
+            Command::Render {
                 output,
                 duration,
                 cycles,
                 until_silence,
                 json,
                 ..
-            }) => {
+            } => {
                 assert!(output.is_none() && duration.is_none() && cycles.is_none());
                 assert!(!until_silence && !json);
             }
@@ -6375,7 +6346,7 @@ mod tests {
         ])
         .expect("the long form");
         match cli.command {
-            Some(Command::Render {
+            Command::Render {
                 output,
                 duration,
                 until_silence,
@@ -6383,7 +6354,7 @@ mod tests {
                 json,
                 format,
                 ..
-            }) => {
+            } => {
                 assert_eq!(output, Some(PathBuf::from("take.mp3")));
                 assert_eq!(duration.as_deref(), Some("1:30"));
                 assert!(until_silence && json && format.is_none());
@@ -6418,20 +6389,26 @@ mod tests {
         );
         assert!(wants(&["devices", "--json"]));
         assert!(wants(&["validate", "-j", "song.strudel"]));
-        assert!(wants(&["song.strudel", "-vvv"]));
-        assert!(!wants(&["song.strudel", "-vv"]));
-        // The bare form is the line a musician actually types. It had no
-        // --json of its own while every subcommand grew one, so the only way
-        // to ask was -vvv, which also turns on every live diagnostic.
-        assert!(!wants(&["song.strudel"]));
+        assert!(wants(&["play", "song.strudel", "-vvv"]));
+        assert!(!wants(&["play", "song.strudel", "-vv"]));
+        // `play` is the line a musician actually types. It had no --json of
+        // its own while every other command grew one, so the only way to ask
+        // was -vvv, which also turns on every live diagnostic.
+        assert!(!wants(&["play", "song.strudel"]));
         assert!(
-            wants(&["song.strudel", "--json"]),
-            "the bare form asks like every other command"
+            wants(&["play", "song.strudel", "--json"]),
+            "play asks like every other command"
         );
-        assert!(wants(&["song.strudel", "-j"]));
+        assert!(wants(&["play", "song.strudel", "-j"]));
         assert!(
-            Cli::try_parse_from([product::COMMAND_NAME, "song.strudel", "--json", "--follow"])
-                .is_err(),
+            Cli::try_parse_from([
+                product::COMMAND_NAME,
+                "play",
+                "song.strudel",
+                "--json",
+                "--follow",
+            ])
+            .is_err(),
             "--follow draws prose to the stdout --json promises for JSON alone"
         );
         // Every command reads as prose until it is asked otherwise; none of
@@ -6446,15 +6423,6 @@ mod tests {
             asked.push("--json");
             assert!(wants(&asked), "{asked:?} asked and was not heard");
         }
-        // `trace` was called `play` until it grew into a headless harness that
-        // opens no device. The old name still parses so a script that learned
-        // it keeps working.
-        assert!(matches!(
-            Cli::try_parse_from([product::COMMAND_NAME, "play", "-e", "pure(1)"])
-                .expect("the old name parses")
-                .command,
-            Some(Command::Trace { .. })
-        ));
     }
 }
 

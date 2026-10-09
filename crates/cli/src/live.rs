@@ -55,21 +55,6 @@ pub(super) fn run_musician(
             ));
         }
     }
-    // A mistyped subcommand lands here, because the bare form treats the first
-    // word as a score file and clap never offers "did you mean". When the word
-    // is not a real file and is close to a known subcommand, say so.
-    if let Some(path) = &file
-        && !path.exists()
-        && let Some(word) = path.to_str()
-        && !word.contains(std::path::MAIN_SEPARATOR)
-        && !word.contains('.')
-        && let Some(suggestion) = did_you_mean(word)
-    {
-        return Err(RuntimeError::Message(format!(
-            "no file named `{word}` - did you mean the `{suggestion}` command? \
-             Try `rustel {suggestion} --help`."
-        )));
-    }
     // `--export` writes WAV only: a path with any other extension is refused
     // before any work, and a path with none is written as WAV. The export
     // subcommand writes the other containers.

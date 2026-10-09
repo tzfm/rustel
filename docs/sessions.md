@@ -8,7 +8,7 @@ samples available for replay. Use export to create audio.
 Watched playback and Studio record automatically:
 
 ```sh
-rustel song.strudel --watch
+rustel play song.strudel --watch
 rustel studio set/
 ```
 
@@ -20,10 +20,10 @@ Unwatched playback does not record. A recording error is reported without
 stopping playback.
 
 ```sh
-rustel song.strudel --watch --save-session=debug
-rustel song.strudel --watch --session-file take2.rustel-session
-rustel song.strudel --watch --no-save-session
-RUSTEL_SESSION_DIR=/media/usb/sets rustel song.strudel --watch
+rustel play song.strudel --watch --save-session=debug
+rustel play song.strudel --watch --session-file take2.rustel-session
+rustel play song.strudel --watch --no-save-session
+RUSTEL_SESSION_DIR=/media/usb/sets rustel play song.strudel --watch
 ```
 
 Studio accepts the same three flags. `RUSTEL_SESSION_DIR` does not move Studio
@@ -69,7 +69,7 @@ Use `--follow` to display the active score during live playback or replay.
 For a separate terminal renderer:
 
 ```sh
-rustel song.strudel --watch --score-events 2>&1 >/dev/null | rustel watch-code
+rustel play song.strudel --watch --score-events 2>&1 >/dev/null | rustel watch-code
 rustel replay take.rustel-session --score-events 2>&1 >/dev/null | rustel watch-code
 ```
 

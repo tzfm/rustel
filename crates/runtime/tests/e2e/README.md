@@ -60,7 +60,7 @@ Run it locally or dispatch Heavy CI for the current commit.
 Each score is an ordinary `.strudel` file. Play one, and press Ctrl+C to stop:
 
 ```sh
-cargo run --release -p rustel -- crates/runtime/tests/e2e/scores/corpus/songs/madeallup.strudel
+cargo run --release -p rustel -- play crates/runtime/tests/e2e/scores/corpus/songs/madeallup.strudel
 ```
 
 Provenance lives in each file's own header comment, in the same `@title` /

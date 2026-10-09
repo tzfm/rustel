@@ -6,7 +6,7 @@
 //! Session's own thread where their semantics are the ones the audio uses, and
 //! rate-limits everything so a window never sets the pace of a set.
 //!
-//! Studio owns one [`HydraBridge`]. `rustel <score>` plays the music and
+//! Studio owns one [`HydraBridge`]. `rustel play <score>` plays the music and
 //! reports that the visuals need Studio.
 
 use std::time::{Duration, Instant};

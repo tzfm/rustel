@@ -12,7 +12,7 @@ A build with `--no-default-features` leaves these routes out. The
 `device-audio`, `midi`, `osc`, and `serial` features add them back. See
 [building](building.md).
 
-The playback flags below use `rustel <score>`, not `rustel trace`.
+The playback flags below use `rustel play`, not `rustel trace`.
 `query`, `validate`, and offline rendering do not open output devices.
 
 ## Finding MIDI devices
@@ -55,7 +55,7 @@ SysEx (`sysex`, `sysexid`, `sysexdata`), NRPN (`nrpnn`, `nrpv`), and
 On macOS and Linux:
 
 ```sh
-rustel song.strudel --midi-virtual rustel
+rustel play song.strudel --midi-virtual rustel
 ```
 
 Use `.midi('rustel')` in the score. Repeat the flag for more ports.
@@ -92,8 +92,8 @@ default), jump, or relative. Use relative for binary-offset encoders.
 ## MIDI clock
 
 ```sh
-rustel song.strudel --midi-clock-out MiniLab
-rustel song.strudel --midi-clock-in MiniLab
+rustel play song.strudel --midi-clock-out MiniLab
+rustel play song.strudel --midi-clock-in MiniLab
 ```
 
 Output sends 24 pulses per beat, plus Start, Continue, and Stop messages.
@@ -159,7 +159,7 @@ See [building](building.md) to omit gamepad support. `--all-features` enables it
 Select an input in Studio's Devices panel, or name it for live playback:
 
 ```sh
-rustel song.strudel --audio-input Scarlett
+rustel play song.strudel --audio-input Scarlett
 ```
 
 ```javascript
@@ -193,7 +193,7 @@ An argument changes the port. `oschost` and `oscport` also accept patterns.
 A non-loopback destination needs an explicit grant:
 
 ```sh
-rustel song.strudel --allow-osc-host 192.168.1.10
+rustel play song.strudel --allow-osc-host 192.168.1.10
 ```
 
 ```javascript
@@ -252,7 +252,7 @@ If sound crackles, increase **audio out latency** in Settings ▸ advanced,
 or set a buffer size:
 
 ```sh
-rustel song.strudel --buffer-frames 256
+rustel play song.strudel --buffer-frames 256
 ```
 
 Studio accepts the same flag. The range is 32-16384 frames. Larger buffers

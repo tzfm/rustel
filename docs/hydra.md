@@ -20,8 +20,8 @@ rustel studio hydra.strudel
 Press **F5**. Saving updates the sketch. Stop clears the score's picture;
 remove its Hydra calls to remove it from the set.
 
-`rustel <score>` plays the music but has no editor backdrop. A build without
-Hydra logs a notice and plays the music without visuals.
+`rustel play <score>` plays the music but has no editor backdrop. A build
+without Hydra logs a notice and plays the music without visuals.
 
 ## The snippet shelf
 

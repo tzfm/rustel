@@ -38,7 +38,7 @@ export audio. No browser is required.
 | --- | --- |
 | **Strudel patterns** | Patterns, samples, synths, and effects from the Strudel language. See [compatibility](docs/compatibility.md) for the exceptions. |
 | **Studio** | A terminal editor with live update, visuals, a mixer, and a key reference. A bad update leaves the last good score playing. |
-| **Your editor** | Run `rustel song.strudel --watch` and edit in any editor. Audio keeps running across saves. |
+| **Your editor** | Run `rustel play song.strudel --watch` and edit in any editor. Audio keeps running across saves. |
 | **Session tapes** | Studio logs each installed update with its time. See [sessions](docs/sessions.md). |
 | **Hardware** | Speakers, audio input, MIDI, OSC, and serial. MIDI clock can follow or lead. See [hardware](docs/hardware.md). |
 | **Visuals** | Scope, piano roll, spectrum, and [Hydra](docs/hydra.md) in the terminal. |
@@ -70,8 +70,8 @@ Press **Ctrl+Q** twice to quit. Use Control on macOS too.
 Save the pattern above as `song.strudel`, then run:
 
 ```sh
-rustel song.strudel          # Play until Ctrl+C
-rustel song.strudel --watch  # Reload when you save the file
+rustel play song.strudel          # Play until Ctrl+C
+rustel play song.strudel --watch  # Reload when you save the file
 ```
 
 Check a score or export about 30 seconds of audio, rounded to a whole cycle:
