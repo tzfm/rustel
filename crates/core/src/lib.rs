@@ -532,9 +532,11 @@ impl Hap {
         Hap {
             whole: self.whole,
             part: self.part,
-            pick_lookup: (value == self.value)
-                .then(|| self.pick_lookup.clone())
-                .flatten(),
+            pick_lookup: self
+                .pick_lookup
+                .as_ref()
+                .filter(|_| value == self.value)
+                .cloned(),
             value,
             context: self.context.clone(),
             live_controls: [0; 2],
@@ -3398,6 +3400,41 @@ fn scoped_pick_lookup(mut lookup: PickLookup) -> Option<Arc<PickLookup>> {
     Some(Arc::new(lookup))
 }
 
+/// True when the eager `set` lookup equals the lookup a pick derives from
+/// the merged value.
+///
+/// `set_object` starts from the members of the merged value, then overwrites
+/// each entry with the member of the left value, then of the right value.
+/// The two lookups are equal when each overwriting member has the bits of
+/// the merged member. `same_key` compares bits, so a zero of the other sign
+/// keeps the eager path.
+fn set_lookup_follows_value(value: &Value, left: &Hap, right: &Hap) -> bool {
+    if left.pick_lookup.is_some()
+        || right.pick_lookup.is_some()
+        || value.has_js_function()
+        // A string gives one lookup entry for each character.
+        || matches!(left.value, Value::Str(_))
+        || matches!(right.value, Value::Str(_))
+    {
+        return false;
+    }
+    let merged = |key: &str, member: &Value| {
+        value
+            .get(key)
+            .is_some_and(|merged| same_key(merged, member))
+    };
+    let right_members = right.value.as_object();
+    if !right_members.is_none_or(|members| members.iter().all(|(key, member)| merged(key, member)))
+    {
+        return false;
+    }
+    left.value.as_object().is_none_or(|members| {
+        members.iter().all(|(key, member)| {
+            right_members.is_some_and(|right| right.contains_key(key)) || merged(key, member)
+        })
+    })
+}
+
 fn applied_pick_lookup(
     flow: LookupFlow,
     value: &Value,
@@ -3405,13 +3442,20 @@ fn applied_pick_lookup(
     right: &Hap,
 ) -> Option<Arc<PickLookup>> {
     match flow {
-        LookupFlow::Left => (value == &left.value)
-            .then(|| left.pick_lookup.clone())
-            .flatten(),
-        LookupFlow::Right => (value == &right.value)
-            .then(|| right.pick_lookup.clone())
-            .flatten(),
+        LookupFlow::Left => {
+            let lookup = left.pick_lookup.as_ref()?;
+            (value == &left.value).then(|| lookup.clone())
+        }
+        LookupFlow::Right => {
+            let lookup = right.pick_lookup.as_ref()?;
+            (value == &right.value).then(|| lookup.clone())
+        }
         LookupFlow::Set => {
+            // A pick derives this lookup from the value. Plain data needs no
+            // eager copy.
+            if set_lookup_follows_value(value, left, right) {
+                return None;
+            }
             if value == &right.value {
                 right.pick_lookup.clone()
             } else {
@@ -3423,6 +3467,9 @@ fn applied_pick_lookup(
             }
         }
         LookupFlow::Infer | LookupFlow::Add => {
+            if left.pick_lookup.is_none() && right.pick_lookup.is_none() {
+                return None;
+            }
             if value == &left.value {
                 left.pick_lookup.clone()
             } else if value == &right.value {
@@ -8671,5 +8718,88 @@ mod callback_query_metrics_tests {
             };
             assert_eq!(kinds.get(kind), expected, "{kind:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod set_lookup_tests {
+    use super::*;
+
+    fn object(entries: &[(&str, Value)]) -> Value {
+        Value::object(
+            entries
+                .iter()
+                .map(|(key, value)| ((*key).into(), value.clone())),
+        )
+    }
+
+    fn entries(lookup: &PickLookup) -> Vec<(String, Value)> {
+        let PickLookup::Object { entries, .. } = lookup else {
+            panic!("a set lookup is an object");
+        };
+        entries
+            .iter()
+            .map(|(key, pattern)| (key.clone(), pattern.as_pure().expect("a pure entry")))
+            .collect()
+    }
+
+    #[test]
+    fn a_skipped_set_lookup_equals_the_lookup_of_the_merged_value() {
+        let members = [
+            Value::F64(0.0),
+            Value::F64(-0.0),
+            Value::F64(1.0),
+            Value::Bool(true),
+            Value::Str("x".into()),
+            Value::List(vec![Value::F64(-0.0)]),
+        ];
+        let mut values = vec![Value::Undefined, Value::Null, Value::Str("ab".into())];
+        values.extend(members.iter().cloned());
+        for key in ["value", "0", "a"] {
+            for member in &members {
+                values.push(object(&[(key, member.clone())]));
+            }
+        }
+        for first in &members {
+            for second in &members {
+                values.push(object(&[("value", first.clone()), ("a", second.clone())]));
+            }
+        }
+
+        let span = TimeSpan::new(Fraction::ZERO, Fraction::ONE);
+        let mut skipped = 0;
+        for left in &values {
+            for right in &values {
+                let left_hap = Hap::new(Some(span), span, left.clone());
+                let right_hap = Hap::new(Some(span), span, right.clone());
+                for merged in [
+                    controls::set_value(left, right),
+                    compose::compose_op(compose::ComposeOp::Set, left, right),
+                ] {
+                    if !set_lookup_follows_value(&merged, &left_hap, &right_hap) {
+                        continue;
+                    }
+                    skipped += 1;
+                    // The lookup the merge stored before, then the one a pick derives.
+                    let Some(eager) = (merged != *right)
+                        .then(|| PickLookup::set_object(&left_hap, &right_hap, &merged))
+                        .flatten()
+                    else {
+                        continue;
+                    };
+                    let derived = PickLookup::from_value(&merged).expect("an object value");
+                    assert_eq!(eager.enumerable_len(), derived.enumerable_len());
+                    let (eager, derived) = (entries(&eager), entries(&derived));
+                    assert_eq!(eager.len(), derived.len());
+                    for ((eager_key, eager_value), (key, value)) in eager.iter().zip(&derived) {
+                        assert!(
+                            eager_key == key && same_key(eager_value, value),
+                            "{left:?} set {right:?}: {eager_key} {eager_value:?}, {key} {value:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(skipped > 1_000, "only {skipped} merges skipped the lookup");
     }
 }
