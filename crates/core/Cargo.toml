@@ -10,6 +10,10 @@ description = "Pattern values, events, queries, and transformations"
 # Pattern values and graphs remain independent of the JavaScript runtime.
 
 [features]
+default = ["tuning-list"]
+# The table of 3,304 named scales (244 KB compressed) and its decoder.
+# Without the feature, every named scale is unknown and a frequency list works.
+tuning-list = ["dep:flate2"]
 # Benchmark-only callback boundary census. Ordinary builds retain the exact
 # aggregate counter without adding a branch to every host crossing.
 callback-census = []
@@ -17,7 +21,7 @@ callback-census = []
 [dependencies]
 rustel-fraction = { path = "../fraction" }
 dragonbox_ecma = "0.1.12"
-flate2 = "1"
+flate2 = { version = "1", optional = true }
 once_cell = "1"
 serde = { version = "1", features = ["derive"] }
 # `midimaps` resolves aliases of one control in document order, as a

@@ -204,6 +204,7 @@ jobs:
         run: |
           bash .github/scripts/cargo-ci.sh test -p rustel-engine -- --test-threads=1
           bash .github/scripts/cargo-ci.sh test -p rustel-engine --features session --test embedding -- --test-threads=1
+          bash .github/scripts/cargo-ci.sh test -p rustel-core --no-default-features -- --test-threads=1
           bash .github/scripts/cargo-ci.sh clippy -p rustel-engine --no-default-features -- -D warnings
           bash .github/scripts/cargo-ci.sh clippy -p rustel-engine --features session -- -D warnings
 

@@ -10,7 +10,7 @@ description = "Mini-notation parser and pattern compiler"
 # Hand-written krill parser.
 
 [dependencies]
-rustel-core = { path = "../core" }
+rustel-core = { path = "../core", default-features = false }
 rustel-fraction = { path = "../fraction" }
 
 [dev-dependencies]
