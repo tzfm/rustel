@@ -461,7 +461,6 @@ impl Drop for CliBatch {
 
 /// The five CLI routes a query-time runaway can arrive through. Each one asks
 /// for JSON, so its failure is the error envelope and not the human line.
-/// Four routes pass `--json`; the bare score route passes `-vvv`.
 fn query_time_cli_cases(
     score: &std::path::Path,
     render: &std::path::Path,
@@ -503,10 +502,10 @@ fn query_time_cli_cases(
             "1".into(),
         ],
         vec![
-            "play".into(),
+            "export".into(),
             score.to_string_lossy().into_owned(),
-            "-vvv".into(),
-            "--export".into(),
+            "--json".into(),
+            "-o".into(),
             export.to_string_lossy().into_owned(),
             "--duration".into(),
             "0.1".into(),
@@ -4911,16 +4910,14 @@ fn trace_duration_limits_keep_the_resource_error_contract() {
     }
 }
 
+#[cfg(any(target_os = "windows", not(feature = "midi")))]
 #[test]
-fn a_virtual_midi_port_is_refused_for_an_offline_export() {
-    let score = scratch("virtual-midi-export.strudel");
-    let output = scratch("virtual-midi-export.wav");
+fn a_virtual_midi_port_is_refused_where_none_can_exist() {
+    let score = scratch("virtual-midi-refused.strudel");
     std::fs::write(&score, "note('c4')").expect("write score");
     let result = run(&[
         "play",
         score.to_str().expect("UTF-8 score"),
-        "--export",
-        output.to_str().expect("UTF-8 output"),
         "--duration",
         "1",
         "--midi-virtual",
@@ -4933,14 +4930,11 @@ fn a_virtual_midi_port_is_refused_for_an_offline_export() {
     let error = String::from_utf8_lossy(&result.stderr);
     #[cfg(target_os = "windows")]
     assert!(error.contains("unavailable on Windows"), "{error}");
-    #[cfg(all(not(target_os = "windows"), feature = "midi"))]
-    assert!(error.contains("requires live playback"), "{error}");
-    #[cfg(all(not(target_os = "windows"), not(feature = "midi")))]
+    #[cfg(not(target_os = "windows"))]
     assert!(
         error.contains("requires a build with the midi feature"),
         "{error}"
     );
-    assert!(!output.exists(), "a refused run wrote an export");
     let _ = std::fs::remove_file(score);
 }
 
@@ -5043,32 +5037,6 @@ fn the_bounce_success_line_names_the_sample_rate_without_truncating_it() {
         "the render line truncates the rate to kHz: {stdout}"
     );
     let _ = std::fs::remove_file(&out);
-
-    // `--export` says the same fact in its own summary line.
-    let score = scratch("rate-44100.strudel");
-    let out = scratch("rate-44100-export.wav");
-    std::fs::write(&score, r#"note("c4").gain(0.2)"#).expect("write score");
-    let stdout = ok_stdout(&[
-        "play",
-        score.to_str().expect("UTF-8 score"),
-        "--export",
-        out.to_str().expect("UTF-8 output"),
-        "--cycles",
-        "1",
-        "--sample-rate",
-        "44100",
-    ]);
-    assert!(
-        stdout.contains("at 44100 Hz"),
-        "the export line did not name the rate: {stdout}"
-    );
-    assert!(
-        !stdout.contains("kHz"),
-        "the export line truncates the rate to kHz: {stdout}"
-    );
-    for path in [score, out] {
-        let _ = std::fs::remove_file(path);
-    }
 }
 
 /// The command line prints recoverable notices on stderr, which a library
@@ -5193,7 +5161,7 @@ fn scalar_wav_renders_the_bundled_bd_sample_without_node_or_a_sample_server() {
 }
 
 #[test]
-fn musician_export_is_a_deterministic_audible_wav_and_cycles_control_length() {
+fn export_is_a_deterministic_audible_wav_and_cycles_control_length() {
     let score = scratch("musician-export.strudel");
     let first = scratch("musician-export-first.wav");
     let second = scratch("musician-export-second.wav");
@@ -5201,10 +5169,10 @@ fn musician_export_is_a_deterministic_audible_wav_and_cycles_control_length() {
 
     for output in [&first, &second] {
         let args = [
-            "play",
+            "export",
             score.to_str().expect("UTF-8 score"),
-            "-vvv",
-            "--export",
+            "--json",
+            "-o",
             output.to_str().expect("UTF-8 output"),
             "--cycles",
             "2",
@@ -5219,21 +5187,21 @@ fn musician_export_is_a_deterministic_audible_wav_and_cycles_control_length() {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .expect("spawn musician export");
+            .expect("spawn export");
         let result = wait_for_output(child, &args);
         assert!(
             result.status.success(),
-            "musician export failed: {}",
+            "export failed: {}",
             String::from_utf8_lossy(&result.stderr)
         );
         let report: serde_json::Value =
-            serde_json::from_slice(&result.stdout).expect("musician export report");
+            serde_json::from_slice(&result.stdout).expect("export report");
         assert_eq!(report["format"], "wav-scalar-pcm");
         assert_eq!(report["duration_secs"], 4.0);
     }
 
-    let first_bytes = std::fs::read(&first).expect("first musician WAV");
-    let second_bytes = std::fs::read(&second).expect("second musician WAV");
+    let first_bytes = std::fs::read(&first).expect("first WAV");
+    let second_bytes = std::fs::read(&second).expect("second WAV");
     assert_eq!(&first_bytes[..4], b"RIFF");
     assert_eq!(&first_bytes[8..12], b"WAVE");
     assert_eq!(
@@ -5247,9 +5215,9 @@ fn musician_export_is_a_deterministic_audible_wav_and_cycles_control_length() {
             .0
             .iter()
             .any(|sample| *sample != [0, 0]),
-        "musician export wrote a silent false green"
+        "export wrote a silent false green"
     );
-    assert_eq!(first_bytes, second_bytes, "musician export is not stable");
+    assert_eq!(first_bytes, second_bytes, "export is not stable");
 
     for path in [score, first, second] {
         let _ = std::fs::remove_file(path);
@@ -5290,9 +5258,9 @@ fn an_export_whose_score_threw_fails_the_exit_status() {
             let _ = std::fs::remove_file(&out);
             assert_reported_failure(
                 &[
-                    "play",
+                    "export",
                     score_path.to_str().expect("UTF-8 score"),
-                    "--export",
+                    "-o",
                     out.to_str().expect("UTF-8 output"),
                     "--cycles",
                     "1",
@@ -5403,7 +5371,7 @@ fn an_export_whose_filter_failed_open_is_complete_and_exits_zero() {
         ),
         (
             "filter-open-export.wav",
-            vec!["play", score.as_str(), "-vvv", "--cycles", "2", "--export"],
+            vec!["export", score.as_str(), "--json", "--cycles", "2", "-o"],
             report_onsets,
         ),
         (
@@ -5430,7 +5398,7 @@ fn an_export_whose_filter_failed_open_is_complete_and_exits_zero() {
 }
 
 #[test]
-fn musician_score_tempo_overrides_cli_baseline_and_controls_cycle_export() {
+fn score_tempo_overrides_cli_baseline_and_controls_cycle_export() {
     let score = scratch("musician-score-tempo.strudel");
     let output = scratch("musician-score-tempo.wav");
     std::fs::write(
@@ -5458,10 +5426,10 @@ fn musician_score_tempo_overrides_cli_baseline_and_controls_cycle_export() {
     .expect("write tempo score");
 
     let args = [
-        "play",
+        "export",
         score.to_str().expect("UTF-8 score"),
-        "-vvv",
-        "--export",
+        "--json",
+        "-o",
         output.to_str().expect("UTF-8 output"),
         "--cycles",
         "2",
@@ -5816,12 +5784,12 @@ fn musician_prebake_runs_before_the_score_on_the_same_heap() {
     .expect("write score");
 
     let args = [
-        "play",
+        "export",
         score.to_str().expect("UTF-8 score"),
-        "-vvv",
+        "--json",
         "--prebake",
         prebake.to_str().expect("UTF-8 prebake"),
-        "--export",
+        "-o",
         output.to_str().expect("UTF-8 output"),
         "--duration",
         "1",
@@ -5867,7 +5835,7 @@ fn musician_prebake_runs_before_the_score_on_the_same_heap() {
 }
 
 #[test]
-fn projected_elementals_reach_query_and_same_heap_musician_export() {
+fn projected_elementals_reach_query_and_same_heap_export() {
     let query_source = r#"
       rustelScope.stack(
         rustelScope.stepcat(
@@ -6085,12 +6053,12 @@ fn projected_elementals_reach_query_and_same_heap_musician_export() {
     .expect("write elemental score");
 
     let args = [
-        "play",
+        "export",
         score.to_str().expect("UTF-8 score"),
-        "-vvv",
+        "--json",
         "--prebake",
         prebake.to_str().expect("UTF-8 prebake"),
-        "--export",
+        "-o",
         output.to_str().expect("UTF-8 output"),
         "--duration",
         "1.5",
@@ -6098,7 +6066,7 @@ fn projected_elementals_reach_query_and_same_heap_musician_export() {
     let result = run(&args);
     assert!(
         result.status.success(),
-        "elemental musician export failed: {}",
+        "elemental export failed: {}",
         String::from_utf8_lossy(&result.stderr)
     );
     let report: serde_json::Value =
@@ -6107,7 +6075,7 @@ fn projected_elementals_reach_query_and_same_heap_musician_export() {
     assert_eq!(report["duration_secs"], 1.5);
     assert_eq!(report["onset_count"], 3);
     assert_eq!(report["device_audio"], "not-requested");
-    let bytes = std::fs::read(&output).expect("elemental musician WAV");
+    let bytes = std::fs::read(&output).expect("elemental WAV");
     assert_eq!(&bytes[..4], b"RIFF");
     assert_eq!(wav_data(&bytes).len(), 72_000 * 2 * 2);
 
@@ -6136,12 +6104,12 @@ fn musician_prebake_failures_are_structured_and_no_file_is_auto_discovered() {
     let score_text = score.to_str().expect("UTF-8 score");
     let output_text = output.to_str().expect("UTF-8 output");
     let missing_result = run(&[
-        "play",
+        "export",
         score_text,
-        "-vvv",
+        "--json",
         "--prebake",
         missing.to_str().expect("UTF-8 missing"),
-        "--export",
+        "-o",
         output_text,
     ]);
     assert_eq!(missing_result.status.code(), Some(4));
@@ -6150,12 +6118,12 @@ fn musician_prebake_failures_are_structured_and_no_file_is_auto_discovered() {
     assert_eq!(missing_error["error"]["kind"], "io");
 
     let invalid_result = run(&[
-        "play",
+        "export",
         score_text,
-        "-vvv",
+        "--json",
         "--prebake",
         invalid.to_str().expect("UTF-8 invalid"),
-        "--export",
+        "-o",
         output_text,
     ]);
     assert_eq!(invalid_result.status.code(), Some(1));
@@ -6170,14 +6138,7 @@ fn musician_prebake_failures_are_structured_and_no_file_is_auto_discovered() {
     );
     assert!(!output.exists(), "failed prebake still rendered a score");
 
-    let no_discovery = run(&[
-        "play",
-        score_text,
-        "--export",
-        output_text,
-        "--duration",
-        "0.1",
-    ]);
+    let no_discovery = run(&["export", score_text, "-o", output_text, "--duration", "0.1"]);
     assert!(
         no_discovery.status.success(),
         "an adjacent prebake.js was auto-loaded: {}",
@@ -6322,10 +6283,7 @@ fn query_time_javascript_deadline_is_structured_on_every_cli_route() {
         );
     }
     assert!(!render.exists(), "a refused render created its output");
-    assert!(
-        !export.exists(),
-        "a refused musician export created its WAV"
-    );
+    assert!(!export.exists(), "a refused export created its WAV");
 
     // The error kind comes from the error type, not from its text. A score
     // that throws the deadline wording is an ordinary throw: empty haps, as
@@ -6457,12 +6415,12 @@ fn musician_prebake_file_limit_accepts_exactly_four_mib_and_refuses_one_more_byt
     std::fs::write(&score, "note('c4')").expect("write score");
 
     let exact = run(&[
-        "play",
+        "export",
         score.to_str().expect("UTF-8 score"),
-        "-vvv",
+        "--json",
         "--prebake",
         prebake.to_str().expect("UTF-8 setup"),
-        "--export",
+        "-o",
         output.to_str().expect("UTF-8 output"),
         "--duration",
         "0",
@@ -6474,12 +6432,12 @@ fn musician_prebake_file_limit_accepts_exactly_four_mib_and_refuses_one_more_byt
     );
 
     let over = run(&[
-        "play",
+        "export",
         score.to_str().expect("UTF-8 score"),
-        "-vvv",
+        "--json",
         "--prebake",
         oversized.to_str().expect("UTF-8 oversized setup"),
-        "--export",
+        "-o",
         output.to_str().expect("UTF-8 output"),
     ]);
     assert_eq!(over.status.code(), Some(3));
@@ -6500,10 +6458,10 @@ fn musician_prebake_file_limit_accepts_exactly_four_mib_and_refuses_one_more_byt
     let stdin_run = |size: usize| {
         use std::io::Write;
         let args = [
-            "play",
+            "export",
             "-",
-            "-vvv",
-            "--export",
+            "--json",
+            "-o",
             output.to_str().expect("UTF-8 output"),
             "--duration",
             "0",
@@ -6648,8 +6606,7 @@ fn unwatched_musician_refuses_an_unplayable_score_before_opening_audio() {
         let score = scratch(&format!("musician-unplayable-{name}.strudel"));
         std::fs::write(&score, source).expect("write unplayable score");
         let path = score.to_str().expect("UTF-8 score");
-        // The bare musician route has no --json; -vvv is how it is asked for
-        // the structured stderr this test reads.
+        // -vvv asks for the structured stderr this test reads.
         let args = match extra {
             Some(flag) => vec!["play", path, "-vvv", flag],
             None => vec!["play", path, "-vvv"],
@@ -6687,8 +6644,7 @@ fn playable_and_explicitly_watched_scores_still_reach_audio_startup() {
         let score = scratch(&format!("musician-audio-control-{name}.strudel"));
         std::fs::write(&score, source).expect("write score");
         let path = score.to_str().expect("UTF-8 score");
-        // The bare musician route has no --json; -vvv is how it is asked for
-        // the structured stderr this test reads.
+        // -vvv asks for the structured stderr this test reads.
         let args = match extra {
             Some(flag) => vec!["play", path, "-vvv", flag],
             None => vec!["play", path, "-vvv"],
@@ -6712,19 +6668,17 @@ fn playable_and_explicitly_watched_scores_still_reach_audio_startup() {
 }
 
 #[test]
-fn musician_surface_rejects_ambiguous_shapes_as_usage_errors() {
+fn ambiguous_play_and_export_shapes_are_usage_errors() {
     let score = scratch("musician-conflicts.strudel");
     let output = scratch("musician-conflicts.wav");
     std::fs::write(&score, r#"note("c4")"#).expect("write score");
     let score = score.to_str().expect("UTF-8 score");
     let output = output.to_str().expect("UTF-8 output");
     for args in [
-        vec!["play", score, "--watch", "--export", output],
-        vec!["play", score, "--cycles", "2"],
         vec![
-            "play",
+            "export",
             score,
-            "--export",
+            "-o",
             output,
             "--cycles",
             "2",
@@ -6737,7 +6691,7 @@ fn musician_surface_rejects_ambiguous_shapes_as_usage_errors() {
         assert_eq!(
             result.status.code(),
             Some(2),
-            "ambiguous musician invocation was not a usage error: {args:?}\n{}",
+            "ambiguous invocation was not a usage error: {args:?}\n{}",
             String::from_utf8_lossy(&result.stderr)
         );
     }
@@ -6745,7 +6699,7 @@ fn musician_surface_rejects_ambiguous_shapes_as_usage_errors() {
 }
 
 #[test]
-fn musician_export_preserves_structured_failure_exit_classes() {
+fn export_preserves_structured_failure_exit_classes() {
     let assert_error_kind = |stderr: &[u8], kind: &str| {
         let lines = structured_lines(stderr);
         let text = String::from_utf8_lossy(stderr);
@@ -6766,20 +6720,20 @@ fn musician_export_preserves_structured_failure_exit_classes() {
     std::fs::write(&score, "note(").expect("write malformed score");
     let score_text = score.to_str().expect("UTF-8 score");
 
-    let malformed = run(&["play", score_text, "-vvv", "--export", unused_output_text]);
+    let malformed = run(&["export", score_text, "--json", "-o", unused_output_text]);
     assert_eq!(malformed.status.code(), Some(1));
     assert_error_kind(&malformed.stderr, "evaluation");
 
     std::fs::write(&score, r#"note("c4")"#).expect("write valid score");
-    let io = run(&["play", score_text, "-vvv", "--export", missing_output]);
+    let io = run(&["export", score_text, "--json", "-o", missing_output]);
     assert_eq!(io.status.code(), Some(4));
     assert_error_kind(&io.stderr, "io");
 
     let limit = run(&[
-        "play",
+        "export",
         score_text,
-        "-vvv",
-        "--export",
+        "--json",
+        "-o",
         unused_output_text,
         "--duration",
         "86401",
@@ -6789,67 +6743,6 @@ fn musician_export_preserves_structured_failure_exit_classes() {
 
     let _ = std::fs::remove_file(score);
     let _ = std::fs::remove_file(unused_output);
-}
-
-/// Pins that `--export` refuses a `.mp3` or `.json` path with an
-/// `invalid-argument` error pointing at `rustel export -o` and writes nothing,
-/// while a `.wav` path still bounces.
-#[test]
-fn musician_export_refuses_names_it_cannot_write_and_keeps_bouncing_wav() {
-    let score = scratch("musician-export-mismatch.strudel");
-    std::fs::write(&score, r#"note("c4")"#).expect("write score");
-    let score_text = score.to_str().expect("UTF-8 score");
-    for extension in ["mp3", "json"] {
-        let output = scratch(&format!("musician-export-mismatch.{extension}"));
-        let refused = run(&[
-            "play",
-            score_text,
-            "-vvv",
-            "--export",
-            output.to_str().expect("UTF-8 output"),
-        ]);
-        assert_eq!(
-            refused.status.code(),
-            Some(1),
-            "a .{extension} export must be a diagnosed refusal, not a bounce: {}",
-            String::from_utf8_lossy(&refused.stderr)
-        );
-        let envelope: serde_json::Value =
-            serde_json::from_slice(&refused.stderr).expect("refusal envelope");
-        assert_eq!(envelope["error"]["kind"], "invalid-argument");
-        let message = envelope["error"]["message"].as_str().expect("message");
-        assert!(
-            message.contains("--export writes WAV"),
-            "the refusal must say what --export writes: {message}"
-        );
-        assert!(
-            message.contains("rustel export -o"),
-            "the refusal must point at the other containers: {message}"
-        );
-        assert!(
-            !output.exists(),
-            "the refused bounce still wrote {}",
-            output.display()
-        );
-    }
-    let wav = scratch("musician-export-mismatch.wav");
-    let bounced = run(&[
-        "play",
-        score_text,
-        "--export",
-        wav.to_str().expect("UTF-8 output"),
-        "--duration",
-        "0.1",
-    ]);
-    assert!(
-        bounced.status.success(),
-        "a .wav export stopped working: {}",
-        String::from_utf8_lossy(&bounced.stderr)
-    );
-    assert_audible(&wav);
-
-    let _ = std::fs::remove_file(score);
-    let _ = std::fs::remove_file(wav);
 }
 
 // -- bench ------------------------------------------------------------------

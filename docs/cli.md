@@ -40,7 +40,8 @@ and hold values.
 `export` and `render` are the same command. Export uses no audio device.
 The defaults are 8 cycles and a 16-bit stereo WAV at 48 kHz, saved beside the
 score. `--duration` accepts `30s`, `2m`, `1:30`, `1h`, or `16b`. Durations of
-at least one cycle round to the nearest whole cycle.
+at least one cycle round to the nearest whole cycle. `--prebake setup.js`
+loads helpers before the score, as for `play`.
 
 | Format | Output |
 | --- | --- |

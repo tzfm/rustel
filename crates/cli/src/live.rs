@@ -12,14 +12,8 @@ pub(super) fn run_musician(
         file,
         prebake,
         watch,
-        export,
-        cycles,
         duration,
-        until_silence,
-        silence_floor,
-        silence_hold,
         cps,
-        sample_rate,
         sample_access,
         save_session,
         no_save_session,
@@ -39,7 +33,7 @@ pub(super) fn run_musician(
         // reports; the field itself has no second reader here.
         json: _,
     } = args;
-    // Reject unsupported virtual ports before loading the score or writing a file.
+    // Reject unsupported virtual ports before loading the score.
     if !midi_virtual.is_empty() {
         if cfg!(target_os = "windows") {
             return Err(RuntimeError::Message(
@@ -49,25 +43,7 @@ pub(super) fn run_musician(
             return Err(RuntimeError::Message(
                 "--midi-virtual requires a build with the midi feature".into(),
             ));
-        } else if export.is_some() {
-            return Err(RuntimeError::Message(
-                "--midi-virtual requires live playback and cannot be used with --export".into(),
-            ));
         }
-    }
-    // `--export` writes WAV only: a path with any other extension is refused
-    // before any work, and a path with none is written as WAV. The export
-    // subcommand writes the other containers.
-    if let Some(export) = &export
-        && export
-            .extension()
-            .is_some_and(|extension| !extension.eq_ignore_ascii_case("wav"))
-    {
-        return Err(RuntimeError::Message(format!(
-            "--export writes WAV; `{}` is not a .wav path. Use a .wav path, or \
-             `rustel export -o` for mp3 or onset JSON.",
-            export.display()
-        )));
     }
     // `--json` is the documented way to ask for machine output, and this is
     // the path that plays a score: watching one with it printed "Started
@@ -85,16 +61,13 @@ pub(super) fn run_musician(
         // Fail before reading: a watched path must be a rereadable file.
         let _ = watch_file(&input)?;
     }
-    let sample_rate = sample_rate.unwrap_or(48_000);
     let mut session = Session::with_config(with_sample_access(
         session_config(dispatch)
             .with_cps(cps)
-            .with_sample_rate(sample_rate),
+            .with_sample_rate(48_000),
         &input.sample_access,
     )?)?;
-    if export.is_none() {
-        session.set_direct_diagnostic_logging(output.structured());
-    }
+    session.set_direct_diagnostic_logging(output.structured());
     let _watcher = watch_for_interrupt(session.transport());
     let (loaded, initial_error) = if watch {
         load_watch_musician_sources(
@@ -114,82 +87,6 @@ pub(super) fn run_musician(
             None,
         )
     };
-
-    if let Some(output) = export {
-        // Deterministic scalar export renders through the same sample
-        // library as everything else (A/B lanes depend on it).
-        if let Err(error) = session.enable_default_samples() {
-            notice(
-                serde_json::json!({
-                    "sample_library": { "status": "unavailable", "message": error.to_string() }
-                }),
-                || format!("warning: the sample library is unavailable - {error}"),
-            );
-        }
-        let duration = match cycles {
-            Some(cycles) => {
-                let cycles = parse_positive_seconds("cycles", cycles)?;
-                // A successful score-local setcps/setcpm overrides the CLI
-                // baseline. `--cycles` describes musical cycles, so derive
-                // its wall-clock bounce from the Session's committed tempo,
-                // not the value parsed before score evaluation.
-                parse_positive_seconds("duration", cycles / session.config().cps)?
-            }
-            // With --until-silence the duration is only a ceiling, so the
-            // two-second default would end every bounce before it began.
-            None if until_silence => parse_positive_seconds("duration", duration.unwrap_or(600.0))?,
-            None => parse_positive_seconds("duration", duration.unwrap_or(2.0))?,
-        };
-        if until_silence {
-            let floor_db = silence_floor.unwrap_or(-60.0);
-            if !floor_db.is_finite() || floor_db > 0.0 {
-                return Err(RuntimeError::Message(format!(
-                    "--silence-floor is dBFS and must be at or below 0, got {floor_db}"
-                )));
-            }
-            let hold = parse_positive_seconds("silence-hold", silence_hold.unwrap_or(2.0))?;
-            let floor = 10f64.powf(floor_db / 20.0) as f32;
-            session.stop_export_when_silent(floor, std::time::Duration::from_secs_f64(hold));
-            notice(
-                serde_json::json!({
-                    "export_until_silence": {
-                        "floor_dbfs": floor_db,
-                        "hold_secs": hold,
-                        "ceiling_secs": duration,
-                        "message": "stops when the music does; --duration is only the ceiling",
-                    }
-                }),
-                || {
-                    format!(
-                        "bouncing until the music stays under {floor_db} dBFS for {hold} s; {duration} s is only the ceiling"
-                    )
-                },
-            );
-        }
-        let report = session.render(duration, &output, RenderFormat::ScalarWav)?;
-        if json_asked() || LiveOutput::new(verbosity, ui_events, json_asked()).structured() {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&report).map_err(json_err)?
-            );
-        } else {
-            let on = style::stdout_on();
-            println!(
-                "{} {} - {:.1} s, 16-bit stereo WAV at {} Hz, {} onset{}",
-                style::green(on, "wrote"),
-                style::bold(on, &report.path),
-                report.duration_secs,
-                report.sample_rate,
-                report.onset_count,
-                if report.onset_count == 1 { "" } else { "s" },
-            );
-        }
-        // Written, but not the score: see `RenderReport::failure`.
-        if let Some(message) = report.failure() {
-            return Err(RuntimeError::Message(message));
-        }
-        return Ok(());
-    }
 
     // Watched sets record themselves. An unwatched one plays a file that never
     // changes, so its "tape" would be the file itself.

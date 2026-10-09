@@ -546,17 +546,17 @@ fn human_live_event(event: &serde_json::Value, verbosity: u8) -> Option<String> 
 
 #[derive(Debug, clap::Args)]
 struct MusicianArgs {
-    /// Score to play until Ctrl-C/--duration or export as WAV.
+    /// Score to play until Ctrl-C or --duration.
     #[arg(value_name = "FILE", required = true)]
     file: Option<PathBuf>,
     /// Evaluate setup JavaScript on the same heap before the score.
     #[arg(long, value_name = "FILE", help_heading = "Playing")]
     prebake: Option<PathBuf>,
     /// Reload stable saves without restarting the Session or audio stream.
-    #[arg(long, conflicts_with = "export", help_heading = "Playing")]
+    #[arg(long, help_heading = "Playing")]
     watch: bool,
-    /// Play for this many wall-clock seconds, or bound a bounce (default 2).
-    #[arg(long, conflicts_with = "cycles", help_heading = "Playing")]
+    /// Play for this many wall-clock seconds.
+    #[arg(long, help_heading = "Playing")]
     duration: Option<f64>,
     /// Cycles per second the score starts at; setcps/setcpm in the score win.
     #[arg(long, default_value_t = 0.5, help_heading = "Playing")]
@@ -577,56 +577,6 @@ struct MusicianArgs {
         )
     )]
     buffer_frames: Option<u32>,
-    /// Bounce deterministic scalar PCM to a .wav file instead of opening an
-    /// audio device; any other extension is refused. `rustel export -o FILE`
-    /// writes the other containers (.mp3, .json), read off the name.
-    #[arg(
-        long,
-        value_name = "WAV",
-        conflicts_with = "watch",
-        help_heading = "Bouncing to a file"
-    )]
-    export: Option<PathBuf>,
-    /// Bounce this many cycles; duration is cycles / cps.
-    #[arg(
-        long,
-        value_name = "N",
-        requires = "export",
-        conflicts_with = "duration",
-        help_heading = "Bouncing to a file"
-    )]
-    cycles: Option<f64>,
-    /// Stop the bounce once the music has gone quiet and stayed quiet, using
-    /// --duration (default 600) only as a ceiling. For scores that do not
-    /// `arrange`, and so have no written-down length.
-    #[arg(long, requires = "export", help_heading = "Bouncing to a file")]
-    until_silence: bool,
-    /// What counts as quiet, in dBFS (default -60).
-    #[arg(
-        long,
-        requires = "until_silence",
-        value_name = "DBFS",
-        allow_negative_numbers = true,
-        help_heading = "Bouncing to a file"
-    )]
-    silence_floor: Option<f64>,
-    /// How long it must stay quiet before the bounce ends, in seconds
-    /// (default 2). Raise it for a score whose rests are longer than its ending.
-    #[arg(
-        long,
-        requires = "until_silence",
-        value_name = "SECS",
-        help_heading = "Bouncing to a file"
-    )]
-    silence_hold: Option<f64>,
-    /// The bounce's sample rate in Hz (default 48000).
-    #[arg(
-        long,
-        requires = "export",
-        value_name = "HZ",
-        help_heading = "Bouncing to a file"
-    )]
-    sample_rate: Option<u32>,
     #[command(flatten)]
     sample_access: SampleAccessArgs,
     /// How much of the set to record. Watched sets are recorded by default -
@@ -669,14 +619,10 @@ struct MusicianArgs {
     /// Stdout carries only the protocol. The run's own narration goes to
     /// stderr, as for any other command, and is JSON in this mode. The two
     /// streams carry different objects.
-    #[arg(long, hide = true, conflicts_with_all = ["export", "follow"])]
+    #[arg(long, hide = true, conflicts_with = "follow")]
     ui_events: bool,
     /// Emit `score_active` JSON on stderr for `watch-code` or another editor.
-    #[arg(
-        long = "score-events",
-        conflicts_with = "export",
-        help_heading = "Playing"
-    )]
+    #[arg(long = "score-events", help_heading = "Playing")]
     announce_score: bool,
     /// Print the report as JSON instead of a readable summary.
     ///
@@ -876,8 +822,7 @@ enum Command {
     /// Play a score through the audio device until Ctrl-C.
     ///
     /// `--watch` reloads each stable save with no restart of the audio
-    /// stream. `--export out.wav` opens no device and bounces the score to a
-    /// file.
+    /// stream. To write a file, use `rustel export`.
     Play(Box<MusicianArgs>),
     /// Read or write user-wide settings in rustel.json.
     Config {
@@ -1260,6 +1205,9 @@ enum Command {
     Render {
         #[command(flatten)]
         input: SourceInput,
+        /// Evaluate setup JavaScript on the same heap before the score.
+        #[arg(long, value_name = "FILE")]
+        prebake: Option<PathBuf>,
         /// How long: seconds (60, 30s), minutes (2m, 1:30) or bars (16b).
         /// Ends on the nearest whole cycle, never mid-bar. [default: 8 cycles]
         #[arg(long, value_name = "LENGTH", conflicts_with = "cycles")]
@@ -2480,6 +2428,7 @@ fn run_command(
         }
         Command::Render {
             input,
+            prebake,
             duration,
             cycles,
             until_silence,
@@ -2516,6 +2465,10 @@ fn run_command(
                 &input.sample_access,
             )?)?;
             let _watcher = watch_for_interrupt(session.transport());
+            if let Some(path) = &prebake {
+                let source = read_bounded_file(path, "prebake")?;
+                session.evaluate_prebake_cancellable(&source, &EVALUATION_CANCELLED)?;
+            }
             load_source(&mut session, &input, &EVALUATION_CANCELLED)?;
             if let Err(error) = session.enable_default_samples() {
                 notice(
@@ -3917,7 +3870,7 @@ mod dsp_selection_tests {
     }
 
     #[test]
-    fn command_musician_and_replay_exports_retain_prepared_configuration() {
+    fn command_and_replay_exports_retain_prepared_configuration() {
         use rustel_runtime::session_log::{SaveStatus, SessionMode, SessionRecorder};
 
         let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("export directory");
@@ -3936,7 +3889,7 @@ mod dsp_selection_tests {
         );
         drop(recorder);
 
-        for route in ["render", "musician", "replay"] {
+        for route in ["render", "replay"] {
             let mut expected = None;
             for preference in ["auto", "portable"] {
                 let output = directory.path().join(format!("{route}-{preference}.wav"));
@@ -3949,12 +3902,6 @@ mod dsp_selection_tests {
                         "--format".into(),
                         "scalar-wav".into(),
                         "--output".into(),
-                        output.display().to_string(),
-                    ]),
-                    "musician" => args.extend([
-                        "play".into(),
-                        fixture.display().to_string(),
-                        "--export".into(),
                         output.display().to_string(),
                     ]),
                     "replay" => args.extend([
@@ -4480,7 +4427,6 @@ mod live_output_contract_tests {
         ])
         .expect("finite live playback");
         assert_eq!(finite_live.play().duration, Some(40.0));
-        assert_eq!(finite_live.play().export, None);
 
         let help = Cli::command().render_long_help().to_string();
         // Phrase assertions match the whitespace-normalised help: clap rewraps
