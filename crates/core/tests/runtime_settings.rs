@@ -667,6 +667,94 @@ fn pick_lookup_attached_to_a_hap_keeps_entry_patterns_in_the_owner_runtime() {
     });
 }
 
+fn object_value(entries: &[(&str, Value)]) -> Value {
+    Value::object(
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).into(), value.clone())),
+    )
+}
+
+fn first_hap(pattern: &rustel_core::Pattern) -> Hap {
+    pattern.query_arc(Fraction::ZERO, Fraction::ONE).remove(0)
+}
+
+fn pick_member(lookup_pattern: &rustel_core::Pattern, key: &str) -> Vec<Value> {
+    rustel_core::pick_patternified(
+        rustel_core::pure(Value::Str(key.into())),
+        lookup_pattern.clone(),
+        PickIndexMode::Modulo,
+        JoinMode::Inner,
+    )
+    .query_arc(Fraction::ZERO, Fraction::ONE)
+    .into_iter()
+    .map(|hap| hap.value)
+    .collect()
+}
+
+#[test]
+fn set_of_plain_objects_keeps_no_lookup_and_picks_the_merged_members() {
+    let left = rustel_core::pure(object_value(&[
+        ("a", Value::F64(1.0)),
+        ("b", Value::F64(2.0)),
+    ]));
+    let right = rustel_core::pure(object_value(&[
+        ("b", Value::F64(3.0)),
+        ("c", Value::F64(4.0)),
+    ]));
+    let merged = left.set(&right);
+    assert!(first_hap(&merged).pick_lookup().is_none());
+    for (key, expected) in [("a", 1.0), ("b", 3.0), ("c", 4.0)] {
+        assert_eq!(pick_member(&merged, key), vec![Value::F64(expected)]);
+    }
+}
+
+#[test]
+fn set_keeps_the_lookup_entry_patterns_of_its_left_side() {
+    let entry = rustel_core::signal(|_, _| Value::F64(7.0));
+    let left = rustel_core::pure_pick_lookup(
+        object_value(&[("a", Value::F64(1.0))]),
+        PickLookup::Object {
+            enumerable_len: 1,
+            entries: vec![("a".into(), entry)],
+        },
+    );
+    let merged = left.set(&rustel_core::pure(object_value(&[("b", Value::F64(2.0))])));
+    assert!(first_hap(&merged).pick_lookup().is_some());
+    assert_eq!(pick_member(&merged, "a"), vec![Value::F64(7.0)]);
+    assert_eq!(pick_member(&merged, "b"), vec![Value::F64(2.0)]);
+}
+
+#[test]
+fn set_keeps_the_lookup_where_the_lookup_and_the_merged_value_differ() {
+    // The merge drops a lone `value` member. The lookup keeps the member.
+    let merged = compose::compose(
+        &rustel_core::pure(Value::F64(3.0)),
+        &rustel_core::pure(object_value(&[("value", Value::F64(2.0))])),
+        compose::ComposeOp::Set,
+        Alignment::In,
+    );
+    assert!(first_hap(&merged).pick_lookup().is_some());
+    assert_eq!(pick_member(&merged, "value"), vec![Value::F64(2.0)]);
+
+    // A string on the right gives one lookup entry for each character.
+    let merged = compose::compose(
+        &rustel_core::pure(object_value(&[("0", Value::F64(7.0))])),
+        &rustel_core::pure(Value::Str("ab".into())),
+        compose::ComposeOp::Set,
+        Alignment::In,
+    );
+    assert!(first_hap(&merged).pick_lookup().is_some());
+    assert_eq!(pick_member(&merged, "0"), vec![Value::Str("a".into())]);
+
+    // The merged value takes the right zero. The lookup keeps the left zero.
+    let left = rustel_core::pure(object_value(&[("value", Value::F64(-0.0))]));
+    let merged = left.set(&rustel_core::pure(Value::F64(0.0)));
+    assert!(first_hap(&merged).pick_lookup().is_some());
+    let picked = pick_member(&merged, "value");
+    assert!(matches!(picked[..], [Value::F64(zero)] if zero.is_sign_negative()));
+}
+
 #[test]
 fn repeated_runtime_attachment_is_flat_and_queryable() {
     let settings = RuntimeSettings::default();
