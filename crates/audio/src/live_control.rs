@@ -1,7 +1,8 @@
 //! Sample-clock transitions for directly bound continuous score controls.
 //!
-//! The UI commits the exact number immediately. Only the sounding gain/cutoff
-//! moves through a short ramp; note timing and pattern values never do.
+//! The UI commits the exact number immediately. Only the sounding gain,
+//! low-pass cutoff and low-pass resonance move through a short ramp. Note
+//! timing and pattern values never do.
 //!
 //! ```text
 //! slider move --> LiveControlUpdate --> control ring --> audio callback
@@ -14,8 +15,8 @@
 pub const SLIDER_SMOOTHING_SECS: f32 = 0.035;
 
 /// Transition of an exact update, in seconds. A sounding voice never steps:
-/// a step in gain or cutoff is a click, and the steps of one drag are heard
-/// as distortion.
+/// a step in gain, cutoff or resonance is a click, and the steps of one drag
+/// are heard as distortion.
 pub const SLIDER_DECLICK_SECS: f32 = 0.005;
 
 /// A plain-data message on the device's single-producer control ring.

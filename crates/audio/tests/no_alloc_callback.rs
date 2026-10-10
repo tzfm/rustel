@@ -1038,7 +1038,7 @@ fn live_ring_preserves_the_complete_oscillator_control_bundle() {
     let ring = Ring::new(2);
     let controls = OscillatorControls {
         limit: None,
-        live_controls: [0; 2],
+        live_controls: [0; 3],
         preview_epoch: 7,
         choke_only: false,
         piano: true,
