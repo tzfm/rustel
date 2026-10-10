@@ -8,7 +8,7 @@ publish = false
 description = "Credited, statically linked extensions beyond upstream Strudel"
 
 [dependencies]
-rustel-core = { path = "../core" }
+rustel-core = { path = "../core", default-features = false }
 rustel-fraction = { path = "../fraction" }
 rustel-mini = { path = "../mini" }
 
