@@ -62,8 +62,10 @@ pub const LIMIT_REFERENCE: ReferenceEntry = ReferenceEntry {
     origin: "rustel",
 };
 
-/// The complete pinned control surface.
-pub static CONTROLS: &[ControlRow] = &[
+/// The authored table: one row for each control, with its names, its aliases
+/// and its reference entry. [`CONTROLS`] and [`CONTROL_NAMES`] are built from
+/// the rows, so a control has no way to exist without a reference entry.
+const ROWS: &[ControlRow] = &[
     ControlRow {
         names: &["s", "n", "gain"],
         aliases: &["sound"],
@@ -9849,6 +9851,38 @@ pub static CONTROLS: &[ControlRow] = &[
         },
     },
 ];
+
+/// The complete pinned control surface, reference entries included. A build
+/// links the reference text only when the build reads this table. Code which
+/// shows the text reads this table.
+pub static CONTROLS: &[ControlRow] = ROWS;
+
+/// The names and aliases of one control, with no reference entry. The slices
+/// are the ones of the matching [`ControlRow`].
+#[derive(Clone, Copy)]
+pub struct ControlNames {
+    /// The accessor names, as in [`ControlRow::names`].
+    pub names: &'static [&'static str],
+    /// The aliases, as in [`ControlRow::aliases`].
+    pub aliases: &'static [&'static str],
+}
+
+/// The names and aliases of every control, in table order. No item points to
+/// a reference entry. The control registry reads this table. A build with a
+/// size limit reads this table and not [`CONTROLS`], so the linker drops the
+/// reference text.
+pub static CONTROL_NAMES: [ControlNames; ROWS.len()] = {
+    let mut table = [ControlNames { names: &[], aliases: &[] }; ROWS.len()];
+    let mut index = 0;
+    while index < ROWS.len() {
+        table[index] = ControlNames {
+            names: ROWS[index].names,
+            aliases: ROWS[index].aliases,
+        };
+        index += 1;
+    }
+    table
+};
 
 /// Every control's reference entry, in table order.
 pub fn reference_entries() -> impl Iterator<Item = &'static ReferenceEntry> {
