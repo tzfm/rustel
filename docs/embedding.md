@@ -228,11 +228,11 @@ the feature off:
 rustel-core = { git = "https://github.com/tzfm/rustel", default-features = false }
 ```
 
-The `rustel-mini`, `rustel-scheduler` and `rustel-voice` crates depend on
-`rustel-core` with no default features, so they keep the feature off. The
-`rustel-engine` crate keeps the default features of `rustel-core` and so keeps
-the table. Cargo features are additive: any other dependency on `rustel-core`
-with defaults enabled turns the feature back on. Run
+The `rustel-mini`, `rustel-scheduler`, `rustel-voice` and `rustel-ext` crates
+depend on `rustel-core` with no default features, so they keep the feature
+off. The `rustel-engine` crate keeps the default features of `rustel-core` and
+so keeps the table. Cargo features are additive: any other dependency on
+`rustel-core` with defaults enabled turns the feature back on. Run
 `cargo tree -e features -i rustel-core` to see the result.
 
 Without the feature, `Tune::scale_names()` is empty and `Tune::scale_count()`
