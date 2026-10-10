@@ -1045,7 +1045,7 @@ mod tests {
         /// An onset on `whole_begin` that plays `note`.
         fn onset(onset_id: u64, whole_begin: &str, note: u8) -> OnsetEventJson {
             OnsetEventJson {
-                live_controls: [0; 2],
+                live_controls: [0; 3],
                 onset_id,
                 generation: 2,
                 whole_begin: whole_begin.into(),

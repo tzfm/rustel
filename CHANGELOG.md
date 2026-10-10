@@ -18,6 +18,7 @@
 ### Sound changes
 
 - The stop fade runs for the full 10 ms. The fade ended after 128 frames, about 3 ms at 48 kHz, and left a click.
+- An `lpq` slider moves the resonance of a note already sounding. It works like an `lpf` slider on the cutoff. An exact move takes 5 ms, and a smoothed mouse move takes 35 ms. Before, the new resonance reached only the next note, so a long note or a `legato(2)` pad kept the old value. A render does not change.
 
 ## v0.1.1
 

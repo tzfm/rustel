@@ -217,7 +217,7 @@ fn native_event(event: &FixtureEvent, sample_rate: u32) -> OnsetEvent {
     )
     .with_controls(OscillatorControls {
         limit: None,
-        live_controls: [0; 2],
+        live_controls: [0; 3],
         preview_epoch: 0,
         choke_only: false,
         piano: false,

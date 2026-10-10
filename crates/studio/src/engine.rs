@@ -3139,7 +3139,8 @@ impl StudioEngine {
         self.set_slider_with_transition(id, value, false)
     }
 
-    /// Commit the exact cell value and ramp eligible sustained gain/cutoff.
+    /// Commit the exact cell value and ramp eligible sustained gain, cutoff
+    /// and resonance.
     pub fn set_slider_smoothed(&mut self, id: &str, value: f64) -> Result<(), RuntimeError> {
         self.set_slider_with_transition(id, value, true)
     }

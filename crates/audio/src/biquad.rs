@@ -381,6 +381,14 @@ impl FilterChain {
         }
     }
 
+    /// Sets the base resonance. A cutoff envelope does not change the
+    /// resonance.
+    pub(crate) fn set_lowpass_q(&mut self, q: f32) {
+        if let Some(filter) = &mut self.lowpass {
+            filter.base_q = q;
+        }
+    }
+
     /// Align block-rate behaviour to the render clock: `first_frame` is the
     /// absolute frame this chain first processes.
     pub(crate) fn set_block_phase(&mut self, first_frame: u64) {

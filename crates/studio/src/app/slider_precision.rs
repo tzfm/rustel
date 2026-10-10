@@ -197,7 +197,7 @@ impl PrecisionView {
         );
         frame.render_widget(
             Paragraph::new(format!(
-                "S: audio smoothing {} (direct gain/lpf)",
+                "S: audio smoothing {} (direct gain, lpf, lpq)",
                 if self.smoothing { "on" } else { "off" }
             ))
             .style(Style::default().fg(theme.muted)),

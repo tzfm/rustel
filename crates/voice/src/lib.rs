@@ -2276,7 +2276,7 @@ fn resolve_voice_at(
                 preview_epoch: 0,
                 choke_only: false,
                 piano: false,
-                live_controls: [0; 2],
+                live_controls: [0; 3],
                 // `if (noise) { getNoiseMix(...) }` - absent or zero skips the
                 // mix entirely rather than crossfading at zero.
                 noise: checked_f32(
