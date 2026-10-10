@@ -474,6 +474,21 @@ impl App {
             self.dirty_frame = true;
             return true;
         }
+        // A row of the vst page: the click chooses the row, and the keys
+        // act on the row, as on the sources page.
+        #[cfg(feature = "vst")]
+        if let Some(mut sheet) = self.settings_sheet {
+            self.count_vst_folders(&mut sheet);
+            if let Some(row) = sheet.vst_row_at(self.settings_sheet_frame(), x, y) {
+                self.focus_panel(PanelKind::Settings);
+                self.pointer = Some(Pointer::Panel);
+                sheet.selected = row;
+                sheet.hold_scroll = true;
+                self.settings_sheet = Some(sheet);
+                self.dirty_frame = true;
+                return true;
+            }
+        }
         false
     }
 
@@ -595,6 +610,8 @@ impl App {
         // The learnable rows plus the fixed ones past them (the panels'
         // Alt chords, which a learn can neither take nor move).
         sheet.keybind_count = super::super::settings::RESET_KEYBINDS_ROW + 1;
+        #[cfg(feature = "vst")]
+        self.count_vst_folders(&mut sheet);
         match sheet.key_in_frame(
             code,
             &mut settings,
@@ -890,6 +907,27 @@ impl App {
                 return true;
             }
             SettingsAction::RefreshSource(at) => self.refresh_sample_source(at),
+            // The prompt opens over the page, as the import prompt does.
+            #[cfg(feature = "vst")]
+            SettingsAction::AddVstFolder => {
+                self.settings_sheet = Some(sheet);
+                self.open_set_prompt(SetPrompt::AddVstFolder);
+                #[cfg(feature = "hydra")]
+                self.sync_settings_webcam_preview();
+                return true;
+            }
+            #[cfg(feature = "vst")]
+            SettingsAction::RemoveVstFolder(at) => {
+                self.remove_vst_folder(at);
+                // The list is one row shorter, and the cursor stays on a row.
+                self.count_vst_folders(&mut sheet);
+                let rows = super::super::settings::VST_CONTROL_COUNT
+                    + sheet.vst_folder_count
+                    + sheet.vst_standard_count;
+                sheet.selected = sheet.selected.min(rows - 1);
+            }
+            #[cfg(feature = "vst")]
+            SettingsAction::RescanVst => self.rescan_vst(),
         }
         // The keybind learn belongs to the Keybinds page: Tabbed away
         // from it - or closed by any door the sheet has - the learn goes

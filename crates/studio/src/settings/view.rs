@@ -23,55 +23,9 @@ impl Widget for SettingsSheetView<'_> {
                 Style::default().fg(theme.muted)
             }
         };
-        buffer.set_stringn(
-            panel.x + 2,
-            panel.y,
-            " settings ",
-            10,
-            tab_style(SettingsPage::Settings),
-        );
-        buffer.set_stringn(
-            panel.x + 13,
-            panel.y,
-            " advanced ",
-            10,
-            tab_style(SettingsPage::Advanced),
-        );
-        buffer.set_stringn(
-            panel.x + 24,
-            panel.y,
-            " mapping ",
-            9,
-            tab_style(SettingsPage::Mapping),
-        );
-        buffer.set_stringn(
-            panel.x + 34,
-            panel.y,
-            " keybinds ",
-            10,
-            tab_style(SettingsPage::Keybinds),
-        );
-        buffer.set_stringn(
-            panel.x + 45,
-            panel.y,
-            " samples ",
-            9,
-            tab_style(SettingsPage::Sources),
-        );
-        buffer.set_stringn(
-            panel.x + 56,
-            panel.y,
-            " reference ",
-            11,
-            tab_style(SettingsPage::Reference),
-        );
-        buffer.set_stringn(
-            panel.x + 68,
-            panel.y,
-            " about ",
-            7,
-            tab_style(SettingsPage::About),
-        );
+        for (page, label, at) in TABS {
+            buffer.set_stringn(panel.x + at, panel.y, label, label.len(), tab_style(*page));
+        }
         if self.sheet.page == SettingsPage::About {
             render_about(&self, panel, rows, buffer);
             return;
@@ -86,6 +40,11 @@ impl Widget for SettingsSheetView<'_> {
         }
         if self.sheet.page == SettingsPage::Sources {
             render_sources(&self, panel, rows, buffer);
+            return;
+        }
+        #[cfg(feature = "vst")]
+        if self.sheet.page == SettingsPage::Vst {
+            render_vst(&self, panel, rows, buffer);
             return;
         }
         let width = usize::from(rows.width);
@@ -1124,6 +1083,128 @@ fn render_sources(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer:
         width,
         Style::default().fg(theme.muted),
     );
+}
+
+/// The vst page: the two actions, the folders the player added, then the
+/// standard folders, dimmed and tagged. Under the list, the plugin count and
+/// the preset folder.
+#[cfg(feature = "vst")]
+fn render_vst(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer: &mut Buffer) {
+    let theme = view.theme;
+    let width = usize::from(rows.width);
+    let folders = &view.vst.folders;
+    let added = folders.iter().filter(|folder| !folder.standard).count();
+    let lines = vst_lines(added, folders.len() - added);
+    let shown = usize::from(rows.height).max(1);
+    let first = view.sheet.first_choice(shown, &lines);
+    let label_width = VST_CONTROLS
+        .iter()
+        .map(|(label, _)| label.len())
+        .max()
+        .unwrap_or(0);
+    let border = Style::default().fg(theme.muted);
+    let content_x = rows.x + 1;
+    let content_width = width.saturating_sub(2);
+    let marker = |selected: bool| {
+        if selected {
+            super::super::terminal::symbol("▸")
+        } else {
+            " "
+        }
+    };
+    for (offset, line) in lines.iter().skip(first).take(shown).enumerate() {
+        let y = rows.y + offset as u16;
+        match line {
+            SourceLine::Header { section, first } => {
+                if offset + 1 == shown {
+                    continue;
+                }
+                let rule = if *first {
+                    GroupRule::Opens(section.title())
+                } else {
+                    GroupRule::Between(section.title())
+                };
+                draw_group_border(buffer, rows, y, rule, theme);
+                continue;
+            }
+            SourceLine::Gap => continue,
+            SourceLine::Footer => {
+                draw_group_border(buffer, rows, y, GroupRule::Closes, theme);
+                continue;
+            }
+            SourceLine::Control(index) => {
+                let selected = *index == view.sheet.selected;
+                let (label, explain) = VST_CONTROLS[*index];
+                let text = format!("{} {label:<label_width$}", marker(selected));
+                let style = if selected {
+                    Style::default()
+                        .fg(theme.foreground)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.foreground)
+                };
+                buffer.set_stringn(content_x, y, &text, content_width, style);
+                let explain_x = (2 + label_width + 2).min(content_width);
+                buffer.set_stringn(
+                    content_x + explain_x as u16,
+                    y,
+                    explain,
+                    content_width - explain_x,
+                    Style::default().fg(theme.muted),
+                );
+            }
+            SourceLine::NoImports => {
+                buffer.set_stringn(
+                    content_x,
+                    y,
+                    "  none yet · a adds a folder",
+                    content_width,
+                    Style::default().fg(theme.muted),
+                );
+            }
+            SourceLine::Row(index) => {
+                let folder = &folders[index - VST_CONTROL_COUNT];
+                let selected = *index == view.sheet.selected;
+                let tag = if folder.standard { " · standard" } else { "" };
+                let text = format!("{} {}{tag}", marker(selected), folder.path);
+                let style = if selected {
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else if folder.standard {
+                    Style::default()
+                        .fg(theme.muted)
+                        .add_modifier(Modifier::ITALIC)
+                } else {
+                    Style::default().fg(theme.foreground)
+                };
+                buffer.set_stringn(content_x, y, &text, content_width, style);
+            }
+        }
+        buffer.set_stringn(rows.x, y, "│", 1, border);
+        buffer.set_stringn(rows.right() - 1, y, "│", 1, border);
+    }
+    let at = view.sheet.selected;
+    let hint = if at == VST_ADD_ROW {
+        "Enter opens the folder prompt"
+    } else if at == VST_RESCAN_ROW {
+        "Enter reads every folder and tests each plugin again"
+    } else if at < VST_CONTROL_COUNT + added {
+        "d removes this folder"
+    } else {
+        "a standard folder stays on the list"
+    };
+    let footer = [
+        plugins_found(view.vst.plugins),
+        format!(
+            "presets: {} · one folder of .vstpreset files for each plugin",
+            view.vst.presets
+        ),
+        format!("a adds · {hint} · Tab pages · Esc closes"),
+    ];
+    for (line, y) in footer.iter().zip(panel.bottom().saturating_sub(4)..) {
+        buffer.set_stringn(rows.x, y, line, width, Style::default().fg(theme.muted));
+    }
 }
 
 /// Colour of the `n/m cached` fraction: full, some, or none.

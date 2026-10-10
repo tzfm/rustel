@@ -737,6 +737,11 @@ fn reserve_fx_reverb_returns(pool: &mut Vec<Box<crate::reverb::OrbitReverb>>, in
 /// Orbit indices in common use; sends beyond this refuse loudly
 /// at resolve time rather than aliasing into a wrong bus.
 pub const MAX_ORBITS: usize = 16;
+/// An insert with no input and no output for this long sleeps. The time is
+/// long, so the late echo of a delay effect still sounds.
+const INSERT_IDLE_SECONDS: u32 = 30;
+/// An insert output below this level is silence: about -120 dB.
+const INSERT_SILENCE: f32 = 1e-6;
 /// Frames of per-orbit mix kept for routing: the largest block a host asks
 /// for in one go.
 pub const ORBIT_MIX_FRAMES: usize = 4096;
@@ -831,6 +836,9 @@ impl From<OscillatorControls> for VoiceRenderControls {
             stretch,
             fm,
             orbit: _,
+            insert_orbit: _,
+            effects: _,
+            instrument: _,
             lfos,
             bus_mods,
             bus,
@@ -918,6 +926,9 @@ struct Voice {
     delay_wet: f32,
     /// Wet send into the orbit reverb (0 = no send).
     reverb_wet: f32,
+    /// The dry path feeds the orbit insert, not the orbit.
+    through_insert: bool,
+    insert_orbit: usize,
     dry_gain: f32,
     stretch: Option<Box<[crate::stretch::Stretch; 2]>>,
     orbit: usize,
@@ -3819,6 +3830,31 @@ pub struct ScalarBackend {
     /// hold point it contains, so order and timing match the live path.
     pending_ducks: Vec<PendingDuck>,
     orbit_reverbs: Vec<Option<Box<crate::reverb::OrbitReverb>>>,
+    /// The outside effects and the instrument of each orbit. The notes that
+    /// ask for an effect feed `insert_blocks`, and the output of the chain
+    /// joins the orbit.
+    orbit_inserts: Vec<Option<Box<dyn crate::insert::OrbitInsert>>>,
+    /// Live inserts wait for a matching onset before replacing the active copy.
+    prepared_inserts: Vec<Option<Box<dyn crate::insert::OrbitInsert>>>,
+    /// Displaced copies wait in this bounded list for return to the producer.
+    retired_inserts: Vec<Box<dyn crate::insert::OrbitInsert>>,
+    insert_blocks: Vec<[[f32; crate::reverb::REVERB_BLOCK]; 2]>,
+    /// Output orbit of each physical insert bus, selected by its latest onset.
+    insert_outputs: [usize; MAX_ORBITS],
+    /// Frames each insert had no input and no output. A long idle insert
+    /// sleeps until a note asks for the effect again.
+    insert_idle_frames: Vec<u32>,
+    /// The effects of the orbit that run, one bit for each stage of the
+    /// chain: the stages that served the last note with an effect.
+    effect_stages: [u8; MAX_ORBITS],
+    /// The instrument of the orbit goes through the effects of the orbit:
+    /// the last instrument note asked for an effect too.
+    instrument_to_effect: [bool; MAX_ORBITS],
+    /// Offline only: builds a missing insert at activation, as the inline
+    /// reverb does.
+    insert_provider: Option<Arc<crate::insert::InsertProvider>>,
+    /// Notes that asked for an insert their orbit did not hold.
+    missing_insert_events: u64,
     /// Per-orbit stereo accumulation for one ≤128-frame sub-block: the
     /// pre-duck orbit signal (voices + delay + reverb returns).
     orbit_blocks: Vec<[[f32; crate::reverb::REVERB_BLOCK]; 2]>,
@@ -4326,6 +4362,65 @@ impl ScalarBackend {
             .map(|reverb| reverb.params())
     }
 
+    /// Install or replace the insert of one slot: an effect of an orbit has
+    /// [`crate::insert::effect_slot`], and the instrument has
+    /// [`crate::insert::instrument_slot`]. The caller frees the displaced
+    /// box outside the callback.
+    pub fn install_insert(
+        &mut self,
+        slot: usize,
+        insert: Box<dyn crate::insert::OrbitInsert>,
+    ) -> Option<Box<dyn crate::insert::OrbitInsert>> {
+        let slots = crate::insert::INSERT_SLOTS;
+        if self.orbit_inserts.is_empty() {
+            self.orbit_inserts = (0..slots).map(|_| None).collect();
+        }
+        self.orbit_inserts[slot.min(slots - 1)].replace(insert)
+    }
+
+    /// Stage a live insert until an accepted onset asks for it. The caller
+    /// returns any displaced preparation to the producer.
+    pub(crate) fn prepare_insert(
+        &mut self,
+        slot: usize,
+        insert: Box<dyn crate::insert::OrbitInsert>,
+    ) -> Option<Box<dyn crate::insert::OrbitInsert>> {
+        let Some(prepared) = self.prepared_inserts.get_mut(slot) else {
+            return Some(insert);
+        };
+        prepared.replace(insert)
+    }
+
+    /// Take a displaced live insert for off-thread reclamation.
+    pub(crate) fn take_retired_insert(&mut self) -> Option<Box<dyn crate::insert::OrbitInsert>> {
+        self.retired_inserts.pop()
+    }
+
+    /// The rate the backend renders at.
+    #[cfg_attr(not(feature = "device-audio"), allow(dead_code))]
+    pub(crate) fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// The insert a slot holds now.
+    pub fn orbit_insert_key(&self, slot: usize) -> Option<crate::insert::InsertKey> {
+        self.orbit_inserts
+            .get(slot)?
+            .as_ref()
+            .map(|insert| insert.key())
+    }
+
+    /// Offline renders build a missing insert at activation with this
+    /// provider. The live path ignores the provider and waits for an install.
+    pub fn set_insert_provider(&mut self, provider: Arc<crate::insert::InsertProvider>) {
+        self.insert_provider = Some(provider);
+    }
+
+    /// Notes that asked for an insert their orbit did not hold.
+    pub fn missing_insert_events(&self) -> u64 {
+        self.missing_insert_events
+    }
+
     /// Live-path policy switch: forbid IR synthesis at activation time.
     pub fn forbid_inline_reverb(&mut self) {
         self.allow_inline_reverb = false;
@@ -4781,6 +4876,10 @@ impl ScalarBackend {
         for reverb in self.orbit_reverbs.iter_mut().flatten() {
             reverb.reset();
         }
+        for insert in self.orbit_inserts.iter_mut().flatten() {
+            insert.reset();
+        }
+        self.insert_outputs = std::array::from_fn(|orbit| orbit);
         for bus in &mut self.orbit_delays {
             // Skip inactive lines: after the stop ramp reset_at runs on every
             // stopped block, and re-zeroing 16 one-second stereo lines would
@@ -4815,6 +4914,7 @@ impl ScalarBackend {
     /// has its own verb rather than a flag on the reload. The ramp is the
     /// choke group's, which is what a cut already sounds like here.
     pub fn cut_sounding_voices(&mut self, at_frame: u64) {
+        self.cut_instrument_notes(at_frame);
         for voice in &mut self.voices {
             if voice.cut_fade_frame.is_none() {
                 voice.cut_fade_frame = Some(at_frame);
@@ -4823,6 +4923,16 @@ impl ScalarBackend {
                 / self.sample_rate as f32
                 + CUT_FADE_SECS;
             voice.stop_secs = voice.stop_secs.min(stop_at);
+        }
+    }
+
+    /// An instrument holds its own notes. A cut of the engine voices at
+    /// `at_frame` ends them at the same frame.
+    fn cut_instrument_notes(&mut self, at_frame: u64) {
+        let frames = at_frame.saturating_sub(self.frame).min(u64::from(u32::MAX)) as u32;
+        let instruments = crate::insert::instrument_slot(0);
+        for instrument in self.orbit_inserts.iter_mut().skip(instruments).flatten() {
+            instrument.cut_notes(frames);
         }
     }
 
@@ -4898,6 +5008,7 @@ impl ScalarBackend {
         // click the choke ramp exists to avoid. The arm keeps the requested
         // frame so a late-activating outgoing onset is pre-faded to it.
         let fade_from = cut_frame.max(self.frame);
+        self.cut_instrument_notes(fade_from);
         for voice in self.voices.iter_mut().filter(|voice| !voice.piano) {
             voice.cut_fade_frame = Some(match voice.cut_fade_frame {
                 Some(fade) => fade.min(fade_from),
@@ -5406,7 +5517,18 @@ impl AudioBackend for ScalarBackend {
         if self.orbit_reverbs.is_empty() {
             self.orbit_reverbs = (0..MAX_ORBITS).map(|_| None).collect();
         }
+        if self.orbit_inserts.is_empty() {
+            self.orbit_inserts = (0..crate::insert::INSERT_SLOTS).map(|_| None).collect();
+        }
+        if self.prepared_inserts.is_empty() {
+            self.prepared_inserts = (0..crate::insert::INSERT_SLOTS).map(|_| None).collect();
+            self.retired_inserts = Vec::with_capacity(crate::insert::INSERT_SLOTS);
+        }
         self.orbit_blocks = vec![[[0.0; crate::reverb::REVERB_BLOCK]; 2]; MAX_ORBITS];
+        self.insert_blocks = vec![[[0.0; crate::reverb::REVERB_BLOCK]; 2]; MAX_ORBITS];
+        self.insert_idle_frames = vec![0; crate::insert::INSERT_SLOTS];
+        self.effect_stages = [0; MAX_ORBITS];
+        self.instrument_to_effect = [false; MAX_ORBITS];
         self.reverb_sends = vec![[[0.0; crate::reverb::REVERB_BLOCK]; 2]; MAX_ORBITS];
         self.orbit_mix = vec![0.0; MAX_ORBITS * ORBIT_MIX_FRAMES * 2];
         self.ui_visual_mix = vec![[0.0; UI_VISUAL_MIX_FRAMES * 2]; MAX_UI_AUDIO_VISUALS];
@@ -5517,6 +5639,16 @@ impl AudioBackend for ScalarBackend {
         let ducks = &mut self.orbit_ducks;
         let pending_ducks = &mut self.pending_ducks;
         let reverbs = &mut self.orbit_reverbs;
+        let inserts = &mut self.orbit_inserts;
+        let prepared_inserts = &mut self.prepared_inserts;
+        let retired_inserts = &mut self.retired_inserts;
+        let insert_blocks = &mut self.insert_blocks;
+        let insert_outputs = &mut self.insert_outputs;
+        let insert_idle_frames = &mut self.insert_idle_frames;
+        let effect_stages = &mut self.effect_stages;
+        let instrument_to_effect = &mut self.instrument_to_effect;
+        let insert_provider = self.insert_provider.as_deref();
+        let missing_insert_events = &mut self.missing_insert_events;
         let allow_inline_reverb = self.allow_inline_reverb;
         let missing_reverb_events = &mut self.missing_reverb_events;
         let voice_ceiling_drops = &mut self.voice_ceiling_drops;
@@ -5934,6 +6066,75 @@ impl AudioBackend for ScalarBackend {
                     }
                     _ => 0.0,
                 };
+                // Gives the insert of a slot what the note asks for. False
+                // means the slot does not hold the insert, and the note
+                // plays with no insert.
+                let mut serve = |wanted: &crate::insert::InsertControls, slot: usize| {
+                    let Some(held) = inserts.get_mut(slot) else {
+                        return false;
+                    };
+                    if held.as_ref().is_none_or(|held| held.key() != wanted.key)
+                        && prepared_inserts[slot]
+                            .as_ref()
+                            .is_some_and(|prepared| prepared.key() == wanted.key)
+                        && retired_inserts.len() < retired_inserts.capacity()
+                    {
+                        if let Some(retired) = held.take() {
+                            retired_inserts.push(retired);
+                        }
+                        *held = prepared_inserts[slot].take();
+                    }
+                    // Offline: build at activation, as the inline reverb
+                    // does. Live waits for the producer's install.
+                    if allow_inline_reverb
+                        && held.as_ref().is_none_or(|held| held.key() != wanted.key)
+                        && let Some(built) =
+                            insert_provider.and_then(|build| build(wanted.key, sample_rate, slot))
+                    {
+                        *held = Some(built);
+                    }
+                    let Some(held) = held.as_mut().filter(|held| held.key() == wanted.key) else {
+                        *missing_insert_events += 1;
+                        return false;
+                    };
+                    // The frames from the block start to the note.
+                    let frames = e.onset_frame.saturating_sub(start);
+                    let frames = frames.min(u64::from(u32::MAX)) as u32;
+                    held.restore_params(frames);
+                    for param in wanted.params() {
+                        held.set_param(*param, frames);
+                    }
+                    if let Some((beats, tempo)) = wanted.clock() {
+                        held.sync(beats, tempo, frames);
+                    }
+                    if let Some(note) = wanted.note() {
+                        held.note(note, frames);
+                    }
+                    insert_idle_frames[slot] = 0;
+                    true
+                };
+                let insert_orbit = e.controls.insert_orbit();
+                // The stages of the chain that hold the effect the note
+                // asks for. The note goes through these and no other.
+                let mut stages = 0u8;
+                for (stage, wanted) in e.controls.effects.iter().enumerate() {
+                    if let Some(wanted) = wanted
+                        && serve(wanted, crate::insert::effect_slot(insert_orbit, stage))
+                    {
+                        stages |= 1 << stage;
+                    }
+                }
+                let through_insert = stages != 0;
+                if through_insert {
+                    effect_stages[insert_orbit] = stages;
+                    insert_outputs[insert_orbit] = usize::from(e.controls.orbit).min(MAX_ORBITS - 1);
+                }
+                if let Some(wanted) = e.controls.instrument
+                    && serve(&wanted, crate::insert::instrument_slot(insert_orbit))
+                {
+                    instrument_to_effect[insert_orbit] = through_insert;
+                    insert_outputs[insert_orbit] = usize::from(e.controls.orbit).min(MAX_ORBITS - 1);
+                }
                 let muted = e.sample.is_some_and(|sample| sample.muted);
                 let (delay_wet, orbit) = match e.controls.delay {
                     Some(delay) => {
@@ -6182,6 +6383,8 @@ impl AudioBackend for ScalarBackend {
                     distort_shape: e.controls.distort.map(|d| d.shape()).unwrap_or(0.0),
                     delay_wet,
                     reverb_wet,
+                    through_insert,
+                    insert_orbit,
                     dry_gain: e.controls.dry.unwrap_or(1.0),
                     // Leased from the pool built at init. An exhausted pool
                     // means the voice plays without the vocoder rather than
@@ -6495,6 +6698,12 @@ impl AudioBackend for ScalarBackend {
             for buffer in sends.iter_mut() {
                 buffer[0][..sub_len].fill(0.0);
                 buffer[1][..sub_len].fill(0.0);
+            }
+            for (buffer, stages) in insert_blocks.iter_mut().zip(effect_stages.iter()) {
+                if *stages != 0 {
+                    buffer[0][..sub_len].fill(0.0);
+                    buffer[1][..sub_len].fill(0.0);
+                }
             }
             // Arm every duck whose 10 ms hold point this sub-block reaches,
             // in arm order and, within one arm frame, in admission order:
@@ -7664,6 +7873,8 @@ impl AudioBackend for ScalarBackend {
                         let (left, right) = (left * dry, right * dry);
                         let mix = if v.piano {
                             &mut piano_mix
+                        } else if v.through_insert {
+                            &mut insert_blocks[v.insert_orbit]
                         } else {
                             &mut blocks[v.orbit]
                         };
@@ -7784,6 +7995,8 @@ impl AudioBackend for ScalarBackend {
                         let (left, right) = (sample * lg * dry, sample * rg * dry);
                         let mix = if v.piano {
                             &mut piano_mix
+                        } else if v.through_insert {
+                            &mut insert_blocks[v.insert_orbit]
                         } else {
                             &mut blocks[v.orbit]
                         };
@@ -7879,6 +8092,90 @@ impl AudioBackend for ScalarBackend {
                         &mut right[0][..sub_len],
                     );
                 }
+            }
+            // A sample of an insert that is not finite becomes silence, so
+            // one bad insert cannot poison what comes after. True means the
+            // output was silent.
+            let settle = |left: &mut [f32], right: &mut [f32]| {
+                let mut silent = true;
+                for sample in left.iter_mut().chain(right.iter_mut()) {
+                    if !sample.is_finite() {
+                        *sample = 0.0;
+                    }
+                    silent &= sample.abs() < INSERT_SILENCE;
+                }
+                silent
+            };
+            let add_insert_output =
+                |mix: &mut [[f32; crate::reverb::REVERB_BLOCK]; 2], left: &[f32], right: &[f32]| {
+                    for (channel, wet) in [(0, left), (1, right)] {
+                        for (out, wet) in mix[channel][..sub_len].iter_mut().zip(wet) {
+                            *out += *wet;
+                        }
+                    }
+                };
+            let insert_idle_limit = sample_rate.saturating_mul(INSERT_IDLE_SECONDS);
+            let (effects, instruments) = inserts.split_at_mut(crate::insert::instrument_slot(0));
+            // An instrument makes sound from its notes. The output joins the
+            // effects of the orbit when the note asked for an effect, and
+            // the orbit when not. An instrument with no sound and no note
+            // for `INSERT_IDLE_SECONDS` sleeps until the next note.
+            for (bus, slot) in instruments.iter_mut().enumerate() {
+                let Some(instrument) = slot else { continue };
+                let idle = &mut insert_idle_frames[crate::insert::instrument_slot(bus)];
+                if *idle >= insert_idle_limit && !instrument.busy() {
+                    continue;
+                }
+                let mut sound = [[0.0f32; crate::reverb::REVERB_BLOCK]; 2];
+                let (left, right) = sound.split_at_mut(1);
+                let (left, right) = (&mut left[0][..sub_len], &mut right[0][..sub_len]);
+                instrument.process(left, right);
+                let silent = settle(left, right);
+                let mix = if instrument_to_effect[bus] && effect_stages[bus] != 0 {
+                    &mut insert_blocks[bus]
+                } else {
+                    &mut blocks[insert_outputs[bus]]
+                };
+                add_insert_output(mix, left, right);
+                *idle = if silent {
+                    idle.saturating_add(sub_len as u32)
+                } else {
+                    0
+                };
+            }
+            // The effects take the notes that ask for an effect, each stage
+            // after the stage before, and the output of the chain joins the
+            // orbit before the duck gain. An effect runs on silent input so
+            // the tail rings out, then sleeps after `INSERT_IDLE_SECONDS`
+            // with no input and no output.
+            for (bus, stages) in effect_stages.iter().enumerate() {
+                if *stages == 0 {
+                    continue;
+                }
+                let (left, right) = insert_blocks[bus].split_at_mut(1);
+                let (left, right) = (&mut left[0][..sub_len], &mut right[0][..sub_len]);
+                for stage in 0..crate::insert::EFFECT_CHAIN {
+                    let slot = crate::insert::effect_slot(bus, stage);
+                    let Some(effect) = effects[slot]
+                        .as_mut()
+                        .filter(|_| stages & (1 << stage) != 0)
+                    else {
+                        continue;
+                    };
+                    let fed = left.iter().chain(right.iter()).any(|sample| *sample != 0.0);
+                    let idle = &mut insert_idle_frames[slot];
+                    if !fed && *idle >= insert_idle_limit && !effect.busy() {
+                        continue;
+                    }
+                    effect.process(left, right);
+                    let silent = settle(left, right);
+                    *idle = if fed || !silent {
+                        0
+                    } else {
+                        idle.saturating_add(sub_len as u32)
+                    };
+                }
+                add_insert_output(&mut blocks[insert_outputs[bus]], left, right);
             }
             let orbit_pairs = self.orbit_pairs;
             let orbit_gains = self.orbit_gains.0;
@@ -9733,5 +10030,212 @@ mod wavetable_boundary_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod insert_routing_tests {
+    use super::*;
+    use crate::insert::{InsertControls, InsertKey, InsertNote, InsertParam, OrbitInsert};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct StatefulInsert {
+        key: InsertKey,
+        memory: [f32; 2],
+        held: u32,
+        resets: Arc<AtomicUsize>,
+    }
+
+    impl OrbitInsert for StatefulInsert {
+        fn key(&self) -> InsertKey {
+            self.key
+        }
+
+        fn set_param(&mut self, _param: InsertParam, _frames: u32) {}
+
+        fn note(&mut self, note: InsertNote, frames: u32) {
+            assert_eq!(frames, 0);
+            self.held = note.frames;
+        }
+
+        fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+            for (left, right) in left.iter_mut().zip(right) {
+                let instrument = if self.held > 0 { 0.125 } else { 0.0 };
+                self.held = self.held.saturating_sub(1);
+                for (channel, sample) in [left, right].into_iter().enumerate() {
+                    self.memory[channel] = *sample + instrument + self.memory[channel] * 0.5;
+                    *sample = self.memory[channel];
+                }
+            }
+        }
+
+        fn reset(&mut self) {
+            self.resets.fetch_add(1, Ordering::Relaxed);
+            self.memory = [0.0; 2];
+            self.held = 0;
+        }
+    }
+
+    #[test]
+    fn an_orbit_move_keeps_the_insert_state_and_old_native_delay() {
+        for instrument in [false, true] {
+            let key = InsertKey {
+                plugin: 7,
+                preset: 0,
+            };
+            let builds = Arc::new(AtomicUsize::new(0));
+            let resets = Arc::new(AtomicUsize::new(0));
+            let make_backend = |moved: bool| {
+                let mut backend = ScalarBackend::prepared(48_000, 16).unwrap();
+                backend.orbit_pairs[2] = u8::from(moved);
+                let builds = Arc::clone(&builds);
+                let resets = Arc::clone(&resets);
+                backend.set_insert_provider(Arc::new(move |wanted, _, _| {
+                    assert_eq!(wanted, key);
+                    builds.fetch_add(1, Ordering::Relaxed);
+                    Some(Box::new(StatefulInsert {
+                        key,
+                        memory: [0.0; 2],
+                        held: 0,
+                        resets: Arc::clone(&resets),
+                    }))
+                }));
+                for (frame, orbit) in [(0, 1), (639, 2), (1024, 1), (1536, 2)] {
+                    let mut event = OnsetEvent::new(frame, 440.0, 0.25, 0.04);
+                    event.controls.orbit = if moved { orbit } else { 1 };
+                    event.controls.insert_orbit = Some(1);
+                    let mut insert = InsertControls::new(key);
+                    if instrument {
+                        if frame == 0 {
+                            insert = insert.with_note(InsertNote {
+                                pitch: 69.0,
+                                velocity: 0.5,
+                                frames: 768,
+                            });
+                        }
+                        event.controls.instrument = Some(insert);
+                    } else {
+                        event.controls.effects[0] = Some(insert);
+                    }
+                    if frame == 0 && !instrument {
+                        event.controls.delay = Some(crate::backend::DelayControls {
+                            wet: 0.3,
+                            time_secs: 256.0 / 48_000.0,
+                            feedback: 0.5,
+                        });
+                    } else if frame != 0 {
+                        event.gain = 0.0;
+                    }
+                    backend.note(event);
+                }
+                backend
+            };
+            let mut baseline = make_backend(false);
+            let mut moved = make_backend(true);
+            let slot = if instrument {
+                crate::insert::instrument_slot(1)
+            } else {
+                crate::insert::effect_slot(1, 0)
+            };
+            let mut identity = None;
+            let mut expected = [0.0; 256];
+            let mut actual = [0.0; 256];
+            for block in 0..16 {
+                baseline.process_block(&mut expected, 128);
+                moved.process_block(&mut actual, 128);
+                for (actual, routed) in actual.iter_mut().zip(moved.orbit_mix(2, 128)) {
+                    *actual += routed;
+                }
+                let pointer =
+                    moved.orbit_inserts[slot].as_deref().unwrap() as *const dyn OrbitInsert;
+                let pointer = pointer as *const ();
+                assert_eq!(*identity.get_or_insert(pointer), pointer);
+                for (expected, actual) in expected.iter().zip(actual) {
+                    assert!((expected - actual).abs() < 1e-6, "block {block}");
+                }
+                assert_eq!(moved.orbit_delays[1].left, baseline.orbit_delays[1].left);
+                assert_eq!(moved.orbit_delays[1].right, baseline.orbit_delays[1].right);
+                assert!(!moved.orbit_delays[2].active);
+                if block == 3 {
+                    assert_eq!(moved.insert_outputs[1], 1);
+                    assert!(
+                        moved.orbit_blocks[2]
+                            .iter()
+                            .flatten()
+                            .all(|value| *value == 0.0)
+                    );
+                }
+                if block == 4 {
+                    assert_eq!(moved.insert_outputs[1], 2);
+                    // Route selection follows block activation: this onset
+                    // at 639 moves the old sound from frame 512, 127 early.
+                    assert!(moved.orbit_mix(2, 128)[0].abs() > 0.01);
+                    assert!(
+                        moved.orbit_blocks[2]
+                            .iter()
+                            .flatten()
+                            .any(|value| value.abs() > 0.01)
+                    );
+                    if !instrument {
+                        assert!(
+                            moved.orbit_blocks[1]
+                                .iter()
+                                .flatten()
+                                .any(|value| value.abs() > 0.001)
+                        );
+                        let old = moved
+                            .voices
+                            .iter()
+                            .find(|voice| voice.start_frame == 0)
+                            .unwrap();
+                        assert_eq!((old.orbit, old.insert_orbit), (1, 1));
+                    }
+                }
+                if block == 8 {
+                    assert_eq!(moved.insert_outputs[1], 1);
+                }
+            }
+            assert_eq!(builds.load(Ordering::Relaxed), 2);
+            assert_eq!(resets.load(Ordering::Relaxed), 0);
+            assert_eq!(moved.missing_insert_events(), 0);
+        }
+
+        // SBD connects its graph 100 ms before its source onset. The insert
+        // follows the same graph while the oscillator phase remains parked.
+        let mut backend = ScalarBackend::prepared(48_000, 1).unwrap();
+        let key = InsertKey {
+            plugin: 7,
+            preset: 0,
+        };
+        backend.set_insert_provider(Arc::new(move |_, _, _| {
+            Some(Box::new(StatefulInsert {
+                key,
+                memory: [0.0; 2],
+                held: 0,
+                resets: Arc::new(AtomicUsize::new(0)),
+            }))
+        }));
+        let mut event = OnsetEvent::new(6336, 43.653_53, 0.25, 1.0);
+        event.synth = Some(crate::backend::SynthSource::Sbd {
+            decay_secs: 0.5,
+            pdecay_secs: 0.5,
+            penv_semitones: 36.0,
+            stop_secs: 0.51,
+        });
+        event.controls.orbit = 2;
+        event.controls.insert_orbit = Some(1);
+        event.controls.effects[0] = Some(InsertControls::new(key));
+        backend.note(event);
+        let mut output = [0.0; 256];
+        for _ in 0..12 {
+            backend.process_block(&mut output, 128);
+        }
+        assert_eq!(backend.insert_outputs[1], 1);
+        backend.process_block(&mut output, 128);
+        assert_eq!(backend.insert_outputs[1], 2);
+        let voice = &backend.voices[0];
+        assert_eq!(voice.graph_start_frame, 1536);
+        assert_eq!(voice.start_frame - voice.graph_start_frame, 4800);
+        assert!(matches!(&voice.source, VoiceSource::Sbd { phase, .. } if *phase == 0.0));
     }
 }

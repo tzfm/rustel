@@ -1967,6 +1967,23 @@ const SOURCES_CONTROLS: &[Row] = &[
 /// How many selectable rows precede the imports on Sources.
 pub(super) const SOURCE_CONTROL_COUNT: usize = SOURCES_CONTROLS.len();
 
+/// The two actions at the top of the vst page, before the folders: the
+/// label and the explanation of each.
+#[cfg(feature = "vst")]
+const VST_CONTROLS: [(&str, &str); 2] = [
+    (
+        "add folder",
+        "opens a prompt for a folder with VST3 plugins",
+    ),
+    ("rescan", "reads every folder and tests each plugin again"),
+];
+#[cfg(feature = "vst")]
+pub(super) const VST_CONTROL_COUNT: usize = VST_CONTROLS.len();
+#[cfg(feature = "vst")]
+const VST_ADD_ROW: usize = 0;
+#[cfg(feature = "vst")]
+const VST_RESCAN_ROW: usize = 1;
+
 /// The terminal profile belongs with the bindings it determines.
 pub(super) const TERMINAL_PROFILE_ROW: usize = 0;
 pub(super) const KEYBIND_ACTION_START: usize = 1;
@@ -2322,10 +2339,34 @@ pub enum SettingsPage {
     Keybinds,
     /// The folders and packs the player imported.
     Sources,
+    /// The folders the plugin host reads for VST3 plugins.
+    #[cfg(feature = "vst")]
+    Vst,
     /// Which kinds of entry the reference and the suggestions offer.
     Reference,
     About,
 }
+
+/// The tabs on the top border, in Tab order: the page, its label, and the
+/// column of the label from the left edge of the sheet. Drawing, the Tab
+/// cycle and the click strips all read this table.
+const TABS: &[(SettingsPage, &str, u16)] = &[
+    (SettingsPage::Settings, " settings ", 2),
+    (SettingsPage::Advanced, " advanced ", 13),
+    (SettingsPage::Mapping, " mapping ", 24),
+    (SettingsPage::Keybinds, " keybinds ", 34),
+    (SettingsPage::Sources, " samples ", 45),
+    #[cfg(feature = "vst")]
+    (SettingsPage::Vst, " vst ", 55),
+    #[cfg(feature = "vst")]
+    (SettingsPage::Reference, " reference ", 61),
+    #[cfg(not(feature = "vst"))]
+    (SettingsPage::Reference, " reference ", 56),
+    #[cfg(feature = "vst")]
+    (SettingsPage::About, " about ", 73),
+    #[cfg(not(feature = "vst"))]
+    (SettingsPage::About, " about ", 68),
+];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct SettingsPosition {
@@ -2338,7 +2379,7 @@ struct SettingsPosition {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct SettingsNavigation {
     page: SettingsPage,
-    positions: [SettingsPosition; 7],
+    positions: [SettingsPosition; TABS.len()],
 }
 
 impl SettingsNavigation {
@@ -2372,6 +2413,14 @@ pub struct SettingsSheet {
     /// How many keybind rows the keybinds page is showing, for the same
     /// reason as `source_count`.
     pub keybind_count: usize,
+    /// How many folders the player added on the vst page, for the same
+    /// reason as `source_count`.
+    #[cfg(feature = "vst")]
+    pub vst_folder_count: usize,
+    /// How many standard folders follow them. The cursor walks both lists
+    /// as one. A standard folder is read-only.
+    #[cfg(feature = "vst")]
+    pub vst_standard_count: usize,
     /// The first line of the page drawn, kept from key to key so walking
     /// through the middle of a page leaves it still. The page keeps a margin
     /// of rows around the selection; see [`super::scroll`].
@@ -2438,6 +2487,15 @@ pub enum SettingsAction {
     RenameSourceBank(usize),
     /// Enter on a source row: fetch what it holds into the cache now.
     RefreshSource(usize),
+    /// The vst page: the sheet hands over to a picker for a plugin folder.
+    #[cfg(feature = "vst")]
+    AddVstFolder,
+    /// `d` on a folder the player added: take the folder off the list.
+    #[cfg(feature = "vst")]
+    RemoveVstFolder(usize),
+    /// Enter on the rescan row: read every plugin folder again.
+    #[cfg(feature = "vst")]
+    RescanVst,
     /// Enter on a keybind row: wait for a chord, and make it this
     /// action's. The chord itself arrives through the app's learn state.
     LearnKeybind(BindAction),
@@ -2647,6 +2705,45 @@ impl SettingsSheet {
         matches!(self.page, SettingsPage::Sources)
     }
 
+    /// The vst page: two actions, then a list of plugin folders.
+    #[cfg(feature = "vst")]
+    pub(super) const fn shows_vst(self) -> bool {
+        matches!(self.page, SettingsPage::Vst)
+    }
+
+    /// The vst page is a list, as the sources page is: the arrows walk the
+    /// two actions, the folders the player added, then the standard
+    /// folders. Only a folder the player added is removed.
+    #[cfg(feature = "vst")]
+    fn vst_key(&mut self, code: crossterm::event::KeyCode) -> SettingsAction {
+        use crossterm::event::KeyCode;
+        let added = self.vst_folder_count;
+        let len = VST_CONTROL_COUNT + added + self.vst_standard_count;
+        let at = self.selected.min(len - 1);
+        let on_added = at >= VST_CONTROL_COUNT && at < VST_CONTROL_COUNT + added;
+        match code {
+            KeyCode::Up => {
+                self.selected = (at + len - 1) % len;
+                SettingsAction::Nothing
+            }
+            KeyCode::Down => {
+                self.selected = (at + 1) % len;
+                SettingsAction::Nothing
+            }
+            KeyCode::Char('a' | '+') => SettingsAction::AddVstFolder,
+            KeyCode::Enter if at == VST_ADD_ROW => SettingsAction::AddVstFolder,
+            KeyCode::Enter if at == VST_RESCAN_ROW => SettingsAction::RescanVst,
+            KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace if on_added => {
+                SettingsAction::RemoveVstFolder(at - VST_CONTROL_COUNT)
+            }
+            // The page takes the key, so the score does not.
+            KeyCode::Enter | KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
+                SettingsAction::Nothing
+            }
+            _ => SettingsAction::Ignored,
+        }
+    }
+
     /// The keybinds page is a list of learnable rows. The arrows move the
     /// cursor, Enter arms the learn, and Delete or Backspace restores the
     /// studio's own chord. Space does not clear a binding, because a
@@ -2723,6 +2820,8 @@ impl SettingsSheet {
             | SettingsPage::Keybinds
             | SettingsPage::Sources
             | SettingsPage::About => &[],
+            #[cfg(feature = "vst")]
+            SettingsPage::Vst => &[],
         }
     }
 
@@ -2810,6 +2909,15 @@ impl SettingsSheet {
                     .collect()
             }
             SettingsPage::Sources => source_lines(self.source_count, self.default_count)
+                .iter()
+                .enumerate()
+                .filter_map(|(line, row)| match row {
+                    SourceLine::Control(index) | SourceLine::Row(index) => Some((line, *index)),
+                    _ => None,
+                })
+                .collect(),
+            #[cfg(feature = "vst")]
+            SettingsPage::Vst => vst_lines(self.vst_folder_count, self.vst_standard_count)
                 .iter()
                 .enumerate()
                 .filter_map(|(line, row)| match row {
@@ -3011,6 +3119,10 @@ impl SettingsSheet {
         if self.shows_mapping() && !matches!(code, KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab) {
             return self.mapping_key(code);
         }
+        #[cfg(feature = "vst")]
+        if self.shows_vst() && !matches!(code, KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab) {
+            return self.vst_key(code);
+        }
         // The keybinds page keeps Esc and Tab for the sheet - a page you
         // could not leave is a trap - and hands a learn-armed capture its
         // key as `Capture` rather than deciding here: the app knows what
@@ -3070,24 +3182,15 @@ impl SettingsSheet {
                 {
                     self.webcam_preview = false;
                 }
-                const PAGES: [SettingsPage; 7] = [
-                    SettingsPage::Settings,
-                    SettingsPage::Advanced,
-                    SettingsPage::Mapping,
-                    SettingsPage::Keybinds,
-                    SettingsPage::Sources,
-                    SettingsPage::Reference,
-                    SettingsPage::About,
-                ];
-                let at = PAGES
+                let at = TABS
                     .iter()
-                    .position(|page| *page == self.page)
+                    .position(|(page, ..)| *page == self.page)
                     .unwrap_or(0);
-                let len = PAGES.len();
-                let page = if matches!(code, KeyCode::Tab) {
-                    PAGES[(at + 1) % len]
+                let len = TABS.len();
+                let (page, ..) = if matches!(code, KeyCode::Tab) {
+                    TABS[(at + 1) % len]
                 } else {
-                    PAGES[(at + len - 1) % len]
+                    TABS[(at + len - 1) % len]
                 };
                 self.show_page(page);
                 SettingsAction::Nothing
@@ -3161,28 +3264,12 @@ impl SettingsSheet {
         if y != panel.y {
             return None;
         }
-        if x >= panel.x + 2 && x < panel.x + 12 {
-            return Some(SettingsPage::Settings);
-        }
-        if x >= panel.x + 13 && x < panel.x + 23 {
-            return Some(SettingsPage::Advanced);
-        }
-        if x >= panel.x + 24 && x < panel.x + 33 {
-            return Some(SettingsPage::Mapping);
-        }
-        if x >= panel.x + 34 && x < panel.x + 44 {
-            return Some(SettingsPage::Keybinds);
-        }
-        if x >= panel.x + 45 && x < panel.x + 54 {
-            return Some(SettingsPage::Sources);
-        }
-        if x >= panel.x + 56 && x < panel.x + 67 {
-            return Some(SettingsPage::Reference);
-        }
-        if x >= panel.x + 68 && x < panel.x + 75 {
-            return Some(SettingsPage::About);
-        }
-        None
+        TABS.iter()
+            .find(|(_, label, at)| {
+                let left = panel.x + at;
+                x >= left && x < left + label.len() as u16
+            })
+            .map(|(page, ..)| *page)
     }
 
     pub fn show_page(&mut self, page: SettingsPage) {
@@ -3285,7 +3372,12 @@ impl SettingsSheet {
     /// `self.first`, not from the selection alone, so the window keeps its
     /// place while the cursor stays clear of the margin.
     fn first_sources(self, shown: usize, imported: usize, shipped: usize) -> usize {
-        let lines = source_lines(imported, shipped);
+        self.first_choice(shown, &source_lines(imported, shipped))
+    }
+
+    /// The same walk over the lines of a page: the sources page or the vst
+    /// page.
+    fn first_choice(self, shown: usize, lines: &[SourceLine]) -> usize {
         let selected_line = lines
             .iter()
             .position(|line| match line {
@@ -3325,6 +3417,11 @@ impl SettingsSheet {
             SettingsPage::Sources => {
                 self.first_sources(shown, self.source_count, self.default_count)
             }
+            #[cfg(feature = "vst")]
+            SettingsPage::Vst => self.first_choice(
+                shown,
+                &vst_lines(self.vst_folder_count, self.vst_standard_count),
+            ),
             SettingsPage::Mapping => self.mapping_first(rows),
             SettingsPage::About => self
                 .first
@@ -3372,6 +3469,18 @@ impl SettingsSheet {
                 panel,
                 Rect {
                     height: rows.height.saturating_sub(1),
+                    ..rows
+                },
+            ));
+        }
+        // Two footer rows on the vst page: the plugin count and the preset
+        // folder.
+        #[cfg(feature = "vst")]
+        if self.shows_vst() {
+            return Some((
+                panel,
+                Rect {
+                    height: rows.height.saturating_sub(2),
                     ..rows
                 },
             ));
@@ -3430,17 +3539,33 @@ impl SettingsSheet {
         if !self.shows_sources() {
             return None;
         }
-        let (_, rows) = self.geometry_for(available)?;
-        if x < rows.x || x >= rows.right() || y < rows.y || y >= rows.bottom() {
-            return None;
-        }
         let len = SOURCE_CONTROL_COUNT + self.source_count + self.default_count;
         if len == 0 {
             return None;
         }
         let lines = source_lines(self.source_count, self.default_count);
+        self.choice_at(available, x, y, &lines)
+    }
+
+    /// The row under a point, while the vst page is up: an action or a
+    /// folder, by the index the cursor walks.
+    #[cfg(feature = "vst")]
+    pub fn vst_row_at(self, available: Rect, x: u16, y: u16) -> Option<usize> {
+        if !self.shows_vst() {
+            return None;
+        }
+        let lines = vst_lines(self.vst_folder_count, self.vst_standard_count);
+        self.choice_at(available, x, y, &lines)
+    }
+
+    /// The choice on the line under a point, in the window the page draws.
+    fn choice_at(self, available: Rect, x: u16, y: u16, lines: &[SourceLine]) -> Option<usize> {
+        let (_, rows) = self.geometry_for(available)?;
+        if x < rows.x || x >= rows.right() || y < rows.y || y >= rows.bottom() {
+            return None;
+        }
         let shown = usize::from(rows.height).max(1);
-        let first = self.first_sources(shown, self.source_count, self.default_count);
+        let first = self.first_choice(shown, lines);
         match lines.get(first + usize::from(y - rows.y)) {
             Some(SourceLine::Control(index)) | Some(SourceLine::Row(index)) => Some(*index),
             _ => None,
@@ -3564,6 +3689,10 @@ pub struct SettingsSheetView<'a> {
     pub mappings: [SlotView; MAPPING_SLOTS],
     /// The shortcut rows, as the keybinds page reads them.
     pub bindings: Vec<KeybindRow>,
+    /// The plugin folders and the two facts under them, as the vst page
+    /// reads them.
+    #[cfg(feature = "vst")]
+    pub vst: VstPage,
     /// Only `super_seen` is read here, for the one place ⌘ is named in the
     /// whole studio: the About page can honestly say Command reaches this
     /// terminal, without any chord ever being advertised in that form.
@@ -3837,7 +3966,7 @@ fn keybinds_footer_hint(
 }
 
 /// A line on the sources page: a group border, air, a cache control, a
-/// source row, or the empty-state line.
+/// source row, or the empty-state line. The vst page has the same lines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SourceLine {
     /// A group title: opens the first box, or closes one and opens the next.
@@ -3854,12 +3983,18 @@ enum SourceLine {
     Row(usize),
 }
 
-/// Which boxed section a sources-page header names.
+/// Which boxed section a sources-page or vst-page header names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SourceSection {
     Cache,
     User,
     Defaults,
+    #[cfg(feature = "vst")]
+    Plugins,
+    #[cfg(feature = "vst")]
+    PluginFolders,
+    #[cfg(feature = "vst")]
+    StandardFolders,
 }
 
 impl SourceSection {
@@ -3868,6 +4003,12 @@ impl SourceSection {
             Self::Cache => "sample cache",
             Self::User => "user samples",
             Self::Defaults => "default samples",
+            #[cfg(feature = "vst")]
+            Self::Plugins => "plugins",
+            #[cfg(feature = "vst")]
+            Self::PluginFolders => "your folders",
+            #[cfg(feature = "vst")]
+            Self::StandardFolders => "standard folders",
         }
     }
 }
@@ -3878,34 +4019,93 @@ impl SourceSection {
 /// the sheet's cursor walks - so the sheet can find the row under a click
 /// by the same reckoning the page draws.
 fn source_lines(imported: usize, shipped: usize) -> Vec<SourceLine> {
-    let mut lines = Vec::with_capacity(SOURCE_CONTROL_COUNT + imported + shipped + 8);
+    use SourceSection::{Cache, Defaults, User};
+    section_lines(
+        [Cache, User, Defaults],
+        SOURCE_CONTROL_COUNT,
+        imported,
+        shipped,
+    )
+}
+
+/// The lines of the vst page in order: the two actions, the folders the
+/// player added (or the empty-state line), then the standard folders.
+#[cfg(feature = "vst")]
+fn vst_lines(added: usize, standard: usize) -> Vec<SourceLine> {
+    use SourceSection::{PluginFolders, Plugins, StandardFolders};
+    section_lines(
+        [Plugins, PluginFolders, StandardFolders],
+        VST_CONTROL_COUNT,
+        added,
+        standard,
+    )
+}
+
+/// Three boxed groups: `controls` rows, the `listed` rows the player owns
+/// (or the empty-state line), then the `fixed` rows the player does not own.
+/// The third group is absent with no fixed row.
+fn section_lines(
+    sections: [SourceSection; 3],
+    controls: usize,
+    listed: usize,
+    fixed: usize,
+) -> Vec<SourceLine> {
+    let mut lines = Vec::with_capacity(controls + listed + fixed + 8);
     lines.push(SourceLine::Header {
-        section: SourceSection::Cache,
+        section: sections[0],
         first: true,
     });
-    lines.extend((0..SOURCE_CONTROL_COUNT).map(SourceLine::Control));
+    lines.extend((0..controls).map(SourceLine::Control));
     lines.push(SourceLine::Gap);
     lines.push(SourceLine::Header {
-        section: SourceSection::User,
+        section: sections[1],
         first: false,
     });
-    if imported == 0 {
+    if listed == 0 {
         lines.push(SourceLine::NoImports);
     }
-    lines.extend((SOURCE_CONTROL_COUNT..SOURCE_CONTROL_COUNT + imported).map(SourceLine::Row));
-    if shipped > 0 {
+    lines.extend((controls..controls + listed).map(SourceLine::Row));
+    if fixed > 0 {
         lines.push(SourceLine::Gap);
         lines.push(SourceLine::Header {
-            section: SourceSection::Defaults,
+            section: sections[2],
             first: false,
         });
-        lines.extend(
-            (SOURCE_CONTROL_COUNT + imported..SOURCE_CONTROL_COUNT + imported + shipped)
-                .map(SourceLine::Row),
-        );
+        lines.extend((controls + listed..controls + listed + fixed).map(SourceLine::Row));
     }
     lines.push(SourceLine::Footer);
     lines
+}
+
+/// The vst page as the page reads: the plugin folders in cursor order, and
+/// the two facts under the list.
+#[cfg(feature = "vst")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VstPage {
+    /// The folders the player added, then the standard folders.
+    pub folders: Vec<VstFolder>,
+    /// The number of plugins the host found in all folders.
+    pub plugins: usize,
+    /// The folder with one folder of `.vstpreset` files for each plugin.
+    pub presets: String,
+}
+
+/// One plugin folder, as its row reads.
+#[cfg(feature = "vst")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VstFolder {
+    pub path: String,
+    /// A folder the system names. The row is read-only, dimmed and tagged.
+    pub standard: bool,
+}
+
+/// The plugin count, as the vst page and the status line say the number.
+#[cfg(feature = "vst")]
+pub(super) fn plugins_found(count: usize) -> String {
+    match count {
+        1 => "1 plugin found".to_owned(),
+        count => format!("{count} plugins found"),
+    }
 }
 /// MiB/GiB label for a byte count, matching the sample cache row.
 pub fn format_cache_bytes(bytes: u64) -> String {
@@ -4044,6 +4244,9 @@ mod tests {
             SettingsPage::Mapping,
             SettingsPage::Keybinds,
             SettingsPage::Sources,
+            #[cfg(feature = "vst")]
+            SettingsPage::Vst,
+            SettingsPage::Reference,
             SettingsPage::About,
         ];
         let mut sheet = SettingsSheet::default();
@@ -4400,6 +4603,8 @@ mod tests {
             sources: Vec::new(),
             mappings: Default::default(),
             bindings: Vec::new(),
+            #[cfg(feature = "vst")]
+            vst: VstPage::default(),
         }
         .render(area, &mut buffer);
         buffer
@@ -4637,6 +4842,8 @@ mod tests {
                         ..Default::default()
                     },
                 ],
+                #[cfg(feature = "vst")]
+                vst: VstPage::default(),
             };
             render_keybinds(&view, panel, rows, &mut buffer);
             let footer = (rows.bottom()..panel.bottom().saturating_sub(1))
@@ -5796,6 +6003,8 @@ mod tests {
             sources: Vec::new(),
             mappings: Default::default(),
             bindings: Vec::new(),
+            #[cfg(feature = "vst")]
+            vst: VstPage::default(),
             #[cfg(feature = "hydra")]
             hydra_webcam: None,
             theme: &theme,
@@ -5910,6 +6119,8 @@ mod tests {
                     sources: sources.to_vec(),
                     mappings: Default::default(),
                     bindings: Vec::new(),
+                    #[cfg(feature = "vst")]
+                    vst: VstPage::default(),
                 }
                 .render(area, &mut buffer);
                 (0..area.height)
@@ -6171,6 +6382,8 @@ mod tests {
             sources: Vec::new(),
             mappings: Default::default(),
             bindings: Vec::new(),
+            #[cfg(feature = "vst")]
+            vst: VstPage::default(),
         }
         .render(area, &mut buffer);
         let lines = (0..area.height)
@@ -6823,6 +7036,8 @@ mod tests {
                 sources: Vec::new(),
                 mappings: Default::default(),
                 bindings: Vec::new(),
+                #[cfg(feature = "vst")]
+                vst: VstPage::default(),
                 capabilities: KeyboardCapabilities::legacy(),
                 theme: &theme,
             }
@@ -6925,6 +7140,8 @@ mod tests {
             sources: Vec::new(),
             mappings: Default::default(),
             bindings: Vec::new(),
+            #[cfg(feature = "vst")]
+            vst: VstPage::default(),
             theme: &Theme::built_in_default(),
         }
         .render(area, &mut buffer);
@@ -7240,6 +7457,11 @@ mod tests {
         sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default());
         assert_eq!(sheet.page, SettingsPage::Sources);
         sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default());
+        #[cfg(feature = "vst")]
+        {
+            assert_eq!(sheet.page, SettingsPage::Vst);
+            sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default());
+        }
         assert_eq!(sheet.page, SettingsPage::Reference);
         sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default());
         assert_eq!(sheet.page, SettingsPage::About);
@@ -7260,6 +7482,15 @@ mod tests {
             &mut settings,
             &TerminalFeatures::default(),
         );
+        #[cfg(feature = "vst")]
+        {
+            assert_eq!(sheet.page, SettingsPage::Vst);
+            sheet.key(
+                KeyCode::BackTab,
+                &mut settings,
+                &TerminalFeatures::default(),
+            );
+        }
         assert_eq!(sheet.page, SettingsPage::Sources);
         sheet.key(
             KeyCode::BackTab,
@@ -7302,7 +7533,7 @@ mod tests {
         assert_eq!(sheet.selected, 1, "the same page keeps its row");
     }
 
-    /// The seven tabs each answer to their own strip of the title row.
+    /// Each tab answers to its own strip of the title row.
     #[test]
     fn every_tab_has_its_own_click_strip() {
         let area = Rect::new(0, 0, 120, 40);
@@ -7317,16 +7548,30 @@ mod tests {
         assert_eq!(at(43), Some(SettingsPage::Keybinds));
         assert_eq!(at(45), Some(SettingsPage::Sources));
         assert_eq!(at(53), Some(SettingsPage::Sources));
-        assert_eq!(at(56), Some(SettingsPage::Reference));
-        assert_eq!(at(66), Some(SettingsPage::Reference));
-        assert_eq!(at(68), Some(SettingsPage::About));
-        assert_eq!(at(74), Some(SettingsPage::About));
+        #[cfg(feature = "vst")]
+        {
+            assert_eq!(at(55), Some(SettingsPage::Vst));
+            assert_eq!(at(59), Some(SettingsPage::Vst));
+            assert_eq!(at(60), None);
+            assert_eq!(at(61), Some(SettingsPage::Reference));
+            assert_eq!(at(71), Some(SettingsPage::Reference));
+            assert_eq!(at(72), None);
+            assert_eq!(at(73), Some(SettingsPage::About));
+            assert_eq!(at(79), Some(SettingsPage::About));
+        }
+        #[cfg(not(feature = "vst"))]
+        {
+            assert_eq!(at(55), None);
+            assert_eq!(at(56), Some(SettingsPage::Reference));
+            assert_eq!(at(66), Some(SettingsPage::Reference));
+            assert_eq!(at(67), None);
+            assert_eq!(at(68), Some(SettingsPage::About));
+            assert_eq!(at(74), Some(SettingsPage::About));
+        }
         assert_eq!(at(23), None, "the gap between tabs is nobody's");
         assert_eq!(at(33), None);
         assert_eq!(at(44), None);
         assert_eq!(at(54), None);
-        assert_eq!(at(55), None);
-        assert_eq!(at(67), None);
     }
 
     /// Every category starts listed. Each row hides one category.
@@ -7421,6 +7666,8 @@ mod tests {
             sources: Vec::new(),
             mappings: Default::default(),
             bindings: Vec::new(),
+            #[cfg(feature = "vst")]
+            vst: VstPage::default(),
             sheet: SettingsSheet {
                 page: SettingsPage::About,
                 ..SettingsSheet::default()
@@ -7668,6 +7915,8 @@ mod tests {
             sources: Vec::new(),
             mappings,
             bindings: Vec::new(),
+            #[cfg(feature = "vst")]
+            vst: VstPage::default(),
             capabilities: KeyboardCapabilities::legacy(),
             theme: &theme,
         }

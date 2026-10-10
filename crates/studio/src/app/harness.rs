@@ -214,6 +214,12 @@ impl Studio {
         // initialize writes its own error where a test expects no ports.
         app.devices
             .pin(crate::devices::DeviceInventory::no_hardware());
+        // The plugins of the machine are host-read too. A hermetic studio
+        // has no standard plugin folder, so a vst tab lists and loads no
+        // plugin of the runner. A test with a plugin pins its own folder
+        // after the open.
+        #[cfg(feature = "vst")]
+        rustel_runtime::vst::pin_standard_folders(Vec::new());
         // Paint the opening frame now. The real loop paints before it reads
         // a key (`dirty_frame` starts true), and key handlers read the
         // frame's geometry - the log panel's scroll rows among them - so a
@@ -714,6 +720,8 @@ impl Studio {
             Tab::Samples => "samples",
             Tab::Chords => "chords",
             Tab::Scales => "scales",
+            #[cfg(feature = "vst")]
+            Tab::Vst => "vst",
             #[cfg(feature = "hydra")]
             Tab::Examples => "examples",
             #[cfg(feature = "hydra")]

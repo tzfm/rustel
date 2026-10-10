@@ -114,6 +114,20 @@ It binds to `127.0.0.1:9247` by default. Clients must authenticate. The protocol
 is plaintext TCP; use a trusted network or an encrypted tunnel.
 See [Remote control](studio.md#remote-control).
 
+## Plugins
+
+```sh
+rustel vst
+rustel vst supermassive
+rustel vst serum "osc a"
+rustel vst --rescan
+```
+
+`rustel vst` lists the VST3 plugins a score reaches with `.vst()` and
+`.vsti()`. A name prints the parameters and presets of one plugin. The first
+run tests each plugin and keeps the result in a scan cache, and `--rescan`
+tests each plugin again. See [Plugins](plugins.md#the-plugin-scan).
+
 ## Samples
 
 ```sh

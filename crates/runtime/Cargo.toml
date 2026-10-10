@@ -14,7 +14,7 @@ description = "Native host library behind the rustel command and studio: Session
 # explicitly with `--no-default-features` and adds back only the capabilities
 # it needs. Internal benchmark instrumentation remains opt-in even for the
 # complete product.
-default = ["mp3-export", "extensions", "opus", "osc", "serial", "hydra", "gamepad"]
+default = ["mp3-export", "extensions", "opus", "osc", "serial", "hydra", "gamepad", "vst"]
 # Recording and replaying a live-coding set (`session_log`). The rustel
 # command and the studio record; a host that records nothing leaves it out.
 session-log = []
@@ -40,6 +40,9 @@ midi = ["dep:rustel-midi", "dep:midir", "dep:coremidi", "dep:objc2-core-foundati
 gamepad = ["dep:gilrs", "dep:log", "dep:objc2", "dep:objc2-foundation", "dep:objc2-core-foundation", "dep:objc2-game-controller"]
 # OSC output. Pure UDP with no dependencies of its own.
 osc = ["dep:rustel-osc"]
+# VST3 plugins for `.vst()`. The host loads native plugin code from the VST3
+# folders, so a host that must not do this leaves the feature out.
+vst = ["dep:rustel-vst3"]
 # Hydra visuals, drawn behind the code. A minimal/headless build can omit the
 # GPU stack.
 hydra = [
@@ -115,6 +118,7 @@ gilrs = { version = "0.11", optional = true, default-features = false, features 
 log = { version = "0.4", optional = true }
 
 rustel-osc = { path = "../osc", optional = true }
+rustel-vst3 = { path = "../vst3", optional = true }
 rustel-hydra = { path = "../hydra", optional = true }
 # Native Hydra sources. OxiMedia is one pure-Rust capture surface across
 # V4L2, AVFoundation and Media Foundation; pin the young API until its frame

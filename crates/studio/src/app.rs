@@ -38,6 +38,7 @@
 //! | jumping to the first error | `error_navigation.rs` |
 //! | pasting into prompts | `prompt_paste.rs` |
 //! | the remote-control sheet and its footer indicator | `remote_panel.rs`, `remote_edit.rs` |
+//! | the two vst tabs, and the plugin rows of the memory breakdown | `vst.rs` |
 //!
 //! And the machinery every feature goes through:
 //!
@@ -11227,6 +11228,7 @@ mod tests {
                 settled,
                 total,
                 loading: Some("mlkr-grsl".into()),
+                plugins: 0,
                 waiting,
             }
         }
@@ -11315,6 +11317,20 @@ mod tests {
                 Some("loading sounds · 3/12 · 25% · mlkr-grsl"),
                 "nothing is held"
             );
+
+            // A plugin wait has its own word, alone or beside the sounds.
+            for (plugins, words) in [(9, "plugins"), (2, "sounds and plugins")] {
+                let waiting = LoadingCue {
+                    plugins,
+                    ..cue(3, 12, true)
+                };
+                loading(&mut app, Some(waiting), LOADING_LABEL_AFTER);
+                let label = app.loading_line(Instant::now()).and_then(|line| line.label);
+                assert_eq!(
+                    label,
+                    Some(format!("waiting for {words} · 3/12 · 25% · mlkr-grsl"))
+                );
+            }
         }
 
         /// The line grows with the load along the header row, adds no row and
@@ -26425,6 +26441,9 @@ mod tests {
             assert_eq!(settings, crate::settings::UiSettings::default());
 
             sheet.key(KeyCode::Tab, &mut settings, &features);
+            #[cfg(feature = "vst")]
+            assert_eq!(sheet.page(), SettingsPage::Vst, "Tab still pages");
+            #[cfg(not(feature = "vst"))]
             assert_eq!(sheet.page(), SettingsPage::Reference, "Tab still pages");
             sheet.show_page(SettingsPage::Sources);
             assert_eq!(
@@ -34726,6 +34745,10 @@ mod tests {
             // App enumerates the runner's audio or MIDI hardware.
             app.devices
                 .pin(crate::devices::DeviceInventory::no_hardware());
+            // Nor its plugins: with no standard plugin folder, a vst tab
+            // lists and loads no plugin of the machine.
+            #[cfg(feature = "vst")]
+            rustel_runtime::vst::pin_standard_folders(Vec::new());
             // A folder of its own, as the real one has: the config folder is
             // never the set's folder, and a prebake.strudel among the scores
             // would be read as one.
@@ -38373,6 +38396,8 @@ mod tests {
 mod theme_sheets;
 mod transport;
 mod viz_panel;
+#[cfg(feature = "vst")]
+mod vst;
 
 use bank_context::bank_machines_ranked;
 use completion::{Landing, ReferenceAnchor};
@@ -38955,6 +38980,22 @@ struct App {
     #[cfg(feature = "hydra")]
     generator_session: super::ideas::Generator,
     catalogue_refreshed_at: Instant,
+    /// When the vst tab of the reference column last read the plugin list.
+    #[cfg(feature = "vst")]
+    plugins_polled_at: Instant,
+    /// The plugin host read its folders at the last turn.
+    #[cfg(feature = "vst")]
+    plugins_scanning: bool,
+    /// The plugins in their load at the last turn: see `rustel_runtime::vst::loads`.
+    #[cfg(feature = "vst")]
+    plugin_loads: Vec<String>,
+    /// The bundles the plugin scan tested and the bundles of the scan in
+    /// all at the last turn, while the scan runs.
+    #[cfg(feature = "vst")]
+    plugin_scan: Option<(usize, usize)>,
+    /// The plugin rows of the memory breakdown, as last measured.
+    #[cfg(feature = "vst")]
+    plugin_memory: Vec<super::memory::PluginMemory>,
     linter: Linter,
     /// The newest finding per scene, in the coordinates of the revision
     /// it was checked at.
@@ -39377,6 +39418,7 @@ struct App {
     tabs_closed: u64,
     live_material_sent: Option<Vec<(SceneId, LiveTextMark, bool)>>,
     tabs_closed_sent: u64,
+    plugins_shown_sent: Vec<String>,
     setups_select_variants_sent: bool,
     sent_setup_selected_variants: bool,
     /// The mixer widget's faders and which strip the keys drive.
@@ -39646,6 +39688,16 @@ impl App {
             #[cfg(feature = "hydra")]
             generator_session: super::ideas::Generator::default(),
             catalogue_refreshed_at: now,
+            #[cfg(feature = "vst")]
+            plugins_polled_at: now,
+            #[cfg(feature = "vst")]
+            plugins_scanning: false,
+            #[cfg(feature = "vst")]
+            plugin_loads: Vec::new(),
+            #[cfg(feature = "vst")]
+            plugin_scan: None,
+            #[cfg(feature = "vst")]
+            plugin_memory: Vec::new(),
             linter: Linter::spawn().map_err(RuntimeError::Io)?,
             lint: HashMap::new(),
             // Check what was opened before anything is typed.
@@ -39836,6 +39888,7 @@ impl App {
             tabs_closed: 0,
             live_material_sent: None,
             tabs_closed_sent: 0,
+            plugins_shown_sent: Vec::new(),
             setups_select_variants_sent: false,
             sent_setup_selected_variants: false,
             mixer,
@@ -39924,6 +39977,8 @@ impl App {
         app.forget_sources_in_gone_sets();
         app.adopt_global_sources();
         app.refresh_catalogue();
+        #[cfg(feature = "vst")]
+        app.adopt_vst_folders();
         // Laid out the way the set was left: the same scores in the same
         // panes, with the caret in the pane that had it.
         app.restore_panes();
@@ -40252,8 +40307,13 @@ impl App {
                 Some((*id, LiveTextMark::of(scene), *pinned))
             })
             .collect();
+        #[cfg(feature = "vst")]
+        let plugins = self.plugins_shown();
+        #[cfg(not(feature = "vst"))]
+        let plugins = Vec::new();
         if (self.live_material_sent.as_ref() == Some(&key)
-            && self.tabs_closed_sent == self.tabs_closed)
+            && self.tabs_closed_sent == self.tabs_closed
+            && self.plugins_shown_sent == plugins)
             || now.duration_since(self.last_edit_at) < LINT_DEBOUNCE
         {
             return;
@@ -40285,6 +40345,7 @@ impl App {
                 .collect(),
             tabs_closed: self.tabs_closed,
             setups_select_variants,
+            plugins: plugins.clone(),
         };
         if !self.worker.try_set_live_material(material.clone()) {
             // The queue is full: the next turn asks again.
@@ -40311,6 +40372,7 @@ impl App {
         load_variants_ahead(&ahead, setups_select_variants, &library);
         self.live_material_sent = Some(key);
         self.tabs_closed_sent = self.tabs_closed;
+        self.plugins_shown_sent = plugins;
         self.setups_select_variants_sent = setups_select_variants;
     }
 

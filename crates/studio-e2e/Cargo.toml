@@ -46,6 +46,12 @@ tempfile = "3"
 # would.
 crossterm = "0.29"
 
+[dev-dependencies]
+# The vst tabs suite pins the plugin folders, so no test reads the plugins
+# of the machine. Its plugin is the fixture of the plugin host tests.
+rustel-runtime = { path = "../runtime", features = ["test-support"] }
+rustel-vst3-fixture = { path = "../vst3-fixture" }
+
 [features]
 default = []
 # `pty`: drive the real `rustel studio` binary under a pseudo-terminal. The

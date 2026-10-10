@@ -6,6 +6,7 @@ mod composition;
 mod controls;
 mod modulation;
 mod patterns;
+mod plugin;
 mod values;
 
 pub(super) fn install<'js>(

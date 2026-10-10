@@ -149,6 +149,8 @@ impl ReferencePanel {
             names,
             swatches,
             bank_compatibility: None,
+            #[cfg(feature = "vst")]
+            plugin: None,
         });
         // As in `browse_for`: the word asked for is the one to land on.
         panel.selected = 0;
@@ -196,6 +198,8 @@ impl ReferencePanel {
             scale_query: String::new(),
             scale_selected: 0,
             open_scale: None,
+            #[cfg(feature = "vst")]
+            vst: VstTab::default(),
             scroll: std::cell::Cell::new(0),
             sound_scroll: std::cell::Cell::new(0),
             chord_scroll: std::cell::Cell::new(0),
@@ -274,7 +278,7 @@ impl ReferencePanel {
     /// Shift+Tab: the tab before this one, wrapping, as in the devices
     /// panel and the settings sheet.
     pub fn previous_tab(&mut self) {
-        // Round the other way: four or five tabs, and no list to reverse.
+        // Round the other way: seven tabs at most, and no list to reverse.
         for _ in 0..tabs().len().saturating_sub(1) {
             self.toggle_tab();
         }
@@ -294,20 +298,12 @@ impl ReferencePanel {
     }
 
     pub fn toggle_tab(&mut self) {
-        let next = match self.tab {
-            Tab::Reference => Tab::Samples,
-            Tab::Samples => Tab::Chords,
-            Tab::Chords => Tab::Scales,
-            #[cfg(feature = "hydra")]
-            Tab::Scales => Tab::Generator,
-            #[cfg(not(feature = "hydra"))]
-            Tab::Scales => Tab::Reference,
-            #[cfg(feature = "hydra")]
-            Tab::Generator => Tab::Examples,
-            #[cfg(feature = "hydra")]
-            Tab::Examples => Tab::Reference,
-        };
-        self.select_tab(next);
+        let all = tabs();
+        let at = all
+            .iter()
+            .position(|(tab, _)| *tab == self.tab)
+            .unwrap_or(0);
+        self.select_tab(all[(at + 1) % all.len()].0);
     }
 
     pub(crate) fn refresh(&mut self, reference: &Reference) {
@@ -317,10 +313,7 @@ impl ReferencePanel {
                 .as_ref()
                 .filter(|bank| bank.only_compatible)
                 .map_or(vocabulary.names.len(), |bank| bank.count);
-            self.results = super::super::fuzzy::rank(
-                self.query.trim(),
-                vocabulary.names.iter().take(count).map(String::as_str),
-            );
+            self.results = vocabulary.rank(self.query.trim(), count);
         } else {
             self.results = reference.search_with(&self.query, self.snippets_last);
         }
@@ -417,6 +410,8 @@ impl ReferencePanel {
         } else {
             match self.tab {
                 Tab::Samples => &self.sound_query,
+                #[cfg(feature = "vst")]
+                Tab::Vst => self.vst.query(),
                 _ => &self.query,
             }
         };
@@ -431,6 +426,8 @@ impl ReferencePanel {
     pub fn wants_text(&self) -> bool {
         match self.tab {
             Tab::Samples | Tab::Chords | Tab::Scales => true,
+            #[cfg(feature = "vst")]
+            Tab::Vst => true,
             Tab::Reference => matches!(self.mode, ReferenceMode::Browse),
             // The shelf has no search box; its letters are shortcuts.
             #[cfg(feature = "hydra")]
@@ -450,6 +447,8 @@ impl ReferencePanel {
         match self.tab {
             Tab::Reference => !matches!(self.mode, ReferenceMode::Browse),
             Tab::Samples | Tab::Chords | Tab::Scales => false,
+            #[cfg(feature = "vst")]
+            Tab::Vst => false,
             #[cfg(feature = "hydra")]
             Tab::Examples | Tab::Generator => false,
         }
@@ -489,6 +488,8 @@ impl ReferencePanel {
                 self.sound_selected = 0;
                 self.refresh_sounds();
             }
+            #[cfg(feature = "vst")]
+            Tab::Vst => self.vst.edit_query(|query| query.push_str(&addition)),
             Tab::Reference => {
                 self.query.push_str(&addition);
                 self.selected = 0;
@@ -532,6 +533,8 @@ impl ReferencePanel {
                 self.sound_selected = 0;
                 self.refresh_sounds();
             }
+            #[cfg(feature = "vst")]
+            Tab::Vst => self.vst.edit_query(String::clear),
             Tab::Reference => {
                 self.query.clear();
                 self.selected = 0;
@@ -552,6 +555,8 @@ impl ReferencePanel {
                 Tab::Chords => &self.chord_query,
                 Tab::Scales => &self.scale_query,
                 Tab::Samples => &self.sound_query,
+                #[cfg(feature = "vst")]
+                Tab::Vst => self.vst.query(),
                 Tab::Reference => &self.query,
                 #[cfg(feature = "hydra")]
                 Tab::Examples | Tab::Generator => return 0,
@@ -596,6 +601,8 @@ impl ReferencePanel {
                 self.sound_selected = 0;
                 self.refresh_sounds();
             }
+            #[cfg(feature = "vst")]
+            Tab::Vst => self.vst.edit_query(|query| query.push(character)),
             Tab::Reference => {
                 self.query.push(character);
                 self.selected = 0;
@@ -633,6 +640,10 @@ impl ReferencePanel {
                 self.sound_selected = 0;
                 self.refresh_sounds();
             }
+            #[cfg(feature = "vst")]
+            Tab::Vst => self.vst.edit_query(|query| {
+                query.pop();
+            }),
             Tab::Reference => {
                 self.query.pop();
                 self.selected = 0;
@@ -667,6 +678,11 @@ impl ReferencePanel {
             if self.tab == Tab::Examples && before != at {
                 self.snippet_code_scroll.set(0);
             }
+            return;
+        }
+        #[cfg(feature = "vst")]
+        if self.tab == Tab::Vst {
+            self.vst.move_by(delta);
             return;
         }
         if self.tab == Tab::Scales {
@@ -736,6 +752,10 @@ impl ReferencePanel {
         }
         if self.bank_list() {
             return false;
+        }
+        #[cfg(feature = "vst")]
+        if self.tab == Tab::Vst {
+            return self.vst.expand();
         }
         #[cfg(feature = "hydra")]
         if self.tab.is_snippets() {
@@ -847,6 +867,10 @@ impl ReferencePanel {
         }
         if self.bank_list() {
             return false;
+        }
+        #[cfg(feature = "vst")]
+        if self.tab == Tab::Vst {
+            return self.vst.collapse();
         }
         #[cfg(feature = "hydra")]
         if self.tab.is_snippets() {
@@ -1170,6 +1194,21 @@ impl ReferencePanel {
                 Some(SnippetLine::Generator(_)) | None => PanelAction::Nothing,
             };
         }
+        #[cfg(feature = "vst")]
+        if self.tab == Tab::Vst {
+            // Enter writes the row into the score: the plugin call, a
+            // parameter, or a preset. A row with no text opens: a group, or
+            // a plugin before its load, which has no kind yet.
+            let text = self.vst.score_text();
+            match self.vst.row(self.vst.selected) {
+                Some(PluginRow::Group(index)) => self.vst.toggle_group(index),
+                Some(PluginRow::Plugin(_)) if text.is_none() => {
+                    self.vst.expand();
+                }
+                _ => {}
+            }
+            return text.map_or(PanelAction::Nothing, PanelAction::Insert);
+        }
         if self.tab == Tab::Scales {
             return match self.scale_rows().get(self.scale_selected).copied() {
                 Some(ScaleRow::Scale(index)) => {
@@ -1281,6 +1320,11 @@ impl ReferencePanel {
         if self.tab == Tab::Samples && !self.bank_list() {
             return PanelAction::Close;
         }
+        // The same on the vst tab: ← folds a plugin, Esc leaves.
+        #[cfg(feature = "vst")]
+        if self.tab == Tab::Vst {
+            return PanelAction::Close;
+        }
         match self.mode {
             ReferenceMode::Entry {
                 from_browse: true, ..
@@ -1352,6 +1396,19 @@ impl ReferencePanel {
                     }
                     SnippetLine::Generator(_) => return self.generator_activate(),
                 }
+            }
+            return PanelAction::Nothing;
+        }
+        #[cfg(feature = "vst")]
+        if self.tab == Tab::Vst {
+            // A click selects the row. On a plugin or a group the click is
+            // the fold also, as on the sample banks.
+            let Some(clicked) = self.vst.row(index) else {
+                return PanelAction::Nothing;
+            };
+            self.vst.selected = index;
+            if matches!(clicked, PluginRow::Plugin(_) | PluginRow::Group(_)) && !self.vst.expand() {
+                self.vst.collapse();
             }
             return PanelAction::Nothing;
         }

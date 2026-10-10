@@ -164,7 +164,8 @@ at runtime.
 The default playback load mode waits for the first two cycles of sounds. An
 old score keeps playing while a new score loads. Stop cancels a pending update.
 In asynchronous load mode, notes whose sounds are not ready can be skipped.
-Change this option under Settings ▸ Advanced ▸ Playback.
+Change this option under Settings ▸ Advanced ▸ Playback. The wait includes the
+VST3 plugins of the score: see [plugins](plugins.md#load-time-and-memory).
 
 ### Launch timing
 
@@ -275,6 +276,23 @@ sound design, and Hydra visuals. The generator tab makes new music from a
 direction, such as Acid current. In both tabs, Space plays the music and `c`
 copies the code. A copy does not change the score. Paste the code into the
 score, then update the score.
+
+The vst tab lists the VST3 plugins in the plugin folders. Right arrow loads a
+plugin and opens its row: the parameters at the top level, then one row for
+each parameter group with its parameter count, then the presets. Right arrow
+on a group shows its parameters. Left arrow closes the group or the plugin.
+A parameter row shows the name a score writes, the title and the default.
+
+In a `.vst()` or `.vsti()` call, Ctrl+F completes from the plugin host. The
+first string lists the plugin names: a part of a name finds the plugin, and a
+loaded plugin shows only for its own call. The object lists the parameter keys
+of the plugin, each with its title and default, when the plugin has loaded.
+The string of `preset` lists the preset files of the plugin.
+Type to search the plugins by name. With a plugin open, the search finds its
+parameters too, by name, title or group. Enter on a plugin writes
+`.vst("name")` for an effect and `.vsti("name")` for an instrument at the
+caret. Enter on a parameter writes the parameter with its default, and Enter
+on a preset writes `preset: "name"`.
 
 F12 enables Piano mode. Use it to enter notes from the keyboard. Leave Piano
 mode before you use those keys to edit ordinary text.
@@ -434,6 +452,13 @@ automatic.
 To change a shortcut, select its row, press Enter, then press the new chord.
 Del restores the default. The panel shortcuts Alt+O, Alt+R, Alt+D and Alt+T
 are at the end of the list. The panel footers show the chord you set.
+
+The vst page lists the folders the plugin host reads for VST3 plugins: your
+folders first, then the standard folders of the system. Press `a` to add a
+folder and `d` to remove one of yours. Enter on `rescan` reads every folder
+again, for example after you install a plugin. The page shows the number of
+plugins found and the preset folder, `<rustel-config>/vst`, with one folder of
+`.vstpreset` files for each plugin.
 
 Studio saves preferences in `<rustel-config>/studio.json`. The default config
 folder is `~/.rustel`, including `%USERPROFILE%\.rustel` on Windows.

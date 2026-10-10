@@ -59,6 +59,8 @@ fn audition_list(area: Rect, tab: Tab) -> Rect {
         Tab::Samples => 3 + samples_wave_rows(area),
         Tab::Chords | Tab::Scales => 2 + keyboard_rows(area),
         Tab::Reference => 0,
+        #[cfg(feature = "vst")]
+        Tab::Vst => 0,
         #[cfg(feature = "hydra")]
         Tab::Examples | Tab::Generator => 0,
     };
@@ -148,26 +150,18 @@ pub fn inner_area(area: Rect) -> Rect {
 
 /// Tabs in drawing and cycling order, with labels from widest to shortest.
 pub(super) fn tabs() -> &'static [(Tab, [&'static str; 3])] {
-    #[cfg(feature = "hydra")]
-    {
-        &[
-            (Tab::Reference, ["reference", "ref", "ref"]),
-            (Tab::Samples, ["samples", "samp", "smp"]),
-            (Tab::Chords, ["chords", "chord", "chd"]),
-            (Tab::Scales, ["scales", "scale", "scl"]),
-            (Tab::Generator, ["generator", "gen", "gen"]),
-            (Tab::Examples, ["examples", "examp", "ex"]),
-        ]
-    }
-    #[cfg(not(feature = "hydra"))]
-    {
-        &[
-            (Tab::Reference, ["reference", "ref", "ref"]),
-            (Tab::Samples, ["samples", "samp", "smp"]),
-            (Tab::Chords, ["chords", "chord", "chd"]),
-            (Tab::Scales, ["scales", "scale", "scl"]),
-        ]
-    }
+    &[
+        (Tab::Reference, ["reference", "ref", "ref"]),
+        (Tab::Samples, ["samples", "samp", "smp"]),
+        (Tab::Chords, ["chords", "chord", "chd"]),
+        (Tab::Scales, ["scales", "scale", "scl"]),
+        #[cfg(feature = "vst")]
+        (Tab::Vst, ["vst", "vst", "vst"]),
+        #[cfg(feature = "hydra")]
+        (Tab::Generator, ["generator", "gen", "gen"]),
+        #[cfg(feature = "hydra")]
+        (Tab::Examples, ["examples", "examp", "ex"]),
+    ]
 }
 
 /// Label positions and the number of hidden tabs, shared by drawing and
@@ -280,6 +274,8 @@ impl ReferencePanel {
             Tab::Samples => (self.sound_selected, &self.sound_scroll),
             Tab::Chords => (self.chord_selected, &self.chord_scroll),
             Tab::Scales => (self.scale_selected, &self.scale_scroll),
+            #[cfg(feature = "vst")]
+            Tab::Vst => (self.vst.selected, &self.vst.scroll),
             #[cfg(feature = "hydra")]
             Tab::Examples | Tab::Generator => (self.snippet_selected, &self.snippet_scroll),
         }
@@ -295,6 +291,8 @@ impl ReferencePanel {
             Tab::Samples => self.sound_rows().len(),
             Tab::Chords => self.chord_rows().len(),
             Tab::Scales => self.scale_rows().len(),
+            #[cfg(feature = "vst")]
+            Tab::Vst => self.vst.rows().len(),
             #[cfg(feature = "hydra")]
             Tab::Examples | Tab::Generator => self.snippet_lines().len(),
         }

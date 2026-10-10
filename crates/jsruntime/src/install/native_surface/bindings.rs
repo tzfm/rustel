@@ -127,7 +127,7 @@ fn define_method<'js>(
         "filterHaps" => ("", 1),
         "filterValues" | "withQuerySpan" => ("value", 1),
         "modulate" => ("value", 3),
-        "lfo" | "env" | "bmod" => ("value", 2),
+        "lfo" | "env" | "bmod" | "vst" | "vsti" => ("value", 2),
         _ => ("value", 0),
     };
     function
@@ -417,6 +417,22 @@ pub(super) fn install<'js>(
         .map_err(|error| error.to_string())?;
         set_function_length(&free, 1)?;
         globals.set(kind, free).map_err(|error| error.to_string())?;
+    }
+    for call in ["vst", "vsti"] {
+        define_method(
+            proto,
+            call,
+            Function::new(ctx.clone(), move |ctx, this, args| {
+                plugin::plugin_method(ctx, this, args, call)
+            })
+            .map_err(|error| error.to_string())?,
+        )?;
+        let free = Function::new(ctx.clone(), move |ctx, args| {
+            plugin::plugin_free(ctx, args, call)
+        })
+        .map_err(|error| error.to_string())?;
+        set_function_length(&free, 2)?;
+        globals.set(call, free).map_err(|error| error.to_string())?;
     }
     define_method(
         proto,

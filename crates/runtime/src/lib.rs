@@ -75,6 +75,8 @@ pub mod ui_analysis;
 /// Bounded, versioned live-editor event protocol.
 pub mod ui_events;
 pub mod updates;
+#[cfg(feature = "vst")]
+pub mod vst;
 mod watch;
 
 pub use capabilities::{

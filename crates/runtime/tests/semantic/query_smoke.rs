@@ -916,6 +916,62 @@ fn a_pattern_port_is_rejected_instead_of_silently_becoming_port_zero() {
     }
 }
 
+/// `.vst()` keeps the plugin name and the preset name as text, samples each
+/// value as a pattern, and a second call adds an effect after the first.
+#[test]
+fn vst_names_are_text_and_values_are_patterns() {
+    let mut session = Session::new().expect("session");
+    session
+        .evaluate(
+            r#"s("saw*4").vst("Old One", { depth: 1 })
+                .vst("My Plugin", { mix: "0.2 0.8", preset: "Warm Pad" })"#,
+        )
+        .expect("a score with a plugin");
+    let haps = session.query(Fraction::ZERO, Fraction::ONE).expect("query");
+    let shown: Vec<String> = haps
+        .iter()
+        .map(|hap| {
+            let plugin = hap.value.as_object().and_then(|map| map.get("vst"));
+            plugin.map(rustel_core::Value::show).unwrap_or_default()
+        })
+        .collect();
+    let with_mix = |mix: &str| {
+        format!(
+            "{{name:Old One params:{{depth:1}}}} {{name:My Plugin params:{{mix:{mix}}} preset:Warm Pad}}"
+        )
+    };
+    assert_eq!(
+        shown,
+        [
+            with_mix("0.2"),
+            with_mix("0.2"),
+            with_mix("0.8"),
+            with_mix("0.8")
+        ]
+    );
+
+    let mut session = Session::new().expect("session");
+    assert!(session.evaluate(r#"s("saw").vst({ mix: 1 })"#).is_err());
+
+    // An instrument and an effect are two requests on one note, and a
+    // plugin call starts a chain too. Only the first argument names the
+    // plugin: a key `name` in the object is a parameter.
+    let mut session = Session::new().expect("session");
+    session
+        .evaluate(r#"vsti("Synth One", { preset: "Bass" }).note("c3").vst("Comp", { name: 0.3 })"#)
+        .expect("a score with an instrument and an effect");
+    let haps = session.query(Fraction::ZERO, Fraction::ONE).expect("query");
+    let shown = haps[0].value.show();
+    assert!(
+        shown.contains("vsti:{name:Synth One preset:Bass}"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("vst:[{name:Comp params:{name:0.3}}]"),
+        "{shown}"
+    );
+}
+
 #[test]
 fn lfo_config_values_may_be_patterns() {
     let mut session = Session::new().expect("session");

@@ -125,6 +125,11 @@ pub struct LiveMaterial {
     /// counts whatever this says: see
     /// [`rustel_runtime::Session::prebake_selects_variants`].
     pub setups_select_variants: bool,
+    /// The plugins the reference column shows: the open plugin of its vst
+    /// tab, and the plugin of a word list for a plugin call. The idle sweep
+    /// keeps them loaded, as the plugins the tabs name. The column loads a
+    /// plugin on show, so an unload here starts the load again at once.
+    pub plugins: Vec<String>,
 }
 
 /// The ids no memory policy may drop, and what they were worked out
@@ -1261,6 +1266,16 @@ pub struct StudioEngine {
     next_install_preview: bool,
     /// [`LiveMaterial::tabs_closed`] as last sent.
     live_tabs_closed: u64,
+    /// The plugins the texts of the tabs name, as last sent.
+    #[cfg(feature = "vst")]
+    live_plugins_named: Vec<String>,
+    /// [`LiveMaterial::plugins`] as last sent.
+    #[cfg(feature = "vst")]
+    live_plugins_shown: Vec<String>,
+    /// Whether the idle sweep of this quiet spell has unloaded the plugins
+    /// nothing keeps: see [`Self::unload_idle_plugins`].
+    #[cfg(feature = "vst")]
+    plugins_swept: bool,
     /// How much decoded sound the recently visited tabs may keep, when a
     /// test says: see [`Self::recent_tabs_allowance`] otherwise.
     recent_tabs_bytes: Option<usize>,
@@ -1698,6 +1713,12 @@ impl StudioEngine {
             played_from_generation: 0,
             next_install_preview: false,
             live_tabs_closed: 0,
+            #[cfg(feature = "vst")]
+            live_plugins_named: Vec::new(),
+            #[cfg(feature = "vst")]
+            live_plugins_shown: Vec::new(),
+            #[cfg(feature = "vst")]
+            plugins_swept: false,
             recent_tabs_bytes: None,
             protection_generation: 0,
             protection: None,
@@ -2722,7 +2743,7 @@ impl StudioEngine {
         self.stopped_device_time
             .get_or_insert_with(|| live.device.clock_seconds());
         // As for a stop: the score is no longer kept for being the score.
-        self.idle_swept = false;
+        self.ask_idle_sweep();
         self.session.transport().stop();
         self.session.consume_audio_confirmations();
         self.supersede_launch();
@@ -4693,10 +4714,11 @@ impl StudioEngine {
                 text_from: self.text_from_generation,
             };
             let mut reverbs = LiveReverbBatch::default();
-            let shield = live.producer.shield_reload_with_clock(
+            let shield = live.producer.shield_reload_with_assets(
                 &mut self.session,
                 || device.clock_seconds(),
                 device.sample_rate(),
+                |events| LiveReverbBatch::install_inserts(device, events),
                 |event| {
                     let pushed = device.push(event);
                     if pushed {
@@ -5113,6 +5135,8 @@ impl StudioEngine {
         if let Some(library) = self.session.sample_library() {
             library.set_render_rate(device.sample_rate());
         }
+        #[cfg(feature = "vst")]
+        rustel_runtime::vst::attach(&device);
         Ok(device)
     }
 
@@ -5351,7 +5375,7 @@ impl StudioEngine {
                 text_from: self.text_from_generation,
             };
             let mut reverbs = LiveReverbBatch::default();
-            let result = live.producer.step_unwatched_with_clock_and_cutover(
+            let result = live.producer.step_unwatched_with_assets(
                 &mut self.session,
                 || device.render_frontier_seconds(),
                 device.sample_rate(),
@@ -5369,6 +5393,7 @@ impl StudioEngine {
                     );
                     device.set_generation(generation, takeover_frame, cut);
                 },
+                |events| LiveReverbBatch::install_inserts(device, events),
                 |event| {
                     let pushed = device.push(event);
                     if pushed {
@@ -5384,6 +5409,7 @@ impl StudioEngine {
                     pushed
                 },
             );
+            // Retry pending inserts even when this turn scheduled no batch.
             let preparation_started = Instant::now();
             reverbs.flush(device);
             live.producer
@@ -5538,7 +5564,7 @@ impl StudioEngine {
             // The score is no longer kept for being the score, so what the
             // last sweep decided was still wanted is decided again: a tab
             // closed while it played goes with the next idle sweep.
-            self.idle_swept = false;
+            self.ask_idle_sweep();
         }
         self.piano = [None; PIANO_KEYS];
         self.piano_close_when_idle = true;
@@ -5593,7 +5619,7 @@ impl StudioEngine {
         // A different score names different sounds, so what the last sweep
         // decided was still wanted has to be decided again.
         if self.current_score != source {
-            self.idle_swept = false;
+            self.ask_idle_sweep();
             self.current_score = source.to_owned();
             self.current_score_names = protected_names(source);
             self.protection_generation = self.protection_generation.wrapping_add(1);
@@ -5864,7 +5890,7 @@ impl StudioEngine {
         // mid-edit would be swept and decoded again a moment later.
         if material.tabs_closed != self.live_tabs_closed {
             self.live_tabs_closed = material.tabs_closed;
-            self.idle_swept = false;
+            self.ask_idle_sweep();
             // The tab gone may be the one the score played from: once no
             // tab holds its text, what it sounded goes at Stop, or now.
             let mut open = material.pinned.iter().chain(&material.recent);
@@ -5879,6 +5905,21 @@ impl StudioEngine {
                     self.played_by_score.clear();
                 }
             }
+        }
+        #[cfg(feature = "vst")]
+        {
+            // A plugin the column shows no more goes with the next sweep.
+            // A text edit asks for no sweep, as for the sounds.
+            if material.plugins != self.live_plugins_shown {
+                self.live_plugins_shown.clone_from(&material.plugins);
+                self.plugins_swept = false;
+            }
+            self.live_plugins_named = material
+                .pinned
+                .iter()
+                .chain(&material.recent)
+                .flat_map(|text| rustel_runtime::vst::names_in_source(text))
+                .collect();
         }
         let mut seen: HashMap<String, usize> = HashMap::new();
         let mut pinned: Vec<(String, Variants)> = Vec::new();
@@ -6264,7 +6305,49 @@ impl StudioEngine {
         self.idle_swept = false;
     }
 
+    /// A stop, a different score or a tab gone: the idle sweep decides
+    /// again what is still wanted, for the sounds and for the plugins.
+    fn ask_idle_sweep(&mut self) {
+        self.idle_swept = false;
+        #[cfg(feature = "vst")]
+        {
+            self.plugins_swept = false;
+        }
+    }
+
+    /// Unloads the plugins nothing asks for, one time for each quiet spell,
+    /// with the idle sweep of the sounds: after the same idle time, and
+    /// again after [`Self::ask_idle_sweep`]. The sweep keeps the plugins
+    /// the tabs name, the plugins the reference column shows, and the
+    /// plugins of the score in play, of an armed launch and of a held edit.
+    /// The host keeps each plugin with a running copy, so an unload waits
+    /// for the output of its score to close.
+    #[cfg(feature = "vst")]
+    fn unload_idle_plugins(&mut self, now: Instant) {
+        if self.plugins_swept
+            || self.unused_sample_idle.is_zero()
+            || now.saturating_duration_since(self.last_preview_at) < self.unused_sample_idle
+        {
+            return;
+        }
+        self.plugins_swept = true;
+        let score = self.live.is_some().then_some(self.current_score.as_str());
+        let launch = self.pending_launch.as_ref().map(|pending| &*pending.source);
+        let mut keep: Vec<String> = self
+            .live_plugins_shown
+            .iter()
+            .chain(&self.live_plugins_named)
+            .cloned()
+            .collect();
+        for source in score.into_iter().chain(launch).chain(self.waiting_source()) {
+            keep.extend(rustel_runtime::vst::names_in_source(source));
+        }
+        rustel_runtime::vst::unload_unused(&keep);
+    }
+
     fn enforce_sample_memory(&mut self, now: Instant) {
+        #[cfg(feature = "vst")]
+        self.unload_idle_plugins(now);
         if let Some(live) = &self.live {
             let before = self.sample_use_until.len();
             let frame = live.device.clock_frames();
@@ -9606,6 +9689,7 @@ pub(super) mod tests {
             recent: Vec::new(),
             tabs_closed: 0,
             setups_select_variants: false,
+            ..LiveMaterial::default()
         });
         engine
             .warm_source("silence", Duration::ZERO)
@@ -9635,6 +9719,7 @@ pub(super) mod tests {
             ],
             tabs_closed: 0,
             setups_select_variants: false,
+            ..LiveMaterial::default()
         });
 
         engine.force_sample_idle_for_test(Duration::from_secs(5));
@@ -9710,6 +9795,7 @@ pub(super) mod tests {
             recent: Vec::new(),
             tabs_closed: 0,
             setups_select_variants: false,
+            ..LiveMaterial::default()
         });
 
         engine.force_sample_idle_for_test(Duration::from_secs(5));
@@ -9726,6 +9812,7 @@ pub(super) mod tests {
             recent: recent.iter().map(|text| Arc::from(*text)).collect(),
             tabs_closed,
             setups_select_variants: false,
+            ..LiveMaterial::default()
         }
     }
 
@@ -9797,6 +9884,7 @@ pub(super) mod tests {
             recent: vec![Arc::from("s(\"kick snare hat\")")],
             tabs_closed: 0,
             setups_select_variants: false,
+            ..LiveMaterial::default()
         });
 
         let memory = engine.snapshot().sample_memory;
@@ -9825,6 +9913,7 @@ pub(super) mod tests {
             ],
             tabs_closed: 0,
             setups_select_variants: false,
+            ..LiveMaterial::default()
         });
         let before = engine.snapshot().sample_memory;
         assert_eq!(before.recent_bytes, 8 * 1024, "{before:?}");
@@ -10222,6 +10311,7 @@ pub(super) mod tests {
             recent: Vec::new(),
             tabs_closed: 0,
             setups_select_variants: false,
+            ..LiveMaterial::default()
         });
         let start = Instant::now();
         assert!(engine.refresh_protection(start));
@@ -10234,6 +10324,7 @@ pub(super) mod tests {
             recent: Vec::new(),
             tabs_closed: 0,
             setups_select_variants: false,
+            ..LiveMaterial::default()
         });
         assert_eq!(
             engine.protection_generation, generation,
@@ -15560,6 +15651,158 @@ mod load_mode_tests {
         start(&mut engine, "s(\"<sine sine kick>\")");
         assert!(!engine.start_is_held(), "the kick is past the first window");
         assert!(!engine.hold_update("s(\"<sine sine kick>\").gain(0.5)", false, false));
+    }
+
+    /// Changing controls must not wait again for plugins already named by
+    /// the playing score, including two chains sharing the default orbit.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn plugin_parameter_edits_do_not_reenter_loading() {
+        let library = loading_kick();
+        let mut engine = studio(LoadMode::Wait, &library);
+        let source = r#"$: s("sine").vst("First").vst("Second", {wetout: 0.6})
+$: s("supersaw").seg(16).vst("Distortion", {drive: 0.1})"#;
+        engine.session.evaluate(source).expect("playing score");
+        for edit in [
+            source.replace("drive: 0.1", "drive: 0.9"),
+            source.replace("drive: 0.1", "drive: slider(0.2, 0, 1), mix: 0.5"),
+            source.replace("{drive: 0.1}", "{}"),
+            format!("// shifted source positions\n{source}"),
+            source.replace(".seg(16)", ".seg(8).gain(0.5)"),
+        ] {
+            assert!(engine.new_in_text(&edit, false).is_empty(), "{edit}");
+        }
+    }
+
+    /// A changed plugin, preset, stage, orbit or instrument role still
+    /// needs preparation before a waiting edit lands.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn new_plugin_copies_are_still_followed_after_an_edit() {
+        let library = loading_kick();
+        let mut engine = studio(LoadMode::Wait, &library);
+        engine
+            .session
+            .evaluate(r#"s("sine").vst("First", {drive: 0.1})"#)
+            .expect("playing score");
+        for edit in [
+            r#"s("sine").vst("Other", {drive: 0.1})"#,
+            r#"s("sine").vst("First", {preset: "Soft", drive: 0.1})"#,
+            r#"s("sine").vst("First").vst("First")"#,
+            r#"s("sine").vst("First").orbit(2)"#,
+            r#"note("c3").vsti("First", {drive: 0.1})"#,
+        ] {
+            let followed = engine.new_in_text(edit, false);
+            assert_eq!(followed.len(), 1, "{edit}: {followed:?}");
+            assert!(matches!(followed[0], loading::Followed::Plugin { .. }));
+        }
+        engine.master.set_load_mode(LoadMode::Async);
+        assert!(
+            engine
+                .new_in_text(r#"s("sine").vst("Other")"#, false)
+                .is_empty()
+        );
+    }
+
+    /// Readiness checks prepare a replacement without taking the slot
+    /// away from the plugin the current score is still playing.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn preparing_a_plugin_edit_preserves_the_playing_insert() {
+        use rustel_runtime::vst;
+        use std::sync::atomic::AtomicUsize;
+
+        let folder = tempfile::tempdir().expect("plugins");
+        rustel_vst3_fixture::install(folder.path());
+        let presets = folder.path().join("presets");
+        let plugin_presets = presets.join(rustel_vst3_fixture::NAME);
+        std::fs::create_dir_all(&plugin_presets).expect("preset folder");
+        std::fs::write(
+            plugin_presets.join("Soft.vstpreset"),
+            rustel_vst3_fixture::preset(0.2, 0.0),
+        )
+        .expect("preset");
+        vst::pin_standard_folders(vec![folder.path().to_path_buf()]);
+        let host = vst::host();
+        host.set_preset_folder(presets);
+        host.wait_idle();
+        let vst::Resolved::Ready(plugin, _) = host.resolve(rustel_vst3_fixture::NAME, true) else {
+            panic!("fixture loaded");
+        };
+        let key = rustel_audio::InsertKey { plugin, preset: 0 };
+        let slot = rustel_audio::effect_slot(1, 0);
+        let library = loading_kick();
+        let mut engine = studio(LoadMode::Wait, &library);
+        let source = r#"setcpm(90/4)
+$: note("g#3*4").s("sine").vst("Rustel Fixture")
+    .vst("Rustel Fixture", {gain:0.6}).orbit(1)
+$: s("supersaw").seg(16)"#;
+        start(&mut engine, source);
+        let copies = Arc::new(AtomicUsize::new(0));
+        engine
+            .live
+            .as_ref()
+            .expect("playing")
+            .device
+            .set_insert_provider(Arc::new({
+                let copies = Arc::clone(&copies);
+                let provider = host.provider(false);
+                move |key, sample_rate, slot| {
+                    let insert = provider(key, sample_rate, slot);
+                    if insert.is_some() {
+                        copies.fetch_add(1, Ordering::Relaxed);
+                    }
+                    insert
+                }
+            }));
+        turn_until(&mut engine, "the playing insert", |engine| {
+            !engine.start_is_held()
+                && (0..2).all(|stage| {
+                    engine
+                        .live
+                        .as_ref()
+                        .unwrap()
+                        .device
+                        .holds_insert(rustel_audio::effect_slot(1, stage), key)
+                })
+        });
+        assert_eq!(copies.load(Ordering::Relaxed), 2);
+
+        for orbit in [2, 1, 2, 1] {
+            let incoming = source.replace(".orbit(1)", &format!(".orbit({orbit})"));
+            assert!(!engine.hold_update(&incoming, false, false));
+            engine.evaluate(&incoming, false).expect("orbit edit");
+            turn_until(
+                &mut engine,
+                "the orbit edit reaching the output",
+                |engine| {
+                    let device = &engine.live.as_ref().unwrap().device;
+                    device.generation() == engine.generation()
+                        && (0..2).all(|stage| {
+                            device.holds_insert(rustel_audio::effect_slot(1, stage), key)
+                        })
+                },
+            );
+            assert_eq!(engine.active_source(), Some(incoming.as_str()));
+            assert!(engine.load.held_edit.is_none());
+            assert!(engine.snapshot().loading.is_none());
+            assert_eq!(copies.load(Ordering::Relaxed), 2);
+        }
+
+        let incoming = engine.new_in_text(
+            r#"s("sine*16").vst("Rustel Fixture", {preset: "Soft"})"#,
+            false,
+        );
+        assert_eq!(incoming.len(), 1);
+        turn_until(&mut engine, "the prepared replacement", |engine| {
+            !engine.loading_among(&incoming)
+        });
+        for _ in 0..20 {
+            assert!(!engine.loading_among(&incoming));
+            assert!(engine.live.as_ref().unwrap().device.holds_insert(slot, key));
+        }
+        drop(engine);
+        vst::pin_standard_folders(Vec::new());
     }
 
     /// A newer edit replaces a held one.

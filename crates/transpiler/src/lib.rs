@@ -19,7 +19,7 @@ use oxc_ast::ast::{
     ExportDefaultDeclaration, ExportFromDeclaration, ExportNamedDeclaration, Expression,
     ForOfStatement, IfStatement, ImportDeclaration, ImportExpression, ImportMeta,
     JSXAttributeValue, JSXText, NewExpression, ObjectExpression, ObjectPropertyKind, Program,
-    RegExpLiteral, Statement, TemplateLiteral, VariableDeclarationKind,
+    PropertyKey, RegExpLiteral, Statement, TemplateLiteral, VariableDeclarationKind,
 };
 use oxc_ast_visit::{Visit, VisitMut, walk, walk_mut};
 use oxc_codegen::{Codegen, CodegenOptions};
@@ -368,7 +368,7 @@ impl OrdinaryStringLiteralRanges {
 /// `.midi("Pilote IAC Bus 1")` reaches the call as four words: `Pilote`,
 /// `IAC`, `Bus`, `1`. The transpiler leaves the string unchanged, so a
 /// name means the same in single and double quotes.
-const PORT_NAMED_CALLS: [(&str, usize); 8] = [
+const PORT_NAMED_CALLS: [(&str, usize); 10] = [
     ("midi", 0),
     ("midin", 0),
     ("midikeys", 0),
@@ -380,6 +380,9 @@ const PORT_NAMED_CALLS: [(&str, usize); 8] = [
     ("samples", 0),
     ("samples", 1),
     ("loadSoundfont", 0),
+    // A plugin, by the name of its bundle.
+    ("vst", 0),
+    ("vsti", 0),
 ];
 
 /// The built-in `Error` family, and the argument position that carries a
@@ -433,6 +436,27 @@ impl HydraImageStringCollector {
                     self.ranges.push((span.start as usize, span.end as usize));
                 }
                 _ => {}
+            }
+        }
+        // Plugin option keys name parameters. A preset value names a file.
+        if matches!(name, "vst" | "vsti")
+            && let Some(Argument::ObjectExpression(options)) = arguments.get(1)
+        {
+            for property in &options.properties {
+                if let ObjectPropertyKind::ObjectProperty(property) = property
+                    && !property.computed
+                {
+                    if let PropertyKey::StringLiteral(literal) = &property.key {
+                        let span = literal.span();
+                        self.ranges.push((span.start as usize, span.end as usize));
+                    }
+                    if property.key.static_name().as_deref() == Some("preset")
+                        && let Expression::StringLiteral(literal) = &property.value
+                    {
+                        let span = literal.span();
+                        self.ranges.push((span.start as usize, span.end as usize));
+                    }
+                }
             }
         }
     }
@@ -4009,6 +4033,8 @@ mod tests {
             r#"await samples("github:tidalcycles/dirt-samples")"#,
             r#"await samples({ bd: ["bd.wav"] }, "https://example.test/audio/")"#,
             r#"$: s("bd").serial(38400, 0, 0, "/dev/tty.usbmodem 1")"#,
+            r#"$: s("bd").vst("Valhalla Supermassive", { preset: "Warm Pad" })"#,
+            r#"$: note("c3").vsti("Serum 2", { preset: "Bass One" })"#,
         ];
         for source in named {
             let output = transpile(
@@ -4029,7 +4055,11 @@ mod tests {
                         .output
                         .contains("m('github:tidalcycles/dirt-samples'")
                     && !output.output.contains("m('https://example.test/audio/'")
-                    && !output.output.contains("m('/dev/tty.usbmodem 1'"),
+                    && !output.output.contains("m('/dev/tty.usbmodem 1'")
+                    && !output.output.contains("m('Valhalla Supermassive'")
+                    && !output.output.contains("m('Warm Pad'")
+                    && !output.output.contains("m('Serum 2'")
+                    && !output.output.contains("m('Bass One'"),
                 "a name was parsed as a rhythm: {}",
                 output.output
             );
@@ -4047,6 +4077,42 @@ mod tests {
         );
         assert!(output.output.contains("m('c4 e4'"), "{}", output.output);
         assert!(output.output.contains("m('0.5 1'"), "{}", output.output);
+        // A plugin value is a pattern as before. The preset alone is a name.
+        let output = transpile(
+            r#"$: s("bd").vst("Gain", { mix: "0.2 0.8", preset: "A B" })"#,
+            &TranspileOptions {
+                add_return: false,
+                ..TranspileOptions::default()
+            },
+        );
+        assert!(output.output.contains("m('0.2 0.8'"), "{}", output.output);
+        assert!(!output.output.contains("m('A B'"), "{}", output.output);
+    }
+
+    #[test]
+    fn plugin_option_keys_remain_strings_while_values_keep_mini_notation() {
+        for source in [
+            r#"$: s("sawtooth").vst("Effect", { "mix": 0.15, "drive": "0.2 0.8", "preset": "A B" })"#,
+            r#"$: note("c3").vsti("Instrument", { "mix": 0.15, "drive": "0.2 0.8", "preset": "A B" })"#,
+        ] {
+            let output = transpile(
+                source,
+                &TranspileOptions {
+                    add_return: false,
+                    ..TranspileOptions::default()
+                },
+            );
+            assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+            for key in ["mix", "drive", "preset"] {
+                assert!(
+                    !output.output.contains(&format!("m('{key}'")),
+                    "a plugin option key was parsed as a rhythm: {}",
+                    output.output
+                );
+            }
+            assert!(output.output.contains("m('0.2 0.8'"), "{}", output.output);
+            assert!(!output.output.contains("m('A B'"), "{}", output.output);
+        }
     }
 
     #[test]

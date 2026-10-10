@@ -54,6 +54,7 @@ mod devices;
 mod live;
 mod replay;
 mod sample_cache;
+mod vst;
 
 use completions::{install_completions, run_completions, shell_from_environment};
 #[cfg(all(test, feature = "device-audio"))]
@@ -919,6 +920,37 @@ enum Command {
         #[arg(short = 'j', long)]
         json: bool,
     },
+    /// List the VST3 plugins `.vst()` finds, or one plugin with its parameters.
+    ///
+    ///     rustel vst                # every plugin found
+    ///     rustel vst supermassive   # one plugin: parameters and presets
+    ///     rustel vst serum "osc a"  # the parameters of one group
+    ///     rustel vst --rescan       # read each plugin again
+    ///
+    /// The first run reads each plugin bundle in a process of its own and
+    /// keeps the plugin names in a scan cache. A bundle with the same files
+    /// gets no new read. A name loads that one plugin. A part of a name is
+    /// enough when one plugin only has that part. Plugin folders: the
+    /// standard VST3 folders of the system, or the folders in
+    /// `RUSTEL_VST3_PATH` when set.
+    Vst {
+        /// Plugin to load.
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+        /// Show the parameters with this word in their group, name or key.
+        #[arg(value_name = "FILTER", requires = "name")]
+        filter: Option<String>,
+        /// Emit raw JSON instead of the human-readable list, for scripting.
+        #[arg(short = 'j', long)]
+        json: bool,
+        /// Empty the scan cache and read each plugin bundle again.
+        #[arg(long, conflicts_with = "worker")]
+        rescan: bool,
+        /// Internal: run this bundle for the host that started this
+        /// process. Each plugin bundle runs in a process of its own.
+        #[arg(long, hide = true, value_name = "BUNDLE", conflicts_with = "name")]
+        worker: Option<PathBuf>,
+    },
     /// Report the binary, CPU, runtime tiers, selected capabilities, and audio facts.
     Doctor {
         /// Emit the stable versioned JSON schema instead of the human view.
@@ -1754,6 +1786,10 @@ fn main() -> ExitCode {
     let outcome = worker
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    // The outputs of the run ended with the worker. The plugins end before
+    // the process does.
+    #[cfg(feature = "vst")]
+    rustel_runtime::vst::shutdown();
     // The run is over; a console handler standing in front of the process
     // exit on our behalf can stand down.
     #[cfg(windows)]
@@ -1848,6 +1884,12 @@ fn run() -> Result<(), RuntimeError> {
         std::sync::atomic::Ordering::Relaxed,
     );
     // One switch for the whole run, read once from the parsed line.
+    // Each plugin bundle runs in a process of its own, so a plugin fault
+    // does not end this one.
+    #[cfg(feature = "vst")]
+    if let Ok(program) = std::env::current_exe() {
+        rustel_runtime::vst::set_worker(program, vec!["vst".into(), "--worker".into()]);
+    }
     let json = cli.wants_json();
     JSON_MODE.store(json, std::sync::atomic::Ordering::Relaxed);
     rustel_runtime::set_progress_json(json);
@@ -1988,6 +2030,10 @@ fn run_command(
                 mode: save_session.unwrap_or(SessionModeArg::Normal).into(),
                 file: session_file,
             });
+            // Studio knows each plugin by name before the first use. The
+            // scan runs in the background and costs the start no time.
+            #[cfg(feature = "vst")]
+            rustel_runtime::vst::scan_in_background();
             rustel_studio::run(rustel_studio::StudioOptions {
                 path: file,
                 mini,
@@ -2051,6 +2097,13 @@ fn run_command(
         ),
         Command::GamepadMonitor { duration } => run_gamepad_monitor(duration),
         Command::Devices { json } => run_devices(json),
+        Command::Vst {
+            name,
+            filter,
+            json,
+            rescan,
+            worker,
+        } => vst::run_vst(name.as_deref(), filter.as_deref(), json, rescan, worker),
         Command::Doctor { json } => run_doctor(json, dispatch),
         #[cfg(feature = "studio")]
         Command::Doc { name, json } => run_doc(&name, json),

@@ -5,7 +5,7 @@ regenerate them whenever that graph changes. Source and asset attributions
 are maintained by hand.
 
 This project is AGPL-3.0-or-later (see `LICENSE`). It links the
-556 packages below. This file is the attribution notice that must
+558 packages below. This file is the attribution notice that must
 travel with any binary built from this tree.
 
 ## Licenses that place obligations beyond attribution
@@ -103,6 +103,14 @@ in their own work; this collective credit does not transfer ownership.
   sources' generation details and any separate terms for their inputs have
   not been independently verified.
 
+## VST3 interfaces
+
+The plugin host in `crates/vst3` talks to plugins through the `vst3` crate.
+Its bindings are generated from the interface headers of the VST 3.8.0 SDK,
+Copyright (c) Steinberg Media Technologies GmbH, under the MIT license. VST
+is a registered trademark of Steinberg Media Technologies GmbH. Rustel ships
+no plugin and no part of the SDK other than these interface definitions.
+
 ## Extension source permissions
 
 `crates/ext/src/switch_angel/` is a native Rust adaptation of Switch Angel's
@@ -163,7 +171,7 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 
 | Count | License |
 | ---: | :--- |
-| 251 | MIT OR Apache-2.0 |
+| 253 | MIT OR Apache-2.0 |
 | 128 | MIT |
 | 24 | MIT/Apache-2.0 |
 | 18 | Apache-2.0 |
@@ -266,6 +274,7 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | `codespan-reporting` | 0.12.0 | Apache-2.0 |
 | `color_quant` | 1.1.0 | MIT |
 | `colorchoice` | 1.0.5 | MIT OR Apache-2.0 |
+| `com-scrape-types` | 0.1.1 | MIT OR Apache-2.0 |
 | `combine` | 4.6.7 | MIT |
 | `compact_str` | 0.10.0 | MIT |
 | `compact_str` | 0.9.1 | MIT |
@@ -677,6 +686,7 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | `vec_map` | 0.8.2 | MIT/Apache-2.0 |
 | `version_check` | 0.9.5 | MIT/Apache-2.0 |
 | `vsimd` | 0.8.0 | MIT |
+| `vst3` | 0.3.0 | MIT OR Apache-2.0 |
 | `vtparse` | 0.6.2 | MIT |
 | `walkdir` | 2.5.0 | Unlicense/MIT |
 | `wasi` | 0.11.1+wasi-snapshot-preview1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |

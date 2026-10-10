@@ -139,11 +139,21 @@ fn select_row(studio: &mut rustel_studio_e2e::Hermetic, marker: &str) {
     panic!("no row reads {marker:?}:\n{}", studio.rows().join("\n"));
 }
 
-/// A braille glyph: what the minimap draws its map with. Empty cells are
-/// skipped by the renderer, so any braille on screen is a lit dot.
-fn has_braille(rows: &[String]) -> bool {
-    rows.iter()
-        .any(|row| row.chars().any(|c| ('\u{2800}'..='\u{28ff}').contains(&c)))
+/// Check the map's cells, excluding the header spinner and reference column.
+/// Use its enabled geometry even in a test with no map.
+fn has_minimap_braille(rows: &[String], reference_open: bool) -> bool {
+    let width = rows[0].chars().count() as u16;
+    let area = ((0, 0).into(), (width, rows.len() as u16).into()).into();
+    let layout = rustel_studio::view::regions(area, false, 1, reference_open, true, None, None);
+    let map = layout.panes[0].minimap;
+    rows[usize::from(map.y)..usize::from(map.bottom())]
+        .iter()
+        .any(|row| {
+            row.chars()
+                .skip(usize::from(map.x))
+                .take(usize::from(map.width))
+                .any(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
+        })
 }
 
 /// With the minimap switch on, a tall pane draws the braille map at its
@@ -170,7 +180,7 @@ fn the_minimap_and_the_reference_column_survive_a_resize() {
         fallback.join("\n")
     );
     assert!(
-        !has_braille(&fallback),
+        !has_minimap_braille(&fallback, false),
         "no minimap draws while the switch is off:\n{}",
         fallback.join("\n")
     );
@@ -187,7 +197,7 @@ fn the_minimap_and_the_reference_column_survive_a_resize() {
 
     let mapped = studio.rows();
     assert!(
-        has_braille(&mapped),
+        has_minimap_braille(&mapped, false),
         "the minimap draws at the pane's right edge once the switch is on:\n{}",
         mapped.join("\n")
     );
@@ -220,7 +230,7 @@ fn the_minimap_and_the_reference_column_survive_a_resize() {
         "the strip is still on screen after the round trip"
     );
     assert!(
-        has_braille(&after),
+        has_minimap_braille(&after, true),
         "the minimap is still drawn after the resize round trip:\n{}",
         after.join("\n")
     );

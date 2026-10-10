@@ -300,6 +300,10 @@ pub struct StudioPrefs {
     /// Order is precedence within the layer: a later row wins a name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sample_sources: Vec<SampleSourcePref>,
+    /// Folders with VST3 plugins the player added. The plugin host reads
+    /// them before the standard folders of the system.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vst_folders: Vec<String>,
     /// Whether an imported source is fetched into the cache in the
     /// background rather than on the first note that needs it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1573,6 +1577,7 @@ mod tests {
         assert_eq!(StudioPrefs::load_from(Some(&path)), StudioPrefs::default());
         let prefs = StudioPrefs {
             theme: Some("solarized".into()),
+            vst_folders: vec!["/music/plugins".into()],
             ..StudioPrefs::default()
         };
         prefs.save_to(&path).unwrap();

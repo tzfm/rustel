@@ -1448,6 +1448,8 @@ pub(super) fn play_live(
     )
     .map_err(runtime_device_error)?;
     sync_live_polyphony(session, &device);
+    #[cfg(feature = "vst")]
+    rustel_runtime::vst::attach(&device);
     // What opened, once: the host, the device, the buffer's real cost.
     output.event(
         LiveDetail::Essential,
@@ -2135,6 +2137,9 @@ pub(super) fn play_live(
         let elapsed = wall_started.elapsed();
         let mut pushed_ui_ids = Vec::new();
         let mut reverbs = rustel_audio::LiveReverbBatch::default();
+        let mut prepare_audio = |events: &[rustel_audio::AudioEvent]| {
+            rustel_audio::LiveReverbBatch::install_inserts(&device, events);
+        };
         let mut push_audio = |event: rustel_audio::QueuedAudioEvent| {
             let pushed = device.push(event);
             if pushed {
@@ -2170,27 +2175,31 @@ pub(super) fn play_live(
         };
         let step_result = first_install.step(session, |session| {
             if reload {
-                producer.step_with_clock(
+                producer.step_with_clock_and_assets(
                     session,
                     elapsed,
                     || device.render_frontier_seconds(),
                     sample_rate,
                     &mut set_generation,
+                    &mut prepare_audio,
                     &mut push_audio,
                 )
             } else if ui_events_enabled || device.generation() != session.generation() {
-                producer.step_unwatched_with_clock_and_cutover(
+                producer.step_unwatched_with_assets(
                     session,
                     || device.render_frontier_seconds(),
                     sample_rate,
                     &mut set_generation,
+                    &mut prepare_audio,
                     &mut push_audio,
                 )
             } else {
-                producer.step_unwatched_with_clock(
+                producer.step_unwatched_with_assets(
                     session,
                     || device.render_frontier_seconds(),
                     sample_rate,
+                    |_, _, _| {},
+                    &mut prepare_audio,
                     &mut push_audio,
                 )
             }
@@ -2201,6 +2210,7 @@ pub(super) fn play_live(
         // settings are now the Session's; rejected evaluations keep the old one.
         sync_live_polyphony(session, &device);
 
+        // Retry pending inserts even when this turn scheduled no batch.
         let reverb_preparation_started = Instant::now();
         reverbs.flush(&device);
         producer.record_asset_preparation(reverb_preparation_started.elapsed());

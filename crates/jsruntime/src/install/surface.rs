@@ -2570,6 +2570,71 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         origin: "rustel",
     },
     ReferenceEntry {
+        name: "vst",
+        synonyms: &[],
+        summary: "Sends the note through a VST3 effect plugin.",
+        description: "Sends the note through a VST3 effect plugin on the orbit of the note. A second `.vst()` call adds an effect after the first, and one orbit holds 4 effects at most. A note on the same orbit with no `.vst()` stays dry. For a plugin that makes the sound, such as a synth, see `vsti`.\n\nThe first argument is the plugin name, as the vst tab of the reference panel lists the plugins. Upper case, spaces and punctuation in the name do not matter: `\"valhalla supermassive\"` finds `ValhallaSupermassive`.\n\nThe second argument sets parameters by name, each from 0 to 1. Each value is a pattern, so a slider or a mini-notation string gives one value to each note. A note carries 8 parameter values at most. `preset` names a `.vstpreset` file in `~/.rustel/vst/<plugin name>/`.\n\nThe plugin shows no window. A plugin not yet loaded takes a moment, and the first notes play dry.",
+        params: &[
+            ReferenceParam {
+                name: "name",
+                r#type: "string",
+                description: "Plugin name.",
+            },
+            ReferenceParam {
+                name: "config",
+                r#type: "Object",
+                description: "Parameter values by name, each from 0 to 1.",
+            },
+            ReferenceParam {
+                name: "config.preset",
+                r#type: "string",
+                description: "Name of a `.vstpreset` file of the plugin.",
+            },
+        ],
+        examples: &[
+            "s(\"bd*2 sd\").vst(\"valhalla supermassive\", { mix: 0.4 })",
+            "note(\"c2 eb2 g2\").s(\"sawtooth\")\n  .vst(\"ott\", { depth: slider(0.5, 0, 1) })",
+            "s(\"hh*8\").vst(\"valhalla supermassive\", { mix: \"0.2 0.8\", preset: \"Big Hall\" })",
+            "s(\"bd*2 sd\").vst(\"ott\", { depth: 0.3 }).vst(\"valhalla supermassive\")",
+        ],
+        tags: &["orbit", "audio"],
+        no_autocomplete: false,
+        deprecated: false,
+        origin: "rustel",
+    },
+    ReferenceEntry {
+        name: "vsti",
+        synonyms: &[],
+        summary: "Plays the note on a VST3 instrument plugin.",
+        description: "Plays the note on a VST3 instrument plugin, such as a synth, on the orbit of the note. The plugin gets the pitch, the level (`gain` times `velocity`) and the length of the note, and makes the sound. The sound of the engine for the note, `s` included, is silent. One orbit holds one instrument plugin.\n\nWith `.vst()` on the same note, the instrument goes through the effect plugins: `.vsti(\"serum 2\").vst(\"ott\")`. `vsti(\"serum 2\")` starts a chain too, with one note for each cycle.\n\nThe arguments are the arguments of `vst`: the plugin name, then parameter values by name from 0 to 1, and `preset`.\n\nThe plugin shows no window. The notes are silent until the plugin is loaded.",
+        params: &[
+            ReferenceParam {
+                name: "name",
+                r#type: "string",
+                description: "Plugin name.",
+            },
+            ReferenceParam {
+                name: "config",
+                r#type: "Object",
+                description: "Parameter values by name, each from 0 to 1.",
+            },
+            ReferenceParam {
+                name: "config.preset",
+                r#type: "string",
+                description: "Name of a `.vstpreset` file of the plugin.",
+            },
+        ],
+        examples: &[
+            "note(\"c2 eb2 g2 bb2\").vsti(\"serum 2\")",
+            "vsti(\"serum 2\").seg(8).note(\"<c2 eb2>\")",
+            "note(\"<c3 eb3>*4\").vsti(\"serum 2\", { macro1: slider(0.2, 0, 1) })\n  .vst(\"ott\", { depth: 0.6 })",
+        ],
+        tags: &["orbit", "audio"],
+        no_autocomplete: false,
+        deprecated: false,
+        origin: "rustel",
+    },
+    ReferenceEntry {
         name: "wchoose",
         synonyms: &[],
         summary: "Chooses randomly from the given list of elements by giving a probability to each element",

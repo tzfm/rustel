@@ -808,6 +808,9 @@ impl Session {
     ) -> Result<(), RuntimeError> {
         // Each installed score can report missing inputs and loading samples
         // afresh. Both JavaScript and mini installs pass through this point.
+        #[cfg(feature = "vst")]
+        let insert_orbits =
+            crate::vst::plan_orbits(self.active_source(), source, self.insert_orbits);
         self.input_warnings_reported.clear();
         self.loading_refusals_reported.clear();
         // Live reloads preserve musical phase at the edit instant.
@@ -1118,6 +1121,10 @@ impl Session {
             }
         }
         self.last_source = Some(Arc::from(source));
+        #[cfg(feature = "vst")]
+        {
+            self.insert_orbits = insert_orbits;
+        }
         self.recovered_source = None;
         self.js.snapshot_active_as_last_good();
         Ok(())
@@ -1489,6 +1496,8 @@ impl Session {
             settings: self.js.snapshot_published_runtime_settings(),
             cps: self.scheduler.cps(),
             cycle_zero_time: self.scheduler.time_at_cycle(Fraction::ZERO),
+            #[cfg(feature = "vst")]
+            insert_orbits: self.insert_orbits,
         }))
     }
 
@@ -1554,7 +1563,13 @@ impl Session {
             // Retain the replay target while the replacement awaits prefill.
             // Consumer confirmation advances it to the replacement generation;
             // this evaluation does not establish what the device is playing.
-            LiveScoreAttempt::Applied(_) => Ok(RollbackAttempt::Applied),
+            LiveScoreAttempt::Applied(_) => {
+                #[cfg(feature = "vst")]
+                {
+                    self.insert_orbits = previous.insert_orbits;
+                }
+                Ok(RollbackAttempt::Applied)
+            }
             LiveScoreAttempt::Deferred => Ok(RollbackAttempt::Deferred),
         }
     }

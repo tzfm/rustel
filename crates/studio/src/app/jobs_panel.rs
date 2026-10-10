@@ -123,6 +123,22 @@ impl App {
                 percent: glance.percent,
             });
         }
+        // The plugin host works on threads of its own: the scan of the
+        // plugins with no test yet, and each plugin in its load.
+        #[cfg(feature = "vst")]
+        {
+            if let Some((done, total)) = self.plugin_scan {
+                jobs.push(BackgroundJob {
+                    name: "scan plugins".into(),
+                    percent: Some(super::super::jobs::percent_of(done, total)),
+                });
+            }
+            let loads = self.plugin_loads.iter();
+            jobs.extend(loads.map(|name| BackgroundJob {
+                name: format!("load {name}"),
+                percent: None,
+            }));
+        }
         // Loader line with no named pack/import progress yet.
         if jobs.is_empty() && self.caching_samples > 0 {
             jobs.push(BackgroundJob {

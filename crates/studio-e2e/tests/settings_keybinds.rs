@@ -35,10 +35,11 @@ fn row_with(studio: &mut Hermetic, label: &str) -> String {
         .unwrap_or_else(|| panic!("no row reads {label:?}:\n{}", studio.rows().join("\n")))
 }
 
-/// Find Keybinds from either remembered settings tab.
+/// Find Keybinds and select its terminal-profile row.
 fn open_keybinds(studio: &mut Hermetic) {
     studio.chord("ctrl+o");
-    for _ in 0..7 {
+    for _ in 0..8 {
+        studio.press(KeyCode::Home, KeyModifiers::NONE);
         if studio.rows().iter().any(|row| row.contains("▸ Terminal")) {
             break;
         }
@@ -52,7 +53,7 @@ fn open_keybinds(studio: &mut Hermetic) {
     );
 }
 
-/// Open the sheet on its Mapping page - the third of seven tabs.
+/// Open the sheet on its Mapping page, the third tab.
 fn open_mapping(studio: &mut Hermetic) {
     studio.chord("ctrl+o");
     studio.press(KeyCode::Tab, KeyModifiers::NONE);
