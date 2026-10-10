@@ -17,25 +17,36 @@ later version.
 //! Tune.js-compatible scale presets and ratio lookup.
 //!
 //! Scale frequency tables are strudel.cc's TuningList from
-//! `packages/xen/tunejs.js`, embedded as gzipped JSON.
+//! `packages/xen/tunejs.js`, embedded as gzipped JSON. The `tuning-list`
+//! feature holds the table. Without the feature the table is empty and a
+//! named scale is unknown.
 
-use flate2::read::GzDecoder;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::io::Read;
 
-static TUNING_LIST: Lazy<HashMap<String, Vec<f64>>> = Lazy::new(|| {
+type Table = HashMap<String, Vec<f64>>;
+
+static TUNING_LIST: Lazy<Table> = Lazy::new(load_table);
+
+#[cfg(feature = "tuning-list")]
+fn load_table() -> Table {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
     let compressed = include_bytes!("../data/tuning_list.json.gz");
     let mut decoder = GzDecoder::new(&compressed[..]);
     let mut json = String::new();
     decoder
         .read_to_string(&mut json)
         .expect("decompress embedded TuningList");
-    let table: HashMap<String, Vec<f64>> =
-        serde_json::from_str(&json).expect("parse embedded TuningList");
-    table
-});
+    serde_json::from_str(&json).expect("parse embedded TuningList")
+}
+
+#[cfg(not(feature = "tuning-list"))]
+fn load_table() -> Table {
+    Table::new()
+}
 
 /// Tune.js engine: load a named scale or raw frequency list, then map steps.
 #[derive(Clone, Debug)]
@@ -162,6 +173,7 @@ enum Unused {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "tuning-list")]
     #[test]
     fn embeds_the_complete_strudel_tuning_list() {
         assert_eq!(Tune::scale_count(), 3304);
@@ -169,6 +181,7 @@ mod tests {
         assert!(Tune::is_valid_scale(&ScaleSpec::name("tranh3")));
     }
 
+    #[cfg(feature = "tuning-list")]
     #[test]
     fn hexany15_ratios_match_tunejs_ratio_mode() {
         let mut tune = Tune::new();
@@ -195,5 +208,15 @@ mod tests {
         tune.tonicize(1.0);
         assert!((tune.note(0.0, None) - 1.0).abs() < 1e-12);
         assert!((tune.note(5.0, None) - 2.0).abs() < 1e-9);
+    }
+
+    #[cfg(not(feature = "tuning-list"))]
+    #[test]
+    fn has_no_named_scales_without_the_tuning_list() {
+        let name = ScaleSpec::name("hexany15");
+        assert_eq!(Tune::scale_count(), 0);
+        assert!(Tune::scale_names().is_empty());
+        assert!(!Tune::is_valid_scale(&name));
+        assert!(Tune::new().load_scale(&name).is_err());
     }
 }
