@@ -6,7 +6,6 @@
 - Scores with several controls query faster. A control such as `.gain(0.8)` built a lookup table for each event, and only `pick` reads the table. Rustel now builds the table when a `pick` asks. `s("[bd hh sd hh]*8").n(3).gain(0.8).pan(0.25).cutoff(800).room(0.3)` queries 1.9 times faster in a release build on one x86-64 desktop. Events stay the same.
 - A host which builds `rustel-core` with no default features drops the scale table (244 KB compressed) and its decoder. The new `tuning-list` feature holds both and is on by default. Named scales are unknown in the smaller build, and a scale given as a frequency list works as before. A default build and every Rustel product build stay unchanged.
 - A build which never reads the reference text of the controls no longer links the text, about 230 KB uncompressed. The control registry reads a table of names and aliases, and only code which shows the text reads the full table. A product build is unchanged.
-- The corpus song `motsol-dawn-mix` plays the `bev` vocal from `tidalcycles/Dirt-Samples` in place of its `anthemsnippet` sample. The source repository of `anthemsnippet` removed the sample on 2026-10-09. With an empty sample cache the song rendered silence and the corpus test failed. The four `motsol-*` regression scores load no sample map.
 
 ### Sound changes
 
