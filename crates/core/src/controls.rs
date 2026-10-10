@@ -253,13 +253,18 @@ pub fn canonical_control_name(name: &str) -> Option<&'static str> {
     default_control_registry().canonical_name(name)
 }
 
-/// The complete pinned control surface from the table that also documents
-/// it: each row installs one control and carries its reference entry.
+/// The complete pinned control surface, installed from the names and aliases
+/// of the catalog table. The registry reads the names-only table and holds no
+/// reference text, so a build which never shows the text does not link the
+/// text.
 pub fn default_control_registry() -> &'static ControlRegistry {
     static REGISTRY: std::sync::LazyLock<ControlRegistry> = std::sync::LazyLock::new(|| {
         let mut registry = ControlRegistry::new();
-        for row in crate::controls_generated::CONTROLS {
-            registry.register(row.names.iter().copied(), row.aliases.iter().copied());
+        for control in crate::controls_generated::CONTROL_NAMES.iter() {
+            registry.register(
+                control.names.iter().copied(),
+                control.aliases.iter().copied(),
+            );
         }
         registry
     });
@@ -277,6 +282,18 @@ mod tests {
         assert_eq!(canonical_control_name("lpf"), Some("cutoff"));
         assert_eq!(canonical_control_name("cutoff"), Some("cutoff"));
         assert_eq!(canonical_control_name("not-a-control"), None);
+    }
+
+    #[test]
+    fn the_registry_holds_every_control_of_the_table() {
+        let registry = default_control_registry();
+        let rows = crate::controls_generated::CONTROLS;
+        assert_eq!(registry.len(), rows.len());
+        for row in rows {
+            for name in row.names.iter().take(1).chain(row.aliases) {
+                assert!(registry.get(name).is_some(), "`{name}` is not installed");
+            }
+        }
     }
 
     #[test]

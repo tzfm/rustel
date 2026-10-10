@@ -191,6 +191,30 @@ window toolkit. A host using Rustel's CPAL output must also install the
 `audio::tripwire::TripwireAlloc` at the binary root as documented by that
 module; the host-owned callback example does not open that adapter.
 
+## Leave out the scale table
+
+`rustel-core` embeds 3,304 named scales as 244 KB of gzipped JSON and decodes
+the table with `flate2` on first use. The `tuning-list` feature holds the table
+and the decoder. The feature is on by default. A host with a size limit turns
+the feature off:
+
+```toml
+[dependencies]
+rustel-core = { git = "https://github.com/tzfm/rustel", default-features = false }
+```
+
+The `rustel-mini`, `rustel-scheduler` and `rustel-voice` crates depend on
+`rustel-core` with no default features, so they keep the feature off. The
+`rustel-engine` crate keeps the default features of `rustel-core` and so keeps
+the table. Cargo features are additive: any other dependency on `rustel-core`
+with defaults enabled turns the feature back on. Run
+`cargo tree -e features -i rustel-core` to see the result.
+
+Without the feature, `Tune::scale_names()` is empty and `Tune::scale_count()`
+is 0. A score sees every named scale as unknown: `tune("hexany15")` and
+`xen("hexany15")` raise the error for an unknown name. A scale given as a
+frequency list works as before, as do the `xen` EDO names such as `31edo`.
+
 ## Build compatibility
 
 `rustel-runtime` with `default-features = false` omits every product

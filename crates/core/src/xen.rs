@@ -1170,6 +1170,7 @@ mod tests {
         let _ = five_edo;
     }
 
+    #[cfg(feature = "tuning-list")]
     #[test]
     fn tune_tiny_negative_step_yields_nan_for_named_and_inline_scales() {
         let pat = crate::pure(Value::Object({
