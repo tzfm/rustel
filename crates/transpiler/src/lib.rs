@@ -859,7 +859,36 @@ pub fn check_nesting(source: &str) -> Result<(), ParseDiagnostic> {
     })
 }
 
-/// Run `work` on a thread with `PARSE_STACK_BYTES` of stack.
+thread_local! {
+    /// Whether this thread is inside [`on_caller_stack`]. `on_parse_stack`
+    /// then runs its work in place.
+    static ON_CALLER_STACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `work` with every parse of this crate on the calling thread.
+///
+/// `transpile` and the other entries parse on a thread with
+/// `PARSE_STACK_BYTES` of stack. During this call they spawn no thread. A
+/// host with no threads, or with a large stack of its own, wraps its calls in
+/// this function. The nesting checks still run first. A source which defeats
+/// the lexical scan overflows the stack of the caller, so the caller owns the
+/// stack size.
+///
+/// The setting belongs to the calling thread. Calls nest. Each call restores
+/// the previous setting, also when `work` unwinds.
+pub fn on_caller_stack<T>(work: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ON_CALLER_STACK.set(self.0);
+        }
+    }
+    let _restore = Restore(ON_CALLER_STACK.replace(true));
+    work()
+}
+
+/// Run `work` on a thread with `PARSE_STACK_BYTES` of stack, or on the calling
+/// thread inside [`on_caller_stack`].
 ///
 /// Every parse in this crate goes through here, except `callback_ir`. That
 /// module parses on the caller's stack and bounds its input with
@@ -867,6 +896,9 @@ pub fn check_nesting(source: &str) -> Result<(), ParseDiagnostic> {
 /// ordinary expressions; the raw size limit also bounds recursion when the
 /// lexical scan is defeated. This stack covers the bounded depth.
 fn on_parse_stack<T: Send>(work: impl FnOnce() -> T + Send) -> Option<T> {
+    if ON_CALLER_STACK.get() {
+        return Some(work());
+    }
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .stack_size(PARSE_STACK_BYTES)
@@ -6357,5 +6389,63 @@ p._scope({ text: "/* not a comment */" });"#;
                 "{source:?} produced invalid JavaScript: {with_return:?}"
             );
         }
+    }
+
+    /// The thread `on_parse_stack` runs its work on.
+    fn parse_thread() -> Option<std::thread::ThreadId> {
+        on_parse_stack(|| std::thread::current().id())
+    }
+
+    #[test]
+    fn transpile_gives_the_same_output_inside_on_caller_stack() {
+        let source = "samples('github:tidalcycles/dirt-samples')\nkick: s(\"bd*2 sd\")\n";
+        let options = TranspileOptions::default();
+        let outside = transpile(source, &options);
+        assert!(outside.diagnostics.is_empty(), "{:?}", outside.diagnostics);
+        for rewrite in ["await samples(", "m('bd*2 sd'", ".p('kick')"] {
+            assert!(
+                outside.output.contains(rewrite),
+                "{rewrite} is missing from {}",
+                outside.output
+            );
+        }
+        assert_eq!(on_caller_stack(|| transpile(source, &options)), outside);
+    }
+
+    #[test]
+    fn awaits_in_code_answers_the_same_inside_on_caller_stack() {
+        for (source, awaits) in [("await samples('x')", true), ("s(\"await\")", false)] {
+            assert_eq!(awaits_in_code(source), awaits, "{source}");
+            assert_eq!(
+                on_caller_stack(|| awaits_in_code(source)),
+                awaits,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn on_caller_stack_parses_on_the_calling_thread() {
+        let caller = std::thread::current().id();
+        assert_eq!(on_caller_stack(parse_thread), Some(caller));
+    }
+
+    #[test]
+    fn on_caller_stack_restores_the_previous_setting() {
+        let caller = std::thread::current().id();
+        let spawns = || parse_thread().is_some_and(|thread| thread != caller);
+        assert!(spawns(), "a parse outside the call spawns its thread");
+        on_caller_stack(|| {
+            on_caller_stack(|| ());
+            assert_eq!(
+                parse_thread(),
+                Some(caller),
+                "the inner call cleared the outer"
+            );
+        });
+        assert!(spawns(), "a parse after the call spawns its thread again");
+        let unwound = std::panic::catch_unwind(|| on_caller_stack(|| panic!("work unwinds")));
+        assert!(unwound.is_err());
+        assert!(spawns(), "a parse after an unwind spawns its thread again");
     }
 }
