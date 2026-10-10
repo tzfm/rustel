@@ -340,14 +340,8 @@ pub(super) fn run_replay(
             // at any buffer size.
             buffer_frames: None,
             watch: true,
-            export: None,
-            cycles: None,
             duration: None,
-            until_silence: false,
-            silence_floor: None,
-            silence_hold: None,
             cps: script.baseline_cps.unwrap_or(0.5),
-            sample_rate: None,
             sample_access,
             // A replay is a playback of a tape, not a new performance: recording
             // it would fill the folder with copies of what is already there.

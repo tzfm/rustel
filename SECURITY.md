@@ -69,8 +69,8 @@ inert policy by default and opt in with
 Explicit grants extend the default:
 
 ```sh
-rustel song.strudel --allow-local-samples /srv/kits
-rustel song.strudel --allow-sample-origin https://samples.example
+rustel play song.strudel --allow-local-samples /srv/kits
+rustel play song.strudel --allow-sample-origin https://samples.example
 ```
 
 An origin granted with `--allow-sample-origin` is trusted by the operator
@@ -149,7 +149,7 @@ and the RFC 6761 `localhost` names). The live loop never performs DNS:
 Non-loopback destinations require an explicit grant:
 
 ```sh
-rustel song.strudel --allow-osc-host 192.168.1.10
+rustel play song.strudel --allow-osc-host 192.168.1.10
 ```
 
 Applications embedding `Session` use `SessionConfig::score_osc_access`.

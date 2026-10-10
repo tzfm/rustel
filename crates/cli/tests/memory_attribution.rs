@@ -257,7 +257,7 @@ fn profile() -> &'static str {
     }
 }
 
-/// A real `rustel` process: query (JS only), play (schedule, no device),
+/// A real `rustel` process: query (JS only), trace (schedule, no device),
 /// render of a dry synth, then room, drums, and a GM piano.
 ///
 /// Differences between rows are the claim. Query vs dry render is the
@@ -281,9 +281,9 @@ fn cli_child_rss_ladder() {
             vec!["query".into(), "-e".into(), SYNTH.into()],
         ),
         (
-            "play synth 0.25s",
+            "trace synth 0.25s",
             vec![
-                "play".into(),
+                "trace".into(),
                 "-e".into(),
                 SYNTH.into(),
                 "--duration".into(),

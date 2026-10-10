@@ -6,8 +6,8 @@ Use `rustel studio` for the [terminal editor](studio.md).
 ## Play
 
 ```sh
-rustel song.strudel
-rustel song.strudel --watch
+rustel play song.strudel
+rustel play song.strudel --watch
 ```
 
 Press Ctrl+C to stop. With `--watch`, each saved change updates playback.
@@ -40,7 +40,8 @@ and hold values.
 `export` and `render` are the same command. Export uses no audio device.
 The defaults are 8 cycles and a 16-bit stereo WAV at 48 kHz, saved beside the
 score. `--duration` accepts `30s`, `2m`, `1:30`, `1h`, or `16b`. Durations of
-at least one cycle round to the nearest whole cycle.
+at least one cycle round to the nearest whole cycle. `--prebake setup.js`
+loads helpers before the score, as for `play`.
 
 | Format | Output |
 | --- | --- |
@@ -73,16 +74,17 @@ refused sample imports return a failure status. A score must end on a pattern
 or collect patterns with `$:`. A definition-only `register(...)` is valid setup.
 
 `validate`, `bench`, and `trace` provide validation, timing, and scheduling
-reports. Use their `--help` for options. Hydra pictures are visible in Studio;
-CLI playback and query do not render them.
+reports. Use their `--help` for options. `trace` gives no sound without
+`--device-audio`. Use `rustel play song.strudel` to hear a score. Hydra
+pictures are visible in Studio; CLI playback and query do not render them.
 
 ## Sessions
 
 Watch mode records score changes in `~/.rustel/sessions/` by default.
 
 ```sh
-rustel song.strudel --watch --save-session debug
-rustel song.strudel --watch --no-save-session
+rustel play song.strudel --watch --save-session debug
+rustel play song.strudel --watch --no-save-session
 rustel replay take.rustel-session
 rustel replay take.rustel-session --export set.wav
 ```
@@ -92,7 +94,7 @@ To show the active code in the terminal that plays the score, use `--follow`.
 To render it in a separate process, pipe the score events to `watch-code`:
 
 ```sh
-rustel song.strudel --watch --score-events 2>&1 >/dev/null | rustel watch-code
+rustel play song.strudel --watch --score-events 2>&1 >/dev/null | rustel watch-code
 ```
 
 ## Hardware
@@ -102,8 +104,8 @@ rustel devices
 rustel midi-list
 rustel midi-monitor
 rustel gamepad-monitor
-rustel song.strudel --midi-clock-out IAC
-rustel song.strudel --audio-input Scarlett
+rustel play song.strudel --midi-clock-out IAC
+rustel play song.strudel --audio-input Scarlett
 ```
 
 See [Hardware](hardware.md) for MIDI, OSC, serial, gamepads, and audio input.
@@ -115,7 +117,7 @@ See [Remote control](studio.md#remote-control).
 ## Samples
 
 ```sh
-rustel song.strudel --allow-local-samples ~/kits
+rustel play song.strudel --allow-local-samples ~/kits
 rustel samples cache --list
 rustel samples cache piano
 rustel samples cache
@@ -205,5 +207,3 @@ rustel --version
 Completion installation writes a shell script and prints any required setup;
 it does not edit your shell configuration. See [rustelup](../rustelup/README.md)
 to install, update, or uninstall.
-
-The hidden `play` alias means `trace`. Use `rustel FILE` for audible playback.

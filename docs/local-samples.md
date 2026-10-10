@@ -118,7 +118,7 @@ Local files stay on disk and are not copied to the remote cache.
 For `samples('http://localhost:5432')`, run a server and grant its exact origin:
 
 ```sh
-rustel song.strudel --allow-sample-origin http://localhost:5432
+rustel play song.strudel --allow-sample-origin http://localhost:5432
 ```
 
 A failed URL never grants access to local files.

@@ -9,6 +9,8 @@
 - The new `transpiler::on_caller_stack(work)` runs every parse of `work` on the calling thread. Each parse spawned a thread with 256 MiB of stack. A host with no threads got a refusal diagnostic from every `transpile` call, and a host on a large stack of its own paid for a thread the host did not need. The nesting checks still run first, and the caller owns the stack size. Existing callers stay unchanged.
 - `rustelup --branch main` and `rustelup --commit <hash>` build rustel from source and install the binary. Use them to test a change before its release. The build needs `git` and `rustup`. Run the install command again to get the new `rustelup`.
 - `rustelup` keeps the backup of the previous binary when a restore fails and prints its path. The cleanup deleted the backup with the stage directory.
+- `rustel play song.strudel` plays a score, and the playing flags are in `rustel play --help`. `rustel song.strudel` is removed and stops with a tip for `rustel play`. `play` was a hidden alias of `trace`, so `rustel play song.strudel` ran with no sound.
+- `rustel export` accepts `--prebake` and is the one command for a bounce to a file. `rustel play` has no `--export`, `--cycles`, `--until-silence`, `--silence-floor`, `--silence-hold` or `--sample-rate`. The old `--export` wrote WAV only, with a default length of 2 seconds.
 
 ### Sound changes
 
