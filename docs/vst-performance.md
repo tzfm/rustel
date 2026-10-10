@@ -58,8 +58,8 @@ frames. The JSON has `device_frames`, `process_frames`, `max_plugin_frames` and
 
 A command has a fixed callback count and no time limit of its own. For an
 unattended run, use an outside supervisor which stops the probe and its workers
-within a set time. Each worker leads a process group of its own. Killing the
-probe's group does not ensure that the workers stop.
+within a set time. Each worker leads a process group of its own, so a kill of
+the probe's group leaves the workers alive.
 
 ## Reading results
 
@@ -101,7 +101,7 @@ silence. Silence alone does not fail a run. An effect chain gets identical left
 and right channels of a 220 Hz sine at amplitude 0.1. Effects have no source-note
 events, so their restoration runs only on automation updates. An instrument
 gets repeating notes. The callback size sets their length and spacing. A default
-preset, an inactive band, mono input or a missing sidechain can leave costly
+preset, an inactive band, mono input or a missing sidechain leaves costly
 plugin code with no work to do. Output above zero does not prove correct sound. Serial
 instrument copies do not stand for a mixed polyphonic workload.
 
@@ -174,12 +174,12 @@ and 128 frames, with overlapping notes. The simulated block budget was 2.67 ms.
 All cases completed without readiness misses, missing inserts, host errors,
 resets or instance destruction during routing. The first block after every move
 stayed within budget. Gain, Distortion and Comeback Kid produced finite nonzero
-audio only on the selected output. The Kickstart chain remained silent, so that
-case establishes instance continuity and readiness only.
+audio only on the selected output. The Kickstart chain remained silent, so the
+Kickstart case establishes instance continuity and readiness only.
 
 The probe exercises the scalar backend's physical-bus and output-route controls
-directly. It does not cover Studio mapping, callback install rings or native
-room and delay tails. Pacing uses ordinary thread sleeps. Measured processing
+directly. The probe does not cover Studio mapping, callback install rings or
+native room and delay tails. Pacing uses ordinary thread sleeps. Measured processing
 excludes sleep time and includes worker exchanges and native voice mixing.
 Budget exceedances are simulated deadline comparisons, not device dropouts.
 
@@ -207,18 +207,18 @@ measurements were obtained.
 
 ## Comparing with a DAW
 
-Orbit changes follow graph activation. At 128 frames, a route change can precede
-an ordinary note onset by up to 127 frames, or 2.65 ms at 48 kHz. SBD connects its
-graph 100 ms before its source onset, and the insert route follows that earlier
-activation. Route changes are not sample-exact.
+Orbit changes follow graph activation. At 128 frames, a route change comes up
+to 127 frames before an ordinary note onset, or 2.65 ms at 48 kHz. SBD connects
+its graph 100 ms before its source onset, and the insert route follows this
+earlier activation. Route changes are not sample-exact.
 
-Canceling a prepared plugin or preset replacement can construct another copy of
-the restored plugin. Ordinary parameter edits and supported orbit-only moves
+Canceling a prepared plugin or preset replacement sometimes builds one more
+copy of the restored plugin. Ordinary parameter edits and supported orbit-only moves
 keep the same copy. Reusing a canceled replacement safely needs an ownership
 handoff between the producer and the audio callback.
 
-The `performance` example measures the host offline, with no pacing. It leaves
-out the score evaluation, the sampler, the mixer, Studio, the audio device
+The `performance` example measures the host offline, with no pacing. The
+example leaves out the score evaluation, the sampler, the mixer, Studio, the audio device
 callbacks and the scheduling of real-time threads. The automation follows
 simulated audio time. The polling follows wall-clock time, so a faster run gets
 fewer checks. An over-budget callback is no observed device underrun. Direct

@@ -6460,7 +6460,7 @@ mod tests {
         }
 
         /// The producer builds an insert one time for an orbit, the running
-        /// callback keeps that instance when its output orbit changes,
+        /// callback keeps the instance when its output orbit changes,
         /// and a displaced insert comes back for the producer to free.
         #[test]
         fn the_callback_installs_and_returns_the_insert_of_an_orbit() {

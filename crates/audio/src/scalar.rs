@@ -10201,7 +10201,7 @@ mod insert_routing_tests {
         }
 
         // SBD connects its graph 100 ms before its source onset. The insert
-        // follows that graph while the oscillator phase remains parked.
+        // follows the same graph while the oscillator phase remains parked.
         let mut backend = ScalarBackend::prepared(48_000, 1).unwrap();
         let key = InsertKey {
             plugin: 7,

@@ -3095,7 +3095,7 @@ impl Session {
     }
 
     /// Plugin requirements of a candidate source, on the physical insert buses
-    /// it will use if accepted. This does not change the playing score's routes.
+    /// the source uses after its accept. The routes of the playing score stay.
     #[cfg(feature = "vst")]
     pub fn plugin_calls_for_source(&self, source: &str) -> Vec<crate::lint::NamedPlugin> {
         let orbits = crate::vst::plan_orbits(self.active_source(), source, self.insert_orbits);

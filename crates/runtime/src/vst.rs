@@ -228,7 +228,7 @@ pub(crate) const INSERT_ORBITS: [u8; rustel_audio::MAX_ORBITS] =
     [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 /// Keep a unique chain on its physical bus when only its literal orbit changes.
-/// Nested calls, dynamic routes and shared slots cannot prove sole ownership.
+/// Nested calls, dynamic routes and shared slots do not prove sole ownership.
 pub(crate) fn plan_orbits(
     previous: Option<&str>,
     source: &str,
@@ -290,7 +290,7 @@ pub(crate) fn plan_orbits(
 fn orbit_source(source: &str) -> Option<(String, Vec<usize>)> {
     let code = crate::lint::code_only(source);
     let bytes = code.as_bytes();
-    // Helpers, bindings and indirect reads can hide another owner's chain.
+    // Helpers, bindings and indirect reads sometimes hide another owner's chain.
     if bytes.contains(&b'=') || source.contains('`') || !code.is_ascii() {
         return None;
     }

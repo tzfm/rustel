@@ -782,7 +782,7 @@ impl OrbitInsert for RemoteInstance {
     }
 
     fn reset(&mut self) {
-        // A stopped callback can reset without processing a block. Keep
+        // A stopped callback sometimes resets with no block to process. Keep
         // one reset and discard events from the score that stopped.
         self.event_count = 0;
         self.push(Event::Reset);

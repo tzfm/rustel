@@ -4,7 +4,7 @@
 
 - Scores use `.vst()` for VST3 effects and `.vsti()` for instruments. Studio lists plugins, parameters and presets. Each plugin bundle runs in a separate process. See [Plugins](https://github.com/tzfm/rustel/blob/main/docs/plugins.md).
 - VST3 parameter edits keep playback running. Ctrl-F opens the plugin at the cursor. Enter inserts parameters anywhere in a call without duplicate keys or changes to existing values. Quoted parameter keys work, and values still accept mini-notation.
-- VST3 parameter lists show the 0 to 1 score value beside the plugin's display text when the formats differ. Removing a parameter returns it to its initial or preset value on a later note. Notes at the same onset share their controls.
+- VST3 parameter lists show the 0 to 1 score value beside the plugin's display text when the formats differ. A parameter you remove from the score goes back to its initial or preset value on the next note. Notes at the same onset share their controls.
 - Changing only the literal orbit of a directly written, unshared VST3 chain to an unused orbit keeps the plugin and its state. The plugin tail follows the new orbit. Native room and delay tails stay on the old orbit. Prepared replacements leave the playing chain in place until the new score activates them.
 - Stopping VST3 playback clears queued controls. Repeated stopped callbacks no longer drop the first note or parameter after resume.
 - VST3 instrument notes on the same key at the same onset keep the longer duration without an early note-off.

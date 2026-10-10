@@ -624,7 +624,7 @@ impl Instance {
     /// list, each at its own frame.
     fn queue_param_changes(&mut self, frames: usize) {
         self.changes.clear();
-        // Notes can arrive out of order. Restore before all values at one
+        // Notes sometimes arrive out of order. Restore before all values at one
         // frame so the notes of a chord keep each other's parameters.
         self.params[..self.param_count]
             .sort_unstable_by_key(|param| (param.at, param.id.is_some()));

@@ -601,7 +601,7 @@ fn parameter_restores_follow_note_time_and_survive_a_full_queue() {
         assert_eq!(block(insert.as_mut(), 1.0, 128), [1.0; 128]);
         assert_eq!(block(insert.as_mut(), 1.0, 128), [0.25; 128]);
 
-        // The later restore can arrive before the value it must clear.
+        // The later restore sometimes arrives before the value to clear.
         insert.restore_params(64);
         insert.set_param(gain(0.5), 32);
         let output = block(insert.as_mut(), 1.0, 128);
@@ -632,7 +632,7 @@ fn parameter_restores_follow_note_time_and_survive_a_full_queue() {
         assert_eq!(block(insert.as_mut(), 1.0, 128), [0.5; 128]);
 
         // A restore rejected by the bounded queue must not forget the
-        // delivered values that a later restore still needs to clear.
+        // delivered values a later restore still needs to clear.
         for frame in 128..192 {
             insert.set_param(
                 InsertParam {

@@ -93,7 +93,7 @@ Each value goes from 0 to 1. The plugin maps the value to its own range. A value
 is a pattern: a number, a mini-notation string or a slider.
 
 The parameter list shows the default as a number from 0 to 1 for the score.
-When the plugin's display text differs, it appears beside the number:
+The display text of the plugin follows the number when the two differ:
 `ingain  In Gain  0.5 = 0.0 dB`. Use the number in the score.
 
 ```js
@@ -107,13 +107,13 @@ A note carries 8 parameter values at most for each plugin. The plugin takes the
 values when the note starts, so a slider move reaches the plugin with the next
 note.
 
-A parameter omitted by a later note returns to its value when the plugin copy
-was created, after loading its preset. Removing a key from the score takes
-effect on that later note. Notes at the same onset share their controls.
-Patterns on one orbit share a copy when they use the same plugin and preset
-at the same chain position. Its parameter values affect all sound in that copy.
-Each copy tracks up to 32 changed parameters for restoration. A parameter beyond
-this limit can keep its last value.
+A parameter a later note does not carry returns to its value from the build of
+the plugin copy, after the load of its preset. Remove a key from the score, and
+the next note plays with the start value. Notes at the same onset share their
+controls. Patterns on one orbit share a copy when they use the same plugin and
+preset at the same chain position. The parameter values of the copy change all
+sound through the copy. Each copy tracks up to 32 changed parameters for the
+restore. A parameter beyond this limit sometimes keeps its last value.
 
 Studio marks a key the plugin has no parameter for, and gives the nearest
 name: `OTT has no parameter "dpth" - did you mean "depth"?`. A note with such a
@@ -145,13 +145,13 @@ note("c2 eb2").vsti("serum 2", { preset: "Dark Bass" })
   the orbit share them, and the chain of the last note is the chain in use. A
   different plugin at the same place of the chain takes the place of the first.
   Use `.orbit(2)` for a second chain or a second copy.
-- Changing only one literal `.orbit(1)` to `.orbit(2)` can reuse the plugin
-  chain. The chain must be written directly, used only once, and move to an
-  orbit with no plugin. Bindings, indirect reads, nested plugin calls and shared
-  chains in the source prevent reuse.
+- An edit of one literal `.orbit(1)` to `.orbit(2)`, and nothing more, reuses
+  the plugin chain. The chain must be written directly, used only once, and
+  move to an orbit with no plugin. Bindings, indirect reads, nested plugin calls
+  and shared chains in the source prevent reuse.
   The plugin state and its tail follow the new output. The old orbit's native
-  `room` and `delay` tails stay on the old orbit. Other orbit edits can need a
-  separate copy.
+  `room` and `delay` tails stay on the old orbit. Each other orbit edit builds
+  a separate copy when the edit needs one.
 - The plugin output joins the orbit before the orbit fader, the DJ filter and
   the duck. `delay` and `room` take the engine voice, not the plugin output.
 - The plugin gets the tempo and the bar position of the score. One cycle is one
@@ -183,9 +183,9 @@ For an edit, Studio reads the plugin calls from the score text: the name and
 the `preset` as quoted strings, the place of each `.vst()` call in its chain,
 and the number of the one `.orbit()` call of the statement. With the name in a
 variable, the edit does not wait. A change of parameter values, or a new
-control on the same plugin, starts no new wait. When a new copy is needed,
-Studio prepares it in the background. The chain in play stays in place until
-the notes of the new score need the new copy.
+control on the same plugin, starts no new wait. When the edit needs a new
+copy, Studio prepares the copy in the background. The chain in play stays in
+place until the notes of the new score need the new copy.
 
 Each orbit with a plugin holds one copy of the plugin. Using the same plugin
 on two orbits holds two copies, and so does a second place in a chain. The
