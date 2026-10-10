@@ -13,7 +13,7 @@ description = "The rustel command: play, render, query and check scores, and ope
 # `studio` adds the rustel-studio crate, and `remote-control` forwards to the
 # studio only. Every other feature forwards to the runtime feature of the same
 # name, and to the studio's when it has one.
-default = ["mp3-export", "extensions", "opus", "osc", "serial", "hydra", "studio", "gamepad", "remote-control"]
+default = ["mp3-export", "extensions", "opus", "osc", "serial", "hydra", "studio", "gamepad", "remote-control", "vst"]
 mp3-export = ["rustel-runtime/mp3-export"]
 extensions = ["rustel-runtime/extensions", "rustel-studio?/extensions"]
 opus = ["rustel-runtime/opus"]
@@ -23,6 +23,7 @@ midi = ["dep:rustel-midi", "rustel-runtime/midi"]
 gamepad = ["rustel-runtime/gamepad", "rustel-studio?/gamepad"]
 osc = ["dep:rustel-osc", "rustel-runtime/osc", "rustel-studio?/osc"]
 hydra = ["dep:rustel-hydra", "rustel-runtime/hydra", "rustel-studio?/hydra"]
+vst = ["rustel-runtime/vst", "rustel-studio?/vst"]
 remote-control = ["rustel-studio?/remote-control"]
 # The studio plays live and lists MIDI ports, so the command's own device and
 # MIDI code is compiled with it.
@@ -61,5 +62,6 @@ windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 [dev-dependencies]
 rustel-audio = { path = "../audio", features = ["test-support"] }
 rustel-jsruntime = { path = "../jsruntime", default-features = false }
+rustel-vst3-fixture = { path = "../vst3-fixture" }
 tempfile = "3"
 libc = "0.2"

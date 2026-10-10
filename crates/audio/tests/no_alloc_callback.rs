@@ -164,6 +164,70 @@ fn reverb_installation_adopts_dispatch_without_callback_allocation() {
     );
 }
 
+/// A gain as an orbit insert. Parameter 1 is the gain.
+struct GainInsert {
+    key: rustel_audio::InsertKey,
+    gain: f32,
+}
+
+impl rustel_audio::OrbitInsert for GainInsert {
+    fn key(&self) -> rustel_audio::InsertKey {
+        self.key
+    }
+
+    fn set_param(&mut self, param: rustel_audio::InsertParam, _frames: u32) {
+        if param.id == 1 {
+            self.gain = param.value;
+        }
+    }
+
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        for sample in left.iter_mut().chain(right) {
+            *sample *= self.gain;
+        }
+    }
+}
+
+#[test]
+fn an_orbit_insert_installs_and_processes_without_callback_allocation() {
+    let _serial = serial_tripwire_test();
+    let key = rustel_audio::InsertKey {
+        plugin: 7,
+        preset: 0,
+    };
+    let mut backend = ScalarBackend::prepared(48_000, 1).expect("scalar init");
+    let mut insert = rustel_audio::InsertControls::new(key);
+    assert!(insert.push(rustel_audio::InsertParam { id: 1, value: 0.0 }));
+    let controls = OscillatorControls {
+        effects: [Some(insert), None, None, None],
+        ..OscillatorControls::default()
+    };
+    assert!(
+        backend.try_note_prepared(OnsetEvent::new(0, 440.0, 0.5, 0.05).with_controls(controls))
+    );
+    let first = Box::new(GainInsert { key, gain: 1.0 });
+    let second = Box::new(GainInsert { key, gain: 1.0 });
+    let mut output = [1.0f32; 128 * 2];
+
+    let before = Violations::capture();
+    let (empty, replaced) = tripwire::audio_scope(|| {
+        let empty = backend.install_insert(1, first);
+        let replaced = backend.install_insert(1, second);
+        backend.process_block(&mut output, 128);
+        (empty, replaced)
+    });
+    let delta = Violations::capture().since(before);
+    assert!(
+        delta.clean(),
+        "the orbit insert allocated or freed in the callback: {delta:?}"
+    );
+    assert!(empty.is_none());
+    assert!(replaced.is_some());
+    // The note set the gain to zero, so the orbit is silent.
+    assert!(output.iter().all(|sample| *sample == 0.0));
+    assert_eq!(backend.missing_insert_events(), 0);
+}
+
 fn fx_reverb_test_controls(params: rustel_audio::reverb::ReverbParams) -> OscillatorControls {
     let mut controls = OscillatorControls {
         limit: None,
@@ -1085,6 +1149,9 @@ fn live_ring_preserves_the_complete_oscillator_control_bundle() {
         stretch: None,
         fm: None,
         orbit: 1,
+        insert_orbit: None,
+        effects: [None; rustel_audio::EFFECT_CHAIN],
+        instrument: None,
         lfos: [None; rustel_audio::MAX_VOICE_MODS],
         envs: [None; rustel_audio::MAX_VOICE_MODS],
         phaser: None,

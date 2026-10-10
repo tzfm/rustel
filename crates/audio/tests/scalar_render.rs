@@ -66,6 +66,9 @@ fn controls(waveform: Waveform, pan: Option<f32>) -> OscillatorControls {
         stretch: None,
         fm: None,
         orbit: 1,
+        insert_orbit: None,
+        effects: [None; rustel_audio::EFFECT_CHAIN],
+        instrument: None,
         lfos: [None; rustel_audio::MAX_VOICE_MODS],
         envs: [None; rustel_audio::MAX_VOICE_MODS],
         phaser: None,
@@ -5027,4 +5030,168 @@ fn input_postgain_scales_the_monitored_signal_once() {
         (ratio - 0.5).abs() < 1e-3,
         "postgain 0.5 must halve the voice once, not twice: ratio {ratio:.3}"
     );
+}
+
+/// A gain as an orbit insert. Parameter 1 is the gain.
+struct GainInsert {
+    key: rustel_audio::InsertKey,
+    gain: f32,
+}
+
+impl rustel_audio::OrbitInsert for GainInsert {
+    fn key(&self) -> rustel_audio::InsertKey {
+        self.key
+    }
+
+    fn set_param(&mut self, param: rustel_audio::InsertParam, _frames: u32) {
+        if param.id == 1 {
+            self.gain = param.value;
+        }
+    }
+
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        for sample in left.iter_mut().chain(right) {
+            *sample *= self.gain;
+        }
+    }
+}
+
+#[test]
+fn an_orbit_insert_processes_the_notes_that_ask_for_the_effect() {
+    use rustel_audio::{InsertControls, InsertKey, InsertParam, InsertProvider, OrbitInsert};
+    use std::sync::Arc;
+
+    let key = InsertKey {
+        plugin: 7,
+        preset: 0,
+    };
+    // One effect for each gain, in chain order.
+    let note = |orbit: u8, gains: &[f32]| {
+        let mut controls = controls(Waveform::Sine, None);
+        controls.orbit = orbit;
+        for (effect, value) in controls.effects.iter_mut().zip(gains) {
+            let mut insert = InsertControls::new(key);
+            assert!(insert.push(InsertParam {
+                id: 1,
+                value: *value
+            }));
+            *effect = Some(insert);
+        }
+        OnsetEvent::new(0, 440.0, 0.5, 0.05).with_controls(controls)
+    };
+    let provider: Arc<InsertProvider> = Arc::new(move |wanted, _sample_rate, _orbit| {
+        (wanted == key).then(|| Box::new(GainInsert { key, gain: 1.0 }) as Box<dyn OrbitInsert>)
+    });
+    let render = |events: &[OnsetEvent], provider: Option<&Arc<InsertProvider>>| {
+        let mut backend = ScalarBackend::new();
+        if let Some(provider) = provider {
+            backend.set_insert_provider(Arc::clone(provider));
+        }
+        let pcm = render_pcm(&mut backend, 48_000, 4_800, events).expect("render");
+        (pcm, backend.missing_insert_events())
+    };
+
+    let (dry, _) = render(&[note(1, &[])], None);
+    assert!(dry.iter().any(|sample| sample.abs() > 0.01));
+    let (halved, missed) = render(&[note(1, &[0.5])], Some(&provider));
+    assert_eq!(missed, 0);
+    for (frame, (wet, dry)) in halved.iter().zip(&dry).enumerate() {
+        assert_eq!(*wet, dry * 0.5, "sample {frame}");
+    }
+
+    // A second effect takes the output of the first.
+    let (chained, missed) = render(&[note(1, &[0.5, 0.5])], Some(&provider));
+    assert_eq!(missed, 0);
+    for (frame, (wet, dry)) in chained.iter().zip(&dry).enumerate() {
+        assert_eq!(*wet, dry * 0.25, "sample {frame}");
+    }
+
+    // Only the note that asks goes through the insert. A note on the same
+    // orbit with no request, and a note on orbit 2, keep the level.
+    let (muted_one, _) = render(&[note(1, &[0.0]), note(1, &[])], Some(&provider));
+    assert_eq!(muted_one, dry);
+    let (muted_one, _) = render(&[note(1, &[0.0]), note(2, &[])], Some(&provider));
+    let (only_two, _) = render(&[note(2, &[])], None);
+    assert_eq!(muted_one, only_two);
+
+    // With no provider the note plays dry, and the miss is counted.
+    let (unserved, missed) = render(&[note(1, &[0.5])], None);
+    assert_eq!(unserved, dry);
+    assert_eq!(missed, 1);
+}
+
+/// An instrument insert with a long silent start: one click 31 seconds into
+/// its note. `busy` is true while the note holds.
+struct LateClick {
+    key: rustel_audio::InsertKey,
+    busy: bool,
+    frames_left: u32,
+    click_at: u32,
+}
+
+impl rustel_audio::OrbitInsert for LateClick {
+    fn key(&self) -> rustel_audio::InsertKey {
+        self.key
+    }
+
+    fn set_param(&mut self, _param: rustel_audio::InsertParam, _frames: u32) {}
+
+    fn note(&mut self, note: rustel_audio::InsertNote, _frames: u32) {
+        self.frames_left = note.frames;
+    }
+
+    fn busy(&self) -> bool {
+        self.busy && self.frames_left > 0
+    }
+
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        for (left, right) in left.iter_mut().zip(right) {
+            if self.frames_left > 0 {
+                self.frames_left -= 1;
+                let click = self.frames_left == self.click_at;
+                (*left, *right) = if click { (1.0, 1.0) } else { (0.0, 0.0) };
+            }
+        }
+    }
+}
+
+/// An instrument that holds a note stays awake through 30 seconds of
+/// silence. An instrument with no note to hold sleeps, and the engine voice
+/// of an instrument note is silent.
+#[test]
+fn an_instrument_insert_that_holds_a_note_stays_awake() {
+    use rustel_audio::{InsertControls, InsertKey, InsertNote, InsertProvider, OrbitInsert};
+    use std::sync::Arc;
+
+    const RATE: u32 = 8_000;
+    let key = InsertKey {
+        plugin: 9,
+        preset: 0,
+    };
+    let frames = 32 * RATE;
+    let note = InsertNote {
+        pitch: 60.0,
+        velocity: 1.0,
+        frames,
+    };
+    let mut controls = controls(Waveform::Sine, None);
+    controls.instrument = Some(InsertControls::new(key).with_note(note));
+    let event = OnsetEvent::new(0, 440.0, 0.0, 32.0).with_controls(controls);
+    let render = |busy: bool| {
+        let provider: Arc<InsertProvider> = Arc::new(move |key, _rate, _slot| {
+            Some(Box::new(LateClick {
+                key,
+                busy,
+                frames_left: 0,
+                click_at: RATE,
+            }) as Box<dyn OrbitInsert>)
+        });
+        let mut backend = ScalarBackend::new();
+        backend.set_insert_provider(provider);
+        let pcm = render_pcm(&mut backend, RATE, frames as usize, &[event]).expect("render");
+        pcm.iter().filter(|sample| sample.abs() > 0.1).count()
+    };
+    // The click is one stereo frame, 31 seconds into the note.
+    assert_eq!(render(true), 2);
+    assert_eq!(render(false), 0);
 }

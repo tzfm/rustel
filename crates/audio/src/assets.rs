@@ -134,6 +134,23 @@ unsafe impl Send for ReturnedReverb {}
 unsafe impl Send for FxReverbInstall {}
 unsafe impl Send for ReturnedFxReverb {}
 
+/// One pending orbit insert, with the same baton discipline as a reverb.
+#[derive(Clone, Copy)]
+pub(crate) struct InsertInstall {
+    pub slot: u8,
+    /// The rate the insert was prepared for. An output at a different rate
+    /// does not take the insert.
+    pub sample_rate: u32,
+    pub insert: *mut dyn crate::insert::OrbitInsert,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ReturnedInsert(pub *mut dyn crate::insert::OrbitInsert);
+
+// SAFETY: same SPSC baton pass. `OrbitInsert` is `Send`.
+unsafe impl Send for InsertInstall {}
+unsafe impl Send for ReturnedInsert {}
+
 /// Both directions plus the leak counter, shared by the device (producer
 /// side) and the callback (consumer side).
 pub(crate) struct SampleChannel {
@@ -143,6 +160,8 @@ pub(crate) struct SampleChannel {
     pub reverb_returns: AssetRing<ReturnedReverb>,
     pub fx_reverb_installs: AssetRing<FxReverbInstall>,
     pub fx_reverb_returns: AssetRing<ReturnedFxReverb>,
+    pub insert_installs: AssetRing<InsertInstall>,
+    pub insert_returns: AssetRing<ReturnedInsert>,
     /// Stage reverbs refused by the install queue or callback byte budget.
     pub fx_reverb_refusals: AtomicU64,
     /// Stage reverb bytes currently admitted by the callback, including
@@ -165,6 +184,8 @@ impl SampleChannel {
             reverb_returns: AssetRing::new(),
             fx_reverb_installs: AssetRing::new(),
             fx_reverb_returns: AssetRing::new(),
+            insert_installs: AssetRing::new(),
+            insert_returns: AssetRing::new(),
             fx_reverb_refusals: AtomicU64::new(0),
             fx_reverb_resident_bytes: AtomicUsize::new(0),
             leaked: AtomicU64::new(0),
@@ -198,6 +219,10 @@ impl SampleChannel {
             // SAFETY: same pass for stage reverbs retired by the callback.
             drop(unsafe { Box::from_raw(returned.0) });
         }
+        while let Some(returned) = self.insert_returns.pop() {
+            // SAFETY: same pass for inserts displaced by the callback.
+            drop(unsafe { Box::from_raw(returned.0) });
+        }
     }
 }
 
@@ -219,6 +244,10 @@ impl Drop for SampleChannel {
         while let Some(install) = self.fx_reverb_installs.pop() {
             // SAFETY: never reached the consumer; unique ownership here.
             drop(unsafe { Box::from_raw(install.reverb) });
+        }
+        while let Some(install) = self.insert_installs.pop() {
+            // SAFETY: never reached the consumer. Unique ownership here.
+            drop(unsafe { Box::from_raw(install.insert) });
         }
     }
 }
@@ -366,12 +395,31 @@ mod tests {
         };
         channel.fx_reverb_installs.push(stage).ok().expect("push");
 
+        // An insert goes through its 2 rings as a reverb does.
+        struct Quiet;
+        impl crate::insert::OrbitInsert for Quiet {
+            fn key(&self) -> crate::insert::InsertKey {
+                crate::insert::InsertKey::default()
+            }
+            fn set_param(&mut self, _param: crate::insert::InsertParam, _frames: u32) {}
+            fn process(&mut self, _left: &mut [f32], _right: &mut [f32]) {}
+        }
+        let boxed_insert = || Box::into_raw(Box::new(Quiet) as Box<dyn crate::insert::OrbitInsert>);
+        let insert = InsertInstall {
+            slot: 2,
+            sample_rate: 48_000,
+            insert: boxed_insert(),
+        };
+        channel.insert_installs.push(insert).ok().expect("push");
+
         let sample = ReturnedSample(boxed_sample());
         channel.returns.push(sample).ok().expect("push");
         let orbit = ReturnedReverb(boxed_room());
         channel.reverb_returns.push(orbit).ok().expect("push");
         let stage = ReturnedFxReverb(boxed_room());
         channel.fx_reverb_returns.push(stage).ok().expect("push");
+        let insert = ReturnedInsert(boxed_insert());
+        channel.insert_returns.push(insert).ok().expect("push");
         drop(channel); // must not leak (miri/asan would flag)
     }
 }

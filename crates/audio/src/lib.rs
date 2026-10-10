@@ -24,6 +24,7 @@ mod device_facts;
 mod dispatch;
 pub mod distortion;
 pub mod input;
+pub mod insert;
 pub mod limiter;
 pub mod live;
 pub mod live_control;
@@ -73,6 +74,10 @@ pub use device_facts::{
 };
 pub use dispatch::DspDispatch;
 pub use distortion::{DISTORTION_ALGORITHMS, DistortControls};
+pub use insert::{
+    EFFECT_CHAIN, INSERT_SLOTS, InsertControls, InsertKey, InsertNote, InsertParam, InsertProvider,
+    MAX_INSERT_PARAMS, OrbitInsert, effect_slot, instrument_slot,
+};
 pub use limiter::{Character as LimiterCharacter, DEFAULT_THRESHOLD_DB, Limiter};
 pub use live::{
     LINE_ARM_WITHDRAWN, LiveBlockReport, LiveFlipAtomics, LiveScalarBackend, MAX_LIVE_VOICES,

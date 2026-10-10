@@ -179,6 +179,13 @@ pub struct OscillatorControls {
     pub fm: Option<FmControls>,
     /// Orbit index (default 1); selects the shared delay bus.
     pub orbit: u8,
+    /// Host-owned insert bus. Its output follows `orbit`.
+    pub insert_orbit: Option<u8>,
+    /// `vst` - the outside effects this note asks of its orbit, in chain
+    /// order, with the parameter values to set there.
+    pub effects: [Option<crate::insert::InsertControls>; crate::insert::EFFECT_CHAIN],
+    /// The insert that makes the sound of the note from the note itself.
+    pub instrument: Option<crate::insert::InsertControls>,
     /// `lfo()` modulators: each rides an
     /// AudioParam additively. Fixed capacity keeps the ring event POD; the
     /// resolver skips-and-logs beyond it.
@@ -1000,6 +1007,12 @@ impl DuckControls {
     }
 }
 
+impl OscillatorControls {
+    pub fn insert_orbit(&self) -> usize {
+        usize::from(self.insert_orbit.unwrap_or(self.orbit)).min(crate::scalar::MAX_ORBITS - 1)
+    }
+}
+
 impl Default for OscillatorControls {
     fn default() -> Self {
         Self {
@@ -1032,6 +1045,9 @@ impl Default for OscillatorControls {
             stretch: None,
             fm: None,
             orbit: 1,
+            insert_orbit: None,
+            effects: [None; crate::insert::EFFECT_CHAIN],
+            instrument: None,
             lfos: [None; MAX_VOICE_MODS],
             envs: [None; MAX_VOICE_MODS],
             phaser: None,

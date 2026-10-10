@@ -18,6 +18,8 @@ members = [
     "crates/midi",
     "crates/osc",
     "crates/hydra",
+    "crates/vst3",
+    "crates/vst3-fixture",
     "crates/studio-e2e",
     "xtask",
 ]

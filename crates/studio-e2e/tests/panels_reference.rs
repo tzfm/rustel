@@ -33,6 +33,7 @@ fn no_width_loses_a_tab_in_silence() {
             ("samples", ["samples", "samp", "smp"]),
             ("chords", ["chords", "chord", "chd"]),
             ("scales", ["scales", "scale", "scl"]),
+            ("vst", ["vst", "vst", "vst"]),
             ("generator", ["generator", "gen", "gen"]),
             ("examples", ["examples", "examp", "ex"]),
         ];
@@ -50,7 +51,7 @@ fn no_width_loses_a_tab_in_silence() {
         assert_eq!(
             studio.reference_tab(),
             Some("reference"),
-            "the six tabs wrap"
+            "the seven tabs wrap"
         );
         studio.press(KeyCode::Esc, KeyModifiers::NONE);
     }
@@ -65,7 +66,7 @@ fn no_width_loses_a_tab_in_silence() {
 #[test]
 fn a_narrow_strip_keeps_the_shown_tab_seated() {
     // 26 columns: the narrowest terminal the layout still opens the
-    // reference at, and too narrow for the tightest tier to seat all six
+    // reference at, and too narrow for the tightest tier to seat all seven
     // labels at once - the strip has to slide.
     let mut studio = hermetic_sized(26, 40);
     studio.press(KeyCode::Home, KeyModifiers::NONE);
@@ -77,6 +78,7 @@ fn a_narrow_strip_keeps_the_shown_tab_seated() {
         ("samples", "smp"),
         ("chords", "chd"),
         ("scales", "scl"),
+        ("vst", "vst"),
         ("generator", "gen"),
         ("examples", "ex"),
     ];
@@ -229,11 +231,19 @@ fn the_reference_setting_hides_osc_entries() {
     assert!(lists_squiz(&mut studio), "listed out of the box");
     close_column(&mut studio);
 
-    // Settings ▸ Reference is the sixth tab. Its first row is OSC.
+    // Find Reference by its first row, independently of optional tabs.
     studio.chord("ctrl+o");
-    for _ in 0..5 {
+    for _ in 0..7 {
+        if studio
+            .rows()
+            .iter()
+            .any(|row| row.contains("OSC / SuperDirt"))
+        {
+            break;
+        }
         studio.press(KeyCode::Tab, KeyModifiers::NONE);
     }
+    row_containing(&studio.rows(), "OSC / SuperDirt");
     studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
 

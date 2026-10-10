@@ -1,0 +1,20 @@
+[package]
+name = "rustel-vst3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "VST3 plugin host: finds, loads and runs plugins as orbit inserts"
+
+[dependencies]
+rustel-audio = { path = "../audio" }
+# Rust bindings for the VST3 interfaces. They need no SDK at build time.
+vst3 = "0.3.0"
+libloading = "0.8"
+# The scan cache file and the report line of a load test.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+rustel-vst3-fixture = { path = "../vst3-fixture" }

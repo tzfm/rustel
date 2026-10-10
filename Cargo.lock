@@ -488,6 +488,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "com-scrape-types"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ce183b975b8fc736a20919c4002717255fbd867df575c792aeefa9a56a73ad0"
+
+[[package]]
 name = "combine"
 version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3620,6 +3626,7 @@ dependencies = [
  "rustel-serial",
  "rustel-studio",
  "rustel-voice",
+ "rustel-vst3-fixture",
  "serde",
  "serde_json",
  "tempfile",
@@ -3764,6 +3771,7 @@ dependencies = [
  "rustel-serial",
  "rustel-transpiler",
  "rustel-voice",
+ "rustel-vst3",
  "rustfft",
  "semver",
  "serde",
@@ -3818,6 +3826,7 @@ dependencies = [
  "rustel-serial",
  "rustel-transpiler",
  "rustel-voice",
+ "rustel-vst3-fixture",
  "serde",
  "serde_json",
  "tachyonfx",
@@ -3840,6 +3849,7 @@ dependencies = [
  "rustel-audio",
  "rustel-runtime",
  "rustel-studio",
+ "rustel-vst3-fixture",
  "serde",
  "serde_json",
  "similar",
@@ -3869,6 +3879,25 @@ dependencies = [
  "rustel-audio",
  "rustel-core",
  "serde_json",
+]
+
+[[package]]
+name = "rustel-vst3"
+version = "0.1.1"
+dependencies = [
+ "libloading 0.8.9",
+ "rustel-audio",
+ "rustel-vst3-fixture",
+ "serde",
+ "serde_json",
+ "vst3",
+]
+
+[[package]]
+name = "rustel-vst3-fixture"
+version = "0.1.1"
+dependencies = [
+ "vst3",
 ]
 
 [[package]]
@@ -4890,6 +4919,15 @@ name = "vsimd"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
+
+[[package]]
+name = "vst3"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e31e3fe7a6f028ded8c5a9984cf283319e6dc63572c9b71da1d4ee9d71d3b6bf"
+dependencies = [
+ "com-scrape-types",
+]
 
 [[package]]
 name = "vtparse"

@@ -169,6 +169,8 @@ impl Widget for ReferenceView<'_> {
             Tab::Samples => self.render_samples(inner, buffer),
             Tab::Chords => self.render_chords(inner, buffer),
             Tab::Scales => self.render_scales(inner, buffer),
+            #[cfg(feature = "vst")]
+            Tab::Vst => self.render_vst(inner, buffer),
             Tab::Reference => match &self.panel.mode {
                 ReferenceMode::Browse => self.render_browse(inner, buffer),
                 ReferenceMode::Entry { index, scroll, .. } => {
@@ -891,6 +893,159 @@ impl ReferenceView<'_> {
                     "← folds",
                     "Enter takes it",
                 ]
+            };
+            render_footer(buffer, inner, inner.bottom() - 1, segments, theme);
+        }
+    }
+
+    /// The plugins the host found. The open plugin lists its parameters,
+    /// its parameter groups and its presets under its row.
+    #[cfg(feature = "vst")]
+    fn render_vst(&self, inner: Rect, buffer: &mut Buffer) {
+        use rustel_runtime::vst::Status;
+        let theme = self.theme;
+        let tab = &self.panel.vst;
+        buffer.set_stringn(
+            inner.x,
+            inner.y + 1,
+            format!("search: {}", tab.query()),
+            usize::from(inner.width),
+            Style::default().fg(theme.foreground),
+        );
+        let rows = tab.rows();
+        let plugins = tab.plugins();
+        let shown = rows
+            .iter()
+            .filter(|row| matches!(row, PluginRow::Plugin(_)))
+            .count();
+        let count = if plugins.is_empty() {
+            "no plugin found · add a folder in settings, vst tab".to_owned()
+        } else if rows.is_empty() {
+            format!("no plugin named {:?}", tab.query().trim())
+        } else {
+            format!("{shown} of {} plugins", plugins.len())
+        };
+        buffer.set_stringn(
+            inner.x,
+            inner.y + 2,
+            count,
+            usize::from(inner.width),
+            Style::default().fg(theme.muted),
+        );
+        let geometry = self.panel.geometry(inner);
+        let list = geometry.list;
+        let open = tab.open_plugin();
+        let marker = |open: bool| super::super::terminal::symbol(if open { "▾" } else { "▸" });
+        let heading = Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD);
+        let foreground = Style::default().fg(theme.foreground);
+        let muted = Style::default().fg(theme.muted);
+        for (position, row) in rows
+            .iter()
+            .enumerate()
+            .skip(geometry.first_row)
+            .take(usize::from(list.height))
+        {
+            let y = list.y + (position - geometry.first_row) as u16;
+            // The row from the left, piece by piece, and the tag at the
+            // right edge.
+            let (pieces, tag) = match *row {
+                PluginRow::Plugin(index) => {
+                    let plugin = &plugins[index];
+                    let is_open = open.is_some_and(|open| open.name == plugin.name);
+                    let tag = match &plugin.status {
+                        // A bundle with no load and no test yet has no kind.
+                        Status::Found if plugin.categories.is_empty() => (String::new(), muted),
+                        Status::Loading => ("loading…".to_owned(), Style::default().fg(theme.warn)),
+                        Status::Found | Status::Ready => {
+                            let kind = if plugin.instrument {
+                                "instrument"
+                            } else {
+                                "effect"
+                            };
+                            let facts = [kind, &plugin.vendor, &plugin.categories];
+                            let facts: Vec<_> =
+                                facts.into_iter().filter(|fact| !fact.is_empty()).collect();
+                            (facts.join(" · "), muted)
+                        }
+                        Status::Failed(reason) => {
+                            (reason.clone(), Style::default().fg(theme.error))
+                        }
+                    };
+                    let text = format!(" {} {} ", marker(is_open), plugin.name);
+                    (vec![(text, heading)], tag)
+                }
+                PluginRow::Group(index) => {
+                    let (name, count) = &tab.groups()[index];
+                    let text = format!("   {} {name} ", marker(tab.group_is_open(name)));
+                    let style = foreground.add_modifier(Modifier::BOLD);
+                    (vec![(text, style)], (count.to_string(), muted))
+                }
+                PluginRow::Param(index) => {
+                    let Some(param) = open.and_then(|plugin| plugin.params.get(index)) else {
+                        continue;
+                    };
+                    // A search lists the parameters flat and names the group
+                    // at the right. An open group has its parameters one
+                    // step in.
+                    let (indent, tag) = if tab.searching() {
+                        ("     ", param.group.clone())
+                    } else if param.group.is_empty() {
+                        ("     ", String::new())
+                    } else {
+                        ("       ", String::new())
+                    };
+                    let default = param.default_shown();
+                    let pieces = vec![
+                        (
+                            format!("{indent}{}", param.key),
+                            Style::default().fg(theme.ok),
+                        ),
+                        (format!("  {}", param.name), foreground),
+                        (format!("  {default} "), muted),
+                    ];
+                    (pieces, (tag, muted))
+                }
+                PluginRow::Preset(index) => {
+                    let pieces = vec![
+                        ("     preset".to_owned(), muted),
+                        (format!("  {} ", tab.presets()[index]), foreground),
+                    ];
+                    (pieces, (String::new(), muted))
+                }
+            };
+            let selected = position == tab.selected;
+            let mut x = list.x;
+            for (text, style) in pieces {
+                let style = if selected {
+                    Style::default()
+                        .fg(theme.selection_text)
+                        .bg(theme.selection)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    style
+                };
+                buffer.set_stringn(x, y, &text, usize::from(list.right() - x), style);
+                x = x
+                    .saturating_add(UnicodeWidthStr::width(text.as_str()) as u16)
+                    .min(list.right());
+            }
+            // A tag longer than the room loses its end, so a failure
+            // reason still starts on the row.
+            let (tag, style) = tag;
+            let tag_width = UnicodeWidthStr::width(tag.as_str()) as u16;
+            let tag_x = list.right().saturating_sub(tag_width + 1).max(x + 1);
+            if tag_x < list.right() {
+                buffer.set_stringn(tag_x, y, &tag, usize::from(list.right() - tag_x), style);
+            }
+        }
+        if list.height > 0 {
+            let return_hint = self.return_hint();
+            let segments: &[&str] = if !self.focused {
+                &[&return_hint, "Esc closes"]
+            } else {
+                &["↑↓ move", "→ loads or opens", "← folds", "Enter inserts"]
             };
             render_footer(buffer, inner, inner.bottom() - 1, segments, theme);
         }

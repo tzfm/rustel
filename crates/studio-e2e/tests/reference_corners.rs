@@ -14,20 +14,20 @@ static AUDIO_CALLBACK_ALLOCATOR: rustel_audio::tripwire::TripwireAlloc =
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use rustel_studio_e2e::{Hermetic, hermetic};
 
-/// Open the reference column on its Examples tab - the sixth and last.
+/// Open the reference column on its Examples tab - the seventh and last.
 fn open_examples(studio: &mut Hermetic) {
     studio.chord("ctrl+f");
-    for _ in 0..5 {
+    for _ in 0..6 {
         studio.press(KeyCode::Tab, KeyModifiers::NONE);
     }
     studio.settle();
     assert_eq!(studio.reference_tab(), Some("examples"));
 }
 
-/// Open the reference column on its Generator tab - the fifth.
+/// Open the reference column on its Generator tab - the sixth.
 fn open_generator(studio: &mut Hermetic) {
     studio.chord("ctrl+f");
-    for _ in 0..4 {
+    for _ in 0..5 {
         studio.press(KeyCode::Tab, KeyModifiers::NONE);
     }
     studio.settle();

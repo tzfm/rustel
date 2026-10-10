@@ -2274,6 +2274,8 @@ struct AudibleSource {
     settings: RuntimeSettings,
     cps: f64,
     cycle_zero_time: f64,
+    #[cfg(feature = "vst")]
+    insert_orbits: [u8; rustel_audio::MAX_ORBITS],
 }
 
 /// Settings a Session is built with; [`Session::with_config`] validates them.
@@ -2596,6 +2598,8 @@ pub struct Session {
     scheduler: Scheduler,
     config: SessionConfig,
     last_source: Option<Arc<str>>,
+    #[cfg(feature = "vst")]
+    insert_orbits: [u8; rustel_audio::MAX_ORBITS],
     /// Files the most recent `preload(...)` asked for, until a caller waits.
     preload_requested: usize,
     /// Whether a setup this session ran picks sample variants: it writes an
@@ -2868,6 +2872,8 @@ impl Session {
             scheduler,
             config,
             last_source: None,
+            #[cfg(feature = "vst")]
+            insert_orbits: crate::vst::INSERT_ORBITS,
             preload_requested: 0,
             prebake_selects_variants: false,
             stop_when_silent: None,
@@ -3086,6 +3092,21 @@ impl Session {
     /// from a score evaluation rather than a directly installed Rust pattern.
     pub fn active_source(&self) -> Option<&str> {
         self.last_source.as_deref()
+    }
+
+    /// Plugin requirements of a candidate source, on the physical insert buses
+    /// it will use if accepted. This does not change the playing score's routes.
+    #[cfg(feature = "vst")]
+    pub fn plugin_calls_for_source(&self, source: &str) -> Vec<crate::lint::NamedPlugin> {
+        let orbits = crate::vst::plan_orbits(self.active_source(), source, self.insert_orbits);
+        let mut plugins = crate::lint::live_plugins(source);
+        for plugin in &mut plugins {
+            plugin.orbit = plugin
+                .orbit
+                .and_then(|orbit| orbits.get(orbit))
+                .map(|orbit| *orbit as usize);
+        }
+        plugins
     }
 
     pub fn generation(&self) -> u64 {
@@ -3382,6 +3403,10 @@ impl Session {
         // candidate reaches the device, but do not let a later successful
         // cutover mislabel the Pattern as the last JavaScript/mini source.
         self.last_source = None;
+        #[cfg(feature = "vst")]
+        {
+            self.insert_orbits = crate::vst::INSERT_ORBITS;
+        }
         self.last_path = EvaluateSource::Pattern;
         self.js.snapshot_active_as_last_good();
         Ok(())
@@ -3829,12 +3854,22 @@ impl Session {
     /// collected, as [`VOICE_NOTICE_DIAGNOSTIC`]s. A notice already pending
     /// is not queued again, so one raised every window holds one place.
     fn report_voice_notices(&mut self, notices: Vec<rustel_voice::VoiceNotice>) {
-        for notice in notices {
+        let notices = notices
+            .into_iter()
+            .map(|notice| (notice.message, notice.record));
+        // A plugin that did not start on the plugin thread has no note to
+        // report through, so its reason joins the notices here.
+        #[cfg(feature = "vst")]
+        let notices = notices.chain(crate::vst::take_errors().into_iter().map(|message| {
+            let record = serde_json::json!({ "vst_skipped": { "message": &message } });
+            (message, record)
+        }));
+        for (message, record) in notices {
             let pending = self.pending_diagnostics.iter().any(|diagnostic| {
-                diagnostic.kind == VOICE_NOTICE_DIAGNOSTIC && diagnostic.message == notice.message
+                diagnostic.kind == VOICE_NOTICE_DIAGNOSTIC && diagnostic.message == message
             });
             if !pending {
-                self.report_diagnostic(VOICE_NOTICE_DIAGNOSTIC, notice.message, notice.record);
+                self.report_diagnostic(VOICE_NOTICE_DIAGNOSTIC, message, record);
             }
         }
     }
@@ -3933,7 +3968,11 @@ impl Session {
         };
         let mut resolved: std::collections::BTreeMap<String, std::collections::BTreeSet<i64>> =
             std::collections::BTreeMap::new();
-        for sound in self.window_sounds(from_cycle, cycles, ceiling) {
+        let haps = self.window_haps(from_cycle, cycles, ceiling);
+        // A plugin loads as a sample does: before the first note asks.
+        #[cfg(feature = "vst")]
+        crate::vst::prepare(&haps, library.render_rate(), &self.insert_orbits);
+        for sound in Self::sounds_in(&haps) {
             // `.bank("tr909")` makes the sound `tr909_bd`. Warming only `bd`
             // fetches a different bank's files, and the lane's first hit is
             // refused. Warm the banked spelling too, as the voice looks it up.
@@ -3968,16 +4007,42 @@ impl Session {
         cycles: f64,
         ceiling: Duration,
     ) -> Vec<WindowSound> {
+        Self::sounds_in(&self.window_haps(from_cycle, cycles, ceiling))
+    }
+
+    /// The plugins the score asks for from `from_cycle` for `cycles` that are
+    /// not ready for their notes, at the rate of the output. `holds` says if
+    /// the output has a plugin on a slot: see
+    /// `LiveScalarDevice::holds_insert`. A start that waits for its sounds
+    /// waits while the count is above 0. The call starts the load of each
+    /// plugin it counts, and waits for nothing.
+    #[cfg(feature = "vst")]
+    pub fn plugins_pending(
+        &self,
+        from_cycle: f64,
+        cycles: f64,
+        ceiling: Duration,
+        sample_rate: u32,
+        holds: impl Fn(usize, rustel_audio::InsertKey) -> bool,
+    ) -> usize {
+        let haps = self.window_haps(from_cycle, cycles, ceiling);
+        crate::vst::pending(&haps, sample_rate, &self.insert_orbits, holds)
+    }
+
+    /// The haps the active score has from `from_cycle` for `cycles`. Empty
+    /// when the query does not finish within `ceiling`.
+    fn window_haps(&self, from_cycle: f64, cycles: f64, ceiling: Duration) -> Vec<crate::HapJson> {
         let begin = Fraction::from_f64(from_cycle.max(0.0)).unwrap_or(Fraction::ZERO);
         let span = Fraction::from_f64(cycles.max(1.0)).unwrap_or(Fraction::int(2));
         let ceiling = Instant::now() + ceiling;
-        let Ok(report) =
-            rustel_core::with_query_deadline(ceiling, || self.query_report(begin, begin.add(span)))
-        else {
-            return Vec::new();
-        };
+        rustel_core::with_query_deadline(ceiling, || self.query_report(begin, begin.add(span)))
+            .map(|report| report.haps)
+            .unwrap_or_default()
+    }
+
+    fn sounds_in(haps: &[crate::HapJson]) -> Vec<WindowSound> {
         let mut sounds = Vec::new();
-        for hap in &report.haps {
+        for hap in haps {
             let crate::ValueJson::Raw(serde_json::Value::Object(object)) = &hap.value else {
                 continue;
             };
@@ -4978,6 +5043,15 @@ impl Session {
                     .filter_map(|onset| {
                         match crate::render::live_audio_event(onset, sample_rate, cps, lookup) {
                             Ok(event) => {
+                                #[cfg(feature = "vst")]
+                                let event = {
+                                    let mut event = event;
+                                    event.controls.insert_orbit = Some(
+                                        self.insert_orbits[(event.controls.orbit as usize)
+                                            .min(rustel_audio::MAX_ORBITS - 1)],
+                                    );
+                                    event
+                                };
                                 if let Some(warning) = self.input_channel_warning(&event)
                                     && !input_warnings.contains(&warning)
                                 {
@@ -5727,6 +5801,15 @@ impl Session {
                     .filter_map(|onset| {
                         match crate::render::live_audio_event(onset, sample_rate, cps, lookup) {
                             Ok(event) => {
+                                #[cfg(feature = "vst")]
+                                let event = {
+                                    let mut event = event;
+                                    event.controls.insert_orbit = Some(
+                                        self.insert_orbits[(event.controls.orbit as usize)
+                                            .min(rustel_audio::MAX_ORBITS - 1)],
+                                    );
+                                    event
+                                };
                                 if let Some(warning) = self.input_channel_warning(&event)
                                     && !input_warnings.contains(&warning)
                                 {
@@ -18064,7 +18147,17 @@ mod tests {
     #[test]
     fn captured_direct_pattern_clears_a_later_textual_rollback_target() {
         let mut session = Session::new().expect("session");
+        #[cfg(not(feature = "vst"))]
         session.evaluate_mini("bd").expect("source A");
+        #[cfg(feature = "vst")]
+        {
+            let source = r#"s("sine").vst("Delay").orbit(1)"#;
+            session.evaluate(source).expect("source A");
+            session
+                .reload_at(&source.replace("orbit(1)", "orbit(2)"), false, 0.1)
+                .expect("move plugin");
+            assert_eq!(session.insert_orbits[2], 1);
+        }
         // Inject replay policy, not consumer-copy evidence.
         session
             .mark_audible_generation(session.generation())
@@ -18073,6 +18166,8 @@ mod tests {
         session
             .set_pattern(rustel_core::pure(Value::Str("native".into())))
             .expect("direct Pattern B");
+        #[cfg(feature = "vst")]
+        assert_eq!(session.insert_orbits, crate::vst::INSERT_ORBITS);
         let captured = session
             .capture_rollback_source(session.generation())
             .expect("capture direct Pattern");
@@ -18187,6 +18282,40 @@ mod tests {
                 .show(),
             "s:bd"
         );
+
+        #[cfg(feature = "vst")]
+        {
+            let mut session = Session::new().expect("session");
+            let source = r#"s("sine").vst("Delay").orbit(1)"#;
+            session.evaluate(source).expect("audible plugin source");
+            session
+                .mark_audible_generation(session.generation())
+                .expect("retain physical bus one");
+            let moved = source.replace("orbit(1)", "orbit(2)");
+            assert_eq!(session.plugin_calls_for_source(&moved)[0].orbit, Some(1));
+            assert_eq!(session.insert_orbits, crate::vst::INSERT_ORBITS);
+            session.reload_at(&moved, false, 0.1).expect("move to two");
+            let accepted = session.insert_orbits;
+            assert_eq!(accepted[2], 1);
+            let moved = source.replace("orbit(1)", "orbit(3)");
+            assert!(matches!(
+                session.evaluate_cancellable(&moved, &AtomicBool::new(true)),
+                Err(RuntimeError::Cancelled)
+            ));
+            assert_eq!(session.insert_orbits, accepted);
+            session
+                .reload_at(&moved, false, 0.2)
+                .expect("move to three");
+            assert_eq!(session.insert_orbits[3], 1);
+            assert_eq!(
+                session
+                    .rollback_to_previous_source(0.3)
+                    .expect("rollback orbit"),
+                RollbackAttempt::Applied
+            );
+            assert_eq!(session.active_source(), Some(source));
+            assert_eq!(session.insert_orbits, crate::vst::INSERT_ORBITS);
+        }
     }
 
     #[cfg(feature = "device-audio")]

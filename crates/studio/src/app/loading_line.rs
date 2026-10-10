@@ -1,7 +1,7 @@
 //! The header's loading line: a thin line that grows along the bottom of
-//! the header row while the sounds the playing or the waiting score needs
-//! come in, shown only once a load has lasted, and after a while its words
-//! in the tempo's place.
+//! the header row while the sounds and the plugins the playing or the
+//! waiting score needs come in, shown only once a load has lasted, and after
+//! a while its words in the tempo's place.
 
 use super::*;
 
@@ -49,12 +49,23 @@ impl App {
         }
         let label = (lasted >= LOADING_LABEL_AFTER).then(|| {
             let words = if cue.waiting {
-                "waiting for sounds"
+                "waiting for"
             } else {
-                "loading sounds"
+                "loading"
+            };
+            // A plugin wait is named as a sound wait is.
+            let what = if cue.plugins == 0 {
+                "sounds"
+            } else if cue.plugins < cue.total - cue.settled {
+                "sounds and plugins"
+            } else {
+                "plugins"
             };
             let percent = cue.settled * 100 / cue.total;
-            let mut label = format!("{words} · {}/{} · {percent}%", cue.settled, cue.total);
+            let mut label = format!(
+                "{words} {what} · {}/{} · {percent}%",
+                cue.settled, cue.total
+            );
             if let Some(name) = &cue.loading {
                 label.push_str(" · ");
                 label.push_str(name);

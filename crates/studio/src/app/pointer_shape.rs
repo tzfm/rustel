@@ -99,6 +99,8 @@ impl App {
             Tab::Samples => panel.sound_rows().len(),
             Tab::Chords => panel.chord_rows().len(),
             Tab::Scales => panel.scale_rows().len(),
+            #[cfg(feature = "vst")]
+            Tab::Vst => panel.vst.rows().len(),
             #[cfg(feature = "hydra")]
             Tab::Examples | Tab::Generator => panel.snippet_lines().len(),
         };

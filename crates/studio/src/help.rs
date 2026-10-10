@@ -39,6 +39,8 @@ pub enum HelpContext {
     Settings,
     SettingsAbout,
     SettingsSources,
+    #[cfg(feature = "vst")]
+    SettingsVst,
     Log,
     Jobs,
     Export,
@@ -69,6 +71,8 @@ impl HelpContext {
             Self::Settings => "settings",
             Self::SettingsAbout => "settings · about",
             Self::SettingsSources => "settings · samples",
+            #[cfg(feature = "vst")]
+            Self::SettingsVst => "settings · vst",
             Self::Log => "log",
             Self::Jobs => "background jobs",
             Self::Export => "export",
@@ -105,6 +109,10 @@ impl HelpContext {
             Self::SettingsAbout => "This page describes the terminal and runtime capabilities.",
             Self::SettingsSources => {
                 "Fetch imports, cache all remote packs, refresh their lists, and clear the cache; then your folders and the studio's packs. r aliases a bank on a user import; c caches a remote pack."
+            }
+            #[cfg(feature = "vst")]
+            Self::SettingsVst => {
+                "The folders with your VST3 plugins, then the standard folders of the system. The plugin host reads all of them. Rescan after you install a plugin."
             }
             Self::Log => {
                 "The newest studio messages are at the bottom of the log. v shows the running commentary underneath them."
@@ -287,6 +295,12 @@ impl HelpContext {
                     "c · Tab · Esc",
                     "cache this remote pack · other pages · close",
                 ),
+            ],
+            #[cfg(feature = "vst")]
+            Self::SettingsVst => [
+                ("a / +", "add a folder with VST3 plugins"),
+                ("Enter · d", "do the selected action · remove the folder"),
+                ("Tab · Esc", "other pages · close"),
             ],
             Self::Log => [
                 (

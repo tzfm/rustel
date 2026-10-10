@@ -327,6 +327,8 @@ impl Session {
             cycle_zero_time: self
                 .scheduler
                 .time_at_cycle(rustel_fraction::Fraction::ZERO),
+            #[cfg(feature = "vst")]
+            insert_orbits: self.insert_orbits,
         });
         let book = self
             .audio_confirmations

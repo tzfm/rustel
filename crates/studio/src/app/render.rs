@@ -1092,6 +1092,8 @@ impl App {
             sources: self.source_rows(),
             mappings: self.mapping_slot_views(),
             keybind_rows: self.keybind_rows(),
+            #[cfg(feature = "vst")]
+            vst_page: self.vst_page(),
             latency: self.latency_report(),
             // Only built while the panel could draw them: merging the port
             // lists is cheap, but not free, and most frames have no panel.

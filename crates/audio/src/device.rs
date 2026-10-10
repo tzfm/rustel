@@ -121,15 +121,18 @@ pub fn input_retry_delay(attempts: u64) -> Duration {
 }
 
 /// Coalesces one producer turn's shared-orbit reverb requests. The final
-/// scheduled parameters for each orbit are prepared once after the turn.
+/// scheduled parameters for each orbit are prepared once per turn.
 pub struct LiveReverbBatch {
     requested: [Option<crate::reverb::ReverbParams>; crate::scalar::MAX_ORBITS],
+    /// The last insert each slot asked for in this turn.
+    inserts: [Option<crate::insert::InsertKey>; crate::insert::INSERT_SLOTS],
 }
 
 impl Default for LiveReverbBatch {
     fn default() -> Self {
         Self {
             requested: [None; crate::scalar::MAX_ORBITS],
+            inserts: [None; crate::insert::INSERT_SLOTS],
         }
     }
 }
@@ -142,6 +145,7 @@ impl LiveReverbBatch {
     /// Observe one event without constructing an orbit impulse response.
     /// Per-voice `.FX()` reverbs keep their distinct bounded cache.
     pub fn observe(&mut self, device: &LiveScalarDevice, event: &crate::AudioEvent) {
+        self.observe_inserts(event);
         if let Some(reverb) = event.controls.reverb {
             self.request_orbit(
                 usize::from(event.controls.orbit),
@@ -166,11 +170,45 @@ impl LiveReverbBatch {
         }
     }
 
-    /// Prepare and ship at most one shared reverb per orbit.
+    fn observe_inserts(&mut self, event: &crate::AudioEvent) {
+        let insert_orbit = event.controls.insert_orbit();
+        for (stage, effect) in event.controls.effects.iter().enumerate() {
+            if let Some(effect) = effect {
+                self.inserts[crate::insert::effect_slot(insert_orbit, stage)] = Some(effect.key);
+            }
+        }
+        if let Some(instrument) = event.controls.instrument {
+            self.inserts[crate::insert::instrument_slot(insert_orbit)] = Some(instrument.key);
+        }
+    }
+
+    /// Install an accepted batch's inserts before publishing its events.
+    /// The provider must return immediately when an insert is not ready.
+    pub fn install_inserts(device: &LiveScalarDevice, events: &[crate::AudioEvent]) {
+        let mut batch = Self::default();
+        for event in events {
+            batch.observe_inserts(event);
+        }
+        batch.flush_inserts(device);
+    }
+
+    /// Prepare and ship at most one shared reverb and one insert per orbit.
     pub fn flush(&mut self, device: &LiveScalarDevice) {
         for (orbit, request) in self.requested.iter_mut().enumerate() {
             if let Some(params) = request.take() {
                 device.ensure_reverb(orbit, params);
+            }
+        }
+        self.flush_inserts(device);
+    }
+
+    fn flush_inserts(&mut self, device: &LiveScalarDevice) {
+        // An insert not ready on an earlier turn gets a new try on each
+        // turn, so the insert is on the orbit before the next note asks.
+        let waiting = *device.insert_waiting.lock().expect("waiting inserts");
+        for (slot, request) in self.inserts.iter_mut().enumerate() {
+            if let Some(key) = request.take().or(waiting[slot]) {
+                device.ensure_insert(slot, key);
             }
         }
     }
@@ -195,6 +233,14 @@ pub struct LiveScalarDevice {
     /// Recently shipped `.FX()` stage reverbs. The pointer identity lets the
     /// producer forget a fingerprint when the callback returns that box.
     fx_reverb_cache: std::sync::Mutex<Vec<(crate::reverb::ReverbParams, usize, usize)>>,
+    /// Producer-side record of the insert shipped to each orbit.
+    insert_cache: std::sync::Mutex<[Option<crate::insert::InsertKey>; crate::insert::INSERT_SLOTS]>,
+    /// The insert each orbit asked for and did not get yet.
+    insert_waiting:
+        std::sync::Mutex<[Option<crate::insert::InsertKey>; crate::insert::INSERT_SLOTS]>,
+    /// Builds an insert outside the callback. With no provider, a note that
+    /// asks for an insert plays dry.
+    insert_provider: std::sync::Mutex<Option<Arc<crate::insert::InsertProvider>>>,
     shared: LiveShared,
     sample_rate: u32,
     channels: u16,
@@ -1293,6 +1339,68 @@ impl LiveScalarDevice {
         }
     }
 
+    /// Set what builds the orbit inserts, for example a plugin host. The
+    /// provider runs on the producer thread and answers fast for a key that
+    /// has no effect.
+    pub fn set_insert_provider(&self, provider: Arc<crate::insert::InsertProvider>) {
+        *self.insert_provider.lock().expect("insert provider") = Some(provider);
+    }
+
+    /// Make sure `slot` holds the insert for `key`, building and shipping a
+    /// new one when it does not. The effect of an orbit has the number of
+    /// the orbit, and the instrument has [`crate::insert::instrument_slot`].
+    /// Producer-side and potentially slow: the provider loads and prepares
+    /// the insert. A repeat call with the same key is a cache hit.
+    pub fn ensure_insert(&self, slot: usize, key: crate::insert::InsertKey) {
+        let slot = slot.min(crate::insert::INSERT_SLOTS - 1);
+        let mut cache = self.insert_cache.lock().expect("producer insert cache");
+        let mut waiting = self.insert_waiting.lock().expect("waiting inserts");
+        waiting[slot] = None;
+        if cache[slot] == Some(key) {
+            return;
+        }
+        let provider = self
+            .insert_provider
+            .lock()
+            .expect("insert provider")
+            .clone();
+        let Some(provider) = provider else {
+            return;
+        };
+        self.reclaim_assets();
+        // Not ready, or no room in the ring: the next turn tries again.
+        waiting[slot] = Some(key);
+        let Some(insert) = provider(key, self.sample_rate, slot) else {
+            return;
+        };
+        let pointer = Box::into_raw(insert);
+        match self
+            .shared
+            .samples
+            .insert_installs
+            .push(crate::assets::InsertInstall {
+                slot: slot as u8,
+                sample_rate: self.sample_rate,
+                insert: pointer,
+            }) {
+            Ok(()) => {
+                cache[slot] = Some(key);
+                waiting[slot] = None;
+            }
+            Err(install) => {
+                // SAFETY: never left this thread. Unique owner.
+                drop(unsafe { Box::from_raw(install.insert) });
+            }
+        }
+    }
+
+    /// True when the output has the insert for `key` on `slot`: shipped by
+    /// [`Self::ensure_insert`] and not replaced since.
+    pub fn holds_insert(&self, slot: usize, key: crate::insert::InsertKey) -> bool {
+        let cache = self.insert_cache.lock().expect("producer insert cache");
+        cache.get(slot) == Some(&Some(key))
+    }
+
     /// Generate a `.FX()` stage reverb off the audio thread and ship it into
     /// the callback's stage pool. The eight most recent fingerprints avoid
     /// duplicate synthesis; older ones can be regenerated after eviction.
@@ -1446,6 +1554,9 @@ impl LiveScalarDevice {
             input: None,
             reverb_cache: std::sync::Mutex::new(vec![None; crate::scalar::MAX_ORBITS]),
             fx_reverb_cache: std::sync::Mutex::new(Vec::with_capacity(8)),
+            insert_cache: std::sync::Mutex::new([None; crate::insert::INSERT_SLOTS]),
+            insert_waiting: std::sync::Mutex::new([None; crate::insert::INSERT_SLOTS]),
+            insert_provider: std::sync::Mutex::new(None),
             shared,
             sample_rate: facts.sample_rate_hz(),
             channels: facts.channels(),
@@ -3089,6 +3200,14 @@ impl LiveScalarDevice {
             .lock()
             .expect("producer fx reverb cache")
             .clear();
+        self.insert_cache
+            .lock()
+            .expect("producer insert cache")
+            .fill(None);
+        self.insert_waiting
+            .lock()
+            .expect("waiting inserts")
+            .fill(None);
         self.shared
             .samples
             .fx_reverb_resident_bytes
@@ -4275,6 +4394,7 @@ fn write_live_output_inner<T>(
     // hand displaced ones back for the producer to free.
     backend.drain_sample_installs(&shared.samples);
     backend.drain_reverb_installs(&shared.samples);
+    backend.drain_insert_installs(&shared.samples);
     for update in shared.live_controls.drain_available() {
         backend.set_live_control(update);
     }
@@ -4324,13 +4444,14 @@ fn write_live_output_inner<T>(
             start.saturating_add(rendered as u64),
             count,
         );
-        let mut report = backend.process_block_with(
+        let mut report = backend.process_block_with_assets(
             &mut scratch[..count * 2],
             count,
             start.saturating_add(rendered as u64),
             &shared.ring,
             shared.flip_atomics(),
             &shared.stopped,
+            Some(&shared.samples),
         );
         report.accepted += immediate.accepted;
         report.refused += immediate.refused;
@@ -6336,6 +6457,136 @@ mod tests {
             assert_eq!(pressure.active_orbit_reverbs, 1);
             assert_eq!(pressure.orbit_reverb_misses, 0);
             assert!(peak > 0.0, "the shared reverb bus stayed silent");
+        }
+
+        /// The producer builds an insert one time for an orbit, the running
+        /// callback keeps that instance when its output orbit changes,
+        /// and a displaced insert comes back for the producer to free.
+        #[test]
+        fn the_callback_installs_and_returns_the_insert_of_an_orbit() {
+            use std::sync::atomic::AtomicUsize;
+
+            #[derive(Default)]
+            struct Seen {
+                built: AtomicUsize,
+                processed: [AtomicUsize; 2],
+                parameters: [AtomicUsize; 2],
+                dropped: AtomicUsize,
+            }
+            struct Probe(crate::insert::InsertKey, Arc<Seen>, usize);
+            impl crate::insert::OrbitInsert for Probe {
+                fn key(&self) -> crate::insert::InsertKey {
+                    self.0
+                }
+                fn set_param(&mut self, _param: crate::insert::InsertParam, _frames: u32) {
+                    self.2 += 1;
+                    self.1.parameters[self.0.plugin as usize - 1].store(self.2, Ordering::Relaxed);
+                }
+                fn process(&mut self, _left: &mut [f32], _right: &mut [f32]) {
+                    self.1.processed[self.0.plugin as usize - 1].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            impl Drop for Probe {
+                fn drop(&mut self) {
+                    self.1.dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            fn until(what: &str, ready: impl Fn() -> bool) {
+                let start = std::time::Instant::now();
+                while !ready() {
+                    assert!(start.elapsed().as_secs() < 10, "{what}");
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+
+            let device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
+            let seen = Arc::new(Seen::default());
+            let key = |plugin| crate::insert::InsertKey { plugin, preset: 0 };
+            // A note with no provider plays dry, and a later request tries again.
+            device.ensure_insert(1, key(1));
+            device.set_insert_provider(Arc::new({
+                let seen = Arc::clone(&seen);
+                move |wanted, sample_rate, orbit| {
+                    assert_eq!((sample_rate, orbit), (48_000, 1));
+                    seen.built.fetch_add(1, Ordering::Relaxed);
+                    Some(Box::new(Probe(wanted, Arc::clone(&seen), 0)) as Box<_>)
+                }
+            }));
+            device.ensure_insert(1, key(1));
+            device.ensure_insert(1, key(1));
+            assert_eq!(seen.built.load(Ordering::Relaxed), 1);
+            // An effect runs for a note that asks for the effect.
+            let mut controls = crate::OscillatorControls {
+                orbit: 1,
+                ..Default::default()
+            };
+            let mut effect = crate::insert::InsertControls::new(key(1));
+            assert!(effect.push(crate::insert::InsertParam { id: 0, value: 0.5 }));
+            controls.effects[0] = Some(effect);
+            let mut event = AudioEvent {
+                onset_id: 1,
+                generation: device.generation(),
+                target_frame: device.clock_frames() + 4_800,
+                onset_lead: 0.0,
+                freq_hz: 220.0,
+                gain: 0.5,
+                duration_secs: 0.05,
+                ui_visuals: 0,
+                controls,
+                sample: None,
+                synth: None,
+                wavetable: None,
+                cut: None,
+            };
+            assert!(device.push(event));
+            until("the callback did not run the insert", || {
+                seen.processed[0].load(Ordering::Relaxed) > 0
+            });
+
+            // The output orbit moves. The physical insert and its state stay.
+            for orbit in [2, 1] {
+                event.onset_id += 1;
+                event.target_frame = device.clock_frames() + 4_800;
+                event.controls.orbit = orbit;
+                event.controls.insert_orbit = Some(1);
+                LiveReverbBatch::install_inserts(&device, &[event]);
+                assert_eq!(seen.built.load(Ordering::Relaxed), 1);
+                assert!(
+                    device
+                        .insert_waiting
+                        .lock()
+                        .expect("waiting inserts")
+                        .iter()
+                        .all(Option::is_none)
+                );
+                assert!(device.push(event));
+                until("the rerouted note did not reach the same insert", || {
+                    seen.parameters[0].load(Ordering::Relaxed) == event.onset_id as usize
+                });
+            }
+            assert!(device.holds_insert(1, key(1)));
+            assert!(!device.holds_insert(2, key(1)));
+            assert_eq!(seen.dropped.load(Ordering::Relaxed), 0);
+
+            device.ensure_insert(1, key(2));
+            assert_eq!(seen.built.load(Ordering::Relaxed), 2);
+            let staged_by = device.clock_frames() + 512;
+            until("the callback did not stage the replacement", || {
+                device.clock_frames() >= staged_by
+            });
+            assert_eq!(seen.processed[1].load(Ordering::Relaxed), 0);
+            assert_eq!(device.shared.samples.insert_returns.len(), 0);
+            event.onset_id += 1;
+            event.target_frame = device.clock_frames() + 4_800;
+            event.controls.effects[0] = Some(crate::insert::InsertControls::new(key(2)));
+            assert!(device.push(event));
+            until("the displaced insert did not come back", || {
+                seen.processed[1].load(Ordering::Relaxed) > 0
+                    && device.shared.samples.insert_returns.len() == 1
+            });
+            assert_eq!(seen.dropped.load(Ordering::Relaxed), 0);
+            device.reclaim_assets();
+            assert_eq!(seen.dropped.load(Ordering::Relaxed), 1);
         }
 
         #[test]

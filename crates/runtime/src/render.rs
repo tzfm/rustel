@@ -458,7 +458,26 @@ pub(crate) fn render_scalar_pcm_with_refusals(
     let mut backend = scalar_backend(dispatch, library, max_polyphony);
     let pcm = rustel_audio::render_pcm(&mut backend, sample_rate, frames, &events)
         .map_err(io::Error::other)?;
+    plugin_problems(&mut refused);
     Ok((pcm, refused))
+}
+
+/// Adds the problems of the plugin host in a render to `refused`, and
+/// prints each one as a refused voice is printed. A plugin process that
+/// ended in the render has its notice here.
+fn plugin_problems(refused: &mut Vec<String>) {
+    #[cfg(feature = "vst")]
+    for message in crate::vst::settle() {
+        if rustel_voice::direct_diagnostic_logging() {
+            let record = serde_json::json!({ "vst_skipped": { "message": &message } });
+            eprintln!("{record}");
+        }
+        if !refused.contains(&message) {
+            refused.push(message);
+        }
+    }
+    #[cfg(not(feature = "vst"))]
+    let _ = refused;
 }
 
 fn scalar_backend(
@@ -472,6 +491,11 @@ fn scalar_backend(
         for (id, decoded) in library.take_ready() {
             let _ = backend.install_sample(id, Box::new(decoded));
         }
+    }
+    // A render waits for each plugin, so the first note has its effect.
+    #[cfg(feature = "vst")]
+    if let Some(plugins) = crate::vst::started() {
+        backend.set_insert_provider(plugins.provider(true));
     }
     #[cfg(test)]
     tests::BUILT_DISPATCH.set(Some(backend.dispatch()));
@@ -719,7 +743,7 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
             observer(tick);
         }
     };
-    rustel_audio::write_wav_controlled(
+    let written = rustel_audio::write_wav_controlled(
         path,
         &mut backend,
         sample_rate,
@@ -733,9 +757,11 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
             limiter,
         },
         format,
-    )
-    .map(|bytes| (bytes, refused))
-    .map_err(io::Error::other)
+    );
+    plugin_problems(&mut refused);
+    written
+        .map(|bytes| (bytes, refused))
+        .map_err(io::Error::other)
 }
 
 /// Read a 16-bit stereo WAV the writer above produced back as interleaved

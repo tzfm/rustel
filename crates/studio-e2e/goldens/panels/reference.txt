@@ -1,9 +1,9 @@
   File  Edit  Scene  Transport  View  Options  Help                                                                                                   
  ◉ rustel STOPPED ✓ ready   120.0 bpm · 0.50 cps · cycle 0.00                                 setxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx ▸ first 
   1 first                                                                                                                                             
-  1 $: s("bd")                                                                               │ ref  samp  chord  scale  gen  examp       Tab switches 
+  1 $: s("bd")                                                                               │ ref  samp  chord  scale  vst  gen  examp  Tab switches 
   2                                                                                          │ search:                                                
-                                                                                             │ 788 functions · type tag: to narrow by kind            
+                                                                                             │ 790 functions · type tag: to narrow by kind            
                                                                                              │  temporal                                              
                                                                                              │  almostAlways  Shorthand for .sometimesBy(0.9, fn)     
                                                                                              │  almostNever  Shorthand for .sometimesBy(0.1, fn)      
@@ -36,5 +36,5 @@
                                                                                              │  fast  density Speed up a pattern by the given factor. 
                                                                                              │  fastChunk  Like chunk, but the cycles of the…         
                                                                                              │ ↑↓ move · → or Enter opens · Esc closes                
- reference - 788 entries; type to search                                              1,1                                                       0.0dB 
+ reference - 790 entries; type to search                                              1,1                                                       0.0dB 
  ♪ no output  ⌁ no midi                                                                                      MASTER ^⇧Up/^⇧Down       pk  --  LUFS -- 

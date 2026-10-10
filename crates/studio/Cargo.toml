@@ -11,19 +11,22 @@ description = "The terminal studio behind `rustel studio`: editor, visuals, mixe
 # The complete studio. `--no-default-features` keeps the editor and live
 # playback; each feature below adds one capability back and turns on the
 # runtime feature of the same name.
-default = ["extensions", "gamepad", "hydra", "osc", "serial", "remote-control"]
+default = ["extensions", "gamepad", "hydra", "osc", "serial", "remote-control", "vst"]
 extensions = ["dep:rustel-ext", "rustel-runtime/extensions"]
 gamepad = ["rustel-runtime/gamepad"]
 hydra = ["dep:rustel-hydra", "rustel-runtime/hydra"]
 osc = ["dep:rustel-osc", "rustel-runtime/osc"]
 serial = ["dep:rustel-serial", "rustel-runtime/serial"]
+vst = ["rustel-runtime/vst"]
 # Included in ordinary builds; enable the listener with the flag or Studio menu.
 remote-control = ["dep:getrandom"]
 # The end-to-end harness for the studio suite (`crates/studio-e2e`): a test
 # can open a real `App`, press real keys, and render the real frame into a
 # test backend. Not in `default` - the product must not depend on its own
 # test scaffolding, and this keeps the surface out of ordinary builds.
-harness = []
+# The harness pins what the runtime reads from the machine, such as the
+# plugin folders, through the runtime's test hooks.
+harness = ["rustel-runtime/test-support"]
 
 [dependencies]
 # Every studio plays live, lists MIDI ports so a score can name one without
@@ -107,4 +110,5 @@ rustel-runtime = { path = "../runtime", default-features = false, features = [
 ] }
 rustel-audio = { path = "../audio", features = ["test-support"] }
 rustel-fraction = { path = "../fraction" }
+rustel-vst3-fixture = { path = "../vst3-fixture" }
 rustel-mini = { path = "../mini" }

@@ -123,8 +123,12 @@ pub fn classify_from<'a>(lexer: Lexer, clusters: impl IntoIterator<Item = &'a st
             start += 1;
             continue;
         }
+        // A digit after the first letter is part of the name: `filter1on`.
         let mut end = start;
-        while end < clusters.len() && tokens[end] == Token::Text && is_word(clusters[end]) {
+        while end < clusters.len()
+            && matches!(tokens[end], Token::Text | Token::Number)
+            && is_word(clusters[end])
+        {
             end += 1;
         }
         let word: String = clusters[start..end].concat();
@@ -133,15 +137,13 @@ pub fn classify_from<'a>(lexer: Lexer, clusters: impl IntoIterator<Item = &'a st
             .find(|cluster| !cluster.chars().all(char::is_whitespace))
             .is_some_and(|cluster| cluster.starts_with('('));
         let class = if KEYWORDS.contains(&word.as_str()) {
-            Some(Token::Keyword)
+            Token::Keyword
         } else if called {
-            Some(Token::Function)
+            Token::Function
         } else {
-            None
+            Token::Text
         };
-        if let Some(class) = class {
-            tokens[start..end].fill(class);
-        }
+        tokens[start..end].fill(class);
         start = end;
     }
     tokens
@@ -370,7 +372,7 @@ mod tests {
     /// language's own words are neither calls nor ordinary text.
     #[test]
     fn a_word_is_read_as_a_call_or_a_keyword() {
-        let line = "const x = stack(s(\"bd\").fast(2))";
+        let line = "const x = stack(s(\"bd\").fast(2), osc2(), { filter1on: 1.5 })";
         let clusters: Vec<String> = line.chars().map(|c| c.to_string()).collect();
         let tokens = super::classify(clusters.iter().map(String::as_str));
         let at = |needle: &str| tokens[line.find(needle).expect("in the line")];
@@ -380,6 +382,12 @@ mod tests {
         assert_eq!(at("fast"), Token::Function);
         // A name that is not called stays ordinary text.
         assert_eq!(at("x ="), Token::Text);
+        // A digit in a name has the class of the name, and a number keeps
+        // its own.
+        assert_eq!(at("2()"), Token::Function);
+        assert_eq!(at("1on"), Token::Text);
+        assert_eq!(at("1.5"), Token::Number);
+        assert_eq!(at("5 }"), Token::Number);
         // And a word inside a string is still a string.
         assert_eq!(at("bd"), Token::String);
     }

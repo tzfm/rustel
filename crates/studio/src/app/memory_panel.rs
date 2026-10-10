@@ -74,6 +74,8 @@ impl App {
     pub(super) fn count_for_the_breakdown(&mut self) {
         self.memory_closed_files = self.closed_file_count();
         self.measure_sample_cache();
+        #[cfg(feature = "vst")]
+        self.measure_plugins();
     }
 
     /// Put the breakdown away, and remember that it was.
@@ -237,6 +239,10 @@ impl App {
             returned_when_stopped: rustel_runtime::free_memory::RELEASES_FREE_MEMORY,
             sample_cache: self.sample_cache_bytes.filter(|_| !pinned),
             fetch_imports: self.ui_settings.precache_sources,
+            #[cfg(feature = "vst")]
+            plugins: self.plugin_memory.clone(),
+            #[cfg(not(feature = "vst"))]
+            plugins: Vec::new(),
         }
     }
 
