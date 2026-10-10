@@ -190,7 +190,10 @@ pub(super) fn arrange<'js>(
             rquickjs::Exception::throw_range(&ctx, "arrangement cycles must be finite")
         })?;
         let value: rquickjs::Value = array.get(1)?;
-        let (pattern, nested) = reify_bridged(&ctx, &value)?;
+        let (mut pattern, nested) = reify_bridged(&ctx, &value)?;
+        if let Some(mark) = section_mark(array)? {
+            pattern = pattern.with_added_context(vec![mark]);
+        }
         sidecars.push(nested);
         total = total.checked_add(cycles).ok_or_else(|| {
             rquickjs::Exception::throw_range(&ctx, "arrangement total cycles overflow")
@@ -199,6 +202,22 @@ pub(super) fn arrange<'js>(
     }
     let pattern = rustel_core::combinators::stepcat(&items).slow(total);
     derive_wrapper(ctx, pattern, &sidecars)
+}
+
+/// The source span of the cycle count, which the transpiler appends to a
+/// section written in the score.
+fn section_mark(section: &rquickjs::Array<'_>) -> rquickjs::Result<Option<(usize, usize)>> {
+    let offset = |index| -> rquickjs::Result<Option<usize>> {
+        let value: rquickjs::Value = section.get(index)?;
+        Ok(value
+            .as_number()
+            .filter(|offset| *offset >= 0.0 && offset.fract() == 0.0)
+            .map(|offset| offset as usize))
+    };
+    Ok(match (offset(2)?, offset(3)?) {
+        (Some(from), Some(to)) if from < to => Some((from, to)),
+        _ => None,
+    })
 }
 
 pub(super) fn choose_lookup<'js>(

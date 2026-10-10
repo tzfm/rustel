@@ -29,6 +29,7 @@ use oxc_span::{GetSpan, SourceType};
 use oxc_syntax::xml_entities::XML_ENTITIES;
 use std::path::Path;
 
+mod arrange_marks;
 mod callback_ir;
 mod frequency_sliders;
 pub use callback_ir::{
@@ -2088,9 +2089,14 @@ fn transpile_here(source: &str, options: &TranspileOptions) -> TranspileOutput {
         mut diagnostics,
         map: mini_map,
     } = rewrite_mini_literals(source, options, &regexes, &ordinary_strings);
-    // The widget splice runs while its sites are one map from the source,
-    // before `rewrite_kabelsalat` moves them.
-    let widget_source = rewrite_widget_calls(&mini, &mini_map, &widgets, &sites);
+    // The splices run while their sites are one map from the source, before
+    // `rewrite_kabelsalat` moves them.
+    let mut splices = widget_splices(&mini, &mini_map, &widgets, &sites);
+    if options.emit_mini_locations {
+        splices.extend(arrange_marks::splices(source, options.block_offset));
+        splices.sort_by_key(|&(at, _)| at);
+    }
+    let widget_source = splice(&mini, &mini_map, &splices);
     let kabel = rewrite_kabelsalat(&widget_source, regexes_are_present);
     let labels = rewrite_labels(&kabel, regexes_are_present);
     let samples = rewrite_bare_samples(&labels);
@@ -2865,7 +2871,7 @@ fn visual_record(
     }
 }
 
-/// How `rewrite_widget_calls` splices a recorded call. Positions are source
+/// How `widget_splices` splices a recorded call. Positions are source
 /// offsets without `block_offset`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CallSite {
@@ -3201,46 +3207,55 @@ fn find_member_expression_start(bytes: &[u8], dot: usize, regexes: &RegexLiteral
     start
 }
 
-/// `rewritten`, the output of `rewrite_mini_literals`, with each recorded
-/// widget call spliced at its site, which `map` carries into it.
+/// Text to insert in the rewritten score, before the byte at a source offset.
+type Splice = (usize, String);
+
+/// The splices of the recorded widget calls, in source order.
 ///
 /// Each id lands on the call its record was made for, and unrecorded calls
-/// are left alone. Every splice is an insertion, so the score's text and line
-/// breaks survive. The sites arrive in source order.
-fn rewrite_widget_calls(
+/// are left alone. `rewritten` is the output of `rewrite_mini_literals`, and
+/// `map` carries each site into it.
+fn widget_splices(
     rewritten: &str,
     map: &RewriteMap,
     records: &[WidgetRecord],
     sites: &[CallSite],
-) -> String {
+) -> Vec<Splice> {
     debug_assert_eq!(records.len(), sites.len());
-    let mut output = String::with_capacity(rewritten.len() + records.len() * 24);
-    let mut cursor = 0usize;
-    let mut insert = |at: usize, text: &str| {
-        debug_assert!(cursor <= at, "widget sites out of source order");
-        output.push_str(&rewritten[cursor..at]);
-        output.push_str(text);
-        cursor = at;
-    };
+    let mut splices = Vec::with_capacity(records.len() * 2);
     for (record, site) in records.iter().zip(sites) {
         let open = match *site {
             CallSite::AsWritten => continue,
             CallSite::Slider { name_end, open } => {
-                insert(map.to_rewritten(name_end), "WithID");
+                splices.push((name_end, "WithID".to_string()));
                 open
             }
             CallSite::Method { open } => open,
         };
-        let at = map.to_rewritten(open + 1);
         let mut arguments = quote_single(&record.id);
         if let Some(slot) = record.visual_slot {
             arguments.push_str(", ");
             arguments.push_str(&slot.to_string());
         }
-        if rewritten.as_bytes().get(at) != Some(&b')') {
+        if rewritten.as_bytes().get(map.to_rewritten(open + 1)) != Some(&b')') {
             arguments.push_str(", ");
         }
-        insert(at, &arguments);
+        splices.push((open + 1, arguments));
+    }
+    splices
+}
+
+/// `rewritten` with `splices` inserted. The splices arrive in source order.
+/// Every splice is an insertion, so the score's text and line breaks survive.
+fn splice(rewritten: &str, map: &RewriteMap, splices: &[Splice]) -> String {
+    let mut output = String::with_capacity(rewritten.len() + splices.len() * 24);
+    let mut cursor = 0usize;
+    for (source, text) in splices {
+        let at = map.to_rewritten(*source);
+        debug_assert!(cursor <= at, "splices out of source order");
+        output.push_str(&rewritten[cursor..at]);
+        output.push_str(text);
+        cursor = at;
     }
     output.push_str(&rewritten[cursor..]);
     output

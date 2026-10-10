@@ -166,6 +166,21 @@ old score keeps playing while a new score loads. Stop cancels a pending update.
 In asynchronous load mode, notes whose sounds are not ready can be skipped.
 Change this option under Settings ▸ Advanced ▸ Playback.
 
+During playback, Studio marks each mini-notation value while its note sounds.
+In an `arrange` call, Studio also marks the cycle count of the section in
+play, so you see your place in the song:
+
+```js
+arrange(
+  [8, note("c2*4")],
+  [4, note("c2*4, g3*8")]
+)
+```
+
+The `8` stays marked for 8 cycles, then the `4` for 4 cycles. A section needs
+the form `[cycles, pattern]` inside the call to get a mark. A section with no
+sound has no mark.
+
 ### Launch timing
 
 The launch setting selects immediate playback or the next beat, cycle, two
