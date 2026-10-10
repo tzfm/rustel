@@ -53,6 +53,12 @@ with `SuperDirt (OSC):`. Describe required receiver setup once. Parameters
 should state meaning and units. OSC forwarding alone does not prove receiver
 support.
 
+The `osc`, `serial`, `fm_matrix`, `bind` and `internals` tags also set
+visibility. Settings ▸ Reference has one switch for each. Give `osc` to every
+entry only an OSC receiver reads, including controls with no native effect. A
+control with a native effect does not take `superdirt`. A test fails when a
+`superdirt` entry has no `osc` tag.
+
 ## Existing checks
 
 - Studio reference tests check installed names, aliases, and exact symbols.

@@ -61,6 +61,13 @@ impl Widget for SettingsSheetView<'_> {
         buffer.set_stringn(
             panel.x + 56,
             panel.y,
+            " reference ",
+            11,
+            tab_style(SettingsPage::Reference),
+        );
+        buffer.set_stringn(
+            panel.x + 68,
+            panel.y,
             " about ",
             7,
             tab_style(SettingsPage::About),
@@ -238,6 +245,7 @@ impl Widget for SettingsSheetView<'_> {
                 },
                 Row::RefreshSources => String::new(),
                 Row::SampleCache => self.sample_cache.clone(),
+                Row::ReferenceCategory(category) => on_off(self.settings.shows_category(*category)),
             };
             let marker = if selected {
                 format!("{} ", super::super::terminal::symbol("▸"))

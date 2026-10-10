@@ -304,6 +304,9 @@ pub struct StudioPrefs {
     /// background rather than on the first note that needs it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precache_sources: Option<bool>,
+    /// The reference categories the player hides, by tag.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reference_hidden: Vec<String>,
     /// What an imported bank was renamed to, by the name it arrived under.
     /// An overlay: the files are untouched, and removing the entry brings
     /// the old name back.
@@ -761,6 +764,14 @@ impl StudioPrefs {
             show_header: self.show_header.unwrap_or(defaults.show_header),
             show_footer: self.show_footer.unwrap_or(defaults.show_footer),
             precache_sources: self.precache_sources.unwrap_or(defaults.precache_sources),
+            reference_hidden: super::reference::Category::ALL
+                .into_iter()
+                .filter(|category| {
+                    self.reference_hidden
+                        .iter()
+                        .any(|tag| tag == category.tag())
+                })
+                .collect(),
             sample_ceiling: self
                 .sample_ceiling
                 .as_deref()
@@ -882,6 +893,10 @@ impl StudioPrefs {
         self.sample_ceiling = Some(settings.sample_ceiling.key().to_owned());
         self.unused_sample_idle = Some(settings.unused_sample_idle.key().to_owned());
         self.precache_sources = Some(settings.precache_sources);
+        self.reference_hidden = settings
+            .hidden_categories()
+            .map(|category| category.tag().to_owned())
+            .collect();
         self.show_menu = Some(settings.show_menu);
         self.show_header = Some(settings.show_header);
         self.show_footer = Some(settings.show_footer);
@@ -1711,6 +1726,26 @@ mod tests {
                 serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
             assert_eq!(restored.ui_settings().show_scrollbars, enabled);
         }
+    }
+
+    #[test]
+    fn reference_categories_keep_only_hidden_tags() {
+        use super::super::reference::Category;
+        let legacy: StudioPrefs = serde_json::from_str("{}").unwrap();
+        assert!(legacy.ui_settings().shows_category(Category::Osc));
+        let mut prefs = StudioPrefs::default();
+        prefs.set_ui_settings(&legacy.ui_settings());
+        let json = serde_json::to_string(&prefs).unwrap();
+        assert!(!json.contains("reference_hidden"), "{json}");
+
+        let mut settings = legacy.ui_settings();
+        settings.reference_hidden.push(Category::Osc);
+        prefs.set_ui_settings(&settings);
+        let json = serde_json::to_string(&prefs).unwrap();
+        assert!(json.contains(r#""reference_hidden":["osc"]"#), "{json}");
+        let restored: StudioPrefs = serde_json::from_str(&json).unwrap();
+        assert!(!restored.ui_settings().shows_category(Category::Osc));
+        assert!(restored.ui_settings().shows_category(Category::Serial));
     }
 
     #[test]

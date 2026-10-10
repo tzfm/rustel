@@ -800,7 +800,7 @@ impl App {
             }
             (Some(_), None) => format!(
                 "reference - {} entries; type to search",
-                self.reference.len()
+                self.reference.len() - self.reference.hidden_len()
             ),
             (None, _) => "reference closed".into(),
         };

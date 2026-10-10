@@ -1326,6 +1326,11 @@ impl ReferenceView<'_> {
                         .join(", ");
                     format!("tags: {names}")
                 } else {
+                    // Hidden entries are not in the count. The empty box
+                    // says how many are hidden, so a short list does not
+                    // look broken.
+                    let hidden = self.reference.hidden_len();
+                    let shown = self.reference.len() - hidden;
                     match filter.label() {
                         // Naming the filter is what tells a reader the short
                         // list is the whole answer and not a search that went
@@ -1339,15 +1344,13 @@ impl ReferenceView<'_> {
                         // the same on both sides of the `of`. The row
                         // names the `tag:` filter instead, so a reader can
                         // find it.
-                        None if self.panel.query.is_empty() => format!(
-                            "{} functions · type tag: to narrow by kind",
-                            self.reference.len()
-                        ),
-                        None => format!(
-                            "{} of {} functions",
-                            self.panel.results.len(),
-                            self.reference.len()
-                        ),
+                        None if self.panel.query.is_empty() && hidden > 0 => {
+                            format!("{shown} functions · {hidden} hidden · type tag: to narrow")
+                        }
+                        None if self.panel.query.is_empty() => {
+                            format!("{shown} functions · type tag: to narrow by kind")
+                        }
+                        None => format!("{} of {shown} functions", self.panel.results.len()),
                     }
                 }
             }

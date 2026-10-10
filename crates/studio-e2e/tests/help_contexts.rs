@@ -73,8 +73,9 @@ fn help_names_the_editor_by_default() {
     assert_eq!(studio.focus(), None, "the keys went back to the score");
 }
 
-/// The settings sheet has six pages, and help follows the one being shown:
-/// Settings, then Sources (imports and packs), then About (the terminal).
+/// The settings sheet has seven pages, and help follows the one being shown:
+/// Settings, then Sources (imports and packs), then Reference (switches,
+/// like Settings), then About (the terminal).
 #[test]
 fn help_follows_the_settings_pages() {
     let mut studio = hermetic();
@@ -104,7 +105,15 @@ fn help_follows_the_settings_pages() {
         "Fetch imports, cache all remote packs, refresh their lists",
     );
 
-    // The page after Sources is About.
+    // The page after Sources is Reference, whose rows are switches.
+    studio.press(KeyCode::Tab, KeyModifiers::NONE);
+    assert_help_page(
+        &mut studio,
+        "settings",
+        "Settings change live and are remembered when they change.",
+    );
+
+    // The page after Reference is About.
     studio.press(KeyCode::Tab, KeyModifiers::NONE);
     assert_help_page(
         &mut studio,

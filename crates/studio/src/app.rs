@@ -26425,7 +26425,7 @@ mod tests {
             assert_eq!(settings, crate::settings::UiSettings::default());
 
             sheet.key(KeyCode::Tab, &mut settings, &features);
-            assert_eq!(sheet.page(), SettingsPage::About, "Tab still pages");
+            assert_eq!(sheet.page(), SettingsPage::Reference, "Tab still pages");
             sheet.show_page(SettingsPage::Sources);
             assert_eq!(
                 sheet.key(KeyCode::Esc, &mut settings, &features),
@@ -39897,6 +39897,10 @@ impl App {
             sliders_revision: None,
             live_sliders: HashMap::new(),
         };
+        // The reference leaves out what the settings hide from the first
+        // frame, before a terminal is adopted.
+        app.reference
+            .set_hidden(app.ui_settings.hidden_categories());
         // The set open now is the one a bare launch opens next time, and
         // the newest of the recent ones.
         app.remember_current_set();
