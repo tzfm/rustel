@@ -3046,9 +3046,13 @@ mod tests {
         fn the_list_gathers_its_results_under_the_tag_each_is_filed_by() {
             let reference = Reference::load_all();
             let searched = ReferencePanel::browse_for(&reference, "lpf");
+            let first_name = searched
+                .browse_rows()
+                .iter()
+                .find(|row| matches!(row, BrowseRow::Entry(_)));
             assert!(
-                matches!(searched.browse_rows().first(), Some(BrowseRow::Tag(0))),
-                "a search opens over the best answer"
+                matches!(first_name, Some(BrowseRow::Entry(0))),
+                "a search opens on the best answer"
             );
             let panel = ReferencePanel::browse(&reference);
             let rows = panel.browse_rows();
