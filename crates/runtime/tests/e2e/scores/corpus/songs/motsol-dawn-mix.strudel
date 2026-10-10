@@ -6,8 +6,6 @@
 // @title Mot solnedgången (dawn mix)
 // @by Rymdljus, Atraeus remix with sample and arrange by Janeishly
 // alternate arrangement by Rymdljus with twiddly bits by Multidroid
-// The original anthemsnippet sample left its source repository on 2026-10-09.
-// The name now plays the bev vocal from Dirt-Samples.
 samples({ anthemsnippet: 'bev/00-mono.wav' }, 'github:tidalcycles/Dirt-Samples/master/')
 setcpm (120/4)
 
