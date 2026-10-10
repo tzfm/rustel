@@ -29,6 +29,7 @@ use super::editor::KeyboardCapabilities;
 use super::engine::StudioDeviceInfo;
 use super::graphics::{RenderingMode, Tier};
 use super::prebake::{PrebakeRow, PrebakeScope};
+use super::reference::Category;
 use super::terminal::{CaretShape, TerminalFeatures};
 use super::theme::Theme;
 
@@ -1554,6 +1555,8 @@ pub struct UiSettings {
     /// Whether an imported source is fetched into the cache in the
     /// background rather than on the first note that needs it.
     pub precache_sources: bool,
+    /// The reference categories the browse list and the suggestions hide.
+    pub reference_hidden: Vec<Category>,
 }
 
 impl Default for UiSettings {
@@ -1612,6 +1615,7 @@ impl Default for UiSettings {
             sample_ceiling: SampleCeiling::default(),
             unused_sample_idle: UnusedSampleIdle::Standard,
             precache_sources: false,
+            reference_hidden: Vec::new(),
         }
     }
 }
@@ -1641,6 +1645,18 @@ impl UiSettings {
             character: self.master_limiter_character,
         }
     }
+    /// Whether the reference lists `category`.
+    pub fn shows_category(&self, category: Category) -> bool {
+        !self.reference_hidden.contains(&category)
+    }
+
+    /// The hidden categories, in [`Category::ALL`] order.
+    pub fn hidden_categories(&self) -> impl Iterator<Item = Category> + '_ {
+        Category::ALL
+            .into_iter()
+            .filter(|category| !self.shows_category(*category))
+    }
+
     /// Make the switches current; the tier is set by the caller, who knows
     /// the terminal.
     pub fn apply(&self) {
@@ -1739,6 +1755,8 @@ enum Row {
     RefreshSources,
     /// Not a setting: how much the sample cache holds, and Enter to empty it.
     SampleCache,
+    /// Whether the reference and the suggestions list this category.
+    ReferenceCategory(Category),
 }
 
 /// Enough visual effect to be present, little enough to read code over.
@@ -1927,6 +1945,16 @@ const ADVANCED_ROWS: &[Row] = &[
     Row::UnusedSampleIdle,
 ];
 
+/// The reference page: which kinds of entry the reference column and the
+/// editor's suggestions offer.
+const REFERENCE_ROWS: &[Row] = &[
+    Row::ReferenceCategory(Category::Osc),
+    Row::ReferenceCategory(Category::Serial),
+    Row::ReferenceCategory(Category::FmMatrix),
+    Row::ReferenceCategory(Category::Bind),
+    Row::ReferenceCategory(Category::Internals),
+];
+
 /// Cache controls at the top of the Sources page, before imports and
 /// shipped packs.
 const SOURCES_CONTROLS: &[Row] = &[
@@ -2083,6 +2111,7 @@ impl Row {
             | Self::CacheDefaults
             | Self::RefreshSources
             | Self::SampleCache => "Sample cache",
+            Self::ReferenceCategory(_) => "Listed in the reference",
         }
     }
 
@@ -2144,6 +2173,11 @@ impl Row {
             Self::CacheDefaults => "cache all",
             Self::RefreshSources => "refresh all",
             Self::SampleCache => "clear cache",
+            Self::ReferenceCategory(Category::Osc) => "OSC / SuperDirt",
+            Self::ReferenceCategory(Category::Serial) => "serial",
+            Self::ReferenceCategory(Category::FmMatrix) => "FM routing matrix",
+            Self::ReferenceCategory(Category::Bind) => "bind & join",
+            Self::ReferenceCategory(Category::Internals) => "pattern internals",
         }
     }
 
@@ -2218,6 +2252,21 @@ impl Row {
             Self::CacheDefaults => "Enter caches every remote pack onto disk",
             Self::RefreshSources => "Enter refetches every remote pack's list",
             Self::SampleCache => "Enter twice empties downloaded samples",
+            Self::ReferenceCategory(Category::Osc) => {
+                "osc() and controls only SuperDirt reads · tag:osc lists them anyway"
+            }
+            Self::ReferenceCategory(Category::Serial) => {
+                "serial() output · tag:serial lists it anyway"
+            }
+            Self::ReferenceCategory(Category::FmMatrix) => {
+                "fmi12…fmi88: route one operator into another · tag:fm_matrix lists them anyway"
+            }
+            Self::ReferenceCategory(Category::Bind) => {
+                "bind, join, appLeft: for writing pattern functions · tag:bind lists them anyway"
+            }
+            Self::ReferenceCategory(Category::Internals) => {
+                "withHap, splitQueries and other hap plumbing · tag:internals lists them anyway"
+            }
         }
     }
 }
@@ -2273,6 +2322,8 @@ pub enum SettingsPage {
     Keybinds,
     /// The folders and packs the player imported.
     Sources,
+    /// Which kinds of entry the reference and the suggestions offer.
+    Reference,
     About,
 }
 
@@ -2287,7 +2338,7 @@ struct SettingsPosition {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct SettingsNavigation {
     page: SettingsPage,
-    positions: [SettingsPosition; 6],
+    positions: [SettingsPosition; 7],
 }
 
 impl SettingsNavigation {
@@ -2408,7 +2459,10 @@ pub enum SettingsAction {
 
 impl SettingsSheet {
     pub(super) const fn shows_settings(self) -> bool {
-        matches!(self.page, SettingsPage::Settings | SettingsPage::Advanced)
+        matches!(
+            self.page,
+            SettingsPage::Settings | SettingsPage::Advanced | SettingsPage::Reference
+        )
     }
 
     /// The mapping page: a grid of slot boxes, so its keys are a grid's.
@@ -2664,6 +2718,7 @@ impl SettingsSheet {
         match self.page {
             SettingsPage::Settings => ROWS,
             SettingsPage::Advanced => ADVANCED_ROWS,
+            SettingsPage::Reference => REFERENCE_ROWS,
             SettingsPage::Mapping
             | SettingsPage::Keybinds
             | SettingsPage::Sources
@@ -2744,14 +2799,16 @@ impl SettingsSheet {
             return SettingsAction::Nothing;
         }
         let choices: Vec<(usize, usize)> = match self.page {
-            SettingsPage::Settings | SettingsPage::Advanced => grouped_rows(self.rows())
-                .iter()
-                .enumerate()
-                .filter_map(|(line, row)| match row {
-                    DisplayRow::Control(index) => Some((line, *index)),
-                    _ => None,
-                })
-                .collect(),
+            SettingsPage::Settings | SettingsPage::Advanced | SettingsPage::Reference => {
+                grouped_rows(self.rows())
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(line, row)| match row {
+                        DisplayRow::Control(index) => Some((line, *index)),
+                        _ => None,
+                    })
+                    .collect()
+            }
             SettingsPage::Sources => source_lines(self.source_count, self.default_count)
                 .iter()
                 .enumerate()
@@ -2935,6 +2992,15 @@ impl SettingsSheet {
                     settings.unused_sample_idle = settings.unused_sample_idle.step(forwards);
                 }
                 Row::PrecacheSources => set_switch(&mut settings.precache_sources),
+                Row::ReferenceCategory(category) => {
+                    if settings.shows_category(category) {
+                        settings.reference_hidden.push(category);
+                    } else {
+                        settings
+                            .reference_hidden
+                            .retain(|hidden| *hidden != category);
+                    }
+                }
             }
         };
         // Esc and Tab are the sheet's whatever page is up: a page that
@@ -3004,12 +3070,13 @@ impl SettingsSheet {
                 {
                     self.webcam_preview = false;
                 }
-                const PAGES: [SettingsPage; 6] = [
+                const PAGES: [SettingsPage; 7] = [
                     SettingsPage::Settings,
                     SettingsPage::Advanced,
                     SettingsPage::Mapping,
                     SettingsPage::Keybinds,
                     SettingsPage::Sources,
+                    SettingsPage::Reference,
                     SettingsPage::About,
                 ];
                 let at = PAGES
@@ -3109,7 +3176,10 @@ impl SettingsSheet {
         if x >= panel.x + 45 && x < panel.x + 54 {
             return Some(SettingsPage::Sources);
         }
-        if x >= panel.x + 56 && x < panel.x + 63 {
+        if x >= panel.x + 56 && x < panel.x + 67 {
+            return Some(SettingsPage::Reference);
+        }
+        if x >= panel.x + 68 && x < panel.x + 75 {
             return Some(SettingsPage::About);
         }
         None
@@ -3248,7 +3318,7 @@ impl SettingsSheet {
         };
         let shown = usize::from(rows.height).max(1);
         self.first = match self.page {
-            SettingsPage::Settings | SettingsPage::Advanced => {
+            SettingsPage::Settings | SettingsPage::Advanced | SettingsPage::Reference => {
                 self.first_line(shown, &grouped_rows(self.rows()))
             }
             SettingsPage::Keybinds => self.first_row(shown, self.keybind_count),
@@ -3545,10 +3615,10 @@ impl SettingsSheetView<'_> {
     /// one sentence twice. A narrow terminal trims the copy on the row,
     /// and there the block earns its place.
     ///
-    /// Measured over both pages of controls, because the sheet is one
+    /// Measured over every page of controls, because the sheet is one
     /// height for all of them.
     fn explain_rows(available: Rect) -> u16 {
-        let controls = || ROWS.iter().chain(ADVANCED_ROWS);
+        let controls = || ROWS.iter().chain(ADVANCED_ROWS).chain(REFERENCE_ROWS);
         let label = controls()
             .map(|row| row.label().chars().count())
             .max()
@@ -7170,6 +7240,8 @@ mod tests {
         sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default());
         assert_eq!(sheet.page, SettingsPage::Sources);
         sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default());
+        assert_eq!(sheet.page, SettingsPage::Reference);
+        sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default());
         assert_eq!(sheet.page, SettingsPage::About);
         // The About page reads; a key it has no use for is the score's.
         assert_eq!(
@@ -7177,6 +7249,12 @@ mod tests {
             SettingsAction::Ignored
         );
         assert_eq!(settings, original);
+        sheet.key(
+            KeyCode::BackTab,
+            &mut settings,
+            &TerminalFeatures::default(),
+        );
+        assert_eq!(sheet.page, SettingsPage::Reference);
         sheet.key(
             KeyCode::BackTab,
             &mut settings,
@@ -7224,7 +7302,7 @@ mod tests {
         assert_eq!(sheet.selected, 1, "the same page keeps its row");
     }
 
-    /// The six tabs each answer to their own strip of the title row.
+    /// The seven tabs each answer to their own strip of the title row.
     #[test]
     fn every_tab_has_its_own_click_strip() {
         let area = Rect::new(0, 0, 120, 40);
@@ -7239,13 +7317,40 @@ mod tests {
         assert_eq!(at(43), Some(SettingsPage::Keybinds));
         assert_eq!(at(45), Some(SettingsPage::Sources));
         assert_eq!(at(53), Some(SettingsPage::Sources));
-        assert_eq!(at(56), Some(SettingsPage::About));
-        assert_eq!(at(62), Some(SettingsPage::About));
+        assert_eq!(at(56), Some(SettingsPage::Reference));
+        assert_eq!(at(66), Some(SettingsPage::Reference));
+        assert_eq!(at(68), Some(SettingsPage::About));
+        assert_eq!(at(74), Some(SettingsPage::About));
         assert_eq!(at(23), None, "the gap between tabs is nobody's");
         assert_eq!(at(33), None);
         assert_eq!(at(44), None);
         assert_eq!(at(54), None);
         assert_eq!(at(55), None);
+        assert_eq!(at(67), None);
+    }
+
+    /// Every category starts listed. Each row hides one category.
+    #[test]
+    fn reference_page_switches_categories() {
+        let mut settings = UiSettings::default();
+        assert_eq!(settings.hidden_categories().count(), 0);
+        let mut sheet = SettingsSheet::default();
+        sheet.show_page(SettingsPage::Reference);
+        let features = TerminalFeatures::default();
+        for (index, category) in Category::ALL.into_iter().enumerate() {
+            sheet.select(index);
+            assert_eq!(
+                sheet.key(KeyCode::Char(' '), &mut settings, &features),
+                SettingsAction::Changed
+            );
+            assert!(!settings.shows_category(category), "{category:?}");
+        }
+        assert_eq!(
+            settings.hidden_categories().collect::<Vec<_>>(),
+            Category::ALL
+        );
+        sheet.key(KeyCode::Left, &mut settings, &features);
+        assert!(settings.shows_category(Category::Internals));
     }
 
     #[test]
