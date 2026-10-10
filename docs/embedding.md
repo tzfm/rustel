@@ -75,6 +75,31 @@ Ordinary JavaScript side effects already performed before a refusal remain
 in the runtime. The legacy `evaluate_score` method keeps its unbounded
 execution contract.
 
+## Parse on the stack of the host
+
+The `transpiler` module spawns a thread with 256 MiB of stack for every parse
+of a score. A host with no threads gets a refusal diagnostic from every
+`transpile` call. A host which already runs on a large stack of its own pays
+for a thread the host does not need. Wrap the calls in
+`transpiler::on_caller_stack`:
+
+```rust
+use rustel_engine::transpiler::{TranspileOptions, on_caller_stack, transpile};
+
+let output = on_caller_stack(|| transpile(source, &TranspileOptions::default()));
+```
+
+Inside the closure no parse spawns a thread. This holds for `awaits_in_code`
+and for the `JsRuntime` calls which evaluate a score, such as
+`evaluate_score_cancellable`, because they transpile first. Calls nest, and
+the setting belongs to the calling thread.
+
+The host then owns the stack size. The nesting checks still run first, so
+source which nests too deep or spends too many bytes on structure gets a
+diagnostic. A source which defeats the lexical scan overflows the stack of the
+calling thread. The thread which the module spawns has 256 MiB for this case.
+Calls outside `on_caller_stack` keep the spawned thread.
+
 ## Reuse scores with a native audio callback
 
 Enable `session` while keeping device ownership in the application:
