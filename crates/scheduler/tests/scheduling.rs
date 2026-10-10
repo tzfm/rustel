@@ -352,34 +352,35 @@ fn deadline_budget_fits_the_remaining_horizon() {
     let query_max = *queries.last().unwrap();
 
     // Measure wake jitter through the condition-variable path. A plain
-    // `thread::sleep` would only measure timer granularity.
+    // `thread::sleep` would only measure timer granularity. The waiter asks
+    // for each signal. Two signals merged into one wake would leave a
+    // timestamp in the channel, and each later sample would read its age.
     let waker = Arc::new(rustel_scheduler::Waker::default());
     let mut jitter: Vec<Duration> = Vec::with_capacity(WAKE_SAMPLES);
     {
         let w = waker.clone();
+        let (ask, asked) = std::sync::mpsc::channel::<()>();
         let (tx, rx) = std::sync::mpsc::channel::<Instant>();
         let producer = std::thread::spawn(move || {
-            for _ in 0..WAKE_SAMPLES {
+            while asked.recv().is_ok() {
                 std::thread::sleep(Duration::from_micros(50));
                 tx.send(Instant::now()).unwrap();
                 w.signal();
             }
         });
         for _ in 0..WAKE_SAMPLES {
-            if waker.wait(Duration::from_millis(50))
-                && let Ok(sent) = rx.recv_timeout(Duration::from_millis(50))
-            {
-                jitter.push(sent.elapsed());
-            }
+            ask.send(()).unwrap();
+            assert!(
+                waker.wait(Duration::from_secs(5)),
+                "the producer sent no signal"
+            );
+            jitter.push(rx.recv().unwrap().elapsed());
         }
+        drop(ask);
         producer.join().unwrap();
     }
     jitter.sort();
-    let wake_p999 = if jitter.is_empty() {
-        Duration::ZERO
-    } else {
-        percentile(&jitter, 0.999)
-    };
+    let wake_p999 = percentile(&jitter, 0.999);
 
     // --- H_remaining on a partly drained horizon
     let (_t, mut s, clk) = setup();
@@ -394,10 +395,9 @@ fn deadline_budget_fits_the_remaining_horizon() {
     let deadline = s.affordable_deadline(clk.now(), overhead);
 
     println!(
-        "scheduler timing budget on {} ({} arch)\n           samples ............ query {QUERY_SAMPLES}, wake {} (of {WAKE_SAMPLES}), recovery {RECOVERY_SAMPLES}\n           H_remaining ........ {:?}\n           interrupt_recovery . p99.9 {:?}\n           query .............. p50 {:?}  p99.9 {:?}  max {:?}\n           wake_jitter ........ p99.9 {:?} (condvar path)\n           overhead ........... {:?}\n           safety factor ...... {}x\n           => D (afforded) .... {:?}",
+        "scheduler timing budget on {} ({} arch)\n           samples ............ query {QUERY_SAMPLES}, wake {WAKE_SAMPLES}, recovery {RECOVERY_SAMPLES}\n           H_remaining ........ {:?}\n           interrupt_recovery . p99.9 {:?}\n           query .............. p50 {:?}  p99.9 {:?}  max {:?}\n           wake_jitter ........ p99.9 {:?} (condvar path)\n           overhead ........... {:?}\n           safety factor ...... {}x\n           => D (afforded) .... {:?}",
         std::env::consts::OS,
         std::env::consts::ARCH,
-        jitter.len(),
         Duration::from_secs_f64(h_remaining),
         recovery_p999,
         query_p50,
@@ -409,11 +409,6 @@ fn deadline_budget_fits_the_remaining_horizon() {
         deadline,
     );
 
-    assert!(
-        jitter.len() > WAKE_SAMPLES / 2,
-        "too few wake samples ({}) to characterise jitter",
-        jitter.len()
-    );
     let d = deadline.unwrap_or_else(|| {
         panic!(
             "budget does not close on {}/{}: overhead {:?} x{} safety >= H_remaining {:?}",
