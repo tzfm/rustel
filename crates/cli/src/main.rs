@@ -1029,7 +1029,8 @@ enum Command {
     /// Open the native modeless terminal studio.
     ///
     /// The score is edited and visualized in-process; F5 updates and plays,
-    /// F8 stops, and Ctrl+S also updates. A missing file opens as a new score.
+    /// F8 stops, and Ctrl+S also updates. A missing `.strudel` file opens as a
+    /// new score. Any other missing path opens as a new set folder.
     #[cfg(feature = "studio")]
     Studio {
         /// A set folder, or a score to open with its folder as the set.

@@ -29,7 +29,9 @@ RUSTEL_SESSION_DIR=/media/usb/sets rustel play song.strudel --watch
 Studio accepts the same three flags. `RUSTEL_SESSION_DIR` does not move Studio
 tapes. With no path, Studio opens the last set. On first use, or when that
 folder is gone, it creates a new set in the sets folder and names it for the
-date. A score path that does not exist opens an unsaved starter score.
+date. A missing path that ends in `.strudel` opens an unsaved starter score.
+Any other missing path, such as `rustel studio set1`, creates a new set folder.
+Its tapes go to `set1/sessions`.
 
 | Mode | Contents |
 | --- | --- |
