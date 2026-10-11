@@ -188,4 +188,55 @@ mod tests {
             assert!(access.permit_origin(refused).is_err(), "{refused}");
         }
     }
+
+    /// A loopback server that answers each request with `reply(path)`.
+    fn serve(reply: fn(&str) -> Vec<u8>) -> String {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let origin = format!("http://{}", listener.local_addr().expect("address"));
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(&stream);
+                let mut request = String::new();
+                reader.read_line(&mut request).ok();
+                let mut header = String::new();
+                while reader.read_line(&mut header).is_ok_and(|read| read > 2) {
+                    header.clear();
+                }
+                let path = request.split_whitespace().nth(1).unwrap_or("/");
+                (&stream).write_all(&reply(path)).ok();
+            }
+        });
+        origin
+    }
+
+    #[test]
+    fn a_fetch_follows_redirects_on_its_origin_and_caps_the_size() {
+        fn reply(path: &str) -> Vec<u8> {
+            let response = |status: &str, headers: &str, body: &[u8]| {
+                let head = format!(
+                    "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                [head.as_bytes(), body].concat()
+            };
+            match path {
+                "/script.js" => response("200 OK", "", b"globalThis.a = 1"),
+                "/same" => response("302 Found", "Location: /script.js\r\n", b""),
+                "/away" => response("302 Found", "Location: http://localhost:1/x.js\r\n", b""),
+                _ => response("200 OK", "", &vec![b'a'; MAX_IMPORT_BYTES + 1]),
+            }
+        }
+        let origin = serve(reply);
+        let get = |path: &str| fetch(&Url::parse(&format!("{origin}{path}")).expect("url"));
+        assert_eq!(get("/script.js").as_deref(), Ok("globalThis.a = 1"));
+        assert_eq!(get("/same").as_deref(), Ok("globalThis.a = 1"));
+        assert!(
+            get("/away")
+                .unwrap_err()
+                .contains("leaves the trusted origin")
+        );
+        assert!(get("/big").unwrap_err().contains("larger than"));
+    }
 }
