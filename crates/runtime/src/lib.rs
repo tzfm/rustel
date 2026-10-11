@@ -55,6 +55,7 @@ pub mod samples;
 /// The shared "is this a valid score" answer behind `check` and
 /// `query`: the static lint plus a fallback-free dry evaluation.
 pub mod score_check;
+mod score_import;
 #[cfg(feature = "serial")]
 pub mod serial_bridge;
 mod session;
@@ -145,6 +146,7 @@ pub use samples::{
     SCORE_SAMPLE_CACHE_SESSION_MAX_BYTES, SCORE_SAMPLE_CACHE_SESSION_MAX_ENTRIES,
     ScoreSampleAccess, clear_score_sample_cache, sample_cache_dir, score_sample_cache_dir,
 };
+pub use score_import::{ScoreImportAccess, import_origin};
 pub use session::{
     EvaluateSource, PREVIEW_ONSET_ID_FLAG, RuntimeError, SAMPLE_AWAITED_DIAGNOSTIC,
     SAMPLE_LOADING_DIAGNOSTIC, Session, SessionConfig, SessionDiagnostic, VOICE_NOTICE_DIAGNOSTIC,

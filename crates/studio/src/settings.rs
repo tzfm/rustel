@@ -2325,6 +2325,8 @@ pub enum SettingsPage {
     Sources,
     /// Which kinds of entry the reference and the suggestions offer.
     Reference,
+    /// The origins a score imports scripts from, and the ones refused so far.
+    Trust,
     About,
 }
 
@@ -2339,7 +2341,7 @@ struct SettingsPosition {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct SettingsNavigation {
     page: SettingsPage,
-    positions: [SettingsPosition; 7],
+    positions: [SettingsPosition; 8],
 }
 
 impl SettingsNavigation {
@@ -2373,6 +2375,9 @@ pub struct SettingsSheet {
     /// How many keybind rows the keybinds page is showing, for the same
     /// reason as `source_count`.
     pub keybind_count: usize,
+    /// How many origins the trust page is showing: the trusted ones, then
+    /// the ones refused in this studio.
+    pub trust_count: usize,
     /// The first line of the page drawn, kept from key to key so walking
     /// through the middle of a page leaves it still. The page keeps a margin
     /// of rows around the selection; see [`super::scroll`].
@@ -2446,6 +2451,10 @@ pub enum SettingsAction {
     /// back. Space is not among them - it types spaces, and a reflexive
     /// press on a row must not clear a binding.
     ClearKeybind(BindAction),
+    /// Enter on a trust row: trust the origin, if it is a refused one.
+    TrustImport(usize),
+    /// Delete, Backspace or `d` on a trust row: take the origin off the page.
+    ForgetImport(usize),
     /// Ask before replacing all overrides with this terminal's defaults.
     AskResetKeybinds,
     /// The second Enter on the reset row confirmed replacing all overrides.
@@ -2474,6 +2483,38 @@ impl SettingsSheet {
     /// The keybinds page: a list of actions, so its keys are a list's.
     pub(super) const fn shows_keybinds(self) -> bool {
         matches!(self.page, SettingsPage::Keybinds)
+    }
+
+    /// The trust page: a list of origins.
+    pub(super) const fn shows_trust(self) -> bool {
+        matches!(self.page, SettingsPage::Trust)
+    }
+
+    /// The arrows walk the origins and wrap. Enter trusts, and Delete,
+    /// Backspace or `d` takes an origin off the page. Esc and Tab stay the
+    /// sheet's.
+    fn trust_key(&mut self, code: crossterm::event::KeyCode) -> SettingsAction {
+        use crossterm::event::KeyCode;
+        let len = self.trust_count;
+        if len == 0 {
+            return SettingsAction::Ignored;
+        }
+        let at = self.selected.min(len - 1);
+        match code {
+            KeyCode::Up => {
+                self.select((at + len - 1) % len);
+                SettingsAction::Nothing
+            }
+            KeyCode::Down => {
+                self.select((at + 1) % len);
+                SettingsAction::Nothing
+            }
+            KeyCode::Enter => SettingsAction::TrustImport(at),
+            KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('d' | 'D') => {
+                SettingsAction::ForgetImport(at)
+            }
+            _ => SettingsAction::Ignored,
+        }
     }
 
     /// Arrows walk the grid the way it reads - across, then down - and
@@ -2723,6 +2764,7 @@ impl SettingsSheet {
             SettingsPage::Mapping
             | SettingsPage::Keybinds
             | SettingsPage::Sources
+            | SettingsPage::Trust
             | SettingsPage::About => &[],
         }
     }
@@ -2821,6 +2863,7 @@ impl SettingsSheet {
             SettingsPage::Keybinds => (0..self.keybind_count)
                 .map(|index| (index, index))
                 .collect(),
+            SettingsPage::Trust => (0..self.trust_count).map(|index| (index, index)).collect(),
             SettingsPage::Mapping => {
                 let columns = usize::from(MAPPING_COLUMNS);
                 let step = (shown / usize::from(SLOT_HEIGHT)).max(1) * columns;
@@ -3020,6 +3063,9 @@ impl SettingsSheet {
         {
             return self.keybind_key(code, settings);
         }
+        if self.shows_trust() && !matches!(code, KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab) {
+            return self.trust_key(code);
+        }
         match code {
             KeyCode::Esc => {
                 if self.confirm_reset_keybinds {
@@ -3071,13 +3117,14 @@ impl SettingsSheet {
                 {
                     self.webcam_preview = false;
                 }
-                const PAGES: [SettingsPage; 7] = [
+                const PAGES: [SettingsPage; 8] = [
                     SettingsPage::Settings,
                     SettingsPage::Advanced,
                     SettingsPage::Mapping,
                     SettingsPage::Keybinds,
                     SettingsPage::Sources,
                     SettingsPage::Reference,
+                    SettingsPage::Trust,
                     SettingsPage::About,
                 ];
                 let at = PAGES
@@ -3181,6 +3228,9 @@ impl SettingsSheet {
             return Some(SettingsPage::Reference);
         }
         if x >= panel.x + 68 && x < panel.x + 75 {
+            return Some(SettingsPage::Trust);
+        }
+        if x >= panel.x + 76 && x < panel.x + 83 {
             return Some(SettingsPage::About);
         }
         None
@@ -3323,6 +3373,7 @@ impl SettingsSheet {
                 self.first_line(shown, &grouped_rows(self.rows()))
             }
             SettingsPage::Keybinds => self.first_row(shown, self.keybind_count),
+            SettingsPage::Trust => self.first_row(shown, self.trust_count),
             SettingsPage::Sources => {
                 self.first_sources(shown, self.source_count, self.default_count)
             }
@@ -3419,6 +3470,20 @@ impl SettingsSheet {
         let first = self.first_row(shown, self.keybind_count);
         let index = first + usize::from(y - rows.y);
         (index < self.keybind_count).then_some(index)
+    }
+
+    /// The origin under a point, while the trust page is up.
+    pub fn trust_row_at(self, available: Rect, x: u16, y: u16) -> Option<usize> {
+        if !self.shows_trust() {
+            return None;
+        }
+        let (_, rows) = self.geometry_for(available)?;
+        if x < rows.x || x >= rows.right() || y < rows.y || y >= rows.bottom() {
+            return None;
+        }
+        let shown = usize::from(rows.height).max(1);
+        let index = self.first_row(shown, self.trust_count) + usize::from(y - rows.y);
+        (index < self.trust_count).then_some(index)
     }
 
     /// The source under a point, while the sources page is up: an import
@@ -3565,6 +3630,8 @@ pub struct SettingsSheetView<'a> {
     pub mappings: [SlotView; MAPPING_SLOTS],
     /// The shortcut rows, as the keybinds page reads them.
     pub bindings: Vec<KeybindRow>,
+    /// The origins of the trust page: the trusted ones, then the refused.
+    pub trust: Vec<TrustRow>,
     /// Only `super_seen` is read here, for the one place ⌘ is named in the
     /// whole studio: the About page can honestly say Command reaches this
     /// terminal, without any chord ever being advertised in that form.
@@ -3793,6 +3860,16 @@ impl SlotGrid {
                 .is_some_and(|cell| cell.contains(ratatui::layout::Position::new(x, y)))
         })
     }
+}
+
+/// One origin of the trust page.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrustRow {
+    /// As the engine names it, such as `https://glossing.dev`.
+    pub origin: String,
+    /// Whether scores import scripts from it. A refused origin is on the
+    /// page until the studio closes, so the player trusts it with one key.
+    pub trusted: bool,
 }
 
 /// One action's binding, as its row should read.
@@ -4401,6 +4478,7 @@ mod tests {
             sources: Vec::new(),
             mappings: Default::default(),
             bindings: Vec::new(),
+            trust: Vec::new(),
         }
         .render(area, &mut buffer);
         buffer
@@ -4638,6 +4716,7 @@ mod tests {
                         ..Default::default()
                     },
                 ],
+                trust: Vec::new(),
             };
             render_keybinds(&view, panel, rows, &mut buffer);
             let footer = (rows.bottom()..panel.bottom().saturating_sub(1))
@@ -5797,6 +5876,7 @@ mod tests {
             sources: Vec::new(),
             mappings: Default::default(),
             bindings: Vec::new(),
+            trust: Vec::new(),
             #[cfg(feature = "hydra")]
             hydra_webcam: None,
             theme: &theme,
@@ -5911,6 +5991,7 @@ mod tests {
                     sources: sources.to_vec(),
                     mappings: Default::default(),
                     bindings: Vec::new(),
+                    trust: Vec::new(),
                 }
                 .render(area, &mut buffer);
                 (0..area.height)
@@ -6172,6 +6253,7 @@ mod tests {
             sources: Vec::new(),
             mappings: Default::default(),
             bindings: Vec::new(),
+            trust: Vec::new(),
         }
         .render(area, &mut buffer);
         let lines = (0..area.height)
@@ -6824,6 +6906,7 @@ mod tests {
                 sources: Vec::new(),
                 mappings: Default::default(),
                 bindings: Vec::new(),
+                trust: Vec::new(),
                 capabilities: KeyboardCapabilities::legacy(),
                 theme: &theme,
             }
@@ -6926,6 +7009,7 @@ mod tests {
             sources: Vec::new(),
             mappings: Default::default(),
             bindings: Vec::new(),
+            trust: Vec::new(),
             theme: &Theme::built_in_default(),
         }
         .render(area, &mut buffer);
@@ -7243,6 +7327,18 @@ mod tests {
         sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default());
         assert_eq!(sheet.page, SettingsPage::Reference);
         sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default());
+        assert_eq!(sheet.page, SettingsPage::Trust);
+        // The trust page walks its origins and names the one a key acts on.
+        sheet.trust_count = 2;
+        let mut trust_key = |code| sheet.key(code, &mut settings, &TerminalFeatures::default());
+        assert_eq!(trust_key(KeyCode::Up), SettingsAction::Nothing);
+        assert_eq!(trust_key(KeyCode::Enter), SettingsAction::TrustImport(1));
+        assert_eq!(trust_key(KeyCode::Down), SettingsAction::Nothing);
+        assert_eq!(
+            trust_key(KeyCode::Char('d')),
+            SettingsAction::ForgetImport(0)
+        );
+        sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default());
         assert_eq!(sheet.page, SettingsPage::About);
         // The About page reads; a key it has no use for is the score's.
         assert_eq!(
@@ -7250,6 +7346,12 @@ mod tests {
             SettingsAction::Ignored
         );
         assert_eq!(settings, original);
+        sheet.key(
+            KeyCode::BackTab,
+            &mut settings,
+            &TerminalFeatures::default(),
+        );
+        assert_eq!(sheet.page, SettingsPage::Trust);
         sheet.key(
             KeyCode::BackTab,
             &mut settings,
@@ -7303,7 +7405,7 @@ mod tests {
         assert_eq!(sheet.selected, 1, "the same page keeps its row");
     }
 
-    /// The seven tabs each answer to their own strip of the title row.
+    /// The eight tabs each answer to their own strip of the title row.
     #[test]
     fn every_tab_has_its_own_click_strip() {
         let area = Rect::new(0, 0, 120, 40);
@@ -7320,8 +7422,11 @@ mod tests {
         assert_eq!(at(53), Some(SettingsPage::Sources));
         assert_eq!(at(56), Some(SettingsPage::Reference));
         assert_eq!(at(66), Some(SettingsPage::Reference));
-        assert_eq!(at(68), Some(SettingsPage::About));
-        assert_eq!(at(74), Some(SettingsPage::About));
+        assert_eq!(at(68), Some(SettingsPage::Trust));
+        assert_eq!(at(74), Some(SettingsPage::Trust));
+        assert_eq!(at(76), Some(SettingsPage::About));
+        assert_eq!(at(82), Some(SettingsPage::About));
+        assert_eq!(at(75), None);
         assert_eq!(at(23), None, "the gap between tabs is nobody's");
         assert_eq!(at(33), None);
         assert_eq!(at(44), None);
@@ -7422,6 +7527,7 @@ mod tests {
             sources: Vec::new(),
             mappings: Default::default(),
             bindings: Vec::new(),
+            trust: Vec::new(),
             sheet: SettingsSheet {
                 page: SettingsPage::About,
                 ..SettingsSheet::default()
@@ -7669,6 +7775,7 @@ mod tests {
             sources: Vec::new(),
             mappings,
             bindings: Vec::new(),
+            trust: Vec::new(),
             capabilities: KeyboardCapabilities::legacy(),
             theme: &theme,
         }

@@ -16,7 +16,9 @@ fn playable_stem(stem: &str) -> bool {
 }
 
 fn reserved(stem: &str) -> bool {
-    matches!(stem, "in" | "bus") || rustel_voice::is_native_synth_sound(stem)
+    matches!(stem, "in" | "bus")
+        || rustel_voice::is_native_synth_sound(stem)
+            && !rustel_voice::native_synth_yields_to_sample(stem)
 }
 
 /// Built on publication, never by walking files on the playback path. A

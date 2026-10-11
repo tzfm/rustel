@@ -225,6 +225,8 @@ enum EngineCommand {
         budget_bytes: usize,
         idle: Duration,
     },
+    /// The origins of the Trust page, after the player changed them.
+    SetTrustedImports(Vec<String>),
     /// What the performer can reach without a wait: the tabs whose sounds
     /// no memory policy may drop, and those kept by recency.
     SetLiveMaterial(super::engine::LiveMaterial),
@@ -669,6 +671,14 @@ impl StudioWorker {
             && self
                 .commands
                 .try_send(EngineCommand::SetSampleMemory { budget_bytes, idle })
+                .is_ok()
+    }
+
+    pub fn try_set_trusted_imports(&self, origins: Vec<String>) -> bool {
+        !self.shutdown_requested.load(Ordering::Acquire)
+            && self
+                .commands
+                .try_send(EngineCommand::SetTrustedImports(origins))
                 .is_ok()
     }
 
@@ -1636,6 +1646,10 @@ fn process_command(
         }
         EngineCommand::SetSampleMemory { budget_bytes, idle } => {
             engine.set_sample_memory_policy(budget_bytes, idle);
+            false
+        }
+        EngineCommand::SetTrustedImports(origins) => {
+            engine.set_trusted_imports(&origins);
             false
         }
         EngineCommand::SetLiveMaterial(material) => {

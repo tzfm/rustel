@@ -13,6 +13,7 @@
 //! | completion lists at the caret (Ctrl+Space, Tab) | `completion.rs`, `string_roles.rs`, `bank_context.rs` |
 //! | hearing a chord, scale, sound or snippet | `previews.rs` |
 //! | the Settings sheet | `settings_sheet.rs` |
+//! | its Trust page: origins for script imports | `import_trust.rs` |
 //! | the theme picker, editor and save sheet | `theme_sheets.rs` |
 //! | the export sheet | `export_sheet.rs` |
 //! | the top menu and help | `menu_bar.rs` |
@@ -157,6 +158,7 @@ mod event_loop;
 mod export_sheet;
 mod focus;
 mod hydra_backdrop;
+mod import_trust;
 mod jobs_panel;
 mod key_bindings;
 mod keyboard;
@@ -38775,6 +38777,7 @@ fn run_once(options: StudioOptions) -> Result<Session, RuntimeError> {
             input: options.input.clone().or_else(|| prefs.audio_input.clone()),
             preview_budget_bytes: sample_settings.preview_budget.bytes(),
             unused_sample_idle: sample_settings.unused_sample_idle.duration(),
+            trusted_imports: prefs.trusted_imports.clone(),
             ..StudioConfig::default()
         },
         #[cfg(feature = "hydra")]
@@ -39268,6 +39271,11 @@ struct App {
     /// checker finds it fine, the message comes down without waiting for
     /// the next update to say the same.
     update_failure: Option<(SceneId, Revision)>,
+    /// The origins whose script imports the engine refused in this studio,
+    /// newest last. The Trust page offers them, so nobody types an origin.
+    blocked_imports: Vec<String>,
+    /// The Trust page changed and the engine does not have the list yet.
+    trusted_imports_owed: bool,
     /// Latest refused revision for each scene with an unresolved log alert.
     evaluation_alerts: HashMap<SceneId, Revision>,
     /// A diagnostic copied into the ordinary status line by the navigation
@@ -39776,6 +39784,8 @@ impl App {
             installed_revision: None,
             inflight: HashMap::new(),
             update_failure: None,
+            blocked_imports: Vec::new(),
+            trusted_imports_owed: false,
             evaluation_alerts: HashMap::new(),
             lint_status: None,
             pending_evaluation: None,

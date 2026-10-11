@@ -827,6 +827,49 @@ mod voice_refusal_tests {
         }
     }
 
+    /// A slider move re-queries the score that plays. A refusal of its first
+    /// window would roll back to that same score and silence the set.
+    #[test]
+    fn a_requery_of_the_playing_score_still_skips_an_invalid_voice() {
+        let mut session = Session::with_config(SessionConfig {
+            cps: 1.0,
+            horizon: 0.5,
+            sample_rate: RATE,
+            ..SessionConfig::default()
+        })
+        .unwrap();
+        session.set_direct_diagnostic_logging(false);
+        session
+            .set_pattern(ordered_pair(
+                voice("sine", 1.0),
+                voice("supersaw", 100.0),
+                false,
+            ))
+            .unwrap();
+        session
+            .schedule_audio_live_at(
+                0.0,
+                RATE,
+                Duration::ZERO,
+                LiveQueryBudgetMode::InitialPrefill,
+            )
+            .unwrap_or_else(|_| panic!("the first window"));
+        session
+            .requery_active_at(0.25)
+            .expect("requery")
+            .expect("a playing score");
+        let batch = session
+            .schedule_audio_live_at(
+                0.25,
+                RATE,
+                Duration::ZERO,
+                LiveQueryBudgetMode::ReplacementPrefill,
+            )
+            .unwrap_or_else(|_| panic!("a requery keeps the per-onset skip policy"));
+        assert!(batch.dispositions.refused > 0);
+        assert!(batch.dispositions.converted > 0);
+    }
+
     #[cfg(feature = "midi")]
     #[test]
     fn external_routing_is_valid_but_cannot_hide_a_hard_native_sibling() {
@@ -1931,6 +1974,7 @@ use crate::osc_bridge::ScoreOscAccess;
 use crate::producer::{ProducerPhase, ProducerTurnRecord};
 use crate::render::{RenderFormat, write_onset_dump, write_silent_wav};
 use crate::samples::ScoreSampleAccess;
+use crate::score_import::ScoreImportAccess;
 
 const DEFAULT_CPS: f64 = 0.5;
 const DEFAULT_HORIZON: f64 = 0.5;
@@ -2296,6 +2340,9 @@ pub struct SessionConfig {
     /// Filesystem and network resources that evaluated score text may select
     /// through `samples(...)`. Empty by default.
     pub score_sample_access: ScoreSampleAccess,
+    /// The origins that evaluated text may import scripts from with
+    /// `import('https://...')`. Empty by default.
+    pub score_import_access: ScoreImportAccess,
     /// Destinations score-chosen `oschost` values may reach. Loopback only
     /// until the host grants additional IPs.
     #[cfg(feature = "osc")]
@@ -2315,6 +2362,7 @@ impl Default for SessionConfig {
             channels: DEFAULT_CHANNELS,
             dsp_dispatch: rustel_audio::DspDispatch::automatic(),
             score_sample_access: ScoreSampleAccess::denied(),
+            score_import_access: ScoreImportAccess::denied(),
             #[cfg(feature = "osc")]
             score_osc_access: ScoreOscAccess::loopback_only(),
             pointer: None,
@@ -2365,6 +2413,12 @@ impl SessionConfig {
         self
     }
 
+    /// Trust origins for script imports.
+    pub fn with_score_import_access(mut self, access: ScoreImportAccess) -> Self {
+        self.score_import_access = access;
+        self
+    }
+
     /// Grant score-chosen OSC destinations.
     #[cfg(feature = "osc")]
     pub fn with_score_osc_access(mut self, access: ScoreOscAccess) -> Self {
@@ -2404,6 +2458,11 @@ pub enum RuntimeError {
     Audio(String),
     /// This build omits the feature the work needs, such as `mp3-export`.
     Unsupported(String),
+    /// The text imports a script from an origin that the host does not
+    /// trust. Nothing was fetched.
+    UntrustedImport {
+        origin: String,
+    },
     Message(String),
 }
 
@@ -2441,6 +2500,10 @@ impl std::fmt::Display for RuntimeError {
             Self::ResourceLimit(e) => write!(f, "{e}"),
             Self::Audio(e) => write!(f, "audio: {e}"),
             Self::Unsupported(e) => write!(f, "{e}"),
+            Self::UntrustedImport { origin } => write!(
+                f,
+                "{origin} is not trusted for import(); --allow-import-origin {origin} trusts it"
+            ),
             Self::Interrupted(signal) => {
                 write!(f, "interrupted by signal {signal} before the work started")
             }
@@ -2466,6 +2529,7 @@ impl RuntimeError {
             Self::ResourceLimit(_) => "resource-limit",
             Self::Audio(_) => "audio",
             Self::Unsupported(_) => "unsupported",
+            Self::UntrustedImport { .. } => "untrusted-import",
             Self::Interrupted(_) => "interrupted",
             Self::Cancelled => "cancelled",
             Self::Panic(_) => "panic",
@@ -2684,6 +2748,11 @@ pub struct Session {
     /// the (takeover, cut) pair in the middle of a turn, before it knows
     /// whether the window holds, and the anchor must outlive that.
     requery_anchor_time: Option<f64>,
+    /// The generation that a re-query of the playing score made. Its first
+    /// window plays the score the device already plays, so a refused voice
+    /// is skipped and logged as in a steady window. No earlier score exists
+    /// to return to.
+    requeried_generation: Option<u64>,
     /// The next live reload takes over at this time rather than one
     /// continuity margin ahead: a launch quantised to a cycle line.
     takeover_override: Option<f64>,
@@ -2694,6 +2763,11 @@ pub struct Session {
     /// The default sample banks. `None` until enabled;
     /// resolution then falls back to the bundled `bd` alone.
     samples: Option<std::sync::Arc<crate::samples::SampleLibrary>>,
+    /// The text of each imported script, by the specifier that names it. A
+    /// script is fetched once and runs again in a rebuilt realm.
+    import_sources: std::collections::BTreeMap<String, Arc<str>>,
+    /// The error of each imported script that threw in this realm.
+    import_errors: std::collections::BTreeMap<String, Arc<str>>,
     /// Ordinary CLI surfaces report asynchronous sample failures as JSON on
     /// stderr. Full-screen clients disable that direct writer and drain the
     /// same failures into their own diagnostic channel instead, otherwise a
@@ -2895,11 +2969,14 @@ impl Session {
             requery_takeover_time: None,
             requery_takeover_cut: TakeoverCut::None,
             requery_anchor_time: None,
+            requeried_generation: None,
             takeover_override: None,
             next_from_zero: false,
             last_path: EvaluateSource::Pattern,
             last_play_iterations: 0,
             samples: None,
+            import_sources: std::collections::BTreeMap::new(),
+            import_errors: std::collections::BTreeMap::new(),
             direct_diagnostic_logging: rustel_voice::default_direct_diagnostic_logging(),
             pending_diagnostics: VecDeque::new(),
             bindings_ready: false,
@@ -3078,6 +3155,12 @@ impl Session {
         self.config.max_polyphony = voices.clamp(1, rustel_audio::MAX_CONFIGURABLE_POLYPHONY);
     }
 
+    /// Replace the origins that text may import scripts from. The next
+    /// evaluation reads the new list.
+    pub fn set_score_import_access(&mut self, access: ScoreImportAccess) {
+        self.config.score_import_access = access;
+    }
+
     pub fn last_evaluate_source(&self) -> EvaluateSource {
         self.last_path.clone()
     }
@@ -3183,6 +3266,8 @@ impl Session {
             self.requery_takeover_cut = TakeoverCut::None;
             self.requery_anchor_time = None;
         }
+        // A pending rewind is a new score that the device does not play yet.
+        self.requeried_generation = pending_rewind.is_none().then_some(generation_after);
         Ok(Some((generation_before, generation_after)))
     }
 
@@ -3225,6 +3310,7 @@ impl Session {
         // this recovery generation's cursor instead of its own line.
         self.requery_takeover_cut = TakeoverCut::None;
         self.requery_anchor_time = None;
+        self.requeried_generation = Some(generation_after);
         // Nor does it hold a latency-compensated event from before the
         // cursor: the recovery generation sounds every onset it queries.
         self.compensated_onsets.clear();
@@ -4780,6 +4866,8 @@ impl Session {
         let cancellation = self.transport.stopped_flag();
         let js = &self.js;
         let scheduler = &mut self.scheduler;
+        js.set_cycle_time(scheduler.cycle_at_time(now));
+        js.set_cps(scheduler.cps());
         let status = js
             .with_runtime_settings(|| {
                 rustel_core::with_cancellation(cancellation, || {
@@ -5697,6 +5785,9 @@ impl Session {
         // before it. A generation not yet published uses its pending
         // takeover. A cut, or no takeover time, keeps nothing.
         let generation = self.generation();
+        // Only a new score can be refused in favour of the one that plays.
+        let replaces_score = matches!(mode, LiveQueryBudgetMode::ReplacementPrefill)
+            && self.requeried_generation != Some(generation);
         // A device that plays its first generation begins a timeline: no
         // earlier generation handed a message out on it.
         if matches!(mode, LiveQueryBudgetMode::InitialPrefill) {
@@ -5792,7 +5883,7 @@ impl Session {
                                 } else {
                                     dispositions.refused += 1;
                                     if invalid_control.is_none()
-                                        && matches!(mode, LiveQueryBudgetMode::ReplacementPrefill)
+                                        && replaces_score
                                         && matches!(
                                             error,
                                             rustel_voice::VoiceError::InvalidControl(_)
@@ -5932,9 +6023,7 @@ impl Session {
         // Invalid controls reject the whole replacement before any sibling
         // reaches the output. Asset skips and external-only onsets keep their
         // separate policies; their diagnostic text is not a failure class.
-        if matches!(mode, LiveQueryBudgetMode::ReplacementPrefill)
-            && let Some(message) = invalid_control
-        {
+        if let Some(message) = invalid_control {
             let scope = if events.is_empty() && !self.has_pending_external_output() {
                 "every onset of"
             } else {
@@ -5989,7 +6078,7 @@ impl Session {
                     )),
                 ));
             }
-            if matches!(mode, LiveQueryBudgetMode::ReplacementPrefill) {
+            if replaces_score {
                 match self.replacement_renders_ahead(now, sample_rate, lookup) {
                     ReplacementLookAhead::Renders => {}
                     ReplacementLookAhead::Loading(loading) => {
@@ -8284,6 +8373,16 @@ mod tests {
         assert_eq!(render.cps, 2.0);
         assert!(render.onset_count >= 2);
         std::fs::remove_file(output).expect("remove owned tempo onset dump");
+
+        // `getCps()` gives the tempo in play, then the tempo the score sets,
+        // in the evaluation and in a query.
+        session
+            .evaluate(
+                "const playing = getCps(); setcpm(30); const set = getCps(); \
+                 new Pattern(state => pure(`${playing} ${set} ${getCps()}`).query(state))",
+            )
+            .expect("a score that reads the tempo");
+        assert_eq!(active_values(&session), ["2 0.5 0.5"]);
     }
 
     #[test]
@@ -8549,6 +8648,62 @@ mod tests {
             haps.iter().all(|hap| hap.context.is_empty()),
             "prebake byte offsets leaked into the score document: {haps:?}"
         );
+
+        // A string that `mini` parses at run time is not in the score either.
+        session.evaluate("$: note(mini('c4 e4'))").expect("score");
+        let haps = session
+            .query(Fraction::ZERO, Fraction::ONE)
+            .expect("query run-time mini");
+        assert_eq!(haps.len(), 2);
+        assert!(
+            haps.iter().all(|hap| hap.context.is_empty()),
+            "offsets in the string leaked into the score document: {haps:?}"
+        );
+    }
+
+    /// A score imports a script only from an origin the host trusts, and the
+    /// refusal comes before any fetch.
+    #[test]
+    fn a_script_import_runs_as_setup_only_from_a_trusted_origin() {
+        let url = "https://scripts.example/helpers.js";
+        let score = format!("await import('{url}')\n$: fromImport()");
+        let mut session = Session::new().expect("session");
+        // The text a fetch of `url` gives.
+        session.import_sources.insert(
+            url.to_owned(),
+            Arc::from("globalThis.fromImport = () => stack(note(60), note(64));"),
+        );
+        let refused = session.evaluate(&score).expect_err("an untrusted origin");
+        assert_eq!(refused.kind(), "untrusted-import");
+        assert!(
+            refused.to_string().starts_with("https://scripts.example "),
+            "{refused}"
+        );
+
+        let mut access = ScoreImportAccess::denied();
+        access.permit_origin("https://scripts.example").unwrap();
+        session.set_score_import_access(access);
+        session.evaluate(&score).expect("the trusted import");
+        let haps = session.query(Fraction::ZERO, Fraction::ONE).expect("query");
+        assert_eq!(haps.len(), 2);
+        // The realm has run the script. A second score loads nothing new.
+        session.import_sources.clear();
+        session.evaluate(&score).expect("the loaded import");
+
+        // A script that throws keeps its error. The second run of a script
+        // with a first-run guard would load a part of it and report nothing.
+        let broken = "https://scripts.example/broken.js";
+        session.import_sources.insert(
+            broken.to_owned(),
+            Arc::from(
+                "globalThis.ranOnce ??= 0; if (ranOnce++ === 0) throw new Error('first run');",
+            ),
+        );
+        let score = format!("await import('{broken}')\n$: note(60)");
+        for _ in 0..2 {
+            let error = session.evaluate(&score).expect_err("the script throws");
+            assert!(error.to_string().contains("first run"), "{error}");
+        }
     }
 
     #[test]

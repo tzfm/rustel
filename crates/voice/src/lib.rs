@@ -8,6 +8,10 @@
 //! Unsupported sounds and controls return explicit errors rather than
 //! plausible-sounding approximations.
 
+mod bus_names;
+
+pub use bus_names::BusNames;
+
 #[cfg(test)]
 mod classification_tests {
     //! Native resolver policy tests; no scheduler, callback, or JavaScript execution.
@@ -365,7 +369,7 @@ mod tests {
         for name in [
             "white", "pink", "brown", "crackle", "bytebeat", "bus", "supersaw", "pulse", "sbd",
             "sine", "sin", "triangle", "tri", "square", "sqr", "sawtooth", "saw", "user",
-            "TRIANGLE",
+            "TRIANGLE", "one",
         ] {
             assert!(super::is_native_synth_sound(name), "missed {name:?}");
         }
@@ -844,6 +848,75 @@ mod tests {
                 bus: (out_of_range - 1) as u8
             })
         );
+    }
+
+    #[test]
+    fn a_bus_name_gives_its_send_receiver_and_modulator_one_slot() {
+        #[derive(Default)]
+        struct Named(BusNames);
+        impl SampleLookup for Named {
+            fn resolve(&self, _s: &str, _n: f64, _midi: f64) -> SampleResolution {
+                SampleResolution::Unknown
+            }
+            fn bus_names(&self) -> Option<&BusNames> {
+                Some(&self.0)
+            }
+        }
+        let host = Named::default();
+        let resolve = |value: serde_json::Value, host: &dyn SampleLookup| {
+            resolve_voice_with_samples(&value, 0, 0.5, 0.0, 48_000, 0.5, host)
+        };
+        let top = (rustel_audio::MAX_BUSES - 1) as u8;
+        let send = resolve(serde_json::json!({ "s": "sine", "bus": "move_0" }), &host);
+        assert_eq!(send.expect("a named send").controls.bus, Some(top));
+        let receiver = resolve(serde_json::json!({ "s": "bus", "n": "move_0" }), &host);
+        assert_eq!(
+            receiver.expect("a named receiver").synth,
+            Some(rustel_audio::SynthSource::Bus { bus: top })
+        );
+        let modulated = resolve(
+            serde_json::json!({ "s": "saw", "cutoff": 800, "bmod": { "a": { "b": "move_0" } } }),
+            &host,
+        );
+        let bus_mod = modulated.expect("a named modulator").controls.bus_mods[0];
+        assert_eq!(bus_mod.map(|bus_mod| bus_mod.bus), Some(top));
+        // `"1"` is bus 1, and a number keeps its slot off the names.
+        let numbered = resolve(serde_json::json!({ "s": "sine", "bus": "1" }), &host);
+        assert_eq!(numbered.expect("a number in quotes").controls.bus, Some(1));
+
+        let refused = resolve(
+            serde_json::json!({ "s": "sine", "bus": "move_0" }),
+            &BundledOnly,
+        );
+        assert!(refused.expect_err("no names").contains("bus name `move_0`"));
+    }
+
+    #[test]
+    fn one_is_a_constant_signal_unless_a_sample_has_the_name() {
+        struct HasOne;
+        impl SampleLookup for HasOne {
+            fn resolve(&self, s: &str, _n: f64, _midi: f64) -> SampleResolution {
+                BundledOnly.resolve(if s == "one" { "bd" } else { s }, 0.0, 36.0)
+            }
+        }
+        let resolve = |host: &dyn SampleLookup| {
+            resolve_voice_with_samples(
+                &serde_json::json!({ "s": "one" }),
+                0,
+                0.5,
+                0.0,
+                48_000,
+                0.5,
+                host,
+            )
+            .expect("one plays")
+        };
+        let synth = resolve(&BundledOnly);
+        assert_eq!(synth.synth, Some(rustel_audio::SynthSource::One));
+        assert!(synth.sample.is_none());
+        let sample = resolve(&HasOne);
+        assert_eq!(sample.synth, None);
+        assert!(sample.sample.is_some());
     }
 
     use super::*;
@@ -1769,8 +1842,8 @@ pub fn default_direct_diagnostic_logging() -> bool {
 
 /// The sounds the native voice engine makes by itself, under the names a
 /// score writes in `s("…")`: the oscillators, the noises and the dedicated
-/// synths. What a sound browser lists beside the sample banks. `bus`, `in`
-/// and the oscillator aliases (`sin`, `saw`, …) are accepted by
+/// synths. What a sound browser lists beside the sample banks. `bus`, `in`,
+/// `one` and the oscillator aliases (`sin`, `saw`, …) are accepted by
 /// [`is_native_synth_sound`] but are not sounds anyone browses for.
 pub const NATIVE_SYNTH_SOUNDS: &[&str] = &[
     "sine",
@@ -1794,13 +1867,22 @@ pub const NATIVE_SYNTH_SOUNDS: &[&str] = &[
     "z_noise",
 ];
 
+/// Whether a native synth name gives way to a sample of the same name.
+///
+/// `one` is a common name for a sample file. A host with a sample of that
+/// name plays the sample, and only a host with none plays the constant
+/// signal. Every other native synth name is never an unbanked sample.
+pub fn native_synth_yields_to_sample(name: &str) -> bool {
+    name == "one"
+}
+
 /// True when a sound name is generated entirely by the native voice engine.
 ///
 /// These names need no preload when no sample bank claims them. Oscillator
 /// names are case-insensitive; the dedicated synth sources keep the exact
 /// lowercase names accepted by [`resolve_voice_with_samples`].
 pub fn is_native_synth_sound(name: &str) -> bool {
-    matches!(name, "bus" | "in")
+    matches!(name, "bus" | "in" | "one")
         || NATIVE_SYNTH_SOUNDS.contains(&name)
         || [
             "sine", "sin", "triangle", "tri", "square", "sqr", "sawtooth", "saw", "user",
@@ -1902,6 +1984,11 @@ pub enum SampleResolution {
 
 pub trait SampleLookup {
     fn resolve(&self, s: &str, n: f64, midi: f64) -> SampleResolution;
+
+    /// The bus names of this host. Without them a named bus is refused.
+    fn bus_names(&self) -> Option<&BusNames> {
+        None
+    }
 }
 
 /// Why one onset could not be converted, independently of its diagnostic text.
@@ -2164,6 +2251,8 @@ fn resolve_voice_at(
             None,
         ),
         serde_json::Value::Object(object) => {
+            let slotted = with_bus_slots(object, samples)?;
+            let object = slotted.as_ref().unwrap_or(object);
             let gain = optional_f64(object.get("gain"), "gain")?.unwrap_or(0.8);
             let velocity = optional_f64(object.get("velocity"), "velocity")?.unwrap_or(1.0);
             let postgain = optional_f64(object.get("postgain"), "postgain")?.unwrap_or(1.0);
@@ -2264,7 +2353,9 @@ fn resolve_voice_at(
                 cps,
                 frequency,
             )?;
-            let synth = synth_source(object, duration_secs, target_time)?;
+            // A sample named `one` is the sound, not the constant signal.
+            let synth = synth_source(object, duration_secs, target_time)?
+                .filter(|synth| !(sample.is_some() && *synth == rustel_audio::SynthSource::One));
             let orbit = optional_f64(object.get("orbit"), "orbit")?.unwrap_or(1.0);
             if !(0.0..16.0).contains(&orbit) {
                 return Err(format!("orbit {orbit} is outside the supported 0..16 range").into());
@@ -2467,6 +2558,83 @@ fn resolve_voice_at(
     Ok(event)
 }
 
+/// Give each bus name in `object` its slot: the `bus` control, the `n` of a
+/// `bus` source, and the bus of each `bmod` entry. A bus number keeps its own
+/// slot. Returns `None` when `object` holds no name.
+fn with_bus_slots(
+    object: &serde_json::Map<String, serde_json::Value>,
+    samples: &dyn SampleLookup,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, String> {
+    let names = samples.bus_names();
+    // A number in range reserves its slot. Any other value stays for the
+    // range checks that follow.
+    let slot_of = |id: &serde_json::Value| -> Result<Option<serde_json::Value>, String> {
+        let text = match id {
+            serde_json::Value::String(text) => text,
+            serde_json::Value::Number(number) => {
+                if let (Some(names), Some(slot)) = (names, number.as_f64())
+                    && (0.0..rustel_audio::MAX_BUSES as f64).contains(&slot)
+                {
+                    names.number(slot as u8);
+                }
+                return Ok(None);
+            }
+            _ => return Ok(None),
+        };
+        // `"1"` and `1` name the same bus.
+        if let Ok(number) = text.trim().parse::<f64>() {
+            return Ok(Some(serde_json::json!(number)));
+        }
+        let names =
+            names.ok_or_else(|| format!("bus name `{text}` needs a host with bus names"))?;
+        let slot = names.name(text).ok_or_else(|| {
+            format!(
+                "bus name `{text}` has no free bus: numbers use all {}",
+                rustel_audio::MAX_BUSES
+            )
+        })?;
+        Ok(Some(serde_json::json!(slot)))
+    };
+    let mut slotted = None;
+    let mut set = |key: &str, slot: serde_json::Value| {
+        slotted
+            .get_or_insert_with(|| object.clone())
+            .insert(key.to_owned(), slot);
+    };
+    if let Some(slot) = object.get("bus").map(&slot_of).transpose()?.flatten() {
+        set("bus", slot);
+    }
+    let receives = object.get("s").and_then(serde_json::Value::as_str) == Some("bus")
+        && !object.contains_key("bank");
+    if receives && let Some(slot) = object.get("n").map(&slot_of).transpose()?.flatten() {
+        set("n", slot);
+    }
+    if let Some(serde_json::Value::Object(mods)) = object.get("bmod") {
+        let mut mods_slotted = None;
+        for (id, entry) in mods {
+            let Some(entry) = entry.as_object() else {
+                continue;
+            };
+            let key = if entry.contains_key("bus") {
+                "bus"
+            } else {
+                "b"
+            };
+            if let Some(slot) = entry.get(key).map(&slot_of).transpose()?.flatten() {
+                let mut entry = entry.clone();
+                entry.insert(key.to_owned(), slot);
+                mods_slotted
+                    .get_or_insert_with(|| mods.clone())
+                    .insert(id.clone(), serde_json::Value::Object(entry));
+            }
+        }
+        if let Some(mods) = mods_slotted {
+            set("bmod", serde_json::Value::Object(mods));
+        }
+    }
+    Ok(slotted)
+}
+
 /// Resolve the dedicated synth sources with their pinned trigger defaults.
 fn synth_source(
     object: &serde_json::Map<String, serde_json::Value>,
@@ -2477,6 +2645,7 @@ fn synth_source(
         return Ok(None);
     };
     match name {
+        "one" => Ok(Some(rustel_audio::SynthSource::One)),
         // `density` matters only to crackle.
         "white" | "pink" | "brown" | "crackle" => {
             let kind = match name {
@@ -3199,7 +3368,7 @@ fn sample_controls(
     // could apply that fallback. An explicit bank still takes the sample
     // route, so `s("supersaw").bank("my_bank")` keeps its bank semantics.
     let banked_name = !std::ptr::eq(name, plain);
-    if !banked_name && is_native_synth_sound(name) {
+    if !banked_name && is_native_synth_sound(name) && !native_synth_yields_to_sample(name) {
         return Ok(None);
     }
     // Sample pitch: freq wins, then note, then a default that depends on the
@@ -6108,6 +6277,20 @@ pub static SOUND_REFERENCE: &[ReferenceEntry] = &[
         description: "One of the pinned ZZFX shapes: the generator as noise, shaped by the same z* controls and the zzfx([...]) array as bare zzfx.",
         params: &[],
         examples: &[],
+        tags: &["sound", "synth"],
+        no_autocomplete: false,
+        deprecated: false,
+        origin: "rustel",
+    },
+    ReferenceEntry {
+        name: "one",
+        synonyms: &[],
+        summary: "a constant signal - the source of a bus modulator",
+        description: "Plays the value 1 under the envelope, at the level of `gain`. Send it to a bus with `bus` and `dry(0)`. A second pattern reads the bus with `bmod`, so the gain pattern moves the control of that pattern.",
+        params: &[],
+        examples: &[
+            "modulator: s(\"one\").seg(8).gain(\"0 0.5 1 0.5\").bus('wobble').dry(0)\ncarrier: s(\"saw\").note(\"c2\").lpf(300).bmod({ b: 'wobble', da: 1500 })",
+        ],
         tags: &["sound", "synth"],
         no_autocomplete: false,
         deprecated: false,

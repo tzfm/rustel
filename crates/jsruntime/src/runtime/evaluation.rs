@@ -159,6 +159,7 @@ impl JsRuntime {
         options.add_return = false;
         options.wrap_async = false;
         options.allow_module_syntax = false;
+        options.loaded_imports = self.loaded_imports.borrow().iter().cloned().collect();
         let output = rustel_transpiler::transpile(source, &options);
         if !output.diagnostics.is_empty() {
             return Err(QueryError::Message(
@@ -531,6 +532,7 @@ impl JsRuntime {
     }
 
     pub(super) fn transpile_score(
+        &self,
         source: &str,
         options: &rustel_transpiler::TranspileOptions,
     ) -> Result<rustel_transpiler::TranspileOutput, String> {
@@ -539,6 +541,7 @@ impl JsRuntime {
         // A bare top-level `return` is only for the async function wrapper.
         options.add_return = false;
         options.allow_module_syntax = false;
+        options.loaded_imports = self.loaded_imports.borrow().iter().cloned().collect();
         let output = rustel_transpiler::transpile(source, &options);
         if !output.diagnostics.is_empty() {
             return Err(output
@@ -1185,7 +1188,9 @@ impl JsRuntime {
         // the Rust transpiler neither executes on the QuickJS heap nor has a
         // cancellable/fuelled parser yet. The API's claim stops at synchronous
         // QuickJS execution.
-        let output = Self::transpile_score(source, options).map_err(QueryError::Message)?;
+        let output = self
+            .transpile_score(source, options)
+            .map_err(QueryError::Message)?;
 
         struct CancellationGuard<'a> {
             slot: std::rc::Rc<Cell<Option<*const std::sync::atomic::AtomicBool>>>,
@@ -1280,7 +1285,7 @@ impl JsRuntime {
         let effect_policy_owner = EffectPolicyOwner::enter(self);
         let _effect_transaction =
             EffectTransactionOwner::enter(self, EffectPolicy::NONE).map_err(|e| e.to_string())?;
-        let output = Self::transpile_score(source, options)?;
+        let output = self.transpile_score(source, options)?;
         self.begin_slider_candidate()?;
         if let Err(error) = self.begin_voicing_candidate() {
             self.discard_slider_candidate();

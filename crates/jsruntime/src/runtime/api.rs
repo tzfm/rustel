@@ -13,12 +13,17 @@ impl JsRuntime {
         // line above and never moves it again, so the size has to be set here,
         // before any query can recurse beneath it. See `MAX_JS_STACK_BYTES`.
         rt.set_max_stack_size(MAX_JS_STACK_BYTES);
-        // This runtime never grants module resolution. The explicit resolver
-        // is the enforcement boundary for dynamically constructed imports
+        // This runtime never reads a module. The explicit resolver is the
+        // enforcement boundary for dynamically constructed imports
         // (`eval`/`Function`) that cannot be rejected by source inspection.
         // It also keeps a later QuickJS default change from silently turning
-        // score text into filesystem or network access.
-        rt.set_loader(RejectModuleResolver, RejectModuleLoader);
+        // score text into filesystem or network access. A script that the
+        // host has run resolves to an empty module. See `LoadedImports`.
+        let loaded_imports = LoadedImports::default();
+        rt.set_loader(
+            RejectModuleResolver(loaded_imports.clone()),
+            RejectModuleLoader(loaded_imports.clone()),
+        );
         let ctx = Context::full(&rt)?;
         let effect_transaction = Rc::new(RefCell::new(None));
         let effect_policy = Rc::new(Cell::new(EffectPolicy::NONE));
@@ -127,6 +132,9 @@ impl JsRuntime {
             ids: std::rc::Rc::new(Cell::new(0)),
             logs: std::rc::Rc::new(RefCell::new(Vec::new())),
             contained_query_errors_unlogged: Cell::new(false),
+            cycle_time: std::rc::Rc::new(Cell::new(0.0)),
+            cps: std::rc::Rc::new(Cell::new(0.5)),
+            loaded_imports,
             timeline_state: rustel_core::TimelineState::default(),
             midi_in_bus: std::sync::Arc::new(rustel_core::midi_in::InputBus::new()),
             midi_in_handles: std::rc::Rc::new(RefCell::new(MidiInputHandles::default())),
@@ -191,6 +199,18 @@ impl JsRuntime {
 
     pub fn take_logs(&self) -> Vec<String> {
         std::mem::take(&mut self.logs.borrow_mut())
+    }
+
+    /// Set the cycle that `getTime()` returns. The host calls it with the
+    /// start of each scheduling window.
+    pub fn set_cycle_time(&self, cycle: f64) {
+        self.cycle_time.set(cycle);
+    }
+
+    /// Set the tempo, in cycles per second, that `getCps()` returns. The
+    /// host calls it before each evaluation and each scheduling window.
+    pub fn set_cps(&self, cps: f64) {
+        self.cps.set(cps);
     }
 
     /// Run `f` without logging the query errors a stack contains. A caller

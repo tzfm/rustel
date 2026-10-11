@@ -1,6 +1,12 @@
 use super::*;
 
-pub(super) struct RejectModuleResolver;
+/// The script specifiers this realm has run through
+/// [`JsRuntime::run_import`]. `import()` of one of them resolves to an empty
+/// module, because the script has already made its definitions. Every other
+/// specifier is refused, so the realm itself never reads a file or a URL.
+pub(super) type LoadedImports = Rc<RefCell<BTreeSet<String>>>;
+
+pub(super) struct RejectModuleResolver(pub(super) LoadedImports);
 
 impl rquickjs::loader::Resolver for RejectModuleResolver {
     fn resolve<'js>(
@@ -10,6 +16,9 @@ impl rquickjs::loader::Resolver for RejectModuleResolver {
         name: &str,
         _attributes: Option<rquickjs::loader::ImportAttributes<'js>>,
     ) -> rquickjs::Result<String> {
+        if self.0.borrow().contains(name) {
+            return Ok(name.to_owned());
+        }
         Err(rquickjs::Error::new_resolving_message(
             base,
             name,
@@ -18,15 +27,18 @@ impl rquickjs::loader::Resolver for RejectModuleResolver {
     }
 }
 
-pub(super) struct RejectModuleLoader;
+pub(super) struct RejectModuleLoader(pub(super) LoadedImports);
 
 impl rquickjs::loader::Loader for RejectModuleLoader {
     fn load<'js>(
         &mut self,
-        _ctx: &Ctx<'js>,
+        ctx: &Ctx<'js>,
         name: &str,
         _attributes: Option<rquickjs::loader::ImportAttributes<'js>>,
     ) -> rquickjs::Result<rquickjs::Module<'js>> {
+        if self.0.borrow().contains(name) {
+            return rquickjs::Module::declare(ctx.clone(), name, "");
+        }
         Err(rquickjs::Error::new_loading_message(
             name,
             "module loading is disabled in native score code",

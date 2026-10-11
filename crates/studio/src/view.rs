@@ -585,6 +585,8 @@ pub struct StudioView<'a> {
     pub mappings: [super::settings::SlotView; super::settings::MAPPING_SLOTS],
     /// The shortcut rows, for the Keybinds page.
     pub keybind_rows: Vec<super::settings::KeybindRow>,
+    /// The origins of the Trust page.
+    pub trust_rows: Vec<super::settings::TrustRow>,
     /// What the open stream costs end to end, for the devices panel.
     pub latency: Option<super::devices::LatencyReport>,
     /// The MIDI tab's rows, merged and with their boxes resolved. Empty while
@@ -1207,6 +1209,7 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
                 sources: view.sources,
                 mappings: view.mappings,
                 bindings: view.keybind_rows,
+                trust: view.trust_rows,
                 capabilities: chrome.capabilities,
                 theme,
             },
@@ -9170,6 +9173,7 @@ mod tests {
                         sources: Vec::new(),
                         mappings: Default::default(),
                         keybind_rows: Vec::new(),
+                        trust_rows: Vec::new(),
                         latency: None,
                         caching_samples: 0,
                         importing_sources: 0,
@@ -9288,6 +9292,7 @@ mod tests {
                         sources: Vec::new(),
                         mappings: Default::default(),
                         keybind_rows: Vec::new(),
+                        trust_rows: Vec::new(),
                         latency: None,
                         caching_samples: 0,
                         importing_sources: 0,
@@ -9394,6 +9399,7 @@ mod tests {
                         sources: Vec::new(),
                         mappings: Default::default(),
                         keybind_rows: Vec::new(),
+                        trust_rows: Vec::new(),
                         latency: None,
                         caching_samples: 0,
                         importing_sources: 0,
@@ -9503,6 +9509,7 @@ mod tests {
                         sources: Vec::new(),
                         mappings: Default::default(),
                         keybind_rows: Vec::new(),
+                        trust_rows: Vec::new(),
                         latency: None,
                         caching_samples: 0,
                         importing_sources: 0,

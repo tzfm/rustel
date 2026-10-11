@@ -38,7 +38,8 @@ fn row_with(studio: &mut Hermetic, label: &str) -> String {
 /// Find Keybinds from either remembered settings tab.
 fn open_keybinds(studio: &mut Hermetic) {
     studio.chord("ctrl+o");
-    for _ in 0..7 {
+    // Eight presses walk the eight pages back to the one that was open.
+    for _ in 0..8 {
         if studio.rows().iter().any(|row| row.contains("▸ Terminal")) {
             break;
         }
@@ -52,7 +53,7 @@ fn open_keybinds(studio: &mut Hermetic) {
     );
 }
 
-/// Open the sheet on its Mapping page - the third of seven tabs.
+/// Open the sheet on its Mapping page - the third of eight tabs.
 fn open_mapping(studio: &mut Hermetic) {
     studio.chord("ctrl+o");
     studio.press(KeyCode::Tab, KeyModifiers::NONE);

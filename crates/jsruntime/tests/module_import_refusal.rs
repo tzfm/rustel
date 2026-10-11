@@ -11,6 +11,9 @@
 //! outcomes today, so a single test could pass while either one quietly
 //! stopped working. The messages differ, which is what lets these tests say
 //! WHICH layer refused.
+//!
+//! One import resolves: a script that the host fetched and ran itself. The
+//! realm still loads nothing.
 
 use rustel_jsruntime::{JsRuntime, QueryError};
 use rustel_transpiler::TranspileOptions;
@@ -80,6 +83,43 @@ fn static_import_statements_fail_closed() {
                 .is_err(),
             "static module syntax must not evaluate: {source}"
         );
+    }
+}
+
+/// The host fetches a script and the realm runs it. From then on its
+/// specifier resolves, and every other import is still refused.
+#[test]
+fn a_script_the_host_ran_resolves_and_nothing_else_does() {
+    let rt = JsRuntime::new().unwrap();
+    rt.install_semantic_bindings().unwrap();
+    let url = "https://example.com/helpers.js";
+    // The script is JavaScript as written. Code it hands to the repl is
+    // score code, so its double-quoted string is mini-notation.
+    let script = r#"globalThis.rawText = "bd sd";
+(async () => { await window.strudelMirror.repl.evaluate('globalThis.viaRepl = "bd sd";'); })();"#;
+    let never = std::sync::atomic::AtomicBool::new(false);
+    let options = TranspileOptions::default();
+    rt.run_import(url, script, &options, BUDGET, &never)
+        .expect("the script runs");
+    assert!(rt.import_loaded(url));
+    rt.evaluate_prelude(
+        &format!(
+            r#"await import("{url}");
+await Function('t', 'return import(t)')('{url}');
+if (typeof rawText !== 'string') throw new Error('a string of the script became a pattern');
+if (typeof viaRepl !== 'object') throw new Error('repl code kept its mini-notation as text');
+if (typeof strudelMirror !== 'undefined') throw new Error('the repl mirror stayed');"#
+        ),
+        &options,
+        BUDGET,
+    )
+    .expect("the import resolves");
+    for refused in [
+        "await import('https://example.com/other.js');",
+        "await Function('t', 'return import(t)')('https://example.com/other.js');",
+    ] {
+        rt.evaluate_prelude(refused, &options, BUDGET)
+            .expect_err("a script the host did not run");
     }
 }
 

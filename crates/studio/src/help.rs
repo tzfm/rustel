@@ -39,6 +39,7 @@ pub enum HelpContext {
     Settings,
     SettingsAbout,
     SettingsSources,
+    SettingsTrust,
     Log,
     Jobs,
     Export,
@@ -69,6 +70,7 @@ impl HelpContext {
             Self::Settings => "settings",
             Self::SettingsAbout => "settings · about",
             Self::SettingsSources => "settings · samples",
+            Self::SettingsTrust => "settings · trust",
             Self::Log => "log",
             Self::Jobs => "background jobs",
             Self::Export => "export",
@@ -105,6 +107,9 @@ impl HelpContext {
             Self::SettingsAbout => "This page describes the terminal and runtime capabilities.",
             Self::SettingsSources => {
                 "Fetch imports, cache all remote packs, refresh their lists, and clear the cache; then your folders and the studio's packs. r aliases a bank on a user import; c caches a remote pack."
+            }
+            Self::SettingsTrust => {
+                "The origins a score imports scripts from with await import('https://...'). An origin the engine refused is listed until the studio closes."
             }
             Self::Log => {
                 "The newest studio messages are at the bottom of the log. v shows the running commentary underneath them."
@@ -287,6 +292,14 @@ impl HelpContext {
                     "c · Tab · Esc",
                     "cache this remote pack · other pages · close",
                 ),
+            ],
+            Self::SettingsTrust => [
+                ("Enter", "trust the refused origin under the cursor"),
+                (
+                    "d · Delete",
+                    "remove a trusted origin, or dismiss a refused one",
+                ),
+                ("Tab · Esc", "other pages · close"),
             ],
             Self::Log => [
                 (

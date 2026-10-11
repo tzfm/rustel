@@ -1334,6 +1334,11 @@ struct SampleAccessArgs {
     /// Permit samples('local:...') beneath this directory.
     #[arg(long = "allow-local-samples", value_name = "DIR")]
     local_root: Option<PathBuf>,
+    /// Trust this exact https origin for `await import('https://...')`. The
+    /// script runs as setup code before the score. May be repeated. By
+    /// default no script loads.
+    #[arg(long = "allow-import-origin", value_name = "ORIGIN")]
+    import_origins: Vec<String>,
     /// Permit score-chosen OSC destinations other than loopback.
     /// Repeatable. The value must be an IP literal; names are not resolved
     /// on the music thread.
@@ -1361,6 +1366,12 @@ fn with_sample_access(
             .map_err(RuntimeError::Message)?;
     }
     config.score_sample_access = access;
+    for origin in &args.import_origins {
+        config
+            .score_import_access
+            .permit_origin(origin)
+            .map_err(RuntimeError::Message)?;
+    }
     #[cfg(feature = "osc")]
     {
         let mut osc_access = ScoreOscAccess::loopback_only();

@@ -107,9 +107,12 @@ pub(crate) fn native_mini_sequence<'js>(
             continue;
         }
         let source: String = coerce.call((source,))?;
-        patterns.push(rustel_mini::mini(&source).map_err(|error| {
+        let parsed = rustel_mini::mini(&source).map_err(|error| {
             rquickjs::Error::new_from_js_message("string", "Pattern", error.to_string())
-        })?);
+        })?;
+        // The string is not in the score. Its positions would mark the
+        // first characters of the score as playing.
+        patterns.push(parsed.map_haps_native(|hap| Some(hap.clone().with_context(Vec::new()))));
     }
     let pattern = if patterns.is_empty() {
         // Empty slowcat IS silence, so `sequence()`

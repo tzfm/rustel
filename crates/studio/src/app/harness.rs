@@ -180,6 +180,8 @@ impl Studio {
                 // ^H would open the host's default input; a hermetic
                 // studio answers it as a machine with no input does.
                 open_default_input: false,
+                // As `run_once` does: the Trust page of the last studio.
+                trusted_imports: crate::prefs::StudioPrefs::load().trusted_imports,
                 ..Default::default()
             },
             #[cfg(feature = "hydra")]

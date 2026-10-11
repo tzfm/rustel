@@ -68,12 +68,23 @@ impl Widget for SettingsSheetView<'_> {
         buffer.set_stringn(
             panel.x + 68,
             panel.y,
+            " trust ",
+            7,
+            tab_style(SettingsPage::Trust),
+        );
+        buffer.set_stringn(
+            panel.x + 76,
+            panel.y,
             " about ",
             7,
             tab_style(SettingsPage::About),
         );
         if self.sheet.page == SettingsPage::About {
             render_about(&self, panel, rows, buffer);
+            return;
+        }
+        if self.sheet.page == SettingsPage::Trust {
+            render_trust(&self, panel, rows, buffer);
             return;
         }
         if self.sheet.page == SettingsPage::Mapping {
@@ -692,6 +703,92 @@ pub(super) fn render_keybinds(
     } else {
         format!("{hint}{more}")
     };
+    let lines = wrap_words(&text, width);
+    let height = usize::from(
+        panel
+            .bottom()
+            .saturating_sub(1)
+            .saturating_sub(rows.bottom()),
+    );
+    let count = lines.len().min(height);
+    let top = panel.bottom().saturating_sub(1 + count as u16);
+    for (offset, line) in lines.iter().take(count).enumerate() {
+        buffer.set_stringn(
+            rows.x,
+            top + offset as u16,
+            line,
+            width,
+            Style::default().fg(theme.muted),
+        );
+    }
+}
+
+/// The trust page: one origin a row, and what the keys do below the list.
+pub(super) fn render_trust(
+    view: &SettingsSheetView<'_>,
+    panel: Rect,
+    rows: Rect,
+    buffer: &mut Buffer,
+) {
+    let theme = view.theme;
+    let width = usize::from(rows.width);
+    let shown = usize::from(rows.height).max(1);
+    let first = view.sheet.first_row(shown, view.trust.len());
+    if view.trust.is_empty() {
+        buffer.set_stringn(
+            rows.x,
+            rows.y,
+            "  none yet · a score that imports a script puts its origin here",
+            width,
+            Style::default().fg(theme.muted),
+        );
+    }
+    let origin_width = view
+        .trust
+        .iter()
+        .map(|row| row.origin.width())
+        .max()
+        .unwrap_or(0);
+    for (offset, (index, row)) in view
+        .trust
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(shown)
+        .enumerate()
+    {
+        let selected = index == view.sheet.selected;
+        let marker = if selected {
+            super::super::terminal::symbol("▸")
+        } else {
+            " "
+        };
+        let state = if row.trusted { "trusted" } else { "refused" };
+        let style = if selected {
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else if row.trusted {
+            Style::default().fg(theme.foreground)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        buffer.set_stringn(
+            rows.x,
+            rows.y + offset as u16,
+            format!("{marker} {:<origin_width$}  {state}", row.origin),
+            width,
+            style,
+        );
+    }
+    let keys = match view.trust.get(view.sheet.selected) {
+        Some(row) if row.trusted => "d removes · Tab pages",
+        Some(_) => "Enter trusts · d dismisses · Tab pages",
+        None => "Tab pages",
+    };
+    let text = format!(
+        "A score loads a script with await import('https://...') only from a trusted origin. The script runs as setup code before the score. {keys}"
+    );
     let lines = wrap_words(&text, width);
     let height = usize::from(
         panel

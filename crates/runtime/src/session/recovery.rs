@@ -809,6 +809,8 @@ impl Session {
         fresh.export_limiter = self.export_limiter;
         fresh.render_tail_secs = self.render_tail_secs;
         fresh.pending_diagnostics = std::mem::take(&mut self.pending_diagnostics);
+        // The replay runs the imported scripts again, with no new fetch.
+        fresh.import_sources = std::mem::take(&mut self.import_sources);
         #[cfg(feature = "device-audio")]
         {
             // Keep output receipts. Replay sources refer to the discarded realm.

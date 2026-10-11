@@ -344,7 +344,7 @@ impl OrdinaryStringLiteralRanges {
             .iter()
             .chain(ERROR_MESSAGE_CALLS.iter())
             .map(|(name, _)| *name)
-            .chain(std::iter::once("initImage"))
+            .chain(["initImage", "import"])
             .any(|name| source.contains(name))
         {
             return Self::default();
@@ -486,6 +486,15 @@ impl<'a> Visit<'a> for HydraImageStringCollector {
             self.exempt_named_argument(called, &new_expr.arguments);
         }
         walk::walk_new_expression(self, new_expr);
+    }
+
+    // A script URL is not mini-notation.
+    fn visit_import_expression(&mut self, expression: &ImportExpression<'a>) {
+        if import_specifier(expression).is_some() {
+            let span = expression.source.span();
+            self.ranges.push((span.start as usize, span.end as usize));
+        }
+        walk::walk_import_expression(self, expression);
     }
 }
 
@@ -928,6 +937,9 @@ pub struct TranspileOptions {
     /// capability; standalone transpiler callers retain ordinary ES2022
     /// module support by default.
     pub allow_module_syntax: bool,
+    /// Script URLs the host has run. See [`script_imports`]. With module
+    /// syntax off, `import('<url>')` of one of them is still accepted.
+    pub loaded_imports: Vec<String>,
 }
 
 impl Default for TranspileOptions {
@@ -942,8 +954,79 @@ impl Default for TranspileOptions {
             emit_widgets: true,
             id: None,
             allow_module_syntax: true,
+            loaded_imports: Vec::new(),
         }
     }
+}
+
+/// What a parse accepts of ECMAScript module syntax.
+#[derive(Clone, Copy)]
+enum ModuleSyntax<'a> {
+    Allowed,
+    /// Refused, except `import('<url>')` of a script the host has run.
+    Refused {
+        loaded_imports: &'a [String],
+    },
+}
+
+impl<'a> ModuleSyntax<'a> {
+    fn of(options: &'a TranspileOptions) -> Self {
+        if options.allow_module_syntax {
+            Self::Allowed
+        } else {
+            Self::Refused {
+                loaded_imports: &options.loaded_imports,
+            }
+        }
+    }
+}
+
+/// The specifier of `import('...')` when it is one string with nothing
+/// interpolated.
+fn import_specifier<'a>(expression: &ImportExpression<'a>) -> Option<&'a str> {
+    match &expression.source {
+        Expression::StringLiteral(literal) => Some(literal.value.as_str()),
+        Expression::TemplateLiteral(template) if template.expressions.is_empty() => template
+            .quasis
+            .first()
+            .and_then(|quasi| quasi.value.cooked)
+            .map(|cooked| cooked.as_str()),
+        _ => None,
+    }
+}
+
+/// The script URLs a score imports with `import('http...')`, in source
+/// order. A host fetches and runs each one before the score, then names it in
+/// [`TranspileOptions::loaded_imports`]. A specifier that the score builds at
+/// run time is not listed, and the score realm refuses it.
+pub fn script_imports(source: &str) -> Vec<String> {
+    #[derive(Default)]
+    struct Imports(Vec<String>);
+
+    impl<'a> Visit<'a> for Imports {
+        fn visit_import_expression(&mut self, expression: &ImportExpression<'a>) {
+            if let Some(specifier) = import_specifier(expression)
+                && (specifier.starts_with("https://") || specifier.starts_with("http://"))
+                && !self.0.iter().any(|seen| seen == specifier)
+            {
+                self.0.push(specifier.to_owned());
+            }
+            walk::walk_import_expression(self, expression);
+        }
+    }
+
+    // Most scores import nothing. Skip the parse for them.
+    if !source.contains("import") || check_nesting(source).is_err() {
+        return Vec::new();
+    }
+    on_parse_stack(|| {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
+        let mut imports = Imports::default();
+        imports.visit_program(&parsed.program);
+        imports.0
+    })
+    .unwrap_or_default()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1043,12 +1126,12 @@ pub struct KabelsalatSpan {
 /// comments, ASI, precedence and source spans. Parse diagnostics are never
 /// discarded; callers decide whether recovery is acceptable.
 pub fn parse_and_print(source: &str) -> ParseOutput {
-    parse_and_print_as(source, SourceType::mjs(), true)
+    parse_and_print_as(source, SourceType::mjs(), ModuleSyntax::Allowed)
 }
 
 pub fn parse_and_print_path(source: &str, path: impl AsRef<Path>) -> ParseOutput {
     match SourceType::from_path(path) {
-        Ok(source_type) => parse_and_print_as(source, source_type, true),
+        Ok(source_type) => parse_and_print_as(source, source_type, ModuleSyntax::Allowed),
         Err(error) => ParseOutput {
             diagnostics: vec![ParseDiagnostic {
                 message: error.to_string(),
@@ -1062,7 +1145,7 @@ pub fn parse_and_print_path(source: &str, path: impl AsRef<Path>) -> ParseOutput
 fn parse_and_print_as(
     source: &str,
     source_type: SourceType,
-    allow_module_syntax: bool,
+    modules: ModuleSyntax<'_>,
 ) -> ParseOutput {
     // Before the allocator, before the parser: the recursion this refuses
     // would abort the process rather than return a diagnostic.
@@ -1072,9 +1155,7 @@ fn parse_and_print_as(
             ..ParseOutput::default()
         };
     }
-    let Some(output) =
-        on_parse_stack(|| parse_and_print_here(source, source_type, allow_module_syntax))
-    else {
+    let Some(output) = on_parse_stack(|| parse_and_print_here(source, source_type, modules)) else {
         return ParseOutput {
             diagnostics: vec![ParseDiagnostic {
                 message: "could not reserve a stack to parse on".into(),
@@ -1139,7 +1220,7 @@ impl<'a> Visit<'a> for StatementNesting {
 fn parse_and_print_here(
     source: &str,
     source_type: SourceType,
-    allow_module_syntax: bool,
+    modules: ModuleSyntax<'_>,
 ) -> ParseOutput {
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, source_type).parse();
@@ -1193,8 +1274,11 @@ fn parse_and_print_here(
                         .map(|label| label.offset() as usize),
                 }),
         );
-        if !allow_module_syntax {
-            let mut validator = ModuleSyntaxValidator::default();
+        if let ModuleSyntax::Refused { loaded_imports } = modules {
+            let mut validator = ModuleSyntaxValidator {
+                diagnostics: Vec::new(),
+                loaded_imports,
+            };
             validator.visit_program(&program);
             diagnostics.extend(validator.diagnostics);
         }
@@ -1330,9 +1414,9 @@ pub struct SetupDefinitions {
     /// Names a later score can call.
     pub names: Vec<String>,
     /// A definition whose name is not in the text - `globalThis[key] = …`,
-    /// `Object.assign(globalThis, helpers)`, a computed `register(...)`. A
-    /// checker that cannot read the name must not refuse any later call as
-    /// unknown.
+    /// `Object.assign(globalThis, helpers)`, a computed `register(...)`, an
+    /// `import(...)` of a script. A checker that cannot read the name must
+    /// not refuse any later call as unknown.
     pub has_dynamic_names: bool,
     /// Direct children of the program only.
     pub top_level_declarations: Vec<TopLevelDeclaration>,
@@ -1455,6 +1539,12 @@ impl SetupCollector {
 }
 
 impl<'a> Visit<'a> for SetupCollector {
+    // An imported script defines names that this text does not show.
+    fn visit_import_expression(&mut self, expression: &ImportExpression<'a>) {
+        self.has_dynamic_names = true;
+        walk::walk_import_expression(self, expression);
+    }
+
     fn visit_assignment_expression(&mut self, assignment: &AssignmentExpression<'a>) {
         if let Some(member) = assignment.left.as_member_expression() {
             let object = member.object();
@@ -1656,12 +1746,12 @@ fn registration_hints_from_program(program: &Program<'_>) -> RegistrationHints {
     }
 }
 
-#[derive(Default)]
-struct ModuleSyntaxValidator {
+struct ModuleSyntaxValidator<'o> {
     diagnostics: Vec<ParseDiagnostic>,
+    loaded_imports: &'o [String],
 }
 
-impl ModuleSyntaxValidator {
+impl ModuleSyntaxValidator<'_> {
     fn reject(&mut self, offset: u32, message: &'static str) {
         self.diagnostics.push(ParseDiagnostic {
             message: message.to_owned(),
@@ -1670,8 +1760,13 @@ impl ModuleSyntaxValidator {
     }
 }
 
-impl<'a> Visit<'a> for ModuleSyntaxValidator {
+impl<'a> Visit<'a> for ModuleSyntaxValidator<'_> {
     fn visit_import_expression(&mut self, expression: &ImportExpression<'a>) {
+        if import_specifier(expression)
+            .is_some_and(|specifier| self.loaded_imports.iter().any(|loaded| loaded == specifier))
+        {
+            return;
+        }
         self.reject(
             expression.span.start,
             "dynamic import is disabled in native score code",
@@ -2100,7 +2195,7 @@ fn transpile_here(source: &str, options: &TranspileOptions) -> TranspileOutput {
     let kabel = rewrite_kabelsalat(&widget_source, regexes_are_present);
     let labels = rewrite_labels(&kabel, regexes_are_present);
     let samples = rewrite_bare_samples(&labels);
-    let mut parsed = parse_and_print_as(&samples, SourceType::mjs(), options.allow_module_syntax);
+    let mut parsed = parse_and_print_as(&samples, SourceType::mjs(), ModuleSyntax::of(options));
     // The parser read the rewritten text; the score is what the reader sees.
     for diagnostic in &mut parsed.diagnostics {
         if let Some(offset) = diagnostic.offset {
@@ -6235,6 +6330,25 @@ p._scope({ text: "/* not a comment */" });"#;
             .is_empty(),
             "standalone transpiler callers retain module support"
         );
+
+        // A host lists the script URLs of a score, runs them, and names
+        // them. Only those imports pass, and the URL stays a string.
+        let url = "https://glossing.dev/scripts.js";
+        let source = format!("await import(\"{url}\");\nimport(name);\nimport('./local.js');");
+        assert_eq!(script_imports(&source), [url]);
+        let loaded = TranspileOptions {
+            loaded_imports: vec![url.to_owned()],
+            ..score.clone()
+        };
+        let output = transpile(&format!("await import(\"{url}\")"), &loaded);
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert_eq!(output.output, format!("await import('{url}');"));
+        assert!(
+            !transpile("import('https://other.example/x.js')", &loaded)
+                .diagnostics
+                .is_empty()
+        );
+        assert!(setup_definitions(&source).has_dynamic_names);
     }
 
     #[test]

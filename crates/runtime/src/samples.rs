@@ -107,6 +107,7 @@ mod empty_font_tests {
             shared: Arc::new(super::codec_tests::sample_test_shared(1)),
             manifest_queue,
             manifest_order: Mutex::new(()),
+            bus_names: rustel_voice::BusNames::default(),
         };
         assert_eq!(
             library.variants_of("gm_empty"),
@@ -320,6 +321,7 @@ mod live_warm_tests {
             shared: Arc::new(super::codec_tests::sample_test_shared(1)),
             manifest_queue,
             manifest_order: Mutex::new(()),
+            bus_names: rustel_voice::BusNames::default(),
         };
         (library, jobs)
     }
@@ -1735,6 +1737,7 @@ mod variant_tests {
             shared: Arc::new(super::codec_tests::sample_test_shared(1)),
             manifest_queue,
             manifest_order: Mutex::new(()),
+            bus_names: rustel_voice::BusNames::default(),
         };
         (library, jobs)
     }
@@ -4805,6 +4808,8 @@ pub struct SampleLibrary {
     /// look at whether a manifest is on its way, so no other producer's job
     /// lands in between. Never held while waiting.
     manifest_order: Mutex<()>,
+    /// The slot of each bus name a score sends to or reads from.
+    bus_names: rustel_voice::BusNames,
 }
 
 /// Keeps the manifest worker on a job until it drops; see
@@ -8096,6 +8101,7 @@ impl SampleLibrary {
             shared,
             manifest_queue,
             manifest_order: Mutex::new(()),
+            bus_names: rustel_voice::BusNames::default(),
         })
     }
 
@@ -17904,5 +17910,9 @@ impl SampleLookup for SampleLibrary {
     fn resolve(&self, s: &str, n: f64, midi: f64) -> SampleResolution {
         // A sound the engine asks for is one about to play.
         self.resolve_with_priority(s, n, midi, LoadPriority::Now)
+    }
+
+    fn bus_names(&self) -> Option<&rustel_voice::BusNames> {
+        Some(&self.bus_names)
     }
 }

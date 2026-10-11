@@ -407,14 +407,12 @@ impl App {
                 // written against a global one that did not run, and
                 // nothing sounding should be rebuilt on half a heap.
                 self.prebake_queue.clear();
+                let message = self
+                    .note_untrusted_import(&failure)
+                    .unwrap_or_else(|| format!("{}: {}", failure.kind, failure.message));
                 self.set_error(
                     ErrorOwner::Setup,
-                    format!(
-                        "{}: {}: {}",
-                        sent.scope.tab_name(),
-                        failure.kind,
-                        failure.message
-                    ),
+                    format!("{}: {message}", sent.scope.tab_name()),
                 );
             }
         }

@@ -5711,12 +5711,12 @@ const ROWS: &[ControlRow] = &[
             name: "bus",
             synonyms: &[],
             summary: "A `bus` is a send which can be used for mixing patterns.",
-            description: "A `bus` is a send which can be used for mixing patterns. It combines with..\n  s(\"bus\") to play that bus through another pattern (for, say, applying non-linear\n  effects like distortion to multiple signals)\n\n  otherPat.bmod(..) (to modulate another pattern with the bus)",
+            description: "A `bus` is a send which can be used for mixing patterns. It combines with..\n  s(\"bus\") to play that bus through another pattern (for, say, applying non-linear\n  effects like distortion to multiple signals)\n\n  otherPat.bmod(..) (to modulate another pattern with the bus)\n\nRustel has 16 buses. A number from 0 to 15 selects one. A name such as 'drums' takes a bus no number uses. When each bus has a name, a new name takes the bus of the name used longest ago.",
             params: &[
                 ReferenceParam {
-                    name: "number",
-                    r#type: "number | Pattern",
-                    description: "",
+                    name: "bus",
+                    r#type: "number | string | Pattern",
+                    description: "a bus number from 0 to 15, or a name.",
                 },
             ],
             examples: &[],

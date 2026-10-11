@@ -2155,6 +2155,18 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         origin: "rustel",
     },
     ReferenceEntry {
+        name: "getCps",
+        synonyms: &[],
+        summary: "the tempo in cycles per second",
+        description: "Returns the tempo the score set with `setcps` or `setcpm` in this evaluation. With none set, it returns the tempo in play. A helper reads it to turn a time in seconds into cycles.",
+        params: &[],
+        examples: &["setcpm(120/4)\n$: note(\"c3 e3\").s(\"sawtooth\").decay(0.25 / getCps())"],
+        tags: &["internals"],
+        no_autocomplete: false,
+        deprecated: false,
+        origin: "rustel",
+    },
+    ReferenceEntry {
         name: "setDefaultJoin",
         synonyms: &[],
         summary: "Sets the default method of combining events from two patterns (aka [alignment](https://strudel.cc/technical-manual/alignment/)).",
