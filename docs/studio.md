@@ -10,7 +10,9 @@ rustel studio set/
 ```
 
 With no path, Studio opens the last set. On first use, it creates a set. A new
-score path opens a starter score. Update writes the file and plays it. The
+path that ends in `.strudel` opens a starter score. Update writes the file and
+plays it. Any other new path, such as `rustel studio set1`, creates a set folder
+with a starter scene. File > Open set does the same with a path you type. The
 parent folder must exist.
 
 Type or paste a score, then press **Ctrl+S** or **F5**. Press **Ctrl+G** or **F8**
@@ -313,6 +315,12 @@ $: s("bd sd").gain(slider(0.5, 0, 1, 0.01))
 Update the score to activate its controls. Drag a slider, scroll over it, or
 press Alt+Up / Alt+Down with the caret on it. Keyboard changes use its step.
 A live change updates the code and is recorded in the session tape.
+
+A slider placed directly on `gain`, `lpf` or `lpq` also moves notes already
+sounding. An exact move takes 5 ms. With slider smoothing on in Settings, a
+mouse move takes 35 ms. With a lowpass envelope on the same note, such as
+`lpenv` or `lpattack`, an `lpf` slider changes from the next note. Any other
+control changes from the next note.
 
 Ctrl+J opens the smart action at the caret. On a number, it can create a slider.
 On a slider, it can change or remove the control. These source edits require
