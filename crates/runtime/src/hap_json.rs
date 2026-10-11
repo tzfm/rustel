@@ -102,7 +102,7 @@ pub struct QueryReport {
 pub struct OnsetEventJson {
     /// Private direct-control provenance; never part of query/report JSON.
     #[serde(skip)]
-    pub live_controls: [u64; 2],
+    pub live_controls: [u64; 3],
     pub onset_id: u64,
     pub generation: u64,
     /// The begin of the onset's whole as `n/d`. The audio path reads the
