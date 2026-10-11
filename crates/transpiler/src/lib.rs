@@ -1765,6 +1765,8 @@ impl<'a> Visit<'a> for ModuleSyntaxValidator<'_> {
         if import_specifier(expression)
             .is_some_and(|specifier| self.loaded_imports.iter().any(|loaded| loaded == specifier))
         {
+            // The options argument can hold another import.
+            walk::walk_import_expression(self, expression);
             return;
         }
         self.reject(
@@ -6343,11 +6345,12 @@ p._scope({ text: "/* not a comment */" });"#;
         let output = transpile(&format!("await import(\"{url}\")"), &loaded);
         assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
         assert_eq!(output.output, format!("await import('{url}');"));
-        assert!(
-            !transpile("import('https://other.example/x.js')", &loaded)
-                .diagnostics
-                .is_empty()
-        );
+        for refused in [
+            "import('https://other.example/x.js')".to_owned(),
+            format!("import('{url}', {{ with: import('./local.js') }})"),
+        ] {
+            assert!(!transpile(&refused, &loaded).diagnostics.is_empty());
+        }
         assert!(setup_definitions(&source).has_dynamic_names);
     }
 
