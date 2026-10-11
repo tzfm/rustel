@@ -19,6 +19,7 @@
 ### Sound changes
 
 - The stop fade runs for the full 10 ms. The fade ended after 128 frames, about 3 ms at 48 kHz, and left a click.
+- `.pg(x)` multiplies the postgain of each note by `x`. `.accent(x)` multiplies `velocity` and `lpenv` the same way. Before, both silenced the pattern with no error, because the multiplier held no events.
 
 ## v0.1.1
 
