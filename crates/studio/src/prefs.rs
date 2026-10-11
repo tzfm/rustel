@@ -310,7 +310,7 @@ pub struct StudioPrefs {
     /// The origins the player trusts for `import('https://...')` in a
     /// score, such as `https://glossing.dev`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub trusted_imports: Vec<String>,
+    pub import_origins: Vec<String>,
     /// What an imported bank was renamed to, by the name it arrived under.
     /// An overlay: the files are untouched, and removing the entry brings
     /// the old name back.

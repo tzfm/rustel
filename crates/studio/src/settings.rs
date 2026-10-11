@@ -3869,7 +3869,7 @@ pub struct TrustRow {
     pub origin: String,
     /// Whether scores import scripts from it. A refused origin is on the
     /// page until the studio closes, so the player trusts it with one key.
-    pub trusted: bool,
+    pub allowed: bool,
 }
 
 /// One action's binding, as its row should read.

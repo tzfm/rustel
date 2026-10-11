@@ -38777,7 +38777,7 @@ fn run_once(options: StudioOptions) -> Result<Session, RuntimeError> {
             input: options.input.clone().or_else(|| prefs.audio_input.clone()),
             preview_budget_bytes: sample_settings.preview_budget.bytes(),
             unused_sample_idle: sample_settings.unused_sample_idle.duration(),
-            trusted_imports: prefs.trusted_imports.clone(),
+            import_origins: prefs.import_origins.clone(),
             ..StudioConfig::default()
         },
         #[cfg(feature = "hydra")]
@@ -39275,7 +39275,7 @@ struct App {
     /// newest last. The Trust page offers them, so nobody types an origin.
     blocked_imports: Vec<String>,
     /// The Trust page changed and the engine does not have the list yet.
-    trusted_imports_owed: bool,
+    import_origins_owed: bool,
     /// Latest refused revision for each scene with an unresolved log alert.
     evaluation_alerts: HashMap<SceneId, Revision>,
     /// A diagnostic copied into the ordinary status line by the navigation
@@ -39785,7 +39785,7 @@ impl App {
             inflight: HashMap::new(),
             update_failure: None,
             blocked_imports: Vec::new(),
-            trusted_imports_owed: false,
+            import_origins_owed: false,
             evaluation_alerts: HashMap::new(),
             lint_status: None,
             pending_evaluation: None,

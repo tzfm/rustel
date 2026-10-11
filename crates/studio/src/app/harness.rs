@@ -181,7 +181,7 @@ impl Studio {
                 // studio answers it as a machine with no input does.
                 open_default_input: false,
                 // As `run_once` does: the Trust page of the last studio.
-                trusted_imports: crate::prefs::StudioPrefs::load().trusted_imports,
+                import_origins: crate::prefs::StudioPrefs::load().import_origins,
                 ..Default::default()
             },
             #[cfg(feature = "hydra")]

@@ -34,14 +34,14 @@ impl App {
 
     /// The rows of the Trust page: the trusted origins, then the refused.
     pub(super) fn trust_rows(&self) -> Vec<TrustRow> {
-        let row = |trusted| {
+        let row = |allowed| {
             move |origin: &String| TrustRow {
                 origin: origin.clone(),
-                trusted,
+                allowed,
             }
         };
         self.prefs
-            .trusted_imports
+            .import_origins
             .iter()
             .map(row(true))
             .chain(self.blocked_imports.iter().map(row(false)))
@@ -53,14 +53,14 @@ impl App {
         let Some(row) = self.trust_rows().into_iter().nth(at) else {
             return;
         };
-        if row.trusted {
+        if row.allowed {
             self.status = format!("{} is trusted · d removes it", row.origin);
             return;
         }
         self.blocked_imports
             .retain(|blocked| *blocked != row.origin);
-        self.prefs.trusted_imports.push(row.origin.clone());
-        self.trusted_imports_changed();
+        self.prefs.import_origins.push(row.origin.clone());
+        self.import_origins_changed();
         // The refusal on the footer names an origin that is trusted now.
         for owner in [ErrorOwner::Evaluation, ErrorOwner::Setup] {
             if self
@@ -79,11 +79,11 @@ impl App {
         let Some(row) = self.trust_rows().into_iter().nth(at) else {
             return;
         };
-        if row.trusted {
+        if row.allowed {
             self.prefs
-                .trusted_imports
-                .retain(|trusted| *trusted != row.origin);
-            self.trusted_imports_changed();
+                .import_origins
+                .retain(|origin| *origin != row.origin);
+            self.import_origins_changed();
             self.status = format!("{} removed · its scripts no longer load", row.origin);
         } else {
             self.blocked_imports
@@ -92,20 +92,20 @@ impl App {
         }
     }
 
-    fn trusted_imports_changed(&mut self) {
+    fn import_origins_changed(&mut self) {
         self.save_prefs_soon();
-        self.trusted_imports_owed = true;
-        self.send_trusted_imports();
+        self.import_origins_owed = true;
+        self.send_import_origins();
     }
 
     /// Give the engine the trusted origins, when it does not have them yet.
-    pub(super) fn send_trusted_imports(&mut self) {
-        if self.trusted_imports_owed
+    pub(super) fn send_import_origins(&mut self) {
+        if self.import_origins_owed
             && self
                 .worker
-                .try_set_trusted_imports(self.prefs.trusted_imports.clone())
+                .try_set_import_origins(self.prefs.import_origins.clone())
         {
-            self.trusted_imports_owed = false;
+            self.import_origins_owed = false;
         }
     }
 }

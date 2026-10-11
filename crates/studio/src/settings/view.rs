@@ -763,12 +763,12 @@ pub(super) fn render_trust(
         } else {
             " "
         };
-        let state = if row.trusted { "trusted" } else { "refused" };
+        let state = if row.allowed { "trusted" } else { "refused" };
         let style = if selected {
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD)
-        } else if row.trusted {
+        } else if row.allowed {
             Style::default().fg(theme.foreground)
         } else {
             Style::default().fg(theme.muted)
@@ -782,7 +782,7 @@ pub(super) fn render_trust(
         );
     }
     let keys = match view.trust.get(view.sheet.selected) {
-        Some(row) if row.trusted => "d removes · Tab pages",
+        Some(row) if row.allowed => "d removes · Tab pages",
         Some(_) => "Enter trusts · d dismisses · Tab pages",
         None => "Tab pages",
     };

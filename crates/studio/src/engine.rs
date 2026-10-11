@@ -267,7 +267,7 @@ pub struct StudioConfig {
     pub open_default_input: bool,
     /// The origins of the Trust page, which scores import scripts from.
     /// They add to the origins that `session` already trusts.
-    pub trusted_imports: Vec<String>,
+    pub import_origins: Vec<String>,
 }
 
 impl Default for StudioConfig {
@@ -286,7 +286,7 @@ impl Default for StudioConfig {
             unused_sample_idle: DEFAULT_UNUSED_SAMPLE_IDLE,
             watch_pads: true,
             open_default_input: true,
-            trusted_imports: Vec::new(),
+            import_origins: Vec::new(),
         }
     }
 }
@@ -1609,7 +1609,7 @@ impl StudioEngine {
         let preview_budget_bytes = config.preview_budget_bytes;
         let unused_sample_idle = config.unused_sample_idle;
         let mut session = Session::with_config(config.session.clone())?;
-        session.set_score_import_access(import_access(&config.session, &config.trusted_imports));
+        session.set_score_import_access(import_access(&config.session, &config.import_origins));
         session.set_query_hap_budget(STUDIO_QUERY_HAP_BUDGET)?;
         let master = Arc::new(StudioMasterBus::default());
         master.set_max_polyphony(config.session.max_polyphony);
@@ -5866,7 +5866,7 @@ impl StudioEngine {
 
     /// Replace the origins of the Trust page. The next evaluation imports
     /// scripts from them and from the origins the session config trusts.
-    pub fn set_trusted_imports(&mut self, origins: &[String]) {
+    pub fn set_import_origins(&mut self, origins: &[String]) {
         self.session
             .set_score_import_access(import_access(&self.config.session, origins));
     }
