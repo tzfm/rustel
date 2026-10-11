@@ -10,7 +10,9 @@ rustel studio set/
 ```
 
 With no path, Studio opens the last set. On first use, it creates a set. A new
-score path opens a starter score. Update writes the file and plays it. The
+path that ends in `.strudel` opens a starter score. Update writes the file and
+plays it. Any other new path, such as `rustel studio set1`, creates a set folder
+with a starter scene. File > Open set does the same with a path you type. The
 parent folder must exist.
 
 Type or paste a score, then press **Ctrl+S** or **F5**. Press **Ctrl+G** or **F8**
