@@ -23,62 +23,17 @@ impl Widget for SettingsSheetView<'_> {
                 Style::default().fg(theme.muted)
             }
         };
-        buffer.set_stringn(
-            panel.x + 2,
-            panel.y,
-            " settings ",
-            10,
-            tab_style(SettingsPage::Settings),
-        );
-        buffer.set_stringn(
-            panel.x + 13,
-            panel.y,
-            " advanced ",
-            10,
-            tab_style(SettingsPage::Advanced),
-        );
-        buffer.set_stringn(
-            panel.x + 24,
-            panel.y,
-            " mapping ",
-            9,
-            tab_style(SettingsPage::Mapping),
-        );
-        buffer.set_stringn(
-            panel.x + 34,
-            panel.y,
-            " keybinds ",
-            10,
-            tab_style(SettingsPage::Keybinds),
-        );
-        buffer.set_stringn(
-            panel.x + 45,
-            panel.y,
-            " samples ",
-            9,
-            tab_style(SettingsPage::Sources),
-        );
-        buffer.set_stringn(
-            panel.x + 56,
-            panel.y,
-            " reference ",
-            11,
-            tab_style(SettingsPage::Reference),
-        );
-        buffer.set_stringn(
-            panel.x + 68,
-            panel.y,
-            " trust ",
-            7,
-            tab_style(SettingsPage::Trust),
-        );
-        buffer.set_stringn(
-            panel.x + 76,
-            panel.y,
-            " about ",
-            7,
-            tab_style(SettingsPage::About),
-        );
+        // A tab stops short of the right border.
+        let right = panel.width.saturating_sub(1);
+        for (start, label, page) in tab_spans(panel.width) {
+            buffer.set_stringn(
+                panel.x + start,
+                panel.y,
+                &label,
+                usize::from(right.saturating_sub(start)),
+                tab_style(page),
+            );
+        }
         if self.sheet.page == SettingsPage::About {
             render_about(&self, panel, rows, buffer);
             return;

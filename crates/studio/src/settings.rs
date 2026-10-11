@@ -2330,6 +2330,40 @@ pub enum SettingsPage {
     About,
 }
 
+/// The tabs of the title row in a panel `width` columns wide: where each
+/// starts, what it says and the page it opens.
+///
+/// A label has a space on both sides, at fixed columns. A panel too narrow
+/// for the last tab drops those spaces and sets the labels one column apart.
+fn tab_spans(width: u16) -> Vec<(u16, String, SettingsPage)> {
+    const TABS: [(&str, u16, SettingsPage); 8] = [
+        ("settings", 2, SettingsPage::Settings),
+        ("advanced", 13, SettingsPage::Advanced),
+        ("mapping", 24, SettingsPage::Mapping),
+        ("keybinds", 34, SettingsPage::Keybinds),
+        ("samples", 45, SettingsPage::Sources),
+        ("reference", 56, SettingsPage::Reference),
+        ("trust", 68, SettingsPage::Trust),
+        ("about", 76, SettingsPage::About),
+    ];
+    let (about, start, _) = TABS[TABS.len() - 1];
+    // The padded last tab and the border must fit.
+    if start + about.len() as u16 + 2 < width {
+        return TABS
+            .iter()
+            .map(|&(label, start, page)| (start, format!(" {label} "), page))
+            .collect();
+    }
+    let mut start = 2;
+    TABS.iter()
+        .map(|&(label, _, page)| {
+            let span = (start, label.to_owned(), page);
+            start += label.len() as u16 + 1;
+            span
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct SettingsPosition {
     selected: usize,
@@ -3209,31 +3243,12 @@ impl SettingsSheet {
         if y != panel.y {
             return None;
         }
-        if x >= panel.x + 2 && x < panel.x + 12 {
-            return Some(SettingsPage::Settings);
-        }
-        if x >= panel.x + 13 && x < panel.x + 23 {
-            return Some(SettingsPage::Advanced);
-        }
-        if x >= panel.x + 24 && x < panel.x + 33 {
-            return Some(SettingsPage::Mapping);
-        }
-        if x >= panel.x + 34 && x < panel.x + 44 {
-            return Some(SettingsPage::Keybinds);
-        }
-        if x >= panel.x + 45 && x < panel.x + 54 {
-            return Some(SettingsPage::Sources);
-        }
-        if x >= panel.x + 56 && x < panel.x + 67 {
-            return Some(SettingsPage::Reference);
-        }
-        if x >= panel.x + 68 && x < panel.x + 75 {
-            return Some(SettingsPage::Trust);
-        }
-        if x >= panel.x + 76 && x < panel.x + 83 {
-            return Some(SettingsPage::About);
-        }
-        None
+        tab_spans(panel.width)
+            .into_iter()
+            .find(|(start, label, _)| {
+                x >= panel.x + start && x < panel.x + start + label.len() as u16
+            })
+            .map(|(_, _, page)| page)
     }
 
     pub fn show_page(&mut self, page: SettingsPage) {
@@ -7433,6 +7448,37 @@ mod tests {
         assert_eq!(at(54), None);
         assert_eq!(at(55), None);
         assert_eq!(at(67), None);
+
+        // At 80 columns the tabs lose their padding. Each one stays whole,
+        // answers to a click on its own label, and the corner stays.
+        let area = Rect::new(0, 0, 80, 40);
+        let (panel, _) = SettingsSheetView::geometry(area).expect("fits");
+        let buffer = render_sheet(
+            SettingsSheet::default(),
+            &UiSettings::default(),
+            &TerminalFeatures::default(),
+            area,
+        );
+        let title: String = (panel.x..panel.right())
+            .map(|x| buffer[(x, panel.y)].symbol())
+            .collect();
+        assert!(title.ends_with('╮'), "{title}");
+        for (label, page) in [
+            ("settings", SettingsPage::Settings),
+            ("advanced", SettingsPage::Advanced),
+            ("mapping", SettingsPage::Mapping),
+            ("keybinds", SettingsPage::Keybinds),
+            ("samples", SettingsPage::Sources),
+            ("reference", SettingsPage::Reference),
+            ("trust", SettingsPage::Trust),
+            ("about", SettingsPage::About),
+        ] {
+            let column = title[..title.find(label).expect(label)].chars().count() as u16;
+            for dx in 0..label.len() as u16 {
+                let click = SettingsSheet::tab_at(area, panel.x + column + dx, panel.y);
+                assert_eq!(click, Some(page), "{label} in {title}");
+            }
+        }
     }
 
     /// Every category starts listed. Each row hides one category.
