@@ -123,7 +123,9 @@ the local prebake, and the master limiter.
 
 Use the File menu to create, open, or rename a set. Open Recent lists the last
 eight sets. Changing sets saves edits. If Studio cannot save a score, the set
-stays open. The current music continues until you update a score or stop it.
+panel asks what to do. Enter retries the save. Del leaves the set without the
+edits it could not save. Esc keeps the set open. The current music continues
+until you update a score or stop it.
 
 New sets go in `<rustel-config>/sets/` by default. Change the default folder in
 Settings. This affects new sets; it does not move existing sets.
