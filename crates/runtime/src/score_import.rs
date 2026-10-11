@@ -43,8 +43,8 @@ impl ScoreImportAccess {
     /// Trust the scripts of one exact origin, such as `https://glossing.dev`.
     ///
     /// The origin has no credentials, path, query or fragment. It uses
-    /// https. Plain http is for an origin that names loopback, so a script
-    /// can come from a server on this machine.
+    /// https. Only an origin that names loopback accepts http, so a script
+    /// comes from a server on this machine.
     pub fn permit_origin(&mut self, origin: &str) -> Result<(), String> {
         let origin = import_origin(origin)?;
         if !self.origins.contains(&origin) {

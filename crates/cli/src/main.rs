@@ -1335,8 +1335,8 @@ struct SampleAccessArgs {
     #[arg(long = "allow-local-samples", value_name = "DIR")]
     local_root: Option<PathBuf>,
     /// Trust this exact https origin for `await import('https://...')`. The
-    /// script runs as setup code before the score. May be repeated. By
-    /// default no script loads.
+    /// script runs as setup code before the score. Repeatable. By default
+    /// no script loads.
     #[arg(long = "allow-import-origin", value_name = "ORIGIN")]
     import_origins: Vec<String>,
     /// Permit score-chosen OSC destinations other than loopback.

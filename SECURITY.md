@@ -58,8 +58,8 @@ The host loads the script. The realm does not:
   origin refuses the evaluation before any request leaves the machine.
 - The host fetches the script with the address rules of the sample client:
   public addresses only, redirects on the same origin, no credentials. The
-  origin uses https. Plain http is accepted only for an origin which names
-  loopback. A script is 1 MiB at most, and one fetch takes 8 seconds at most.
+  origin uses https. Only an origin which names loopback accepts http. A
+  script is 1 MiB at most, and one fetch takes 8 seconds at most.
 - The realm runs the text as setup code, with the limits of a prebake. The
   script gets no filesystem, process, socket, or HTTP API, and no capability
   the importing score lacks. While the script runs,

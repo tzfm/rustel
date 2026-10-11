@@ -2502,7 +2502,7 @@ impl std::fmt::Display for RuntimeError {
             Self::Unsupported(e) => write!(f, "{e}"),
             Self::UntrustedImport { origin } => write!(
                 f,
-                "{origin} is not trusted for import(); --allow-import-origin {origin} trusts it"
+                "{origin} is not trusted for import(). Trust it with --allow-import-origin {origin}"
             ),
             Self::Interrupted(signal) => {
                 write!(f, "interrupted by signal {signal} before the work started")
