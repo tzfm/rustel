@@ -94,7 +94,7 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
     fn filter_when_function(&self, function: Option<&crate::value::FunctionRef>) -> Self;
     /// Native `withHaps` with per-hap drop (tonal `scale`'s shape).
     fn map_haps_native(&self, f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static) -> Self;
-    /// Internal pitch-only rewrite: named gain/cutoff controls must not be transformed.
+    /// Internal pitch-only rewrite: named gain, cutoff and resonance controls must not be transformed.
     #[doc(hidden)]
     fn map_pitch_haps_native(
         &self,

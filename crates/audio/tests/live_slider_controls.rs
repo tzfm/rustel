@@ -1,8 +1,8 @@
 use rustel_audio::live_control::{LiveControlUpdate, SLIDER_DECLICK_SECS, SLIDER_SMOOTHING_SECS};
 use rustel_audio::tripwire::{self, TripwireAlloc, Violations};
 use rustel_audio::{
-    AudioBackend, Envelope, FilterControls, OnsetEvent, OscillatorControls, ScalarBackend,
-    StaticBiquad, Waveform,
+    AudioBackend, Envelope, FilterControls, FilterEnvelope, OnsetEvent, OscillatorControls,
+    ScalarBackend, StaticBiquad, Waveform,
 };
 use std::sync::Mutex;
 
@@ -11,7 +11,22 @@ static ALLOCATOR: TripwireAlloc = TripwireAlloc;
 static SERIAL: Mutex<()> = Mutex::new(());
 const RATE: u32 = 48_000;
 
-fn tone(gain: f32, bindings: [u64; 2], cutoff: Option<f32>) -> ScalarBackend {
+fn tone(gain: f32, bindings: [u64; 3], cutoff: Option<f32>) -> ScalarBackend {
+    tone_with(gain, bindings, lowpass(cutoff, None))
+}
+
+fn lowpass(cutoff: Option<f32>, envelope: Option<FilterEnvelope>) -> FilterControls {
+    FilterControls {
+        lowpass: cutoff.map(|frequency_hz| StaticBiquad {
+            frequency_hz,
+            q: 0.0,
+        }),
+        lowpass_envelope: envelope,
+        ..FilterControls::default()
+    }
+}
+
+fn tone_with(gain: f32, bindings: [u64; 3], filters: FilterControls) -> ScalarBackend {
     let mut backend = ScalarBackend::prepared(RATE, 8).unwrap();
     assert!(
         backend.try_note_prepared(OnsetEvent::new(0, 1000.0, gain, 5.0).with_controls(
@@ -25,13 +40,7 @@ fn tone(gain: f32, bindings: [u64; 2], cutoff: Option<f32>) -> ScalarBackend {
                     sustain: 1.0,
                     release_secs: 0.01
                 },
-                filters: FilterControls {
-                    lowpass: cutoff.map(|frequency_hz| StaticBiquad {
-                        frequency_hz,
-                        q: 0.0
-                    }),
-                    ..FilterControls::default()
-                },
+                filters,
                 ..OscillatorControls::default()
             }
         ))
@@ -53,8 +62,8 @@ fn declick_frames() -> usize {
 #[test]
 fn sustained_zero_gain_fades_in_sample_by_sample_and_exact_edits_replace_the_glide() {
     let _serial = SERIAL.lock().unwrap();
-    let mut fading = tone(0.0, [7, 0], None);
-    let mut reference = tone(1.0, [7, 0], None);
+    let mut fading = tone(0.0, [7, 0, 0], None);
+    let mut reference = tone(1.0, [7, 0, 0], None);
     assert!(render(&mut fading, 128).iter().all(|value| *value == 0.0));
     render(&mut reference, 128);
     fading.set_live_control(LiveControlUpdate {
@@ -108,7 +117,7 @@ fn sustained_zero_gain_fades_in_sample_by_sample_and_exact_edits_replace_the_gli
 #[test]
 fn an_exact_gain_update_does_not_step_a_sounding_voice() {
     let _serial = SERIAL.lock().unwrap();
-    let mut voice = tone(1.0, [7, 0], None);
+    let mut voice = tone(1.0, [7, 0, 0], None);
     let steady = render(&mut voice, 1024);
     let slope = |samples: &[f32]| {
         samples
@@ -134,7 +143,7 @@ fn an_exact_gain_update_does_not_step_a_sounding_voice() {
         slope(&joined)
     );
     // After the ramp the voice is at the exact target.
-    let mut reference = tone(1.0, [0, 0], None);
+    let mut reference = tone(1.0, [0, 0, 0], None);
     render(&mut reference, 1024 + declick_frames());
     for (actual, full) in render(&mut voice, 256)
         .into_iter()
@@ -145,34 +154,50 @@ fn an_exact_gain_update_does_not_step_a_sounding_voice() {
 }
 
 #[test]
-fn filter_slider_changes_the_existing_voice_and_leaves_unbound_voices_alone() {
+fn filter_sliders_change_the_existing_voice_and_leave_unbound_voices_alone() {
     let _serial = SERIAL.lock().unwrap();
-    let mut bound = tone(0.5, [0, 9], Some(100.0));
-    let mut unbound = tone(0.5, [0, 0], Some(100.0));
-    render(&mut bound, 4096);
-    render(&mut unbound, 4096);
-    let update = LiveControlUpdate {
-        binding: 9,
-        value: 4000.0,
-        smooth: true,
+    // The cutoff opens far above the 1 kHz tone. The resonance peaks on it,
+    // also under an envelope that holds the cutoff there.
+    let held = FilterEnvelope {
+        attack_secs: 0.0,
+        decay_secs: 0.0,
+        sustain: 1.0,
+        release_secs: 0.01,
+        min_hz: 1000.0,
+        max_hz: 1000.0,
     };
-    bound.set_live_control(update);
-    unbound.set_live_control(update);
-    render(&mut bound, 2048);
-    render(&mut unbound, 2048);
-    let power = |samples: Vec<f32>| samples.iter().map(|sample| sample * sample).sum::<f32>();
-    let opened = power(render(&mut bound, 2048));
-    let unchanged = power(render(&mut unbound, 2048));
-    assert!(
-        opened > unchanged * 100.0,
-        "bound {opened}, unbound {unchanged}"
-    );
+    for (bindings, filters, value) in [
+        ([0, 9, 0], lowpass(Some(100.0), None), 4000.0),
+        ([0, 0, 9], lowpass(Some(1000.0), None), 30.0),
+        ([0, 0, 9], lowpass(Some(1000.0), Some(held)), 30.0),
+    ] {
+        let mut bound = tone_with(0.5, bindings, filters);
+        let mut unbound = tone_with(0.5, [0; 3], filters);
+        render(&mut bound, 4096);
+        render(&mut unbound, 4096);
+        let update = LiveControlUpdate {
+            binding: 9,
+            value,
+            smooth: true,
+        };
+        bound.set_live_control(update);
+        unbound.set_live_control(update);
+        render(&mut bound, 2048);
+        render(&mut unbound, 2048);
+        let power = |samples: Vec<f32>| samples.iter().map(|sample| sample * sample).sum::<f32>();
+        let opened = power(render(&mut bound, 2048));
+        let unchanged = power(render(&mut unbound, 2048));
+        assert!(
+            opened > unchanged * 100.0,
+            "{bindings:?}: bound {opened}, unbound {unchanged}"
+        );
+    }
 }
 
 #[test]
 fn live_updates_and_filter_ramps_allocate_nothing_in_the_callback() {
     let _serial = SERIAL.lock().unwrap();
-    let mut backend = tone(0.0, [7, 9], Some(200.0));
+    let mut backend = tone(0.0, [7, 9, 10], Some(200.0));
     let mut block = [0.0; 256];
     let before = Violations::capture();
     tripwire::audio_scope(|| {
@@ -187,6 +212,11 @@ fn live_updates_and_filter_ramps_allocate_nothing_in_the_callback() {
             value: 4000.0,
             smooth: true,
         });
+        backend.set_live_control(LiveControlUpdate {
+            binding: 10,
+            value: 12.0,
+            smooth: true,
+        });
         for _ in 0..20 {
             backend.process_block(&mut block, 128);
         }
@@ -199,9 +229,9 @@ fn live_updates_and_filter_ramps_allocate_nothing_in_the_callback() {
 fn prefetched_onsets_take_the_latest_target_without_touching_another_evaluation() {
     let _serial = SERIAL.lock().unwrap();
     // These notes are queued but not activated yet, as in the live horizon.
-    let mut pending = tone(0.0, [7, 0], None);
-    let mut other_evaluation = tone(0.0, [8, 0], None);
-    let mut reference = tone(0.75, [7, 0], None);
+    let mut pending = tone(0.0, [7, 0, 0], None);
+    let mut other_evaluation = tone(0.0, [8, 0, 0], None);
+    let mut reference = tone(0.75, [7, 0, 0], None);
     let update = LiveControlUpdate {
         binding: 7,
         value: 0.75,
@@ -224,7 +254,7 @@ fn live_gain_stays_after_nonlinear_fx_when_a_silent_voice_fades_in() {
         let mut backend = ScalarBackend::prepared(RATE, 2).unwrap();
         let mut controls = OscillatorControls {
             limit: None,
-            live_controls: [binding, 0],
+            live_controls: [binding, 0, 0],
             envelope: Envelope {
                 attack_secs: 0.0,
                 decay_secs: 0.0,

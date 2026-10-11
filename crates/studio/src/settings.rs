@@ -1494,7 +1494,8 @@ pub struct UiSettings {
     /// Whether Hydra's backdrop averages the pixels it scales down, or picks
     /// one of them. Costs the same either way; it is purely how it looks.
     pub backdrop_smoothing: bool,
-    /// Smooth direct gain/filter slider mouse changes in the audio engine.
+    /// Smooth direct gain, cutoff and resonance slider mouse changes in the
+    /// audio engine.
     pub slider_smoothing: bool,
     /// Equal distance means equal frequency ratios for direct Hz controls.
     pub frequency_slider_log: bool,
