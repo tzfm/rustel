@@ -9490,7 +9490,7 @@ mod tests {
     #[test]
     #[cfg(feature = "device-audio")]
     fn live_ui_trace_keeps_transpiler_byte_ranges_on_audio_onset_ids() {
-        let source = r#"$: note("c4 e4")"#;
+        let source = r#"$: arrange([1, note("c4 e4")])"#;
         let mut session = Session::with_config(SessionConfig {
             cps: 2.0,
             ..SessionConfig::default()
@@ -9519,10 +9519,12 @@ mod tests {
 
         assert_eq!(batch.events.len(), 2);
         assert_eq!(traces.len(), 2);
-        assert_eq!(traces[0].context, vec![(9, 11)]);
-        assert_eq!(&source.as_bytes()[9..11], b"c4");
-        assert_eq!(traces[1].context, vec![(12, 14)]);
-        assert_eq!(&source.as_bytes()[12..14], b"e4");
+        // Each note carries its own span, then the cycle count of its section.
+        assert_eq!(traces[0].context, vec![(21, 23), (12, 13)]);
+        assert_eq!(&source.as_bytes()[21..23], b"c4");
+        assert_eq!(traces[1].context, vec![(24, 26), (12, 13)]);
+        assert_eq!(&source.as_bytes()[24..26], b"e4");
+        assert_eq!(&source.as_bytes()[12..13], b"1");
         assert!(batch.events.iter().zip(&traces).all(|(audio, trace)| {
             audio.generation == trace.generation && audio.onset_id == trace.onset_id
         }));
