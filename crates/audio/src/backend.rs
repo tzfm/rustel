@@ -116,9 +116,10 @@ impl Default for FilterControls {
 /// upmix and an explicitly inserted centered stereo panner.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OscillatorControls {
-    /// Host-only direct slider bindings: gain, then lowpass cutoff. Zero is
-    /// unbound. Tokens never cross score evaluations or arbitrary value maps.
-    pub live_controls: [u64; 2],
+    /// Host-only direct slider bindings: gain, lowpass cutoff, then lowpass
+    /// resonance. Zero is unbound. Tokens never cross score evaluations or
+    /// arbitrary value maps.
+    pub live_controls: [u64; 3],
     /// Host preview identity. Zero belongs to the score; a newer nonzero
     /// identity replaces older preview voices without touching score voices.
     pub preview_epoch: u64,
@@ -1003,7 +1004,7 @@ impl DuckControls {
 impl Default for OscillatorControls {
     fn default() -> Self {
         Self {
-            live_controls: [0; 2],
+            live_controls: [0; 3],
             preview_epoch: 0,
             choke_only: false,
             piano: false,

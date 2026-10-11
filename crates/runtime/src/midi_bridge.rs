@@ -2150,7 +2150,7 @@ mod tests {
             whole_begin: "0/1".into(),
             duration_secs: 0.5,
             target_time: 12.5,
-            live_controls: [0; 2],
+            live_controls: [0; 3],
             ui_visuals: 0,
             value: ValueJson::Raw(value),
             value_show: String::new(),

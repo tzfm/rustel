@@ -166,6 +166,52 @@ pub struct Reference {
     /// Documented but filtered out by the `known` predicate; reported,
     /// not shown.
     omitted: usize,
+    /// Categories the settings hide from the browse list and the
+    /// suggestions. Lookup by name still finds their entries.
+    hidden: Vec<Category>,
+}
+
+/// A kind of entry the settings hide from the browse list and the editor
+/// suggestions. An entry joins a kind through the kind's tag.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Category {
+    /// Controls only an OSC receiver such as SuperDirt reads, and `osc`.
+    Osc,
+    /// Output over a serial port.
+    Serial,
+    /// The FM matrix cells, `fmi11` to `fmi88`, each routing one operator
+    /// into another.
+    FmMatrix,
+    /// The bind and join family, for writing new pattern functions.
+    Bind,
+    /// Hap and query plumbing such as `withHap` and `splitQueries`.
+    Internals,
+}
+
+impl Category {
+    pub const ALL: [Self; 5] = [
+        Self::Osc,
+        Self::Serial,
+        Self::FmMatrix,
+        Self::Bind,
+        Self::Internals,
+    ];
+
+    /// The tag an entry carries to belong to this category.
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Osc => "osc",
+            Self::Serial => "serial",
+            Self::FmMatrix => "fm_matrix",
+            Self::Bind => "bind",
+            Self::Internals => "internals",
+        }
+    }
+
+    /// Whether `entry` belongs to this category.
+    pub fn files(self, entry: &Entry) -> bool {
+        entry.tags.iter().any(|tag| tag == self.tag())
+    }
 }
 
 /// The first `tag:` filter in a query and the text to search alongside it.
@@ -2993,20 +3039,24 @@ mod tests {
         }
 
         /// The browse list gathers its results under the tag each entry is
-        /// filed by. The headings arrive in the order the search put their
-        /// best member in, never alphabetically: what was typed has to still
-        /// be on the first row the cursor can land on. Every result appears
-        /// exactly once, in search order within its run.
+        /// filed by. An empty search puts the most used heading first. A
+        /// search puts the best answer's heading first. Every result appears
+        /// once, in search order within its run.
         #[test]
         fn the_list_gathers_its_results_under_the_tag_each_is_filed_by() {
             let reference = Reference::load_all();
+            let searched = ReferencePanel::browse_for(&reference, "lpf");
+            let first_name = searched
+                .browse_rows()
+                .iter()
+                .find(|row| matches!(row, BrowseRow::Entry(_)));
+            assert!(
+                matches!(first_name, Some(BrowseRow::Entry(0))),
+                "a search opens on the best answer"
+            );
             let panel = ReferencePanel::browse(&reference);
             let rows = panel.browse_rows();
             assert!(rows.len() > panel.results.len(), "headings were added");
-            assert!(
-                matches!(rows.first(), Some(BrowseRow::Tag(0))),
-                "the first heading opens over the best answer"
-            );
             let mut seen: Vec<usize> = Vec::new();
             let mut headings: Vec<&str> = Vec::new();
             let mut under: Option<&str> = None;
@@ -3038,7 +3088,7 @@ mod tests {
                     }
                 }
             }
-            assert!(headings.len() > 1, "several tags: {headings:?}");
+            assert_eq!(headings[..3], ["temporal", "tonal", "audio"]);
             let mut order: Vec<usize> = seen.clone();
             order.sort_unstable();
             order.dedup();
@@ -5072,6 +5122,71 @@ mod tests {
                 panel.tab = Tab::Examples;
                 assert!(!panel.paste_query(&reference, "min"));
                 assert!(!panel.clear_query(&reference));
+            }
+        }
+
+        /// A hidden category leaves the list. Its `tag:` and its names still
+        /// reach the entries.
+        #[test]
+        fn hidden_categories_leave_search_but_not_lookup() {
+            let mut reference = Reference::load_all();
+            let names = |reference: &Reference, query: &str| -> Vec<String> {
+                reference
+                    .search(query)
+                    .into_iter()
+                    .map(|index| reference.entry(index).unwrap().name.clone())
+                    .collect()
+            };
+            let everything = reference.search("").len();
+            assert_eq!(reference.hidden_len(), 0);
+            for name in ["squiz", "osc", "fadeInTime", "oschost", "serial"] {
+                assert!(names(&reference, "").contains(&name.to_owned()), "{name}");
+            }
+
+            reference.set_hidden(Category::ALL);
+            let listed = names(&reference, "");
+            for name in ["squiz", "osc", "fadeInTime", "oschost", "serial"] {
+                assert!(!listed.contains(&name.to_owned()), "{name} is hidden");
+                assert!(reference.lookup(name).is_some(), "{name} still resolves");
+            }
+            assert!(listed.contains(&"lpf".to_owned()), "native controls stay");
+            assert!(
+                listed.contains(&"dry".to_owned()),
+                "native superdirt-tagged stay"
+            );
+            assert_eq!(listed.len() + reference.hidden_len(), everything);
+            assert!(!names(&reference, "squiz").contains(&"squiz".to_owned()));
+            assert!(names(&reference, "tag:osc").contains(&"squiz".to_owned()));
+            assert!(names(&reference, "tag:serial").contains(&"serial".to_owned()));
+            assert!(
+                !names(&reference, "tag:control").contains(&"fadeInTime".to_owned()),
+                "another tag does not bring a hidden entry back"
+            );
+
+            for name in ["fmi12", "fmi88", "bind", "innerJoin", "appLeft", "withHap"] {
+                assert!(!listed.contains(&name.to_owned()), "{name} is hidden");
+            }
+            for name in ["fmi", "fmi2", "fmh8", "set", "keep", "withValue", "stack"] {
+                assert!(listed.contains(&name.to_owned()), "{name} stays");
+            }
+            assert!(names(&reference, "tag:fm_matrix").contains(&"fmi12".to_owned()));
+            assert!(names(&reference, "tag:bind").contains(&"squeezeJoin".to_owned()));
+            assert!(names(&reference, "tag:internals").contains(&"withHap".to_owned()));
+
+            reference.set_hidden([Category::Serial]);
+            assert!(names(&reference, "").contains(&"squiz".to_owned()));
+            assert!(!names(&reference, "").contains(&"serial".to_owned()));
+        }
+
+        /// A control only SuperDirt plays carries `superdirt` and `osc`.
+        #[test]
+        fn superdirt_entries_are_osc_entries() {
+            let reference = Reference::load_all();
+            for index in 0..reference.len() {
+                let entry = reference.entry(index).unwrap();
+                if entry.tags.iter().any(|tag| tag == "superdirt") {
+                    assert!(Category::Osc.files(entry), "{} lacks osc", entry.name);
+                }
             }
         }
     }

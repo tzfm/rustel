@@ -93,10 +93,10 @@ fn open_advanced(studio: &mut Hermetic) {
     studio.settle();
 }
 
-/// Open the sheet on the About page - the sixth of six tabs.
+/// Open the sheet on the About page - the seventh of seven tabs.
 fn open_about(studio: &mut Hermetic) {
     open_sheet(studio);
-    for _ in 0..5 {
+    for _ in 0..6 {
         studio.press(KeyCode::Tab, KeyModifiers::NONE);
     }
     studio.settle();
@@ -787,10 +787,10 @@ fn settings_and_advanced_keep_their_place_until_studio_restarts() {
     open_sheet(&mut studio);
 }
 
-/// Tab walks the strip's six pages in order and wraps - each page
+/// Tab walks the strip's seven pages in order and wraps - each page
 /// recognised by a row only it draws.
 #[test]
-fn tab_cycles_the_six_pages_and_wraps() {
+fn tab_cycles_the_seven_pages_and_wraps() {
     let mut studio = hermetic();
     open_sheet(&mut studio);
 
@@ -799,6 +799,7 @@ fn tab_cycles_the_six_pages_and_wraps() {
         "not assigned",         // mapping: the slot boxes
         "automatic",            // keybinds: the terminal-profile row
         "fetch imports",        // sources
+        "OSC / SuperDirt",      // reference
         "Terminal: rustel-e2e", // about
         "launch on",            // and back to settings
     ] {

@@ -198,6 +198,77 @@ fn esc_from_browse_closes_the_column() {
     assert_eq!(studio.status(), "reference closed");
 }
 
+/// OSC off hides squiz from the browser and the suggestions. `tag:osc` and
+/// Ctrl+D still reach the entry.
+#[test]
+fn the_reference_setting_hides_osc_entries() {
+    let mut studio = hermetic();
+    let close_column = |studio: &mut rustel_studio_e2e::Hermetic| {
+        for _ in 0..3 {
+            if studio.reference_tab().is_none() {
+                break;
+            }
+            studio.press(KeyCode::Esc, KeyModifiers::NONE);
+        }
+        assert_eq!(studio.reference_tab(), None);
+    };
+    let lists_squiz = |studio: &mut rustel_studio_e2e::Hermetic| {
+        studio
+            .rows()
+            .iter()
+            .any(|row| row.contains("squiz") && row.contains("SuperDirt (OSC)"))
+    };
+    let browse_for_squiz = |studio: &mut rustel_studio_e2e::Hermetic| {
+        studio.set_score("$: ");
+        studio.press(KeyCode::End, KeyModifiers::NONE);
+        studio.chord("ctrl+d");
+        studio.type_text("squiz");
+    };
+
+    browse_for_squiz(&mut studio);
+    assert!(lists_squiz(&mut studio), "listed out of the box");
+    close_column(&mut studio);
+
+    // Settings ▸ Reference is the sixth tab. Its first row is OSC.
+    studio.chord("ctrl+o");
+    for _ in 0..5 {
+        studio.press(KeyCode::Tab, KeyModifiers::NONE);
+    }
+    studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+
+    browse_for_squiz(&mut studio);
+    assert!(
+        !lists_squiz(&mut studio),
+        "switched off, the browser leaves it out"
+    );
+    for _ in 0.."squiz".len() {
+        studio.press(KeyCode::Backspace, KeyModifiers::NONE);
+    }
+    row_containing(&studio.rows(), "hidden · type tag: to narrow");
+    studio.type_text("tag:osc squiz");
+    assert!(lists_squiz(&mut studio), "tag:osc lists squiz anyway");
+    close_column(&mut studio);
+
+    studio.set_score("$: s(\"bd\").squ");
+    studio.press(KeyCode::End, KeyModifiers::NONE);
+    studio.chord("ctrl+f");
+    assert!(!lists_squiz(&mut studio), "no suggestion offers squiz");
+    close_column(&mut studio);
+
+    studio.set_score("$: squiz(2)");
+    studio.press(KeyCode::Home, KeyModifiers::NONE);
+    for _ in 0..5 {
+        studio.press(KeyCode::Right, KeyModifiers::NONE);
+    }
+    studio.chord("ctrl+d");
+    assert_eq!(
+        studio.status(),
+        "reference - squiz",
+        "a hidden name still opens"
+    );
+}
+
 /// Tab walks the tabs - reference, samples, chords, scales - and Esc from
 /// any of them closes the column. (With the `hydra` feature Generator and Examples
 /// follow scales; this walk only pins the four every build has.)

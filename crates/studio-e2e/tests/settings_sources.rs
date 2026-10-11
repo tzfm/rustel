@@ -50,7 +50,7 @@ fn select_row(studio: &mut Hermetic, marker: &str) {
     panic!("no row reads {marker:?}:\n{}", studio.rows().join("\n"));
 }
 
-/// Open the sheet on its Sources page - the fifth of six tabs.
+/// Open the sheet on its Sources page - the fifth of seven tabs.
 fn open_sources(studio: &mut Hermetic) {
     studio.chord("ctrl+o");
     for _ in 0..4 {

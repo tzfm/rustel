@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- With an empty search, the reference lists its headings by use across the 186 songs in the score corpus. Temporal, tonal and audio come first. A search still opens on the best match.
+- Settings ▸ Reference has five switches, all on by default. Turn one off to hide a kind of entry from the reference and the editor suggestions. The kinds are OSC and SuperDirt-only controls, `serial()`, the FM routing matrix `fmi11` to `fmi88`, the `bind` and `join` family, and pattern internals such as `withHap`. `tag:` search still lists a hidden kind, and Ctrl+D still opens its page. `fadeInTime`, `chorus`, `oschost` and `oscport` now carry the `osc` tag. `dry`, `bus`, `busgain`, `octave`, `unit` and `phaserdepth` play natively, so they lose the `superdirt` tag.
 - Pattern queries are faster. Cycle time arithmetic uses 64-bit math when numerators and denominators are below 2^31. Every operation used 128-bit math. `s("[bd hh sd hh]*8").fast(2)` queries 1.7 times faster over whole cycles and 1.65 times faster over a 25 millicycle live window, in a release build on one x86-64 desktop. Events stay the same.
 - Scores with several controls query faster. A control such as `.gain(0.8)` built a lookup table for each event, and only `pick` reads the table. Rustel now builds the table when a `pick` asks. `s("[bd hh sd hh]*8").n(3).gain(0.8).pan(0.25).cutoff(800).room(0.3)` queries 1.9 times faster in a release build on one x86-64 desktop. Events stay the same.
 - A host which builds `rustel-core` with no default features drops the scale table (244 KB compressed) and its decoder. The new `tuning-list` feature holds both and is on by default. Named scales are unknown in the smaller build, and a scale given as a frequency list works as before. A default build and every Rustel product build stay unchanged.
@@ -13,10 +15,12 @@
 - `rustel export` accepts `--prebake` and is the one command for a bounce to a file. `rustel play` has no `--export`, `--cycles`, `--until-silence`, `--silence-floor`, `--silence-hold` or `--sample-rate`. The old `--export` wrote WAV only, with a default length of 2 seconds.
 - `rustel-ext` no longer turns the scale table on. A host which builds `rustel-core` with no default features keeps the table off and still gets the extension names. A default build stays unchanged.
 - Studio marks the cycle count of the `arrange` section in play. `arrange([8, intro], [16, verse])` marks the `8` for 8 cycles, then the `16`. An `arrange` call had no mark, so the score did not show your place in the song. Each event of a section carries one more source span. Sound and timing stay the same.
+- Two timing tests no longer fail on a loaded CI runner. The scheduler budget test measured the age of its own channel as wake jitter, 138 ms on one Windows runner. The studio handover test left 50 ms for a late wake of the MIDI sender thread and now leaves 200 ms.
 
 ### Sound changes
 
 - The stop fade runs for the full 10 ms. The fade ended after 128 frames, about 3 ms at 48 kHz, and left a click.
+- An `lpq` slider moves the resonance of a note already sounding. It works like an `lpf` slider on the cutoff. An exact move takes 5 ms, and a smoothed mouse move takes 35 ms. Before, the new resonance reached only the next note, so a long note or a `legato(2)` pad kept the old value. A render does not change.
 
 ## v0.1.1
 

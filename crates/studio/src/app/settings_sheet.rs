@@ -165,6 +165,14 @@ impl App {
 
     pub(super) fn apply_ui_settings(&mut self) {
         self.ui_settings.apply();
+        // An open list follows the switch at once.
+        if self
+            .reference
+            .set_hidden(self.ui_settings.hidden_categories())
+            && let Some(panel) = self.reference_panel.as_mut()
+        {
+            panel.refresh(&self.reference);
+        }
         if let Some(panel) = self.set_panel.as_mut() {
             panel.on_right = self.ui_settings.set_panel_right;
         }

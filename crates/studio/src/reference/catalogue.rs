@@ -358,6 +358,38 @@ impl Reference {
         self.entries.len()
     }
 
+    /// Hide these categories from the browse list and the suggestions.
+    /// Returns true when the hidden set changed.
+    pub fn set_hidden(&mut self, hidden: impl IntoIterator<Item = Category>) -> bool {
+        let hidden: Vec<Category> = hidden.into_iter().collect();
+        if self.hidden == hidden {
+            return false;
+        }
+        self.hidden = hidden;
+        true
+    }
+
+    /// How many entries the settings hide from an unfiltered list.
+    pub fn hidden_len(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| !self.offers(entry, &TagFilter::default()))
+            .count()
+    }
+
+    /// Whether a search lists `entry`. The entry is in no hidden category,
+    /// or the query's `tag:` names the hidden category.
+    fn offers(&self, entry: &Entry, filter: &TagFilter) -> bool {
+        self.hidden.iter().all(|category| {
+            !category.files(entry)
+                || filter.name.is_some_and(|name| {
+                    category
+                        .tag()
+                        .starts_with(name.to_ascii_lowercase().as_str())
+                })
+        })
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -435,7 +467,8 @@ impl Reference {
     /// Entries matching a query, best first: the exact name, then names
     /// that start with it, then names and synonyms that contain it, then
     /// summaries that mention it. An empty query lists everything,
-    /// hidden-from-completion entries last.
+    /// hidden-from-completion entries last. A [`Category`] the settings
+    /// hide stays out unless a `tag:` word names the category.
     ///
     /// A `tag:` word narrows the field before any of that ranking happens -
     /// see [`TagFilter`]. Ranking a whole vocabulary cannot answer "show me
@@ -461,7 +494,7 @@ impl Reference {
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| filter.admits(entry))
+            .filter(|(_, entry)| filter.admits(entry) && self.offers(entry, &filter))
             // An underscore asks for an inline/underscored callable, not a
             // one-character typo for `H`, `i`, `n`, etc. Keep fuzzy matching
             // within that family so partial names and typos still work.

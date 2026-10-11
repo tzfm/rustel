@@ -888,7 +888,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "s(\"sine\").fmi00(1)",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -912,7 +912,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "s(\"sine\").fmi01(1)",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -936,7 +936,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "s(\"sine\").fmi02(1)",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -960,7 +960,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "s(\"sine\").fmi03(1)",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -984,7 +984,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "s(\"sine\").fmi04(1)",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1008,7 +1008,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "s(\"sine\").fmi05(1)",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1032,7 +1032,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "s(\"sine\").fmi06(1)",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1056,7 +1056,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "s(\"sine\").fmi07(1)",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1080,7 +1080,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "s(\"sine\").fmi08(1)",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1104,7 +1104,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi(\"<0 2 4 8>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1128,7 +1128,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi11(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1152,7 +1152,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi12(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1176,7 +1176,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi13(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1200,7 +1200,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi14(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1224,7 +1224,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi15(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1248,7 +1248,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi16(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1272,7 +1272,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi17(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1296,7 +1296,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi18(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1320,7 +1320,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi20(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1344,7 +1344,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi2(\"<0 2 4 8>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1368,7 +1368,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi22(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1392,7 +1392,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi23(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1416,7 +1416,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi24(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1440,7 +1440,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi25(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1464,7 +1464,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi26(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1488,7 +1488,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi27(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1512,7 +1512,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi28(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1536,7 +1536,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi30(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1560,7 +1560,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi31(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1584,7 +1584,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi3(\"<0 2 4 8>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1608,7 +1608,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi33(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1632,7 +1632,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi34(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1656,7 +1656,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi35(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1680,7 +1680,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi36(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1704,7 +1704,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi37(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1728,7 +1728,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi38(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1752,7 +1752,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi40(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1776,7 +1776,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi41(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1800,7 +1800,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi42(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1824,7 +1824,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi4(\"<0 2 4 8>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1848,7 +1848,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi44(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1872,7 +1872,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi45(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1896,7 +1896,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi46(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1920,7 +1920,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi47(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1944,7 +1944,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi48(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1968,7 +1968,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi50(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -1992,7 +1992,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi51(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2016,7 +2016,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi52(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2040,7 +2040,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi53(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2064,7 +2064,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi5(\"<0 2 4 8>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2088,7 +2088,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi55(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2112,7 +2112,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi56(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2136,7 +2136,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi57(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2160,7 +2160,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi58(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2184,7 +2184,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi60(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2208,7 +2208,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi61(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2232,7 +2232,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi62(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2256,7 +2256,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi63(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2280,7 +2280,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi64(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2304,7 +2304,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi6(\"<0 2 4 8>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2328,7 +2328,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi66(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2352,7 +2352,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi67(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2376,7 +2376,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi68(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2400,7 +2400,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi70(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2424,7 +2424,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi71(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2448,7 +2448,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi72(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2472,7 +2472,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi73(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2496,7 +2496,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi74(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2520,7 +2520,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi75(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2544,7 +2544,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi7(\"<0 2 4 8>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2568,7 +2568,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi77(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2592,7 +2592,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi78(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2616,7 +2616,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi80(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2640,7 +2640,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi81(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2664,7 +2664,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi82(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2688,7 +2688,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi83(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2712,7 +2712,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi84(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2736,7 +2736,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi85(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2760,7 +2760,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi86(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2784,7 +2784,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi8(\"<0 2 4 8>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2808,7 +2808,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c2 e2\").s(\"sine\").fmi88(\"<0 1 4>\")",
             ],
-            tags: &["control", "fm"],
+            tags: &["control", "fm", "fm_matrix"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -2854,7 +2854,7 @@ const ROWS: &[ControlRow] = &[
                 },
             ],
             examples: &[],
-            tags: &["pitch"],
+            tags: &["pitch", "osc"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -3744,7 +3744,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "n(run(8)).scale(\"D:pentatonic\").s(\"sawtooth\").release(0.5)\n.phaser(2).phaserdepth(\"<0 .5 .75 1>\")",
             ],
-            tags: &["audio", "superdirt"],
+            tags: &["audio"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -5113,7 +5113,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "n(\"[0,3,7](3,8)\").s(\"superpiano\").room(.7).dry(\"<0 .5 .75 1>\").osc()",
             ],
-            tags: &["superdirt"],
+            tags: &["amplitude", "orbit", "audio"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -5159,7 +5159,7 @@ const ROWS: &[ControlRow] = &[
                 },
             ],
             examples: &[],
-            tags: &["control"],
+            tags: &["control", "osc"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -5674,7 +5674,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "n(\"0,4,7\").scale(\"F:minor\").s('supersaw').octave(\"<0 1 2 3>\")",
             ],
-            tags: &["superdirt"],
+            tags: &["pitch", "audio"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -5720,7 +5720,7 @@ const ROWS: &[ControlRow] = &[
                 },
             ],
             examples: &[],
-            tags: &["superdirt"],
+            tags: &["orbit", "audio"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -5742,7 +5742,7 @@ const ROWS: &[ControlRow] = &[
                 },
             ],
             examples: &[],
-            tags: &["superdirt"],
+            tags: &["amplitude", "orbit", "audio"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -6649,7 +6649,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "speed(\"1 2 .5 3\").s(\"bd\").unit(\"c\").osc()",
             ],
-            tags: &["superdirt"],
+            tags: &["samples", "pitch"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -8230,7 +8230,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c4\").oschost('127.0.0.1').oscport(57120).osc();",
             ],
-            tags: &["external_io"],
+            tags: &["external_io", "osc"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",
@@ -8254,7 +8254,7 @@ const ROWS: &[ControlRow] = &[
             examples: &[
                 "note(\"c4\").oschost('127.0.0.1').oscport(57120).osc();",
             ],
-            tags: &["external_io"],
+            tags: &["external_io", "osc"],
             no_autocomplete: false,
             deprecated: false,
             origin: "rustel",

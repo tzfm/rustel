@@ -268,6 +268,23 @@ footer. Depending on the view, it inserts text or copies an example. Esc goes
 back or closes the panel. Search filters such as `tag:vis` and `tag:snippet`
 find visualizers and reusable snippets.
 
+Settings ▸ Reference has one switch for each of five kinds of entry. All five
+are on by default. Turn one off to hide the kind from the reference and the
+suggestions:
+
+- **OSC / SuperDirt**: controls only SuperDirt or another OSC receiver reads,
+  plus `osc()`, `oschost` and `oscport`.
+- **serial**: `serial()`.
+- **FM routing matrix**: `fmi11` to `fmi88`. The operator controls, such as
+  `fmi`, `fmi2` and `fmh`, stay listed.
+- **bind & join**: `bind`, `innerJoin`, `appLeft` and the rest of the family.
+  You use them to write new pattern functions.
+- **pattern internals**: `withHap`, `splitQueries` and other hap plumbing.
+
+A hidden kind stays in reach. `tag:osc`, `tag:serial`, `tag:fm_matrix`,
+`tag:bind` and `tag:internals` list the kind anyway, and Ctrl+D still opens
+the documentation.
+
 In the panel, Tab goes to the next tab. The examples tab has parts, tracks,
 sound design, and Hydra visuals. The generator tab makes new music from a
 direction, such as Acid current. In both tabs, Space plays the music and `c`
@@ -309,6 +326,12 @@ $: s("bd sd").gain(slider(0.5, 0, 1, 0.01))
 Update the score to activate its controls. Drag a slider, scroll over it, or
 press Alt+Up / Alt+Down with the caret on it. Keyboard changes use its step.
 A live change updates the code and is recorded in the session tape.
+
+A slider placed directly on `gain`, `lpf` or `lpq` also moves notes already
+sounding. An exact move takes 5 ms. With slider smoothing on in Settings, a
+mouse move takes 35 ms. With a lowpass envelope on the same note, such as
+`lpenv` or `lpattack`, an `lpf` slider changes from the next note. Any other
+control changes from the next note.
 
 Ctrl+J opens the smart action at the caret. On a number, it can create a slider.
 On a slider, it can change or remove the control. These source edits require
@@ -417,8 +440,8 @@ Webcam input is off by default and needs explicit consent in Settings.
 
 Press Ctrl+O. Use Tab to change pages, arrows to select or change values, and
 Space to toggle a switch. Settings include playback, rendering, samples,
-controller mapping, and key bindings. The About page reports terminal
-capabilities.
+controller mapping, key bindings, and the kinds of entry the reference lists.
+The About page reports terminal capabilities.
 
 The Terminal row at the top of the Keybinds page selects the list of shortcuts
 that Studio avoids because the terminal takes them. Keep it on automatic unless

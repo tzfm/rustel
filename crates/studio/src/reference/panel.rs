@@ -2,6 +2,30 @@
 
 use super::*;
 
+/// Headings by use across the 186 songs in
+/// `crates/runtime/tests/e2e/scores/corpus/songs`, most used first. An empty
+/// search lists the headings in this order. Headings not named here follow.
+const HEADINGS_BY_USE: &[&str] = &[
+    "temporal",
+    "tonal",
+    "audio",
+    "amplitude",
+    "orbit",
+    "filter",
+    "combiners",
+    "math",
+    "pitch",
+    "samples",
+    "visualization",
+    "functional",
+    "fm",
+    "distortion",
+    "generators",
+    "envelope",
+    "other",
+    "rustel",
+];
+
 impl ReferencePanel {
     /// The list, already searched for `query` - the word under the caret,
     /// so a misspelt name opens on its nearest real ones.
@@ -312,13 +336,12 @@ impl ReferencePanel {
     }
 
     /// The rows the browse list draws: the results, gathered under the tag
-    /// each entry is filed by, the headings in the order the search put
-    /// their best member in.
+    /// each entry is filed by. An empty search orders the headings by
+    /// [`HEADINGS_BY_USE`].
     ///
-    /// Not alphabetically, and not most-used first: what was typed has to
-    /// still be on the first row the cursor can land on, or the search has
-    /// stopped answering. Ungrouped this is the results, one row each,
-    /// which is what this list was before it grew headings.
+    /// A search orders the headings by their best member instead. What was
+    /// typed has to stay on the first row the cursor lands on, or the search
+    /// stops answering. Ungrouped this is the results, one row each.
     fn grouped_rows(&self, reference: &Reference) -> Vec<BrowseRow> {
         let flat = || (0..self.results.len()).map(BrowseRow::Entry).collect();
         // A word list - scales, chords, colours - has no tags to group by.
@@ -343,6 +366,14 @@ impl ReferencePanel {
         // One kind of thing is no grouping.
         if runs.len() < 2 {
             return flat();
+        }
+        if self.query.trim().is_empty() {
+            runs.sort_by_key(|(tag, _)| {
+                HEADINGS_BY_USE
+                    .iter()
+                    .position(|heading| heading == tag)
+                    .unwrap_or(HEADINGS_BY_USE.len())
+            });
         }
         let mut rows = Vec::with_capacity(self.results.len() + runs.len());
         for (_, members) in &runs {

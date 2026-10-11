@@ -375,7 +375,7 @@ mod tests {
             whole_begin: "3/4".into(),
             duration_secs: 0.25,
             target_time: 9.5,
-            live_controls: [0; 2],
+            live_controls: [0; 3],
             ui_visuals: 0,
             value: ValueJson::Raw(value),
             value_show: String::new(),
