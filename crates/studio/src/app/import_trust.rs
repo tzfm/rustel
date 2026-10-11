@@ -22,11 +22,14 @@ impl App {
         // The engine's message opens with the origin.
         let origin = failure.message.split_whitespace().next()?;
         let origin = rustel_runtime::import_origin(origin).ok()?;
-        self.blocked_imports.retain(|blocked| *blocked != origin);
-        if self.blocked_imports.len() >= MAX_BLOCKED_IMPORTS {
-            self.blocked_imports.remove(0);
+        // The saved list may be ahead of the engine. Its origin is not refused.
+        if !self.prefs.import_origins.contains(&origin) {
+            self.blocked_imports.retain(|blocked| *blocked != origin);
+            if self.blocked_imports.len() >= MAX_BLOCKED_IMPORTS {
+                self.blocked_imports.remove(0);
+            }
+            self.blocked_imports.push(origin.clone());
         }
-        self.blocked_imports.push(origin.clone());
         Some(format!(
             "{origin} is not trusted - Settings → Trust lets its scripts run"
         ))
@@ -59,8 +62,10 @@ impl App {
         }
         self.blocked_imports
             .retain(|blocked| *blocked != row.origin);
-        self.prefs.import_origins.push(row.origin.clone());
-        self.import_origins_changed();
+        if !self.prefs.import_origins.contains(&row.origin) {
+            self.prefs.import_origins.push(row.origin.clone());
+            self.import_origins_changed();
+        }
         // The refusal on the footer names an origin that is trusted now.
         for owner in [ErrorOwner::Evaluation, ErrorOwner::Setup] {
             if self

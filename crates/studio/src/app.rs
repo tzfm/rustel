@@ -4763,6 +4763,34 @@ mod tests {
             );
         }
 
+        /// The engine can refuse an origin that the saved list trusts already,
+        /// when it has not the list yet. The Trust page keeps one row for it.
+        #[test]
+        fn a_stale_import_refusal_adds_no_second_row_for_a_saved_origin() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let origin = "https://scripts.invalid";
+            app.prefs.import_origins.push(origin.to_owned());
+
+            app.handle_evaluation(EvaluationOutcome {
+                request_id: 17,
+                editor_revision: 0,
+                result: Err(crate::EngineFailure {
+                    kind: "untrusted-import".into(),
+                    message: format!("{origin} is not trusted for import()"),
+                    recoverable: true,
+                    playback_stopped: false,
+                }),
+            });
+            assert!(app.blocked_imports.is_empty());
+
+            // Enter on a refused row of the same origin adds nothing.
+            app.blocked_imports.push(origin.to_owned());
+            app.trust_import(1);
+            assert_eq!(app.prefs.import_origins, [origin]);
+            assert!(app.blocked_imports.is_empty());
+        }
+
         #[test]
         fn an_engine_failure_alert_clears_when_playback_resumes() {
             let directory = tempfile::tempdir().expect("temp dir");
