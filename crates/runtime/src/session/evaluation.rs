@@ -146,15 +146,24 @@ impl Session {
     ) -> Result<(), RuntimeError> {
         use crate::score_import::ImportRefusal;
 
-        for specifier in rustel_transpiler::script_imports(source) {
-            let url = self
-                .config
-                .score_import_access
-                .approve(&specifier)
-                .map_err(|refusal| match refusal {
-                    ImportRefusal::Untrusted { origin } => RuntimeError::UntrustedImport { origin },
-                    ImportRefusal::Invalid(message) => RuntimeError::Message(message),
-                })?;
+        // Approve every import first, so a refusal leaves the others unrun.
+        let imports = rustel_transpiler::script_imports(source)
+            .into_iter()
+            .map(|specifier| {
+                let url = self
+                    .config
+                    .score_import_access
+                    .approve(&specifier)
+                    .map_err(|refusal| match refusal {
+                        ImportRefusal::Untrusted { origin } => {
+                            RuntimeError::UntrustedImport { origin }
+                        }
+                        ImportRefusal::Invalid(message) => RuntimeError::Message(message),
+                    })?;
+                Ok((specifier, url))
+            })
+            .collect::<Result<Vec<_>, RuntimeError>>()?;
+        for (specifier, url) in imports {
             if self.js.import_loaded(&specifier) {
                 continue;
             }

@@ -8683,6 +8683,13 @@ mod tests {
         let mut access = ScoreImportAccess::denied();
         access.permit_origin("https://scripts.example").unwrap();
         session.set_score_import_access(access);
+        // One untrusted import refuses the text before a trusted one runs.
+        let mixed = format!("await import('{url}')\nawait import('https://other.example/x.js')");
+        let refused = session
+            .evaluate(&mixed)
+            .expect_err("one origin is untrusted");
+        assert_eq!(refused.kind(), "untrusted-import");
+        assert!(!session.js.import_loaded(url));
         session.evaluate(&score).expect("the trusted import");
         let haps = session.query(Fraction::ZERO, Fraction::ONE).expect("query");
         assert_eq!(haps.len(), 2);
