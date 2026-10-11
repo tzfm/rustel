@@ -11016,8 +11016,23 @@ mod tests {
         }
 
         /// A set is not put down while one of its scores cannot be written.
+        /// The set panel asks: Enter retries, Del leaves without the score,
+        /// Esc keeps the set.
         #[test]
-        fn a_set_with_a_score_that_cannot_be_saved_stays_open() {
+        fn a_set_with_a_score_that_cannot_be_saved_asks_before_it_goes() {
+            let press = |app: &mut App, code| {
+                app.handle_terminal_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+                    .unwrap();
+            };
+            let open = |app: &mut App, folder: &std::path::Path| {
+                let set = SceneSet::open(folder, "// starter").expect("set");
+                app.switch_set(set, "opened set");
+            };
+            let asking = |app: &App| {
+                app.set_panel
+                    .as_ref()
+                    .is_some_and(|panel| panel.unsaved.is_some())
+            };
             let directory = tempfile::tempdir().expect("temp dir");
             let mut app = app_over(directory.path());
             let unsaved = app.scenes.current().id;
@@ -11025,14 +11040,33 @@ mod tests {
             let path = app.scenes.current().path.clone();
             refuse_writes_to(&path);
             let elsewhere = tempfile::tempdir().expect("second set");
-            write(elsewhere.path(), "other.strudel");
-            let set = SceneSet::open(elsewhere.path(), "// starter").expect("set");
+            let other = write(elsewhere.path(), "other.strudel");
 
-            app.switch_set(set, "opened set");
-
+            open(&mut app, elsewhere.path());
             let scene = app.scenes.get(unsaved).expect("the old set stays open");
             assert!(scene.editor.source().contains("hh"));
-            assert!(app.status.contains("stays open"), "{}", app.status);
+            assert!(asking(&app), "{}", app.status);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Set));
+            press(&mut app, KeyCode::Esc);
+            assert!(!asking(&app) && app.scenes.get(unsaved).is_some());
+
+            // Enter writes again. It fails, so the panel asks again. Once the
+            // write succeeds, the set goes with the score on disk.
+            open(&mut app, elsewhere.path());
+            press(&mut app, KeyCode::Enter);
+            assert!(asking(&app), "{}", app.status);
+            std::fs::remove_dir(&path).expect("the folder goes");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.scenes.directory(), elsewhere.path());
+            assert!(std::fs::read_to_string(&path).unwrap().contains("hh"));
+
+            // Del leaves without the score that could not be written.
+            type_text(&mut app, "kk");
+            refuse_writes_to(&other);
+            open(&mut app, directory.path());
+            press(&mut app, KeyCode::Delete);
+            assert_eq!(app.scenes.directory(), directory.path());
+            assert!(other.is_dir(), "the edit was left behind");
         }
 
         /// The set file keeps a pad for open tabs only, so a tab closed with
@@ -38418,7 +38452,7 @@ use sample_sources::{
     status_sample_source_error,
 };
 use sessions::TAPE_GESTURE_SETTLE;
-use sets::SetPrompt;
+use sets::{SetPrompt, SetSwitch};
 use slider::{LiveChip, LiveSliderSet, SliderSpan, SliderTrack, slider_stepped};
 use theme_sheets::THEME_APPLY_SETTLE;
 use transport::{AppErrors, ErrorOwner};
@@ -39437,6 +39471,9 @@ struct App {
     /// A quit waiting for its second press. `^Q` asks, the next `^Q` goes,
     /// and anything else calls it off.
     quit_armed: bool,
+    /// Where a set switch was going while the set panel asks about a score
+    /// that could not be saved.
+    pending_switch: Option<SetSwitch>,
     /// Set while the menu bar has the keyboard.
     ///
     /// Its own field rather than a `Focus`/`PanelKind` variant, exactly as
@@ -39855,6 +39892,7 @@ impl App {
             focus: Focus::Editor,
             help: None,
             quit_armed: false,
+            pending_switch: None,
             menu: None,
             clicks: super::textblock::ClickCounter::default(),
             armed_slider: None,

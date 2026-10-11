@@ -155,6 +155,30 @@ impl App {
             let handled = self.handle_set_prompt_key(code, primary, shift);
             return handled || self.set_prompt.is_some();
         }
+        // A set that could not go because a score could not be saved:
+        // Enter retries, Del leaves without the score, Esc keeps the set.
+        // Any other key withdraws the question and does its own thing.
+        if let Some(panel) = self.set_panel.as_mut()
+            && panel.unsaved.take().is_some()
+        {
+            match code {
+                KeyCode::Enter if !primary => {
+                    self.retry_switch();
+                    return true;
+                }
+                KeyCode::Delete => {
+                    self.leave_unsaved();
+                    return true;
+                }
+                KeyCode::Esc => {
+                    self.pending_switch = None;
+                    self.status = "this set stays open".into();
+                    self.dirty_frame = true;
+                    return true;
+                }
+                _ => self.pending_switch = None,
+            }
+        }
         let Some(panel) = self.set_panel.as_mut() else {
             return false;
         };
@@ -356,6 +380,17 @@ impl App {
         }
     }
 
+    /// Open the set panel, or focus it when it is open, to ask a question.
+    fn raise_set_panel(&mut self) {
+        if self.set_panel.is_none() {
+            self.open_set_panel(true);
+            self.prefs.set_panel = Some(true);
+            self.save_prefs_soon();
+        } else {
+            self.focus_panel(PanelKind::Set);
+        }
+    }
+
     /// Delete on a line asks: the panel names what would go, and Enter
     /// lets it, Esc keeps it. The tape being written cannot go.
     fn ask_delete_set_line(&mut self) {
@@ -458,13 +493,7 @@ impl App {
             return;
         }
         let path = self.scenes.current().path.clone();
-        if self.set_panel.is_none() {
-            self.open_set_panel(true);
-            self.prefs.set_panel = Some(true);
-            self.save_prefs_soon();
-        } else {
-            self.focus_panel(PanelKind::Set);
-        }
+        self.raise_set_panel();
         self.refresh_set_panel(Some(path.clone()));
         // The refresh can only land on this scene when the scene is one of
         // the panel's rows. A score that has never been written is not -
@@ -630,20 +659,32 @@ impl App {
     }
 
     /// File > New set: a folder named after the day under the sets
-    /// folder, with a starter scene, taken up at once. Nothing is asked.
+    /// folder, with a starter scene, taken up at once. Studio asks only
+    /// when a score of the open set could not be saved.
     pub(super) fn new_set(&mut self) {
         // Checked first, so a refused switch does not leave a new folder.
-        if self.keeps_set_for_unsaved_score() {
+        if let Some(name) = self.score_not_on_disk() {
+            self.ask_to_leave(name, SetSwitch::New);
             return;
         }
+        if let Some(set) = self.create_dated_set() {
+            self.switch_set(set, "new set");
+        }
+    }
+
+    /// A new set folder named after the day, or the error that stopped it.
+    fn create_dated_set(&mut self) -> Option<SceneSet> {
         let root = self.sets_root();
         let starter = self.starter_score();
         match SceneSet::create_in(&root, &today(), starter) {
-            Ok(set) => self.switch_set(set, "new set"),
-            Err(error) => self.set_error(
-                ErrorOwner::Interface,
-                format!("cannot make a set in {}: {error}", root.display()),
-            ),
+            Ok(set) => Some(set),
+            Err(error) => {
+                self.set_error(
+                    ErrorOwner::Interface,
+                    format!("cannot make a set in {}: {error}", root.display()),
+                );
+                None
+            }
         }
     }
 
@@ -1046,25 +1087,51 @@ impl App {
         }
     }
 
-    /// Write the scores of the open set. True when one could not be written:
-    /// its text is only in its tab, so the set must stay open. The status
-    /// names the score.
-    fn keeps_set_for_unsaved_score(&mut self) -> bool {
-        let Some(name) = self.score_not_on_disk() else {
-            return false;
-        };
-        self.status = format!("this set stays open - {name:?} could not be saved");
+    /// A score of the open set could not be written, so its text is only
+    /// in its tab. The set panel asks before the set goes: Enter retries,
+    /// Del leaves without the score, Esc keeps the set.
+    fn ask_to_leave(&mut self, name: String, next: SetSwitch) {
+        self.raise_set_panel();
+        if let Some(panel) = self.set_panel.as_mut() {
+            panel.deleting = None;
+            panel.error = None;
+            panel.unsaved = Some(name.clone());
+        }
+        self.pending_switch = Some(next);
+        self.status = format!(
+            "could not save {name:?} · Enter retries · Del leaves the set without it · Esc keeps the set"
+        );
         self.dirty_frame = true;
-        true
+    }
+
+    /// Enter on the question: write again, and go on once every score is on
+    /// disk. A write that fails again asks again.
+    fn retry_switch(&mut self) {
+        match self.pending_switch.take() {
+            Some(SetSwitch::Open(set, verb)) => self.switch_set(*set, verb),
+            Some(SetSwitch::New) => self.new_set(),
+            None => {}
+        }
+    }
+
+    /// Del on the question: the set goes, and the edits it could not save
+    /// go with it.
+    fn leave_unsaved(&mut self) {
+        match self.pending_switch.take() {
+            Some(SetSwitch::Open(set, verb)) => self.take_up_set(*set, verb),
+            Some(SetSwitch::New) => {
+                if let Some(set) = self.create_dated_set() {
+                    self.take_up_set(set, "new set");
+                }
+            }
+            None => {}
+        }
     }
 
     /// Put the current set down whole - every dirty score written, its
     /// set file current - and take up `set` in its place. What is sounding
     /// keeps sounding: the engine has the last score it was given.
-    pub(super) fn switch_set(&mut self, mut set: SceneSet, verb: &str) {
-        // A limiter mode still settling was chosen on this set, so it lands
-        // here before the set is put down rather than on the one after.
-        self.settle_limiter_mode();
+    pub(super) fn switch_set(&mut self, set: SceneSet, verb: &'static str) {
         // Whole, and not only its scores: a prebake tab still dirty here is
         // dropped by the replacement below without ever being written, and
         // the global prebake it edits belongs to no set at all.
@@ -1074,10 +1141,19 @@ impl App {
         // what was on screen when it was left rather than whatever the
         // worker has not written yet.
         //
-        // A score that could not be written keeps this set open.
-        if self.keeps_set_for_unsaved_score() {
+        // A score that could not be written keeps this set open and asks.
+        if let Some(name) = self.score_not_on_disk() {
+            self.ask_to_leave(name, SetSwitch::Open(Box::new(set), verb));
             return;
         }
+        self.take_up_set(set, verb);
+    }
+
+    /// Put the current set down as it is and take up `set`.
+    fn take_up_set(&mut self, mut set: SceneSet, verb: &str) {
+        // A limiter mode still settling was chosen on this set, so it lands
+        // here before the set is put down rather than on the one after.
+        self.settle_limiter_mode();
         self.persist_manifest();
         self.finish_set_recording();
         // Ids go on from where this set's left off: the studio remembers
@@ -1374,6 +1450,12 @@ fn set_candidate(path: &std::path::Path) -> Candidate {
         detail: format!("{scores} score{}", if scores == 1 { "" } else { "s" }),
         path: path.to_path_buf(),
     }
+}
+
+/// Where a set switch was going when a score could not be saved.
+pub(super) enum SetSwitch {
+    Open(Box<SceneSet>, &'static str),
+    New,
 }
 
 /// Which of the File menu's prompts is up: a set to open, a recent one,

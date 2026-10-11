@@ -77,6 +77,9 @@ pub struct SetPanel {
     /// A delete waiting for its second press, by line - one press asks,
     /// the next confirms, anything else calls it off.
     pub deleting: Option<usize>,
+    /// The score that could not be saved while the set was asked to go.
+    /// Enter retries, Del leaves without it, Esc keeps the set.
+    pub unsaved: Option<String>,
     /// What the last verb refused, shown under the list.
     pub error: Option<String>,
     /// The last click, for the second of a double click.
@@ -107,6 +110,7 @@ impl SetPanel {
             selected: 0,
             sessions_open: false,
             deleting: None,
+            unsaved: None,
             error: None,
             last_click: None,
             hold_scroll: false,
@@ -190,6 +194,7 @@ impl SetPanel {
             .unwrap_or(0)
             .min(self.lines.len().saturating_sub(1));
         self.deleting = None;
+        self.unsaved = None;
     }
 
     /// Where the cursor goes after a row is deleted: the row that took
@@ -243,6 +248,7 @@ impl SetPanel {
         }
         self.selected = ((self.selected as isize + delta).rem_euclid(count as isize)) as usize;
         self.deleting = None;
+        self.unsaved = None;
         self.error = None;
         self.hold_scroll = false;
     }
@@ -255,6 +261,7 @@ impl SetPanel {
         }
         self.selected = (self.selected as isize + delta).clamp(0, count as isize - 1) as usize;
         self.deleting = None;
+        self.unsaved = None;
         self.error = None;
         self.hold_scroll = false;
     }
@@ -292,6 +299,7 @@ impl SetPanel {
             self.selected = self.selected.min(fold);
         }
         self.deleting = None;
+        self.unsaved = None;
         self.error = None;
     }
 
@@ -304,6 +312,7 @@ impl SetPanel {
         });
         self.selected = line.min(self.lines.len().saturating_sub(1));
         self.deleting = None;
+        self.unsaved = None;
         self.error = None;
         self.last_click = if double { None } else { Some((line, now)) };
         self.hold_scroll = true;
@@ -704,6 +713,14 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
                 usize::from(error.width),
                 Style::default().fg(theme.error),
             );
+        } else if let Some(name) = &self.panel.unsaved {
+            buffer.set_stringn(
+                error.x,
+                error.y,
+                format!("could not save {name}"),
+                usize::from(error.width),
+                Style::default().fg(theme.error),
+            );
         } else if let Some(line) = self
             .panel
             .deleting
@@ -726,6 +743,7 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
         }
         if self.panel.error.is_none()
             && self.panel.deleting.is_none()
+            && self.panel.unsaved.is_none()
             && let Some(tape) = self.panel.selected_tape()
         {
             let recorded = tape.recorded.replace('T', " ");
@@ -747,7 +765,9 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
         let reveal_hint = format!("{reveal} reveal · Del delete · +/- size");
         let live_tape_hint = format!("{reveal} reveal · n new first");
         let folder_hint = format!("{reveal} reveal · +/- size");
-        let hints = if let Some(tape) = self.panel.selected_tape() {
+        let hints = if self.panel.unsaved.is_some() {
+            ["Enter retry · Del leave", "Esc keep the set"]
+        } else if let Some(tape) = self.panel.selected_tape() {
             [
                 rename_hint.as_str(),
                 if tape.recording {
