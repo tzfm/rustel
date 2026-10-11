@@ -293,7 +293,10 @@ impl Default for StudioConfig {
 
 /// The origins that `session` trusts for script imports, and `origins` of
 /// the Trust page added to them.
-fn import_access(session: &SessionConfig, origins: &[String]) -> rustel_runtime::ScoreImportAccess {
+pub(super) fn import_access(
+    session: &SessionConfig,
+    origins: &[String],
+) -> rustel_runtime::ScoreImportAccess {
     let mut access = session.score_import_access.clone();
     for origin in origins {
         // The page keeps only origins that the runtime named.

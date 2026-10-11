@@ -518,14 +518,17 @@ pub struct ExportGlance {
 
 /// Snapshot the host default and any persisted score override for an isolated
 /// export. Re-evaluating source text can then override this inherited value.
+/// The export imports scripts from the origins of the Trust page too.
 pub(super) fn session_config(
     default: &SessionConfig,
     host_default: usize,
     score_override: Option<usize>,
+    import_origins: &[String],
 ) -> SessionConfig {
     default
         .clone()
         .with_max_polyphony(score_override.unwrap_or(host_default))
+        .with_score_import_access(super::engine::import_access(default, import_origins))
 }
 
 /// The render, on its own thread.
@@ -1494,7 +1497,7 @@ mod tests {
                 format!("{setter} stack(note('c3'), note('e3'), note('g3'), note('c4')).s('sine').gain(0.05).attack(0).decay(0).sustain(1)"),
                 false,
                 ExportSettings { length: Length::Cycles(0.025), mp3: false, ..ExportSettings::default() },
-                session_config(&SessionConfig::default(), voices, inherited),
+                session_config(&SessionConfig::default(), voices, inherited, &[]),
                 target.clone(),
             ).expect("start export job");
             let deadline = Instant::now() + std::time::Duration::from_secs(30);
@@ -1516,10 +1519,11 @@ mod tests {
             limited, unrestricted,
             "the job must use the passed host budget"
         );
-        assert_eq!(
-            session_config(&SessionConfig::default(), 192, None).max_polyphony,
-            192
-        );
+        // The origins of the Trust page reach the export.
+        let origins = ["https://glossing.dev".to_owned()];
+        let config = session_config(&SessionConfig::default(), 192, None, &origins);
+        assert_eq!(config.max_polyphony, 192);
+        assert_eq!(config.score_import_access.origins(), origins);
         let mut live = Session::new().expect("live session");
         live.evaluate("setMaxPolyphony(1); s('sine')")
             .expect("set persistent override");

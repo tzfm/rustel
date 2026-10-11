@@ -147,6 +147,7 @@ impl App {
                 &self.options.session,
                 self.ui_settings.max_polyphony,
                 self.worker.master().max_polyphony_override(),
+                &self.prefs.import_origins,
             ),
             sheet.target.clone(),
         ) {
