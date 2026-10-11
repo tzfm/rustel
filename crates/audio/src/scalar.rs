@@ -890,6 +890,7 @@ struct Voice {
     /// Only these directly bound controls can move on a sustained voice.
     live_gain: crate::live_control::Ramp,
     live_cutoff: crate::live_control::Ramp,
+    live_resonance: crate::live_control::Ramp,
     /// Frame at which the connected graph begins producing output. This is
     /// normally the source onset. SBD is the exception: its graph begins one
     /// scheduler lead earlier because its asymmetric WaveShaper curve produces
@@ -4026,6 +4027,7 @@ impl ScalarBackend {
         for voice in &mut self.voices {
             voice.live_gain.retarget(update, self.sample_rate);
             voice.live_cutoff.retarget(update, self.sample_rate);
+            voice.live_resonance.retarget(update, self.sample_rate);
         }
         if let Some(target) = self
             .live_control_targets
@@ -5562,15 +5564,18 @@ impl AudioBackend for ScalarBackend {
                 }
                 activated += 1;
                 let mut event = *e;
-                if event.controls.live_controls != [0; 2] {
+                if event.controls.live_controls != [0; 3] {
                     for target in live_control_targets {
                         if event.controls.live_controls[0] == target.binding {
                             event.gain = target.value;
                         }
-                        if event.controls.live_controls[1] == target.binding
-                            && let Some(filter) = event.controls.filters.lowpass.as_mut()
-                        {
-                            filter.frequency_hz = target.value;
+                        if let Some(filter) = event.controls.filters.lowpass.as_mut() {
+                            if event.controls.live_controls[1] == target.binding {
+                                filter.frequency_hz = target.value;
+                            }
+                            if event.controls.live_controls[2] == target.binding {
+                                filter.q = target.value;
+                            }
                         }
                     }
                 }
@@ -5578,6 +5583,10 @@ impl AudioBackend for ScalarBackend {
                 let live_cutoff = crate::live_control::Ramp::new(
                     event.controls.live_controls[1],
                     event.controls.filters.lowpass.map_or(0.0, |filter| filter.frequency_hz),
+                );
+                let live_resonance = crate::live_control::Ramp::new(
+                    event.controls.live_controls[2],
+                    event.controls.filters.lowpass.map_or(0.0, |filter| filter.q),
                 );
                 // Keep the source's unit-gain amplitude even when the slider
                 // begins at zero, so a sustained silent note can fade in.
@@ -6170,6 +6179,7 @@ impl AudioBackend for ScalarBackend {
                 let mut voice = Voice {
                     live_gain,
                     live_cutoff,
+                    live_resonance,
                     graph_start_frame,
                     start_frame: e.onset_frame,
                     generation: e.generation,
@@ -6783,6 +6793,13 @@ impl AudioBackend for ScalarBackend {
                         v.filters.set_lowpass_frequency(cutoff);
                         if let Some(right) = &mut v.filters_right {
                             right.set_lowpass_frequency(cutoff);
+                        }
+                    }
+                    if v.live_resonance.binding != 0 {
+                        let q = v.live_resonance.next();
+                        v.filters.set_lowpass_q(q);
+                        if let Some(right) = &mut v.filters_right {
+                            right.set_lowpass_q(q);
                         }
                     }
                     let filter_adds = [

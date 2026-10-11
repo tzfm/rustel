@@ -34,7 +34,7 @@ fn fm_chain(stages: &[Option<(f32, f32)>]) -> rustel_audio::FmControls {
 fn controls(waveform: Waveform, pan: Option<f32>) -> OscillatorControls {
     OscillatorControls {
         limit: None,
-        live_controls: [0; 2],
+        live_controls: [0; 3],
         preview_epoch: 0,
         choke_only: false,
         piano: false,
