@@ -22,7 +22,7 @@ impl App {
         // The engine's message opens with the origin.
         let origin = failure.message.split_whitespace().next()?;
         let origin = rustel_runtime::import_origin(origin).ok()?;
-        // The saved list may be ahead of the engine. Its origin is not refused.
+        // A refusal for an origin on the saved list is stale.
         if !self.prefs.import_origins.contains(&origin) {
             self.blocked_imports.retain(|blocked| *blocked != origin);
             if self.blocked_imports.len() >= MAX_BLOCKED_IMPORTS {

@@ -4763,8 +4763,8 @@ mod tests {
             );
         }
 
-        /// The engine can refuse an origin that the saved list trusts already,
-        /// when it has not the list yet. The Trust page keeps one row for it.
+        /// A refusal arrives late for an origin on the saved list. The Trust
+        /// page keeps one row for this origin.
         #[test]
         fn a_stale_import_refusal_adds_no_second_row_for_a_saved_origin() {
             let directory = tempfile::tempdir().expect("temp dir");

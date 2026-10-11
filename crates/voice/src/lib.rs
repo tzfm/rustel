@@ -2582,8 +2582,8 @@ fn with_bus_slots(
 ) -> Result<Option<serde_json::Map<String, serde_json::Value>>, String> {
     let names = samples.bus_names();
     // A number in range, or a string that reads as one, reserves its slot.
-    // Any other value stays for the range checks that follow. Text that is
-    // not a finite number, such as `"NaN"`, is a name.
+    // Any other value stays for the range checks that follow. Other text,
+    // such as `"NaN"`, is a name.
     let slot_of = |id: &serde_json::Value| -> Result<Option<serde_json::Value>, String> {
         let (number, text) = match id {
             serde_json::Value::Number(number) => (number.as_f64(), None),
