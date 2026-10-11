@@ -78,6 +78,28 @@ fn acidenv_sets_the_filter_envelope_from_its_argument() {
     );
 }
 
+/// `pg(x)` is `pat.mul(postgain(x))`. `accent(x)` multiplies `velocity` and
+/// `lpenv` the same way. The receiver keeps every event.
+#[test]
+fn pg_and_accent_multiply_controls_on_the_receivers_events() {
+    assert_eq!(
+        control("s(\"square*2\").pg(0.35)", "postgain"),
+        vec!["F64(0.35)", "F64(0.35)"]
+    );
+    assert_eq!(
+        control("s(\"square\").postgain(2).pg(0.5)", "postgain"),
+        vec!["F64(1.0)"]
+    );
+    assert_eq!(
+        control("s(\"square\").velocity(0.5).accent(1)", "velocity"),
+        vec!["F64(0.5625)"]
+    );
+    assert_eq!(
+        control("s(\"square\").accent(1)", "lpenv"),
+        vec!["F64(1.2)"]
+    );
+}
+
 #[test]
 fn grab_snaps_each_note_to_the_nearest_of_a_set() {
     // `scale()` offers named modes; this takes any collection of pitches.

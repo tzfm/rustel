@@ -5,23 +5,23 @@ use rustel_core::reference::{ReferenceEntry, ReferenceParam};
 use rustel_core::register::{DeclaredIn, Registry, add_in};
 
 use super::ORIGIN;
-use super::shared::{binary, control, scalar, value};
+use super::shared::{binary, scalar, source_control_pattern, value};
 
 pub(super) const REFERENCE: ReferenceEntry = simple_reference!(
     "pg",
     "multiply post-gain",
-    "Multiplies the receiver's postgain control by the supplied value. Note that this engine builds the multiplier control on silence, which carries no events, so the call currently silences the receiver instead of scaling it, unlike strudel.cc.",
+    "Multiplies the receiver's postgain control by the supplied value. A receiver with no postgain takes the value.",
     params: [ReferenceParam {
         name: "value",
         r#type: "number | Pattern",
-        description: "the factor to multiply postgain by; a missing argument leaves postgain unset.",
+        description: "the factor to multiply postgain by.",
     }],
     examples: ["note(\"c e g\").s(\"sawtooth\").pg(0.8)"],
     "gain"
 );
 
 fn apply<P: PatOps>(args: &[Value], pattern: P) -> P {
-    let postgain = control(&P::pat_silence(), "postgain", &scalar(value(args, 0)));
+    let postgain = source_control_pattern("postgain", scalar(value(args, 0)));
     binary(&pattern, &postgain, ComposeOp::Mul)
 }
 
