@@ -883,6 +883,21 @@ mod tests {
         // `"1"` is bus 1, and a number keeps its slot off the names.
         let numbered = resolve(serde_json::json!({ "s": "sine", "bus": "1" }), &host);
         assert_eq!(numbered.expect("a number in quotes").controls.bus, Some(1));
+        // Text that is not a finite number is a name.
+        for (index, text) in ["NaN", "inf", "infinity"].into_iter().enumerate() {
+            let named = resolve(serde_json::json!({ "s": "sine", "bus": text }), &host);
+            let slot = named.expect("a name").controls.bus;
+            assert_eq!(slot, Some(top - 1 - index as u8), "{text}");
+        }
+        // A number in quotes reserves its slot, as the number does.
+        let reserving = Named::default();
+        let quoted = resolve(serde_json::json!({ "s": "sine", "bus": "15" }), &reserving);
+        assert_eq!(quoted.expect("a number in quotes").controls.bus, Some(top));
+        let named = resolve(
+            serde_json::json!({ "s": "sine", "bus": "drums" }),
+            &reserving,
+        );
+        assert_eq!(named.expect("a name").controls.bus, Some(top - 1));
 
         let refused = resolve(
             serde_json::json!({ "s": "sine", "bus": "move_0" }),
@@ -2566,25 +2581,33 @@ fn with_bus_slots(
     samples: &dyn SampleLookup,
 ) -> Result<Option<serde_json::Map<String, serde_json::Value>>, String> {
     let names = samples.bus_names();
-    // A number in range reserves its slot. Any other value stays for the
-    // range checks that follow.
+    // A number in range, or a string that reads as one, reserves its slot.
+    // Any other value stays for the range checks that follow. Text that is
+    // not a finite number, such as `"NaN"`, is a name.
     let slot_of = |id: &serde_json::Value| -> Result<Option<serde_json::Value>, String> {
-        let text = match id {
-            serde_json::Value::String(text) => text,
-            serde_json::Value::Number(number) => {
-                if let (Some(names), Some(slot)) = (names, number.as_f64())
-                    && (0.0..rustel_audio::MAX_BUSES as f64).contains(&slot)
-                {
-                    names.number(slot as u8);
-                }
-                return Ok(None);
-            }
+        let (number, text) = match id {
+            serde_json::Value::Number(number) => (number.as_f64(), None),
+            serde_json::Value::String(text) => (
+                text.trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|number| number.is_finite()),
+                Some(text),
+            ),
             _ => return Ok(None),
         };
-        // `"1"` and `1` name the same bus.
-        if let Ok(number) = text.trim().parse::<f64>() {
-            return Ok(Some(serde_json::json!(number)));
+        if let Some(number) = number {
+            if let Some(names) = names
+                && (0.0..rustel_audio::MAX_BUSES as f64).contains(&number)
+            {
+                names.number(number as u8);
+            }
+            // `"1"` and `1` name the same bus.
+            return Ok(text.map(|_| serde_json::json!(number)));
         }
+        let Some(text) = text else {
+            return Ok(None);
+        };
         let names =
             names.ok_or_else(|| format!("bus name `{text}` needs a host with bus names"))?;
         let slot = names.name(text).ok_or_else(|| {
