@@ -707,8 +707,21 @@ impl SceneSet {
     /// text. A file whose folder's project file lists it opens the whole
     /// set with that scene selected; any other file is a one-scene set
     /// whose folder is the file's parent, so a second scene is written
-    /// beside it. A missing file becomes an unsaved starter.
+    /// beside it. A missing `.strudel` file becomes an unsaved starter. Any
+    /// other missing path becomes a new set folder, and its parent must exist.
     pub fn open(path: &Path, starter: &str) -> Result<Self, SceneError> {
+        let score = path
+            .extension()
+            .is_some_and(|extension| extension == SCENE_EXTENSION);
+        if !score && !path.exists() {
+            std::fs::create_dir(path).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("cannot create {}: {error}", path.display()),
+                )
+            })?;
+            return Self::started(path.to_path_buf(), starter);
+        }
         if path.is_dir() {
             let mut set = Self::empty(path.to_path_buf());
             let (listed, kept) = SetManifest::load_kept(path);
@@ -781,6 +794,11 @@ impl SceneSet {
         std::fs::create_dir_all(root)?;
         let directory = free_set_folder(root, day);
         std::fs::create_dir(&directory)?;
+        Self::started(directory, starter)
+    }
+
+    /// A folder the studio just made, with one starter scene written into it.
+    fn started(directory: PathBuf, starter: &str) -> Result<Self, SceneError> {
         let mut set = Self::empty(directory);
         // Made by the studio, the folder is a set from the start: its
         // project file is written as soon as there is one to write.
@@ -2258,6 +2276,26 @@ mod tests {
         assert_eq!(set.len(), 2, "the project file now opens the whole set");
         assert_eq!(set.current().name(), "song");
         assert!(!set.current().dirty);
+    }
+
+    #[test]
+    fn a_missing_path_that_is_not_a_score_is_a_new_set() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["set1", "v1.2"] {
+            let path = root.path().join(name);
+            let set = SceneSet::open(&path, "// starter").unwrap();
+            assert_eq!(set.directory(), path);
+            assert_eq!(set.current().path, path.join("scene 1.strudel"));
+            assert!(!set.current().dirty, "the starter is written at once");
+        }
+        let typo = root.path().join("typo").join("set1");
+        let error = SceneSet::open(&typo, "// starter").err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .starts_with(&format!("cannot create {}", typo.display()))
+        );
+        assert!(!root.path().join("typo").exists(), "no parent is made");
     }
 
     #[test]
