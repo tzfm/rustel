@@ -65,9 +65,10 @@ Use these alternatives if the terminal or operating system takes a shortcut.
 | Quit | ^Q twice |
 
 In a split view, use **Ctrl+Shift+[ / Ctrl+Shift+]** to change scenes. F6 and F7
-also work. Each pane has its own caret and scroll position. Selecting a scene
-already in the other pane moves focus there. A split does not create a second
-player.
+also work. Each pane has its own caret and scroll position. A scene shows in one
+pane at a time. A click on the tab of a scene in the other pane keeps the caret
+in your pane, and F10 moves the caret to the other pane. A split does not create
+a second player.
 
 F1 opens keyboard help when the menu bar is hidden. Menus show available
 actions and shortcuts. Press Esc to return to the editor. To cancel the first

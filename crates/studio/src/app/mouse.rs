@@ -358,7 +358,7 @@ impl App {
         }
         if within(self.regions.scenes, x, y) {
             if let Some(index) = self.scene_chip_at(x, y) {
-                self.select_scene(index);
+                self.click_scene_chip(index);
             }
             return Ok(true);
         }

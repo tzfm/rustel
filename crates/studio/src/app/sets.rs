@@ -302,10 +302,10 @@ impl App {
                 if self.replay_view.is_some() {
                     self.close_replay();
                 }
-                // A score already on the strip is chosen the way its tab
-                // is clicked - the focused pane shows it - rather than
-                // opened again, which would move the set's current scene
-                // under the panes without moving them.
+                // A score already on the strip is selected: the focused
+                // pane shows it, or the caret goes to the pane with the
+                // score. Opening it again would move the set's current
+                // scene under the panes without moving them.
                 let open = self
                     .scenes
                     .scores()
