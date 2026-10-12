@@ -28,6 +28,7 @@
 - A score plays with the names from its own imports. Two helper scripts which both define `.sc()` no longer change each other. Before, the script loaded last gave its `.sc()` to every score, so a score sounded different after another scene played. A name from one script only stays available to every score, and an import in a prebake shares its names with every score.
 - `.onSchedule(callback)` is accepted and returns the pattern unchanged, the same as `.onTrigger()`. Rustel calls no playback callback. Before, a score with `.onSchedule()` stopped with an error.
 - `isobite(structure)` plays the next cycle of a pattern on each event of a structure. `"<0 1 2 3 4 5>".isobite("[x - x*2]*2")` plays `"0 - [1 2] 3 - [4 5]"`. With a pattern and a structure of different lengths, the two shift against each other from cycle to cycle. `cyclestruct` and `cycleStruct` are the same function.
+- Studio unit tests get a new config folder for each run. The folder was named after the process id, and Windows reuses ids fast. A new run then read the preference files of an older run, so two tests failed in a full run and passed alone.
 
 ### Sound changes
 
