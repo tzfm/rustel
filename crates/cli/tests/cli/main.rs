@@ -5061,14 +5061,15 @@ fn the_bounce_success_line_names_the_sample_rate_without_truncating_it() {
 }
 
 /// The command line prints recoverable notices on stderr, which a library
-/// Session does only when its host opts in.
+/// Session does only when its host opts in. A notice that every note raises
+/// prints once, with the number of onsets.
 #[test]
-fn render_prints_a_refused_voice_on_stderr() {
+fn render_prints_recoverable_notices_on_stderr() {
     let path = scratch("refused-voice.wav");
     let out = run(&[
         "render",
         "-e",
-        r#"s("supersaw").unison(100)"#,
+        r#"stack(s("supersaw").unison(100), note("c2*4").s("sawtooth").lpf(400).lpenv(4).lfo({s:.7}))"#,
         "--duration",
         "1",
         "--format",
@@ -5084,6 +5085,14 @@ fn render_prints_a_refused_voice_on_stderr() {
             .lines()
             .any(|line| line.starts_with(r#"{"voice_refused":"#) && line.contains("unison 100")),
         "the refused voice was not reported: {stderr}"
+    );
+    let skipped: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("modulator target 'lpenv'"))
+        .collect();
+    assert!(
+        matches!(skipped[..], [line] if line.starts_with("warning: ") && line.ends_with(" onsets)")),
+        "the skipped modulator was not reported once: {stderr}"
     );
 }
 

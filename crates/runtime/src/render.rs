@@ -107,6 +107,54 @@ pub(crate) fn scalar_event_detailed(
     })
 }
 
+/// The voice notices of one render: each distinct sentence, with the number
+/// of onsets that raised it.
+type NoticeTally = Vec<(String, usize)>;
+
+/// A tally for a run a person reads: direct logging on and no `--json`. A
+/// `--json` run keeps one record per notice. A host with direct logging off
+/// collects its own notices.
+fn notice_tally() -> Option<NoticeTally> {
+    (rustel_voice::direct_diagnostic_logging()
+        && !PROGRESS_JSON.load(std::sync::atomic::Ordering::Relaxed))
+    .then(Vec::new)
+}
+
+/// [`scalar_event`] with the voice notices of the onset counted in `tally`
+/// and kept off stderr.
+fn tallied_scalar_event(
+    onset: &OnsetEventJson,
+    sample_rate: u32,
+    cps: f64,
+    samples: &dyn rustel_voice::SampleLookup,
+    tally: Option<&mut NoticeTally>,
+) -> Result<rustel_audio::OnsetEvent, String> {
+    let Some(tally) = tally else {
+        return scalar_event(onset, sample_rate, cps, samples);
+    };
+    let (event, notices) = rustel_voice::with_diagnostic_policy(false, || {
+        scalar_event(onset, sample_rate, cps, samples)
+    });
+    for notice in notices {
+        match tally
+            .iter_mut()
+            .find(|(message, _)| *message == notice.message)
+        {
+            Some((_, onsets)) => *onsets += 1,
+            None => tally.push((notice.message, 1)),
+        }
+    }
+    event
+}
+
+/// Print each distinct notice once, with its onset count.
+fn print_notice_tally(tally: Option<NoticeTally>) {
+    for (message, onsets) in tally.into_iter().flatten() {
+        let unit = if onsets == 1 { "onset" } else { "onsets" };
+        eprintln!("warning: {message} ({onsets} {unit})");
+    }
+}
+
 /// The cycle `whole_begin` names. The text is the scheduler's fraction in its
 /// `n/d` form. The result equals the fraction's `to_f64`. The parse does not
 /// allocate.
@@ -428,18 +476,21 @@ pub(crate) fn render_scalar_pcm_with_refusals(
         // fallback is silent (not an error), so a settled-probe cannot see
         // it. Three fixed rounds cover s → ir → anything an ir resolve
         // itself queues; each round is a cheap re-resolve plus a wait.
+        // The last pass counts the notices, so these rounds drop theirs.
+        let mut dropped = notice_tally();
         for _ in 0..3 {
             for onset in onsets {
-                let _ = scalar_event(onset, sample_rate, cps, lookup);
+                let _ = tallied_scalar_event(onset, sample_rate, cps, lookup, dropped.as_mut());
             }
             library.wait_until_idle(std::time::Duration::from_secs(120));
         }
     }
+    let mut notices = notice_tally();
     let mut refused: Vec<String> = Vec::new();
     let events: Vec<rustel_audio::OnsetEvent> = onsets
         .iter()
-        .filter_map(
-            |onset| match scalar_event(onset, sample_rate, cps, lookup) {
+        .filter_map(|onset| {
+            match tallied_scalar_event(onset, sample_rate, cps, lookup, notices.as_mut()) {
                 Ok(event) => Some(event),
                 Err(message) => {
                     if !refused.iter().any(|seen| seen == &message) {
@@ -453,9 +504,10 @@ pub(crate) fn render_scalar_pcm_with_refusals(
                     }
                     None
                 }
-            },
-        )
+            }
+        })
         .collect();
+    print_notice_tally(notices);
     let mut backend = scalar_backend(dispatch, library, max_polyphony);
     let pcm = rustel_audio::render_pcm(&mut backend, sample_rate, frames, &events)
         .map_err(io::Error::other)?;
@@ -618,13 +670,16 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
         // passes over every onset in the set), so this loop must check for
         // a stop request. Progress uses the same 2-second cadence as the
         // audio phase, so a short bounce prints nothing.
+        //
+        // The last pass counts the notices, so these rounds drop theirs.
+        let mut dropped = notice_tally();
         let mut spoke_at = std::time::Instant::now();
         for round in 0..3 {
             for onset in onsets {
                 if stopped() {
                     return Err(cancelled_now());
                 }
-                let _ = scalar_event(onset, sample_rate, cps, lookup);
+                let _ = tallied_scalar_event(onset, sample_rate, cps, lookup, dropped.as_mut());
                 if report && spoke_at.elapsed() >= std::time::Duration::from_secs(2) {
                     spoke_at = std::time::Instant::now();
                     report_progress(
@@ -656,12 +711,13 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
     // drops only its own voice; the rest still play. One bad onset must never
     // silence an offline render either. A run of one refusal prints once;
     // `refused` keeps each distinct message for the caller.
+    let mut notices = notice_tally();
     let mut last_refused: Option<String> = None;
     let mut refused: Vec<String> = Vec::new();
     let events: Vec<rustel_audio::OnsetEvent> = onsets
         .iter()
-        .filter_map(
-            |onset| match scalar_event(onset, sample_rate, cps, lookup) {
+        .filter_map(|onset| {
+            match tallied_scalar_event(onset, sample_rate, cps, lookup, notices.as_mut()) {
                 Ok(event) => Some(event),
                 Err(message) => {
                     if last_refused.as_deref() != Some(message.as_str()) {
@@ -678,9 +734,10 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
                     }
                     None
                 }
-            },
-        )
+            }
+        })
         .collect();
+    print_notice_tally(notices);
     let frames = (duration_secs * f64::from(sample_rate)).round();
     if !frames.is_finite() || frames < 0.0 || frames > usize::MAX as f64 {
         return Err(io::Error::new(
