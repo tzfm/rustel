@@ -1,0 +1,9 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+// This can be avoided by making the struct pattern 1 cycle,
+// and slowing the whole pattern down as follows:
+"<0 1 2 3>".isobite("x x*2").slow(2).n().scale("c:major")
+// the same as "<[0] [1 2] [3] [0 1] [2] [3 0] [1] [2 3]>".n().scale("c:major")

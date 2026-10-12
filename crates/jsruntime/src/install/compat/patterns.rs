@@ -480,6 +480,17 @@ pub(super) fn install<'js>(
         Arc::new(|patterns| rustel_core::combinators::scrub(&patterns[1], &patterns[0])),
         UpstreamExport::Callable,
     )?;
+    for name in ["isobite", "cyclestruct", "cycleStruct"] {
+        install_pattern_arguments(
+            ctx,
+            proto,
+            globals,
+            name,
+            2,
+            Arc::new(|patterns| rustel_core::combinators::isobite(&patterns[1], &patterns[0])),
+            UpstreamExport::Callable,
+        )?;
+    }
 
     define_method(
         proto,

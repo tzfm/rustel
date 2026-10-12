@@ -1097,6 +1097,27 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         origin: "rustel",
     },
     ReferenceEntry {
+        name: "isobite",
+        synonyms: &["cycleStruct", "cyclestruct"],
+        summary: "Plays the next cycle of the pattern on each event of a structure.",
+        description: "Like `struct`, but each event of the structure plays the next cycle of the pattern. When the pattern and the structure have different lengths, the two shift against each other from cycle to cycle. This is an isorhythm.\n\nThe structure is read one cycle at a time. A structure which repeats only after several cycles skips or repeats parts of the pattern. Write the structure in one cycle and slow the result to avoid this.",
+        params: &[ReferenceParam {
+            name: "structure",
+            r#type: "Pattern",
+            description: "the rhythm. An event with the value 0 or false is a rest.",
+        }],
+        examples: &[
+            "\"<0 1 2 3 4 5>\".isobite(\"[x - x*2]*2\").n().scale(\"c:major\")\n// the same as \"0 - [1 2] 3 - [4 5]\".n().scale(\"c:major\")",
+            "\"<0 1 2 3 4>\".isobite(\"x - x\").n().scale(\"c:major\")\n// the same as \"<[0 - 1] [2 - 3] [4 - 0] [1 - 2] [3 - 4]>\".n().scale(\"c:major\")",
+            "// The structure repeats after 2 cycles, so parts of the melody are skipped.\n\"<0 1 2 3>\".isobite(\"x x*2\".slow(2)).n().scale(\"c:major\")\n// the same as \"<[0] [2 3] [2] [2 3]>\".n().scale(\"c:major\")",
+            "// A structure of 1 cycle, with the result slowed down, skips nothing.\n\"<0 1 2 3>\".isobite(\"x x*2\").slow(2).n().scale(\"c:major\")\n// the same as \"<[0] [1 2] [3] [0 1] [2] [3 0] [1] [2 3]>\".n().scale(\"c:major\")",
+        ],
+        tags: &["temporal"],
+        no_autocomplete: false,
+        deprecated: false,
+        origin: "rustel",
+    },
+    ReferenceEntry {
         name: "isquare",
         synonyms: &[],
         summary: "A square signal between 1 and 0 (like `square`, but flipped).",

@@ -1,0 +1,9 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+// Here the structure pattern repeats after 2 cycles,
+// so certain haps from the melody are skipped.
+"<0 1 2 3>".isobite("x x*2".slow(2)).n().scale("c:major")
+// the same as "<[0] [2 3] [2] [2 3]>".n().scale("c:major")

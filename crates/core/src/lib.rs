@@ -4084,6 +4084,12 @@ enum Node {
     /// this shape natively (each note covers the source hap's whole/part).
     ExpandHapsNative(Pattern, HapExpandFn),
     Collect(Pattern),
+    /// `isobite`: the onsets in the cycle of the query, each valued by its
+    /// position among them. An onset is a hap with a value not loosely 0.
+    CycleOnsetIndex(Pattern),
+    /// `isobite`: one hap over the cycle of the query, valued by the number
+    /// of onsets in the cycle.
+    CycleOnsetCount(Pattern),
     /// `withSeed(() => n)`: rewrite `state.controls.randSeed`
     /// for the subtree, which every random signal reads. The registered
     /// `seed(n)` combinator is the constant form; function-valued `withSeed`
@@ -4210,6 +4216,8 @@ fn inherited_runtime_settings(node: &Node) -> Option<settings::RuntimeSettings> 
         | Node::MapHapsWithState(pattern, _)
         | Node::ExpandHapsNative(pattern, _)
         | Node::Collect(pattern)
+        | Node::CycleOnsetIndex(pattern)
+        | Node::CycleOnsetCount(pattern)
         | Node::WithRandSeed(pattern, _)
         | Node::Degrade(pattern, _, _)
         | Node::InnerJoin(pattern, _)
@@ -4682,6 +4690,9 @@ impl Pattern {
                     )
                 })
                 .collect(),
+
+            Node::CycleOnsetIndex(pat) => query_cycle_onset_index(pat, state),
+            Node::CycleOnsetCount(pat) => query_cycle_onset_count(pat, state),
 
             // Extension implementations may rewrite public Hap values. They
             // have no provenance contract, so only later direct controls bind.
@@ -6766,6 +6777,18 @@ impl Pattern {
         Pattern::of(Node::Collect(self.clone()))
     }
 
+    /// The onsets of each cycle, valued by their position in the cycle.
+    /// See [`combinators::isobite`].
+    pub fn cycle_onset_indices(&self) -> Self {
+        Pattern::of(Node::CycleOnsetIndex(self.clone())).split_queries()
+    }
+
+    /// One hap per cycle, valued by the number of onsets in the cycle.
+    /// See [`combinators::isobite`].
+    pub fn cycle_onset_count(&self) -> Self {
+        Pattern::of(Node::CycleOnsetCount(self.clone())).split_queries()
+    }
+
     pub fn loop_at(&self, factor: Fraction) -> Self {
         Pattern::of(Node::LoopAt(self.clone(), factor))
     }
@@ -7194,6 +7217,8 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
         | Node::MapHapsWithState(pattern, _)
         | Node::ExpandHapsNative(pattern, _)
         | Node::Collect(pattern)
+        | Node::CycleOnsetIndex(pattern)
+        | Node::CycleOnsetCount(pattern)
         | Node::WithRandSeed(pattern, _)
         | Node::Degrade(pattern, _, _)
         | Node::InnerJoin(pattern, _)
@@ -7420,6 +7445,8 @@ fn compute_purity(node: &Node) -> purity::Purity {
         | Node::MapHapsWithState(p, _)
         | Node::ExpandHapsNative(p, _)
         | Node::Collect(p)
+        | Node::CycleOnsetIndex(p)
+        | Node::CycleOnsetCount(p)
         | Node::WithRandSeed(p, _)
         | Node::Degrade(p, _, _)
         | Node::SplitQueries(p)
@@ -7644,6 +7671,56 @@ fn query_midi_keys(lengths: &Pattern, port: &Arc<midi_in::InputPort>, state: &St
         }
     }
     out
+}
+
+/// The haps `isobite` counts in the cycle of the query: each hap with a value
+/// not loosely equal to 0.
+fn cycle_onsets(structure: &Pattern, state: &State) -> Vec<Hap> {
+    let zero = Value::F64(0.0);
+    structure
+        .query(&state.set_span(whole_cycle(state.span.begin)))
+        .into_iter()
+        .filter(|hap| !compose::js_loose_eq(&hap.value, &zero))
+        .collect()
+}
+
+/// Each onset, cut to the query span and valued by its position in the cycle.
+/// Two or more onsets are ordered by the begin of their whole, so an analog
+/// hap among them is a query error, as in [`sort_haps_by_part`].
+#[inline(never)]
+fn query_cycle_onset_index(structure: &Pattern, state: &State) -> Vec<Hap> {
+    let mut onsets = cycle_onsets(structure, state);
+    if onsets.len() > 1 {
+        if onsets.iter().any(|hap| hap.whole.is_none()) {
+            signal_query_error(|| {
+                "isobite: Cannot read properties of undefined (reading 'begin')".into()
+            });
+            return Vec::new();
+        }
+        // Stable: onsets with one begin keep their query order.
+        onsets.sort_by_key(|hap| hap.whole.map(|whole| whole.begin));
+    }
+    onsets
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, hap)| {
+            let part = state.span.intersection(&hap.part)?;
+            let mut indexed = hap.with_value(|_| Value::F64(index as f64));
+            indexed.part = part;
+            Some(indexed)
+        })
+        .collect()
+}
+
+/// One hap over the cycle of the query, valued by its onset count.
+#[inline(never)]
+fn query_cycle_onset_count(structure: &Pattern, state: &State) -> Vec<Hap> {
+    let count = cycle_onsets(structure, state).len();
+    vec![Hap::new(
+        Some(whole_cycle(state.span.begin)),
+        state.span,
+        Value::F64(count as f64),
+    )]
 }
 
 /// `withSeed`'s query, out of `query_node`'s recursive frame.

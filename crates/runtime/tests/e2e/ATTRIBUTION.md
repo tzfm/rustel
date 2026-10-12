@@ -75,6 +75,6 @@ project and carry its AGPL-3.0 licence.
 - rustel maintainers
 - Rymdljus, Atraeus, Janeishly, Multidroid
 
-## upstream docs - 448 score(s)
+## upstream docs - 452 score(s)
 
 - the Strudel project (AGPL-3.0)

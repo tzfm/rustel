@@ -506,7 +506,7 @@ fn js_less_than(a: &Value, b: &Value) -> Option<bool> {
 }
 
 /// JS `==` restricted to the value shapes patterns actually carry.
-fn js_loose_eq(a: &Value, b: &Value) -> bool {
+pub(crate) fn js_loose_eq(a: &Value, b: &Value) -> bool {
     use Value::*;
     match (a, b) {
         (Undefined | Null, Undefined | Null) => true,
