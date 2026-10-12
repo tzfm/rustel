@@ -104,6 +104,26 @@ impl App {
         true
     }
 
+    /// A click on a scene chip puts the scene in the focused pane. A scene
+    /// the other pane shows stays there, and the caret stays here: a scene
+    /// has one caret, so two panes do not show the same scene.
+    pub(super) fn click_scene_chip(&mut self, index: usize) {
+        let elsewhere = self.scenes.scenes().get(index).and_then(|scene| {
+            let pane = self.panes.iter().position(|pane| pane.scene == scene.id)?;
+            (pane != self.focused).then(|| (pane, scene.name()))
+        });
+        let Some((pane, name)) = elsewhere else {
+            self.select_scene(index);
+            return;
+        };
+        self.status = format!(
+            "{name:?} is open in the {} pane - {} goes there",
+            if pane == 0 { "left" } else { "right" },
+            self.shortcut_or_menu(BindAction::HopPane, "View > Switch pane")
+        );
+        self.dirty_frame = true;
+    }
+
     pub(super) fn step_scene(&mut self, delta: isize) {
         if self.replay_view.is_some() {
             self.status = format!(
@@ -122,9 +142,9 @@ impl App {
             self.dirty_frame = true;
             return;
         }
-        // Cycling replaces only the focused pane. Direct tab selection may
-        // focus an already visible scene, but cycling skips that scene so
-        // the other pane and the musician's caret stay where they were.
+        // Cycling replaces only the focused pane. It skips the scene in the
+        // other pane, so that pane and the musician's caret stay where they
+        // were.
         let current = self.scenes.current_index() as isize;
         let next = (1..len).find_map(|offset| {
             let index =

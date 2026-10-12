@@ -15119,6 +15119,38 @@ mod tests {
         }
 
         #[test]
+        fn a_click_on_the_other_panes_tab_keeps_the_caret_and_both_panes() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = navigation_app(directory.path(), 5, true);
+            app.regions.scenes = Rect::new(0, 1, 140, 1);
+            let ids: Vec<_> = app.scenes.scenes().iter().map(|scene| scene.id).collect();
+            let click = |app: &mut App, index: usize| {
+                let chip = view::scene_strip_hits(app.regions.scenes, &app.scene_chips())[index];
+                app.handle_mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: chip.x,
+                    row: chip.y,
+                    modifiers: KeyModifiers::NONE,
+                })
+                .unwrap();
+            };
+            // Left pane on the third scene, right pane on the fifth, then
+            // the fourth.
+            click(&mut app, 2);
+            app.focus_pane(1);
+            click(&mut app, 4);
+            click(&mut app, 3);
+
+            click(&mut app, 2);
+            assert_eq!(app.focused, 1);
+            assert_eq!(
+                app.panes.iter().map(|pane| pane.scene).collect::<Vec<_>>(),
+                [ids[2], ids[3]]
+            );
+            assert!(app.status.contains("left pane"), "{}", app.status);
+        }
+
+        #[test]
         fn single_pane_keeps_plain_and_shifted_scene_navigation_and_portable_aliases() {
             let directory = tempfile::tempdir().unwrap();
             let mut app = navigation_app(directory.path(), 3, false);
