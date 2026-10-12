@@ -254,10 +254,13 @@ pub(crate) fn isolate_for_tests() {
         // Keep the pre-isolation sample cache available to tests that need
         // pinned manifests. App tests still write to the isolated cache.
         let _ = sample_cache_before_test_isolation();
-        let mut path = std::env::temp_dir();
-        path.push(format!("rustel-test-config-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&path);
-        path
+        // One new folder per process. Windows reuses a process id fast, so a
+        // folder named after the id holds the preference files of an older run.
+        tempfile::Builder::new()
+            .prefix("rustel-test-config-")
+            .tempdir()
+            .expect("test configuration folder")
+            .keep()
     });
     // Tests read colours in the terminal output. A `NO_COLOR` from the
     // shell must not remove them.
