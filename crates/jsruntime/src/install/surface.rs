@@ -1444,8 +1444,8 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         origin: "rustel",
     },
     ReferenceEntry {
-        name: "onTrigger",
-        synonyms: &[],
+        name: "onSchedule",
+        synonyms: &["onTrigger"],
         summary: "Playback callbacks are not supported in Rustel.",
         description: "Returns the pattern unchanged without calling the callback.",
         params: &[],

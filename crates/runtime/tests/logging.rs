@@ -10,7 +10,7 @@ later version.
 
 //! `.log()` prints when a note sounds, not when it is queried.
 //!
-//! Upstream attaches the callback to `hap.context.onTrigger` and calls it
+//! Upstream attaches the callback to `hap.context.onSchedule` and calls it
 //! from the browser's scheduler. This engine formats the text when the hap is
 //! produced and prints it when the onset fires, the moment upstream logs at.
 //! A re-queried span therefore cannot print twice.

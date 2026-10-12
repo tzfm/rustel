@@ -27,7 +27,7 @@ These names remain available, but the named feature is inactive.
 | `registerSynthSounds` | Does not register additional synths. |
 | `loadSoundfont` | Returns an empty object without loading a soundfont. |
 | `.webaudio()`, `.csound()`, `.tone()`, `.webdirt()`, `.speak()`, `.wave()`, `.soundfont()`, `.dough()`, `.fscope()` | Return the pattern unchanged. They do not select an output, produce speech, load a font, or open a frequency scope. |
-| `.onTrigger()`, `.onTriggerTime()` | Return the pattern without calling the callback. |
+| `.onSchedule()`, `.onTrigger()`, `.onTriggerTime()` | Return the pattern without calling the callback. |
 | `addEventListener`, `removeEventListener` | Accept the call. Rustel has no browser events, and the listener is never called. |
 | `theme`, `fontFamily`, `fontSize` | Do not change Studio's appearance. |
 | `mousex`, `mouseX`, `mousey`, `mouseY` | Return zero. They do not read the pointer. |

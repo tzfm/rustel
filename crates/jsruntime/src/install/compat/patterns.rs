@@ -346,13 +346,15 @@ pub(super) fn install<'js>(
     proto: &rquickjs::Object<'js>,
     globals: &rquickjs::Object<'js>,
 ) -> Result<(), String> {
-    define_method(
-        proto,
-        "onTrigger",
-        Function::new(ctx.clone(), passthrough).map_err(|error| error.to_string())?,
-        "",
-        1,
-    )?;
+    for name in ["onSchedule", "onTrigger"] {
+        define_method(
+            proto,
+            name,
+            Function::new(ctx.clone(), passthrough).map_err(|error| error.to_string())?,
+            "",
+            1,
+        )?;
+    }
     for (name, values_only) in [("log", false), ("logValues", true)] {
         let function = Function::new(ctx.clone(), move |ctx, this, args| {
             log_pattern(ctx, this, args, values_only)
