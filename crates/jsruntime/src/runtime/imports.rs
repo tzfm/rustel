@@ -46,7 +46,13 @@ impl JsRuntime {
         let effects = with_ctx(&self.ctx, |ctx| {
             let globals = ctx.globals();
             let before = match scope {
-                ImportScope::Score => Some(import_surface::snapshot(&ctx).map_err(script_error)?),
+                ImportScope::Score => {
+                    // A name the last score registered goes back first. The
+                    // script then takes the name from the surface, and the
+                    // value of that score does not become the base.
+                    restore_registration_surface(&ctx).map_err(script_error)?;
+                    Some(import_surface::snapshot(&ctx).map_err(script_error)?)
+                }
                 ImportScope::Shared => None,
             };
             let outer: rquickjs::Value = globals.get("strudelMirror").map_err(script_error)?;
