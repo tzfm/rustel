@@ -135,6 +135,7 @@ impl JsRuntime {
             cycle_time: std::rc::Rc::new(Cell::new(0.0)),
             cps: std::rc::Rc::new(Cell::new(0.5)),
             loaded_imports,
+            import_surface: RefCell::default(),
             timeline_state: rustel_core::TimelineState::default(),
             midi_in_bus: std::sync::Arc::new(rustel_core::midi_in::InputBus::new()),
             midi_in_handles: std::rc::Rc::new(RefCell::new(MidiInputHandles::default())),

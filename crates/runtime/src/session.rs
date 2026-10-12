@@ -8713,6 +8713,51 @@ mod tests {
         }
     }
 
+    /// Two scripts give `sc` two meanings. A score gets the meaning of the
+    /// import in its own text, whatever score ran before.
+    #[test]
+    fn each_score_keeps_the_names_of_its_own_imports() {
+        fn play(session: &mut Session, source: &str) -> Result<Vec<String>, RuntimeError> {
+            session.evaluate(source).map(|()| active_values(session))
+        }
+        let url = |name: &str| format!("https://scripts.example/{name}.js");
+        let with = |name: &str| format!("await import('{}')\n$: note(0).sc()", url(name));
+        let mut session = Session::new().expect("session");
+        let mut access = ScoreImportAccess::denied();
+        access.permit_origin("https://scripts.example").unwrap();
+        session.set_score_import_access(access);
+        for (name, octave) in [("low", 24), ("high", 72)] {
+            session.import_sources.insert(
+                url(name),
+                Arc::from(format!(
+                    "Pattern.prototype.sc = function () {{ return this.add(note({octave})) }};
+                     globalThis.both = {octave}; globalThis.{name}Only = 1;"
+                )),
+            );
+        }
+        let engine = play(&mut session, "$: note(0).sc()").expect("the engine's sc");
+        let low = play(&mut session, &with("low")).expect("low");
+        let high = play(&mut session, &with("high")).expect("high");
+        assert!(low != high && low != engine);
+        assert_eq!(play(&mut session, &with("low")).expect("low again"), low);
+
+        // A score with no import gets the engine's `sc` back. A name two
+        // scripts made has no owner. A name one script made stays.
+        assert_eq!(
+            play(&mut session, "$: note(0).sc()").expect("engine"),
+            engine
+        );
+        play(&mut session, "$: note(both)").expect_err("two meanings, no import");
+        play(&mut session, "$: note(lowOnly + highOnly)").expect("one meaning each");
+
+        // A prebake import is for every score. A score import still wins.
+        session
+            .evaluate_prebake(&format!("await import('{}')", url("high")))
+            .expect("prebake");
+        assert_eq!(play(&mut session, "$: note(0).sc()").expect("shared"), high);
+        assert_eq!(play(&mut session, &with("low")).expect("low"), low);
+    }
+
     #[test]
     fn cancellation_after_setup_staging_discards_the_whole_transaction() {
         use std::sync::atomic::Ordering;

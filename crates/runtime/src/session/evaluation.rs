@@ -1,6 +1,7 @@
 //! Score evaluation, live replacement, and rollback.
 
 use super::*;
+use rustel_jsruntime::ImportScope;
 
 impl Session {
     /// Compile mini-notation via the Rust parser and install it.
@@ -86,7 +87,8 @@ impl Session {
         // just as ordinary score evaluation does.
         self.ensure_voicings()?;
         self.js.set_cps(self.scheduler.cps());
-        self.load_script_imports(source, cancellation)?;
+        self.load_script_imports(source, cancellation, ImportScope::Shared)
+            .inspect_err(|_| self.js.show_last_good_imports())?;
         // Setup code is not the active editor document. Locations created
         // here are bare byte offsets and would be indistinguishable from score
         // offsets if a helper returned its own mini-notation pattern later.
@@ -105,6 +107,9 @@ impl Session {
                 .js
                 .evaluate_prelude_with_effects(source, &transpile_options, budget),
         };
+        // The prebake ran with no score import on the surface, so its names
+        // are for every score. The playing score gets its own names back.
+        self.js.show_last_good_imports();
         let effects = match result {
             Ok((_, effects)) => {
                 if expected_error.is_some() {
@@ -139,10 +144,15 @@ impl Session {
     ///
     /// An origin that the host does not trust refuses the evaluation before
     /// any fetch. The first trusted import of a script waits for its fetch.
+    ///
+    /// A score sees the names of the imports in its own text. Two scripts
+    /// with one name in common do not change a score with one of them. A
+    /// prebake import is for every score.
     fn load_script_imports(
         &mut self,
         source: &str,
         cancellation: Option<&AtomicBool>,
+        scope: ImportScope,
     ) -> Result<(), RuntimeError> {
         use crate::score_import::ImportRefusal;
 
@@ -163,10 +173,21 @@ impl Session {
                 Ok((specifier, url))
             })
             .collect::<Result<Vec<_>, RuntimeError>>()?;
-        for (specifier, url) in imports {
+        let named: Vec<String> = match scope {
+            ImportScope::Score => imports.iter().map(|(name, _)| name.clone()).collect(),
+            // Setup code defines names for every score.
+            ImportScope::Shared => Vec::new(),
+        };
+        for (position, (specifier, url)) in imports.into_iter().enumerate() {
             if self.js.import_loaded(&specifier) {
+                if scope == ImportScope::Shared {
+                    self.js.share_import(&specifier);
+                }
                 continue;
             }
+            // A new script runs on the names of the imports before it.
+            self.js
+                .show_imports(named.get(..position).unwrap_or_default());
             if let Some(error) = self.import_errors.get(&specifier) {
                 return Err(RuntimeError::Js(error.to_string()));
             }
@@ -192,6 +213,7 @@ impl Session {
                 &options,
                 PREBAKE_CPU_BUDGET,
                 cancellation.unwrap_or(&never),
+                scope,
             );
             let effects = match ran.map_err(RuntimeError::from) {
                 Ok(effects) => effects,
@@ -210,6 +232,7 @@ impl Session {
                 self.apply_sample_effects(effects.samples, effects.preload);
             }
         }
+        self.js.show_imports(&named);
         Ok(())
     }
 
@@ -582,7 +605,35 @@ impl Session {
         self.ensure_bindings()?;
         self.ensure_voicings()?;
         self.js.set_cps(self.scheduler.cps());
-        self.load_script_imports(source, Some(cancellation))?;
+        let evaluated = self
+            .load_script_imports(source, Some(cancellation), ImportScope::Score)
+            .and_then(|()| {
+                self.evaluate_loaded_score(
+                    source,
+                    budget,
+                    cancellation,
+                    allow_mini_fallback,
+                    no_pattern,
+                    seed,
+                )
+            });
+        if evaluated.is_err() {
+            // The playing score keeps the names of its own imports.
+            self.js.show_last_good_imports();
+        }
+        evaluated
+    }
+
+    /// Evaluate a score after its imports ran.
+    fn evaluate_loaded_score(
+        &mut self,
+        source: &str,
+        budget: Duration,
+        cancellation: &AtomicBool,
+        allow_mini_fallback: bool,
+        no_pattern: NoPatternPolicy,
+        seed: Option<&RuntimeSettings>,
+    ) -> Result<EvaluatedScore, RuntimeError> {
         // A bounded first-install probe may reject the score after JavaScript
         // has published its slider and voicing candidates. Save the empty
         // baseline so that refusal can restore all three active roots.

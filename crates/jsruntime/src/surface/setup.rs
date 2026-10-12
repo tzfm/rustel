@@ -23,6 +23,26 @@ pub(crate) fn keep_registration_surface(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
     registration::forget_surface(ctx)
 }
 
+/// The objects where setup code defines names for scores: the globals, then
+/// the Pattern prototype and the score scope of an installed surface.
+pub(crate) fn score_surface_objects<'js>(
+    ctx: &Ctx<'js>,
+) -> rquickjs::Result<Vec<rquickjs::Object<'js>>> {
+    let mut objects = vec![ctx.globals()];
+    objects.extend(registration::surface_objects(ctx)?.into_iter().flatten());
+    Ok(objects)
+}
+
+/// Define `name` on a surface object, or remove the name when `value` is
+/// undefined. No setter runs.
+pub(crate) fn put_back_surface_name<'js>(
+    target: &rquickjs::Object<'js>,
+    name: &str,
+    value: rquickjs::Value<'js>,
+) -> rquickjs::Result<()> {
+    registration::put_back(target, name, value)
+}
+
 pub(crate) struct RegistrationSeal {
     names: Rc<RefCell<HashSet<String>>>,
 }

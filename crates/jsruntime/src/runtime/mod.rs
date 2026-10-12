@@ -232,6 +232,8 @@ pub struct JsRuntime {
     /// set none. See [`JsRuntime::set_cps`].
     pub(crate) cps: std::rc::Rc<Cell<f64>>,
     pub(super) loaded_imports: LoadedImports,
+    /// The names of score imports. See [`JsRuntime::show_imports`].
+    pub(super) import_surface: RefCell<ImportSurface>,
     pub(super) timeline_state: rustel_core::TimelineState,
     /// MIDI inputs this Session's scores have named, and their live values.
     ///
@@ -722,9 +724,13 @@ mod api;
 mod callback_host;
 mod callback_query;
 mod evaluation;
+mod import_surface;
 mod imports;
 mod inspection;
 mod teardown;
+
+pub use import_surface::ImportScope;
+use import_surface::ImportSurface;
 
 #[cfg(test)]
 mod caught_panic_tests {
