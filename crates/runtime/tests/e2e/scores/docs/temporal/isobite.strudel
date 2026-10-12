@@ -1,0 +1,7 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+"<0 1 2 3 4 5>".isobite("[x - x*2]*2").n().scale("c:major")
+// the same as "0 - [1 2] 3 - [4 5]".n().scale("c:major")

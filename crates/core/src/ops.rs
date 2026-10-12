@@ -71,6 +71,10 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
     fn loop_at(&self, factor: Fraction) -> Self;
     fn cpm(&self, cpm: Fraction) -> Self;
     fn split_queries(&self) -> Self;
+    /// `isobite`: the onsets of each cycle, valued by their position.
+    fn cycle_onset_indices(&self) -> Self;
+    /// `isobite`: one hap per cycle, valued by its onset count.
+    fn cycle_onset_count(&self) -> Self;
     fn with_query_time(&self, f: impl Fn(Fraction) -> Fraction + Send + Sync + 'static) -> Self;
     fn with_hap_time(&self, f: impl Fn(Fraction) -> Fraction + Send + Sync + 'static) -> Self;
     fn with_query_span(
@@ -279,6 +283,12 @@ impl PatOps for Pattern {
     }
     fn split_queries(&self) -> Self {
         Pattern::split_queries(self)
+    }
+    fn cycle_onset_indices(&self) -> Self {
+        Pattern::cycle_onset_indices(self)
+    }
+    fn cycle_onset_count(&self) -> Self {
+        Pattern::cycle_onset_count(self)
     }
     fn with_query_time(&self, f: impl Fn(Fraction) -> Fraction + Send + Sync + 'static) -> Self {
         Pattern::with_query_time(self, f)
@@ -551,6 +561,12 @@ impl PatOps for PurePattern {
     }
     fn split_queries(&self) -> Self {
         PurePattern::split_queries(self)
+    }
+    fn cycle_onset_indices(&self) -> Self {
+        PurePattern::assert_pure(self.pattern().cycle_onset_indices())
+    }
+    fn cycle_onset_count(&self) -> Self {
+        PurePattern::assert_pure(self.pattern().cycle_onset_count())
     }
     fn with_query_time(&self, f: impl Fn(Fraction) -> Fraction + Send + Sync + 'static) -> Self {
         PurePattern::assert_pure(self.pattern().with_query_time(f))

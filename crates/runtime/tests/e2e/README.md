@@ -1,6 +1,6 @@
 # The corpus suite
 
-The suite evaluates and renders 1479 scores, then compares each result with a
+The suite evaluates and renders 1484 scores, then compares each result with a
 committed golden. Run it before you open a pull request:
 
 ```sh
@@ -54,7 +54,7 @@ Run it locally or dispatch Heavy CI for the current commit.
 | `scores/corpus/generated` | 680 | fuzzed combinations of the pattern surface |
 | `scores/corpus/regressions` | 100 | one score per bug that has been fixed |
 | `scores/corpus/songs` | 186 | complete pieces, credited in `ATTRIBUTION.md` |
-| `scores/docs` | 447 | upstream documentation examples, with exact duplicates removed |
+| `scores/docs` | 452 | upstream documentation examples, with exact duplicates removed |
 | `scores/probes` | 66 | narrow synthesis cases - one oscillator, one filter |
 
 Each score is an ordinary `.strudel` file. Play one, and press Ctrl+C to stop:

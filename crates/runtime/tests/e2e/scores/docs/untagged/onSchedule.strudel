@@ -1,0 +1,8 @@
+/*
+  @by the Strudel project (AGPL-3.0)
+  @origin upstream docs
+  @duration 4
+*/
+s("bd sd").onSchedule((hap, time, cps) => {
+  console.log('hap scheduled', time, cps);
+})

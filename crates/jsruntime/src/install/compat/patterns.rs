@@ -346,13 +346,15 @@ pub(super) fn install<'js>(
     proto: &rquickjs::Object<'js>,
     globals: &rquickjs::Object<'js>,
 ) -> Result<(), String> {
-    define_method(
-        proto,
-        "onTrigger",
-        Function::new(ctx.clone(), passthrough).map_err(|error| error.to_string())?,
-        "",
-        1,
-    )?;
+    for name in ["onSchedule", "onTrigger"] {
+        define_method(
+            proto,
+            name,
+            Function::new(ctx.clone(), passthrough).map_err(|error| error.to_string())?,
+            "",
+            1,
+        )?;
+    }
     for (name, values_only) in [("log", false), ("logValues", true)] {
         let function = Function::new(ctx.clone(), move |ctx, this, args| {
             log_pattern(ctx, this, args, values_only)
@@ -478,6 +480,17 @@ pub(super) fn install<'js>(
         Arc::new(|patterns| rustel_core::combinators::scrub(&patterns[1], &patterns[0])),
         UpstreamExport::Callable,
     )?;
+    for name in ["isobite", "cyclestruct", "cycleStruct"] {
+        install_pattern_arguments(
+            ctx,
+            proto,
+            globals,
+            name,
+            2,
+            Arc::new(|patterns| rustel_core::combinators::isobite(&patterns[1], &patterns[0])),
+            UpstreamExport::Callable,
+        )?;
+    }
 
     define_method(
         proto,

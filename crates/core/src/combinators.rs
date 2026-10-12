@@ -510,6 +510,21 @@ pub fn bite<P: PatOps>(pat: &P, npat: &P, ipat: &P) -> P {
     })
 }
 
+/// Plays the next cycle of `pat` on each onset of `structure`.
+///
+/// `structure` is read one cycle at a time. A cycle with `n` onsets plays `n`
+/// cycles of `pat` in order, each squeezed into one onset. An onset is a hap
+/// with a value not loosely equal to 0.
+pub fn isobite<P: PatOps>(pat: &P, structure: &P) -> P {
+    let count = structure.cycle_onset_count();
+    let pat = pat.clone();
+    let sped = count.inner_bind(move |n| match crate::register::value_to_fraction(n) {
+        Some(n) => pat.fast(n),
+        None => P::pat_silence(),
+    });
+    bite(&sped, &count, &structure.cycle_onset_indices())
+}
+
 pub use crate::compose::compose;
 
 /// `pat.struct(other)` = `keepif.out`.

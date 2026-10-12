@@ -3,7 +3,7 @@
   1 first                                                                                                                                             
   1 $: s("bd")                                                                               │ ref  samp  chord  scale  gen  examp       Tab switches 
   2                                                                                          │ search:                                                
-                                                                                             │ 793 functions · type tag: to narrow by kind            
+                                                                                             │ 794 functions · type tag: to narrow by kind            
                                                                                              │  temporal                                              
                                                                                              │  almostAlways  Shorthand for .sometimesBy(0.9, fn)     
                                                                                              │  almostNever  Shorthand for .sometimesBy(0.1, fn)      
@@ -36,5 +36,5 @@
                                                                                              │  fast  density Speed up a pattern by the given factor. 
                                                                                              │  fastChunk  Like chunk, but the cycles of the…         
                                                                                              │ ↑↓ move · → or Enter opens · Esc closes                
- reference - 793 entries; type to search                                              1,1                                                       0.0dB 
+ reference - 794 entries; type to search                                              1,1                                                       0.0dB 
  ♪ no output  ⌁ no midi                                                                                      MASTER ^⇧Up/^⇧Down       pk  --  LUFS -- 

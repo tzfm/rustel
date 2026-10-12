@@ -1314,3 +1314,59 @@ fn a_control_called_with_no_argument_leaves_an_event_alone() {
         "naming a bare value is what an empty control is for"
     );
 }
+
+/// Each event of the structure plays the next cycle of the pattern. The
+/// second column is the pattern the reference gives as the same result.
+#[test]
+fn isobite_plays_the_next_cycle_on_each_structure_event() {
+    let events = |source: &str| {
+        let mut session = Session::new().expect("session");
+        session
+            .evaluate(source)
+            .unwrap_or_else(|error| panic!("{source}: {error}"));
+        let mut events: Vec<_> = session
+            .query(Fraction::ZERO, Fraction::int(10))
+            .expect("query")
+            .into_iter()
+            .map(|hap| {
+                let whole = hap.whole.map(|whole| (whole.begin, whole.end));
+                (hap.part.begin, hap.part.end, whole, hap.value.show())
+            })
+            .collect();
+        events.sort();
+        events
+    };
+    for (source, same_as) in [
+        (
+            r#""<0 1 2 3 4 5>".isobite("[x - x*2]*2")"#,
+            r#""0 - [1 2] 3 - [4 5]""#,
+        ),
+        (
+            r#""<0 1 2 3 4>".cyclestruct("x - x")"#,
+            r#""<[0 - 1] [2 - 3] [4 - 0] [1 - 2] [3 - 4]>""#,
+        ),
+        (
+            r#""<0 1 2 3>".cycleStruct("x x*2".slow(2))"#,
+            r#""<[0] [2 3] [2] [2 3]>""#,
+        ),
+        (
+            r#"isobite("x x*2", "<0 1 2 3>").slow(2)"#,
+            r#""<[0] [1 2] [3] [0 1] [2] [3 0] [1] [2 3]>""#,
+        ),
+        // A 0 in the structure is a rest.
+        (r#""<0 1 2 3>".isobite("1 0 1")"#, r#""<[0 - 1] [2 - 3]>""#),
+    ] {
+        assert_eq!(events(source), events(same_as), "{source}");
+    }
+
+    // Two signals have no onset to order. The query reports an error.
+    let mut session = Session::new().expect("session");
+    session
+        .evaluate(r#""<0 1>".isobite(stack(sine, cosine))"#)
+        .expect("evaluate");
+    let report = session
+        .query_report(Fraction::ZERO, Fraction::ONE)
+        .expect("query");
+    assert!(report.haps.is_empty());
+    assert!(report.query_threw.is_some());
+}

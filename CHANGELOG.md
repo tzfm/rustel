@@ -26,6 +26,8 @@
 - In a split view, a click on the tab of a scene open in the other pane keeps the caret in your pane. The status line names the pane with the scene, and F10 moves the caret there. Before, the click moved the caret to the other pane.
 - `rustel export`, `rustel render` and `rustel replay --export` print each voice notice once, with the number of onsets. Before, an LFO on a target Rustel does not modulate, such as `.lpenv(4).lfo({s:.7})`, printed several JSON lines for each note. With `--json`, the records stay the same.
 - A score plays with the names from its own imports. Two helper scripts which both define `.sc()` no longer change each other. Before, the script loaded last gave its `.sc()` to every score, so a score sounded different after another scene played. A name from one script only stays available to every score, and an import in a prebake shares its names with every score.
+- `.onSchedule(callback)` is accepted and returns the pattern unchanged, the same as `.onTrigger()`. Rustel calls no playback callback. Before, a score with `.onSchedule()` stopped with an error.
+- `isobite(structure)` plays the next cycle of a pattern on each event of a structure. `"<0 1 2 3 4 5>".isobite("[x - x*2]*2")` plays `"0 - [1 2] 3 - [4 5]"`. With a pattern and a structure of different lengths, the two shift against each other from cycle to cycle. `cyclestruct` and `cycleStruct` are the same function.
 
 ### Sound changes
 
