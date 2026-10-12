@@ -93,6 +93,10 @@ const MAX_VARIANT_ROWS: usize = 64;
 /// than any score the ranker gives, so they land after every real match
 /// rather than merely below the good ones.
 const SNIPPET_OFF_LINE_PENALTY: i32 = 100_000;
+/// What a name gains when it starts with the query in the case typed.
+/// Larger than the 200 between an exact match and a match from the start,
+/// so `cycleS` puts `cycleStruct` over a keyword `cycles`.
+const TYPED_CASE_BONUS: i32 = 300;
 
 /// The most characters a search box holds. The limit is longer than the
 /// longest name the studio knows. It also bounds the ranking cost of an
@@ -4864,6 +4868,8 @@ mod tests {
                 ("pianoroll", "pianoroll"),
                 ("scope", "scope"),
                 ("cutoff", "lpf"),
+                // The capital asks for `cycleStruct`, not `cyclesPer`.
+                ("cycleS", "isobite"),
             ] {
                 let matches = reference.search(query);
                 assert_eq!(reference.entry(matches[0]).unwrap().name, wanted, "{query}");
@@ -6127,10 +6133,11 @@ mod sketch_tab_tests {
         assert!(panel.selected_snippet_code().is_none());
         assert_eq!(panel.copy(), PanelAction::Nothing);
     }
-    /// Each row shows up to three aliases beside the name. A matching alias comes
-    /// first; extra aliases are counted. The lowercase name is not an alias.
+    /// A row leads with the spelling the query asks for and shows up to three
+    /// other names beside it, the main name first. Enter writes the spelling
+    /// the row shows. Two spellings which differ only in case count as one.
     #[test]
-    fn a_rows_aliases_stand_beside_its_name_with_the_matched_one_first() {
+    fn a_row_leads_with_the_spelling_typed_and_enter_writes_it() {
         let reference = Reference::load_all();
         // A function with aliases, and one of them that is not a prefix of
         // the name, so a hit through it is plainly through the alias.
@@ -6149,15 +6156,23 @@ mod sketch_tab_tests {
             })
             .expect("a function with an alias");
         let text = aliases_text(entry, "");
-        assert!(text.contains(&alias), "{text} lists {alias}");
         assert!(
-            aliases_text(entry, &alias).starts_with(&alias),
-            "the hit comes first: {}",
-            aliases_text(entry, &alias)
+            text.to_lowercase().contains(&alias.to_lowercase()),
+            "{text} lists {alias}"
+        );
+        assert_eq!(entry.spelling_for(""), entry.name, "no query, main name");
+        let typed = entry.spelling_for(&alias).to_owned();
+        assert!(typed.eq_ignore_ascii_case(&alias), "{typed} for {alias}");
+        assert!(
+            entry
+                .spelling_for(&alias.to_uppercase())
+                .eq_ignore_ascii_case(&alias),
+            "whatever the case it was typed in"
         );
         assert!(
-            aliases_text(entry, &alias.to_uppercase()).starts_with(&alias),
-            "whatever the case it was typed in"
+            aliases_text(entry, &alias).starts_with(&entry.name),
+            "the main name comes first: {}",
+            aliases_text(entry, &alias)
         );
         let shown = text
             .split(' ')
@@ -6167,6 +6182,14 @@ mod sketch_tab_tests {
         let mut lone = entry.clone();
         lone.synonyms = vec![lone.name.to_lowercase()];
         assert_eq!(aliases_text(&lone, ""), "", "a name is not its own alias");
+        let mut twins = entry.clone();
+        twins.synonyms = vec!["cyclestruct".into(), "cycleStruct".into()];
+        assert_eq!(twins.spelling_for("cyclest"), "cycleStruct");
+        assert_eq!(
+            aliases_text(&twins, ""),
+            "cycleStruct",
+            "twins count as one"
+        );
         let _ = index;
 
         let mut panel = ReferencePanel::browse(&reference);
@@ -6207,16 +6230,16 @@ mod sketch_tab_tests {
                     .collect()
             })
             .collect();
-        let label = format!(" {} ", entry.name);
+        let label = format!(" {typed} ");
         let (y, row) = rows
             .iter()
             .enumerate()
-            .find(|(_, row)| row.contains(&label))
+            .find(|(_, row)| row.contains(&label) && !row.contains("search:"))
             .expect("the entry's row");
         let after_name = &row[row.find(&label).unwrap() + label.len()..];
         assert!(
-            after_name.trim_start().starts_with(&alias),
-            "the matched alias stands beside the name: {row}"
+            after_name.trim_start().starts_with(&entry.name),
+            "the main name stands beside the spelling typed: {row}"
         );
         let alias_x = row.find(after_name.trim_start()).unwrap() as u16;
         assert_eq!(
@@ -6224,6 +6247,10 @@ mod sketch_tab_tests {
             theme.muted,
             "muted"
         );
+
+        // Enter opens the page, then writes the spelling the row showed.
+        assert_eq!(panel.confirm(&reference), PanelAction::Nothing);
+        assert_eq!(panel.confirm(&reference), PanelAction::Insert(typed));
     }
 }
 

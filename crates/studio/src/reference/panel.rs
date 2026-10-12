@@ -1247,7 +1247,7 @@ impl ReferencePanel {
             ReferenceMode::Browse if self.quick => self
                 .selected_result()
                 .and_then(|index| reference.entry(index))
-                .map(|entry| PanelAction::Insert(entry.name.clone()))
+                .map(|entry| PanelAction::Insert(entry.spelling_for(&self.query).to_owned()))
                 .unwrap_or(PanelAction::Nothing),
             ReferenceMode::Browse => match self.selected_result() {
                 Some(index) => {
@@ -1262,7 +1262,7 @@ impl ReferencePanel {
             },
             ReferenceMode::Entry { index, .. } => reference
                 .entry(index)
-                .map(|entry| PanelAction::Insert(entry.name.clone()))
+                .map(|entry| PanelAction::Insert(entry.spelling_for(&self.query).to_owned()))
                 .unwrap_or(PanelAction::Nothing),
         }
     }

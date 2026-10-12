@@ -5,23 +5,33 @@ use super::*;
 /// How many other names a row shows before saying `+n`.
 pub(super) const ALIASES_SHOWN: usize = 3;
 
-/// An entry's other names for its row, the one the query matched first:
-/// the synonyms that are not the name itself in another case, the first
-/// few spelled out and the rest counted.
+/// An entry's other names for its row: each spelling but the one the row
+/// shows for `query`. Under an alias the main name comes first. Under the
+/// main name the alias the query matches comes first. Two spellings which
+/// differ only in case count as one, and the one with a capital is kept.
+/// The first few are spelled out and the rest counted.
 pub(super) fn aliases_text(entry: &Entry, query: &str) -> String {
-    let lowercase = entry.name.to_lowercase();
-    let mut aliases: Vec<&str> = entry
-        .synonyms
-        .iter()
-        .map(String::as_str)
-        .filter(|alias| alias.to_lowercase() != lowercase)
-        .collect();
-    aliases.dedup();
+    let shown = entry.spelling_for(query);
+    let mut aliases: Vec<&str> = Vec::new();
+    for spelling in std::iter::once(&entry.name).chain(&entry.synonyms) {
+        if spelling.eq_ignore_ascii_case(shown) {
+            continue;
+        }
+        match aliases
+            .iter_mut()
+            .find(|alias| alias.eq_ignore_ascii_case(spelling))
+        {
+            Some(twin) if !twin.chars().any(char::is_uppercase) => *twin = spelling,
+            Some(_) => {}
+            None => aliases.push(spelling),
+        }
+    }
     if aliases.is_empty() {
         return String::new();
     }
     let query = query.trim().to_lowercase();
-    if !query.is_empty()
+    if shown == entry.name
+        && !query.is_empty()
         && let Some(hit) = aliases
             .iter()
             .position(|alias| alias.to_lowercase().starts_with(&query))
@@ -1418,7 +1428,7 @@ impl ReferenceView<'_> {
                 },
                 None => match self.reference.entry(index) {
                     Some(entry) => (
-                        entry.name.as_str(),
+                        entry.spelling_for(&self.panel.query),
                         entry.summary.as_str(),
                         entry.snippet.is_some(),
                         aliases_text(entry, &self.panel.query),
@@ -1463,9 +1473,9 @@ impl ReferenceView<'_> {
             buffer.set_stringn(x, y, &name, room, name_style);
             let name_width = UnicodeWidthStr::width(name.as_str()) as u16;
             let mut summary_x = x.saturating_add(name_width + 1);
-            // The other names the thing goes by, muted beside the name -
-            // the one the search matched first - so `bpe` typed shows
-            // `bpenv` with `bpe` right beside it, and the hit makes sense.
+            // The other names the thing goes by, muted beside the name. The
+            // row leads with the spelling the query asks for, so `cutoff`
+            // typed shows `cutoff` with `lpf` right beside it.
             if !aliases.is_empty() && summary_x < list.right() {
                 let room = usize::from(list.right() - summary_x);
                 let aliases = elide(&aliases, room);

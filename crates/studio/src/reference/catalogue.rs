@@ -85,6 +85,32 @@ impl Entry {
     pub fn heading(&self) -> &str {
         self.tags.first().map(String::as_str).unwrap_or("other")
     }
+
+    /// The spelling of this entry that `query` asks for. The name stays when
+    /// the query is empty or is the start of the name. Otherwise the first
+    /// synonym which starts with the query leads, and of two synonyms which
+    /// differ only in case, the one with a capital.
+    pub fn spelling_for(&self, query: &str) -> &str {
+        let query = TagFilter::parse(query).rest.to_lowercase();
+        let starts = |spelling: &str| spelling.to_lowercase().starts_with(&query);
+        if query.is_empty() || starts(&self.name) {
+            return &self.name;
+        }
+        let mut asked: Option<&str> = None;
+        for synonym in self.synonyms.iter().filter(|synonym| starts(synonym)) {
+            match asked {
+                None => asked = Some(synonym),
+                Some(first)
+                    if synonym.eq_ignore_ascii_case(first)
+                        && !first.chars().any(char::is_uppercase) =>
+                {
+                    asked = Some(synonym);
+                }
+                Some(_) => {}
+            }
+        }
+        asked.unwrap_or(&self.name)
+    }
 }
 
 /// Present a multiword origin in title case.
@@ -522,6 +548,18 @@ impl Reference {
                 // Deprioritize these entries when browsing without a query.
                 let score = if query.is_empty() && entry.no_autocomplete {
                     score - 30
+                } else {
+                    score
+                };
+                // A capital in the query is a choice: `cycleS` asks for
+                // `cycleStruct`, not `cyclesPer`. A name which starts with
+                // the query as typed outranks every case-blind match.
+                let typed_case = query.chars().any(char::is_uppercase)
+                    && std::iter::once(&entry.name)
+                        .chain(&entry.synonyms)
+                        .any(|name| name.starts_with(query));
+                let score = if typed_case {
+                    score + TYPED_CASE_BONUS
                 } else {
                     score
                 };
