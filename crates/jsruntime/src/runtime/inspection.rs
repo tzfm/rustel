@@ -128,6 +128,7 @@ impl JsRuntime {
     /// its baseline slider and voicing state still needs to be restorable.
     pub fn snapshot_active_as_last_good(&self) {
         let _settings = self.core_settings.bind();
+        self.keep_last_good_imports();
         with_ctx(&self.ctx, |ctx| {
             *self.last_good_active.borrow_mut() = host_active(&ctx)
                 .ok()
@@ -156,6 +157,7 @@ impl JsRuntime {
     /// the first successful install.
     pub fn restore_last_good_active(&self) -> Result<(), QueryError> {
         let _settings = self.core_settings.bind();
+        self.show_last_good_imports();
         with_ctx(&self.ctx, |ctx| -> Result<(), QueryError> {
             let restored = {
                 let saved = self.last_good_active.borrow();

@@ -25,6 +25,7 @@
 - A slider move no longer silences the set when the score has a refused voice. The move asks the score again, and one refused voice refused the full update. The rollback then loaded the same score, and the set stayed silent. A refused voice is now skipped and logged, as on the first play.
 - In a split view, a click on the tab of a scene open in the other pane keeps the caret in your pane. The status line names the pane with the scene, and F10 moves the caret there. Before, the click moved the caret to the other pane.
 - `rustel export`, `rustel render` and `rustel replay --export` print each voice notice once, with the number of onsets. Before, an LFO on a target Rustel does not modulate, such as `.lpenv(4).lfo({s:.7})`, printed several JSON lines for each note. With `--json`, the records stay the same.
+- A score plays with the names from its own imports. Two helper scripts which both define `.sc()` no longer change each other. Before, the script loaded last gave its `.sc()` to every score, so a score sounded different after another scene played. A name from one script only stays available to every score, and an import in a prebake shares its names with every score.
 
 ### Sound changes
 

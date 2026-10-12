@@ -26,6 +26,9 @@ impl JsRuntime {
     /// its helpers as text compiles them with this call.
     ///
     /// Definitions made before a failure stay, as for any setup file.
+    ///
+    /// With [`ImportScope::Score`] the realm tracks the names the script
+    /// sets, and [`Self::show_imports`] picks their meaning for each score.
     pub fn run_import(
         &self,
         specifier: &str,
@@ -33,6 +36,7 @@ impl JsRuntime {
         options: &rustel_transpiler::TranspileOptions,
         budget: std::time::Duration,
         cancellation: &std::sync::atomic::AtomicBool,
+        scope: ImportScope,
     ) -> Result<Vec<ScoreEffects>, QueryError> {
         let queued = Rc::new(RefCell::new(Vec::<String>::new()));
         let setup = |source: &str| {
@@ -41,6 +45,16 @@ impl JsRuntime {
         };
         let effects = with_ctx(&self.ctx, |ctx| {
             let globals = ctx.globals();
+            let before = match scope {
+                ImportScope::Score => {
+                    // A name the last score registered goes back first. The
+                    // script then takes the name from the surface, and the
+                    // value of that score does not become the base.
+                    restore_registration_surface(&ctx).map_err(script_error)?;
+                    Some(import_surface::snapshot(&ctx).map_err(script_error)?)
+                }
+                ImportScope::Shared => None,
+            };
             let outer: rquickjs::Value = globals.get("strudelMirror").map_err(script_error)?;
             globals
                 .set("strudelMirror", repl_mirror(&ctx, queued.clone())?)
@@ -67,12 +81,63 @@ impl JsRuntime {
             };
             let effects = run();
             globals.set("strudelMirror", outer).map_err(script_error)?;
+            if let (Ok(_), Some(before)) = (&effects, before) {
+                self.import_surface
+                    .borrow_mut()
+                    .record(&ctx, specifier, &before)
+                    .map_err(script_error)?;
+            }
             effects
         })?;
         self.loaded_imports
             .borrow_mut()
             .insert(specifier.to_owned());
         Ok(effects)
+    }
+
+    /// Give a score the names of its own imports. `specifiers` are the
+    /// imports in the score text, in order.
+    ///
+    /// Only a name with two meanings changes: one that two imports set, or
+    /// one an import took from the surface. The call costs a list compare
+    /// when the score before had the same imports.
+    pub fn show_imports(&self, specifiers: &[String]) {
+        let listed = self.import_surface.borrow().ids(specifiers);
+        self.show_import_ids(listed);
+    }
+
+    /// Give the names back to the score of the last install. A score that
+    /// failed leaves the playing score its own imports.
+    pub fn show_last_good_imports(&self) {
+        let listed = self.import_surface.borrow().last_good();
+        self.show_import_ids(listed);
+    }
+
+    /// Let every score see the names of an import a score loaded. A prebake
+    /// names the import now.
+    pub fn share_import(&self, specifier: &str) {
+        with_ctx(&self.ctx, |ctx| {
+            self.import_surface.borrow_mut().share(&ctx, specifier);
+        });
+    }
+
+    pub(super) fn keep_last_good_imports(&self) {
+        self.import_surface.borrow_mut().keep_last_good();
+    }
+
+    fn show_import_ids(&self, listed: Vec<usize>) {
+        let mut surface = self.import_surface.borrow_mut();
+        if surface.shows(&listed) {
+            return;
+        }
+        with_ctx(&self.ctx, |ctx| {
+            // A name the last score registered goes back first. The swap
+            // then replaces the value the engine or an import gave the name.
+            if restore_registration_surface(&ctx).is_err() {
+                let _ = ctx.catch();
+            }
+            surface.show(&ctx, listed);
+        });
     }
 }
 

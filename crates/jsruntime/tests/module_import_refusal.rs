@@ -15,7 +15,7 @@
 //! One import resolves: a script that the host fetched and ran itself. The
 //! realm still loads nothing.
 
-use rustel_jsruntime::{JsRuntime, QueryError};
+use rustel_jsruntime::{ImportScope, JsRuntime, QueryError};
 use rustel_transpiler::TranspileOptions;
 use std::time::Duration;
 
@@ -99,7 +99,7 @@ fn a_script_the_host_ran_resolves_and_nothing_else_does() {
 (async () => { await window.strudelMirror.repl.evaluate('globalThis.viaRepl = "bd sd";'); })();"#;
     let never = std::sync::atomic::AtomicBool::new(false);
     let options = TranspileOptions::default();
-    rt.run_import(url, script, &options, BUDGET, &never)
+    rt.run_import(url, script, &options, BUDGET, &never, ImportScope::Score)
         .expect("the script runs");
     assert!(rt.import_loaded(url));
     rt.evaluate_prelude(

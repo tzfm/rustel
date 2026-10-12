@@ -81,6 +81,19 @@ fn displaced_state<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Option<rquickjs::Arr
     Ok(state.into_array())
 }
 
+/// The Pattern prototype and the score scope.
+pub(super) fn surface_objects<'js>(
+    ctx: &Ctx<'js>,
+) -> rquickjs::Result<Option<[rquickjs::Object<'js>; 2]>> {
+    let Some(state) = displaced_state(ctx)? else {
+        return Ok(None);
+    };
+    Ok(Some([
+        state.get(DISPLACED_PROTO)?,
+        state.get(DISPLACED_SCOPE)?,
+    ]))
+}
+
 /// Put a name back the way the engine had it, or take it away if the
 /// engine never had it.
 ///
@@ -88,7 +101,7 @@ fn displaced_state<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Option<rquickjs::Arr
 /// configurable, as the engine's `set` bound it - so no setter or getter on
 /// the prototype chain runs. A score turn restores before its deadline
 /// starts, so this runs no score code.
-fn put_back<'js>(
+pub(super) fn put_back<'js>(
     target: &rquickjs::Object<'js>,
     name: &str,
     original: rquickjs::Value<'js>,

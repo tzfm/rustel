@@ -172,6 +172,12 @@ waits for the fetch, 8 seconds at most. Studio fetches each script one time
 per launch, so an import needs the network. For a set you play offline, paste
 the script into a prebake.
 
+A score plays with the names from its own imports. Suppose two scripts each
+define `.sc()` in a different way. A scene with the first import gets the
+first `.sc()`, and a scene with the second import gets the second, in any play
+order. A name from one script only stays available to every scene. An import
+in a prebake shares all its names with every score in the set.
+
 The script runs in the score sandbox, with the limits of a prebake. A helper
 with a browser page or kabelsalat dependency does not work. Studio does not
 check a score with an import for unknown function names: the script defines
