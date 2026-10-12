@@ -474,6 +474,24 @@ impl App {
             self.dirty_frame = true;
             return true;
         }
+        // An origin of the trust page: the click chooses it. Trust and
+        // removal stay the keys' work.
+        if let Some(sheet) = self.settings_sheet.as_mut() {
+            sheet.trust_count = self.prefs.import_origins.len() + self.blocked_imports.len();
+        }
+        if let Some(row) = self
+            .settings_sheet
+            .and_then(|sheet| sheet.trust_row_at(self.settings_sheet_frame(), x, y))
+        {
+            self.focus_panel(PanelKind::Settings);
+            self.pointer = Some(Pointer::Panel);
+            if let Some(sheet) = self.settings_sheet.as_mut() {
+                sheet.select(row);
+                sheet.hold_scroll = true;
+            }
+            self.dirty_frame = true;
+            return true;
+        }
         false
     }
 
@@ -595,6 +613,7 @@ impl App {
         // The learnable rows plus the fixed ones past them (the panels'
         // Alt chords, which a learn can neither take nor move).
         sheet.keybind_count = super::super::settings::RESET_KEYBINDS_ROW + 1;
+        sheet.trust_count = self.prefs.import_origins.len() + self.blocked_imports.len();
         match sheet.key_in_frame(
             code,
             &mut settings,
@@ -890,6 +909,19 @@ impl App {
                 return true;
             }
             SettingsAction::RefreshSource(at) => self.refresh_sample_source(at),
+            SettingsAction::TrustImport(at) => {
+                let refused = at >= self.prefs.import_origins.len();
+                self.trust_import(at);
+                if refused {
+                    // The origin moved up, to the end of the trusted ones.
+                    sheet.selected = self.prefs.import_origins.len().saturating_sub(1);
+                }
+            }
+            SettingsAction::ForgetImport(at) => {
+                self.forget_import(at);
+                let rows = self.prefs.import_origins.len() + self.blocked_imports.len();
+                sheet.selected = at.min(rows.saturating_sub(1));
+            }
         }
         // The keybind learn belongs to the Keybinds page: Tabbed away
         // from it - or closed by any door the sheet has - the learn goes

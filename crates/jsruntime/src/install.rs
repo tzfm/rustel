@@ -43,6 +43,7 @@ pub fn reference_entries() -> impl Iterator<Item = &'static rustel_core::referen
         .chain(native_surface::bindings::REFERENCE_ENTRIES.iter())
         .chain(pattern_bindings::REFERENCE_ENTRIES.iter())
         .chain(surface::REFERENCE_ENTRIES.iter())
+        .chain(compat::REFERENCE_ENTRIES.iter())
         .chain(crate::surface::JOIN_REFERENCE_ENTRIES.iter())
 }
 

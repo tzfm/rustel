@@ -1092,6 +1092,7 @@ impl App {
             sources: self.source_rows(),
             mappings: self.mapping_slot_views(),
             keybind_rows: self.keybind_rows(),
+            trust_rows: self.trust_rows(),
             latency: self.latency_report(),
             // Only built while the panel could draw them: merging the port
             // lists is cheap, but not free, and most frames have no panel.

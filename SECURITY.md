@@ -37,7 +37,43 @@ Native scores cannot load ECMAScript modules. The source validator rejects
 static imports, direct `import(...)`, and `import.meta` before execution. A
 rejecting QuickJS module resolver is a separate backstop for imports assembled
 at runtime through `eval` or `Function`. Neither layer resolves local paths or
-remote URLs.
+remote URLs. The one exception is a script import from a trusted origin.
+
+### Script imports
+
+One form loads code: `await import('<url>')`, with the URL written as one
+string, from an origin the host trusts. No origin is trusted by default.
+
+```sh
+rustel play song.strudel --allow-import-origin https://glossing.dev
+```
+
+Repeat `--allow-import-origin` once per origin. Studio keeps a list of its own
+on the Trust page of Settings and adds the list to the flags. Applications
+embedding `Session` use `SessionConfig::score_import_access`.
+
+The host loads the script. The realm does not:
+
+- The transpiler lists the script URLs before the text runs. An untrusted
+  origin refuses the evaluation before any request leaves the machine.
+- The host fetches the script with the address rules of the sample client:
+  public addresses only, redirects on the same origin, no credentials. The
+  origin uses https. Only an origin which names loopback accepts http. A
+  script is 1 MiB at most, and one fetch takes 8 seconds at most.
+- The realm runs the text as setup code, with the limits of a prebake. The
+  script gets no filesystem, process, socket, or HTTP API, and no capability
+  the importing score lacks. While the script runs,
+  `strudelMirror.repl.evaluate(code)` queues `code`, which then runs as setup
+  code too.
+- `import(url)` then resolves to an empty module. The resolver knows only the
+  URLs the host ran. A URL built at run time, a relative path, a `file:` URL,
+  and an import inside the script stay refused.
+
+A grant covers each script on the origin. On a host with many authors, the
+grant trusts all of them. A script changes when its author edits the file:
+Rustel fetches the script again at each launch and does not pin its content.
+A grant is a decision to run code you did not read. The sandbox limits what
+the code reaches. The sandbox does not limit what the code does to your set.
 
 ## Sample access
 

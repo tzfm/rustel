@@ -18,6 +18,18 @@ Add `--prebake setup.js` to load helpers before the score. Put shared functions
 on `globalThis`. A prebake cannot set tempo, select MIDI input, or open visuals.
 Studio has its own prebakes in Settings.
 
+A score loads a helper script with
+`await import('https://glossing.dev/scripts.js')`. Name each origin you trust:
+
+```sh
+rustel play song.strudel --allow-import-origin https://glossing.dev
+```
+
+Rustel fetches the script and runs the script as setup code before the score.
+With no flag, the score stops and names the origin. `export`, `check` and the
+other score commands accept the flag too. See
+[Script imports](../SECURITY.md#script-imports).
+
 Use `--buffer-frames 128` to request an audio buffer of 32-16384 frames.
 Increase it if sound crackles. Studio calls this setting `audio out latency`.
 The device can use a different size. See [Hardware](hardware.md).

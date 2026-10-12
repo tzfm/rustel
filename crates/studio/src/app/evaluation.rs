@@ -875,10 +875,10 @@ impl App {
                         .as_ref()
                         .and_then(|sent| self.evaluation_alert(sent.scene, sent.editor_revision));
                     self.log.push_with(LogLevel::Error, "update", full, alert);
-                    self.errors.set(
-                        ErrorOwner::Evaluation,
-                        player_facing_error(&failure.message),
-                    );
+                    let footer = self
+                        .note_untrusted_import(&failure)
+                        .unwrap_or_else(|| player_facing_error(&failure.message));
+                    self.errors.set(ErrorOwner::Evaluation, footer);
                     self.update_failure =
                         sent.as_ref().map(|sent| (sent.scene, sent.editor_revision));
                 }

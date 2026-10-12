@@ -226,6 +226,12 @@ pub struct JsRuntime {
     /// Whether a query error a stack contains stays out of `logs`; see
     /// [`JsRuntime::with_contained_query_errors_unlogged`].
     pub(super) contained_query_errors_unlogged: Cell<bool>,
+    /// The cycle that `getTime()` returns. See [`JsRuntime::set_cycle_time`].
+    pub(crate) cycle_time: std::rc::Rc<Cell<f64>>,
+    /// The tempo that `getCps()` returns when the evaluation in progress has
+    /// set none. See [`JsRuntime::set_cps`].
+    pub(crate) cps: std::rc::Rc<Cell<f64>>,
+    pub(super) loaded_imports: LoadedImports,
     pub(super) timeline_state: rustel_core::TimelineState,
     /// MIDI inputs this Session's scores have named, and their live values.
     ///
@@ -716,6 +722,7 @@ mod api;
 mod callback_host;
 mod callback_query;
 mod evaluation;
+mod imports;
 mod inspection;
 mod teardown;
 

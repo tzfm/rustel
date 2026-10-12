@@ -265,6 +265,9 @@ pub struct StudioConfig {
     /// input does, so a hermetic studio never opens the runner's
     /// microphone (nor, on macOS, asks for permission to).
     pub open_default_input: bool,
+    /// The origins of the Trust page, which scores import scripts from.
+    /// They add to the origins that `session` already trusts.
+    pub import_origins: Vec<String>,
 }
 
 impl Default for StudioConfig {
@@ -283,8 +286,23 @@ impl Default for StudioConfig {
             unused_sample_idle: DEFAULT_UNUSED_SAMPLE_IDLE,
             watch_pads: true,
             open_default_input: true,
+            import_origins: Vec::new(),
         }
     }
+}
+
+/// The origins that `session` trusts for script imports, and `origins` of
+/// the Trust page added to them.
+pub(super) fn import_access(
+    session: &SessionConfig,
+    origins: &[String],
+) -> rustel_runtime::ScoreImportAccess {
+    let mut access = session.score_import_access.clone();
+    for origin in origins {
+        // The page keeps only origins that the runtime named.
+        let _ = access.permit_origin(origin);
+    }
+    access
 }
 
 impl StudioConfig {
@@ -1594,6 +1612,7 @@ impl StudioEngine {
         let preview_budget_bytes = config.preview_budget_bytes;
         let unused_sample_idle = config.unused_sample_idle;
         let mut session = Session::with_config(config.session.clone())?;
+        session.set_score_import_access(import_access(&config.session, &config.import_origins));
         session.set_query_hap_budget(STUDIO_QUERY_HAP_BUDGET)?;
         let master = Arc::new(StudioMasterBus::default());
         master.set_max_polyphony(config.session.max_polyphony);
@@ -5846,6 +5865,13 @@ impl StudioEngine {
                 self.retained_samples.insert(id, decoded);
             }
         }
+    }
+
+    /// Replace the origins of the Trust page. The next evaluation imports
+    /// scripts from them and from the origins the session config trusts.
+    pub fn set_import_origins(&mut self, origins: &[String]) {
+        self.session
+            .set_score_import_access(import_access(&self.config.session, origins));
     }
 
     /// Preview RAM policy from the settings sheet. Zero budget means no

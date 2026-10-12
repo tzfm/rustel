@@ -154,6 +154,29 @@ to share helpers with scores. A top-level `const` is local to its setup run.
 Sample loading is allowed in a prebake. Transport changes, live MIDI input,
 and `initHydra` must stay in scores.
 
+### Script imports
+
+A score or a prebake loads a helper script with
+`await import('https://glossing.dev/scripts.js')`. Studio runs the script as
+setup code before the text with the import.
+
+Studio loads a script only from an origin you trust. The first update of such
+a score stops with `https://glossing.dev is not trusted`. Press Ctrl+O, go to
+the Trust page, and press Enter on the origin. Then update the score again.
+Studio keeps the origin in `studio.json`. Press `d` on an origin to remove the
+origin.
+
+The first update after you trust an origin fetches the script. The update
+waits for the fetch, 8 seconds at most. Studio fetches each script one time
+per launch, so an import needs the network. For a set you play offline, paste
+the script into a prebake.
+
+The script runs in the score sandbox, with the limits of a prebake. A helper
+with a browser page or kabelsalat dependency does not work. Studio does not
+check a score with an import for unknown function names: the script defines
+names Studio does not read before the script runs. See
+[Script imports](../SECURITY.md#script-imports) for the security rules.
+
 ## Checking and playback
 
 Studio checks the source after a short typing pause. The first-error command,
@@ -444,7 +467,8 @@ Webcam input is off by default and needs explicit consent in Settings.
 
 Press Ctrl+O. Use Tab to change pages, arrows to select or change values, and
 Space to toggle a switch. Settings include playback, rendering, samples,
-controller mapping, key bindings, and the kinds of entry the reference lists.
+controller mapping, key bindings, the kinds of entry the reference lists, and
+the origins trusted for [script imports](#script-imports).
 The About page reports terminal capabilities.
 
 The Terminal row at the top of the Keybinds page selects the list of shortcuts

@@ -208,6 +208,7 @@ impl App {
         self.settle_readiness(now);
         self.sync_live_material(now);
         self.send_sample_memory();
+        self.send_import_origins();
         #[cfg(feature = "hydra")]
         self.warm_selected_snippet();
         self.settle_marks(now);

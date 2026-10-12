@@ -73,9 +73,10 @@ fn help_names_the_editor_by_default() {
     assert_eq!(studio.focus(), None, "the keys went back to the score");
 }
 
-/// The settings sheet has seven pages, and help follows the one being shown:
+/// The settings sheet has eight pages, and help follows the one being shown:
 /// Settings, then Sources (imports and packs), then Reference (switches,
-/// like Settings), then About (the terminal).
+/// like Settings), then Trust (origins for scripts), then About (the
+/// terminal).
 #[test]
 fn help_follows_the_settings_pages() {
     let mut studio = hermetic();
@@ -113,7 +114,15 @@ fn help_follows_the_settings_pages() {
         "Settings change live and are remembered when they change.",
     );
 
-    // The page after Reference is About.
+    // The page after Reference is Trust.
+    studio.press(KeyCode::Tab, KeyModifiers::NONE);
+    assert_help_page(
+        &mut studio,
+        "settings · trust",
+        "The origins a score imports scripts from",
+    );
+
+    // The page after Trust is About.
     studio.press(KeyCode::Tab, KeyModifiers::NONE);
     assert_help_page(
         &mut studio,

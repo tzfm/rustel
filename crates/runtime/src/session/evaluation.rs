@@ -85,6 +85,8 @@ impl Session {
         // MIDI maps. Install those configuration globals before executing it,
         // just as ordinary score evaluation does.
         self.ensure_voicings()?;
+        self.js.set_cps(self.scheduler.cps());
+        self.load_script_imports(source, cancellation)?;
         // Setup code is not the active editor document. Locations created
         // here are bare byte offsets and would be indistinguishable from score
         // offsets if a helper returned its own mini-notation pattern later.
@@ -128,6 +130,86 @@ impl Session {
         // so an override is visible before its preload resolves.
         self.apply_sample_effects(effects.samples, effects.preload);
         self.retain_recovery_prebake(source, None);
+        Ok(())
+    }
+
+    /// Run each script that `source` imports with `import('https://...')`
+    /// and this realm has not run. A script runs as setup code, before the
+    /// text that imports it, wherever the import stands in that text.
+    ///
+    /// An origin that the host does not trust refuses the evaluation before
+    /// any fetch. The first trusted import of a script waits for its fetch.
+    fn load_script_imports(
+        &mut self,
+        source: &str,
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<(), RuntimeError> {
+        use crate::score_import::ImportRefusal;
+
+        // Approve every import first, so a refusal leaves the others unrun.
+        let imports = rustel_transpiler::script_imports(source)
+            .into_iter()
+            .map(|specifier| {
+                let url = self
+                    .config
+                    .score_import_access
+                    .approve(&specifier)
+                    .map_err(|refusal| match refusal {
+                        ImportRefusal::Untrusted { origin } => {
+                            RuntimeError::UntrustedImport { origin }
+                        }
+                        ImportRefusal::Invalid(message) => RuntimeError::Message(message),
+                    })?;
+                Ok((specifier, url))
+            })
+            .collect::<Result<Vec<_>, RuntimeError>>()?;
+        for (specifier, url) in imports {
+            if self.js.import_loaded(&specifier) {
+                continue;
+            }
+            if let Some(error) = self.import_errors.get(&specifier) {
+                return Err(RuntimeError::Js(error.to_string()));
+            }
+            let failed = |error: String| RuntimeError::Message(format!("import {url}: {error}"));
+            let text = match self.import_sources.get(&specifier) {
+                Some(text) => text.clone(),
+                None => {
+                    let text: Arc<str> = crate::score_import::fetch(&url).map_err(failed)?.into();
+                    self.import_sources.insert(specifier.clone(), text.clone());
+                    text
+                }
+            };
+            // A script can set `n` in a helper that this text cannot show.
+            self.prebake_selects_variants = true;
+            let options = TranspileOptions {
+                emit_mini_locations: false,
+                ..TranspileOptions::default()
+            };
+            let never = AtomicBool::new(false);
+            let ran = self.js.run_import(
+                &specifier,
+                &text,
+                &options,
+                PREBAKE_CPU_BUDGET,
+                cancellation.unwrap_or(&never),
+            );
+            let effects = match ran.map_err(RuntimeError::from) {
+                Ok(effects) => effects,
+                Err(RuntimeError::Js(message)) => {
+                    // A script can record its own first run. A second run
+                    // would then skip the part that failed and report
+                    // nothing, so this realm keeps the failure.
+                    let message = format!("import {url}: {message}");
+                    self.import_errors
+                        .insert(specifier, Arc::from(message.as_str()));
+                    return Err(RuntimeError::Js(message));
+                }
+                Err(other) => return Err(other),
+            };
+            for effects in effects {
+                self.apply_sample_effects(effects.samples, effects.preload);
+            }
+        }
         Ok(())
     }
 
@@ -499,6 +581,8 @@ impl Session {
         // voicing do not yet have complete native implementations.
         self.ensure_bindings()?;
         self.ensure_voicings()?;
+        self.js.set_cps(self.scheduler.cps());
+        self.load_script_imports(source, Some(cancellation))?;
         // A bounded first-install probe may reject the score after JavaScript
         // has published its slider and voicing candidates. Save the empty
         // baseline so that refusal can restore all three active roots.
@@ -994,6 +1078,8 @@ impl Session {
                 if let Some(cps) = cps {
                     self.config.cps = cps;
                 }
+                // A query of the new score reads the new tempo from `getCps()`.
+                self.js.set_cps(self.scheduler.cps());
                 if restart_transport {
                     self.js.midi_input_bus().clear_keys();
                     self.transport.start();

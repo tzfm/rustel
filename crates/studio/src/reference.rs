@@ -1288,7 +1288,7 @@ mod tests {
             for sound in rustel_voice::NATIVE_SYNTH_SOUNDS {
                 installed.insert((*sound).to_string());
             }
-            for alias in ["sin", "tri", "sqr", "saw", "user", "in", "bus"] {
+            for alias in ["sin", "tri", "sqr", "saw", "user", "in", "bus", "one"] {
                 installed.insert(alias.to_string());
             }
             for chord in chord_vocabulary() {
@@ -1641,13 +1641,7 @@ mod tests {
             /// Entries whose examples the engine cannot yet play, with why.
             /// Each is a gap to close, not a licence: the example is right and
             /// we are missing what it needs.
-            const KNOWN_GAPS: &[(&str, &str)] = &[(
-                "bmod",
-                "`s(\"one\")` is a constant-1 source - a DC signal whose \
-             only purpose is to be modulated, which is why the example puts a \
-             slider on its gain. We have no such source, so the modulator voice \
-             is refused and bmod's only example demonstrates nothing.",
-            )];
+            const KNOWN_GAPS: &[(&str, &str)] = &[];
 
             let reference = Reference::load_all();
             let manifest_cache = crate::config::sample_cache_before_test_isolation();

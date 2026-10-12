@@ -836,6 +836,10 @@ pub enum SynthSource {
         /// `density`, crackle only (default 0.02).
         density: f32,
     },
+    /// `one`: a constant 1 at gain 0.3 under the ordinary synth ADSR. A
+    /// pattern sends it to a bus, where `bmod` reads it as a modulation
+    /// signal whose level is the pattern's gain.
+    One,
     /// `pulse`: half-Tomisawa cosine pair with feedback and anti-hunting
     /// filters - including the deliberate per-block internal decay quirk.
     Pulse {

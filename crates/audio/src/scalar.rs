@@ -3092,6 +3092,8 @@ enum VoiceSource {
         density: f32,
         state: NoiseGen,
     },
+    /// `s("one")` - a constant 1.
+    One,
 }
 
 /// Immutable supersaw work shared by every sample of one voice.
@@ -5754,6 +5756,13 @@ impl AudioBackend for ScalarBackend {
                                 e.gain * e.controls.velocity * 0.3,
                                 None,
                             ),
+                            crate::backend::SynthSource::One => (
+                                VoiceSource::One,
+                                e.duration_secs,
+                                // The ordinary synth shape, as for noise.
+                                e.gain * e.controls.velocity * 0.3,
+                                None,
+                            ),
                             crate::backend::SynthSource::Sbd {
                                 decay_secs,
                                 pdecay_secs,
@@ -5994,7 +6003,8 @@ impl AudioBackend for ScalarBackend {
                     | VoiceSource::Input { .. }
                     // A ZzFX note is ONE channel by construction.
                     | VoiceSource::ZzFx { .. }
-                    | VoiceSource::Noise { .. } => false,
+                    | VoiceSource::Noise { .. }
+                    | VoiceSource::One => false,
                 };
                 let stereo_source = source_stereo
                 // A StereoPanner UPMIXES: a mono voice that reaches one comes
@@ -7292,6 +7302,7 @@ impl AudioBackend for ScalarBackend {
                             let sample = state.next(*kind, *density);
                             (sample, sample)
                         }
+                        VoiceSource::One => (1.0, 1.0),
                         VoiceSource::Sbd {
                             controls: sbd,
                             phase,

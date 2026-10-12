@@ -260,6 +260,22 @@ pub(super) fn install<'js>(
         .set("cps", cps.clone())
         .map_err(|error| error.to_string())?;
     scope.set("cps", cps).map_err(|error| error.to_string())?;
+    // `getCps()` reads the tempo that `setCps` staged in this evaluation,
+    // or else the tempo that plays.
+    let staged = runtime.effect_transaction.clone();
+    let playing = runtime.cps.clone();
+    let get_cps = Function::new(ctx.clone(), move || {
+        staged
+            .borrow()
+            .as_ref()
+            .and_then(|effects| effects.cps)
+            .unwrap_or_else(|| playing.get())
+    })
+    .map_err(|error| error.to_string())?;
+    configure_function(&get_cps, "getCps", 0, false).map_err(|error| error.to_string())?;
+    globals
+        .set("getCps", get_cps)
+        .map_err(|error| error.to_string())?;
     let repair = Function::new(ctx.clone(), repair).map_err(|error| error.to_string())?;
     configure_function(&repair, "repair", 3, false).map_err(|error| error.to_string())?;
     canonical

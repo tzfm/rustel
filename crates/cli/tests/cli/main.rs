@@ -893,6 +893,27 @@ fn query_score_text_has_no_implicit_module_or_sample_io_access() {
         &["query", "--json", "-e", "import('file:///tmp/module.js')"],
         "dynamic import is disabled",
     );
+    // A script import names its origin and is refused before any fetch.
+    assert_reported_failure(
+        &[
+            "query",
+            "--json",
+            "-e",
+            "await import('https://scripts.invalid/helpers.js')",
+        ],
+        "https://scripts.invalid is not trusted for import()",
+    );
+    assert_reported_failure(
+        &[
+            "query",
+            "--json",
+            "-e",
+            "s('bd')",
+            "--allow-import-origin",
+            "http://scripts.invalid",
+        ],
+        "import origin must use https",
+    );
     assert_reported_failure(
         &[
             "query",

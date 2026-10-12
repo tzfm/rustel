@@ -41,6 +41,7 @@ impl App {
             Focus::Panel(PanelKind::Reference) => HelpContext::Reference,
             Focus::Panel(PanelKind::Settings) => match self.settings_sheet {
                 Some(sheet) if sheet.shows_sources() => HelpContext::SettingsSources,
+                Some(sheet) if sheet.shows_trust() => HelpContext::SettingsTrust,
                 Some(sheet) if !sheet.shows_settings() => HelpContext::SettingsAbout,
                 _ => HelpContext::Settings,
             },
