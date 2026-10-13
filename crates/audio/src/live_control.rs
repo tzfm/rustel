@@ -46,6 +46,37 @@ impl Ramp {
         }
     }
 
+    /// Continue a matching live fade when a note retriggers.
+    pub fn continue_from(&mut self, previous: Self) {
+        if self.binding != 0
+            && self.binding == previous.binding
+            && self.target == previous.target
+            && previous.remaining != 0
+        {
+            *self = previous;
+        }
+    }
+
+    /// Starts at the value of `previous` and moves to the target of this
+    /// ramp in [`SLIDER_DECLICK_SECS`]: a change at a note start is then no
+    /// step. With the target of `previous`, this ramp goes on as `previous`.
+    pub fn declick_from(&mut self, previous: Self, sample_rate: u32) {
+        if previous.target == self.target {
+            (self.value, self.step, self.remaining) =
+                (previous.value, previous.step, previous.remaining);
+            return;
+        }
+        self.value = previous.value;
+        self.remaining = (SLIDER_DECLICK_SECS * sample_rate as f32).round().max(1.0) as u32;
+        let count = self.remaining as f32;
+        self.step = self.target / count - self.value / count;
+    }
+
+    /// True while the value moves to the target.
+    pub fn is_moving(&self) -> bool {
+        self.remaining != 0
+    }
+
     pub fn retarget(&mut self, update: LiveControlUpdate, sample_rate: u32) {
         if self.binding == 0 || self.binding != update.binding {
             return;
@@ -107,10 +138,44 @@ mod tests {
             1000,
         );
         assert_eq!(ramp.value, current);
+        for (binding, value) in [(0, 0.5), (8, 0.5), (7, 0.75)] {
+            let mut next = Ramp::new(binding, value);
+            next.continue_from(ramp);
+            assert_eq!(next.next(), value);
+        }
         for _ in 0..35 {
             ramp.next();
         }
         assert_eq!(ramp.next(), 0.5);
+    }
+
+    #[test]
+    fn a_change_at_a_note_start_moves_from_the_value_before_and_ends_exact() {
+        // 5 ms at 1000 Hz is five frames.
+        let mut next = Ramp::new(0, 0.25);
+        next.declick_from(Ramp::new(0, 1.0), 1000);
+        assert!(next.is_moving());
+        let values: Vec<f32> = (0..6).map(|_| next.next()).collect();
+        assert!(values.windows(2).take(4).all(|pair| pair[1] < pair[0]));
+        assert!(values[0] < 1.0 && values[0] > 0.25, "{values:?}");
+        assert_eq!(values[4..], [0.25, 0.25]);
+        assert!(!next.is_moving());
+
+        // The same target goes on as the ramp before, in the middle of a
+        // move too.
+        let mut moving = Ramp::new(0, 0.5);
+        moving.declick_from(Ramp::new(0, 0.0), 1000);
+        moving.next();
+        let mut same = Ramp::new(0, 0.5);
+        same.declick_from(moving, 1000);
+        assert_eq!(
+            (same.value, same.remaining),
+            (moving.value, moving.remaining)
+        );
+        let mut settled = Ramp::new(0, 0.5);
+        settled.declick_from(Ramp::new(0, 0.5), 1000);
+        assert!(!settled.is_moving());
+        assert_eq!(settled.next(), 0.5);
     }
 
     #[test]

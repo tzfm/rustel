@@ -551,6 +551,27 @@ impl Hap {
         }
     }
 
+    /// The hap with a new value and the same live control bindings: for a
+    /// change of a key that no slider moves.
+    fn with_value_keeping_live(&self, value: Value) -> Hap {
+        Hap {
+            whole: self.whole,
+            part: self.part,
+            // The lookup shape was of the value before the change.
+            pick_lookup: None,
+            value,
+            context: self.context.clone(),
+            live_controls: self.live_controls,
+            slider_binding: self.slider_binding,
+            ui_visuals: self.ui_visuals,
+            scale: self.scale.clone(),
+            tags: self.tags.clone(),
+            log_line: self.log_line.clone(),
+            edo_size: self.edo_size,
+            scale_definition: self.scale_definition.clone(),
+        }
+    }
+
     fn without_live_controls(mut self) -> Self {
         self.live_controls = [0; 3];
         self.slider_binding = 0;
@@ -6643,6 +6664,25 @@ impl Pattern {
     pub fn fmap(&self, f: impl Fn(&Value) -> Value + Send + Sync + 'static) -> Self {
         let steps = self.steps;
         Pattern::of(Node::FmapNative(self.clone(), Arc::new(f))).with_steps(steps)
+    }
+
+    /// Changes hap values and keeps the live control bindings of each hap.
+    /// `f` returns the new value, or `None` for a value that stays as it is.
+    /// This is for a key that no slider moves, such as a routing name.
+    /// [`Pattern::fmap`] drops the bindings, and a sounding voice then stops
+    /// following its sliders.
+    pub fn fmap_keeping_live(
+        &self,
+        f: impl Fn(&Value) -> Option<Value> + Send + Sync + 'static,
+    ) -> Self {
+        let steps = self.steps;
+        self.map_haps_preserving_live(move |hap| {
+            Some(match f(&hap.value) {
+                Some(value) => hap.with_value_keeping_live(value),
+                None => hap.clone(),
+            })
+        })
+        .with_steps(steps)
     }
 
     /// Host-only provenance for a native query-time slider. Arbitrary value

@@ -27,6 +27,26 @@ pub(super) enum StringRole {
     /// machine can know.
     MidiOut,
     MidiIn,
+    /// A VST3 plugin: the first argument of `.vst()` and `.vsti()`. The
+    /// plugin host has the list.
+    #[cfg(feature = "vst")]
+    Plugin,
+    /// A preset file of the plugin of the call: the string of `preset`.
+    #[cfg(feature = "vst")]
+    Preset,
+}
+
+impl StringRole {
+    /// True for a name with spaces: a choice replaces the whole string,
+    /// not one word of the string.
+    pub(super) fn whole_string(self) -> bool {
+        match self {
+            Self::MidiIn | Self::MidiOut => true,
+            #[cfg(feature = "vst")]
+            Self::Plugin | Self::Preset => true,
+            _ => false,
+        }
+    }
 }
 
 impl App {
@@ -96,6 +116,17 @@ impl App {
                 .find_map(declared)
         };
         let argument = self.completion_argument_index(callee);
+        // A plugin call has 2 strings with a list: the plugin name, and the
+        // preset name in its object. Each other string is a pattern.
+        #[cfg(feature = "vst")]
+        if matches!(callee, "vst" | "vsti") {
+            let key = self.object_key_before_string_at_caret();
+            return match (argument, key.as_deref()) {
+                (0, None) => Some(StringRole::Plugin),
+                (1, Some("preset")) => Some(StringRole::Preset),
+                _ => None,
+            };
+        }
         let entry = self
             .reference
             .resolve(callee)
@@ -199,6 +230,10 @@ impl App {
             StringRole::Tuning => Some("the tunings"),
             StringRole::MidiOut => Some("the MIDI outputs"),
             StringRole::MidiIn => Some("the MIDI inputs"),
+            #[cfg(feature = "vst")]
+            StringRole::Plugin => Some("the plugins"),
+            #[cfg(feature = "vst")]
+            StringRole::Preset => Some("the presets"),
         }
     }
 

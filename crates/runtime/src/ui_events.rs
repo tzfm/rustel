@@ -1662,7 +1662,9 @@ impl UiEventSink {
     /// Spawn a stdout sink with an explicit positive batch capacity.
     pub fn stdout_with_capacity(capacity: usize) -> io::Result<Self> {
         Self::spawn(capacity, |receiver, latest_audio, counters, capacity| {
-            let stdout = io::stdout();
+            // The stream of the process start: a plugin line never lands
+            // between two events.
+            let stdout = crate::stdio::out();
             writer_loop(receiver, latest_audio, counters, capacity, |line| {
                 let mut stdout = stdout.lock();
                 stdout.write_all(line)?;

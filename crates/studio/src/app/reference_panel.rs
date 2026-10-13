@@ -153,6 +153,22 @@ impl App {
     /// while the editor receives the argument. Value pickers still finish their
     /// insertion normally; a sound named after a function is not a function call.
     pub(super) fn confirm_reference_name(&mut self, name: String) -> Result<(), RuntimeError> {
+        #[cfg(feature = "vst")]
+        let name = if self.reference_panel.as_ref().is_some_and(|panel| {
+            panel.tab == Tab::Vst
+                || (panel.tab == Tab::Reference
+                    && matches!(
+                        panel.plugin_words(),
+                        Some(crate::reference::PluginWords::Keys(_))
+                    ))
+        }) {
+            let Some(name) = self.plugin_text_at_caret(name) else {
+                return Ok(());
+            };
+            name
+        } else {
+            name
+        };
         let entry = self.reference_panel.as_ref().and_then(|panel| {
             (panel.tab == Tab::Reference && panel.vocabulary.is_none())
                 .then(|| self.reference.lookup(&name))
@@ -424,6 +440,16 @@ impl App {
 
     /// Retain generated ideas across every way of closing/replacing the panel.
     pub(super) fn set_reference_panel(&mut self, next: Option<ReferencePanel>) {
+        #[cfg(feature = "vst")]
+        let next = {
+            let mut next = next;
+            if let Some(panel) = next.as_mut()
+                && let Some((plugin, _)) = self.plugin_call_at_caret()
+            {
+                panel.vst.open_named(plugin);
+            }
+            next
+        };
         #[cfg(feature = "hydra")]
         let next = {
             let mut next = next;
@@ -477,6 +503,10 @@ impl App {
             .as_ref()
             .map(super::super::reference::ReferencePanel::scroll_signature);
         let handled = self.handle_reference_key_inner(code, primary, shift, alt);
+        // The next frame has the plugin list for a key onto the vst tab,
+        // and the load for a key onto a plugin.
+        #[cfg(feature = "vst")]
+        self.sync_plugins();
         // A key that moved the selection, changed the tab, or opened or
         // folded a row walks the list the keyboard's way, margin and all;
         // one that only played or copied the row leaves a clicked row where
@@ -721,6 +751,10 @@ impl App {
         let Some(panel) = self.reference_panel.as_mut() else {
             return ReferenceKey::NotHandled;
         };
+        // The vst tab writes at the caret, so its arrows stay in the list
+        // too.
+        #[cfg(feature = "vst")]
+        let anchored = anchored || panel.tab == Tab::Vst;
         // Alt+T arms a trim on the row under the cursor and every other key
         // disarms it - moving, searching, Esc, a tab switch - so a stray
         // second press somewhere else can never cut a file nobody meant to
@@ -1292,6 +1326,8 @@ impl App {
             if let Some(panel) = self.reference_panel.as_mut() {
                 panel.select_tab(tab);
             }
+            #[cfg(feature = "vst")]
+            self.sync_plugins();
             self.pointer = Some(Pointer::Panel);
             self.dirty_frame = true;
             return Ok(());
@@ -1443,6 +1479,8 @@ impl App {
             PanelAction::RenameBank { .. } | PanelAction::RenameSample { .. } => {}
             PanelAction::Nothing => {}
         }
+        #[cfg(feature = "vst")]
+        self.sync_plugins();
         self.dirty_frame = true;
         Ok(())
     }

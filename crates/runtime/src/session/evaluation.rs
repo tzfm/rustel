@@ -1257,6 +1257,10 @@ impl Session {
         self.last_source = Some(Arc::from(source));
         self.recovered_source = None;
         self.js.snapshot_active_as_last_good();
+        #[cfg(feature = "vst")]
+        if self.plugins_live.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::vst::score_changed(Some(source));
+        }
         Ok(())
     }
 
@@ -1579,12 +1583,13 @@ impl Session {
                     ui_visuals: hap.ui_visuals_context(),
                     log_line: None,
                 };
-                match crate::render::scalar_event_detailed(
+                let event = crate::render::scalar_event_detailed(
                     &onset,
                     self.config.sample_rate,
                     cps,
                     lookup,
-                ) {
+                );
+                match event {
                     Err(rustel_voice::VoiceError::InvalidControl(message)) => Some(message),
                     _ => None,
                 }

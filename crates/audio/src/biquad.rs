@@ -370,6 +370,35 @@ impl FilterChain {
         self.lowpass.is_some() || self.highpass.is_some() || self.bandpass.is_some()
     }
 
+    pub(crate) fn reconfigure(
+        &mut self,
+        controls: FilterControls,
+        sample_rate: u32,
+        first_frame: u64,
+    ) {
+        let mut next = Self::new(controls, sample_rate);
+        next.set_block_phase(first_frame);
+        for (next, old) in [
+            (next.lowpass.as_mut(), self.lowpass.as_ref()),
+            (next.highpass.as_mut(), self.highpass.as_ref()),
+            (next.bandpass.as_mut(), self.bandpass.as_ref()),
+        ] {
+            if let (Some(next), Some(old)) = (next, old) {
+                if next.ladder.is_some() && old.ladder.is_some() {
+                    next.ladder = old.ladder;
+                } else if next.ladder.is_none() && old.ladder.is_none() {
+                    next.first = old.first;
+                    next.first.configure(next.kind, next.controls, sample_rate);
+                    if let (Some(second), Some(old_second)) = (&mut next.second, old.second) {
+                        *second = old_second;
+                        second.configure(next.kind, next.controls, sample_rate);
+                    }
+                }
+            }
+        }
+        *self = next;
+    }
+
     /// Move the intrinsic cutoff while retaining the filter's delay state.
     /// Once the ramp settles, the ordinary static path stops rebuilding its
     /// coefficients. Envelopes own their cutoff and are excluded by binding.

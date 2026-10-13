@@ -305,7 +305,7 @@ impl JsRuntime {
     /// A callback created in a live bridge frame but not yet owned by a
     /// wrapper. Searched innermost-first, so a nested query resolves its own
     /// cells before an enclosing one's.
-    pub(super) fn pending_callback<'js>(id: CallbackId) -> Option<Function<'js>> {
+    pub(super) fn pending_callback<'js>(id: CallbackId) -> Option<(Function<'js>, Option<String>)> {
         let frames = BRIDGE_FRAMES.with(|frames| frames.borrow().clone());
         for ptr in frames.iter().rev() {
             // SAFETY: pushed by `BridgeScope`, which outlives this call.
@@ -314,8 +314,8 @@ impl JsRuntime {
                 .pending
                 .borrow()
                 .iter()
-                .find(|(candidate, _)| *candidate == id)
-                .map(|(_, func)| func.clone());
+                .find(|(candidate, _, _)| *candidate == id)
+                .map(|(_, func, scope)| (func.clone(), scope.clone()));
             if let Some(func) = hit {
                 return Some(func);
             }
@@ -324,7 +324,10 @@ impl JsRuntime {
                 .borrow()
                 .iter()
                 .find(|(candidate, _)| *candidate == id)
-                .and_then(|(_, cell)| cell.borrow().as_function().cloned());
+                .and_then(|(_, cell)| {
+                    let cell = cell.borrow();
+                    Some((cell.as_function()?.clone(), cell.plugin_scope.clone()))
+                });
             if let Some(func) = harvested {
                 return Some(func);
             }
@@ -405,8 +408,9 @@ impl JsRuntime {
         // Check the evaluation scratch FIRST: during construction there is no
         // wrapper on the query stack yet, and `register()`'s fast path calls
         // combinator bodies eagerly.
-        if let Some(func) = Self::pending_callback(id) {
-            return f(func);
+        if let Some((func, scope)) = Self::pending_callback(id) {
+            return with_bridge_frame(|frame| frame.with_plugin_scope(scope, || f(func)))
+                .ok_or_else(|| format!("callback {id} has no bridge frame"))?;
         }
         let stack = host_stack(ctx).map_err(|e| e.to_string())?;
         let n = stack.len();
@@ -426,27 +430,25 @@ impl JsRuntime {
             )
         };
         let object = top.as_object().ok_or_else(missing)?;
-        let func = if let Some(w) = rquickjs::Class::<PatternWrapper>::from_object(object) {
+        let cell = if let Some(w) = rquickjs::Class::<PatternWrapper>::from_object(object) {
             let b = w.borrow();
-            b.cell(id)
-                .ok_or_else(missing)?
-                .borrow()
-                .as_function()
-                .cloned()
-                .ok_or_else(missing)?
+            b.cell(id).ok_or_else(missing)?.clone()
         } else if let Some(w) = rquickjs::Class::<NativePatternWrapper>::from_object(object) {
             let b = w.borrow();
-            b.cell(id)
-                .ok_or_else(missing)?
-                .borrow()
-                .as_function()
-                .cloned()
-                .ok_or_else(missing)?
+            b.cell(id).ok_or_else(missing)?.clone()
         } else {
             return Err(missing());
         };
 
-        f(func)
+        let (func, scope) = {
+            let cell = cell.borrow();
+            (
+                cell.as_function().cloned().ok_or_else(missing)?,
+                cell.plugin_scope.clone(),
+            )
+        };
+        with_bridge_frame(|frame| frame.with_plugin_scope(scope, || f(func)))
+            .ok_or_else(|| format!("callback {id} has no bridge frame"))?
     }
 
     /// Finish one JavaScript host entry while the core query boundary is still

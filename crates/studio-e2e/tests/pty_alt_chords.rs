@@ -17,16 +17,26 @@ use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, nativ
 
 use rustel_studio_e2e::printable;
 
+/// Locate the `rustel` binary in the running test's Cargo profile directory.
+/// For a relocated test, fall back to the configured or workspace target root.
 fn rustel_binary() -> Option<std::path::PathBuf> {
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
     let exe = if cfg!(windows) {
         "rustel.exe"
     } else {
         "rustel"
+    };
+    if let Ok(test) = std::env::current_exe()
+        && let Some(deps) = test.parent()
+        && deps.file_name().is_some_and(|name| name == "deps")
+        && let Some(profile) = deps.parent()
+    {
+        let binary = profile.join(exe);
+        return binary.is_file().then_some(binary);
+    }
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
     };
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
     let roots = match std::env::var_os("CARGO_TARGET_DIR") {
@@ -76,6 +86,9 @@ impl Terminal {
         // desktop, from a terminal suite. With it the reveal answers at
         // once and the status walk is still exactly what a desktop gives.
         command.env(rustel_studio::reveal::HEADLESS_ENV, "1");
+        // No plugin of the runner either: an empty list stands in for the
+        // standard VST3 folders, so a vst tab lists and loads no plugin.
+        command.env(rustel_runtime::vst::FOLDERS_ENV, "");
         for key in [
             "TERM",
             "TERM_PROGRAM",

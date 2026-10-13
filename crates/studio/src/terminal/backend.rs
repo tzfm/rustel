@@ -92,6 +92,12 @@ impl<W: Write> Backend for StudioBackend<W> {
     }
 
     fn size(&self) -> io::Result<Size> {
+        // With no controlling terminal, the inner backend asks descriptor
+        // 1. That is the null device here: see `rustel_runtime::stdio`.
+        #[cfg(unix)]
+        if let Some((columns, rows)) = super::size_now() {
+            return Ok(Size::new(columns, rows));
+        }
         self.inner.size()
     }
 

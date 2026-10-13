@@ -11,10 +11,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::session::confirmation::WindowReservation;
-use rustel_audio::QueuedAudioEvent;
 use rustel_audio::SampleId;
 use rustel_audio::TakeoverCut;
 use rustel_audio::confirmation::{ConfirmationOnset, WindowOffer};
+use rustel_audio::{AudioEvent, QueuedAudioEvent};
 
 use crate::producer::{
     ProducerLoadMeter, ProducerLoadSnapshot, ProducerPhase, ProducerTurnOutcome, ProducerTurnRecord,
@@ -613,6 +613,31 @@ impl LiveFileProducer {
         set_generation: impl FnMut(u64, u64, TakeoverCut),
         push: impl FnMut(QueuedAudioEvent) -> bool,
     ) -> Result<LiveProducerStep, RuntimeError> {
+        self.step_with_clock_and_assets(
+            session,
+            observed_at,
+            schedule_now,
+            sample_rate,
+            set_generation,
+            |_| {},
+            push,
+        )
+    }
+
+    /// Install an accepted batch's prepared assets before its generation or
+    /// events publish. The callback must not wait for loading or build assets.
+    /// The callback gets only the events the backlog keeps.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_with_clock_and_assets(
+        &mut self,
+        session: &mut Session,
+        observed_at: Duration,
+        schedule_now: impl FnMut() -> f64,
+        sample_rate: u32,
+        set_generation: impl FnMut(u64, u64, TakeoverCut),
+        prepare: impl FnMut(&[AudioEvent]),
+        push: impl FnMut(QueuedAudioEvent) -> bool,
+    ) -> Result<LiveProducerStep, RuntimeError> {
         self.sync_panic_recovery(session);
         let started = self.begin_turn();
         let result = self.step_with_clock_inner(
@@ -621,12 +646,14 @@ impl LiveFileProducer {
             schedule_now,
             sample_rate,
             set_generation,
+            prepare,
             push,
         );
         self.stage_turn(session, started, &result);
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn step_with_clock_inner(
         &mut self,
         session: &mut Session,
@@ -634,6 +661,7 @@ impl LiveFileProducer {
         mut schedule_now: impl FnMut() -> f64,
         sample_rate: u32,
         set_generation: impl FnMut(u64, u64, TakeoverCut),
+        prepare: impl FnMut(&[AudioEvent]),
         mut push: impl FnMut(QueuedAudioEvent) -> bool,
     ) -> Result<LiveProducerStep, RuntimeError> {
         session.consume_audio_confirmations();
@@ -846,12 +874,13 @@ impl LiveFileProducer {
             && !matches!(watches.score, WatchPoll::Stopped)
             && !matches!(watches.prebake, WatchPoll::Stopped))
         .then(Instant::now);
-        let step = self.finish_step(
+        let step = self.finish_step_with_assets(
             session,
             watches,
             &mut schedule_now,
             sample_rate,
             set_generation,
+            prepare,
             push,
         )?;
         if let Some(started) = continuation_started {
@@ -1209,8 +1238,21 @@ impl LiveFileProducer {
     pub fn shield_reload_with_clock(
         &mut self,
         session: &mut Session,
+        schedule_now: impl FnMut() -> f64,
+        sample_rate: u32,
+        push: impl FnMut(QueuedAudioEvent) -> bool,
+    ) -> Result<bool, RuntimeError> {
+        self.shield_reload_with_assets(session, schedule_now, sample_rate, |_| {}, push)
+    }
+
+    /// Install the shield batch's prepared assets before its events publish.
+    /// The callback must not wait for loading or build assets.
+    pub fn shield_reload_with_assets(
+        &mut self,
+        session: &mut Session,
         mut schedule_now: impl FnMut() -> f64,
         sample_rate: u32,
+        mut prepare: impl FnMut(&[AudioEvent]),
         mut push: impl FnMut(QueuedAudioEvent) -> bool,
     ) -> Result<bool, RuntimeError> {
         self.sync_panic_recovery(session);
@@ -1266,6 +1308,12 @@ impl LiveFileProducer {
         let tail_started = batch.tail_started;
         let room = MAX_PENDING_BACKLOG.saturating_sub(self.pending.len());
         let dropped = batch.events.len().saturating_sub(room);
+        let preparation_started = Instant::now();
+        prepare(&batch.events[..batch.events.len().min(room)]);
+        session.record_producer_phase(
+            ProducerPhase::AssetPreparation,
+            preparation_started.elapsed(),
+        );
         self.note_scheduled_through(batch.events.iter().map(|event| event.target_frame));
         self.pending.extend(
             batch
@@ -1388,6 +1436,28 @@ impl LiveFileProducer {
         set_generation: impl FnMut(u64, u64, TakeoverCut),
         push: impl FnMut(QueuedAudioEvent) -> bool,
     ) -> Result<LiveProducerStep, RuntimeError> {
+        self.step_unwatched_with_assets(
+            session,
+            schedule_now,
+            sample_rate,
+            set_generation,
+            |_| {},
+            push,
+        )
+    }
+
+    /// Install an accepted batch's prepared assets before its cutover and events.
+    /// The callback must not wait for loading or build assets.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_unwatched_with_assets(
+        &mut self,
+        session: &mut Session,
+        schedule_now: impl FnMut() -> f64,
+        sample_rate: u32,
+        set_generation: impl FnMut(u64, u64, TakeoverCut),
+        prepare: impl FnMut(&[AudioEvent]),
+        push: impl FnMut(QueuedAudioEvent) -> bool,
+    ) -> Result<LiveProducerStep, RuntimeError> {
         self.sync_panic_recovery(session);
         let started = self.begin_turn();
         let result = self.step_unwatched_with_clock_and_cutover_inner(
@@ -1395,18 +1465,21 @@ impl LiveFileProducer {
             schedule_now,
             sample_rate,
             set_generation,
+            prepare,
             push,
         );
         self.stage_turn(session, started, &result);
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn step_unwatched_with_clock_and_cutover_inner(
         &mut self,
         session: &mut Session,
         mut schedule_now: impl FnMut() -> f64,
         sample_rate: u32,
         set_generation: impl FnMut(u64, u64, TakeoverCut),
+        prepare: impl FnMut(&[AudioEvent]),
         push: impl FnMut(QueuedAudioEvent) -> bool,
     ) -> Result<LiveProducerStep, RuntimeError> {
         session.consume_audio_confirmations();
@@ -1428,7 +1501,7 @@ impl LiveFileProducer {
         };
         let measure_continuation = watch != WatchPoll::Stopped;
         let continuation_started = measure_continuation.then(Instant::now);
-        let step = self.finish_step(
+        let step = self.finish_step_with_assets(
             session,
             WatchResults {
                 score: watch.clone(),
@@ -1437,6 +1510,7 @@ impl LiveFileProducer {
             &mut schedule_now,
             sample_rate,
             set_generation,
+            prepare,
             push,
         )?;
         if let Some(started) = continuation_started {
@@ -1445,13 +1519,36 @@ impl LiveFileProducer {
         Ok(step)
     }
 
+    #[cfg(test)]
     fn finish_step(
+        &mut self,
+        session: &mut Session,
+        watches: WatchResults,
+        schedule_now: impl FnMut() -> f64,
+        sample_rate: u32,
+        set_generation: impl FnMut(u64, u64, TakeoverCut),
+        push: impl FnMut(QueuedAudioEvent) -> bool,
+    ) -> Result<LiveProducerStep, RuntimeError> {
+        self.finish_step_with_assets(
+            session,
+            watches,
+            schedule_now,
+            sample_rate,
+            set_generation,
+            |_| {},
+            push,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_step_with_assets(
         &mut self,
         session: &mut Session,
         watches: WatchResults,
         mut schedule_now: impl FnMut() -> f64,
         sample_rate: u32,
         mut set_generation: impl FnMut(u64, u64, TakeoverCut),
+        mut prepare: impl FnMut(&[AudioEvent]),
         mut push: impl FnMut(QueuedAudioEvent) -> bool,
     ) -> Result<LiveProducerStep, RuntimeError> {
         let WatchResults {
@@ -2123,15 +2220,27 @@ impl LiveFileProducer {
                 WindowReservation::Deferred => unreachable!("deferred before querying"),
             };
 
+            let completed = if self.pending_generation.is_some() {
+                Some(self.pending_reload_event.take().ok_or_else(|| {
+                    RuntimeError::Message(
+                        "replacement generation completed without its retained reload event".into(),
+                    )
+                })?)
+            } else {
+                None
+            };
+            let room = MAX_PENDING_BACKLOG.saturating_sub(self.pending.len());
+            let preparation_started = Instant::now();
+            prepare(&batch.events[..batch.events.len().min(room)]);
+            session.record_producer_phase(
+                ProducerPhase::AssetPreparation,
+                preparation_started.elapsed(),
+            );
             // A silent successful replacement still owns the consumer. For a
             // non-silent one this remains strictly before the first new event
             // crosses the ring.
             if let Some(generation) = self.pending_generation {
-                let completed = self.pending_reload_event.take().ok_or_else(|| {
-                    RuntimeError::Message(
-                        "replacement generation completed without its retained reload event".into(),
-                    )
-                })?;
+                let completed = completed.expect("validated before asset preparation");
                 // The takeover frame - where this generation's re-query
                 // cursor starts - rides with the flip so the consumer keeps
                 // the old generation's earlier onsets sounding (the reload
@@ -3459,11 +3568,12 @@ mod tests {
         producer.arm_replacement(audible, candidate_generation);
 
         let error = producer
-            .step_unwatched_with_clock_and_cutover(
+            .step_unwatched_with_assets(
                 &mut session,
                 || 0.0,
                 48_000,
                 |_, _, _| panic!("a refused candidate reached device cutover"),
+                |_| panic!("a refused candidate prepared assets"),
                 |_| true,
             )
             .expect_err("every onset is refused");
@@ -4090,7 +4200,7 @@ mod tests {
         };
 
         let held = producer
-            .finish_step(
+            .finish_step_with_assets(
                 &mut session,
                 WatchResults {
                     score: WatchPoll::Event(installed.clone()),
@@ -4099,6 +4209,7 @@ mod tests {
                 || 0.0,
                 48_000,
                 |generation, frame, cut| published.push((generation, frame, cut)),
+                |_| panic!("a loading window prepared assets"),
                 |_| panic!("a loading window emitted audio"),
             )
             .expect("a loading hold is a quiet turn");
@@ -4111,7 +4222,7 @@ mod tests {
         // skip-and-log contract; that is not what this test is about.)
         for _ in 0..3 {
             let held = producer
-                .finish_step(
+                .finish_step_with_assets(
                     &mut session,
                     WatchResults {
                         score: WatchPoll::Unchanged,
@@ -4120,6 +4231,7 @@ mod tests {
                     || 0.0,
                     48_000,
                     |generation, frame, cut| published.push((generation, frame, cut)),
+                    |_| panic!("a loading window prepared assets"),
                     |_| panic!("a loading window emitted audio"),
                 )
                 .expect("still held");
@@ -4132,8 +4244,9 @@ mod tests {
         assert_eq!(announced, 0);
 
         library.finish_loading_sample_for_test();
+        let prepared = std::cell::Cell::new(false);
         let ready = producer
-            .finish_step(
+            .finish_step_with_assets(
                 &mut session,
                 WatchResults {
                     score: WatchPoll::Unchanged,
@@ -4141,8 +4254,18 @@ mod tests {
                 },
                 || 0.5,
                 48_000,
-                |generation, frame, cut| published.push((generation, frame, cut)),
-                |_| true,
+                |generation, frame, cut| {
+                    assert!(prepared.get(), "cutover preceded asset preparation");
+                    published.push((generation, frame, cut));
+                },
+                |events| {
+                    assert!(!events.is_empty());
+                    assert!(!prepared.replace(true), "batch prepared more than once");
+                },
+                |_| {
+                    assert!(prepared.get(), "onset preceded asset preparation");
+                    true
+                },
             )
             .expect("the save publishes once its sample is ready");
         assert!(ready.scheduled > 0, "{ready:?}");
@@ -4344,13 +4467,18 @@ mod tests {
                 .expect("replacement");
             producer.arm_replacement(generation_before, generation_after);
 
-            let mut clocks = [1.6, 1.7].into_iter();
+            let clock = std::cell::Cell::new(1.6);
             let mut published = Vec::new();
-            let result = producer.step_unwatched_with_clock_and_cutover(
+            let result = producer.step_unwatched_with_assets(
                 &mut session,
-                || clocks.next().unwrap_or(1.7),
+                || {
+                    let now = clock.get();
+                    clock.set(1.7);
+                    now
+                },
                 48_000,
                 |generation, frame, cut| published.push((generation, frame, cut)),
+                |_| assert!(from_zero, "a rejected edit installed assets"),
                 |_| true,
             );
             (session, generation_after, result, published)

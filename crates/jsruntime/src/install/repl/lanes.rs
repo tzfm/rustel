@@ -92,7 +92,29 @@ fn finish<'js>(
             solo_active = true;
         }
         if !solo_active || solo {
-            lanes.push(pattern);
+            let (pattern, sidecar) = reify_bridged(&ctx, &pattern)?;
+            // Only a plugin note carries the name of its lane. Each note
+            // keeps its slider bindings.
+            let pattern = pattern.fmap_keeping_live(move |value| {
+                let plugin = |controls: &rustel_core::OrderedMap| {
+                    controls.contains_key("vst") || controls.contains_key("vsti")
+                };
+                match value {
+                    Value::Object(controls) if plugin(controls) => {}
+                    // A value JavaScript owns shows its keys after a copy.
+                    Value::JsValue(_) => {}
+                    _ => return None,
+                }
+                let Value::Object(mut controls) = rustel_core::materialize_js_value(value) else {
+                    return None;
+                };
+                if !plugin(&controls) {
+                    return None;
+                }
+                controls.insert("__rustel_lane".into(), Value::Str(name.clone()));
+                Some(Value::Object(controls))
+            });
+            lanes.push(derive_wrapper(ctx.clone(), pattern, &[sidecar])?.into_value());
         }
     }
 

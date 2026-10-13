@@ -93,12 +93,10 @@ fn open_advanced(studio: &mut Hermetic) {
     studio.settle();
 }
 
-/// Open the sheet on the About page - the eighth of eight tabs.
+/// Open the sheet on the About page, the last tab.
 fn open_about(studio: &mut Hermetic) {
     open_sheet(studio);
-    for _ in 0..7 {
-        studio.press(KeyCode::Tab, KeyModifiers::NONE);
-    }
+    studio.press(KeyCode::BackTab, KeyModifiers::SHIFT);
     studio.settle();
 }
 
@@ -802,8 +800,8 @@ fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
     );
 
     open_sheet(&mut studio);
-    for _ in 0..6 {
-        studio.press(KeyCode::Tab, KeyModifiers::NONE);
+    for _ in 0..2 {
+        studio.press(KeyCode::BackTab, KeyModifiers::SHIFT);
     }
     studio.settle();
     let refused = row_with(&mut studio, "https://scripts.invalid");
@@ -824,8 +822,8 @@ fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
     studio.quit();
     let mut studio = reopen_over(studio);
     open_sheet(&mut studio);
-    for _ in 0..6 {
-        studio.press(KeyCode::Tab, KeyModifiers::NONE);
+    for _ in 0..2 {
+        studio.press(KeyCode::BackTab, KeyModifiers::SHIFT);
     }
     studio.settle();
     assert!(row_with(&mut studio, "https://scripts.invalid").contains("trusted"));
@@ -835,10 +833,10 @@ fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
     assert!(studio.rows().join("\n").contains("none yet"));
 }
 
-/// Tab walks the strip's eight pages in order and wraps - each page
+/// Tab walks the strip's pages in order and wraps - each page
 /// recognised by a row only it draws.
 #[test]
-fn tab_cycles_the_eight_pages_and_wraps() {
+fn tab_cycles_the_pages_and_wraps() {
     let mut studio = hermetic();
     open_sheet(&mut studio);
 
@@ -847,6 +845,7 @@ fn tab_cycles_the_eight_pages_and_wraps() {
         "not assigned",         // mapping: the slot boxes
         "automatic",            // keybinds: the terminal-profile row
         "fetch imports",        // sources
+        "add folder",           // vst
         "OSC / SuperDirt",      // reference
         "none yet",             // trust
         "Terminal: rustel-e2e", // about

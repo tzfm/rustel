@@ -17,7 +17,7 @@ fn open_tab(steps: usize) -> Hermetic {
 }
 
 fn first_example() -> Hermetic {
-    let mut studio = open_tab(5);
+    let mut studio = open_tab(6);
     assert_eq!(studio.reference_tab(), Some("examples"));
     studio.press(KeyCode::Down, KeyModifiers::NONE); // First groove shelf
     studio.press(KeyCode::Right, KeyModifiers::NONE);
@@ -27,7 +27,7 @@ fn first_example() -> Hermetic {
 
 #[test]
 fn examples_is_last_and_the_browser_wraps() {
-    let mut studio = open_tab(4);
+    let mut studio = open_tab(5);
     assert_eq!(studio.reference_tab(), Some("generator"));
     row_containing(&studio.rows(), "Glassy pulse");
     studio.press(KeyCode::Tab, KeyModifiers::NONE);
@@ -39,7 +39,7 @@ fn examples_is_last_and_the_browser_wraps() {
 
 #[test]
 fn arrows_open_and_fold_the_example_shelves() {
-    let mut studio = open_tab(5);
+    let mut studio = open_tab(6);
     studio.press(KeyCode::Down, KeyModifiers::NONE);
     studio.press(KeyCode::Right, KeyModifiers::NONE);
     row_containing(&studio.rows(), "Four on the floor");
@@ -71,7 +71,7 @@ fn enter_copies_a_whole_example_and_leaves_the_tree_open() {
 
 #[test]
 fn the_generator_composes_and_recalls_exact_code() {
-    let mut studio = open_tab(4);
+    let mut studio = open_tab(5);
     studio.press(KeyCode::Down, KeyModifiers::NONE); // Generate
     studio.type_text("c");
     let first = studio.clipboard_text().expect("initial idea");

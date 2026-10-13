@@ -216,7 +216,7 @@ impl JsRuntime {
                 // SAFETY: a live Ctx always has a live owning runtime.
                 let runtime = unsafe { rquickjs::qjs::JS_GetRuntime(ctx.as_raw().as_ptr()) };
                 let _pending_job_guard = PendingJobGuard { runtime };
-                let frame = BridgeFrame::new(alloc);
+                let frame = BridgeFrame::setup(alloc);
                 let _scope = BridgeScope::push(&frame);
                 rustel_core::with_callback_host(self, || {
                     self.with_deadline(budget, || {
@@ -669,7 +669,7 @@ impl JsRuntime {
                 runtime,
                 enabled: stage_candidate,
             };
-            let frame = BridgeFrame::new(alloc);
+            let frame = BridgeFrame::evaluation(alloc);
             let _scope = BridgeScope::push(&frame);
             rustel_core::with_callback_host(self, || {
                 let lane_host =

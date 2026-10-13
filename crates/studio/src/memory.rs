@@ -9,6 +9,10 @@
 //! remainder, so the breakdown always adds up to the figure it explains and
 //! never claims to know more than it does.
 //!
+//! The plugins of the plugin host follow the remainder, one row each. A
+//! plugin in the Studio process has no figure of its own, and a plugin
+//! process is outside the figure, so the plugin rows add nothing to the sum.
+//!
 //! Clicking the header's figures opens the log with this breakdown to its
 //! left. The two share a border and resize together. On a short log, the
 //! total and principal parts stay visible before the details.
@@ -88,6 +92,9 @@ pub struct MemoryFigures {
     /// Whether imported sounds are fetched to disk ahead of their first
     /// play: a disk setting, shown beside the disk it fills.
     pub fetch_imports: bool,
+    /// The plugins of the plugin host: each plugin in its load, loaded, or
+    /// failed. Empty with no host, and in a build with no plugins.
+    pub plugins: Vec<PluginMemory>,
 }
 
 impl MemoryFigures {
@@ -169,6 +176,17 @@ impl VisualsMemory {
     }
 }
 
+/// One plugin of the plugin host, as a row of the breakdown.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PluginMemory {
+    /// The name, then the kind, the state, the running copies and the time
+    /// of the load, as far as the host knows them.
+    pub label: String,
+    /// The host loaded the plugin. The plugin is in the Studio process, and
+    /// its memory is part of the figure.
+    pub loaded: bool,
+}
+
 /// Which part a detail row belongs to, which decides when it goes on a
 /// short terminal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,6 +195,7 @@ pub enum Detail {
     Audio,
     Visuals,
     Interface,
+    Plugins,
 }
 
 /// What a row is, which decides how it is drawn and when it is dropped.
@@ -409,6 +428,20 @@ pub fn rows(figures: &MemoryFigures) -> Vec<Row> {
         )),
         None => rows.push(Row::unknown(Part, "not itemised")),
     }
+    // Only while the plugin host has a plugin loaded, loading or failed.
+    if !figures.plugins.is_empty() {
+        let loaded = figures.plugins.iter().filter(|plugin| plugin.loaded);
+        let mut heading = Row::text(Part, "plugins");
+        heading.value = format!("{} loaded", loaded.count());
+        rows.push(heading);
+        for plugin in &figures.plugins {
+            let mut row = Row::text(Of(Detail::Plugins), &plugin.label);
+            if plugin.loaded {
+                row.value = "in process".to_owned();
+            }
+            rows.push(row);
+        }
+    }
     let resident = match figures.resident {
         Some(resident) => format!(
             "RSS {} · {} beyond mem",
@@ -432,15 +465,16 @@ pub fn rows(figures: &MemoryFigures) -> Vec<Row> {
 }
 
 /// When a row goes on a short terminal, earliest first: the hints, then
-/// what is outside the figure, then the interface's, the audio's and the
-/// visuals' details, then the sounds'. `None` stays whatever the height -
-/// the figure, its parts and the remainder, which are the breakdown's
-/// whole point.
+/// what is outside the figure, then the interface's, the audio's, the
+/// visuals' and the plugins' details, then the sounds'. `None` stays
+/// whatever the height: the figure, its parts and the remainder.
 fn drop_rank(kind: RowKind) -> Option<u8> {
     match kind {
         RowKind::Hint => Some(0),
         RowKind::Outside => Some(1),
-        RowKind::Detail(Detail::Interface | Detail::Audio | Detail::Visuals) => Some(2),
+        RowKind::Detail(Detail::Interface | Detail::Audio | Detail::Visuals | Detail::Plugins) => {
+            Some(2)
+        }
         RowKind::Detail(Detail::Sounds) => Some(3),
         RowKind::Title | RowKind::Part | RowKind::Excess => None,
     }
@@ -477,6 +511,7 @@ pub fn sidecar_rows(figures: &MemoryFigures, room: usize) -> Vec<Row> {
                 "interface" => 4,
                 _ => 5,
             },
+            RowKind::Detail(Detail::Plugins) => 5,
             RowKind::Outside => 6,
             RowKind::Detail(_) => 7,
             RowKind::Hint => 8,
@@ -958,6 +993,7 @@ mod tests {
             returned_when_stopped: true,
             sample_cache: Some(300 * MIB as u64),
             fetch_imports: false,
+            plugins: Vec::new(),
         }
     }
 

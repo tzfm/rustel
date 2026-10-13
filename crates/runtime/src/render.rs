@@ -230,6 +230,12 @@ pub(crate) fn live_audio_event(
     samples: &dyn rustel_voice::SampleLookup,
 ) -> Result<rustel_audio::AudioEvent, rustel_voice::VoiceError> {
     let mut scalar = scalar_event_detailed(onset, sample_rate, cps, samples)?;
+    // A note of the live output has the plugin chain of its place in the
+    // score. A render gives its notes chains of its own.
+    #[cfg(feature = "vst")]
+    if let crate::ValueJson::Raw(value) = &onset.value {
+        scalar.controls.insert_chain = crate::vst::live_chain(value);
+    }
     bind_live_controls(&mut scalar, onset);
     Ok(rustel_audio::AudioEvent {
         onset_id: onset.onset_id,
@@ -487,11 +493,17 @@ pub(crate) fn render_scalar_pcm_with_refusals(
     }
     let mut notices = notice_tally();
     let mut refused: Vec<String> = Vec::new();
+    #[cfg(feature = "vst")]
+    let mut chains = crate::vst::RenderChains::new();
     let events: Vec<rustel_audio::OnsetEvent> = onsets
         .iter()
         .filter_map(|onset| {
             match tallied_scalar_event(onset, sample_rate, cps, lookup, notices.as_mut()) {
-                Ok(event) => Some(event),
+                Ok(event) => {
+                    #[cfg(feature = "vst")]
+                    let event = chains.number(event, &onset.value);
+                    Some(event)
+                }
                 Err(message) => {
                     if !refused.iter().any(|seen| seen == &message) {
                         if rustel_voice::direct_diagnostic_logging() {
@@ -511,7 +523,25 @@ pub(crate) fn render_scalar_pcm_with_refusals(
     let mut backend = scalar_backend(dispatch, library, max_polyphony);
     let pcm = rustel_audio::render_pcm(&mut backend, sample_rate, frames, &events)
         .map_err(io::Error::other)?;
+    plugin_problems(&mut refused);
     Ok((pcm, refused))
+}
+
+/// Adds the problems of the plugin host in a render to `refused`, and
+/// prints each one as a refused voice is printed.
+fn plugin_problems(refused: &mut Vec<String>) {
+    #[cfg(feature = "vst")]
+    for message in crate::vst::take_errors() {
+        if rustel_voice::direct_diagnostic_logging() {
+            let record = serde_json::json!({ "vst_skipped": { "message": &message } });
+            eprintln!("{record}");
+        }
+        if !refused.contains(&message) {
+            refused.push(message);
+        }
+    }
+    #[cfg(not(feature = "vst"))]
+    let _ = refused;
 }
 
 fn scalar_backend(
@@ -525,6 +555,11 @@ fn scalar_backend(
         for (id, decoded) in library.take_ready() {
             let _ = backend.install_sample(id, Box::new(decoded));
         }
+    }
+    // A render waits for each plugin, so the first note has its effect.
+    #[cfg(feature = "vst")]
+    if let Some(plugins) = crate::vst::started() {
+        backend.set_insert_provider(plugins.provider(true));
     }
     #[cfg(test)]
     tests::BUILT_DISPATCH.set(Some(backend.dispatch()));
@@ -714,11 +749,17 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
     let mut notices = notice_tally();
     let mut last_refused: Option<String> = None;
     let mut refused: Vec<String> = Vec::new();
+    #[cfg(feature = "vst")]
+    let mut chains = crate::vst::RenderChains::new();
     let events: Vec<rustel_audio::OnsetEvent> = onsets
         .iter()
         .filter_map(|onset| {
             match tallied_scalar_event(onset, sample_rate, cps, lookup, notices.as_mut()) {
-                Ok(event) => Some(event),
+                Ok(event) => {
+                    #[cfg(feature = "vst")]
+                    let event = chains.number(event, &onset.value);
+                    Some(event)
+                }
                 Err(message) => {
                     if last_refused.as_deref() != Some(message.as_str()) {
                         if rustel_voice::direct_diagnostic_logging() {
@@ -777,7 +818,7 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
             observer(tick);
         }
     };
-    rustel_audio::write_wav_controlled(
+    let written = rustel_audio::write_wav_controlled(
         path,
         &mut backend,
         sample_rate,
@@ -791,9 +832,11 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
             limiter,
         },
         format,
-    )
-    .map(|bytes| (bytes, refused))
-    .map_err(io::Error::other)
+    );
+    plugin_problems(&mut refused);
+    written
+        .map(|bytes| (bytes, refused))
+        .map_err(io::Error::other)
 }
 
 /// Read a 16-bit stereo WAV the writer above produced back as interleaved

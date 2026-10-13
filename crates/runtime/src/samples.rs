@@ -10513,6 +10513,12 @@ impl SampleLibrary {
         }
     }
 
+    /// The rate the device runs at, or the default before a device opens.
+    #[cfg(feature = "vst")]
+    pub fn render_rate(&self) -> u32 {
+        self.shared.render_rate.load(Ordering::Acquire)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn render_rate_for_test(&self) -> u32 {
@@ -10921,6 +10927,14 @@ impl SampleLibrary {
         cancelled: Option<&AtomicBool>,
     ) {
         let started = std::time::Instant::now();
+        // A plugin a score named loads on the plugin thread. The wait has
+        // the same deadline and the same stop flag as the samples.
+        #[cfg(feature = "vst")]
+        if let Some(plugins) = crate::vst::started() {
+            plugins.wait_idle_within(deadline, || {
+                cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed))
+            });
+        }
         loop {
             if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
                 return;
@@ -17914,5 +17928,13 @@ impl SampleLookup for SampleLibrary {
 
     fn bus_names(&self) -> Option<&rustel_voice::BusNames> {
         Some(&self.bus_names)
+    }
+
+    #[cfg(feature = "vst")]
+    fn insert(
+        &self,
+        request: &rustel_voice::PluginRequest<'_>,
+    ) -> Result<Option<rustel_audio::InsertControls>, String> {
+        crate::vst::controls(request)
     }
 }

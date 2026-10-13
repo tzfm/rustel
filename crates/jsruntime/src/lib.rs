@@ -262,7 +262,10 @@ mod ownership_cap_tests {
             let frame = BridgeFrame::new(runtime.ids.clone());
             let _scope = BridgeScope::push(&frame);
             let callback_id = frame.next_id();
-            frame.pending.borrow_mut().push((callback_id, callback));
+            frame
+                .pending
+                .borrow_mut()
+                .push((callback_id, callback, None));
             let output = runtime.call_pattern_indexed_batch(
                 callback_id,
                 vec![

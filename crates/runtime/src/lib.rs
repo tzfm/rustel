@@ -66,6 +66,8 @@ pub mod settings;
 /// Reading sound names out of score TEXT, so warming covers what a query
 /// cannot see: lanes commented out for later, and muted `_$:` lanes.
 pub mod sounds;
+/// The standard output of the process, kept clear of plugin text.
+pub mod stdio;
 /// Showing untrusted text on a terminal as visible characters only.
 pub mod terminal_text;
 #[cfg(any(test, feature = "test-support"))]
@@ -76,6 +78,8 @@ pub mod ui_analysis;
 /// Bounded, versioned live-editor event protocol.
 pub mod ui_events;
 pub mod updates;
+#[cfg(feature = "vst")]
+pub mod vst;
 mod watch;
 
 pub use capabilities::{

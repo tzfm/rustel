@@ -210,6 +210,35 @@ general device API is installed in QuickJS. MIDI and serial failures are
 reported and dropped without ending the set. One-shot query, validation, and
 offline render routes do not open these external outputs.
 
+## Plugins
+
+The `vst` Cargo feature is a host-level capability. The default build and the
+release binaries include the feature. With the feature compiled in, live
+playback, Studio and offline render load the VST3 plugins a score names with
+`.vst()` or `.vsti()`. A plugin is native code and runs with the rights of the
+user, outside the QuickJS realm and its limits.
+
+A score selects a plugin by name only. The host compares the name with the
+plugin bundles in the plugin folders: the standard VST3 folders of the system,
+or the folders of `RUSTEL_VST3_PATH`, and the folders set in Studio. A score
+has no way to add a folder, to name a file path, or to supply plugin code. A
+preset name is compared with the `.vstpreset` files in the preset folder of the
+plugin in the same way. A score sets parameter values from 0 to 1 and sends
+notes. There is no additional per-score command-line grant. When a score from
+an unknown source must not start the plugins on the machine, do not play or
+render the score, or use a build without the feature.
+
+The scan of the plugin folders loads each bundle in a process of its own, so
+a plugin fault at the scan ends that process and not the host. The scan
+process has the rights of the user, as the host has: the process is no
+sandbox. The scan process writes the names of the plugins to a file with a
+random name in the temporary folder of the system, and the host reads and
+removes the file. The audio of a plugin runs in the process of the host, as
+in most DAWs: a plugin fault during a set then ends the host. Studio and
+`rustel vst` load each bundle in the plugin folders one time for the scan: a
+plugin in the folders runs also when no score names the plugin. `query`,
+`check` and `validate` load no plugin.
+
 ## Remote sample cache
 
 An exact-origin grant authorizes validated manifests and audio from that origin

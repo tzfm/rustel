@@ -1,0 +1,7 @@
+# A command that hosts plugins sends the standard output of the process to
+# the null device: see `rustel_runtime::stdio`. `outln!` and `out!` write to
+# the stream the process had at its start.
+disallowed-macros = [
+  { path = "std::println", reason = "use `outln!`: a command with plugins sends the standard output to the null device" },
+  { path = "std::print", reason = "use `out!`: a command with plugins sends the standard output to the null device" },
+]

@@ -872,9 +872,11 @@ impl JsRuntime {
                     .eval::<Function, _>(src.as_str())
                     .map_err(|e| e.to_string())?;
                 CELLS_CREATED.with(|c| c.set(c.get() + 1));
-                let cell =
-                    rquickjs::Class::instance(ctx.clone(), CallbackCell::function(f.clone()))
-                        .map_err(|e| e.to_string())?;
+                let cell = rquickjs::Class::instance(
+                    ctx.clone(),
+                    CallbackCell::function(f.clone(), Some(format!("b{id}/"))),
+                )
+                .map_err(|e| e.to_string())?;
                 ids.push(*id);
                 cells.push(cell);
                 factories.push(f);

@@ -54,6 +54,7 @@ Optional features, combinable as needed:
 | `serial` | serial output for microcontrollers, included by default |
 | `studio` | the terminal editor, included by default (includes device audio and MIDI discovery) |
 | `hydra` | [Hydra visuals](hydra.md), included by default and removable from a lean build |
+| `vst` | [VST3 plugins](plugins.md) for `.vst()` and `.vsti()`, included by default |
 
 OSC output is included by default. On Debian and Ubuntu, the default and `--all-features`
 builds need the C toolchain named above for the vendored mp3 encoder, ALSA headers
@@ -67,7 +68,7 @@ sudo apt-get install -y build-essential pkg-config libasound2-dev libudev-dev
 To keep Studio, Hydra, and the other default features while omitting gamepad input:
 
 ```sh
-cargo build --profile local -p rustel --no-default-features --features mp3-export,extensions,opus,osc,serial,hydra,studio,remote-control
+cargo build --profile local -p rustel --no-default-features --features mp3-export,extensions,opus,osc,serial,hydra,studio,remote-control,vst
 ```
 
 Adding `--all-features` enables `gamepad` again and requires the libudev headers on Linux.

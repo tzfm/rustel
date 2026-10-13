@@ -42,6 +42,8 @@ impl App {
             Focus::Panel(PanelKind::Settings) => match self.settings_sheet {
                 Some(sheet) if sheet.shows_sources() => HelpContext::SettingsSources,
                 Some(sheet) if sheet.shows_trust() => HelpContext::SettingsTrust,
+                #[cfg(feature = "vst")]
+                Some(sheet) if sheet.shows_vst() => HelpContext::SettingsVst,
                 Some(sheet) if !sheet.shows_settings() => HelpContext::SettingsAbout,
                 _ => HelpContext::Settings,
             },

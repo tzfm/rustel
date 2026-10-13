@@ -713,6 +713,8 @@ impl App {
                     | SetPrompt::AddSampleSource
                     | SetPrompt::EditSampleSource(_)
             );
+            #[cfg(feature = "vst")]
+            let settings_prompt = settings_prompt || prompt == SetPrompt::AddVstFolder;
             self.set_prompt_return_focus =
                 Some(if settings_prompt && self.settings_sheet.is_some() {
                     Focus::Panel(PanelKind::Settings)
@@ -723,7 +725,7 @@ impl App {
         // An import or bank alias asked for on Sources opens over the page,
         // which stays: the row it acts on is there, and Esc comes back to
         // it. Every other prompt clears the stage as before.
-        if matches!(
+        let over_settings = matches!(
             prompt,
             SetPrompt::SetsFolder
                 | SetPrompt::RecordingsFolder
@@ -732,8 +734,10 @@ impl App {
                 | SetPrompt::PickBankToRename
                 | SetPrompt::RenameBank
                 | SetPrompt::RenameSample
-        ) && self.settings_sheet.is_some()
-        {
+        );
+        #[cfg(feature = "vst")]
+        let over_settings = over_settings || prompt == SetPrompt::AddVstFolder;
+        if over_settings && self.settings_sheet.is_some() {
             self.dismiss_dialogs_except(&[PanelKind::Set, PanelKind::Settings]);
         } else {
             self.dismiss_dialogs(Some(PanelKind::Set));
@@ -816,6 +820,11 @@ impl App {
                 &root,
             )
             .choosing_folders(),
+            #[cfg(feature = "vst")]
+            SetPrompt::AddVstFolder => {
+                FilePicker::new("plugin folder", "reads its plugins", Vec::new(), &root)
+                    .choosing_folders()
+            }
         };
         self.set_prompt = Some((prompt, picker));
         self.focus_panel(PanelKind::Set);
@@ -854,6 +863,10 @@ impl App {
             }
             SetPrompt::RenameBank => {
                 "bank alias - type its playable name · original name resets · Esc back".into()
+            }
+            #[cfg(feature = "vst")]
+            SetPrompt::AddVstFolder => {
+                "plugin folder - type a path, or Tab to browse and Enter on . · Esc back".into()
             }
         };
         self.dirty_frame = true;
@@ -947,6 +960,8 @@ impl App {
                     self.close_set_prompt();
                     self.rename_bank(&name);
                 }
+                #[cfg(feature = "vst")]
+                SetPrompt::AddVstFolder => self.add_vst_folder(&path),
             },
         }
         self.dirty_frame = true;
@@ -1479,4 +1494,7 @@ pub(super) enum SetPrompt {
     RenameSample,
     /// A tape in `renaming_session`, with its extension preserved.
     RenameSession,
+    /// A folder with VST3 plugins, for the vst page of the settings sheet.
+    #[cfg(feature = "vst")]
+    AddVstFolder,
 }

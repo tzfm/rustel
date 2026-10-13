@@ -2660,6 +2660,10 @@ pub struct Session {
     scheduler: Scheduler,
     config: SessionConfig,
     last_source: Option<Arc<str>>,
+    /// The score of this session plays through the plugins of a live
+    /// output: see [`Self::attach_plugins`].
+    #[cfg(feature = "vst")]
+    plugins_live: AtomicBool,
     /// Files the most recent `preload(...)` asked for, until a caller waits.
     preload_requested: usize,
     /// Whether a setup this session ran picks sample variants: it writes an
@@ -2942,6 +2946,8 @@ impl Session {
             scheduler,
             config,
             last_source: None,
+            #[cfg(feature = "vst")]
+            plugins_live: AtomicBool::new(false),
             preload_requested: 0,
             prebake_selects_variants: false,
             stop_when_silent: None,
@@ -3169,6 +3175,27 @@ impl Session {
     /// from a score evaluation rather than a directly installed Rust pattern.
     pub fn active_source(&self) -> Option<&str> {
         self.last_source.as_deref()
+    }
+
+    /// Gives a live output the plugins of the process. From this call, the
+    /// score of this session is the score of that output: an edit keeps the
+    /// plugin copies of each chain it leaves as it was, and ends the copies
+    /// of a chain that left. A session with no such output changes no chain
+    /// of a different session, and each render to a file has chains of its
+    /// own.
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    pub fn attach_plugins(&self, device: &rustel_audio::LiveScalarDevice) {
+        self.plugins_live
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::vst::score_changed(self.active_source());
+        crate::vst::attach(device);
+    }
+
+    /// Plugin calls named in a candidate source. Evaluated haps supply the
+    /// chain identity used to prepare each plugin copy.
+    #[cfg(feature = "vst")]
+    pub fn plugin_calls_for_source(&self, source: &str) -> Vec<crate::lint::NamedPlugin> {
+        crate::lint::live_plugins(source)
     }
 
     pub fn generation(&self) -> u64 {
@@ -3413,6 +3440,11 @@ impl Session {
         {
             self.js.adopt_runtime_settings(&settings);
             self.core_settings_initialized = true;
+        }
+        // A direct pattern has no text to read the plugin chains from.
+        #[cfg(feature = "vst")]
+        if result.is_ok() && self.plugins_live.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::vst::score_changed(None);
         }
         result
     }
@@ -3915,12 +3947,22 @@ impl Session {
     /// collected, as [`VOICE_NOTICE_DIAGNOSTIC`]s. A notice already pending
     /// is not queued again, so one raised every window holds one place.
     fn report_voice_notices(&mut self, notices: Vec<rustel_voice::VoiceNotice>) {
-        for notice in notices {
+        let notices = notices
+            .into_iter()
+            .map(|notice| (notice.message, notice.record));
+        // A plugin that did not start on the plugin thread has no note to
+        // report through, so its reason joins the notices here.
+        #[cfg(feature = "vst")]
+        let notices = notices.chain(crate::vst::take_errors().into_iter().map(|message| {
+            let record = serde_json::json!({ "vst_skipped": { "message": &message } });
+            (message, record)
+        }));
+        for (message, record) in notices {
             let pending = self.pending_diagnostics.iter().any(|diagnostic| {
-                diagnostic.kind == VOICE_NOTICE_DIAGNOSTIC && diagnostic.message == notice.message
+                diagnostic.kind == VOICE_NOTICE_DIAGNOSTIC && diagnostic.message == message
             });
             if !pending {
-                self.report_diagnostic(VOICE_NOTICE_DIAGNOSTIC, notice.message, notice.record);
+                self.report_diagnostic(VOICE_NOTICE_DIAGNOSTIC, message, record);
             }
         }
     }
@@ -4019,7 +4061,11 @@ impl Session {
         };
         let mut resolved: std::collections::BTreeMap<String, std::collections::BTreeSet<i64>> =
             std::collections::BTreeMap::new();
-        for sound in self.window_sounds(from_cycle, cycles, ceiling) {
+        let haps = self.window_haps(from_cycle, cycles, ceiling);
+        // A plugin loads as a sample does: before the first note asks.
+        #[cfg(feature = "vst")]
+        crate::vst::prepare(&haps, library.render_rate());
+        for sound in Self::sounds_in(&haps) {
             // `.bank("tr909")` makes the sound `tr909_bd`. Warming only `bd`
             // fetches a different bank's files, and the lane's first hit is
             // refused. Warm the banked spelling too, as the voice looks it up.
@@ -4054,16 +4100,42 @@ impl Session {
         cycles: f64,
         ceiling: Duration,
     ) -> Vec<WindowSound> {
+        Self::sounds_in(&self.window_haps(from_cycle, cycles, ceiling))
+    }
+
+    /// The plugins the score asks for from `from_cycle` for `cycles` that are
+    /// not ready for their notes, at the rate of the output. `holds` says if
+    /// the output has a plugin on a slot: see
+    /// `LiveScalarDevice::holds_insert`. A start that waits for its sounds
+    /// waits while the count is above 0. The call starts the load of each
+    /// plugin it counts, and waits for nothing.
+    #[cfg(feature = "vst")]
+    pub fn plugins_pending(
+        &self,
+        from_cycle: f64,
+        cycles: f64,
+        ceiling: Duration,
+        sample_rate: u32,
+        holds: impl Fn(rustel_audio::InsertSlot, rustel_audio::InsertKey) -> bool,
+    ) -> usize {
+        let haps = self.window_haps(from_cycle, cycles, ceiling);
+        crate::vst::pending(&haps, sample_rate, holds)
+    }
+
+    /// The haps the active score has from `from_cycle` for `cycles`. Empty
+    /// when the query does not finish within `ceiling`.
+    fn window_haps(&self, from_cycle: f64, cycles: f64, ceiling: Duration) -> Vec<crate::HapJson> {
         let begin = Fraction::from_f64(from_cycle.max(0.0)).unwrap_or(Fraction::ZERO);
         let span = Fraction::from_f64(cycles.max(1.0)).unwrap_or(Fraction::int(2));
         let ceiling = Instant::now() + ceiling;
-        let Ok(report) =
-            rustel_core::with_query_deadline(ceiling, || self.query_report(begin, begin.add(span)))
-        else {
-            return Vec::new();
-        };
+        rustel_core::with_query_deadline(ceiling, || self.query_report(begin, begin.add(span)))
+            .map(|report| report.haps)
+            .unwrap_or_default()
+    }
+
+    fn sounds_in(haps: &[crate::HapJson]) -> Vec<WindowSound> {
         let mut sounds = Vec::new();
-        for hap in &report.haps {
+        for hap in haps {
             let crate::ValueJson::Raw(serde_json::Value::Object(object)) = &hap.value else {
                 continue;
             };
@@ -6339,6 +6411,15 @@ mod playback_reanchor_tests {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "vst")]
+    pub(super) fn plugin_chain(session: &Session) -> u64 {
+        let report = session
+            .query_report(Fraction::ZERO, Fraction::ONE)
+            .expect("query");
+        let value = serde_json::to_value(&report.haps[0].value).expect("value");
+        crate::vst::live_chain(&value).expect("plugin chain")
+    }
+
     /// `setGainCurve` shapes every gain, the default 0.8 included, as
     /// superdough does.
     #[test]
@@ -18286,7 +18367,18 @@ mod tests {
     #[test]
     fn captured_direct_pattern_clears_a_later_textual_rollback_target() {
         let mut session = Session::new().expect("session");
+        #[cfg(not(feature = "vst"))]
         session.evaluate_mini("bd").expect("source A");
+        #[cfg(feature = "vst")]
+        {
+            let source = r#"s("sine").vst("Delay").orbit(1)"#;
+            session.evaluate(source).expect("source A");
+            let chain = plugin_chain(&session);
+            session
+                .reload_at(&source.replace("orbit(1)", "orbit(2)"), false, 0.1)
+                .expect("move plugin");
+            assert_eq!(plugin_chain(&session), chain);
+        }
         // Inject replay policy, not consumer-copy evidence.
         session
             .mark_audible_generation(session.generation())
@@ -18409,6 +18501,39 @@ mod tests {
                 .show(),
             "s:bd"
         );
+
+        #[cfg(feature = "vst")]
+        {
+            let mut session = Session::new().expect("session");
+            let source = r#"s("sine").vst("Delay").orbit(1)"#;
+            session.evaluate(source).expect("audible plugin source");
+            session
+                .mark_audible_generation(session.generation())
+                .expect("retain playing source");
+            let chain = plugin_chain(&session);
+            let moved = source.replace("orbit(1)", "orbit(2)");
+            assert_eq!(session.plugin_calls_for_source(&moved)[0].orbit, Some(2));
+            session.reload_at(&moved, false, 0.1).expect("move to two");
+            assert_eq!(plugin_chain(&session), chain);
+            let moved = source.replace("orbit(1)", "orbit(3)");
+            assert!(matches!(
+                session.evaluate_cancellable(&moved, &AtomicBool::new(true)),
+                Err(RuntimeError::Cancelled)
+            ));
+            assert_eq!(plugin_chain(&session), chain);
+            session
+                .reload_at(&moved, false, 0.2)
+                .expect("move to three");
+            assert_eq!(plugin_chain(&session), chain);
+            assert_eq!(
+                session
+                    .rollback_to_previous_source(0.3)
+                    .expect("rollback orbit"),
+                RollbackAttempt::Applied
+            );
+            assert_eq!(session.active_source(), Some(source));
+            assert_eq!(plugin_chain(&session), chain);
+        }
     }
 
     #[cfg(feature = "device-audio")]

@@ -1284,8 +1284,9 @@ fn render_pressure_details(
             pressure.device.ring_capacity,
         ),
         format!(
-            "recent: deadline {} late {} refused {} fades {} drops {} pool misses {} · max host gap {:.2}ms · trace drops {} · assets {}/{}",
+            "recent: deadline {} underruns {} late {} refused {} fades {} drops {} pool misses {} · max host gap {:.2}ms · trace drops {} · assets {}/{}",
             pressure.callback_deadline_misses,
+            pressure.callback_xruns,
             realtime.window_late_events,
             realtime
                 .window_refused_voices
@@ -2182,6 +2183,7 @@ mod tests {
             cause: rustel_runtime::EnginePressureCause::ProducerOverload,
             level: rustel_runtime::EnginePressureLevel::Error,
             callback_deadline_misses: 2,
+            callback_xruns: 1,
             producer_refusals: 3,
             host_gap_nanos: 8_000_000,
             ..EnginePressureSnapshot::default()
@@ -2259,7 +2261,7 @@ mod tests {
             text.contains("voices 18 peak 23 /128 semantic /512 hard"),
             "{text}"
         );
-        assert!(text.contains("deadline 2 late 0"), "{text}");
+        assert!(text.contains("deadline 2 underruns 1 late 0"), "{text}");
         assert!(text.contains("max host gap 8.00ms"), "{text}");
         assert!(text.contains("device Test Interface · 48000Hz"), "{text}");
         assert!(

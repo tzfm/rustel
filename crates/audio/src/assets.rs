@@ -134,6 +134,23 @@ unsafe impl Send for ReturnedReverb {}
 unsafe impl Send for FxReverbInstall {}
 unsafe impl Send for ReturnedFxReverb {}
 
+/// One pending orbit insert, with the same baton discipline as a reverb.
+#[derive(Clone, Copy)]
+pub(crate) struct InsertInstall {
+    pub slot: crate::insert::InsertSlot,
+    /// The rate the insert was prepared for. An output at a different rate
+    /// does not take the insert.
+    pub sample_rate: u32,
+    pub insert: *mut dyn crate::insert::OrbitInsert,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ReturnedInsert(pub *mut dyn crate::insert::OrbitInsert);
+
+// SAFETY: same SPSC baton pass. `OrbitInsert` is `Send`.
+unsafe impl Send for InsertInstall {}
+unsafe impl Send for ReturnedInsert {}
+
 /// Both directions plus the leak counter, shared by the device (producer
 /// side) and the callback (consumer side).
 pub(crate) struct SampleChannel {
@@ -143,8 +160,11 @@ pub(crate) struct SampleChannel {
     pub reverb_returns: AssetRing<ReturnedReverb>,
     pub fx_reverb_installs: AssetRing<FxReverbInstall>,
     pub fx_reverb_returns: AssetRing<ReturnedFxReverb>,
+    pub insert_installs: AssetRing<InsertInstall>,
+    pub insert_returns: AssetRing<ReturnedInsert>,
     /// Stage reverbs refused by the install queue or callback byte budget.
     pub fx_reverb_refusals: AtomicU64,
+    pub insert_refusals: AtomicU64,
     /// Stage reverb bytes currently admitted by the callback, including
     /// boxes leased to active voices.
     pub fx_reverb_resident_bytes: AtomicUsize,
@@ -165,7 +185,10 @@ impl SampleChannel {
             reverb_returns: AssetRing::new(),
             fx_reverb_installs: AssetRing::new(),
             fx_reverb_returns: AssetRing::new(),
+            insert_installs: AssetRing::new(),
+            insert_returns: AssetRing::new(),
             fx_reverb_refusals: AtomicU64::new(0),
+            insert_refusals: AtomicU64::new(0),
             fx_reverb_resident_bytes: AtomicUsize::new(0),
             leaked: AtomicU64::new(0),
         }
@@ -182,7 +205,15 @@ impl SampleChannel {
     /// Like [`Self::reclaim`], and `returned_fx` sees each returned stage
     /// reverb before it is freed. The producer uses it to drop the cached
     /// fingerprint of a box that the callback evicted or refused.
-    pub fn reclaim_with_fx(&self, mut returned_fx: impl FnMut(*mut crate::reverb::OrbitReverb)) {
+    pub fn reclaim_with_fx(&self, returned_fx: impl FnMut(*mut crate::reverb::OrbitReverb)) {
+        self.reclaim_with_inserts(returned_fx, |_| {});
+    }
+
+    pub fn reclaim_with_inserts(
+        &self,
+        mut returned_fx: impl FnMut(*mut crate::reverb::OrbitReverb),
+        mut returned_insert: impl FnMut(*mut dyn crate::insert::OrbitInsert),
+    ) {
         while let Some(returned) = self.returns.pop() {
             // SAFETY: the pointer completed the full baton pass - boxed by
             // the producer, installed and displaced by the callback - and
@@ -196,6 +227,11 @@ impl SampleChannel {
         while let Some(returned) = self.fx_reverb_returns.pop() {
             returned_fx(returned.0);
             // SAFETY: same pass for stage reverbs retired by the callback.
+            drop(unsafe { Box::from_raw(returned.0) });
+        }
+        while let Some(returned) = self.insert_returns.pop() {
+            returned_insert(returned.0);
+            // SAFETY: same pass for inserts displaced by the callback.
             drop(unsafe { Box::from_raw(returned.0) });
         }
     }
@@ -219,6 +255,10 @@ impl Drop for SampleChannel {
         while let Some(install) = self.fx_reverb_installs.pop() {
             // SAFETY: never reached the consumer; unique ownership here.
             drop(unsafe { Box::from_raw(install.reverb) });
+        }
+        while let Some(install) = self.insert_installs.pop() {
+            // SAFETY: never reached the consumer. Unique ownership here.
+            drop(unsafe { Box::from_raw(install.insert) });
         }
     }
 }
@@ -366,12 +406,31 @@ mod tests {
         };
         channel.fx_reverb_installs.push(stage).ok().expect("push");
 
+        // An insert goes through its 2 rings as a reverb does.
+        struct Quiet;
+        impl crate::insert::OrbitInsert for Quiet {
+            fn key(&self) -> crate::insert::InsertKey {
+                crate::insert::InsertKey::default()
+            }
+            fn set_param(&mut self, _param: crate::insert::InsertParam, _frames: u32) {}
+            fn process(&mut self, _left: &mut [f32], _right: &mut [f32]) {}
+        }
+        let boxed_insert = || Box::into_raw(Box::new(Quiet) as Box<dyn crate::insert::OrbitInsert>);
+        let insert = InsertInstall {
+            slot: crate::insert::effect_slot(2, 0),
+            sample_rate: 48_000,
+            insert: boxed_insert(),
+        };
+        channel.insert_installs.push(insert).ok().expect("push");
+
         let sample = ReturnedSample(boxed_sample());
         channel.returns.push(sample).ok().expect("push");
         let orbit = ReturnedReverb(boxed_room());
         channel.reverb_returns.push(orbit).ok().expect("push");
         let stage = ReturnedFxReverb(boxed_room());
         channel.fx_reverb_returns.push(stage).ok().expect("push");
+        let insert = ReturnedInsert(boxed_insert());
+        channel.insert_returns.push(insert).ok().expect("push");
         drop(channel); // must not leak (miri/asan would flag)
     }
 }

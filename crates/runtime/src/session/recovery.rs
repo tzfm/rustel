@@ -61,6 +61,18 @@ mod tests {
     #[test]
     fn a_scheduler_panic_restores_the_source_and_next_query_works() {
         let mut session = playing_session();
+        #[cfg(not(feature = "vst"))]
+        let source = GOOD.to_owned();
+        #[cfg(feature = "vst")]
+        let source = {
+            let source = format!("{GOOD}.vst('Delay').orbit(1)");
+            session.evaluate(&source).expect("plugin source");
+            let moved = source.replace("orbit(1)", "orbit(2)");
+            session.reload_at(&moved, false, 0.1).expect("move plugin");
+            moved
+        };
+        #[cfg(feature = "vst")]
+        let chain = super::super::tests::plugin_chain(&session);
         let transport = session.transport();
         let generation = session.generation();
         session.inject_panic_for_test(SessionPanicPoint::Query);
@@ -68,7 +80,9 @@ mod tests {
             .schedule_through(0.25, 0.75)
             .expect_err("scheduler query panics");
         assert_panic(error, "Query");
-        assert_eq!(session.active_source(), Some(GOOD));
+        assert_eq!(session.active_source(), Some(source.as_str()));
+        #[cfg(feature = "vst")]
+        assert_eq!(super::super::tests::plugin_chain(&session), chain);
         assert!(Arc::ptr_eq(&session.transport(), &transport));
         assert!(session.generation() > generation);
         // Recovery resumes after the time the rebuild took, so a slow machine

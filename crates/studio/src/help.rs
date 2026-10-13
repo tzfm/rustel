@@ -40,6 +40,8 @@ pub enum HelpContext {
     SettingsAbout,
     SettingsSources,
     SettingsTrust,
+    #[cfg(feature = "vst")]
+    SettingsVst,
     Log,
     Jobs,
     Export,
@@ -71,6 +73,8 @@ impl HelpContext {
             Self::SettingsAbout => "settings · about",
             Self::SettingsSources => "settings · samples",
             Self::SettingsTrust => "settings · trust",
+            #[cfg(feature = "vst")]
+            Self::SettingsVst => "settings · vst",
             Self::Log => "log",
             Self::Jobs => "background jobs",
             Self::Export => "export",
@@ -110,6 +114,10 @@ impl HelpContext {
             }
             Self::SettingsTrust => {
                 "The origins a score imports scripts from with await import('https://...'). An origin the engine refused is listed until the studio closes."
+            }
+            #[cfg(feature = "vst")]
+            Self::SettingsVst => {
+                "The folders with your VST3 plugins, then the standard folders of the system. The plugin host reads all of them. Rescan after you install a plugin."
             }
             Self::Log => {
                 "The newest studio messages are at the bottom of the log. v shows the running commentary underneath them."
@@ -299,6 +307,12 @@ impl HelpContext {
                     "d · Delete",
                     "remove a trusted origin, or dismiss a refused one",
                 ),
+                ("Tab · Esc", "other pages · close"),
+            ],
+            #[cfg(feature = "vst")]
+            Self::SettingsVst => [
+                ("a / +", "add a folder with VST3 plugins"),
+                ("Enter · d", "do the selected action · remove the folder"),
                 ("Tab · Esc", "other pages · close"),
             ],
             Self::Log => [

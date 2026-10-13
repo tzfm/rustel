@@ -215,11 +215,12 @@ impl App {
         // the space, and a choice that replaced one token would leave the
         // other words of the old name: 'MY MIDI DEVICE' would become
         // 'MY DEVICE2 DEVICE'. For these two roles the whole of the string
-        // is what a choice replaces. Every other vocabulary here is
+        // is what a choice replaces. A plugin name and a preset name have
+        // spaces too, and take the same rule. Every other vocabulary here is
         // deliberately space-free and keeps its token, because a pattern
         // string holds several names and only the one under the caret is
         // the question.
-        if matches!(role, Some(StringRole::MidiIn | StringRole::MidiOut)) {
+        if role.is_some_and(StringRole::whole_string) {
             let inside = start.0 + open + 1;
             let mut close = inside;
             let bytes = source.as_bytes();
@@ -358,6 +359,21 @@ impl App {
                 self.midi_port_names(MidiDirection::In),
                 prefix,
             ),
+            // The plugin host has these 2 lists. The host starts here when
+            // this is its first use: the caret is in a plugin call.
+            #[cfg(feature = "vst")]
+            StringRole::Plugin => {
+                let words = super::super::reference::PluginWords::Names {
+                    instrument: callee == "vsti",
+                };
+                self.plugin_words_panel(words, prefix)
+            }
+            #[cfg(feature = "vst")]
+            StringRole::Preset => {
+                let (plugin, _) = self.plugin_call_at_caret()?;
+                let words = super::super::reference::PluginWords::Presets(plugin);
+                self.plugin_words_panel(words, prefix)
+            }
         };
         Some(panel)
     }
@@ -471,11 +487,10 @@ impl App {
         // A MIDI port is one name with spaces in it, so a choice replaces
         // the whole string rather than a word of it. Saying "the word"
         // there would be a promise about the edit that is not kept.
-        let whole = matches!(
-            self.string_completion_at_caret()
-                .and_then(|(callee, _, _)| self.string_role(&callee)),
-            Some(StringRole::MidiIn | StringRole::MidiOut)
-        );
+        let whole = self
+            .string_completion_at_caret()
+            .and_then(|(callee, _, _)| self.string_role(&callee))
+            .is_some_and(StringRole::whole_string);
         let takes = if whole { "the name" } else { "the word" };
         self.status = match self.string_completion_panel_kind() {
             Some("the sample banks") => format!("the sample banks - Enter replaces {takes}"),
@@ -643,6 +658,11 @@ impl App {
             .worker
             .library()
             .is_none_or(|library| library.manifests_pending() > 0);
+        // In the object of a plugin call the question is a parameter key.
+        #[cfg(feature = "vst")]
+        if self.open_plugin_key_completion() {
+            return;
+        }
         // Inside a call that takes one of our lists but with no string
         // opened yet - `chord(|)` - the question is the same one: the
         // list, and the name goes in quoted.
@@ -673,6 +693,10 @@ impl App {
             self.sync_settings_webcam_preview();
             self.invalidate_maps();
             self.dirty_frame = true;
+            return;
+        }
+        #[cfg(feature = "vst")]
+        if self.open_plugin_parameters() {
             return;
         }
         // A string nothing can complete - a name the score invents - is

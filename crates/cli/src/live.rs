@@ -1220,6 +1220,24 @@ fn report_session_diagnostics(
 }
 
 #[cfg(feature = "device-audio")]
+pub(super) fn live_engine_pressure_detail(
+    pressure: &rustel_runtime::EnginePressureSnapshot,
+    now: Instant,
+    last_underrun_notice: &mut Option<Instant>,
+) -> LiveDetail {
+    if pressure.cause == rustel_runtime::EnginePressureCause::DeviceUnderrun
+        && pressure.callback_xruns > 0
+        && last_underrun_notice
+            .is_none_or(|last| now.duration_since(last) >= std::time::Duration::from_secs(10))
+    {
+        *last_underrun_notice = Some(now);
+        LiveDetail::Essential
+    } else {
+        LiveDetail::Debug
+    }
+}
+
+#[cfg(feature = "device-audio")]
 pub(super) fn live_engine_pressure_event(
     pressure: rustel_runtime::EnginePressureSnapshot,
     context: rustel_runtime::EnginePressureReportContext,
@@ -1228,6 +1246,7 @@ pub(super) fn live_engine_pressure_event(
     let producer = pressure.producer;
     let verdict = match pressure.cause {
         rustel_runtime::EnginePressureCause::Healthy => "healthy",
+        rustel_runtime::EnginePressureCause::DeviceUnderrun => "audio device reported an underrun",
         rustel_runtime::EnginePressureCause::DspOverload => {
             "dsp over budget: one callback's render outran its own buffer"
         }
@@ -1448,6 +1467,8 @@ pub(super) fn play_live(
     )
     .map_err(runtime_device_error)?;
     sync_live_polyphony(session, &device);
+    #[cfg(feature = "vst")]
+    session.attach_plugins(&device);
     // What opened, once: the host, the device, the buffer's real cost.
     output.event(
         LiveDetail::Essential,
@@ -1817,6 +1838,7 @@ pub(super) fn play_live(
     );
     let mut pressure_monitor = EnginePressureMonitor::default();
     let mut pressure_since = Instant::now();
+    let mut last_underrun_notice = None;
     let mut process_monitor = output.enabled(LiveDetail::Debug).then(|| {
         let now = Instant::now();
         let mut monitor = ProcessMonitor::new(now);
@@ -2112,11 +2134,9 @@ pub(super) fn play_live(
         // seconds - so the reload cursor margin is refreshed every tick.
         session.set_continuity_margin(device.continuity_margin_seconds());
 
-        // `RUSTEL_DEBUG_CAPTURE=out.wav` reconstructs the real post-mix output
-        // from the analysis tap, each window placed at its absolute frame so a
-        // gap in the mix shows up as a gap in the file. This is how a glitch
-        // gets attributed: if the capture is clean, the engine handed the
-        // device correct audio and the artifact is downstream of us.
+        // `RUSTEL_DEBUG_CAPTURE=out.wav` captures the pre-master mono tap.
+        // Missed windows stay zero at their absolute frame positions. The tap
+        // excludes master gain, limiting, channel conversion and device output.
         //
         // Bounded, because an unbounded buffer in the live loop is exactly the
         // kind of slow leak that ends a set.
@@ -2135,6 +2155,9 @@ pub(super) fn play_live(
         let elapsed = wall_started.elapsed();
         let mut pushed_ui_ids = Vec::new();
         let mut reverbs = rustel_audio::LiveReverbBatch::default();
+        let mut prepare_audio = |events: &[rustel_audio::AudioEvent]| {
+            rustel_audio::LiveReverbBatch::install_inserts(&device, events);
+        };
         let mut push_audio = |event: rustel_audio::QueuedAudioEvent| {
             let pushed = device.push(event);
             if pushed {
@@ -2170,27 +2193,31 @@ pub(super) fn play_live(
         };
         let step_result = first_install.step(session, |session| {
             if reload {
-                producer.step_with_clock(
+                producer.step_with_clock_and_assets(
                     session,
                     elapsed,
                     || device.render_frontier_seconds(),
                     sample_rate,
                     &mut set_generation,
+                    &mut prepare_audio,
                     &mut push_audio,
                 )
             } else if ui_events_enabled || device.generation() != session.generation() {
-                producer.step_unwatched_with_clock_and_cutover(
+                producer.step_unwatched_with_assets(
                     session,
                     || device.render_frontier_seconds(),
                     sample_rate,
                     &mut set_generation,
+                    &mut prepare_audio,
                     &mut push_audio,
                 )
             } else {
-                producer.step_unwatched_with_clock(
+                producer.step_unwatched_with_assets(
                     session,
                     || device.render_frontier_seconds(),
                     sample_rate,
+                    |_, _, _| {},
+                    &mut prepare_audio,
                     &mut push_audio,
                 )
             }
@@ -2201,6 +2228,7 @@ pub(super) fn play_live(
         // settings are now the Session's; rejected evaluations keep the old one.
         sync_live_polyphony(session, &device);
 
+        // Retry pending inserts even when this turn scheduled no batch.
         let reverb_preparation_started = Instant::now();
         reverbs.flush(&device);
         producer.record_asset_preparation(reverb_preparation_started.elapsed());
@@ -2516,20 +2544,21 @@ pub(super) fn play_live(
 
         producer.complete_turn(trace_started.elapsed());
         if pressure_since.elapsed() >= Duration::from_secs(1) {
-            if output.enabled(LiveDetail::Debug) {
-                let device_report = device.report();
-                let producer_report = producer.producer_load_snapshot();
-                let buffer_frames = device
-                    .reported_buffer_frames()
-                    .unwrap_or_else(|| device.requested_buffer_frames());
-                let pressure =
-                    pressure_monitor.sample(device_report, producer_report, buffer_frames);
+            let device_report = device.report();
+            let producer_report = producer.producer_load_snapshot();
+            let buffer_frames = device
+                .reported_buffer_frames()
+                .unwrap_or_else(|| device.requested_buffer_frames());
+            let pressure = pressure_monitor.sample(device_report, producer_report, buffer_frames);
+            let detail =
+                live_engine_pressure_detail(&pressure, Instant::now(), &mut last_underrun_notice);
+            if output.enabled(detail) {
                 let process = process_monitor
                     .as_mut()
                     .map(|monitor| monitor.sample(Instant::now()))
                     .unwrap_or_default();
                 output.event(
-                    LiveDetail::Debug,
+                    detail,
                     live_engine_pressure_event(
                         pressure,
                         EnginePressureReportContext {
@@ -3094,6 +3123,7 @@ pub(super) fn play_live(
         "max_callback_gap_ms": report.max_callback_gap_nanos as f64 / 1e6,
                 "refused_voices": report.refused_voices,
                 "callback_errors": report.callback_errors,
+                "callback_xruns": report.callback_xruns,
                 "callback_scope_misses": report.callback_scope_misses,
                 "callback_allocations": report.callback_allocations,
                 "callback_frees": report.callback_frees,
@@ -3135,6 +3165,7 @@ fn live_device_report_value(report: rustel_audio::LiveDeviceReport) -> serde_jso
         "max_callback_gap_ms": report.max_callback_gap_nanos as f64 / 1e6,
         "refused_voices": report.refused_voices,
         "callback_errors": report.callback_errors,
+        "callback_xruns": report.callback_xruns,
         "callback_scope_misses": report.callback_scope_misses,
         "callback_allocations": report.callback_allocations,
         "callback_frees": report.callback_frees,

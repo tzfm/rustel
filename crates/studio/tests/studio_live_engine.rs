@@ -722,6 +722,259 @@ fn a_direct_slider_after_pitch_transforms_updates_sustained_audio_before_the_nex
     engine.stop(Duration::from_millis(200)).expect("stop");
 }
 
+/// The fixture plugin in a new folder, as the only plugin folder of the
+/// process: no test here reads the plugins of the machine. A new folder is
+/// a new bundle for the host, so each call gives a plugin not yet loaded.
+#[cfg(feature = "vst")]
+fn fixture_plugins() -> tempfile::TempDir {
+    let folder = tempfile::tempdir().unwrap();
+    rustel_vst3_fixture::install(folder.path());
+    rustel_runtime::vst::pin_standard_folders(vec![folder.path().to_path_buf()]);
+    folder
+}
+
+/// A live note goes through its plugin. The plugin is the fixture gain, and
+/// the notes never stop: a silent set at gain 0 is the plugin at work. The
+/// first notes play dry while the plugin loads on its own thread.
+#[cfg(feature = "vst")]
+#[test]
+fn a_live_note_plays_through_its_plugin() {
+    let _engine = one_engine();
+    let _plugins = fixture_plugins();
+    let mut engine = silent_engine();
+    let score = |gain: u8| {
+        format!("note('c3').s('sine').vst('rustel fixture', {{ gain: {gain} }}).fast(8)")
+    };
+    engine
+        .evaluate_and_start(&score(1), false)
+        .expect("score with a plugin");
+    let master = engine.master_bus();
+    let until = |engine: &mut StudioEngine, what: &str, reached: fn(f32) -> bool| {
+        let started = Instant::now();
+        loop {
+            let mut peak = 0.0_f32;
+            tick_for(engine, Duration::from_millis(300), &mut || {
+                peak = peak.max(master.take_levels().peak);
+            });
+            if reached(peak) {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(20), "{what}");
+        }
+    };
+    until(&mut engine, "the set did not sound", |peak| peak > 0.05);
+    engine.evaluate(&score(0), false).expect("gain 0");
+    until(&mut engine, "the notes did not reach the plugin", |peak| {
+        peak == 0.0
+    });
+    engine.evaluate(&score(1), false).expect("gain 1");
+    until(
+        &mut engine,
+        "the plugin did not take the new gain",
+        |peak| peak > 0.05,
+    );
+    // The plugin is loaded, so the check of a score names a key that is no
+    // parameter of the plugin.
+    let wrong = "note('c3').vst('rustel fixture', { gian: 1, gain: 1 })";
+    let marks = rustel_runtime::lint::lint(wrong, false, None);
+    let messages: Vec<&str> = marks.iter().map(|mark| mark.message.as_str()).collect();
+    assert_eq!(
+        messages,
+        ["Rustel Fixture has no parameter \"gian\" - did you mean \"gain\"?"]
+    );
+    engine.stop(Duration::from_millis(200)).expect("stop");
+}
+
+/// In the wait mode a start holds its downbeat, and an edit keeps the last
+/// score, until the plugin of the score is ready. The plugin is the fixture
+/// at gain 0 and the last score is silent, so each note with no plugin is
+/// heard. The load of the plugin takes 600 ms, as the load of a large plugin
+/// does. In the async mode the first notes play dry.
+#[cfg(feature = "vst")]
+#[test]
+fn a_wait_start_and_a_wait_edit_play_no_note_before_their_plugin() {
+    use rustel_studio::settings::LoadMode;
+    let _engine = one_engine();
+    // The plugin thread reads a variable of the process when it loads or
+    // builds the fixture.
+    let no_plugin_work = || {
+        if let Some(host) = rustel_runtime::vst::started() {
+            host.wait_idle();
+        }
+    };
+    // The fixture loads in a few ms. A slow load shows the 2 modes.
+    no_plugin_work();
+    // SAFETY: one engine test runs at a time, and the plugin thread has no
+    // work. So no other thread of this process reads a variable now.
+    unsafe { std::env::set_var(rustel_vst3_fixture::SLOW_ENV, "600") };
+    let score = "note('c3').s('sine').vst('rustel fixture', { gain: 0 }).fast(8)";
+    // The peak of the window, the cycle of the first onset, and if the
+    // engine held the start or the edit.
+    let heard = |mode: LoadMode, edit: bool| {
+        let _plugins = fixture_plugins();
+        let mut engine = silent_engine();
+        let master = engine.master_bus();
+        master.set_load_mode(mode);
+        let held = if edit {
+            engine
+                .evaluate_and_start("silence", false)
+                .expect("a start");
+            tick_for(&mut engine, Duration::from_millis(300), &mut || {});
+            let held = engine.hold_update(score, false, false);
+            if !held {
+                engine.evaluate(score, false).expect("an edit");
+            }
+            held
+        } else {
+            engine.evaluate_and_start(score, false).expect("a start");
+            let cue = engine.snapshot().loading;
+            cue.is_some_and(|cue| cue.waiting && cue.plugins == 1)
+        };
+        let (mut peak, mut first_onset) = (0.0_f32, None);
+        let onset_at = std::cell::Cell::new(None);
+        // The load of the plugin takes 600 ms, and the held start or edit
+        // lands after it: a slow machine needs more
+        // than a fixed window for that, so the window ends at its
+        // deadline, or 400 ms past the first onset. A note with no plugin
+        // lands in that time or never.
+        tick_with(
+            &mut engine,
+            Duration::from_secs(8),
+            &mut |update| {
+                let seen = first_onset.is_some();
+                note_first_onset(&mut first_onset, update);
+                if !seen && first_onset.is_some() {
+                    onset_at.set(Some(Instant::now()));
+                }
+            },
+            &mut |_| {
+                peak = peak.max(master.take_levels().peak);
+                onset_at
+                    .get()
+                    .is_some_and(|at| at.elapsed() >= Duration::from_millis(400))
+            },
+        );
+        let landed = !held || !edit || matches!(engine.take_launch_outcome(), Some(Ok(_)));
+        engine.stop(Duration::from_millis(200)).expect("stop");
+        (peak, first_onset, held && landed)
+    };
+    let (peak, first_onset, held) = heard(LoadMode::Wait, false);
+    assert!(held, "the start waits, and the header counts 1 plugin");
+    assert_eq!(peak, 0.0, "a note of the start played with no plugin");
+    assert_eq!(first_onset, Some(0.0), "the start began on cycle 0");
+    let (peak, _, held) = heard(LoadMode::Wait, true);
+    assert!(held, "the edit waits for the load, then lands");
+    assert_eq!(peak, 0.0, "a note of the edit played with no plugin");
+    for edit in [false, true] {
+        let (peak, _, held) = heard(LoadMode::Async, edit);
+        assert!(!held && peak > 0.05, "async, edit {edit}: peak {peak}");
+    }
+    no_plugin_work();
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_ENV) };
+}
+
+/// The idle sweep unloads a plugin no tab names, after the output of its
+/// score closed. A tab with the plugin name keeps the plugin loaded across
+/// the sweep.
+#[cfg(feature = "vst")]
+#[test]
+fn the_idle_sweep_unloads_a_plugin_no_tab_names() {
+    use rustel_runtime::vst;
+    use rustel_studio::engine::LiveMaterial;
+    let _engine = one_engine();
+    let _plugins = fixture_plugins();
+    let mut engine = silent_engine_with(StudioConfig {
+        unused_sample_idle: Duration::from_millis(1),
+        ..StudioConfig::default()
+    });
+    let loaded = || {
+        let plugins = vst::host().plugins();
+        plugins
+            .iter()
+            .any(|plugin| plugin.status == vst::Status::Ready)
+    };
+    // Plays `score` from its tab, stops, and runs the idle sweep of the
+    // stopped studio. True when the sweep left the fixture loaded.
+    let mut play_and_sweep = |score: &str| {
+        engine.set_live_material(&LiveMaterial {
+            pinned: vec![score.into()],
+            ..LiveMaterial::default()
+        });
+        engine.evaluate_and_start(score, false).expect("a start");
+        tick_for(&mut engine, Duration::from_millis(200), &mut || {});
+        let _ = engine.stop(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(5));
+        engine.idle_turn(accepted_update);
+        // The plugin thread ends its load and the unload of the sweep.
+        vst::host().wait_idle();
+        loaded()
+    };
+    let with_plugin = "note('c3').s('sine').vst('rustel fixture')";
+    assert!(play_and_sweep(with_plugin), "a tab names the plugin");
+    assert!(!play_and_sweep("note('c3').s('sine')"), "no tab does");
+}
+
+/// An edit that leaves a plugin call as it is keeps the copy of the call.
+/// A lane above gives the plugin lane a new number, and a mute of that lane
+/// gives the number back: no note plays with no plugin, and no new copy is
+/// built. The plugin is the fixture at gain 0, so a note with no plugin is
+/// heard. A lane that leaves the score gives its copy back.
+#[cfg(feature = "vst")]
+#[test]
+fn a_plugin_lane_keeps_its_copy_through_edits_above_and_gives_it_back_at_its_end() {
+    use rustel_runtime::vst;
+    use rustel_studio::settings::LoadMode;
+    let _engine = one_engine();
+    let _plugins = fixture_plugins();
+    let mut engine = silent_engine();
+    let master = engine.master_bus();
+    // No wait hides a new copy here: a note of a chain with no copy plays
+    // dry at once.
+    master.set_load_mode(LoadMode::Async);
+    let lane = "$: note('c3').s('sine').vst('rustel fixture', { gain: 0 }).fast(8)";
+    engine.evaluate_and_start(lane, false).expect("a start");
+    let copies = || -> usize {
+        let plugins = vst::host().plugins();
+        plugins.iter().map(|plugin| plugin.running).sum()
+    };
+    let peak_of = |engine: &mut StudioEngine, window: u64| {
+        let mut peak = 0.0_f32;
+        tick_for(engine, Duration::from_millis(window), &mut || {
+            peak = peak.max(master.take_levels().peak);
+        });
+        peak
+    };
+    // The first notes play dry while the plugin loads.
+    let started = Instant::now();
+    while peak_of(&mut engine, 300) > 0.0 || copies() != 1 {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the plugin did not take the lane"
+        );
+    }
+    let above = format!("$: note('c5').s('sine').gain(0)\n{lane}");
+    let muted = format!("_$: note('c5').s('sine').gain(0)\n{lane}");
+    for edit in [above.as_str(), muted.as_str(), lane, above.as_str()] {
+        engine.evaluate(edit, false).expect("an edit");
+        assert_eq!(peak_of(&mut engine, 800), 0.0, "a dry note after: {edit}");
+        assert_eq!(copies(), 1, "{edit}");
+    }
+    // The plugin lane leaves the score: its copy ends after the tail.
+    engine
+        .evaluate("$: note('c5').s('sine').gain(0)", false)
+        .expect("a score with no plugin");
+    let started = Instant::now();
+    while copies() > 0 {
+        peak_of(&mut engine, 300);
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the copy of the removed lane stays"
+        );
+    }
+    engine.stop(Duration::from_millis(200)).expect("stop");
+}
+
 /// What the audition slot heard over a window, and the most voices the
 /// device held at once while it played: the two things the headless
 /// harness can see of a preview.

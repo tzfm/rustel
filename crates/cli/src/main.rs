@@ -21,7 +21,7 @@ use rustel_runtime::CapabilitySafetyFacts;
 use rustel_runtime::ScoreOscAccess;
 use rustel_runtime::{
     AccelerationPreference, CapabilityReportContext, CapabilityReportV1, RenderFormat,
-    RuntimeError, ScoreSampleAccess, Session, SessionConfig, product, sample_cache_dir,
+    RuntimeError, ScoreSampleAccess, Session, SessionConfig, out, outln, product, sample_cache_dir,
     terminal_text,
 };
 
@@ -54,6 +54,7 @@ mod devices;
 mod live;
 mod replay;
 mod sample_cache;
+mod vst;
 
 use completions::{install_completions, run_completions, shell_from_environment};
 #[cfg(all(test, feature = "device-audio"))]
@@ -83,8 +84,9 @@ use live::sync_live_midi_inputs;
 use live::take_tick_intents;
 #[cfg(all(test, feature = "device-audio"))]
 use live::{
-    apply_ui_slider_control, build_live_producer, install_sample_batch, live_engine_pressure_event,
-    observe_ui_layout_if_audible, runtime_device_error,
+    apply_ui_slider_control, build_live_producer, install_sample_batch,
+    live_engine_pressure_detail, live_engine_pressure_event, observe_ui_layout_if_audible,
+    runtime_device_error,
 };
 use live::{play, play_live, run_musician, watch_file};
 #[cfg(feature = "device-audio")]
@@ -918,6 +920,37 @@ enum Command {
         /// Emit raw JSON instead of the human-readable list, for scripting.
         #[arg(short = 'j', long)]
         json: bool,
+    },
+    /// List the VST3 plugins `.vst()` finds, or one plugin with its parameters.
+    ///
+    ///     rustel vst                # every plugin found
+    ///     rustel vst supermassive   # one plugin: parameters and presets
+    ///     rustel vst serum "osc a"  # the parameters of one group
+    ///     rustel vst --rescan       # read each plugin again
+    ///
+    /// The first run reads each plugin bundle in a process of its own and
+    /// keeps the plugin names in a scan cache. A bundle with the same files
+    /// gets no new read. A name loads that one plugin. A part of a name is
+    /// enough when one plugin only has that part. Plugin folders: the
+    /// standard VST3 folders of the system, or the folders in
+    /// `RUSTEL_VST3_PATH` when set.
+    Vst {
+        /// Plugin to load.
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+        /// Show the parameters with this word in their group, name or key.
+        #[arg(value_name = "FILTER", requires = "name")]
+        filter: Option<String>,
+        /// Emit raw JSON instead of the human-readable list, for scripting.
+        #[arg(short = 'j', long)]
+        json: bool,
+        /// Empty the scan cache and read each plugin bundle again.
+        #[arg(long, conflicts_with = "worker")]
+        rescan: bool,
+        /// Internal: run this bundle for the host that started this
+        /// process. Each plugin bundle runs in a process of its own.
+        #[arg(long, hide = true, value_name = "BUNDLE", conflicts_with = "name")]
+        worker: Option<PathBuf>,
     },
     /// Report the binary, CPU, runtime tiers, selected capabilities, and audio facts.
     Doctor {
@@ -1766,6 +1799,10 @@ fn main() -> ExitCode {
     let outcome = worker
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    // The outputs of the run ended with the worker. The plugins end before
+    // the process does.
+    #[cfg(feature = "vst")]
+    rustel_runtime::vst::shutdown();
     // The run is over; a console handler standing in front of the process
     // exit on our behalf can stand down.
     #[cfg(windows)]
@@ -1841,7 +1878,7 @@ fn run() -> Result<(), RuntimeError> {
         Cli::command()
             .print_help()
             .map_err(|error| RuntimeError::Message(error.to_string()))?;
-        println!();
+        outln!();
         return Ok(());
     }
     let cli = Cli::try_parse_from(&args).unwrap_or_else(|mut error| {
@@ -1859,7 +1896,13 @@ fn run() -> Result<(), RuntimeError> {
         cli.no_color || cli.plain,
         std::sync::atomic::Ordering::Relaxed,
     );
-    // One switch for the whole run, read once from the parsed line.
+    // The scan reads each bundle in a process of its own, so a plugin fault
+    // at the read does not end this one. The audio of a plugin runs in this
+    // process: a chain of plugins then costs its plugins and no more.
+    #[cfg(feature = "vst")]
+    if let Ok(program) = std::env::current_exe() {
+        rustel_runtime::vst::set_worker(program, vec!["vst".into(), "--worker".into()]);
+    }
     let json = cli.wants_json();
     JSON_MODE.store(json, std::sync::atomic::Ordering::Relaxed);
     rustel_runtime::set_progress_json(json);
@@ -1867,7 +1910,7 @@ fn run() -> Result<(), RuntimeError> {
     let dispatch = cli.acceleration.dispatch();
     let check_updates = cli.checks_for_updates(
         std::io::stdin().is_terminal()
-            && std::io::stdout().is_terminal()
+            && rustel_runtime::stdio::out().is_terminal()
             && std::io::stderr().is_terminal(),
         std::env::var_os("CI").is_some_and(|value| !value.is_empty()),
     );
@@ -1898,6 +1941,25 @@ fn live_output_options(
     }
 }
 
+/// A file path that names the standard output of the process, as
+/// `/dev/stdout` does, opens the null device after the move of that output.
+/// The path of the kept copy takes its place, so a render still goes down a
+/// pipe.
+#[cfg(all(unix, feature = "vst", not(test)))]
+fn with_output_kept(mut command: Command) -> Command {
+    if let Command::Render {
+        output: Some(path), ..
+    }
+    | Command::Replay {
+        export: Some(path), ..
+    } = &mut command
+        && let Some(kept) = rustel_runtime::stdio::path_to_out(path)
+    {
+        *path = kept;
+    }
+    command
+}
+
 /// Keep the live callback on the accepted Session setting without reopening it.
 #[cfg(feature = "device-audio")]
 fn sync_live_polyphony(session: &Session, device: &rustel_audio::LiveScalarDevice) {
@@ -1917,13 +1979,33 @@ fn run_command(
             _ => rustel_runtime::updates::check_for_updates(|message| eprintln!("{message}")),
         }
     }
+    // A plugin prints when it wants. A command that hosts plugins keeps its
+    // output for itself, and the standard output of the process goes to the
+    // null device: see `rustel_runtime::stdio`. A test calls this function
+    // in the process of the test runner, which reports on that output.
+    #[cfg(all(feature = "vst", not(test)))]
+    let command = if matches!(
+        command,
+        Command::Play(_)
+            | Command::Render { .. }
+            | Command::Trace { .. }
+            | Command::Replay { .. }
+            | Command::Vst { worker: None, .. }
+    ) {
+        #[cfg(unix)]
+        let command = with_output_kept(command);
+        rustel_runtime::stdio::keep_clear();
+        command
+    } else {
+        command
+    };
     match command {
         Command::Play(musician) => run_musician(*musician, verbosity, dispatch),
         Command::Config { command } => {
             match command {
                 ConfigCommand::Get {
                     key: ConfigKey::CheckUpdates,
-                } => println!("{}", rustel_runtime::settings::check_updates()?),
+                } => outln!("{}", rustel_runtime::settings::check_updates()?),
                 ConfigCommand::Set {
                     key: ConfigKey::CheckUpdates,
                     value,
@@ -1964,7 +2046,7 @@ fn run_command(
             }
             if probe_terminal {
                 let features = rustel_studio::terminal::probe_terminal();
-                println!(
+                outln!(
                     "{}",
                     serde_json::json!({
                         "terminal": features.name,
@@ -1981,7 +2063,7 @@ fn run_command(
                 return Ok(());
             }
             if list_themes {
-                println!(
+                outln!(
                     "{}",
                     serde_json::json!({
                         "themes": rustel_studio::theme::Theme::available_names(),
@@ -2000,6 +2082,10 @@ fn run_command(
                 mode: save_session.unwrap_or(SessionModeArg::Normal).into(),
                 file: session_file,
             });
+            // Studio knows each plugin by name before the first use. The
+            // scan runs in the background and costs the start no time.
+            #[cfg(feature = "vst")]
+            rustel_runtime::vst::scan_in_background();
             rustel_studio::run(rustel_studio::StudioOptions {
                 path: file,
                 mini,
@@ -2030,7 +2116,7 @@ fn run_command(
                 rustel_runtime::clear_score_sample_cache().map_err(RuntimeError::Message)?;
                 if empty { "empty" } else { "cleared" }
             };
-            println!(
+            outln!(
                 "{}",
                 serde_json::json!({
                     "score_sample_cache": {
@@ -2063,6 +2149,13 @@ fn run_command(
         ),
         Command::GamepadMonitor { duration } => run_gamepad_monitor(duration),
         Command::Devices { json } => run_devices(json),
+        Command::Vst {
+            name,
+            filter,
+            json,
+            rescan,
+            worker,
+        } => vst::run_vst(name.as_deref(), filter.as_deref(), json, rescan, worker),
         Command::Doctor { json } => run_doctor(json, dispatch),
         #[cfg(feature = "studio")]
         Command::Doc { name, json } => run_doc(&name, json),
@@ -2194,7 +2287,7 @@ fn run_command(
             };
             if json {
                 for diagnostic in diagnostics {
-                    println!(
+                    outln!(
                         "{}",
                         serde_json::json!({
                             "check": {
@@ -2208,7 +2301,7 @@ fn run_command(
                     );
                 }
                 if let Some(eval_error) = &check.eval_error {
-                    println!(
+                    outln!(
                         "{}",
                         serde_json::json!({
                             "check": {
@@ -2220,12 +2313,12 @@ fn run_command(
                     );
                 }
                 if !has_issues {
-                    println!("{}", serde_json::json!({ "check": { "status": "ok" } }));
+                    outln!("{}", serde_json::json!({ "check": { "status": "ok" } }));
                 }
             } else {
                 let on = style::stdout_on();
                 if !has_issues {
-                    println!("{}", style::green(on, "✓ no issues found"));
+                    outln!("{}", style::green(on, "✓ no issues found"));
                 } else {
                     for diagnostic in diagnostics {
                         let badge = match diagnostic.level {
@@ -2239,7 +2332,7 @@ fn run_command(
                                 style::cyan(on, level_name(diagnostic.level))
                             }
                         };
-                        println!(
+                        outln!(
                             "{} {} {}",
                             badge,
                             style::dim(on, &format!("line {}", line_of(diagnostic.from))),
@@ -2250,20 +2343,20 @@ fn run_command(
                         let badge = style::red(on, "error");
                         let message = style::safe_source(&eval_error.message);
                         match eval_error.line {
-                            Some(line) => println!(
+                            Some(line) => outln!(
                                 "{} {} {}",
                                 badge,
                                 style::dim(on, &format!("line {line}")),
                                 message
                             ),
-                            None => println!("{} {}", badge, message),
+                            None => outln!("{} {}", badge, message),
                         }
                     }
                     if has_issues {
                         let total = problems + usize::from(check.eval_error.is_some());
-                        println!("{}", style::red(on, &format!("{total} issue(s) found")));
+                        outln!("{}", style::red(on, &format!("{total} issue(s) found")));
                     } else {
-                        println!(
+                        outln!(
                             "{}",
                             style::cyan(
                                 on,
@@ -2329,7 +2422,7 @@ fn run_command(
                 );
             }
             if json {
-                println!(
+                outln!(
                     "{}",
                     serde_json::to_string_pretty(&report).map_err(json_err)?
                 );
@@ -2410,13 +2503,13 @@ fn run_command(
             let duration = parse_positive_seconds("duration", duration)?;
             let report = play(&mut session, duration, device_audio)?;
             if json {
-                println!(
+                outln!(
                     "{}",
                     serde_json::to_string_pretty(&report).map_err(json_err)?
                 );
             } else {
                 let on = style::stdout_on();
-                println!(
+                outln!(
                     "{} {:.3} s at {} cps through {}, {} onsets",
                     style::green(on, "played"),
                     report.duration_secs,
@@ -2506,7 +2599,7 @@ fn run_command(
             }
             let report = session.render(duration, &output, format.into())?;
             if json_asked() {
-                println!(
+                outln!(
                     "{}",
                     serde_json::to_string_pretty(&report).map_err(json_err)?
                 );
@@ -2520,7 +2613,7 @@ fn run_command(
                     RenderCliFormat::OnsetJson => "onset JSON",
                     RenderCliFormat::Wav => "silent WAV",
                 };
-                println!(
+                outln!(
                     "{} {} - {:.1} s, {} cycles{}, {} at {} Hz, {} onset{}",
                     style::green(on, "wrote"),
                     style::bold(on, &report.path),
@@ -2533,7 +2626,7 @@ fn run_command(
                     if report.onset_count == 1 { "" } else { "s" },
                 );
                 if until_silence {
-                    println!(
+                    outln!(
                         "{}",
                         style::dim(
                             on,
@@ -2567,13 +2660,13 @@ fn run_command(
             let end = parse_fraction(&end)?;
             let metrics = session.bench(begin, end, iterations)?;
             if json {
-                println!(
+                outln!(
                     "{}",
                     serde_json::to_string_pretty(&metrics).map_err(json_err)?
                 );
             } else {
                 let on = style::stdout_on();
-                println!(
+                outln!(
                     "{} queries in {:.3} s - {} queries/s, {} haps/s, {} haps a query",
                     style::bold(on, &metrics.iterations.to_string()),
                     metrics.elapsed_secs,
@@ -2596,7 +2689,7 @@ fn run_command(
                 None => "<eval>".into(),
             };
             if json {
-                println!(
+                outln!(
                     "{}",
                     serde_json::json!({
                         "validate": { "status": "valid", "source": source_name }
@@ -2604,7 +2697,7 @@ fn run_command(
                 );
             } else {
                 let on = style::stdout_on();
-                println!(
+                outln!(
                     "{} {}",
                     style::green(on, "✓ valid"),
                     style::dim(on, &source_name)
@@ -2691,14 +2784,14 @@ fn run_doc(name: &str, json: bool) -> Result<(), RuntimeError> {
             "tags": entry.tags,
             "origin": entry.origin,
         });
-        println!(
+        outln!(
             "{}",
             serde_json::to_string_pretty(&value).expect("the entry serializes")
         );
         return Ok(());
     }
     for line in entry_body(&entry, 100) {
-        println!("{}", line.text);
+        outln!("{}", line.text);
     }
     Ok(())
 }
@@ -3509,7 +3602,7 @@ mod parse_fraction_tests {
 /// to find out.
 fn print_query_report(report: &rustel_runtime::QueryReport) {
     let on = style::stdout_on();
-    println!("{}", style::dim(on, &style::safe_source(&report.source)));
+    outln!("{}", style::dim(on, &style::safe_source(&report.source)));
     // The spans are rationals of wildly different widths - `0/1` beside
     // `11/16` - so the arrow only lines up if the column is measured first.
     let width = report
@@ -3527,7 +3620,7 @@ fn print_query_report(report: &rustel_runtime::QueryReport) {
         // The span is padded before it is painted: an escape has no width on
         // screen but plenty in a format string, and `{:width$}` counts bytes.
         let span = format!("{:width$}", span_text(hap));
-        println!(
+        outln!(
             "{onset} {span}  {value}",
             onset = style::dim(on, onset),
             span = style::cyan(on, &span),
@@ -3536,7 +3629,7 @@ fn print_query_report(report: &rustel_runtime::QueryReport) {
     }
     let count = report.haps.len();
     let plural = if count == 1 { "event" } else { "events" };
-    println!(
+    outln!(
         "{}",
         style::dim(
             on,
@@ -4567,7 +4660,14 @@ mod live_output_contract_tests {
     #[cfg(feature = "device-audio")]
     #[test]
     fn live_pressure_event_keeps_legacy_load_and_adds_the_v1_projection() {
-        let mut pressure = rustel_runtime::EnginePressureSnapshot::default();
+        use std::time::{Duration, Instant};
+
+        let mut pressure = rustel_runtime::EnginePressureSnapshot {
+            cause: rustel_runtime::EnginePressureCause::DeviceUnderrun,
+            callback_xruns: 1,
+            ..Default::default()
+        };
+        pressure.device.callback_xruns = 3;
         pressure.device.stream_id = 42;
         pressure.device.realtime_load.publication = 1;
         pressure.device.realtime_load.sample_rate_hz = 48_000;
@@ -4587,11 +4687,61 @@ mod live_output_contract_tests {
         );
         assert_eq!(event["live_load"]["producer_busy"], 0.125);
         assert_eq!(event["live_load"]["steps"], 64);
+        assert_eq!(
+            event["live_load"]["verdict"],
+            "audio device reported an underrun"
+        );
+        assert_eq!(
+            event["engine_pressure"]["status"]["cause"],
+            "device_underrun"
+        );
+        assert_eq!(event["engine_pressure"]["dsp"]["callback_xruns"], 3);
+        assert_eq!(event["engine_pressure"]["dsp"]["recent_callback_xruns"], 1);
         assert_eq!(event["engine_pressure"]["schema_version"], 1);
         assert_eq!(event["engine_pressure"]["device"]["name"], "silent");
         assert_eq!(
             event["engine_pressure"]["process"],
             serde_json::json!({ "cpu_percent": 12.5, "resident_bytes": 1_024 })
+        );
+
+        let now = Instant::now();
+        let mut last_notice = None;
+        let output = LiveOutput::new(0, false, false);
+        let detail = live_engine_pressure_detail(&pressure, now, &mut last_notice);
+        let line = output
+            .render(detail, &event)
+            .expect("the default CLI warns");
+        assert!(line.contains("audio device underrun"), "{line}");
+
+        pressure.callback_xruns = 0;
+        let detail =
+            live_engine_pressure_detail(&pressure, now + Duration::from_secs(1), &mut last_notice);
+        assert!(
+            output.render(detail, &event).is_none(),
+            "a held cause is quiet"
+        );
+
+        pressure.callback_xruns = 1;
+        let detail =
+            live_engine_pressure_detail(&pressure, now + Duration::from_secs(2), &mut last_notice);
+        assert!(
+            output.render(detail, &event).is_none(),
+            "a new burst is throttled"
+        );
+        assert!(
+            LiveOutput::new(2, false, false)
+                .render(detail, &event)
+                .is_some()
+        );
+        assert_eq!(
+            live_engine_pressure_detail(&pressure, now + Duration::from_secs(10), &mut last_notice,),
+            LiveDetail::Essential
+        );
+
+        pressure.cause = rustel_runtime::EnginePressureCause::DspOverload;
+        assert_eq!(
+            live_engine_pressure_detail(&pressure, now + Duration::from_secs(20), &mut last_notice,),
+            LiveDetail::Debug
         );
     }
 

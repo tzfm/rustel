@@ -23,20 +23,38 @@ fn query(runtime: &JsRuntime) -> Vec<Hap> {
 
 #[test]
 fn direct_gain_lpf_and_lpq_follow_distinct_native_cells() {
-    let runtime = runtime();
-    evaluate(
-        &runtime,
-        "s('sine').gain(sliderWithID('gain', .5)).lpf(sliderWithID('filter', 800, 100, 4000)).lpq(sliderWithID('q', 2, 1, 8))",
-    );
-    let gain = runtime.slider_binding("gain").unwrap();
-    let cutoff = runtime.slider_binding("filter").unwrap();
-    let q = runtime.slider_binding("q").unwrap();
-    assert_ne!(gain, cutoff);
-    assert_ne!(cutoff, q);
-    assert_eq!(query(&runtime)[0].live_controls, [gain, cutoff, q]);
-    assert!(runtime.set_slider_value("gain", 0.75).unwrap());
-    assert_eq!(runtime.slider_binding("gain"), Some(gain));
-    assert_eq!(query(&runtime)[0].live_controls, [gain, cutoff, q]);
+    // A lane label and a plugin call keep the bindings of the line.
+    for (lane, plugin) in [
+        ("", ""),
+        ("$: ", ""),
+        ("lead: ", ""),
+        ("$: ", ".vsti('tone')"),
+    ] {
+        let runtime = runtime();
+        evaluate(
+            &runtime,
+            &format!(
+                "{lane}s('sine').gain(sliderWithID('gain', .5)).lpf(sliderWithID('filter', 800, 100, 4000)).lpq(sliderWithID('q', 2, 1, 8)){plugin}"
+            ),
+        );
+        let gain = runtime.slider_binding("gain").unwrap();
+        let cutoff = runtime.slider_binding("filter").unwrap();
+        let q = runtime.slider_binding("q").unwrap();
+        assert_ne!(gain, cutoff);
+        assert_ne!(cutoff, q);
+        assert_eq!(
+            query(&runtime)[0].live_controls,
+            [gain, cutoff, q],
+            "{lane}{plugin}"
+        );
+        assert!(runtime.set_slider_value("gain", 0.75).unwrap());
+        assert_eq!(runtime.slider_binding("gain"), Some(gain));
+        assert_eq!(
+            query(&runtime)[0].live_controls,
+            [gain, cutoff, q],
+            "{lane}{plugin}"
+        );
+    }
 }
 
 #[test]
