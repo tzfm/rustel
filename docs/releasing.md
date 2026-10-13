@@ -72,7 +72,10 @@ gh pr create --title "Prepare the v0.1.2 release" --body "Version 0.1.2 and its 
 
 The name and the e-mail address in the first output become public. `main`
 accepts changes only through a pull request, so a push to `main` fails. Merge
-the pull request when the checks pass.
+the pull request with a squash merge when the checks pass. The repository
+allows no other merge. The release commit changes `Cargo.toml` and
+`Cargo.lock`, so the full check matrix runs. The markdown-only skip does not
+apply.
 
 ## 6. Tag the merged commit
 
@@ -86,7 +89,9 @@ git push origin v0.1.2
 ```
 
 `git log` shows the release pull request as the last commit. `git ls-remote`
-prints nothing. Never move or delete a tag after the push. To correct a
+prints nothing. The repository restricts new tag refs. The owner push prints
+a bypass notice and goes through. A tag push from another account fails.
+Never move or delete a tag after the push. To correct a
 release, make a new patch release.
 
 ## 7. Check the release
