@@ -23,9 +23,6 @@ Open a new terminal, then:
 rustelup
 ```
 
-In PowerShell with the default execution policy (`Restricted`), run
-`rustelup.cmd`. The installer prints this hint when it applies.
-
 This downloads the newest release build for your platform into
 `~/.rustel/bin` (`%USERPROFILE%\.rustel\bin` on Windows) and puts it on
 your PATH. Linux x86_64, Linux aarch64 (Raspberry Pi), macOS on Apple
@@ -93,9 +90,14 @@ with no option to return to the newest release.
 | `~/.rustel/bin/rustel` | the engine |
 | `~/.rustel/bin/rustel.exe` | the engine on Windows |
 | `~/.rustel/bin/rustelup` | the Unix updater |
-| `~/.rustel/bin/rustelup.ps1` | the Windows updater |
 | `~/.rustel/bin/rustelup.cmd` | Windows command shim |
+| `~/.rustel/lib/rustelup.ps1` | the Windows updater |
 | `~/.rustel/src` | the checkout and build cache of `--branch` and `--commit` |
+
+`rustelup.ps1` stays out of `bin`. PowerShell runs a `.ps1` on your PATH
+before a `.cmd` of the same name, and the default execution policy
+(`Restricted`) blocks the `.ps1`. With the shim alone in `bin`, `rustelup`
+runs in PowerShell and in `cmd.exe`.
 
 Set `RUSTEL_DIR` before installing to move the whole tree somewhere else.
 
@@ -119,13 +121,13 @@ Windows, in PowerShell:
 ```powershell
 Remove-Item -ErrorAction SilentlyContinue @(
   "$HOME\.rustel\bin\rustel.exe",
-  "$HOME\.rustel\bin\rustelup.ps1",
-  "$HOME\.rustel\bin\rustelup.cmd"
+  "$HOME\.rustel\bin\rustelup.cmd",
+  "$HOME\.rustel\lib\rustelup.ps1"
 )
 ```
 
 After a `--branch` or `--commit` build, remove `~/.rustel/src` too.
-If you installed with `RUSTEL_DIR`, use that directory's `bin` and `src` instead.
+If you installed with `RUSTEL_DIR`, use that directory's `bin`, `lib` and `src` instead.
 On Unix, remove the matching `export PATH="…/bin:$PATH"` line added by the
 installer from your shell profile (`~/.bashrc`, `~/.zshenv`, or `~/.profile`).
 For fish, remove only that bin directory from `fish_user_paths`. On Windows,
