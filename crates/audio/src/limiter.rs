@@ -74,6 +74,9 @@ Foundation, either version 3 of the License, or (at your option) any later versi
 
 use crate::meter::db_to_linear;
 
+#[cfg(any(feature = "device-audio", test))]
+pub(crate) mod live;
+
 /// The ceiling on the lookahead, in frames, as a power of two so the rings
 /// mask instead of dividing. 1024 frames is 21 ms at 48 kHz, which is more
 /// than any character asks for; at 192 kHz it is 5.3 ms, which is less than

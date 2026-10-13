@@ -1037,9 +1037,8 @@ fn run_engine(
             break;
         }
 
-        // The second Stop press must win even if its wake-up command could
-        // not enter the bounded queue. If the command handled it already,
-        // its branch cleared this flag and this is a no-op.
+        // The atomic owns the second Stop press, even if its wake-up
+        // command could not enter the bounded queue.
         force_stop_if_requested(&mut engine, &immediate_stop_requested, &mut pending_control);
         // The preview's stop key rides on the same guarantee. A stop pressed
         // early lands while the queue still holds the setup commands, so the
@@ -1511,7 +1510,7 @@ fn process_command(
         EngineCommand::Stop => {
             if engine.is_playing() {
                 // Graceful: the tick loop hushes new onsets, lets the tail
-                // ring out, and reports `Stopped` when the device closes -
+                // ring out, and reports `Stopped` when the device parks -
                 // and the launch it cancels is answered on that next tick.
                 // This command also wakes the worker after the UI has set the
                 // same atomic stop flag, so it must stay idempotent while the
@@ -1528,10 +1527,8 @@ fn process_command(
             false
         }
         EngineCommand::StopImmediate => {
-            // The loop clears the fallback atomic immediately after command
-            // processing. If that path got here first, the consumed output
-            // makes a later stale wake-up harmless, with no duplicate answer.
-            cut_playback(engine, pending);
+            // Only wake the loop. Its atomic request cuts once, so a late
+            // wake cannot stop a stream that has since resumed.
             false
         }
         EngineCommand::SetOutput(name) => {
@@ -2512,6 +2509,7 @@ mod tests {
         ));
         assert!(held.engine.is_stopping());
 
+        let immediate_stop = AtomicBool::new(true);
         assert!(!process_command(
             &mut held.engine,
             EngineCommand::StopImmediate,
@@ -2521,6 +2519,8 @@ mod tests {
             &mut None,
             &mut recording,
         ));
+        assert!(held.engine.is_playing(), "the command only wakes the loop");
+        force_stop_if_requested(&mut held.engine, &immediate_stop, &mut pending);
         assert!(!held.engine.is_playing());
         assert!(matches!(
             pending.pop_front().unwrap(),
@@ -2537,6 +2537,28 @@ mod tests {
             if status.error.is_none() && status.final_signal.is_some()));
         collect_recording(&mut held.engine, &mut recording, &mut pending);
         assert!(pending.is_empty());
+
+        let stream = held.engine.device_report().unwrap().stream_id;
+        held.engine.prepare_piano().unwrap();
+        held.engine.piano_note_on(0, 60, 100).unwrap();
+        assert!(!held.engine.device_report().unwrap().stop_acknowledged);
+        assert!(!process_command(
+            &mut held.engine,
+            EngineCommand::StopImmediate,
+            &AtomicU64::new(0),
+            &AtomicBool::new(false),
+            &mut pending,
+            &mut None,
+            &mut recording,
+        ));
+        force_stop_if_requested(&mut held.engine, &immediate_stop, &mut pending);
+        assert!(pending.is_empty(), "a stale wake must not answer again");
+        let resumed = held.engine.device_report().unwrap();
+        assert_eq!(resumed.stream_id, stream);
+        assert!(
+            !resumed.stop_acknowledged,
+            "a stale wake must not stop audio"
+        );
     }
 
     #[test]

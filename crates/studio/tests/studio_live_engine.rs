@@ -2540,6 +2540,98 @@ fn piano_direct_output_survives_invalid_score_and_is_adopted_by_valid_score() {
     engine.stop(Duration::from_millis(500));
 }
 
+/// A stop parks the output with its stream open, and the next start adopts
+/// the same stream. Closing a stream and opening one again make their own
+/// click on some hosts, even from silence.
+#[test]
+fn a_stop_parks_the_output_and_the_next_start_adopts_the_same_stream() {
+    let _engine = one_engine();
+    let mut engine = StudioEngine::new(StudioConfig {
+        output: Some("silent".into()),
+        poll_interval: Duration::from_millis(2),
+        ..Default::default()
+    })
+    .unwrap();
+    engine
+        .evaluate_and_start("note(36).s('sine').slow(16)", false)
+        .expect("the first score starts");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        engine.tick(accepted_update).unwrap();
+        if engine.master_bus().take_levels().peak > 0.01
+            && engine
+                .device_report()
+                .unwrap()
+                .realtime_pressure
+                .active_voices
+                > 0
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the first score did not sound");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let stream = engine.device_report().unwrap().stream_id;
+    let stop = engine
+        .stop(Duration::from_millis(500))
+        .expect("the stop is acknowledged");
+    assert!(stop.acknowledged);
+    assert!(!engine.is_playing());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let parked = loop {
+        let report = engine.device_report().expect("the output stays parked");
+        if report.realtime_pressure.active_voices == 0 {
+            break report;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the parked output still has voices"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(parked.stream_id, stream);
+    assert!(engine.evaluate_and_start("note(", false).is_err());
+    assert!(!engine.is_playing());
+    let parked = engine.device_report().unwrap();
+    assert_eq!(parked.stream_id, stream);
+    assert!(
+        parked.stop_acknowledged,
+        "a failed start leaves the output stopped"
+    );
+    engine
+        .evaluate_and_start("note(48).s('sine').slow(16)", false)
+        .expect("the next score starts");
+    assert!(engine.is_playing());
+    let adopted = engine.device_report().unwrap();
+    assert_eq!(
+        adopted.stream_id, stream,
+        "the next start adopts the parked stream instead of opening one"
+    );
+    assert!(
+        !adopted.stop_acknowledged,
+        "the adopted stream is cleared to sound again"
+    );
+    engine.master_bus().take_levels();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        engine.tick(accepted_update).unwrap();
+        if engine.master_bus().take_levels().peak > 0.01 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the adopted stream did not sound"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        engine
+            .stop(Duration::from_millis(500))
+            .unwrap()
+            .acknowledged
+    );
+}
+
 fn piano_worker_snapshot(
     worker: &StudioWorker,
     ready: impl Fn(&StudioSnapshot) -> bool,
@@ -2661,7 +2753,11 @@ fn piano_over_playback_tail_stops(immediate: bool) {
             .is_some_and(|pressure| pressure.device.realtime_pressure.active_voices == 1)
     });
     assert!(restarted.playing);
-    assert_ne!(restarted.pressure.unwrap().device.stream_id, stream);
+    assert_eq!(
+        restarted.pressure.unwrap().device.stream_id,
+        stream,
+        "the restart adopts the parked stream instead of opening one"
+    );
     worker.shutdown();
 }
 

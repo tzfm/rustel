@@ -33,6 +33,9 @@
 
 ### Sound changes
 
+- Studio master volume changes ramp over 10 ms, removing the crackle when dragging the fader. The same ramp reaches routed outputs.
+- Limiter threshold, mode and makeup changes fade smoothly during playback. Mode changes keep audio flowing while the new mode fills its lookahead buffer.
+- On macOS, Studio keeps its output stream open across Stop and reuses it on the next start, avoiding the click from closing and reopening it even from silence. The stream closes when you quit, change the output device or buffer size, or the stream fails.
 - The stop fade runs for the full 10 ms. The fade ended after 128 frames, about 3 ms at 48 kHz, and left a click.
 - `.pg(x)` multiplies the postgain of each note by `x`. `.accent(x)` multiplies `velocity` and `lpenv` the same way. Before, both silenced the pattern with no error, because the multiplier held no events.
 - `s("one")` plays a constant signal, the source of a bus modulator: `s("one").gain("0 1").bus(1).dry(0)` moves the control another pattern reads with `bmod({ b: 1 })`. Before, the sound was unknown and the modulator voice was refused. A sample named `one` still plays as a sample.

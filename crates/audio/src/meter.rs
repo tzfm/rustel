@@ -129,6 +129,12 @@ impl MasterMeterShared {
         self.limiter_makeup.store(on, Ordering::Relaxed);
     }
 
+    /// Whether the callback should bring the limiter ceiling to full scale.
+    #[cfg(feature = "device-audio")]
+    pub(crate) fn limiter_makeup(&self) -> bool {
+        self.limiter_makeup.load(Ordering::Relaxed)
+    }
+
     /// The gain to apply after limiting, 1 when there is nothing to make
     /// up. Reads the ceiling it is compensating, so the two cannot drift.
     pub fn limiter_makeup_gain(&self) -> f32 {

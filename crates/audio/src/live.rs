@@ -490,6 +490,26 @@ impl LiveScalarBackend {
         flip: LiveFlipAtomics<'_>,
         stopped: &AtomicBool,
     ) -> LiveBlockReport {
+        let events = ring.drain_queued_available();
+        self.process_block_with_events(
+            output,
+            frames,
+            start_frame,
+            events,
+            flip,
+            stopped.load(Ordering::Acquire),
+        )
+    }
+
+    pub(crate) fn process_block_with_events(
+        &mut self,
+        output: &mut [f32],
+        frames: usize,
+        start_frame: u64,
+        events: impl Iterator<Item = QueuedAudioEvent>,
+        flip: LiveFlipAtomics<'_>,
+        is_stopped: bool,
+    ) -> LiveBlockReport {
         let LiveFlipAtomics {
             generation: active_generation,
             takeover_frame,
@@ -505,7 +525,6 @@ impl LiveScalarBackend {
             return LiveBlockReport::default();
         }
         output[..samples].fill(0.0);
-        let is_stopped = stopped.load(Ordering::Acquire);
         #[cfg(feature = "device-audio")]
         {
             self.confirmation_stopped = is_stopped;
@@ -611,12 +630,7 @@ impl LiveScalarBackend {
 
         let end_frame = start_frame.saturating_add(frames as u64);
         let mut report = LiveBlockReport::default();
-        for mut event in self
-            .held
-            .take()
-            .into_iter()
-            .chain(ring.drain_queued_available())
-        {
+        for mut event in self.held.take().into_iter().chain(events) {
             // Reload can occur while this block is being assembled. Consult
             // the atomic for every event, so old events queued ahead of a new
             // generation cannot block or enter the new backend.

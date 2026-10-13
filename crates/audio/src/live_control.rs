@@ -1,4 +1,4 @@
-//! Sample-clock transitions for directly bound continuous score controls.
+//! Sample-clock transitions for live gain and continuous score controls.
 //!
 //! The UI commits the exact number immediately. Only the sounding gain,
 //! low-pass cutoff and low-pass resonance move through a short ramp. Note
@@ -50,13 +50,22 @@ impl Ramp {
         if self.binding == 0 || self.binding != update.binding {
             return;
         }
-        self.target = update.value;
         let secs = if update.smooth {
             SLIDER_SMOOTHING_SECS
         } else {
             SLIDER_DECLICK_SECS
         };
-        self.remaining = (secs * sample_rate as f32).round().max(1.0) as u32;
+        self.set_target(update.value, (secs * sample_rate as f32).round() as u32);
+    }
+
+    #[cfg(feature = "device-audio")]
+    pub fn target(&self) -> f32 {
+        self.target
+    }
+
+    pub fn set_target(&mut self, value: f32, frames: u32) {
+        self.target = value;
+        self.remaining = frames.max(1);
         let count = self.remaining as f32;
         self.step = self.target / count - self.value / count;
     }
