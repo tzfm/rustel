@@ -294,6 +294,9 @@ pub struct StudioWorker {
     /// Set by the UI's second Stop press. Unlike the bounded command, this
     /// cannot be lost behind a full queue.
     immediate_stop_requested: Arc<AtomicBool>,
+    /// Set by a preview's stop key, for the same reason: the audition
+    /// silence must survive a full command queue.
+    audition_stop_requested: Arc<AtomicBool>,
     master: Arc<StudioMasterBus>,
     library: Option<Arc<rustel_runtime::samples::SampleLibrary>>,
     catalogue: super::catalogue::Catalogue,
@@ -335,6 +338,8 @@ impl StudioWorker {
         let engine_shutdown = Arc::clone(&shutdown_requested);
         let immediate_stop_requested = Arc::new(AtomicBool::new(false));
         let engine_immediate_stop = Arc::clone(&immediate_stop_requested);
+        let audition_stop_requested = Arc::new(AtomicBool::new(false));
+        let engine_audition_stop = Arc::clone(&audition_stop_requested);
         let (ready_tx, ready_rx) = sync_channel(1);
 
         let join = thread::Builder::new()
@@ -364,6 +369,7 @@ impl StudioWorker {
                             engine_epoch,
                             engine_shutdown,
                             engine_immediate_stop,
+                            engine_audition_stop,
                             #[cfg(feature = "hydra")]
                             hydra,
                         );
@@ -394,6 +400,7 @@ impl StudioWorker {
             latest_audio,
             stop,
             immediate_stop_requested,
+            audition_stop_requested,
             master,
             catalogue: super::catalogue::Catalogue::new(library.as_ref()).map_err(|error| {
                 EngineFailure {
@@ -717,9 +724,19 @@ impl StudioWorker {
                 .is_ok()
     }
 
+    /// Ask the engine to silence whatever the browser is previewing.
+    ///
+    /// The flag is the authority and the command only wakes the worker, the
+    /// same contract as [`Self::force_stop`]: a stop the two-slot command
+    /// queue cannot take is still honoured on the worker's next turn rather
+    /// than lost with the preview ringing on.
     pub fn try_stop_audition(&self) -> bool {
-        !self.shutdown_requested.load(Ordering::Acquire)
-            && self.commands.try_send(EngineCommand::StopAudition).is_ok()
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            return false;
+        }
+        self.audition_stop_requested.store(true, Ordering::Release);
+        let _ = self.commands.try_send(EngineCommand::StopAudition);
+        true
     }
 
     pub fn try_configure_piano(
@@ -970,6 +987,7 @@ fn run_engine(
     command_epoch: Arc<AtomicU64>,
     shutdown_requested: Arc<AtomicBool>,
     immediate_stop_requested: Arc<AtomicBool>,
+    audition_stop_requested: Arc<AtomicBool>,
     // Owned by this thread for the life of the studio, so the window closes
     // when the engine stops - which is after the terminal has been given back.
     #[cfg(feature = "hydra")] mut hydra: rustel_runtime::hydra::HydraBridge,
@@ -1023,6 +1041,10 @@ fn run_engine(
         // not enter the bounded queue. If the command handled it already,
         // its branch cleared this flag and this is a no-op.
         force_stop_if_requested(&mut engine, &immediate_stop_requested, &mut pending_control);
+        // The preview's stop key rides on the same guarantee. A stop pressed
+        // early lands while the queue still holds the setup commands, so the
+        // command alone is not a reliable courier for it.
+        stop_audition_if_requested(&mut engine, &audition_stop_requested);
 
         // Evaluation outcomes must precede any layout emitted by the first
         // producer tick for that generation.
@@ -1105,6 +1127,12 @@ fn force_stop_if_requested(
 ) {
     if requested.swap(false, Ordering::AcqRel) {
         cut_playback(engine, pending);
+    }
+}
+
+fn stop_audition_if_requested(engine: &mut StudioEngine, requested: &AtomicBool) {
+    if requested.swap(false, Ordering::AcqRel) {
+        engine.stop_audition();
     }
 }
 
