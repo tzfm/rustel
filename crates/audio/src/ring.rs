@@ -233,6 +233,19 @@ impl Ring {
         self.tail.load(Ordering::Relaxed)
     }
 
+    #[cfg(any(test, feature = "device-audio"))]
+    pub(crate) fn published_end(&self) -> usize {
+        self.tail.load(Ordering::Acquire)
+    }
+
+    /// Consumer-side length through a captured producer cursor. A cursor
+    /// behind the head has already been consumed, including across wrap.
+    #[cfg(any(test, feature = "device-audio"))]
+    pub(crate) fn len_before(&self, end: usize) -> usize {
+        let len = end.wrapping_sub(self.head.load(Ordering::Relaxed));
+        if len <= self.capacity() { len } else { 0 }
+    }
+
     pub fn len(&self) -> usize {
         let head = self.head.load(Ordering::Acquire);
         self.tail
@@ -255,6 +268,14 @@ impl Ring {
         std::iter::from_fn(|| self.pop_queued()).take(self.len())
     }
 
+    #[cfg(any(test, feature = "device-audio"))]
+    pub(crate) fn drain_queued_before(
+        &self,
+        end: usize,
+    ) -> impl Iterator<Item = QueuedAudioEvent> + '_ {
+        std::iter::from_fn(|| self.pop_queued()).take(self.len_before(end))
+    }
+
     pub fn push(&self, e: AudioEvent) -> bool {
         self.push_queued(e.into())
     }
@@ -275,7 +296,7 @@ impl Ring {
         }
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Acquire);
-        if tail - head == self.capacity() {
+        if tail.wrapping_sub(head) == self.capacity() {
             self.refused.fetch_add(1, Ordering::Relaxed);
             return false;
         }
@@ -283,8 +304,8 @@ impl Ring {
         unsafe {
             (*self.buf.get())[tail & self.mask].write(e);
         }
-        self.tail.store(tail + 1, Ordering::Release);
-        let d = tail + 1 - head;
+        self.tail.store(tail.wrapping_add(1), Ordering::Release);
+        let d = tail.wrapping_add(1).wrapping_sub(head);
         self.peak_depth.fetch_max(d, Ordering::Relaxed);
         true
     }
@@ -341,7 +362,7 @@ impl Ring {
         // so the push that published it initialised it first. The payload is
         // `Copy`: reading it leaves the slot as it was.
         let e = unsafe { (*self.buf.get())[head & self.mask].assume_init() };
-        self.head.store(head + 1, Ordering::Release);
+        self.head.store(head.wrapping_add(1), Ordering::Release);
         Some(e)
     }
 }
@@ -407,6 +428,28 @@ mod tests {
         assert!(ring.push(ev(8)));
         assert_eq!(empty.next().map(|event| event.onset_id), None);
         assert_eq!(ring.pop().unwrap().onset_id, 8);
+
+        for cursor in [0, usize::MAX - 1] {
+            let ring = Ring::new(4);
+            ring.head.store(cursor, Ordering::Relaxed);
+            ring.tail.store(cursor, Ordering::Relaxed);
+            for id in 0..3 {
+                assert!(ring.push(ev(id)));
+            }
+            assert_eq!(ring.len(), 3);
+            let end = ring.published_end();
+            assert_eq!(ring.pop().unwrap().onset_id, 0);
+            assert!(ring.push(ev(3)));
+            assert_eq!(
+                ring.drain_queued_before(end)
+                    .map(|queued| queued.event.onset_id)
+                    .collect::<Vec<_>>(),
+                [1, 2]
+            );
+            assert_eq!(ring.drain_queued_before(end).count(), 0);
+            assert_eq!(ring.pop().unwrap().onset_id, 3);
+            assert_eq!(ring.drain_queued_before(end).count(), 0);
+        }
     }
 
     /// What the ring holds in memory follows the pushes: a slot taken

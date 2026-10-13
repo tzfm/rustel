@@ -356,6 +356,62 @@ impl std::fmt::Display for CallbackTripwireArmError {
 
 impl std::error::Error for CallbackTripwireArmError {}
 
+const OUTPUT_RUNNING: u8 = 0;
+const OUTPUT_STOP_REQUESTED: u8 = 1;
+const OUTPUT_STOP_ACKNOWLEDGED: u8 = 2;
+const OUTPUT_RESUME_PENDING: u8 = 3;
+
+/// Resume waits for an outstanding stop ramp. A callback which observed an
+/// acknowledged stop cannot acknowledge a later request after resume.
+struct LiveStop(AtomicU8);
+
+impl LiveStop {
+    fn new() -> Self {
+        Self(AtomicU8::new(OUTPUT_RUNNING))
+    }
+
+    fn request(&self) {
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                matches!(state, OUTPUT_RUNNING | OUTPUT_RESUME_PENDING)
+                    .then_some(OUTPUT_STOP_REQUESTED)
+            });
+    }
+
+    fn resume(&self) {
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| match state {
+                OUTPUT_STOP_REQUESTED => Some(OUTPUT_RESUME_PENDING),
+                OUTPUT_STOP_ACKNOWLEDGED => Some(OUTPUT_RUNNING),
+                _ => None,
+            });
+    }
+
+    fn acknowledged(&self) -> bool {
+        self.0.load(Ordering::Acquire) == OUTPUT_STOP_ACKNOWLEDGED
+    }
+
+    #[cfg(test)]
+    fn is_stopped(&self) -> bool {
+        self.0.load(Ordering::Acquire) != OUTPUT_RUNNING
+    }
+
+    fn complete(&self, observed: u8) {
+        if !matches!(observed, OUTPUT_STOP_REQUESTED | OUTPUT_RESUME_PENDING) {
+            return;
+        }
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| match state {
+                OUTPUT_STOP_REQUESTED => Some(OUTPUT_STOP_ACKNOWLEDGED),
+                OUTPUT_RESUME_PENDING => Some(OUTPUT_RUNNING),
+                _ => None,
+            });
+    }
+}
+
 #[derive(Clone)]
 struct LiveShared {
     ring: Arc<Ring>,
@@ -412,7 +468,9 @@ struct LiveShared {
     buffer_playback_nanos: Arc<AtomicU64>,
     playback_latency_nanos: Arc<AtomicU64>,
     max_playback_latency_nanos: Arc<AtomicU64>,
-    stopped: Arc<AtomicBool>,
+    stop: Arc<LiveStop>,
+    stop_ring_end: Arc<AtomicUsize>,
+    stop_immediate_end: Arc<AtomicUsize>,
     failed: Arc<AtomicBool>,
     callbacks: Arc<AtomicU64>,
     accepted_events: Arc<AtomicU64>,
@@ -436,7 +494,6 @@ struct LiveShared {
     callback_errors: Arc<AtomicU64>,
     callback_scope_misses: Arc<AtomicU64>,
     cutover_race_blocks: Arc<AtomicU64>,
-    stop_acknowledged: Arc<AtomicBool>,
     /// Sample delivery to the callback bank (install/return SPSC pair).
     samples: Arc<crate::assets::SampleChannel>,
     /// Master fader and post-fader metering, shared with the callback.
@@ -495,7 +552,9 @@ impl LiveShared {
             buffer_playback_nanos: Arc::new(AtomicU64::new(0)),
             playback_latency_nanos: Arc::new(AtomicU64::new(0)),
             max_playback_latency_nanos: Arc::new(AtomicU64::new(0)),
-            stopped: Arc::new(AtomicBool::new(false)),
+            stop: Arc::new(LiveStop::new()),
+            stop_ring_end: Arc::new(AtomicUsize::new(0)),
+            stop_immediate_end: Arc::new(AtomicUsize::new(0)),
             failed: Arc::new(AtomicBool::new(false)),
             callbacks: Arc::new(AtomicU64::new(0)),
             accepted_events: Arc::new(AtomicU64::new(0)),
@@ -511,7 +570,6 @@ impl LiveShared {
             callback_errors: Arc::new(AtomicU64::new(0)),
             callback_scope_misses: Arc::new(AtomicU64::new(0)),
             cutover_race_blocks: Arc::new(AtomicU64::new(0)),
-            stop_acknowledged: Arc::new(AtomicBool::new(false)),
             meter: Arc::new(crate::meter::MasterMeterShared::new()),
             score_sources_active: Arc::new(AtomicBool::new(false)),
             score_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -540,7 +598,7 @@ impl LiveShared {
             callback_scope_misses: self.callback_scope_misses.load(Ordering::Acquire),
             callback_allocations: 0,
             callback_frees: 0,
-            stop_acknowledged: self.stop_acknowledged.load(Ordering::Acquire),
+            stop_acknowledged: self.stop.acknowledged(),
             ring_refusals: self.ring.refused.load(Ordering::Acquire) as u64,
             ring_role_conflicts: self.ring.role_conflicts.load(Ordering::Acquire) as u64,
             ring_depth: self.ring.len() as u64,
@@ -563,6 +621,14 @@ impl LiveShared {
 
     fn clock_frames(&self) -> u64 {
         self.frames.load(Ordering::Acquire)
+    }
+
+    fn request_stop(&self) {
+        self.stop_ring_end
+            .store(self.ring.published_end(), Ordering::Release);
+        self.stop_immediate_end
+            .store(self.immediate.published_end(), Ordering::Release);
+        self.stop.request();
     }
 
     /// The four handshake words the callback reads, each under its own name.
@@ -2067,7 +2133,16 @@ impl LiveScalarDevice {
     }
 
     pub fn stop(&self) {
-        self.shared.stopped.store(true, Ordering::Release);
+        self.shared.request_stop();
+    }
+
+    /// Whether a requested stop is still waiting for its callback fade,
+    /// including a resume that must finish that fade first.
+    pub fn stop_pending(&self) -> bool {
+        matches!(
+            self.shared.stop.0.load(Ordering::Acquire),
+            OUTPUT_STOP_REQUESTED | OUTPUT_RESUME_PENDING
+        )
     }
 
     /// Request silence and wait until a data callback has rendered the whole
@@ -2078,7 +2153,7 @@ impl LiveScalarDevice {
     pub fn stop_and_wait(&self, timeout: Duration) -> bool {
         self.stop();
         let deadline = Instant::now() + timeout;
-        while !self.shared.stop_acknowledged.load(Ordering::Acquire) {
+        while !self.shared.stop.acknowledged() {
             if Instant::now() >= deadline || self.shared.failed.load(Ordering::Acquire) {
                 return false;
             }
@@ -2096,11 +2171,17 @@ impl LiveScalarDevice {
         std::thread::sleep(drain);
         true
     }
+
+    /// Resume this stream after its stop ramp completes. An already-running
+    /// output keeps its voices. Events queued after resume wait for the ramp.
+    pub fn resume(&self) {
+        self.shared.stop.resume();
+    }
 }
 
 impl Drop for LiveScalarDevice {
     fn drop(&mut self) {
-        self.shared.stopped.store(true, Ordering::Release);
+        self.shared.request_stop();
         if let Some(mut silent) = self.silent.take() {
             silent.stop();
         }
@@ -2120,31 +2201,25 @@ const SILENT_BUFFER_FRAMES: u32 = 256;
 
 struct LiveCallbackMeters {
     master: crate::meter::MasterMeter,
+    master_gain: Option<crate::live_control::Ramp>,
     load: RealtimeLoadMeter,
     pressure: RealtimePressureMeter,
     sample_rate: u32,
     /// By value, not boxed: its rings are fixed arrays, so holding it here
     /// keeps the whole callback path free of any allocation at all - which
     /// the analysis-tap tripwire tests measure.
-    limiter: crate::limiter::Limiter,
-    /// Whether the limiter ran on the last block. Off holds its rings
-    /// where they were, so coming back on has to clear them.
-    limiter_running: bool,
+    limiter: crate::limiter::live::LiveLimiter,
 }
 
 impl LiveCallbackMeters {
     fn new(sample_rate: u32, publisher: &RealtimeLoadPublisher) -> Self {
         Self {
             master: crate::meter::MasterMeter::new(sample_rate),
+            master_gain: None,
             load: RealtimeLoadMeter::new(sample_rate, publisher),
             pressure: RealtimePressureMeter::default(),
             sample_rate,
-            limiter_running: false,
-            limiter: crate::limiter::Limiter::new(
-                sample_rate,
-                crate::limiter::DEFAULT_THRESHOLD_DB,
-                crate::limiter::Character::default(),
-            ),
+            limiter: crate::limiter::live::LiveLimiter::new(sample_rate),
         }
     }
 }
@@ -2521,13 +2596,7 @@ impl ManualLiveOutput {
     pub fn render(&mut self, output: &mut [f32]) {
         let shared = &self.device.shared;
         self.gate.render_or_silence(output, |output| {
-            let stop_requested = shared.stopped.load(Ordering::Acquire);
             write_live_output(&mut self.backend, &mut self.meters, output, 2, shared);
-            // The ramp spans several callbacks at a short buffer. An earlier
-            // acknowledgement lets the owner close the stream inside the ramp.
-            if stop_requested && self.backend.stop_ramp_complete() {
-                shared.stop_acknowledged.store(true, Ordering::Release);
-            }
         });
     }
 }
@@ -2607,16 +2676,12 @@ fn spawn_silent_output(
                 let due = (elapsed.as_secs_f64() * f64::from(sample_rate)) as u64;
                 while delivered + u64::from(buffer_frames) <= due && !flag.load(Ordering::Acquire) {
                     gate.render_or_silence(&mut output, |output| {
-                        let stop_requested = shared.stopped.load(Ordering::Acquire);
                         shared.buffer_playback_nanos.store(
                             u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
                             Ordering::Release,
                         );
                         shared.playback_latency_nanos.store(0, Ordering::Release);
                         write_live_output(&mut backend, &mut meters, output, 2, &shared);
-                        if stop_requested && backend.stop_ramp_complete() {
-                            shared.stop_acknowledged.store(true, Ordering::Release);
-                        }
                     });
                     delivered += u64::from(buffer_frames);
                 }
@@ -2943,7 +3008,7 @@ impl LiveScalarDevice {
             return Err(DevicePlaybackError::Cancelled);
         }
         let old_sample_rate = self.sample_rate;
-        self.shared.stopped.store(true, Ordering::Release);
+        self.shared.request_stop();
         if let Some(mut silent) = self.silent.take() {
             silent.stop();
         }
@@ -3010,11 +3075,8 @@ impl LiveScalarDevice {
         let facts = &prepared.facts;
         self.shared
             .prepare_recycled_stream(old_sample_rate, facts.sample_rate_hz());
-        self.shared
-            .stop_acknowledged
-            .store(false, Ordering::Release);
         self.shared.failed.store(false, Ordering::Release);
-        self.shared.stopped.store(false, Ordering::Release);
+        self.shared.stop.0.store(OUTPUT_RUNNING, Ordering::Release);
         self.sample_rate = facts.sample_rate_hz();
         self.channels = facts.channels();
         self.host_id = facts.host().id().map(Into::into);
@@ -3025,7 +3087,7 @@ impl LiveScalarDevice {
         self.device_period_frames = facts.device_period_frames();
         self.clear_reverb_caches();
         if let Err(error) = self.activate_prepared(prepared) {
-            self.shared.stopped.store(true, Ordering::Release);
+            self.shared.request_stop();
             self.shared.failed.store(true, Ordering::Release);
             return Err(error);
         }
@@ -4192,7 +4254,6 @@ where
                 #[cfg(windows)]
                 pro_audio.attach_once();
                 gate.render_or_silence(output, |output| {
-                    let stop_requested = shared.stopped.load(Ordering::Acquire);
                     let playback = info.timestamp().playback;
                     let origin = *playback_origin.get_or_insert(playback);
                     let origin_nanos = u64::try_from(origin.as_nanos()).unwrap_or(u64::MAX - 1);
@@ -4217,9 +4278,6 @@ where
                         .max_playback_latency_nanos
                         .fetch_max(latency_nanos, Ordering::Relaxed);
                     write_live_output(&mut backend, &mut meters, output, channels, &shared);
-                    if stop_requested && backend.stop_ramp_complete() {
-                        shared.stop_acknowledged.store(true, Ordering::Release);
-                    }
                 });
             },
             on_error,
@@ -4280,6 +4338,7 @@ fn write_live_output_inner<T>(
     }
     let mut scratch = [0.0f32; BLOCK * 2];
     let mut rendered = 0usize;
+    let mut stop_state = OUTPUT_RUNNING;
     let mut callback_late = 0u64;
     let mut callback_refused = 0u64;
     // Routing set by the producer reaches the backend at a block edge.
@@ -4319,18 +4378,35 @@ fn write_live_output_inner<T>(
             *gain = f32::from_bits(slot.load(Ordering::Relaxed));
         }
         backend.set_orbit_gains(&orbit_gains);
-        let immediate = backend.admit_immediate(
-            &shared.immediate,
-            start.saturating_add(rendered as u64),
-            count,
-        );
-        let mut report = backend.process_block_with(
+        // Bound admission before reading Stop. Events published after a
+        // concurrent stop/resume belong to the next running block.
+        let ring_end = shared.ring.published_end();
+        let immediate_end = shared.immediate.published_end();
+        stop_state = shared.stop.0.load(Ordering::Acquire);
+        for _ in shared
+            .ring
+            .drain_queued_before(shared.stop_ring_end.load(Ordering::Acquire))
+        {}
+        for _ in shared
+            .immediate
+            .drain_queued_before(shared.stop_immediate_end.load(Ordering::Acquire))
+        {}
+        let immediate = if stop_state == OUTPUT_RUNNING {
+            backend.admit_immediate(
+                &shared.immediate,
+                start.saturating_add(rendered as u64),
+                count.min(shared.immediate.len_before(immediate_end)),
+            )
+        } else {
+            crate::LiveBlockReport::default()
+        };
+        let mut report = backend.process_block_with_events(
             &mut scratch[..count * 2],
             count,
             start.saturating_add(rendered as u64),
-            &shared.ring,
+            shared.ring.drain_queued_before(ring_end),
             shared.flip_atomics(),
-            &shared.stopped,
+            stop_state != OUTPUT_RUNNING,
         );
         report.accepted += immediate.accepted;
         report.refused += immediate.refused;
@@ -4340,11 +4416,40 @@ fn write_live_output_inner<T>(
             .analysis
             .write_stereo(&scratch[..count * 2], end_frame);
         // Metering and the device see the same post-fader signal.
-        let gain = shared.meter.gain();
-        if gain != 1.0 {
-            for sample in &mut scratch[..count * 2] {
-                *sample *= gain;
-            }
+        let target_gain = shared.meter.gain();
+        let orbit_peaks = backend.take_orbit_peaks();
+        // Silent startup callbacks can precede the saved volume. Adopt that
+        // volume when the first signal reaches the main pair or a routed orbit.
+        if meters.master_gain.is_none()
+            && (scratch[..count * 2].iter().any(|sample| *sample != 0.0)
+                || orbit_peaks.iter().any(|peak| *peak != 0.0))
+        {
+            meters.master_gain = Some(crate::live_control::Ramp::new(0, target_gain));
+        }
+        if let Some(gain_ramp) = &mut meters.master_gain
+            && target_gain != gain_ramp.target()
+        {
+            gain_ramp.set_target(
+                target_gain,
+                (0.010 * meters.sample_rate as f32).round() as u32,
+            );
+        }
+        // One 10 ms ramp serves every output pair and survives callback boundaries.
+        let mut frame_gains = [0.0_f32; BLOCK];
+        let mut peak_gain = 0.0_f32;
+        for (frame, gain) in scratch[..count * 2]
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(&mut frame_gains[..count])
+        {
+            *gain = meters
+                .master_gain
+                .as_mut()
+                .map_or(target_gain, crate::live_control::Ramp::next);
+            peak_gain = peak_gain.max(*gain);
+            frame[0] *= *gain;
+            frame[1] *= *gain;
         }
         // What the meter would have said before the limiter touched it. CLIP
         // means "this score is asking for more than full scale", and a ceiling
@@ -4354,58 +4459,21 @@ fn write_live_output_inner<T>(
         // The safety limiter, between the fader and every consumer of the
         // output buffer: the meter and the recorder tap both see
         // what the device is about to be handed.
-        if let Some(settings) = shared.meter.limiter_settings() {
-            // Coming back from off, the delay line still holds whatever
-            // was passing through when it was switched off - a burst of
-            // stale audio, then the runway re-filling. Turning a limiter
-            // on should not play something from a minute ago.
-            if !meters.limiter_running {
-                meters.limiter.reset();
-                meters.limiter_running = true;
-            }
-            meters.limiter.set_threshold_db(settings.threshold_db);
-            meters.limiter.set_character(settings.character);
-            meters.limiter.process_stereo(&mut scratch[..count * 2]);
-            // The ceiling back up to full scale, when asked for. Without
-            // it, switching the limiter on makes a set quieter by exactly
-            // the headroom it was given, which reads as the limiter having
-            // broken the volume rather than having changed the sound. The
-            // gain is `1 / ceiling` and nothing else: the limiter has
-            // already promised nothing leaves above the ceiling, so this
-            // lands the ceiling on full scale and cannot pass it.
-            let makeup = shared.meter.limiter_makeup_gain();
-            if makeup != 1.0 {
-                for sample in &mut scratch[..count * 2] {
-                    *sample *= makeup;
-                }
-            }
-            shared
-                .meter
-                .publish_reduction(meters.limiter.take_reduction());
-        } else {
-            // Off is a character, not an absence of protection. Nothing may
-            // reach a float device above full scale, and no NaN may reach it
-            // at all - the integer formats saturate on their own, `f32` and
-            // `f64` do not.
-            for sample in &mut scratch[..count * 2] {
-                *sample = if sample.is_finite() {
-                    sample.clamp(-1.0, 1.0)
-                } else {
-                    0.0
-                };
-            }
-            meters.limiter_running = false;
-            shared.meter.publish_reduction(1.0);
-        }
+        let reduction = meters.limiter.process_stereo(
+            &mut scratch[..count * 2],
+            shared.meter.limiter_settings(),
+            shared.meter.limiter_makeup(),
+        );
+        shared.meter.publish_reduction(reduction);
         meters
             .master
             .observe_stereo(&scratch[..count * 2], &shared.meter);
-        for (slot, peak) in shared.orbit_peaks.iter().zip(backend.take_orbit_peaks()) {
+        for (slot, peak) in shared.orbit_peaks.iter().zip(orbit_peaks) {
             shared
                 .score_peak
                 .fetch_max(peak.to_bits(), Ordering::Relaxed);
             // Non-negative floats order as their bits do.
-            slot.fetch_max((peak * gain).to_bits(), Ordering::Relaxed);
+            slot.fetch_max((peak * peak_gain).to_bits(), Ordering::Relaxed);
         }
         shared.record.write_stereo(&scratch[..count * 2]);
         let visual_generation_current = backend.generation()
@@ -4474,8 +4542,8 @@ fn write_live_output_inner<T>(
                     if mix.len() < (frame + 1) * 2 {
                         continue;
                     }
-                    mixed[dest * 2] += mix[frame * 2] * gain;
-                    mixed[dest * 2 + 1] += mix[frame * 2 + 1] * gain;
+                    mixed[dest * 2] += mix[frame * 2] * frame_gains[frame];
+                    mixed[dest * 2 + 1] += mix[frame * 2 + 1] * frame_gains[frame];
                 }
                 for (channel, sample) in output_frame.iter_mut().enumerate() {
                     *sample = T::from_sample(mixed.get(channel).copied().unwrap_or(0.0));
@@ -4534,6 +4602,9 @@ fn write_live_output_inner<T>(
     }
     if shared.generation.load(Ordering::Acquire) != generation_at_entry {
         shared.cutover_race_blocks.fetch_add(1, Ordering::Relaxed);
+    }
+    if backend.stop_ramp_complete() {
+        shared.stop.complete(stop_state);
     }
 }
 
@@ -4665,6 +4736,107 @@ mod tests {
 
     mod analysis {
         use super::*;
+
+        #[test]
+        fn master_fader_moves_smoothly_on_every_output_pair() {
+            let _tripwire_guard = tripwire_assertion_guard();
+            for sample_rate in [44_100, 96_000] {
+                for channels in [2, 4] {
+                    let render = |chunk: usize| {
+                        let shared = LiveShared::new(1);
+                        shared.meter.set_gain(0.5);
+                        if channels == 4 {
+                            shared.orbit_pairs[1].store(1, Ordering::Relaxed);
+                        }
+                        for orbit in [0, 1] {
+                            assert!(shared.ring.push(AudioEvent {
+                                onset_id: orbit as u64 + 1,
+                                generation: 1,
+                                target_frame: 0,
+                                onset_lead: 0.0,
+                                freq_hz: 0.0,
+                                gain: 0.1,
+                                duration_secs: 2.0,
+                                ui_visuals: 0,
+                                controls: crate::OscillatorControls {
+                                    orbit,
+                                    envelope: crate::Envelope {
+                                        attack_secs: 0.001,
+                                        decay_secs: 0.0,
+                                        sustain: 1.0,
+                                        release_secs: 0.01,
+                                    },
+                                    ..Default::default()
+                                },
+                                sample: None,
+                                synth: Some(crate::SynthSource::One),
+                                wavetable: None,
+                                cut: None,
+                            }));
+                        }
+                        let mut backend = LiveScalarBackend::with_dispatch(
+                            sample_rate,
+                            4,
+                            DspDispatch::portable(),
+                        )
+                        .expect("portable backend");
+                        let mut meters =
+                            LiveCallbackMeters::new(sample_rate, &shared.realtime_load);
+                        let mut output = [0.0f32; 1024 * 4];
+                        let mut render = |frames: usize, output: &mut [f32]| {
+                            let before = tripwire::Violations::capture();
+                            tripwire::audio_scope(|| {
+                                write_live_output(
+                                    &mut backend,
+                                    &mut meters,
+                                    &mut output[..frames * channels],
+                                    channels,
+                                    &shared,
+                                );
+                            });
+                            assert!(tripwire::Violations::capture().since(before).clean());
+                        };
+                        render(1024, &mut output);
+                        let mut previous = output[1023 * channels];
+                        assert!(previous > 0.01);
+                        let unity = previous * 2.0;
+                        let ramp_frames = (sample_rate as f32 * 0.01).round() as usize;
+                        let mut rendered = Vec::new();
+                        for (target, frames) in [
+                            (0.0, ramp_frames * 2),
+                            (4.0, ramp_frames * 2),
+                            (0.2, ramp_frames / 3),
+                            (3.0, ramp_frames / 4),
+                            (1.0, ramp_frames * 2),
+                        ] {
+                            shared.meter.set_gain(target);
+                            let mut remaining = frames;
+                            while remaining != 0 {
+                                let count = remaining.min(chunk);
+                                render(count, &mut output);
+                                for frame in output[..count * channels].chunks_exact(channels) {
+                                    assert!(frame[0].is_finite());
+                                    assert!((frame[0] - previous).abs() < 0.01);
+                                    assert!(frame.iter().all(|sample| *sample == frame[0]));
+                                    previous = frame[0];
+                                    rendered.push(previous);
+                                }
+                                remaining -= count;
+                            }
+                            if frames >= ramp_frames {
+                                assert!((previous - unity * target).abs() < 1e-6);
+                            }
+                        }
+                        assert_eq!(shared.callback_scope_misses.load(Ordering::Relaxed), 0);
+                        rendered
+                    };
+                    let reference = render(1);
+                    for chunk in [73, 1024] {
+                        assert_eq!(render(chunk), reference);
+                    }
+                }
+            }
+        }
 
         #[test]
         fn master_volume_changes_output_without_changing_visuals() {
@@ -5353,7 +5525,7 @@ mod tests {
                 assert_eq!(report.callback_errors, 0);
                 assert_eq!(report.callback_scope_misses, 0);
                 assert!(!self.shared.failed.load(Ordering::Acquire));
-                assert!(!self.shared.stopped.load(Ordering::Acquire));
+                assert!(!self.shared.stop.is_stopped());
                 assert_eq!(self.backend.pressure_observation().voice_ceiling_drops, 0);
             }
         }
@@ -6021,7 +6193,7 @@ mod tests {
 
             assert!(tripwire::allocator_is_armed());
             let before = tripwire::Violations::capture();
-            shared.stopped.store(true, Ordering::Release);
+            shared.request_stop();
             // The 10 ms ramp spans four 128-frame callbacks. The last one
             // resets the voices and returns the lease.
             for _ in 0..4 {
@@ -6926,7 +7098,7 @@ mod tests {
                 });
                 assert!(channel.pop_terminal().is_none());
                 if stop {
-                    shared.stopped.store(true, Ordering::Release);
+                    shared.request_stop();
                 } else {
                     shared.takeover_frame.store(128, Ordering::Release);
                     shared.generation.store(8, Ordering::Release);
@@ -7668,6 +7840,69 @@ mod tests {
         use super::*;
 
         #[cfg(feature = "test-support")]
+        fn resume_tone(frame: u64) -> AudioEvent {
+            AudioEvent {
+                onset_id: frame + 1,
+                generation: 7,
+                target_frame: frame,
+                onset_lead: 0.0,
+                freq_hz: 220.0,
+                gain: 0.5,
+                duration_secs: 1.0,
+                ui_visuals: 0,
+                controls: Default::default(),
+                sample: None,
+                synth: None,
+                wavetable: None,
+                cut: None,
+            }
+        }
+
+        #[cfg(feature = "test-support")]
+        #[test]
+        fn limiter_controls_keep_callback_output_continuous_without_allocating() {
+            let _tripwire_guard = tripwire_assertion_guard();
+            let mut manual = ManualLiveOutput::new(48_000, 7).expect("manual output");
+            let mut event = resume_tone(0);
+            event.synth = Some(crate::SynthSource::One);
+            event.gain = 2.0;
+            event.duration_secs = 2.0;
+            assert!(manual.device().push(event));
+            let mut output = [0.0f32; 256 * 2];
+            for _ in 0..16 {
+                manual.render(&mut output);
+            }
+            let mut previous = output[output.len() - 2];
+            assert!(previous > 0.1);
+            let before = tripwire::Violations::capture();
+            for (threshold_db, character, makeup) in [
+                (-18.0, crate::limiter::Character::Transparent, false),
+                (-6.0, crate::limiter::Character::Hard, true),
+                (-12.0, crate::limiter::Character::Warm, true),
+                (-3.0, crate::limiter::Character::Punchy, false),
+                (f32::NAN, crate::limiter::Character::Transparent, false),
+            ] {
+                manual.device().set_limiter(Some(crate::LimiterSettings {
+                    threshold_db,
+                    character,
+                }));
+                manual.device().set_limiter_makeup(makeup);
+                for _ in 0..8 {
+                    manual.render(&mut output);
+                    for frame in output.as_chunks::<2>().0 {
+                        assert!(frame[0].is_finite() && frame[0] > 0.01);
+                        assert!(frame[0] <= 1.0);
+                        assert!((frame[0] - previous).abs() < 0.01);
+                        assert_eq!(frame[0], frame[1]);
+                        previous = frame[0];
+                    }
+                }
+            }
+            assert!(tripwire::Violations::capture().since(before).clean());
+            assert_eq!(manual.device().report().callback_scope_misses, 0);
+        }
+
+        #[cfg(feature = "test-support")]
         #[test]
         fn manual_output_renders_queued_audio_and_acknowledges_stop() {
             let _tripwire_guard = tripwire_assertion_guard();
@@ -7723,6 +7958,182 @@ mod tests {
             assert_eq!(report.submitted_frames, 1024);
             assert_eq!(report.accepted_events, 1);
             assert!(output.iter().all(|sample| *sample == 0.0));
+        }
+
+        #[cfg(feature = "test-support")]
+        #[test]
+        fn startup_mute_applies_before_piano_and_routed_audio() {
+            let _tripwire_guard = tripwire_assertion_guard();
+            for piano in [false, true] {
+                let shared = LiveShared::new(7);
+                shared.orbit_pairs[1].store(1, Ordering::Relaxed);
+                let mut backend =
+                    LiveScalarBackend::with_dispatch(48_000, 4, DspDispatch::portable())
+                        .expect("portable backend");
+                let mut meters = test_meter();
+                let mut output = [0.0f32; 256 * 4];
+                let mut render = |output: &mut [f32]| {
+                    let before = tripwire::Violations::capture();
+                    tripwire::audio_scope(|| {
+                        write_live_output(&mut backend, &mut meters, output, 4, &shared);
+                    });
+                    assert!(tripwire::Violations::capture().since(before).clean());
+                };
+                render(&mut output);
+                assert!(output.iter().all(|sample| *sample == 0.0));
+
+                shared.meter.set_gain(0.0);
+                let mut note = resume_tone(256);
+                note.controls.piano = piano;
+                note.controls.orbit = 1;
+                note.synth = Some(crate::SynthSource::One);
+                assert!(shared.immediate.push(note));
+                for _ in 0..3 {
+                    render(&mut output);
+                    assert!(output.iter().all(|sample| *sample == 0.0));
+                }
+                assert_eq!(shared.accepted_events.load(Ordering::Relaxed), 1);
+                shared.meter.set_gain(1.0);
+                render(&mut output);
+                assert!(output[..4].iter().all(|sample| sample.abs() < 0.005));
+                render(&mut output);
+                assert!(output.iter().any(|sample| sample.abs() > 0.01));
+            }
+        }
+
+        #[cfg(feature = "test-support")]
+        #[test]
+        fn a_resumed_output_serves_sound_again_after_a_stop() {
+            let _tripwire_guard = tripwire_assertion_guard();
+            let mut manual = ManualLiveOutput::new(48_000, 7).expect("manual output");
+            let mut output = [0.0f32; 256 * 2];
+            assert!(manual.device().push(resume_tone(0)));
+            manual.render(&mut output);
+            assert!(output.iter().any(|sample| sample.abs() > 1e-6));
+
+            assert!(manual.device().push(resume_tone(2048)));
+            assert!(manual.device().push_immediate(resume_tone(256)));
+            manual.device().stop();
+            for _ in 0..3 {
+                manual.render(&mut output);
+            }
+            assert!(manual.device().report().stop_acknowledged);
+            assert!(output.iter().all(|sample| *sample == 0.0));
+
+            manual.device().resume();
+            assert!(!manual.device().report().stop_acknowledged);
+            for _ in 0..6 {
+                manual.render(&mut output);
+                assert!(output.iter().all(|sample| *sample == 0.0));
+            }
+            assert_eq!(manual.device().report().accepted_events, 1);
+            assert_eq!(manual.device().report().ring_depth, 0);
+
+            let mut piano = resume_tone(manual.device().clock_frames());
+            piano.controls.piano = true;
+            assert!(manual.device().push_immediate(piano));
+            manual.render(&mut output);
+            assert!(
+                output.iter().any(|sample| sample.abs() > 1e-6),
+                "the resumed stream renders the new note"
+            );
+            manual.device().resume();
+            manual.device().resume();
+            manual.render(&mut output);
+            assert!(output.iter().any(|sample| sample.abs() > 1e-6));
+            assert_eq!(manual.device().report().accepted_events, 2);
+
+            manual.device().stop();
+            manual.render(&mut output);
+            assert!(!manual.device().report().stop_acknowledged);
+            manual.render(&mut output);
+            assert!(manual.device().report().stop_acknowledged);
+        }
+
+        #[cfg(feature = "test-support")]
+        #[test]
+        fn resuming_a_pending_stop_finishes_the_fade_before_admitting_new_notes() {
+            let _tripwire_guard = tripwire_assertion_guard();
+            for before_resume in [0, 1] {
+                for new_notes in [false, true] {
+                    let mut manual = ManualLiveOutput::new(48_000, 7).unwrap();
+                    let mut output = [0.0f32; 128 * 2];
+                    assert!(!manual.device().stop_pending());
+                    assert!(manual.device().push(resume_tone(0)));
+                    manual.render(&mut output);
+                    assert!(output.iter().any(|sample| sample.abs() > 1e-6));
+                    assert!(manual.device().push(resume_tone(2048)));
+                    assert!(manual.device().push_immediate(resume_tone(128)));
+                    assert!(!manual.device().stop_and_wait(Duration::ZERO));
+                    assert!(manual.device().stop_pending());
+                    manual.device().stop();
+                    for _ in 0..before_resume {
+                        manual.render(&mut output);
+                    }
+                    manual.device().resume();
+                    manual.device().resume();
+                    assert!(manual.device().stop_pending());
+                    if new_notes {
+                        assert!(manual.device().push(resume_tone(640)));
+                        assert!(manual.device().push_immediate(resume_tone(640)));
+                    }
+                    for _ in before_resume..4 {
+                        manual.render(&mut output);
+                        assert_eq!(manual.device().report().accepted_events, 1);
+                    }
+                    assert!(!manual.device().report().stop_acknowledged);
+                    assert!(!manual.device().stop_pending());
+                    assert!(!manual.device().shared.stop.is_stopped());
+                    manual.render(&mut output);
+                    assert_eq!(output.iter().any(|sample| sample.abs() > 1e-6), new_notes);
+                    assert_eq!(
+                        manual.device().report().accepted_events,
+                        if new_notes { 3 } else { 1 }
+                    );
+                    assert_eq!(manual.device().report().ring_depth, 0);
+                    if new_notes {
+                        manual.device().stop();
+                        manual.device().resume();
+                        let frame = manual.device().clock_frames() + 1024;
+                        assert!(manual.device().push(resume_tone(frame)));
+                        assert!(manual.device().push_immediate(resume_tone(frame)));
+                        manual.device().stop();
+                        for _ in 0..4 {
+                            manual.render(&mut output);
+                        }
+                        assert!(manual.device().report().stop_acknowledged);
+                        assert!(!manual.device().stop_pending());
+                        manual.device().resume();
+                        for _ in 0..8 {
+                            manual.render(&mut output);
+                            assert!(output.iter().all(|sample| *sample == 0.0));
+                        }
+                        assert_eq!(manual.device().report().accepted_events, 3);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn an_acknowledged_callback_cannot_acknowledge_a_later_stop() {
+            let stop = LiveStop::new();
+            stop.request();
+            stop.complete(OUTPUT_STOP_REQUESTED);
+            assert!(stop.acknowledged());
+            let observed = stop.0.load(Ordering::Acquire);
+            stop.resume();
+            stop.request();
+            stop.complete(observed);
+            assert!(!stop.acknowledged());
+
+            stop.resume();
+            stop.request();
+            stop.request();
+            stop.complete(OUTPUT_RESUME_PENDING);
+            assert!(
+                stop.acknowledged(),
+                "the second stop cancels pending resume"
+            );
         }
 
         #[cfg(feature = "test-support")]
@@ -7992,7 +8403,7 @@ mod tests {
                 assert_eq!(Arc::strong_count(&gate), 1, "candidate thread was joined");
                 assert_eq!(Arc::strong_count(&shared.input), input_owners);
                 assert_eq!(shared.report(1), before);
-                assert!(!shared.stopped.load(Ordering::Acquire));
+                assert!(!shared.stop.is_stopped());
                 assert_eq!(shared.input.channels(), 1);
             }
         }
@@ -8024,7 +8435,7 @@ mod tests {
             );
             assert!(shared.clock_frames() >= u64::from(SILENT_BUFFER_FRAMES));
             assert_eq!(shared.ring.role_conflicts.load(Ordering::Acquire), 0);
-            assert!(!shared.stopped.load(Ordering::Acquire));
+            assert!(!shared.stop.is_stopped());
         }
 
         /// A held silent clock stays put however long the test looks at it,
@@ -8648,7 +9059,7 @@ mod tests {
                 .expect_err("discovery must fail");
             assert_eq!(error.to_string(), "discovery rejected");
             assert_eq!(discoveries, 1);
-            assert!(!device.shared.stopped.load(Ordering::Acquire));
+            assert!(!device.shared.stop.is_stopped());
             assert!(Arc::ptr_eq(
                 &device.silent.as_ref().expect("retained output").close,
                 &close
@@ -8688,7 +9099,7 @@ mod tests {
                     LiveScalarDevice::prepare_recycled_output,
                 )
                 .expect_err("discovery must fail");
-            assert!(!device.shared.stopped.load(Ordering::Acquire));
+            assert!(!device.shared.stop.is_stopped());
             assert_eq!(
                 device
                     .silent
@@ -8842,7 +9253,7 @@ mod tests {
                     &close,
                     &device.silent.as_ref().expect("old output").close
                 ));
-                assert!(!device.shared.stopped.load(Ordering::Acquire));
+                assert!(!device.shared.stop.is_stopped());
                 assert_eq!(device.audio_facts(), facts);
                 assert_eq!(device.report(), report);
                 assert_eq!(device.confirmations().epoch(), epoch);
@@ -8891,7 +9302,7 @@ mod tests {
                             preparations += 1;
                             assert!(opened.is_none());
                             assert!(device.stream.is_none() && device.silent.is_none());
-                            assert!(device.shared.stopped.load(Ordering::Acquire));
+                            assert!(device.shared.stop.is_stopped());
                             assert!(old_close.load(Ordering::Acquire));
                             assert_eq!(Arc::strong_count(&old_close), 1, "old thread was joined");
                             let prepared =
@@ -8911,7 +9322,7 @@ mod tests {
                     .expect_err("preparation must fail");
                 assert_eq!(error.to_string(), "preparation rejected");
                 assert!(device.stream.is_none() && device.silent.is_none());
-                assert!(device.shared.stopped.load(Ordering::Acquire));
+                assert!(device.shared.stop.is_stopped());
                 assert_eq!(samples[0].1.identity(), identity);
                 assert_eq!(samples[0].1.pcm().as_ptr(), pcm);
                 assert_eq!(samples[0].1.stereo_at(0.0), Some((0.75, 0.75)));
@@ -8924,7 +9335,7 @@ mod tests {
                 .recycle_output_to_with_samples(None, &samples, || false)
                 .expect("successful seeded silent retry");
             assert!(device.stream.is_none() && device.silent.is_some());
-            assert!(!device.shared.stopped.load(Ordering::Acquire));
+            assert!(!device.shared.stop.is_stopped());
             device
                 .check_health()
                 .expect("successful retry clears failure");
@@ -8983,7 +9394,7 @@ mod tests {
                 "live output failed before activation or was already activated"
             );
             assert!(device.stream.is_none() && device.silent.is_none());
-            assert!(device.shared.stopped.load(Ordering::Acquire));
+            assert!(device.shared.stop.is_stopped());
             let candidate_close = candidate_close.expect("candidate was prepared");
             assert!(candidate_close.load(Ordering::Acquire));
             assert_eq!(
@@ -9782,7 +10193,7 @@ mod tests {
                         start,
                         &shared.ring,
                         shared.flip_atomics(),
-                        &shared.stopped,
+                        &AtomicBool::new(shared.stop.is_stopped()),
                     );
                     // A tenth of a second past the cut, well beyond its ramp.
                     if start >= 16_800 {
@@ -9907,7 +10318,7 @@ mod tests {
                     start,
                     &shared.ring,
                     shared.flip_atomics(),
-                    &shared.stopped,
+                    &AtomicBool::new(shared.stop.is_stopped()),
                 );
                 accepted += report.accepted;
                 stale += report.stale;

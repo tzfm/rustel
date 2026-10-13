@@ -308,6 +308,12 @@ impl DecodedSample {
         self.identity
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn pcm_owners_for_test(&self) -> usize {
+        Arc::strong_count(&self.pcm)
+    }
+
     /// This buffer at `target_rate`, converted the way `decodeAudioData`
     /// converts a file to the context's rate. An equal rate is a cheap clone:
     /// the PCM is shared, not copied. A conversion whose body would pass the

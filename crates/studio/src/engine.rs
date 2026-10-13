@@ -182,18 +182,6 @@ const PIANO_RELEASE_SECS: f64 = 0.02;
 /// -120 dBFS. A quiet passage in a long sample must not look like its end.
 const GRACEFUL_STOP_SILENCE_PEAK: f32 = 0.000_001;
 
-fn graceful_stop_source_finished(
-    levels: MasterLevels,
-    active_voices: u64,
-    pending_events: u64,
-    active_orbit_delays: u64,
-) -> bool {
-    active_voices == 0
-        && pending_events == 0
-        && active_orbit_delays == 0
-        && levels.peak <= GRACEFUL_STOP_SILENCE_PEAK
-}
-
 const DEVICE_PROGRESS_DEADLINE: Duration = Duration::from_secs(3);
 const DEVICE_RECYCLE_COOLDOWN: Duration = Duration::from_secs(8);
 const DEVICE_LEAD_WAIT: Duration = Duration::from_millis(250);
@@ -1100,7 +1088,9 @@ pub struct StudioEngine {
     recovery_epoch: u64,
     launch_pads: Vec<(u8, u8)>,
     live: Option<StudioPlayback>,
-    /// Output-only helper: no score producer, transport or cycle ownership.
+    /// Output parked between transports: no score producer, transport or
+    /// cycle ownership. A stop parks the stream here rather than closing
+    /// it, and the next start adopts it where it stands.
     piano_output: Option<LiveScalarDevice>,
     piano_close_when_idle: bool,
     piano_sound: super::PianoSound,
@@ -1831,6 +1821,9 @@ impl StudioEngine {
         ) -> Result<(), DevicePlaybackError>,
     ) -> Result<(), RuntimeError> {
         if self.live.is_none() || self.session.transport().is_stopped() {
+            if self.live.is_some() {
+                let _ = self.stop_output(self.config.stop_timeout, false);
+            }
             self.close_piano_output();
             self.preferred_output = Some(name.to_owned());
             return Ok(());
@@ -1850,7 +1843,7 @@ impl StudioEngine {
             Err(error) => Some(error),
         };
         if self.session.transport().is_stopped() {
-            let _ = self.stop(self.config.stop_timeout);
+            let _ = self.stop_output(self.config.stop_timeout, false);
             return Err(output_recovery_cancelled(requested_error.as_ref()));
         }
         if let Some(error) = &requested_error {
@@ -1871,12 +1864,12 @@ impl StudioEngine {
             if let Err(recovery) = recovered {
                 let message =
                     format!("{error}; could not reopen previous output {previous:?}: {recovery}");
-                let _ = self.stop(self.config.stop_timeout);
+                let _ = self.stop_output(self.config.stop_timeout, false);
                 return Err(RuntimeError::Audio(message));
             }
         }
         if self.session.transport().is_stopped() {
-            let _ = self.stop(self.config.stop_timeout);
+            let _ = self.stop_output(self.config.stop_timeout, false);
             return Err(output_recovery_cancelled(requested_error.as_ref()));
         }
         if let Err(error) = self.rearm_recycled_output() {
@@ -1886,11 +1879,11 @@ impl StudioEngine {
                 }
                 None => format!("replacement output could not refill: {error}"),
             };
-            let _ = self.stop(self.config.stop_timeout);
+            let _ = self.stop_output(self.config.stop_timeout, false);
             return Err(RuntimeError::Audio(message));
         }
         if self.session.transport().is_stopped() {
-            let _ = self.stop(self.config.stop_timeout);
+            let _ = self.stop_output(self.config.stop_timeout, false);
             return Err(output_recovery_cancelled(requested_error.as_ref()));
         }
         if let Some(error) = requested_error {
@@ -1920,6 +1913,9 @@ impl StudioEngine {
             .validate()
             .map_err(|error| RuntimeError::Audio(error.to_string()))?;
         self.config.output_buffer_frames = frames;
+        if self.live.is_some() && self.session.transport().is_stopped() {
+            let _ = self.stop_output(self.config.stop_timeout, false);
+        }
         self.close_piano_output();
         if self.live.is_none() || self.session.transport().is_stopped() {
             return Ok(());
@@ -2552,6 +2548,8 @@ impl StudioEngine {
     }
 
     fn open_piano_output(&mut self) -> Result<(), RuntimeError> {
+        #[cfg(target_os = "linux")]
+        self.refresh_idle_default_output();
         if self.audio_device().is_none() {
             let mut device = self.open_output().map_err(runtime_device_error)?;
             device
@@ -2567,6 +2565,7 @@ impl StudioEngine {
             }
             self.piano_output = Some(device);
         }
+        self.audio_device().expect("piano output").resume();
         Ok(())
     }
 
@@ -2756,6 +2755,20 @@ impl StudioEngine {
         self.piano_tail_silent_since = None;
     }
 
+    /// Reopen an idle Linux default output to resolve its current route.
+    #[cfg(any(target_os = "linux", test))]
+    fn refresh_idle_default_output(&mut self) {
+        if self.preferred_output.is_none()
+            && self.live.is_none()
+            && self.piano_close_when_idle
+            && self.piano.iter().all(Option::is_none)
+            && !self.piano_has_score_tail
+        {
+            self.close_piano_output();
+        }
+    }
+
+    /// Close the parked output on failure, a route or buffer change, or shutdown.
     fn close_piano_output(&mut self) {
         let Some(device) = self.piano_output.take() else {
             return;
@@ -2781,15 +2794,9 @@ impl StudioEngine {
             self.apply_mix_gains(device);
             let levels = device.take_levels();
             self.master.publish(levels);
-            let closing = self.piano_close_when_idle && self.piano.iter().all(Option::is_none);
-            let tail_done = if closing && self.piano_has_score_tail {
-                let pressure = device.report().realtime_pressure;
-                if graceful_stop_source_finished(
-                    levels,
-                    pressure.active_voices,
-                    pressure.pending_events,
-                    pressure.active_orbit_delays,
-                ) {
+            let tail_done = if self.piano_has_score_tail {
+                let (sources_active, peak) = device.take_score_activity();
+                if !sources_active && peak <= GRACEFUL_STOP_SILENCE_PEAK {
                     self.piano_tail_silent_since
                         .get_or_insert_with(Instant::now)
                         .elapsed()
@@ -2799,10 +2806,17 @@ impl StudioEngine {
                     false
                 }
             } else {
-                !self.piano_has_score_tail
+                false
             };
-            if device.output_failed() || (closing && tail_done) {
+            // The parked output stays open for the next start: closing a
+            // stream and opening one again make their own click on some
+            // hosts, even from silence. Only a failed stream is retired.
+            if device.output_failed() {
                 self.close_piano_output();
+            } else if tail_done {
+                self.close_input();
+                self.piano_has_score_tail = false;
+                self.piano_tail_silent_since = None;
             }
         }
     }
@@ -4822,6 +4836,8 @@ impl StudioEngine {
     ) -> Result<StudioInstall, RuntimeError> {
         debug_assert!(self.live.is_none());
         self.sync_polyphony();
+        #[cfg(target_os = "linux")]
+        self.refresh_idle_default_output();
         // The live device carries the input from here: the monitor's stream
         // goes before the output opens, so the two never hold one microphone.
         self.input_monitor = None;
@@ -4835,11 +4851,10 @@ impl StudioEngine {
         self.sync_input_channels();
 
         let was_piano_output = self.piano_output.is_some();
-        let mut device = match self
-            .piano_output
-            .take()
-            .map_or_else(|| self.open_output(), Ok)
-        {
+        // A parked output stayed open through the last stop, so this set
+        // adopts its stream instead of opening one.
+        let parked = self.piano_output.take();
+        let mut device = match parked.map_or_else(|| self.open_output(), Ok) {
             Ok(device) => device,
             Err(error) => {
                 self.session.transport().stop();
@@ -4921,6 +4936,17 @@ impl StudioEngine {
             self.restore_failed_start_device(device, was_piano_output);
             return Err(error);
         }
+        let producer = match LiveFileProducer::unwatched(self.config.poll_interval) {
+            Ok(mut producer) => {
+                producer.adopt_recovery_epoch(&self.session);
+                producer
+            }
+            Err(error) => {
+                transport.stop();
+                self.restore_failed_start_device(device, was_piano_output);
+                return Err(error);
+            }
+        };
         // Provisional UI mapping. Input opening, sample transfer and the
         // worker's first Hydra turn still happen before audio can be queued;
         // the first producer turn refreshes this anchor after that work.
@@ -4942,17 +4968,9 @@ impl StudioEngine {
         device.set_limiter(self.master.limiter());
         device.set_limiter_makeup(self.master.limiter_makeup());
 
-        let producer = match LiveFileProducer::unwatched(self.config.poll_interval) {
-            Ok(mut producer) => {
-                producer.adopt_recovery_epoch(&self.session);
-                producer
-            }
-            Err(error) => {
-                transport.stop();
-                self.restore_failed_start_device(device, was_piano_output);
-                return Err(error);
-            }
-        };
+        // A failed install leaves a parked output silent. Resume only once
+        // its new generation and producer are ready.
+        device.resume();
         self.ui.reset();
         // Each set gets its MIDI troubles told afresh.
         {
@@ -5111,7 +5129,7 @@ impl StudioEngine {
     }
 
     fn restore_failed_start_device(&mut self, device: LiveScalarDevice, was_piano_output: bool) {
-        if was_piano_output {
+        if was_piano_output && device.check_health().is_ok() {
             self.piano_output = Some(device);
         } else {
             device.stop();
@@ -5205,8 +5223,6 @@ impl StudioEngine {
         emit_pending_diagnostics(&mut self.pending_diagnostics, &mut emit);
 
         if self.live.is_none() {
-            // The bank went with the device; any batons still owed are owed
-            // to nobody, and every retiring id is free.
             self.service_idle_piano();
             self.tend_idle_sample_memory();
             return Ok(StudioTick::Idle);
@@ -5272,7 +5288,7 @@ impl StudioEngine {
                         "audio output {} failed while playing live",
                         self.live.as_ref().expect("checked playback").device.name()
                     )));
-                    let _ = self.stop(Duration::from_millis(100));
+                    let _ = self.stop_output(Duration::from_millis(100), false);
                     return Err(error);
                 }
             }
@@ -5285,12 +5301,12 @@ impl StudioEngine {
             .check_health()
         {
             let error = runtime_device_error(error);
-            let _ = self.stop(Duration::from_millis(100));
+            let _ = self.stop_output(Duration::from_millis(100), false);
             return Err(error);
         }
 
         if let Err(error) = self.recycle_stalled_device(observed_at) {
-            let _ = self.stop(self.config.stop_timeout);
+            let _ = self.stop_output(self.config.stop_timeout, false);
             return Err(error);
         }
         let asset_install_started = Instant::now();
@@ -5300,7 +5316,14 @@ impl StudioEngine {
         self.release_retired_samples();
         self.session
             .record_live_asset_preparation(asset_install_started.elapsed());
-        if self.hold_start(&mut emit) {
+        let stop_pending = initial_start
+            && self
+                .live
+                .as_ref()
+                .expect("checked playback")
+                .device
+                .stop_pending();
+        if stop_pending || self.hold_start(&mut emit) {
             // A held start keeps its output open: previews sound through it
             // as they would through a playing score.
             self.advance_previews();
@@ -5532,7 +5555,9 @@ impl StudioEngine {
             // The score finished naturally; the keyboard still owns audio.
             // Keep its voices and the device/recording tap uninterrupted.
             self.detach_stopped_output_for_piano();
+            self.close_input();
             self.piano_has_score_tail = false;
+            self.piano_tail_silent_since = None;
             self.ui.reset();
             StudioTick::Idle
         } else {
@@ -5542,13 +5567,19 @@ impl StudioEngine {
         }
     }
 
-    /// Stop is idempotent at the Session level and consumes the current device
-    /// and producer. A later [`Self::evaluate`] creates fresh playback state.
+    /// Stop is idempotent at the Session level and ends the current playback.
+    /// A healthy device stays open after an acknowledged Stop or a zero timeout.
+    /// A later [`Self::evaluate`] adopts that stream rather than opening a new one.
+    /// An idle Linux default output is reopened to resolve its current route.
     ///
     /// This is the immediate form: the device declicks over ten milliseconds
     /// and drains. A user-facing Stop goes through [`Self::request_stop`] and
     /// lets the tail ring out first.
     pub fn stop(&mut self, timeout: Duration) -> Option<StudioStop> {
+        self.stop_output(timeout, true)
+    }
+
+    fn stop_output(&mut self, timeout: Duration, keep_output: bool) -> Option<StudioStop> {
         // What its last text sounded stays for that text's next start.
         self.end_played();
         self.end_loads();
@@ -5575,7 +5606,7 @@ impl StudioEngine {
         // Piano can retain the callback after a score finishes. Stopping
         // that output needs the same cleanup and
         // acknowledgement as stopping an output owned by the score.
-        let device = self
+        let mut device = self
             .live
             .take()
             .map(|live| live.device)
@@ -5593,13 +5624,25 @@ impl StudioEngine {
         self.external_outputs().forget();
         let acknowledged = device.stop_and_wait(timeout);
         let report = device.report();
-        drop(device);
-        // The device's rings, pools and reverbs are tens of megabytes.
+        // Reuse avoids host clicks from closing and reopening a stream.
+        // A zero timeout leaves the stop ramp pending on a healthy callback;
+        // an expired positive timeout means the callback cannot be reused.
+        if keep_output && device.check_health().is_ok() && (acknowledged || timeout.is_zero()) {
+            device.close_input();
+            self.piano_output = Some(device);
+        } else {
+            drop(device);
+        }
+        // The parked output keeps its rings and pools until the next start
+        // adopts them or a device change releases the stream. What the
+        // session let go is still owed back.
         self.owe_free_memory();
         self.sync_input_channels();
-        // The callback is joined and its ring popped; the producer went
-        // with the device. Nothing can read a retiring id now.
-        self.release_every_retiring_sample();
+        // A timed-out callback may still read retiring samples during its
+        // stop ramp. Keep their horizons until it becomes silent.
+        if acknowledged || self.piano_output.is_none() {
+            self.release_every_retiring_sample();
+        }
         self.session.consume_audio_confirmations();
         self.ui.reset();
         Some(StudioStop {
@@ -5824,11 +5867,26 @@ impl StudioEngine {
     /// which the worker never reaches: once stopped, nothing was ever
     /// dropped, and what browsing decoded stayed for the session.
     ///
-    /// With no device at all the bank went with it, so every retiring id is
-    /// free. A piano output keeps a bank, and its own path.
+    /// A parked output defers the sweep only while it can still sound, so a
+    /// keyboard tail or a ringing score keeps its samples. A stopped stream
+    /// holds no voice, but its bank still needs an uninstall for each sample
+    /// the policy forgets.
     fn tend_idle_sample_memory(&mut self) {
-        if self.live.is_some() || self.piano_output.is_some() {
+        if self.live.is_some() {
             return;
+        }
+        if let Some(device) = self.piano_output.as_ref() {
+            let report = device.report();
+            let pressure = report.realtime_pressure;
+            // Pressure telemetry can still describe audio before Stop.
+            // Stop acknowledgement guarantees that no voice remains.
+            if device.stop_pending()
+                || self.piano.iter().any(Option::is_some)
+                || (!report.stop_acknowledged
+                    && (pressure.active_voices > 0 || pressure.pending_events > 0))
+            {
+                return;
+            }
         }
         self.release_every_retiring_sample();
         self.adopt_idle_ready_samples();
@@ -6121,13 +6179,16 @@ impl StudioEngine {
         {
             return;
         }
-        // Retained means installed: the retention follows a successful ring
-        // push, and a refused install is requeued, never retained.
+        // A retained sample can still occupy the bank or the install ring.
         let installed = self.retained_samples.remove(&id).is_some();
         self.sample_last_used.remove(&id);
-        let Some(live) = self.live.as_ref() else {
-            // No device: no bank holds it, no ring or voice reads it, and
-            // the stop that took the device dropped the producer with it.
+        let Some(device) = self
+            .live
+            .as_ref()
+            .map(|live| &live.device)
+            .or(self.piano_output.as_ref())
+        else {
+            // With no output, no bank, ring or voice holds the id.
             if let Some(library) = self.session.sample_library() {
                 library.release_ids([id]);
             }
@@ -6135,16 +6196,16 @@ impl StudioEngine {
         };
         let baton = if !installed {
             Baton::NotOwed
-        } else if live.device.uninstall_sample(id) {
+        } else if device.uninstall_sample(id) {
             Baton::Pushed {
-                callbacks: live.device.callbacks(),
+                callbacks: device.callbacks(),
             }
         } else {
             // The install ring is full: the baton is owed, not lost. The
             // bank keeps the PCM until the retry lands.
             Baton::Owed
         };
-        live.device.reclaim_samples();
+        device.reclaim_samples();
         self.retiring.push(RetiringSample {
             id,
             baton,
@@ -6165,17 +6226,22 @@ impl StudioEngine {
         {
             return;
         }
-        let Some(live) = self.live.as_ref() else {
+        let Some(device) = self
+            .live
+            .as_ref()
+            .map(|live| &live.device)
+            .or(self.piano_output.as_ref())
+        else {
             return;
         };
         for retiring in &mut self.retiring {
-            if retiring.baton == Baton::Owed && live.device.uninstall_sample(retiring.id) {
+            if retiring.baton == Baton::Owed && device.uninstall_sample(retiring.id) {
                 retiring.baton = Baton::Pushed {
-                    callbacks: live.device.callbacks(),
+                    callbacks: device.callbacks(),
                 };
             }
         }
-        live.device.reclaim_samples();
+        device.reclaim_samples();
     }
 
     /// Hand the library every retiring id nothing can read any more.
@@ -6190,15 +6256,25 @@ impl StudioEngine {
         if self.retiring.is_empty() {
             return;
         }
-        let Some(live) = self.live.as_ref() else {
+        let Some(device) = self
+            .live
+            .as_ref()
+            .map(|live| &live.device)
+            .or(self.piano_output.as_ref())
+        else {
             return;
         };
         let Some(library) = self.session.sample_library() else {
             return;
         };
-        let callbacks = live.device.callbacks();
-        let frame = live.device.clock_frames();
-        let backlog_floor = live.producer.pending_target_floor().unwrap_or(u64::MAX);
+        let callbacks = device.callbacks();
+        let frame = device.clock_frames();
+        device.reclaim_samples();
+        let backlog_floor = self
+            .live
+            .as_ref()
+            .and_then(|live| live.producer.pending_target_floor())
+            .unwrap_or(u64::MAX);
         let audition_horizon = self.audition_horizon_frame;
         let mut released = Vec::new();
         self.retiring.retain(|retiring| {
@@ -6223,18 +6299,24 @@ impl StudioEngine {
         }
     }
 
-    /// The device, its bank, its ring and its voices are gone, or rebuilt
-    /// from what the engine still retains, and no retiring id is in that
-    /// set. The backlog that fed the device is empty. So every retiring id
-    /// is free, baton owed or not, and the use horizons of accepted notes
-    /// are cleared.
+    /// The voices and producer backlog are gone. A parked bank still owes
+    /// its uninstalls. A dropped or rebuilt bank releases every id at once.
     fn release_every_retiring_sample(&mut self) {
+        self.audition_horizon_frame = 0;
         if !self.sample_use_until.is_empty() {
             self.sample_use_until.clear();
             self.protection_generation = self.protection_generation.wrapping_add(1);
             self.idle_swept = false;
         }
         if self.retiring.is_empty() {
+            return;
+        }
+        if self.piano_output.is_some() {
+            for retiring in &mut self.retiring {
+                retiring.quiet_after_frame = 0;
+            }
+            self.retry_pending_uninstalls();
+            self.release_retired_samples();
             return;
         }
         let released: Vec<SampleId> = self
@@ -6437,7 +6519,7 @@ impl StudioEngine {
 
     /// Hand freed memory back to the system when a release is owed, or when
     /// the engine has idled long enough that something it did not see may
-    /// have been let go. Idle turns only: with no output open there is no
+    /// have been let go. Idle turns only: with no playback open there is no
     /// producer for the allocator's locks to hold up.
     fn free_memory_when_due(&mut self, now: Instant) {
         let since_last = now.saturating_duration_since(self.last_free_memory);
@@ -8233,27 +8315,55 @@ pub(super) mod tests {
 
         #[test]
         fn a_healthy_input_handoff_keeps_the_first_attempt_immediate() {
-            let mut input = InputHarness::new(false);
-            let now = Instant::now();
-            input.turn(now, InputStatus::Closed);
-            input.turn(now, InputStatus::Healthy);
-            let diagnostics = input.engine.pending_diagnostics.len();
+            for audition_tail in [false, true] {
+                let mut input = InputHarness::new(false);
+                let now = Instant::now();
+                input.turn(now, InputStatus::Closed);
+                input.turn(now, InputStatus::Healthy);
+                let diagnostics = input.engine.pending_diagnostics.len();
 
-            input.engine.close_input();
-            play_silently(&mut input.engine);
-            input.live = true;
-            input.turn(now, InputStatus::Closed);
-            assert_eq!(input.opens.len(), 2);
-            assert_eq!(input.engine.input_attempts, 0);
-            assert_eq!(input.engine.pending_diagnostics.len(), diagnostics);
+                input.engine.close_input();
+                play_silently(&mut input.engine);
+                input.live = true;
+                input.turn(now, InputStatus::Closed);
+                assert_eq!(input.opens.len(), 2);
+                assert_eq!(input.engine.input_attempts, 0);
+                assert_eq!(input.engine.pending_diagnostics.len(), diagnostics);
 
-            input.engine.close_input();
-            input.engine.live = None;
-            input.live = false;
-            input.turn(now, InputStatus::Closed);
-            assert_eq!(input.opens.len(), 3);
-            assert_eq!(input.engine.input_attempts, 0);
-            assert_eq!(input.engine.pending_diagnostics.len(), diagnostics);
+                input.engine.prepare_piano().unwrap();
+                let stream = input.engine.device_report().unwrap().stream_id;
+                if audition_tail {
+                    input.engine.detach_stopped_output_for_piano();
+                    input.engine.service_idle_piano();
+                    assert_eq!(input.engine.input_opened_for.as_deref(), Some("microphone"));
+                    input.engine.piano_tail_silent_since =
+                        Some(Instant::now() - GRACEFUL_STOP_SILENCE_HOLD);
+                    input.engine.service_idle_piano();
+                } else {
+                    input.engine.request_stop();
+                    input.engine.prepare_piano().unwrap();
+                    assert!(matches!(
+                        input.engine.advance_graceful_stop(Duration::ZERO),
+                        StudioTick::Stopping
+                    ));
+                    assert!(matches!(
+                        input
+                            .engine
+                            .advance_graceful_stop(GRACEFUL_STOP_SILENCE_HOLD),
+                        StudioTick::Idle
+                    ));
+                }
+                assert!(input.engine.live.is_none());
+                assert!(input.engine.input_opened_for.is_none());
+                assert!(!input.engine.piano_has_score_tail);
+                assert_eq!(input.engine.device_report().unwrap().stream_id, stream);
+                input.live = false;
+                input.turn(now, InputStatus::Closed);
+                input.turn(now, InputStatus::Healthy);
+                assert_eq!(input.opens.len(), 3);
+                assert_eq!(input.engine.input_attempts, 0);
+                assert_eq!(input.engine.pending_diagnostics.len(), diagnostics);
+            }
         }
 
         #[test]
@@ -10299,22 +10409,68 @@ pub(super) mod tests {
     /// clock runs out while nothing plays.
     #[test]
     fn the_idle_sweep_runs_on_the_stopped_path() {
-        let mut engine = StudioEngine::new(StudioConfig {
-            output: Some("silent".into()),
-            preview_budget_bytes: 0,
-            unused_sample_idle: Duration::from_secs(1),
-            ..StudioConfig::default()
-        })
-        .expect("engine");
-        let pcm = || DecodedSample::from_parts(48_000, 1, vec![0.0; 128]).expect("pcm");
-        engine.retain_sample_for_test(SampleId(61), pcm());
-        engine.retain_sample_for_test(SampleId(62), pcm());
-        engine.idle_turn(|_| Ok(()));
-        assert_eq!(engine.retained_sample_count(), 2, "not idle long enough");
+        for parked in [false, true] {
+            let mut engine = StudioEngine::new(StudioConfig {
+                output: Some("silent".into()),
+                preview_budget_bytes: 0,
+                unused_sample_idle: Duration::from_secs(1),
+                ..StudioConfig::default()
+            })
+            .expect("engine");
+            if parked {
+                play_silently(&mut engine);
+            }
+            let pcm = DecodedSample::from_parts(48_000, 1, vec![0.0; 128]).expect("pcm");
+            for id in [SampleId(61), SampleId(62)] {
+                if let Some(device) = engine.audio_device() {
+                    device.install_sample(id, pcm.clone()).expect("install");
+                }
+                engine.retain_sample_for_test(id, pcm.clone());
+            }
+            if parked {
+                assert!(
+                    engine
+                        .audio_device()
+                        .unwrap()
+                        .hold_silent_clock_for_test(true)
+                );
+                assert!(!engine.stop(Duration::ZERO).unwrap().acknowledged);
+                engine.last_preview_at = Instant::now() - Duration::from_secs(5);
+                engine.idle_turn(|_| Ok(()));
+                assert_eq!(
+                    engine.retained_sample_count(),
+                    2,
+                    "the stop ramp still needs PCM"
+                );
+                assert!(
+                    engine
+                        .audio_device()
+                        .unwrap()
+                        .hold_silent_clock_for_test(false)
+                );
+                assert!(
+                    engine
+                        .stop(Duration::from_millis(500))
+                        .unwrap()
+                        .acknowledged
+                );
+                engine.last_preview_at = Instant::now();
+            }
+            engine.idle_turn(|_| Ok(()));
+            assert_eq!(engine.retained_sample_count(), 2, "not idle long enough");
+            assert!(pcm.pcm_owners_for_test() > 1, "the engine holds the PCM");
 
-        engine.last_preview_at = Instant::now() - Duration::from_secs(5);
-        engine.idle_turn(|_| Ok(()));
-        assert_eq!(engine.retained_sample_count(), 0, "swept while stopped");
+            engine.last_preview_at = Instant::now() - Duration::from_secs(5);
+            engine.idle_turn(|_| Ok(()));
+            assert_eq!(engine.retained_sample_count(), 0, "swept while stopped");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while pcm.pcm_owners_for_test() > 1 {
+                assert!(Instant::now() < deadline, "the output kept swept PCM");
+                engine.idle_turn(|_| Ok(()));
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(engine.piano_output.is_some(), parked);
+        }
     }
 
     /// Memory the engine lets go returns to the system once the engine is
@@ -10879,36 +11035,6 @@ pub(super) mod tests {
         assert_eq!(status.final_signal.unwrap().nonfinite_count, 0);
         assert_eq!(held.engine.try_finish_recording(), None);
         assert_eq!(held.engine.stop_recording(), None);
-    }
-
-    #[test]
-    fn graceful_stop_does_not_mistake_a_silent_passage_for_a_finished_sample() {
-        let silence = MasterLevels::default();
-        assert!(graceful_stop_source_finished(silence, 0, 0, 0));
-        assert!(
-            !graceful_stop_source_finished(silence, 1, 0, 0),
-            "an active sample voice may resume after a silent passage"
-        );
-        assert!(
-            !graceful_stop_source_finished(silence, 0, 1, 0),
-            "a queued source event is not finished"
-        );
-        assert!(
-            !graceful_stop_source_finished(silence, 0, 0, 1),
-            "a delay line may be silent before its next echo"
-        );
-        assert!(
-            !graceful_stop_source_finished(
-                MasterLevels {
-                    peak: GRACEFUL_STOP_SILENCE_PEAK * 2.0,
-                    ..MasterLevels::default()
-                },
-                0,
-                0,
-                0
-            ),
-            "the source is still ringing through its release or effect tail"
-        );
     }
 
     /// `stop_recording` is the whole close (ask, wait, join), because the
@@ -11908,6 +12034,18 @@ pub(super) mod tests {
 
     pub(crate) fn silent_engine_for_output_selection() -> StudioEngine {
         silent_engine_with_pattern(rustel_core::silence())
+    }
+
+    fn start_selected_output(engine: &mut StudioEngine) {
+        let device = engine.open_output().expect("selected output");
+        engine.session.transport().start();
+        engine
+            .session
+            .bind_audio_confirmations(device.confirmations())
+            .expect("bind output confirmations");
+        engine
+            .start_on(device, "silence", false, false)
+            .expect("start selected output");
     }
 
     /// Freeze or release the silent device's clock. A fired launch fires a
@@ -13199,11 +13337,12 @@ pub(super) mod tests {
         engine.stop(Duration::from_millis(500));
         let before = engine.snapshot();
         let source = engine.active_source().map(str::to_owned);
-        engine.piano_output = Some(engine.open_output().unwrap());
+        let stream = engine.device_report().unwrap().stream_id;
         engine.piano_note_on(0, 60, 100).unwrap();
         engine.piano_note_on(4, 64, 100).unwrap();
         wait_piano_audio(&mut engine, 2);
         let device = engine.piano_output.as_ref().expect("output only");
+        assert_eq!(device.report().stream_id, stream);
         settle_callbacks(device, device.callbacks(), 16);
         assert!(device.take_levels().peak > 0.0001, "direct PCM is audible");
         engine.idle_turn(|_| Ok(()));
@@ -13221,7 +13360,16 @@ pub(super) mod tests {
         engine.stop_piano();
         wait_piano_audio(&mut engine, 0);
         engine.idle_turn(|_| Ok(()));
-        assert!(engine.piano_output.is_none());
+        let parked = engine
+            .piano_output
+            .as_ref()
+            .expect("the parked output stays for the next start");
+        settle_callbacks(parked, parked.callbacks(), 16);
+        assert_eq!(
+            parked.take_levels().peak,
+            0.0,
+            "the parked output is silent"
+        );
         assert_eq!(engine.snapshot().cycle, before.cycle);
     }
 
@@ -13306,8 +13454,10 @@ pub(super) mod tests {
         assert!(stop.report.stop_acknowledged);
         assert_eq!(stop.report.stream_id, stream);
         assert!(
-            engine.audio_device().is_none(),
-            "hard stop closes every sound"
+            engine.piano_output.is_some()
+                && engine.session.transport().is_stopped()
+                && engine.piano.iter().all(Option::is_none),
+            "hard stop closes every sound and parks the output"
         );
         let take = engine.stop_recording().expect("joined recording");
         assert!(take.frames > 0);
@@ -14015,6 +14165,7 @@ $: kb(0.25).s(\"tri\")
             "{error}"
         );
         assert!(engine.session.transport().is_stopped());
+        assert!(engine.piano_output.is_none());
     }
 
     #[test]
@@ -14043,6 +14194,7 @@ $: kb(0.25).s(\"tri\")
         assert_eq!(attempts, 2);
         assert!(!engine.is_playing());
         assert!(engine.session.transport().is_stopped());
+        assert!(engine.piano_output.is_none());
         assert_eq!(engine.preferred_output, preference);
         assert_eq!(engine.retained_samples.get(&id), Some(&decoded));
         assert_eq!(library.take_ready(), vec![(id, decoded)]);
@@ -14087,25 +14239,120 @@ $: kb(0.25).s(\"tri\")
             );
             assert!(!engine.is_playing());
             assert!(stop.is_stopped());
+            assert!(engine.piano_output.is_none());
             assert_eq!(engine.retained_samples.get(&id), Some(&decoded));
             assert_eq!(library.take_ready(), vec![(id, decoded)]);
         }
     }
 
     #[test]
-    fn output_selection_during_stop_does_not_reopen_the_draining_device() {
+    fn output_selection_during_stop_applies_on_the_next_start() {
         let mut engine = silent_engine_for_output_selection();
+        engine.preferred_output = None;
         let stream = engine.live.as_ref().unwrap().device.stream_id();
         let generation = engine.generation();
         engine.request_stop();
+        assert!(matches!(
+            engine.advance_graceful_stop(Duration::ZERO),
+            StudioTick::Stopping
+        ));
         engine
-            .set_output_device_with("next-output", |_, _, _| panic!("reopened after Stop"))
+            .set_output_device_with(rustel_audio::SILENT_OUTPUT_NAME, |_, _, _| {
+                panic!("reopened after Stop")
+            })
             .expect("record next preference");
-        assert!(engine.is_playing(), "existing owner still drains");
+        assert!(!engine.is_playing());
         assert!(engine.session.transport().is_stopped());
-        assert_eq!(engine.live.as_ref().unwrap().device.stream_id(), stream);
+        assert!(engine.piano_output.is_none());
         assert_eq!(engine.generation(), generation);
-        assert_eq!(engine.preferred_output.as_deref(), Some("next-output"));
+        assert_eq!(
+            engine.preferred_output.as_deref(),
+            Some(rustel_audio::SILENT_OUTPUT_NAME)
+        );
+        start_selected_output(&mut engine);
+        let device = &engine.live.as_ref().unwrap().device;
+        assert_ne!(device.stream_id(), stream);
+        assert_eq!(device.name(), rustel_audio::SILENT_OUTPUT_NAME);
+    }
+
+    #[test]
+    fn an_error_stop_releases_the_output_without_a_stream_failure() {
+        let mut engine = silent_engine_for_output_selection();
+        let stream = engine.live.as_ref().unwrap().device.stream_id();
+        assert!(!engine.live.as_ref().unwrap().device.output_failed());
+        let stop = engine
+            .stop_output(Duration::from_millis(500), false)
+            .expect("stop output");
+        assert!(stop.acknowledged);
+        assert!(engine.piano_output.is_none());
+        start_selected_output(&mut engine);
+        assert_ne!(engine.live.as_ref().unwrap().device.stream_id(), stream);
+    }
+
+    #[test]
+    fn an_unacknowledged_stop_releases_the_output_after_its_timeout() {
+        let mut engine = silent_engine_for_output_selection();
+        let stream = engine.live.as_ref().unwrap().device.stream_id();
+        hold_clock(&engine, true);
+        let stop = engine.stop(Duration::from_millis(10)).expect("stop output");
+        assert!(!stop.acknowledged);
+        assert!(engine.piano_output.is_none());
+        start_selected_output(&mut engine);
+        let device = &engine.live.as_ref().unwrap().device;
+        assert_ne!(device.stream_id(), stream);
+        settle_callbacks(device, device.callbacks(), 2);
+    }
+
+    #[test]
+    fn a_failed_start_does_not_restore_an_unhealthy_parked_output() {
+        for failed in [false, true] {
+            let mut engine = silent_engine_for_output_selection();
+            engine.stop(Duration::from_millis(500));
+            let device = engine.piano_output.take().expect("parked output");
+            if failed {
+                device.fail_output_stream_for_test();
+            }
+            engine.restore_failed_start_device(device, true);
+            assert_eq!(engine.piano_output.is_some(), !failed);
+        }
+    }
+
+    #[test]
+    fn refreshing_the_default_output_preserves_piano_and_tail_ownership() {
+        let mut engine = silent_engine_for_output_selection();
+        engine.stop(Duration::from_millis(500));
+        let stream = engine.piano_output.as_ref().unwrap().stream_id();
+        engine.refresh_idle_default_output();
+        assert_eq!(
+            engine.piano_output.as_ref().unwrap().stream_id(),
+            stream,
+            "an explicit output stays open"
+        );
+
+        engine.preferred_output = None;
+        engine.piano_close_when_idle = false;
+        engine.refresh_idle_default_output();
+        assert!(engine.piano_output.is_some(), "the piano owns its output");
+
+        engine.piano_close_when_idle = true;
+        engine.piano[0] = Some(PianoVoice {
+            releasing: true,
+            release_at: None,
+        });
+        engine.refresh_idle_default_output();
+        assert!(engine.piano_output.is_some(), "a key is still releasing");
+
+        engine.piano[0] = None;
+        engine.piano_has_score_tail = true;
+        engine.refresh_idle_default_output();
+        assert!(engine.piano_output.is_some(), "the score tail still sounds");
+
+        engine.piano_has_score_tail = false;
+        engine.refresh_idle_default_output();
+        assert!(
+            engine.piano_output.is_none(),
+            "an idle default is refreshed"
+        );
     }
 
     #[test]
@@ -14232,71 +14479,82 @@ $: kb(0.25).s(\"tri\")
     /// the settle start counting.
     #[test]
     fn an_owed_baton_is_never_released_until_it_lands() {
-        let mut engine = silent_engine_for_output_selection();
-        let library = engine.sample_library().expect("library");
-        let id = SampleId(601);
-        let pcm = || DecodedSample::from_parts(48_000, 1, vec![0.0; 128]).expect("pcm");
-        assert!(
-            engine
-                .live
-                .as_ref()
-                .unwrap()
-                .device
-                .install_sample(id, pcm())
-                .is_ok(),
-            "bank install"
-        );
-        library.forget_id_for_test(id);
-
-        // The ring drains between blocks, so "full" is a moment: refill and
-        // re-retire until the refusal actually lands.
-        let mut owed = false;
-        for _ in 0..8 {
-            engine.retain_sample_for_test(id, pcm());
-            fill_install_ring_for_test(&engine.live.as_ref().unwrap().device);
-            engine.retire_sample(id, 0);
-            if engine.owes_uninstall(id) {
-                owed = true;
-                break;
+        for parked in [false, true] {
+            let mut engine = silent_engine_for_output_selection();
+            if parked {
+                assert!(
+                    engine
+                        .stop(Duration::from_millis(500))
+                        .unwrap()
+                        .acknowledged
+                );
             }
-            engine.retiring.retain(|retiring| retiring.id != id);
-        }
-        assert!(owed, "the install ring never refused the baton");
+            let library = engine.sample_library().expect("library");
+            let id = SampleId(601);
+            let pcm = DecodedSample::from_parts(48_000, 1, vec![0.0; 128]).expect("pcm");
+            assert!(
+                engine
+                    .audio_device()
+                    .unwrap()
+                    .install_sample(id, pcm.clone())
+                    .is_ok(),
+                "bank install"
+            );
+            let device = engine.audio_device().unwrap();
+            settle_callbacks(device, device.callbacks(), BATON_SETTLE_CALLBACKS);
+            assert!(device.hold_silent_clock_for_test(true));
+            library.forget_id_for_test(id);
 
-        // However long we wait, an owed baton keeps the id out of the free
-        // list.
-        std::thread::sleep(Duration::from_millis(20));
-        engine.release_retired_samples();
-        assert!(engine.owes_uninstall(id));
-        assert_eq!(library.free_id_count(), 0);
+            engine.retain_sample_for_test(id, pcm.clone());
+            fill_install_ring_for_test(engine.audio_device().unwrap());
+            engine.retire_sample(id, 0);
+            assert!(
+                engine.owes_uninstall(id),
+                "the install ring refused the baton"
+            );
+            if parked {
+                engine.release_every_retiring_sample();
+            }
 
-        // The retry lands it once the ring has room, and the settle follows.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while engine.owes_uninstall(id) {
-            assert!(Instant::now() < deadline, "the retry never landed");
-            engine.retry_pending_uninstalls();
-            std::thread::sleep(Duration::from_millis(2));
+            engine.release_retired_samples();
+            assert!(engine.owes_uninstall(id));
+            assert_eq!(library.free_id_count(), 0);
+            assert_eq!(pcm.pcm_owners_for_test(), 2, "the bank still holds the PCM");
+            assert!(
+                engine
+                    .audio_device()
+                    .unwrap()
+                    .hold_silent_clock_for_test(false)
+            );
+
+            // The retry lands it once the ring has room, and the settle follows.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while engine.owes_uninstall(id) {
+                assert!(Instant::now() < deadline, "the retry never landed");
+                engine.retry_pending_uninstalls();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let pushed = engine
+                .retiring
+                .iter()
+                .find_map(|retiring| match retiring.baton {
+                    Baton::Pushed { callbacks } => Some(callbacks),
+                    _ => None,
+                })
+                .expect("pushed after the retry");
+            settle_callbacks(
+                engine.audio_device().unwrap(),
+                pushed,
+                BATON_SETTLE_CALLBACKS,
+            );
+            engine.release_retired_samples();
+            assert_eq!(library.free_id_count(), 1);
+            assert_eq!(pcm.pcm_owners_for_test(), 1, "the bank released the PCM");
         }
-        let pushed = engine
-            .retiring
-            .iter()
-            .find_map(|retiring| match retiring.baton {
-                Baton::Pushed { callbacks } => Some(callbacks),
-                _ => None,
-            })
-            .expect("pushed after the retry");
-        settle_callbacks(
-            &engine.live.as_ref().unwrap().device,
-            pushed,
-            BATON_SETTLE_CALLBACKS,
-        );
-        engine.release_retired_samples();
-        assert_eq!(library.free_id_count(), 1);
     }
 
-    /// A stop takes the device, its bank, its ring and its voices with it:
-    /// everything retiring is free at once, and everything still retained
-    /// is not - it is re-published on the next evaluate.
+    /// Stop clears queued use horizons, but the parked bank must process
+    /// retiring ids before reuse. Retained ids remain available to resume.
     #[test]
     fn stop_releases_every_retiring_id_and_keeps_retained_ones() {
         let mut engine = silent_engine_for_output_selection();
@@ -14319,6 +14577,7 @@ $: kb(0.25).s(\"tri\")
         }
         library.forget_id_for_test(retiring);
         engine.retire_sample(retiring, u64::MAX);
+        engine.audition_horizon_frame = u64::MAX;
         engine.release_retired_samples();
         assert_eq!(
             library.free_id_count(),
@@ -14327,6 +14586,9 @@ $: kb(0.25).s(\"tri\")
         );
 
         assert!(engine.stop(Duration::from_millis(500)).is_some());
+        let device = engine.piano_output.as_ref().expect("parked output");
+        settle_callbacks(device, device.callbacks(), BATON_SETTLE_CALLBACKS);
+        engine.idle_turn(|_| Ok(()));
         assert_eq!(engine.retiring_count(), 0);
         assert_eq!(library.free_id_count(), 1, "the retiring id is free");
         assert_eq!(
@@ -14629,6 +14891,29 @@ $: kb(0.25).s(\"tri\")
             "a buffer change is not a device choice"
         );
         assert!(engine.live.is_some(), "the set is still playing");
+    }
+
+    #[test]
+    fn an_output_buffer_change_during_stop_applies_on_the_next_start() {
+        let mut engine = silent_engine_for_output_selection();
+        let stream = engine.live.as_ref().unwrap().device.stream_id();
+        engine.request_stop();
+        assert!(matches!(
+            engine.advance_graceful_stop(Duration::ZERO),
+            StudioTick::Stopping
+        ));
+        engine
+            .set_output_buffer_frames(Some(512))
+            .expect("record next buffer size");
+        assert!(!engine.is_playing());
+        assert!(engine.piano_output.is_none());
+        start_selected_output(&mut engine);
+        let device = &engine.live.as_ref().unwrap().device;
+        assert_ne!(device.stream_id(), stream);
+        assert_eq!(
+            device.buffer_preference(),
+            rustel_audio::AudioBufferPreference::Frames(512)
+        );
     }
 
     /// A live latency change opens a new stream, and what the host granted
@@ -15338,6 +15623,31 @@ mod load_mode_tests {
             "cycle zero comes after the kick came in"
         );
         assert!(engine.snapshot().loading.is_none(), "the cue is gone");
+
+        tests::hold_clock(&engine, true);
+        assert!(!engine.stop(Duration::ZERO).expect("stop").acknowledged);
+        let device = engine.piano_output.take().expect("parked output");
+        engine.session.transport().start();
+        let resumed = engine
+            .start_on(device, "s(\"kick\")", false, true)
+            .expect("restart");
+        assert!(engine.live.as_ref().unwrap().device.stop_pending());
+        assert!(matches!(
+            engine.tick(|_| Ok(())).expect("waiting for the stop fade"),
+            StudioTick::Running {
+                step: None,
+                accepted_audio: 0,
+                ..
+            }
+        ));
+        assert_eq!(
+            engine.live.as_ref().unwrap().initial_start_generation,
+            Some(resumed.generation)
+        );
+        tests::hold_clock(&engine, false);
+        turn_until(&mut engine, "the resumed generation's receipt", |engine| {
+            engine.session.confirmed_audio_generation() == Some(resumed.generation)
+        });
     }
 
     /// Async: the start plays at once, the loading kick is skipped, and
