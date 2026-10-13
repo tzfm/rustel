@@ -233,10 +233,10 @@ fn a_warning_badges_and_the_log_clears_it() {
     studio.set_score("$: s(\"no-such-bank\")");
     studio.chord("ctrl+s");
     studio.settle();
-    assert!(
-        studio.rows().iter().any(|row| row.contains("⚠")),
-        "the badge shows while the warning is unseen:\n{}",
-        studio.rows().join("\n")
+    studio.pump_until(
+        std::time::Duration::from_secs(10),
+        "the badge shows while the warning is unseen",
+        |studio| studio.rows().iter().any(|row| row.contains("⚠")),
     );
 
     // Opening the log marks seen; the badge goes away.

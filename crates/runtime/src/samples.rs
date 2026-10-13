@@ -10757,18 +10757,40 @@ impl SampleLibrary {
         let prefix = source_prefix(&source.base);
         let mut files = HashSet::new();
         let mut sounds = 0;
-        let banks = self.banks.read().expect("default banks");
+        // Snapshot only this pack so catalogue and manifest work can keep
+        // using the table while its files are collected. Matching lowercase
+        // copies share the first URL and therefore stay in the same snapshot.
+        let banks: Vec<_> = self
+            .banks
+            .read()
+            .expect("default banks")
+            .iter()
+            .filter_map(|(name, bank)| {
+                let first = match bank {
+                    Bank::Array(urls) => urls.first(),
+                    Bank::Notes(notes) => notes.iter().find_map(|(_, urls)| urls.first()),
+                };
+                first
+                    .is_some_and(|url| url.starts_with(&*prefix))
+                    .then(|| (name.clone(), bank.clone()))
+            })
+            .collect();
+        let mut lookup_copies: HashMap<String, HashSet<Vec<&Arc<str>>>> = HashMap::new();
+        for (name, bank) in &banks {
+            let lowercase = name.to_lowercase();
+            if lowercase != *name {
+                lookup_copies
+                    .entry(lowercase)
+                    .or_default()
+                    .insert(bank_file_urls(bank));
+            }
+        }
         for (name, bank) in banks.iter() {
             let urls = bank_file_urls(bank);
-            if !urls.first().is_some_and(|url| url.starts_with(&*prefix)) {
-                continue;
-            }
             let lowercase_lookup_copy = name == &name.to_lowercase()
-                && banks.iter().any(|(other_name, other_bank)| {
-                    other_name != name
-                        && other_name.to_lowercase() == *name
-                        && bank_file_urls(other_bank) == urls
-                });
+                && lookup_copies
+                    .get(name)
+                    .is_some_and(|copies| copies.contains(&urls));
             if !lowercase_lookup_copy {
                 sounds += 1;
             }
@@ -10879,17 +10901,20 @@ impl SampleLibrary {
     /// The sounds under a user import and the distinct files they name.
     pub fn import_source_files(&self, spec: &str) -> (usize, HashSet<Arc<str>>) {
         let spec = spec.trim();
-        let slots = self
-            .shared
-            .global_slots
-            .lock()
-            .expect("global source slots");
-        let Some(slot) = slots.iter().find(|slot| slot.spec == spec) else {
-            return (0, HashSet::new());
+        let banks: Vec<Bank> = {
+            let slots = self
+                .shared
+                .global_slots
+                .lock()
+                .expect("global source slots");
+            let Some(slot) = slots.iter().find(|slot| slot.spec == spec) else {
+                return (0, HashSet::new());
+            };
+            slot.banks.values().cloned().collect()
         };
         let mut files = HashSet::new();
         let mut sounds = 0;
-        for bank in slot.banks.values() {
+        for bank in &banks {
             let urls = bank_file_urls(bank);
             if urls.is_empty() {
                 continue;
@@ -17460,6 +17485,70 @@ mod codec_tests {
         assert_eq!(again.files, 2, "but they are still the pack's files");
         let queued = std::iter::from_fn(|| library.shared.jobs.try_pop()).count();
         assert_eq!(queued, 2);
+    }
+
+    /// Only a lowercase lookup copy with the same ordered files is
+    /// excluded from the sound count; distinct names remain sounds.
+    #[test]
+    fn a_shipped_pack_only_deduplicates_matching_lowercase_copies() {
+        let library = SampleLibrary::empty_without_loading();
+        let kick: Arc<str> = Arc::from("https://example.test/drums/kick.wav");
+        let snare: Arc<str> = Arc::from("https://example.test/drums/snare.wav");
+        {
+            let mut banks = library.banks.write().expect("banks");
+            for (name, files) in [
+                ("Kit", vec![kick.clone(), snare.clone()]),
+                ("KIT", vec![kick.clone()]),
+                ("kit", vec![kick.clone()]),
+                ("Other", vec![kick.clone(), snare.clone()]),
+                ("other", vec![snare.clone(), kick.clone()]),
+                ("alias", vec![kick.clone()]),
+            ] {
+                banks.insert(name.to_owned(), Bank::Array(files));
+            }
+        }
+        let pack = DefaultSource {
+            name: "drums".to_owned(),
+            url: "https://example.test/drums.json".to_owned(),
+            base: "https://example.test/drums".to_owned(),
+        };
+        assert_eq!(library.default_source_holds(&pack), (5, 2));
+    }
+
+    /// The first file assigns a keyed bank to its pack, skipping empty keys.
+    #[test]
+    fn a_shipped_pack_classifies_keyed_banks_by_the_first_file() {
+        let library = SampleLibrary::empty_without_loading();
+        let kick: Arc<str> = Arc::from("https://example.test/drums/kick.wav");
+        let elsewhere: Arc<str> = Arc::from("https://other.test/x.wav");
+        {
+            let mut banks = library.banks.write().expect("banks");
+            for (name, bank) in [
+                (
+                    "Kit",
+                    Bank::Notes(vec![(60.0, vec![]), (62.0, vec![kick.clone()])]),
+                ),
+                ("kit", Bank::Array(vec![kick.clone()])),
+                ("Foreign", Bank::Array(vec![elsewhere.clone()])),
+                ("foreign", Bank::Array(vec![kick.clone()])),
+                ("empty", Bank::Notes(vec![(60.0, vec![])])),
+                (
+                    "outside",
+                    Bank::Notes(vec![(60.0, vec![elsewhere]), (62.0, vec![kick.clone()])]),
+                ),
+            ] {
+                banks.insert(name.to_owned(), bank);
+            }
+        }
+        let pack = DefaultSource {
+            name: "drums".to_owned(),
+            url: "https://example.test/drums.json".to_owned(),
+            base: "https://example.test/drums".to_owned(),
+        };
+        assert_eq!(
+            library.default_source_files(&pack),
+            (2, HashSet::from([kick]))
+        );
     }
 
     /// A user URL pack counts and queues the way a shipped pack does, and

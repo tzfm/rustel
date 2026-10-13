@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Studio no longer pauses animated themes during the first sample-library refresh.
+
 ## v0.1.2
 
 - With an empty search, the reference lists its headings by use across the 186 songs in the score corpus. Temporal, tonal and audio come first. A search still opens on the best match.
