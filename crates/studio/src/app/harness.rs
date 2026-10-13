@@ -804,6 +804,22 @@ impl Studio {
         panic!("the scene's sounds never stopped loading");
     }
 
+    /// Pump until no background job is running, so the header's jobs chip
+    /// is gone. A name resolving is not its file landing: the open's own
+    /// sample cache drains after readiness says ready, and a frame taken
+    /// under the chip holds live state. A test that starts a job and means
+    /// to watch it does not call this.
+    pub fn wait_for_jobs_to_clear(&mut self) {
+        for _ in 0..200 {
+            self.app.pump_turn();
+            if self.app.background_jobs().is_empty() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("a background job never stopped");
+    }
+
     // -- internals ---------------------------------------------------------
 
     /// One event through the real handler. A harness that cannot handle an

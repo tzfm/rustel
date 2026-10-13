@@ -619,6 +619,10 @@ fn hermetic_over_inner(
         .expect("local bd bank registers");
     studio.settle();
     studio.wait_for_readiness();
+    // The bd file lands after its name resolves, and while it loads the
+    // header carries the jobs chip. Every fixture hands over a studio with
+    // no job running, or a snapshot taken at once races that live state.
+    studio.wait_for_jobs_to_clear();
     Hermetic {
         studio,
         config_home_path: config_home,
