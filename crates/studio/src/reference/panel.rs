@@ -324,8 +324,11 @@ impl ReferencePanel {
         } else {
             self.results = reference.search_with(&self.query, self.snippets_last);
         }
-        self.rows = self.grouped_rows(reference);
+        self.rows = self.with_alias_rows(reference, self.grouped_rows(reference));
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+        if matches!(self.rows.get(self.selected), Some(BrowseRow::Aliases(_))) {
+            self.selected -= 1;
+        }
         // A heading is a label, not a choice. Typing puts the cursor on row
         // zero, which in a grouped list is the first heading; the row under
         // it is always a name, because a heading with nothing under it is
@@ -383,6 +386,27 @@ impl ReferencePanel {
         rows
     }
 
+    /// `rows` with one more row under each entry which has other names.
+    fn with_alias_rows(&self, reference: &Reference, rows: Vec<BrowseRow>) -> Vec<BrowseRow> {
+        if self.vocabulary.is_some() {
+            return rows;
+        }
+        let mut with_aliases = Vec::with_capacity(rows.len());
+        for row in rows {
+            with_aliases.push(row);
+            if let BrowseRow::Entry(position) = row
+                && let Some(entry) = self
+                    .results
+                    .get(position)
+                    .and_then(|&index| reference.entry(index))
+                && !super::view::aliases_text(entry, &self.query).is_empty()
+            {
+                with_aliases.push(BrowseRow::Aliases(position));
+            }
+        }
+        with_aliases
+    }
+
     /// The rows of the browse list, headings and all.
     pub fn browse_rows(&self) -> &[BrowseRow] {
         &self.rows
@@ -393,7 +417,7 @@ impl ReferencePanel {
     /// behind it.
     pub fn selected_result(&self) -> Option<usize> {
         match self.rows.get(self.selected)? {
-            BrowseRow::Tag(_) => None,
+            BrowseRow::Tag(_) | BrowseRow::Aliases(_) => None,
             BrowseRow::Entry(position) => self.results.get(*position).copied(),
         }
     }
@@ -703,11 +727,15 @@ impl ReferencePanel {
                 }
                 let last = self.rows.len() as isize - 1;
                 let mut at = (self.selected as isize + delta).clamp(0, last);
-                // Skip headings, reversing direction at either end of the
-                // list. Every heading has an entry beneath it, so this
-                // reaches an entry within two steps.
+                // Skip headings and alias rows, reversing direction at
+                // either end of the list. Every heading has an entry beneath
+                // it and every alias row has one above, so this reaches an
+                // entry within three steps.
                 let mut step = if delta < 0 { -1 } else { 1 };
-                while matches!(self.rows.get(at as usize), Some(BrowseRow::Tag(_))) {
+                while matches!(
+                    self.rows.get(at as usize),
+                    Some(BrowseRow::Tag(_) | BrowseRow::Aliases(_))
+                ) {
                     if at + step < 0 || at + step > last {
                         step = -step;
                     }
@@ -1247,7 +1275,7 @@ impl ReferencePanel {
             ReferenceMode::Browse if self.quick => self
                 .selected_result()
                 .and_then(|index| reference.entry(index))
-                .map(|entry| PanelAction::Insert(entry.name.clone()))
+                .map(|entry| PanelAction::Insert(entry.spelling_for(&self.query).to_owned()))
                 .unwrap_or(PanelAction::Nothing),
             ReferenceMode::Browse => match self.selected_result() {
                 Some(index) => {
@@ -1262,7 +1290,7 @@ impl ReferencePanel {
             },
             ReferenceMode::Entry { index, .. } => reference
                 .entry(index)
-                .map(|entry| PanelAction::Insert(entry.name.clone()))
+                .map(|entry| PanelAction::Insert(entry.spelling_for(&self.query).to_owned()))
                 .unwrap_or(PanelAction::Nothing),
         }
     }
@@ -1417,6 +1445,11 @@ impl ReferencePanel {
             Some(BrowseRow::Tag(_)) | None => PanelAction::Nothing,
             Some(BrowseRow::Entry(_)) => {
                 self.selected = index;
+                self.confirm(reference)
+            }
+            // The alias row belongs to the entry above it.
+            Some(BrowseRow::Aliases(_)) => {
+                self.selected = index - 1;
                 self.confirm(reference)
             }
         }

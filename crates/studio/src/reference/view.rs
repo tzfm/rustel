@@ -5,23 +5,33 @@ use super::*;
 /// How many other names a row shows before saying `+n`.
 pub(super) const ALIASES_SHOWN: usize = 3;
 
-/// An entry's other names for its row, the one the query matched first:
-/// the synonyms that are not the name itself in another case, the first
-/// few spelled out and the rest counted.
+/// An entry's other names for its row: each spelling but the one the row
+/// shows for `query`. Under an alias the main name comes first. Under the
+/// main name the alias the query matches comes first. Two spellings which
+/// differ only in case count as one, and the one with a capital is kept.
+/// The first few are spelled out and the rest counted.
 pub(super) fn aliases_text(entry: &Entry, query: &str) -> String {
-    let lowercase = entry.name.to_lowercase();
-    let mut aliases: Vec<&str> = entry
-        .synonyms
-        .iter()
-        .map(String::as_str)
-        .filter(|alias| alias.to_lowercase() != lowercase)
-        .collect();
-    aliases.dedup();
+    let shown = entry.spelling_for(query);
+    let mut aliases: Vec<&str> = Vec::new();
+    for spelling in std::iter::once(&entry.name).chain(&entry.synonyms) {
+        if spelling.eq_ignore_ascii_case(shown) {
+            continue;
+        }
+        match aliases
+            .iter_mut()
+            .find(|alias| alias.eq_ignore_ascii_case(spelling))
+        {
+            Some(twin) if !twin.chars().any(char::is_uppercase) => *twin = spelling,
+            Some(_) => {}
+            None => aliases.push(spelling),
+        }
+    }
     if aliases.is_empty() {
         return String::new();
     }
     let query = query.trim().to_lowercase();
-    if !query.is_empty()
+    if shown == entry.name
+        && !query.is_empty()
         && let Some(hit) = aliases
             .iter()
             .position(|alias| alias.to_lowercase().starts_with(&query))
@@ -35,7 +45,7 @@ pub(super) fn aliases_text(entry: &Entry, query: &str) -> String {
         .take(ALIASES_SHOWN)
         .copied()
         .collect::<Vec<_>>()
-        .join(" ");
+        .join(", ");
     if more > 0 {
         text.push_str(&format!(" +{more}"));
     }
@@ -1374,6 +1384,29 @@ impl ReferenceView<'_> {
             .map(|(at, browse_row)| (at - geometry.first_row, browse_row))
         {
             let y = list.y + row as u16;
+            // The other names of the entry above, on a line of their own so
+            // the summary keeps the full width.
+            if let BrowseRow::Aliases(position) = *browse_row {
+                if let Some(entry) = self
+                    .panel
+                    .results
+                    .get(position)
+                    .and_then(|&index| self.reference.entry(index))
+                {
+                    let room = usize::from(list.width.saturating_sub(3));
+                    let aliases = aliases_text(entry, &self.panel.query);
+                    buffer.set_stringn(
+                        list.x + 3,
+                        y,
+                        elide(&format!("also: {aliases}"), room),
+                        room,
+                        Style::default()
+                            .fg(theme.muted)
+                            .add_modifier(Modifier::ITALIC),
+                    );
+                }
+                continue;
+            }
             // The tag a run of results is filed under, over the first of
             // them: the samples tab's heading without its fold marker,
             // because nothing folds here.
@@ -1402,7 +1435,7 @@ impl ReferenceView<'_> {
             let Some(&index) = self.panel.results.get(position) else {
                 continue;
             };
-            let (name, summary, snippet, aliases) = match &self.panel.vocabulary {
+            let (name, summary, snippet) = match &self.panel.vocabulary {
                 Some(vocabulary) => match vocabulary.names.get(index) {
                     Some(name) => (
                         name.as_str(),
@@ -1412,16 +1445,14 @@ impl ReferenceView<'_> {
                             .map(String::as_str)
                             .unwrap_or(""),
                         false,
-                        String::new(),
                     ),
                     None => continue,
                 },
                 None => match self.reference.entry(index) {
                     Some(entry) => (
-                        entry.name.as_str(),
+                        entry.spelling_for(&self.panel.query),
                         entry.summary.as_str(),
                         entry.snippet.is_some(),
-                        aliases_text(entry, &self.panel.query),
                     ),
                     None => continue,
                 },
@@ -1463,24 +1494,6 @@ impl ReferenceView<'_> {
             buffer.set_stringn(x, y, &name, room, name_style);
             let name_width = UnicodeWidthStr::width(name.as_str()) as u16;
             let mut summary_x = x.saturating_add(name_width + 1);
-            // The other names the thing goes by, muted beside the name -
-            // the one the search matched first - so `bpe` typed shows
-            // `bpenv` with `bpe` right beside it, and the hit makes sense.
-            if !aliases.is_empty() && summary_x < list.right() {
-                let room = usize::from(list.right() - summary_x);
-                let aliases = elide(&aliases, room);
-                buffer.set_stringn(
-                    summary_x,
-                    y,
-                    &aliases,
-                    room,
-                    Style::default()
-                        .fg(theme.muted)
-                        .add_modifier(Modifier::ITALIC),
-                );
-                summary_x =
-                    summary_x.saturating_add(UnicodeWidthStr::width(aliases.as_str()) as u16 + 1);
-            }
             // A snippet says so on its row: it is lines to paste, not a
             // function, and Enter will do something different on it.
             if snippet && summary_x < list.right() {
