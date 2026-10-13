@@ -45,7 +45,7 @@ pub(super) fn aliases_text(entry: &Entry, query: &str) -> String {
         .take(ALIASES_SHOWN)
         .copied()
         .collect::<Vec<_>>()
-        .join(" ");
+        .join(", ");
     if more > 0 {
         text.push_str(&format!(" +{more}"));
     }
@@ -1384,6 +1384,29 @@ impl ReferenceView<'_> {
             .map(|(at, browse_row)| (at - geometry.first_row, browse_row))
         {
             let y = list.y + row as u16;
+            // The other names of the entry above, on a line of their own so
+            // the summary keeps the full width.
+            if let BrowseRow::Aliases(position) = *browse_row {
+                if let Some(entry) = self
+                    .panel
+                    .results
+                    .get(position)
+                    .and_then(|&index| self.reference.entry(index))
+                {
+                    let room = usize::from(list.width.saturating_sub(3));
+                    let aliases = aliases_text(entry, &self.panel.query);
+                    buffer.set_stringn(
+                        list.x + 3,
+                        y,
+                        elide(&format!("also: {aliases}"), room),
+                        room,
+                        Style::default()
+                            .fg(theme.muted)
+                            .add_modifier(Modifier::ITALIC),
+                    );
+                }
+                continue;
+            }
             // The tag a run of results is filed under, over the first of
             // them: the samples tab's heading without its fold marker,
             // because nothing folds here.
@@ -1412,7 +1435,7 @@ impl ReferenceView<'_> {
             let Some(&index) = self.panel.results.get(position) else {
                 continue;
             };
-            let (name, summary, snippet, aliases) = match &self.panel.vocabulary {
+            let (name, summary, snippet) = match &self.panel.vocabulary {
                 Some(vocabulary) => match vocabulary.names.get(index) {
                     Some(name) => (
                         name.as_str(),
@@ -1422,7 +1445,6 @@ impl ReferenceView<'_> {
                             .map(String::as_str)
                             .unwrap_or(""),
                         false,
-                        String::new(),
                     ),
                     None => continue,
                 },
@@ -1431,7 +1453,6 @@ impl ReferenceView<'_> {
                         entry.spelling_for(&self.panel.query),
                         entry.summary.as_str(),
                         entry.snippet.is_some(),
-                        aliases_text(entry, &self.panel.query),
                     ),
                     None => continue,
                 },
@@ -1473,24 +1494,6 @@ impl ReferenceView<'_> {
             buffer.set_stringn(x, y, &name, room, name_style);
             let name_width = UnicodeWidthStr::width(name.as_str()) as u16;
             let mut summary_x = x.saturating_add(name_width + 1);
-            // The other names the thing goes by, muted beside the name. The
-            // row leads with the spelling the query asks for, so `cutoff`
-            // typed shows `cutoff` with `lpf` right beside it.
-            if !aliases.is_empty() && summary_x < list.right() {
-                let room = usize::from(list.right() - summary_x);
-                let aliases = elide(&aliases, room);
-                buffer.set_stringn(
-                    summary_x,
-                    y,
-                    &aliases,
-                    room,
-                    Style::default()
-                        .fg(theme.muted)
-                        .add_modifier(Modifier::ITALIC),
-                );
-                summary_x =
-                    summary_x.saturating_add(UnicodeWidthStr::width(aliases.as_str()) as u16 + 1);
-            }
             // A snippet says so on its row: it is lines to paste, not a
             // function, and Enter will do something different on it.
             if snippet && summary_x < list.right() {

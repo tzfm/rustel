@@ -303,7 +303,7 @@ back or closes the panel. Search filters such as `tag:vis` and `tag:snippet`
 find visualizers and reusable snippets.
 
 A function with more than one name has one row. The row shows the name your
-search text matches best, and the other names follow in a muted color. Enter
+search text matches best, and a line under the row lists the other names after `also:`. Enter
 writes the name the row shows: search `cutoff` and Enter writes `cutoff`,
 search `lpf` and Enter writes `lpf`. When two names differ only in case, the
 row shows the camelCase name. A capital in your search text selects the names
