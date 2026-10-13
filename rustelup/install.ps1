@@ -39,7 +39,19 @@
         }
 
         function Get-FileSha256([string]$Path) {
-            (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+            # Get-FileHash is not available when PowerShell 7 starts Windows
+            # PowerShell through cmd.exe.
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                $stream = [System.IO.File]::OpenRead($Path)
+                try {
+                    ([System.BitConverter]::ToString($sha.ComputeHash($stream)) -replace '-', '').ToLowerInvariant()
+                } finally {
+                    $stream.Dispose()
+                }
+            } finally {
+                $sha.Dispose()
+            }
         }
 
         function Test-Sha256([string]$Path, [string]$Sidecar) {
