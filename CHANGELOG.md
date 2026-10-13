@@ -29,6 +29,7 @@
 - `.onSchedule(callback)` is accepted and returns the pattern unchanged, the same as `.onTrigger()`. Rustel calls no playback callback. Before, a score with `.onSchedule()` stopped with an error.
 - `isobite(structure)` plays the next cycle of a pattern on each event of a structure. `"<0 1 2 3 4 5>".isobite("[x - x*2]*2")` plays `"0 - [1 2] 3 - [4 5]"`. With a pattern and a structure of different lengths, the two shift against each other from cycle to cycle. `cyclestruct` and `cycleStruct` are the same function.
 - A search in the reference shows each function under the name you type. `cycleS` shows `cycleStruct`, with `also: isobite` on a line under the row, and Enter writes `cycleStruct`. The other names of each function are on this line, so the summary has the full width of the row. Before, the row showed the main name `isobite` and Enter wrote `isobite`. When two names differ only in case, the row shows the camelCase name. A capital in your search text puts the names with this capital first, so `cycleS` lists `cycleStruct` before `cyclesPer` and before the `set tempo` snippet.
+- Space stops a sample preview the first time, every time. On a loaded machine the engine's two-slot command queue held the studio's setup commands while the first Space queued the sound, the second Space's stop command was dropped, and the preview rang on with the status line still naming the sound. The stop now sets a flag the engine honours on its next turn, the same guarantee the transport's second Stop press has.
 
 ### Sound changes
 
