@@ -38510,8 +38510,8 @@ use reference_panel::{
 use replay_tabs::SetStash;
 use sample_import::dropped_paths;
 use sample_sources::{
-    ShippedSource, UserSource, sample_source_folder, status_sample_source,
-    status_sample_source_error,
+    ShippedSource, SourceMeasurement, SourceRefresh, UserSource, sample_source_folder,
+    status_sample_source, status_sample_source_error,
 };
 use sessions::TAPE_GESTURE_SETTLE;
 use sets::{SetPrompt, SetSwitch};
@@ -39095,12 +39095,15 @@ struct App {
     precache: Option<super::settings::PrecacheProgress>,
     /// The packs the studio ships with, as the Sources page lists them
     /// under the imports: what each holds, and - while it is being cached
-    /// onto disk - how far its files are. Rebuilt on the readiness poll,
-    /// not on a frame: what it holds is a walk over every default bank.
+    /// onto disk - how far its files are. Counts arrive from a background
+    /// walk on the readiness poll.
     shipped_sources: Vec<ShippedSource>,
     /// User imports as the Sources page follows them: local vs remote,
     /// and - for a URL pack - how much of it is on disk.
     user_sources: Vec<UserSource>,
+    /// Source counts being measured off the UI thread, and requests for the next walk.
+    source_measure: Option<SourceMeasurement>,
+    source_refresh: SourceRefresh,
     /// The cache walk, running on its own thread; the number arrives here.
     cache_measure: Option<std::sync::mpsc::Receiver<u64>>,
     /// Next time a downloading cache may remeasure its on-disk size.
@@ -39777,11 +39780,14 @@ impl App {
                     files: 0,
                     cached_files: 0,
                     cache_bytes: 0,
+                    counts_ready: false,
                     seen_files: HashSet::new(),
                     cache: None,
                 })
                 .collect(),
             user_sources: Vec::new(),
+            source_measure: None,
+            source_refresh: SourceRefresh::default(),
             cache_measure: None,
             cache_measure_due: None,
             cache_clear: None,
