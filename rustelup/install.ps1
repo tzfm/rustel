@@ -29,6 +29,10 @@
         if (-not $RustelDir) { $RustelDir = Join-Path $HomeDir '.rustel' }
         $RustelDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($RustelDir)
         $BinDir = Join-Path $RustelDir 'bin'
+        # PowerShell runs a .ps1 on PATH before a .cmd of the same name, and
+        # the default execution policy blocks the .ps1. The updater stays
+        # out of the bin directory, so `rustelup` finds the shim.
+        $LibDir = Join-Path $RustelDir 'lib'
 
         function say([string]$Message) {
             [Console]::Out.WriteLine("rustelup-init: $Message")
@@ -117,7 +121,7 @@
             $cmd = Join-Path $Directory 'rustelup.cmd'
             $lines = @(
                 '@echo off'
-                'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0rustelup.ps1" %*'
+                'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\lib\rustelup.ps1" %*'
             )
             Set-Content -LiteralPath $cmd -Value $lines -Encoding Ascii
         }
@@ -161,8 +165,10 @@
         }
         $RustelupUrl = "https://github.com/$Repo/releases/download/$Tag/rustelup.ps1"
 
-        if (-not (Test-Path -LiteralPath $BinDir)) {
-            New-Item -ItemType Directory -Path $BinDir | Out-Null
+        foreach ($directory in @($BinDir, $LibDir)) {
+            if (-not (Test-Path -LiteralPath $directory)) {
+                New-Item -ItemType Directory -Path $directory | Out-Null
+            }
         }
 
         $Tmp = $null
@@ -195,8 +201,9 @@
                 err 'downloaded updater failed its help check'
             }
 
-            $dest = Join-Path $BinDir 'rustelup.ps1'
+            $dest = Join-Path $LibDir 'rustelup.ps1'
             $shim = Join-Path $BinDir 'rustelup.cmd'
+            $shadow = Join-Path $BinDir 'rustelup.ps1'
             $previous = Join-Path $Stage 'previous'
             $previousShim = Join-Path $Stage 'previous.cmd'
             foreach ($file in @($dest, $shim)) {
@@ -221,6 +228,9 @@
                 $shimTouched = $true
                 if (-not (Move-InstalledFile (Join-Path $Stage 'rustelup.cmd') $shim)) {
                     err "could not replace $shim"
+                }
+                if (Test-Path -LiteralPath $shadow) {
+                    Remove-Item -LiteralPath $shadow -Force
                 }
             } catch {
                 $installError = $_
@@ -251,9 +261,6 @@
             if (Add-UserPath $BinDir) {
                 say "added $BinDir to PATH"
             }
-            if ((Get-ExecutionPolicy) -eq 'Restricted') {
-                say 'PowerShell is Restricted; run rustelup.cmd'
-            }
         } finally {
             if ($Tmp -and (Test-Path -LiteralPath $Tmp)) {
                 Remove-Item -LiteralPath $Tmp -Recurse -Force -ErrorAction SilentlyContinue
@@ -263,7 +270,7 @@
             }
         }
 
-        say 'open a new terminal, then run: rustelup.cmd'
+        say 'open a new terminal, then run: rustelup'
     } finally {
         [Net.ServicePointManager]::SecurityProtocol = $previousSecurityProtocol
     }
