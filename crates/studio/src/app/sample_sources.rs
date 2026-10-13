@@ -38,6 +38,8 @@ pub(super) struct ShippedSource {
     pub(super) cached_files: usize,
     /// Bytes those cached files take on disk.
     pub(super) cache_bytes: u64,
+    /// Counts have been measured since startup or the last completed download.
+    pub(super) counts_ready: bool,
     /// Every file url this pack has named across refreshes - so a row can
     /// show more on disk than the current manifest lists.
     pub(super) seen_files: HashSet<Arc<str>>,
@@ -50,12 +52,13 @@ impl ShippedSource {
     /// The state column at rest: what the pack holds, or that its list is
     /// not in yet.
     fn state(&self, library_loading: bool) -> String {
-        if self.sounds == 0 && self.files == 0 && self.cached_files == 0 {
-            if library_loading {
-                "fetching its list…".to_owned()
-            } else {
-                "-".to_owned()
-            }
+        let empty = self.sounds == 0 && self.files == 0 && self.cached_files == 0;
+        if empty && library_loading {
+            "fetching its list…".to_owned()
+        } else if !self.counts_ready {
+            "checking files…".to_owned()
+        } else if empty {
+            "-".to_owned()
         } else {
             super::super::settings::source_cache_state(
                 self.sounds,
@@ -74,7 +77,7 @@ impl ShippedSource {
             dimmed: self.sounds == 0,
             shipped: true,
             local: false,
-            cache_fill: (self.files > 0 || self.cached_files > 0)
+            cache_fill: (self.counts_ready && (self.files > 0 || self.cached_files > 0))
                 .then_some((self.cached_files, self.files)),
             cache: self.cache.clone(),
         }
@@ -91,8 +94,82 @@ pub(super) struct UserSource {
     files: usize,
     cached_files: usize,
     cache_bytes: u64,
+    counts_ready: bool,
     seen_files: HashSet<Arc<str>>,
     pub(super) cache: Option<super::super::settings::SourceCacheProgress>,
+}
+
+/// Source counts measured away from the event loop. Rows carry their seen URLs
+/// into the next walk, but download progress belongs to the UI.
+struct SourceRows {
+    shipped: Vec<ShippedSource>,
+    users: Vec<UserSource>,
+}
+
+impl SourceRows {
+    fn measure(mut self, library: &rustel_runtime::samples::SampleLibrary) -> Self {
+        let manifests_settled = library.manifests_pending() == 0;
+        let reports = library.global_source_reports();
+        for shipped in &mut self.shipped {
+            let (sounds, urls) = library.default_source_files(&shipped.source);
+            shipped.sounds = sounds;
+            shipped.files = urls.len();
+            shipped.seen_files.extend(urls);
+            (shipped.cached_files, shipped.cache_bytes) =
+                library.count_cached_urls(shipped.seen_files.iter());
+            shipped.counts_ready = shipped.files > 0 || manifests_settled;
+        }
+        for user in &mut self.users {
+            let (sounds, urls) = library.import_source_files(&user.spec);
+            user.sounds = sounds;
+            user.files = urls.len();
+            if user.local {
+                user.cached_files = user.files;
+                user.cache_bytes = 0;
+            } else {
+                user.seen_files.extend(urls);
+                (user.cached_files, user.cache_bytes) =
+                    library.count_cached_urls(user.seen_files.iter());
+            }
+            // A refetch keeps the previous banks while its new list loads.
+            user.counts_ready = user.local
+                || reports
+                    .iter()
+                    .find(|report| report.spec == user.spec)
+                    .is_none_or(|report| {
+                        report.state != rustel_runtime::samples::GlobalSourceState::Loading
+                    });
+        }
+        self
+    }
+}
+
+/// One source walk at a time. Invalidated work is drained before another starts.
+pub(super) struct SourceMeasurement {
+    receiver: std::sync::mpsc::Receiver<SourceRows>,
+    invalidated: bool,
+}
+
+impl SourceMeasurement {
+    fn spawn(measure: impl FnOnce() -> SourceRows + Send + 'static) -> std::io::Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("sample-source-counts".into())
+            .spawn(move || {
+                let _ = sender.send(measure());
+            })?;
+        Ok(Self {
+            receiver,
+            invalidated: false,
+        })
+    }
+}
+
+/// Requests made during a walk are combined for its next turn.
+#[derive(Default)]
+pub(super) struct SourceRefresh {
+    shipped: bool,
+    users: bool,
 }
 
 /// What to say when imports that were still being read have landed.
@@ -322,6 +399,8 @@ impl App {
                         };
                         if local {
                             (decorate(format!("{banks} sound(s)")), false, None)
+                        } else if tracked.is_some_and(|user| !user.counts_ready) {
+                            (decorate("checking files…".into()), false, None)
                         } else if let Some(user) = tracked.filter(|user| user.files > 0) {
                             (
                                 decorate(super::super::settings::source_cache_state(
@@ -378,99 +457,139 @@ impl App {
         rows
     }
 
-    /// What each shipped pack holds, read off the library: a walk over
-    /// every default bank, so on the poll and when the lists land - never
-    /// on a frame.
     fn refresh_shipped_sources(&mut self) {
-        let Some(library) = self.worker.library() else {
-            return;
-        };
-        let mut changed = false;
-        for shipped in &mut self.shipped_sources {
-            let (sounds, _files) = library.default_source_holds(&shipped.source);
-            let (_, file_urls) = library.default_source_files(&shipped.source);
-            shipped.seen_files.extend(file_urls.iter().cloned());
-            let (cached_files, cache_bytes) = library.count_cached_urls(shipped.seen_files.iter());
-            let files = file_urls.len();
-            let counts_changed = (sounds, files, cached_files, cache_bytes)
-                != (
-                    shipped.sounds,
-                    shipped.files,
-                    shipped.cached_files,
-                    shipped.cache_bytes,
-                );
-            if counts_changed {
-                shipped.sounds = sounds;
-                shipped.files = files;
-                shipped.cached_files = cached_files;
-                shipped.cache_bytes = cache_bytes;
-                changed = true;
-            }
-        }
-        self.dirty_frame |= changed;
+        self.source_refresh.shipped = true;
+        self.measure_source_rows();
     }
 
-    /// What each user import holds, read off the library: local folders
-    /// skip the cache walk; remote packs count files the way shipped ones
-    /// do. Kept in prefs order, and a pack already caching keeps its bar.
     fn refresh_user_sources(&mut self) {
-        let Some(library) = self.worker.library() else {
+        self.reconcile_user_sources();
+        self.source_refresh.users = true;
+        self.measure_source_rows();
+    }
+
+    /// Membership follows preferences immediately, even while counts are pending.
+    fn reconcile_user_sources(&mut self) {
+        if self.user_sources.len() == self.prefs.sample_sources.len()
+            && self
+                .user_sources
+                .iter()
+                .zip(&self.prefs.sample_sources)
+                .all(|(user, source)| user.spec == source.spec.trim())
+        {
             return;
-        };
-        let in_flight: std::collections::HashMap<
-            String,
-            super::super::settings::SourceCacheProgress,
-        > = self
-            .user_sources
-            .iter()
-            .filter_map(|user| {
-                user.cache
-                    .as_ref()
-                    .filter(|progress| !progress.done())
-                    .cloned()
-                    .map(|progress| (user.spec.clone(), progress))
-            })
-            .collect();
-        let next: Vec<UserSource> = self
+        }
+        let mut previous = std::mem::take(&mut self.user_sources);
+        self.user_sources = self
             .prefs
             .sample_sources
             .iter()
             .map(|source| {
                 let spec = source.spec.trim().to_owned();
-                let local = rustel_runtime::samples::source_is_local(&spec);
-                let prior_seen = self
-                    .user_sources
-                    .iter()
-                    .find(|user| user.spec == spec)
-                    .map(|user| user.seen_files.clone())
-                    .unwrap_or_default();
-                let (sounds, files, cached_files, cache_bytes, seen_files) = if local {
-                    let (sounds, files) = library.import_source_holds(&spec);
-                    (sounds, files, files, 0, HashSet::new())
-                } else {
-                    let (sounds, _) = library.import_source_holds(&spec);
-                    let (_, file_urls) = library.import_source_files(&spec);
-                    let mut seen = prior_seen;
-                    seen.extend(file_urls.iter().cloned());
-                    let (cached_files, cache_bytes) = library.count_cached_urls(seen.iter());
-                    (sounds, file_urls.len(), cached_files, cache_bytes, seen)
-                };
+                if let Some(at) = previous.iter().position(|user| user.spec == spec) {
+                    return previous.remove(at);
+                }
                 UserSource {
-                    spec: spec.clone(),
-                    local,
-                    sounds,
-                    files,
-                    cached_files,
-                    cache_bytes,
-                    seen_files,
-                    cache: in_flight.get(&spec).cloned(),
+                    local: rustel_runtime::samples::source_is_local(&spec),
+                    spec,
+                    sounds: 0,
+                    files: 0,
+                    cached_files: 0,
+                    cache_bytes: 0,
+                    counts_ready: false,
+                    seen_files: HashSet::new(),
+                    cache: None,
                 }
             })
             .collect();
-        if next != self.user_sources {
-            self.user_sources = next;
-            self.dirty_frame = true;
+        self.dirty_frame = true;
+    }
+
+    /// Library enumeration and cache-file probes run off the UI thread, including
+    /// the first poll after startup. Requests share a single background walk.
+    fn measure_source_rows(&mut self) {
+        if self.source_measure.is_some()
+            || self.cache_clear.is_some()
+            || !(self.source_refresh.shipped || self.source_refresh.users)
+        {
+            return;
         }
+        let Some(library) = self.worker.library() else {
+            return;
+        };
+        let rows = SourceRows {
+            shipped: if self.source_refresh.shipped {
+                self.shipped_sources.clone()
+            } else {
+                Vec::new()
+            },
+            users: if self.source_refresh.users {
+                self.user_sources.clone()
+            } else {
+                Vec::new()
+            },
+        };
+        if let Ok(measurement) = SourceMeasurement::spawn(move || rows.measure(&library)) {
+            self.source_measure = Some(measurement);
+            self.source_refresh = SourceRefresh::default();
+        }
+    }
+
+    fn poll_source_measurement(&mut self) {
+        let Some(measurement) = &self.source_measure else {
+            self.measure_source_rows();
+            return;
+        };
+        let result = match measurement.receiver.try_recv() {
+            Err(TryRecvError::Empty) => return,
+            result => result,
+        };
+        let invalidated = measurement.invalidated;
+        self.source_measure = None;
+        if let Ok(rows) = result
+            && !invalidated
+        {
+            self.reconcile_user_sources();
+            for mut measured in rows.shipped {
+                if let Some(current) = self
+                    .shipped_sources
+                    .iter_mut()
+                    .find(|current| current.source == measured.source)
+                {
+                    measured.cache = current.cache.clone();
+                    if *current != measured {
+                        *current = measured;
+                        self.dirty_frame = true;
+                    }
+                }
+            }
+            for mut measured in rows.users {
+                if let Some(current) = self
+                    .user_sources
+                    .iter_mut()
+                    .find(|current| current.spec == measured.spec)
+                {
+                    measured.cache = current.cache.clone();
+                    if *current != measured {
+                        *current = measured;
+                        self.dirty_frame = true;
+                    }
+                }
+            }
+        }
+        self.measure_source_rows();
+    }
+
+    /// Cache mutations make an older count unusable. Keep its worker in flight
+    /// until it finishes, then measure the current rows again.
+    fn invalidate_source_measurement(&mut self) {
+        if let Some(measurement) = &mut self.source_measure {
+            measurement.invalidated = true;
+        }
+        self.source_refresh = SourceRefresh {
+            shipped: true,
+            users: true,
+        };
     }
 
     /// Fetch one shipped pack onto disk, from `c` on its row: the files
@@ -486,10 +605,16 @@ impl App {
             self.dirty_frame = true;
             return;
         };
+        self.poll_source_measurement();
         let Some(shipped) = self.shipped_sources.get(at) else {
             return;
         };
         let name = shipped.source.name.clone();
+        if !shipped.counts_ready {
+            self.status = format!("{name} - file counts are not in yet; try again in a moment");
+            self.dirty_frame = true;
+            return;
+        }
         if shipped.sounds == 0 {
             self.status = format!("{name} - its list of sounds is not in yet");
             self.dirty_frame = true;
@@ -516,6 +641,7 @@ impl App {
                 loading: None,
             });
         }
+        self.invalidate_source_measurement();
         let library = std::sync::Arc::clone(&library);
         std::thread::Builder::new()
             .name("cache-pack".into())
@@ -551,10 +677,16 @@ impl App {
             self.dirty_frame = true;
             return;
         }
+        self.poll_source_measurement();
         self.refresh_user_sources();
         let Some(user) = self.user_sources.iter().find(|user| user.spec == spec) else {
             return;
         };
+        if !user.counts_ready {
+            self.status = format!("{label} - file counts are not in yet; try again in a moment");
+            self.dirty_frame = true;
+            return;
+        }
         if user.sounds == 0 && user.files == 0 {
             self.status = format!("{label} - its list of sounds is not in yet");
             self.dirty_frame = true;
@@ -574,6 +706,7 @@ impl App {
                 loading: None,
             });
         }
+        self.invalidate_source_measurement();
         let library = std::sync::Arc::clone(&library);
         let cache_spec = spec.clone();
         std::thread::Builder::new()
@@ -604,17 +737,6 @@ impl App {
             let Some(progress) = shipped.cache.as_mut() else {
                 continue;
             };
-            if progress.done() {
-                let (cached_files, cached_total, cache_bytes) =
-                    library.default_source_cached(&shipped.source);
-                shipped.cached_files = cached_files;
-                shipped.files = cached_total.max(shipped.files);
-                shipped.cache_bytes = cache_bytes;
-                shipped.cache = None;
-                changed = true;
-                finished_a_pack = true;
-                continue;
-            }
             // Down only, like the library's own bar: a score's loads share
             // the line, and a count that climbed would read as a download
             // starting over.
@@ -627,10 +749,17 @@ impl App {
                 progress.loading = loading;
                 changed = true;
             }
+            if progress.done() {
+                shipped.cache = None;
+                shipped.counts_ready = false;
+                changed = true;
+                finished_a_pack = true;
+            }
         }
         if finished_a_pack {
             // Pack finished writing files: refresh the clear-cache size.
             self.cache_measure_due = Some(Instant::now());
+            self.invalidate_source_measurement();
         }
         self.dirty_frame |= changed;
     }
@@ -650,17 +779,6 @@ impl App {
             let Some(progress) = user.cache.as_mut() else {
                 continue;
             };
-            if progress.done() {
-                let (cached_files, cached_total, cache_bytes) =
-                    library.import_source_cached(&user.spec);
-                user.cached_files = cached_files;
-                user.files = cached_total.max(user.files);
-                user.cache_bytes = cache_bytes;
-                user.cache = None;
-                changed = true;
-                finished_a_pack = true;
-                continue;
-            }
             let left = library
                 .pending_cache_for_import(&user.spec)
                 .min(progress.left);
@@ -670,9 +788,16 @@ impl App {
                 progress.loading = loading;
                 changed = true;
             }
+            if progress.done() {
+                user.cache = None;
+                user.counts_ready = false;
+                changed = true;
+                finished_a_pack = true;
+            }
         }
         if finished_a_pack {
             self.cache_measure_due = Some(Instant::now());
+            self.invalidate_source_measurement();
         }
         self.dirty_frame |= changed;
     }
@@ -682,6 +807,7 @@ impl App {
     /// cache size while downloads write files. `loading` is whether the
     /// library still had manifests on the way when the poll sampled it.
     pub(super) fn poll_source_rows(&mut self, loading: bool) {
+        self.poll_source_measurement();
         self.follow_precache();
         // The shipped packs' rows: what each holds, while their lists are
         // still landing, and how far each download is while one runs.
@@ -698,7 +824,7 @@ impl App {
             || self
                 .user_sources
                 .iter()
-                .any(|user| !user.local && user.sounds == 0)
+                .any(|user| !user.counts_ready || (!user.local && user.sounds == 0))
         {
             self.refresh_user_sources();
         }
@@ -744,6 +870,10 @@ impl App {
         let Some(library) = self.worker.library() else {
             return;
         };
+        self.invalidate_source_measurement();
+        for user in &mut self.user_sources {
+            user.counts_ready = false;
+        }
         // The renames are an overlay on what a source brings, so they have
         // to be in place before it brings anything.
         library.set_bank_renames(self.prefs.bank_renames());
@@ -1089,6 +1219,7 @@ impl App {
             self.dirty_frame = true;
             return;
         };
+        self.poll_source_measurement();
         self.refresh_user_sources();
         if library.manifests_pending() > 0 && self.shipped_sources.iter().all(|s| s.sounds == 0) {
             self.status = "the packs' lists are not in yet - try again in a moment".into();
@@ -1106,6 +1237,21 @@ impl App {
             .any(|user| user.cache.as_ref().is_some_and(|progress| !progress.done()))
         {
             self.status = "still caching packs - wait for the rows to finish".into();
+            self.dirty_frame = true;
+            return;
+        }
+        // A newly settled manifest can be ready before its background count.
+        // Do not silently skip that pack while claiming to cache every source.
+        if self
+            .shipped_sources
+            .iter()
+            .any(|shipped| !shipped.counts_ready)
+            || self
+                .user_sources
+                .iter()
+                .any(|user| !user.local && !user.counts_ready)
+        {
+            self.status = "the packs' file counts are not in yet - try again in a moment".into();
             self.dirty_frame = true;
             return;
         }
@@ -1156,6 +1302,7 @@ impl App {
             self.dirty_frame = true;
             return;
         }
+        self.invalidate_source_measurement();
         self.precache = Some(super::super::settings::PrecacheProgress {
             kind: super::super::settings::PrecacheKind::Library,
             total: total_files.max(1),
@@ -1300,6 +1447,7 @@ impl App {
             self.dirty_frame = true;
             return;
         }
+        self.invalidate_source_measurement();
         for shipped in &mut self.shipped_sources {
             shipped.cached_files = 0;
             shipped.cache_bytes = 0;
@@ -1359,5 +1507,393 @@ impl App {
             }
             self.dirty_frame = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::tests::support::app_over;
+
+    fn receive_source_rows(app: &mut App, ready: impl Fn(&App) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready(app) && Instant::now() < deadline {
+            app.poll_source_measurement();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(ready(app), "the background source walk finishes");
+    }
+
+    #[test]
+    fn a_blocked_source_walk_keeps_polling_and_preserves_download_progress() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app_over(directory.path());
+        app.worker
+            .set_library(Arc::new(rustel_runtime::samples::SampleLibrary::empty()));
+        app.source_refresh = SourceRefresh::default();
+        let mut rows = SourceRows {
+            shipped: app.shipped_sources.clone(),
+            users: Vec::new(),
+        };
+        rows.shipped[0].sounds = 77;
+        rows.shipped[0].files = 80;
+        rows.shipped[0].counts_ready = true;
+        let (release, blocked) = std::sync::mpsc::channel();
+        app.source_measure = Some(
+            SourceMeasurement::spawn(move || {
+                blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                rows
+            })
+            .unwrap(),
+        );
+        let progress = super::super::super::settings::SourceCacheProgress {
+            total: 80,
+            left: 42,
+            loading: None,
+        };
+        app.shipped_sources[0].cache = Some(progress.clone());
+        for _ in 0..3 {
+            app.refresh_shipped_sources();
+            app.poll_source_measurement();
+            assert_eq!(app.shipped_sources[0].sounds, 0);
+            assert!(app.source_measure.is_some());
+            assert!(app.source_refresh.shipped);
+        }
+        release.send(()).unwrap();
+        receive_source_rows(&mut app, |app| app.shipped_sources[0].sounds == 77);
+        assert_eq!(app.shipped_sources[0].files, 80);
+        assert_eq!(app.shipped_sources[0].cache, Some(progress));
+        assert!(app.source_measure.is_some(), "one follow-up walk is queued");
+        assert!(!app.source_refresh.shipped);
+    }
+
+    #[test]
+    fn source_results_follow_current_membership_and_keep_seen_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app_over(directory.path());
+        app.worker
+            .set_library(Arc::new(rustel_runtime::samples::SampleLibrary::empty()));
+        let source = |spec: &str| crate::prefs::SampleSourcePref {
+            spec: spec.into(),
+            enabled: true,
+        };
+        app.prefs.sample_sources = vec![
+            source("https://example.test/old.json"),
+            source("https://example.test/keep.json"),
+        ];
+        app.reconcile_user_sources();
+        let mut rows = SourceRows {
+            shipped: Vec::new(),
+            users: app.user_sources.clone(),
+        };
+        rows.users[1].sounds = 3;
+        rows.users[1]
+            .seen_files
+            .insert(Arc::from("https://example.test/kick.wav"));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.source_measure = Some(SourceMeasurement {
+            receiver,
+            invalidated: false,
+        });
+        app.source_refresh = SourceRefresh::default();
+        app.prefs.sample_sources = vec![
+            source("https://example.test/keep.json"),
+            source("https://example.test/new.json"),
+        ];
+        sender.send(rows).unwrap();
+        app.poll_source_measurement();
+        assert_eq!(app.user_sources[0].spec, "https://example.test/keep.json");
+        assert_eq!(app.user_sources[0].sounds, 3);
+        assert!(
+            app.user_sources[0]
+                .seen_files
+                .contains("https://example.test/kick.wav")
+        );
+        assert_eq!(app.user_sources[1].spec, "https://example.test/new.json");
+        assert_eq!(app.user_sources[1].sounds, 0);
+        assert_eq!(app.user_sources.len(), 2);
+    }
+
+    #[test]
+    fn cache_all_waits_for_newly_ready_counts_then_accepts_a_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app_over(directory.path());
+        let library = Arc::new(rustel_runtime::samples::SampleLibrary::empty());
+        app.worker.set_library(Arc::clone(&library));
+        std::fs::write(
+            directory.path().join("kick.wav"),
+            include_bytes!("../../../audio/assets/bd.wav"),
+        )
+        .unwrap();
+        app.prefs.sample_sources = vec![crate::prefs::SampleSourcePref {
+            spec: directory.path().display().to_string(),
+            enabled: true,
+        }];
+        assert!(matches!(
+            library.adopt_global_sources_settled(&app.prefs.global_sources())[0].state,
+            rustel_runtime::samples::GlobalSourceState::Ready { banks: 1 }
+        ));
+        app.reconcile_user_sources();
+        // Give this ready fixture the UI state of a remote pack, without HTTP.
+        app.user_sources[0].local = false;
+        // Its first settled background count has not reached the UI yet.
+        app.user_sources[0].counts_ready = false;
+        app.source_reports.clear();
+        for shipped in &mut app.shipped_sources {
+            shipped.files = 1;
+            shipped.cached_files = 1;
+            shipped.counts_ready = true;
+        }
+        let mut rows = SourceRows {
+            shipped: Vec::new(),
+            users: app.user_sources.clone(),
+        };
+        rows.users[0].sounds = 1;
+        rows.users[0].files = 1;
+        rows.users[0].counts_ready = true;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.source_measure = Some(SourceMeasurement {
+            receiver,
+            invalidated: false,
+        });
+        app.source_refresh = SourceRefresh::default();
+
+        app.cache_whole_library();
+        assert!(
+            app.status.contains("file counts are not in yet"),
+            "{}",
+            app.status
+        );
+        assert!(app.precache.is_none());
+        assert!(app.user_sources[0].cache.is_none());
+
+        sender.send(rows).unwrap();
+        app.cache_whole_library();
+        assert!(
+            app.status.starts_with("caching every remote pack"),
+            "{}",
+            app.status
+        );
+        assert_eq!(app.precache.as_ref().unwrap().total, 1);
+        assert_eq!(app.user_sources[0].cache.as_ref().unwrap().total, 1);
+        assert!(
+            app.source_measure.is_some(),
+            "a periodic refresh does not block caching"
+        );
+    }
+
+    #[test]
+    fn cache_all_waits_for_shipped_counts_after_manifests_settle() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app_over(directory.path());
+        let library = Arc::new(rustel_runtime::samples::SampleLibrary::empty());
+        app.worker.set_library(Arc::clone(&library));
+        app.shipped_sources.truncate(1);
+        app.shipped_sources[0].source.base = "https://example.test/empty/".into();
+        assert_eq!(library.manifests_pending(), 0);
+        let rows = SourceRows {
+            shipped: app.shipped_sources.clone(),
+            users: Vec::new(),
+        }
+        .measure(&library);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.source_measure = Some(SourceMeasurement {
+            receiver,
+            invalidated: false,
+        });
+        app.source_refresh = SourceRefresh::default();
+
+        app.cache_whole_library();
+        assert!(app.status.contains("file counts are not in yet"));
+        assert!(app.precache.is_none());
+
+        sender.send(rows).unwrap();
+        app.cache_whole_library();
+        assert_eq!(app.status, "the remote packs have nothing to cache yet");
+        assert!(app.shipped_sources.iter().all(|source| source.counts_ready));
+        assert!(app.precache.is_none());
+    }
+
+    #[test]
+    fn refetching_a_cached_pack_waits_for_its_new_file_counts() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app_over(directory.path());
+        let library = Arc::new(rustel_runtime::samples::SampleLibrary::empty());
+        app.worker.set_library(Arc::clone(&library));
+        std::fs::write(
+            directory.path().join("kick.wav"),
+            include_bytes!("../../../audio/assets/bd.wav"),
+        )
+        .unwrap();
+        app.prefs.sample_sources = vec![crate::prefs::SampleSourcePref {
+            spec: directory.path().display().to_string(),
+            enabled: true,
+        }];
+        app.source_reports = library.adopt_global_sources_settled(&app.prefs.global_sources());
+        app.reconcile_user_sources();
+        app.shipped_sources.clear();
+        app.settings_sheet = None;
+        // Give the local fixture a fully cached remote row, without HTTP.
+        let user = &mut app.user_sources[0];
+        user.local = false;
+        user.sounds = 1;
+        user.files = 1;
+        user.cached_files = 1;
+        user.counts_ready = true;
+        let old_rows = SourceRows {
+            shipped: Vec::new(),
+            users: app.user_sources.clone(),
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.source_measure = Some(SourceMeasurement {
+            receiver,
+            invalidated: false,
+        });
+        app.source_refresh = SourceRefresh::default();
+        std::fs::write(
+            directory.path().join("snare.wav"),
+            include_bytes!("../../../audio/assets/bd.wav"),
+        )
+        .unwrap();
+        let hold = library.hold_manifest_worker_for_test();
+        app.adopt_global_sources();
+        assert!(!app.user_sources[0].counts_ready);
+        sender.send(old_rows).unwrap();
+        receive_source_rows(&mut app, |app| app.source_measure.is_none());
+        assert_eq!(app.user_sources[0].files, 1, "old banks stay playable");
+        assert!(!app.user_sources[0].counts_ready);
+        app.cache_whole_library();
+        assert!(app.status.contains("not in yet"), "{}", app.status);
+        assert!(app.precache.is_none());
+        receive_source_rows(&mut app, |app| app.source_measure.is_none());
+
+        drop(hold);
+        library.wait_until_idle(Duration::from_secs(5));
+        app.poll_source_rows(false);
+        assert!(
+            app.source_measure.is_some(),
+            "a closed Sources page retries"
+        );
+        receive_source_rows(&mut app, |app| app.user_sources[0].counts_ready);
+        assert_eq!(app.user_sources[0].files, 2);
+    }
+
+    #[test]
+    fn finished_pack_rows_wait_for_fresh_counts_before_caching_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app_over(directory.path());
+        app.worker
+            .set_library(Arc::new(rustel_runtime::samples::SampleLibrary::empty()));
+        let spec = "https://example.test/pack.json";
+        app.prefs.sample_sources = vec![crate::prefs::SampleSourcePref {
+            spec: spec.into(),
+            enabled: true,
+        }];
+        app.reconcile_user_sources();
+        app.source_reports = vec![rustel_runtime::samples::GlobalSourceReport {
+            spec: spec.into(),
+            state: rustel_runtime::samples::GlobalSourceState::Ready { banks: 1 },
+        }];
+        for shipped in &mut app.shipped_sources {
+            shipped.counts_ready = true;
+        }
+        let progress = super::super::super::settings::SourceCacheProgress {
+            total: 10,
+            left: 1,
+            loading: None,
+        };
+        let shipped = &mut app.shipped_sources[0];
+        shipped.sounds = 1;
+        shipped.files = 10;
+        shipped.cached_files = 3;
+        shipped.cache = Some(progress.clone());
+        let user = &mut app.user_sources[0];
+        user.sounds = 1;
+        user.files = 10;
+        user.cached_files = 3;
+        user.counts_ready = true;
+        user.cache = Some(progress);
+
+        app.follow_shipped_caches();
+        app.follow_user_caches();
+        assert!(app.shipped_sources[0].cache.is_none());
+        assert!(app.user_sources[0].cache.is_none());
+        for loading in [false, true] {
+            app.library_loading = loading;
+            let rows = app.source_rows();
+            for row in [&rows[0], &rows[1]] {
+                assert_eq!(row.state, "checking files…");
+                assert_eq!(row.cache_fill, None);
+            }
+        }
+
+        let mut rows = SourceRows {
+            shipped: app.shipped_sources.clone(),
+            users: app.user_sources.clone(),
+        };
+        rows.shipped[0].cached_files = 10;
+        rows.shipped[0].counts_ready = true;
+        rows.users[0].cached_files = 10;
+        rows.users[0].counts_ready = true;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.source_measure = Some(SourceMeasurement {
+            receiver,
+            invalidated: false,
+        });
+        app.source_refresh = SourceRefresh::default();
+
+        app.cache_whole_library();
+        assert!(app.status.contains("file counts are not in yet"));
+        assert!(app.shipped_sources[0].cache.is_none());
+        assert!(app.user_sources[0].cache.is_none());
+        sender.send(rows).unwrap();
+        app.cache_whole_library();
+        assert_eq!(app.status, "every remote pack is already on disk");
+        assert!(app.shipped_sources[0].cache.is_none());
+        assert!(app.user_sources[0].cache.is_none());
+    }
+
+    #[test]
+    fn clearing_the_cache_discards_pending_counts_and_waits_before_remeasuring() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = app_over(directory.path());
+        app.worker
+            .set_library(Arc::new(rustel_runtime::samples::SampleLibrary::empty()));
+        let mut rows = SourceRows {
+            shipped: app.shipped_sources.clone(),
+            users: Vec::new(),
+        };
+        rows.shipped[0].cached_files = 10;
+        rows.shipped[0].cache_bytes = 1_000;
+        rows.shipped[0]
+            .seen_files
+            .insert(Arc::from("https://example.test/kick.wav"));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.source_measure = Some(SourceMeasurement {
+            receiver,
+            invalidated: false,
+        });
+        app.clear_sample_cache();
+        sender.send(rows).unwrap();
+        app.poll_source_measurement();
+        assert_eq!(app.shipped_sources[0].cached_files, 0);
+        assert_eq!(app.shipped_sources[0].cache_bytes, 0);
+        assert!(app.shipped_sources[0].seen_files.is_empty());
+        assert!(
+            app.source_measure.is_none(),
+            "the clear still owns the cache"
+        );
+        assert!(app.source_refresh.shipped && app.source_refresh.users);
+        app.cache_clear
+            .take()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        app.poll_source_measurement();
+        assert!(
+            app.source_measure.is_some(),
+            "counts resume after the clear"
+        );
     }
 }
