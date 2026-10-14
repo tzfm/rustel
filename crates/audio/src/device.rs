@@ -64,6 +64,14 @@ fn rebase_frame_rate(frame: u64, old_sample_rate: u32, new_sample_rate: u32) -> 
     u64::try_from(rebased).unwrap_or(u64::MAX)
 }
 
+/// Takes a lock of the insert state. The insert provider is host code and
+/// runs with these locks. A panic in that code does not end the output: the
+/// next turn reads the value as the panic left it.
+fn locked<T>(lock: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[derive(Debug)]
 pub enum DevicePlaybackError {
     Unavailable(String),
@@ -216,14 +224,16 @@ impl LiveReverbBatch {
     }
 
     fn flush_inserts(&mut self, device: &LiveScalarDevice) {
+        // A turn with no request also frees the copies the callback gave back.
+        device.reclaim_assets();
         // The callback knows a chain before the first insert of the chain.
-        let names = device.insert_names.lock().expect("insert names").clone();
+        let names = locked(&device.insert_names).clone();
         if let Some(names) = names {
             device.set_named_insert_chains(&names());
         }
         // A copy that was not ready gets another try on the next turn.
         let waiting = {
-            let mut waiting = device.insert_waiting.lock().expect("waiting inserts");
+            let mut waiting = locked(&device.insert_waiting);
             // Removed chains must not occupy retry slots forever. Active
             // onsets refresh this age when they request the chain again.
             waiting.retain(|(_, _, requested)| requested.elapsed() < Duration::from_secs(30));
@@ -266,8 +276,9 @@ pub struct LiveScalarDevice {
     /// Recently shipped `.FX()` stage reverbs. The pointer identity lets the
     /// producer forget a fingerprint when the callback returns that box.
     fx_reverb_cache: std::sync::Mutex<Vec<(crate::reverb::ReverbParams, usize, usize)>>,
-    /// Shipped logical slots and box addresses. Returned copies invalidate
-    /// only their own entry, including a copy refused by the callback pool.
+    /// Shipped logical slots and box addresses, one entry for each copy the
+    /// callback did not return. Returned copies invalidate only their own
+    /// entry, including a copy refused by the callback pool.
     insert_cache:
         std::sync::Mutex<Vec<(crate::insert::InsertSlot, crate::insert::InsertKey, usize)>>,
     insert_waiting:
@@ -1394,7 +1405,7 @@ impl LiveScalarDevice {
     /// provider runs on the producer thread and answers fast for a key that
     /// has no effect.
     pub fn set_insert_provider(&self, provider: Arc<crate::insert::InsertProvider>) {
-        *self.insert_provider.lock().expect("insert provider") = Some(provider);
+        *locked(&self.insert_provider) = Some(provider);
     }
 
     /// Prepare and ship a logical slot off the callback. Repeated requests
@@ -1417,8 +1428,8 @@ impl LiveScalarDevice {
             return;
         }
         self.reclaim_assets();
-        let mut cache = self.insert_cache.lock().expect("producer insert cache");
-        let mut waiting = self.insert_waiting.lock().expect("waiting inserts");
+        let mut cache = locked(&self.insert_cache);
+        let mut waiting = locked(&self.insert_waiting);
         waiting.retain(|(held, _, _)| *held != slot);
         if cache
             .iter()
@@ -1426,15 +1437,10 @@ impl LiveScalarDevice {
         {
             return;
         }
-        let provider = self
-            .insert_provider
-            .lock()
-            .expect("insert provider")
-            .clone();
+        let provider = locked(&self.insert_provider).clone();
         let Some(provider) = provider else { return };
         if waiting.len() == crate::insert::INSERT_SLOTS
-            || (cache.len() == crate::insert::INSERT_SLOTS * 2
-                && !cache.iter().any(|(held, _, _)| *held == slot))
+            || cache.len() == crate::insert::INSERT_SLOTS * 2
         {
             self.shared
                 .samples
@@ -1444,25 +1450,26 @@ impl LiveScalarDevice {
         }
         // Not ready, or no room in the ring: the next turn tries again.
         waiting.push((slot, key, requested));
+        // The provider keeps a copy the ring has no room for.
+        let installs = &self.shared.samples.insert_installs;
+        if installs.len() == installs.capacity() {
+            return;
+        }
         let Some(insert) = provider(key, self.sample_rate, slot) else {
             return;
         };
         let pointer = Box::into_raw(insert);
-        match self
-            .shared
-            .samples
-            .insert_installs
-            .push(crate::assets::InsertInstall {
-                slot,
-                sample_rate: self.sample_rate,
-                insert: pointer,
-            }) {
+        match installs.push(crate::assets::InsertInstall {
+            slot,
+            sample_rate: self.sample_rate,
+            insert: pointer,
+        }) {
             Ok(()) => {
-                cache.retain(|(held, _, _)| *held != slot);
                 cache.push((slot, key, pointer as *mut () as usize));
                 waiting.retain(|(held, _, _)| *held != slot);
             }
             Err(install) => {
+                // Only this thread fills the ring, and a place was free.
                 // SAFETY: never left this thread. Unique owner.
                 drop(unsafe { Box::from_raw(install.insert) });
             }
@@ -1475,9 +1482,7 @@ impl LiveScalarDevice {
         slot: crate::insert::InsertSlot,
         key: crate::insert::InsertKey,
     ) -> bool {
-        self.insert_cache
-            .lock()
-            .expect("producer insert cache")
+        locked(&self.insert_cache)
             .iter()
             .any(|(held, cached, _)| *held == slot && *cached == key)
     }
@@ -1546,7 +1551,7 @@ impl LiveScalarDevice {
             .fx_reverb_cache
             .lock()
             .expect("producer fx reverb cache");
-        let mut inserts = self.insert_cache.lock().expect("producer insert cache");
+        let mut inserts = locked(&self.insert_cache);
         self.shared.samples.reclaim_with_inserts(
             |returned| cache.retain(|(_, _, installed)| *installed != returned as usize),
             |returned| {
@@ -1918,7 +1923,7 @@ impl LiveScalarDevice {
     /// before it takes the inserts of a turn, and gives the answer to
     /// [`Self::set_named_insert_chains`].
     pub fn set_insert_names(&self, names: Arc<crate::insert::InsertNames>) {
-        *self.insert_names.lock().expect("insert names") = Some(names);
+        *locked(&self.insert_names) = Some(names);
     }
 
     /// Names the insert chains the playing score has, 64 at most. The
@@ -3370,11 +3375,8 @@ impl LiveScalarDevice {
             .lock()
             .expect("producer fx reverb cache")
             .clear();
-        self.insert_cache
-            .lock()
-            .expect("producer insert cache")
-            .clear();
-        self.insert_waiting.lock().expect("waiting inserts").clear();
+        locked(&self.insert_cache).clear();
+        locked(&self.insert_waiting).clear();
         self.shared
             .samples
             .fx_reverb_resident_bytes
@@ -6759,6 +6761,11 @@ mod tests {
 
             device.ensure_insert(crate::insert::effect_slot(1, 0), key(2));
             assert_eq!(seen.built.load(Ordering::Relaxed), 2);
+            // The slot has 2 copies now. A note that wants the active copy
+            // again builds nothing.
+            device.ensure_insert(crate::insert::effect_slot(1, 0), key(1));
+            device.ensure_insert(crate::insert::effect_slot(1, 0), key(2));
+            assert_eq!(seen.built.load(Ordering::Relaxed), 2);
             let staged_by = device.clock_frames() + 512;
             until("the callback did not stage the replacement", || {
                 device.clock_frames() >= staged_by
@@ -6774,9 +6781,11 @@ mod tests {
                     && device.shared.samples.insert_returns.len() == 1
             });
             assert_eq!(seen.dropped.load(Ordering::Relaxed), 0);
-            device.reclaim_assets();
+            // A turn with no request frees the copy that came back.
+            LiveReverbBatch::default().flush_inserts(&device);
             assert_eq!(seen.dropped.load(Ordering::Relaxed), 1);
             assert!(device.holds_insert(crate::insert::effect_slot(1, 0), key(2)));
+            assert!(!device.holds_insert(crate::insert::effect_slot(1, 0), key(1)));
 
             // Stop consumption so the next copy stays in the line during the
             // recycle. A copy that is not ready waits for the next turn.
@@ -6805,6 +6814,26 @@ mod tests {
             device.ensure_insert(crate::insert::effect_slot(1, 0), key(1));
             assert_eq!(device.shared.samples.insert_installs.len(), 1);
 
+            // With a full line the provider keeps its copy, and the slot
+            // waits for the next turn.
+            let installs = &device.shared.samples.insert_installs;
+            let returns = &device.shared.samples.insert_returns;
+            assert_eq!(installs.capacity(), crate::insert::INSERT_SLOTS);
+            assert_eq!(returns.capacity(), crate::insert::INSERT_SLOTS);
+            while installs.len() < installs.capacity() {
+                let spare = Box::new(Probe(key(1), Arc::default(), 0));
+                let install = crate::assets::InsertInstall {
+                    slot: crate::insert::effect_slot(1, 0),
+                    sample_rate: 48_000,
+                    insert: Box::into_raw(spare),
+                };
+                assert!(installs.push(install).is_ok());
+            }
+            let built = seen.built.load(Ordering::Relaxed);
+            device.ensure_insert(crate::insert::effect_slot(1, 0), key(3));
+            assert_eq!(seen.built.load(Ordering::Relaxed), built);
+            assert_eq!(device.insert_waiting.lock().unwrap().len(), 1);
+
             assert!(
                 device
                     .recycle_output_to_with(
@@ -6830,6 +6859,20 @@ mod tests {
                 .expect("replacement output");
             device.ensure_insert(crate::insert::effect_slot(1, 0), key(1));
             assert!(device.holds_insert(crate::insert::effect_slot(1, 0), key(1)));
+
+            // A provider that panics does not end the output. This step is
+            // the last one: the insert locks stay poisoned after it.
+            let slot = crate::insert::effect_slot(1, 0);
+            device.set_insert_provider(Arc::new(|_, _, _| panic!("a provider fault")));
+            let request = std::panic::AssertUnwindSafe(|| device.ensure_insert(slot, key(2)));
+            assert!(std::panic::catch_unwind(request).is_err());
+            assert!(device.insert_cache.is_poisoned() && device.insert_waiting.is_poisoned());
+            device.set_insert_provider(Arc::new({
+                let seen = Arc::clone(&seen);
+                move |wanted, _, _| Some(Box::new(Probe(wanted, Arc::clone(&seen), 0)) as Box<_>)
+            }));
+            LiveReverbBatch::default().flush_inserts(&device);
+            assert!(device.holds_insert(slot, key(2)));
         }
 
         #[test]

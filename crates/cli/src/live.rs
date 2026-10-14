@@ -1198,15 +1198,20 @@ fn report_session_diagnostics(
         }
     }));
     for diagnostic in diagnostics {
-        let key = (diagnostic.kind.clone(), diagnostic.message.clone());
-        if reported.contains(&key) {
-            continue;
+        // The session gives a plugin line one time for each evaluation, so
+        // the list does not take it. The list still has the lines of the
+        // score before, and would hide the line of the new score.
+        if diagnostic.kind != rustel_runtime::PLUGIN_DIAGNOSTIC {
+            let key = (diagnostic.kind.clone(), diagnostic.message.clone());
+            if reported.contains(&key) {
+                continue;
+            }
+            const MAX_REPORTED_SESSION_DIAGNOSTICS: usize = 64;
+            if reported.len() == MAX_REPORTED_SESSION_DIAGNOSTICS {
+                reported.pop_front();
+            }
+            reported.push_back(key);
         }
-        const MAX_REPORTED_SESSION_DIAGNOSTICS: usize = 64;
-        if reported.len() == MAX_REPORTED_SESSION_DIAGNOSTICS {
-            reported.pop_front();
-        }
-        reported.push_back(key);
         let event = serde_json::json!({
             "live_error": {
                 "kind": diagnostic.kind,

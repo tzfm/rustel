@@ -659,7 +659,8 @@ mod tests {
     }
 
     /// With direct logging off, a scope hands its host each distinct notice
-    /// once, and a nested scope's notices stay its own.
+    /// once, and a nested scope's notices stay its own. A plugin notice
+    /// comes back with direct logging on too.
     #[test]
     fn a_quiet_scope_returns_its_notices_deduplicated() {
         let duck_to_nowhere = || {
@@ -693,6 +694,20 @@ mod tests {
 
         let (_, printed) = super::with_diagnostic_policy(true, duck_to_nowhere);
         assert!(printed.is_empty());
+
+        let request = super::PluginRequest {
+            instrument: false,
+            name: "delay",
+            preset: None,
+            params: &[],
+        };
+        let ((), kept) = super::with_diagnostic_policy(true, || {
+            for _ in 0..2 {
+                super::plugin_value_skipped(&request, "Delay has no parameter 'mix'");
+            }
+        });
+        let kept: Vec<&str> = kept.iter().map(|notice| notice.message.as_str()).collect();
+        assert_eq!(kept, ["vst value skipped: Delay has no parameter 'mix'"]);
     }
 
     /// A notice whose record has no `message` of its own still reads as a
@@ -1828,6 +1843,10 @@ impl Drop for DiagnosticPolicyGuard {
 /// notices with the result, each distinct notice once, in the order first
 /// raised, at most sixteen. A nested scope keeps its own notices; discarding
 /// them is the caller's choice.
+///
+/// A plugin notice is never written here. A note gives the notice again in
+/// each window. The scope returns it with direct logging on too, and the
+/// host says it one time.
 pub fn with_diagnostic_policy<T>(
     direct_logging: bool,
     resolve: impl FnOnce() -> T,
@@ -1946,10 +1965,13 @@ fn report_notice(message: impl Into<String>, record: serde_json::Value) {
         eprintln!("{record}");
         return;
     }
-    let notice = VoiceNotice {
-        message: message.into(),
-        record,
-    };
+    keep_notice(message.into(), record);
+}
+
+/// Keep the notice for the enclosing [`with_diagnostic_policy`] scope, each
+/// distinct notice once. Outside every scope, it is dropped.
+fn keep_notice(message: String, record: serde_json::Value) {
+    let notice = VoiceNotice { message, record };
     COLLECTED_NOTICES.with(|collected| {
         if let Some(notices) = collected.borrow_mut().as_mut()
             && notices.len() < MAX_COLLECTED_NOTICES
@@ -2010,7 +2032,9 @@ pub trait SampleLookup {
     ///
     /// `Ok(None)` plays the note with no plugin and no notice: the plugin
     /// loads now. `Err` plays the note with no plugin and gives the user
-    /// the reason. A host with no plugins keeps this default.
+    /// the reason. A host that drops one value of the request keeps the
+    /// plugin and gives the reason with [`plugin_value_skipped`]. A host
+    /// with no plugins keeps this default.
     fn insert(
         &self,
         _request: &PluginRequest<'_>,
@@ -5435,10 +5459,31 @@ fn tremolo_controls(
 
 /// Tells the user why a note plays with no plugin.
 fn plugin_skipped(call: &str, reason: &str) {
-    report_notice(
-        format!("{call} skipped: {reason}"),
-        serde_json::json!({ "vst_skipped": { "message": reason } }),
-    );
+    let message = format!("{call} skipped: {reason}");
+    let record = serde_json::json!({ "vst_skipped": { "message": reason } });
+    report_plugin_notice(message, record);
+}
+
+/// Tells the user why a note plays with one plugin value less. A host calls
+/// this in [`SampleLookup::insert`] for each value of the request it drops.
+/// The note keeps its plugin.
+pub fn plugin_value_skipped(request: &PluginRequest<'_>, reason: &str) {
+    let call = if request.instrument { "vsti" } else { "vst" };
+    let message = format!("{call} value skipped: {reason}");
+    let record = serde_json::json!({ "vst_skipped": { "message": &message } });
+    report_plugin_notice(message, record);
+}
+
+/// Gives a plugin notice to the enclosing [`with_diagnostic_policy`] scope.
+/// The scope keeps the notice with direct logging on too, and its host says
+/// the notice one time. Outside every scope, [`report_notice`] prints or
+/// drops the notice.
+fn report_plugin_notice(message: String, record: serde_json::Value) {
+    if COLLECTED_NOTICES.with(|collected| collected.borrow().is_some()) {
+        keep_notice(message, record);
+    } else {
+        report_notice(message, record);
+    }
 }
 
 /// The effects a note asks for, in chain order. The hap carries a list

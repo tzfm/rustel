@@ -8,7 +8,10 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use rustel_audio::{InsertKey, InsertProvider, InsertSlot, OrbitInsert};
+use rustel_audio::{
+    InsertControls, InsertKey, InsertParam, InsertProvider, InsertSlot, MAX_INSERT_PARAMS,
+    OrbitInsert,
+};
 
 use crate::cache::{self, Cache, Scanned};
 use crate::instance::{Instance, Loaded};
@@ -112,6 +115,35 @@ impl Plugin {
         })
     }
 
+    /// The values of a note for the audio engine. `values` has each value
+    /// with the name a score writes. A note carries [`MAX_INSERT_PARAMS`]
+    /// values at most. The note drops each value after these, and each
+    /// value with a name the plugin does not have. The list has the reason
+    /// for each dropped value, for the user.
+    pub fn controls(
+        &self,
+        key: InsertKey,
+        values: &[(&str, f64)],
+    ) -> (InsertControls, Vec<String>) {
+        let name = self.name();
+        let mut controls = InsertControls::new(key);
+        let mut dropped = Vec::new();
+        for (param, value) in values {
+            let Some(id) = self.param(param) else {
+                dropped.push(format!("{name} has no parameter with the name '{param}'"));
+                continue;
+            };
+            let value = *value as f32;
+            if !controls.push(InsertParam { id, value }) {
+                let most = MAX_INSERT_PARAMS;
+                dropped.push(format!(
+                    "a note carries {most} values for {name} at most, and '{param}' is one more"
+                ));
+            }
+        }
+        (controls, dropped)
+    }
+
     /// True for a plugin that makes sound from notes.
     pub fn is_instrument(&self) -> bool {
         self.class.categories.contains("Instrument")
@@ -163,7 +195,7 @@ pub enum FoundPreset {
 
 /// How far the plugin of one slot is, for a caller that holds a start
 /// until its plugins are ready.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Prepared {
     /// Built. The audio engine takes the plugin with the next
     /// [`Host::insert`], or an engine holds the plugin of the slot now.
@@ -175,8 +207,8 @@ pub enum Prepared {
     /// runs now.
     Pending,
     /// No such plugin or preset, the wrong kind, or a failure: nothing to
-    /// wait for.
-    Unavailable,
+    /// wait for. The text is the reason, for the user.
+    Unavailable(String),
 }
 
 /// The answer to a plugin name.
@@ -240,7 +272,8 @@ enum Build {
     Running,
     /// A plugin copy the host keeps for a slot.
     Ready(Box<Instance>),
-    Failed(u64),
+    /// The count of the builds at the failure, and the reason for the user.
+    Failed(u64, String),
 }
 
 /// A score can name its plugins before evaluation gives them chain slots.
@@ -531,9 +564,16 @@ struct Shared {
 impl Drop for Shared {
     fn drop(&mut self) {
         // The plugin thread ends each plugin and unloads each library.
-        let state = std::mem::take(self.state.get_mut().expect("plugin list"));
+        let state = self.state.get_mut();
+        let state = std::mem::take(state.unwrap_or_else(|error| error.into_inner()));
         let _ = self.jobs.send(Box::new(move || drop(state)));
     }
+}
+
+/// Takes a lock of the host. A panic of a thread with the lock does not end
+/// the host: the next caller reads the value as that thread left it.
+fn locked<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|error| error.into_inner())
 }
 
 /// The plugin host. A clone is a second handle to the same host.
@@ -573,7 +613,7 @@ impl Host {
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
-        self.shared.state.lock().expect("plugin list")
+        locked(&self.shared.state)
     }
 
     /// Puts a job in the line of the plugin thread. The receiver gets a
@@ -581,7 +621,7 @@ impl Host {
     /// not run, and the receiver reads as disconnected.
     fn enqueue(&self, job: impl FnOnce() + Send + 'static) -> mpsc::Receiver<()> {
         let (done, finished) = mpsc::sync_channel::<()>(1);
-        let _gate = self.shared.gate.lock().expect("job line");
+        let _gate = locked(&self.shared.gate);
         if !self.shared.closed.load(Ordering::Relaxed) {
             let _ = self.shared.jobs.send(Box::new(move || {
                 job();
@@ -600,7 +640,7 @@ impl Host {
         let (done, finished) = mpsc::sync_channel::<()>(1);
         let host = self.clone();
         {
-            let _gate = self.shared.gate.lock().expect("job line");
+            let _gate = locked(&self.shared.gate);
             self.shared.closed.store(true, Ordering::Relaxed);
             let _ = self.shared.jobs.send(Box::new(move || {
                 host.finish_unload(&[]);
@@ -722,7 +762,7 @@ impl Host {
         }
         state
             .builds
-            .retain(|_, build| !matches!(build, Build::Failed(_)));
+            .retain(|_, build| !matches!(build, Build::Failed(..)));
         state
             .known_presets
             .retain(|_, known| matches!(known, KnownPreset::Number(_)));
@@ -788,8 +828,8 @@ impl Host {
         struct Ended<'a>(&'a Host, bool);
         impl Drop for Ended<'_> {
             fn drop(&mut self) {
-                if let (false, Ok(mut state)) = (self.1, self.0.shared.state.lock()) {
-                    state.scan.running = false;
+                if !self.1 {
+                    self.0.state().scan.running = false;
                 }
             }
         }
@@ -846,7 +886,7 @@ impl Host {
 
     /// Writes the cache file beside the preset folders.
     fn save_cache(&self) {
-        let _one_writer = self.shared.saving.lock().expect("cache file");
+        let _one_writer = locked(&self.shared.saving);
         let (cache, root) = {
             let state = self.state();
             (state.cache.clone(), state.preset_root.clone())
@@ -952,7 +992,7 @@ impl Host {
                     }
                 }
                 let host = self.clone();
-                Some(self.enqueue(move || host.finish_load(index, bundle)))
+                Some(self.enqueue(move || host.finish_load(bundle)))
             } else {
                 None
             }
@@ -966,12 +1006,13 @@ impl Host {
         }
     }
 
-    /// Loads the bundle of one row in this process and stores the plugins.
-    /// Runs on the plugin thread.
-    fn finish_load(&self, index: usize, bundle: PathBuf) {
+    /// Loads a bundle in this process and stores its plugins. Runs on the
+    /// plugin thread.
+    fn finish_load(&self, bundle: PathBuf) {
         let start = Instant::now();
         let stamp = cache::stamp(&bundle);
-        let loaded = load_bundle(&bundle).map(|mut plugins: Vec<Plugin>| {
+        let loaded = contained("load", || load_bundle(&bundle));
+        let loaded = loaded.map(|mut plugins: Vec<Plugin>| {
             for plugin in &mut plugins {
                 plugin.load_time = start.elapsed();
             }
@@ -1030,9 +1071,10 @@ impl Host {
                     self.save_cache();
                 }
             }
+            // The list shows the reason, and `Host::key` gives the reason
+            // to each call of a score. A line here would say the fault a
+            // second time.
             Err(error) => {
-                let name = state.entries[index].name.clone();
-                state.errors.push(format!("vst {name}: {error}"));
                 for entry in &mut state.entries {
                     if entry.bundle == bundle && matches!(entry.stage, Stage::Loading) {
                         entry.stage = Stage::Failed(error.clone());
@@ -1096,7 +1138,7 @@ impl Host {
         let taken = state.taken.iter();
         let taken = taken.filter(|(_, mark)| mark.strong_count() > 0);
         let built = state.builds.iter();
-        let built = built.filter(|(_, built)| !matches!(built, Build::Failed(_)));
+        let built = built.filter(|(_, built)| !matches!(built, Build::Failed(..)));
         let chains = taken
             .map(|(build, _)| build)
             .chain(built.map(|(build, _)| build));
@@ -1199,7 +1241,7 @@ impl Host {
                 .filter(|row| {
                     // A failed build holds no plugin.
                     let building = state.builds.iter().any(|(build, built)| {
-                        row_of(build.0.plugin) == Some(**row) && !matches!(built, Build::Failed(_))
+                        row_of(build.0.plugin) == Some(**row) && !matches!(built, Build::Failed(..))
                     });
                     let running = match &state.entries[**row].stage {
                         Stage::Ready(plugin) => plugin.running.load(Ordering::Relaxed) > 0,
@@ -1343,6 +1385,44 @@ impl Host {
         FoundPreset::Number(number)
     }
 
+    /// The key of one plugin call of a score, and the plugin. `name` and
+    /// `preset` are the names the score writes, and `instrument` is true
+    /// for `.vsti()`. The call loads the plugin on first use, and waits for
+    /// nothing. `Ok(None)` means the plugin or the preset loads now: ask
+    /// again later. `Err` has the reason the host does not serve the call,
+    /// for the user.
+    pub fn key(
+        &self,
+        name: &str,
+        preset: Option<&str>,
+        instrument: bool,
+    ) -> Result<Option<(InsertKey, Arc<Plugin>)>, String> {
+        let (plugin, loaded) = match self.resolve(name, false) {
+            Resolved::Ready(plugin, loaded) => (plugin, loaded),
+            Resolved::Pending => return Ok(None),
+            Resolved::Missing => return Err(format!("no plugin has the name '{name}'")),
+            Resolved::Failed(reason) => return Err(format!("{name} did not load: {reason}")),
+        };
+        let found = loaded.name();
+        match (instrument, loaded.is_instrument()) {
+            (true, false) => return Err(format!("{found} is an effect: use .vst()")),
+            (false, true) => return Err(format!("{found} is an instrument: use .vsti()")),
+            _ => {}
+        }
+        let preset = match preset {
+            None => 0,
+            Some(preset) => match self.preset(plugin, preset) {
+                FoundPreset::Number(number) => number,
+                // The host reads the preset folder now.
+                FoundPreset::Pending => return Ok(None),
+                FoundPreset::Missing => {
+                    return Err(format!("{found} has no preset with the name '{preset}'"));
+                }
+            },
+        };
+        Ok(Some((InsertKey { plugin, preset }, loaded)))
+    }
+
     /// [`Host::insert`] as the provider the audio engine takes.
     pub fn provider(&self, wait: bool) -> Arc<InsertProvider> {
         let host = self.clone();
@@ -1430,21 +1510,11 @@ impl Host {
         sample_rate: u32,
         slot: InsertSlot,
     ) -> Prepared {
-        let (plugin, loaded) = match self.resolve(name, false) {
-            Resolved::Ready(plugin, loaded) => (plugin, loaded),
-            Resolved::Pending => return Prepared::Pending,
-            Resolved::Missing | Resolved::Failed(_) => return Prepared::Unavailable,
+        let key = match self.key(name, preset, instrument) {
+            Ok(Some((key, _))) => key,
+            Ok(None) => return Prepared::Pending,
+            Err(reason) => return Prepared::Unavailable(reason),
         };
-        if loaded.is_instrument() != instrument {
-            return Prepared::Unavailable;
-        }
-        let preset = match preset.map(|preset| self.preset(plugin, preset)) {
-            None => 0,
-            Some(FoundPreset::Number(number)) => number,
-            Some(FoundPreset::Pending) => return Prepared::Pending,
-            Some(FoundPreset::Missing) => return Prepared::Unavailable,
-        };
-        let key = InsertKey { plugin, preset };
         let build = (key, sample_rate, Target::Assigned(slot));
         let mut state = self.state();
         if !state.held(&build) {
@@ -1453,7 +1523,7 @@ impl Host {
         match state.builds.get(&build) {
             Some(Build::Ready(_)) => Prepared::Ready(key),
             Some(Build::Running) => Prepared::Pending,
-            Some(Build::Failed(_)) => Prepared::Unavailable,
+            Some(Build::Failed(_, reason)) => Prepared::Unavailable(reason.clone()),
             None if state.held(&build) => Prepared::Ready(key),
             None => Prepared::Unbuilt(key),
         }
@@ -1471,40 +1541,30 @@ impl Host {
         sample_rate: u32,
         copies: usize,
     ) -> Prepared {
-        let (plugin, loaded) = match self.resolve(name, false) {
-            Resolved::Ready(plugin, loaded) => (plugin, loaded),
-            Resolved::Pending => return Prepared::Pending,
-            Resolved::Missing | Resolved::Failed(_) => return Prepared::Unavailable,
+        let key = match self.key(name, preset, instrument) {
+            Ok(Some((key, _))) => key,
+            Ok(None) => return Prepared::Pending,
+            Err(reason) => return Prepared::Unavailable(reason),
         };
-        if loaded.is_instrument() != instrument {
-            return Prepared::Unavailable;
-        }
-        let preset = match preset.map(|preset| self.preset(plugin, preset)) {
-            None => 0,
-            Some(FoundPreset::Number(number)) => number,
-            Some(FoundPreset::Pending) => return Prepared::Pending,
-            Some(FoundPreset::Missing) => return Prepared::Unavailable,
-        };
-        let key = InsertKey { plugin, preset };
         let copies = copies.min(MAX_PARKED);
         let mut state = self.state();
         let mut ready = 0;
         let mut running = 0;
-        let mut failed = false;
+        let mut failed = None;
         for (build, built) in &state.builds {
             if build.0 == key && build.1 == sample_rate && matches!(build.2, Target::Spare(_)) {
                 match built {
                     Build::Ready(_) => ready += 1,
                     Build::Running => running += 1,
-                    Build::Failed(_) => failed = true,
+                    Build::Failed(_, reason) => failed = Some(reason.clone()),
                 }
             }
         }
         if ready >= copies {
             return Prepared::Ready(key);
         }
-        if failed {
-            return Prepared::Unavailable;
+        if let Some(reason) = failed {
+            return Prepared::Unavailable(reason);
         }
         for ordinal in 0..MAX_PARKED {
             if ready + running >= copies {
@@ -1622,7 +1682,7 @@ impl Host {
                 .builds
                 .iter()
                 .filter_map(|(build, built)| match built {
-                    Build::Failed(order) => Some((*build, (0, *order))),
+                    Build::Failed(order, _) => Some((*build, (0, *order))),
                     Build::Ready(copy) => Some((*build, (1, copy.order()))),
                     Build::Running => None,
                 })
@@ -1648,8 +1708,10 @@ impl Host {
                 std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))
             })
             .transpose();
-        let built =
-            preset.and_then(|preset| build_instance(&plugin, preset.as_deref(), key, rate, retire));
+        let built = preset.and_then(|preset| {
+            let build = || build_instance(&plugin, preset.as_deref(), key, rate, retire);
+            contained("build", build)
+        });
         let mut state = self.state();
         state.built += 1;
         let result = match built {
@@ -1658,8 +1720,9 @@ impl Host {
                 Build::Ready(Box::new(copy))
             }
             Err(error) => {
-                state.errors.push(format!("vst {}: {error}", plugin.name()));
-                Build::Failed(state.built)
+                let name = plugin.name();
+                state.errors.push(format!("vst {name}: {error}"));
+                Build::Failed(state.built, format!("{name} did not start: {error}"))
             }
         };
         state.builds.insert(build, result);
@@ -1669,6 +1732,14 @@ impl Host {
 /// The row of a plugin number.
 fn row_of(number: u32) -> Option<usize> {
     (number as usize).checked_sub(1)
+}
+
+/// Runs a load or a build on the plugin thread. A panic in the work is a
+/// failure with a reason. The caller stores the failure, so no row stays
+/// [`Stage::Loading`] and no build stays [`Build::Running`].
+fn contained<T>(work: &str, run: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let run = std::panic::AssertUnwindSafe(run);
+    std::panic::catch_unwind(run).unwrap_or_else(|_| Err(format!("the {work} panicked")))
 }
 
 /// Loads a bundle in this process and reads the parameters of each plugin
@@ -1703,4 +1774,28 @@ fn build_instance(
     }
     let running = Arc::clone(&plugin.running);
     loaded.activate(key, sample_rate, retire, running, plugin.params())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A panic in a load or a build is a failure with a reason. A panic of
+    /// a thread with the locks of the host leaves the host in use.
+    #[test]
+    fn a_panic_leaves_the_host_in_use() {
+        let failed: Result<(), String> = contained("build", || panic!("a build fault"));
+        assert_eq!(failed, Err("the build panicked".into()));
+
+        let host = Host::new();
+        let faulty = host.clone();
+        let fault = std::thread::spawn(move || {
+            let _locks = (faulty.state(), locked(&faulty.shared.gate));
+            panic!("a fault with the locks");
+        });
+        assert!(fault.join().is_err());
+        assert!(host.shared.state.is_poisoned() && host.shared.gate.is_poisoned());
+        assert!(host.plugins().is_empty());
+        assert!(host.wait_idle_within(WAIT_LIMIT, || false));
+    }
 }

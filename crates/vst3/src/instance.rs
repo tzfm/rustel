@@ -5,12 +5,14 @@ use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
-use rustel_audio::{InsertKey, InsertNote, InsertParam, OrbitInsert};
+use rustel_audio::{InsertKey, InsertNote, InsertParam, MAX_INSERT_PARAMS, OrbitInsert};
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::{ComPtr, ComWrapper};
 
-use crate::com::{Changes, Events, Handler, HostApp, Stream, pointer, wide_to_string};
+use crate::com::{
+    Changes, Events, Handler, HostApp, MAX_CHANGES, MAX_EVENTS, Stream, pointer, wide_to_string,
+};
 use crate::module::{ClassInfo, Module};
 use crate::{Job, ParamInfo, canonical, preset};
 
@@ -24,13 +26,19 @@ const INPUT: BusDirection = BusDirections_::kInput as BusDirection;
 const OUTPUT: BusDirection = BusDirections_::kOutput as BusDirection;
 /// The clock a plugin gets until the score gives one.
 const DEFAULT_TEMPO: f64 = 120.0;
-/// The notes one plugin holds at one time.
-const MAX_NOTES: usize = 32;
+/// The notes one plugin holds at one time: one for each key.
+const MAX_NOTES: usize = 128;
+// One block carries the start and the end of each note at most. The event
+// list has room for all of them: a lost end is a note that does not stop.
+const _: () = assert!(MAX_EVENTS >= 2 * MAX_NOTES);
 /// The parameter values and restores that wait for their frame at one time.
-const MAX_TIMED_PARAMS: usize = 64;
+const MAX_TIMED_PARAMS: usize = 512;
 /// The parameters with a value from a note at one time. A parameter past
 /// this count keeps its value when a later note does not carry its key.
 const MAX_CHANGED_PARAMS: usize = 32;
+// One block carries the values of a note and the restore of the values of
+// the note before.
+const _: () = assert!(MAX_CHANGES >= 2 * MAX_INSERT_PARAMS);
 
 /// A parameter value, or a restore of earlier values, at one frame of the
 /// instance. A restore has no parameter number.

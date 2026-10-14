@@ -20,7 +20,7 @@
 //! ```
 
 /// The parameter values one note carries for its insert.
-pub const MAX_INSERT_PARAMS: usize = 8;
+pub const MAX_INSERT_PARAMS: usize = 16;
 /// The effects one chain holds.
 pub const EFFECT_CHAIN: usize = 4;
 /// Concurrent chains, independent of their output orbits.
@@ -245,7 +245,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_note_carries_eight_parameter_values_and_refuses_a_ninth() {
+    fn a_note_carries_sixteen_parameter_values_and_refuses_one_more() {
         let mut controls = InsertControls::new(InsertKey {
             plugin: 3,
             preset: 0,
@@ -255,6 +255,6 @@ mod tests {
         }
         assert!(!controls.push(InsertParam { id: 99, value: 1.0 }));
         assert_eq!(controls.params().len(), MAX_INSERT_PARAMS);
-        assert_eq!(controls.params()[7].id, 7);
+        assert_eq!(controls.params()[15].id, 15);
     }
 }

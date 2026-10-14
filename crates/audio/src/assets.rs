@@ -51,8 +51,13 @@ unsafe impl<T: Copy + Send> Sync for AssetRing<T> {}
 impl<T: Copy> AssetRing<T> {
     #[cfg(any(feature = "device-audio", test))]
     pub fn new() -> Self {
-        let mut slots = Vec::with_capacity(ASSET_RING_CAPACITY);
-        slots.resize_with(ASSET_RING_CAPACITY, || std::cell::UnsafeCell::new(None));
+        Self::with_capacity(ASSET_RING_CAPACITY)
+    }
+
+    #[cfg(any(feature = "device-audio", test))]
+    pub fn with_capacity(capacity: usize) -> Self {
+        let mut slots = Vec::with_capacity(capacity);
+        slots.resize_with(capacity, || std::cell::UnsafeCell::new(None));
         Self {
             slots,
             head: AtomicUsize::new(0),
@@ -185,8 +190,9 @@ impl SampleChannel {
             reverb_returns: AssetRing::new(),
             fx_reverb_installs: AssetRing::new(),
             fx_reverb_returns: AssetRing::new(),
-            insert_installs: AssetRing::new(),
-            insert_returns: AssetRing::new(),
+            // A place for each slot: one turn ships each insert of a start.
+            insert_installs: AssetRing::with_capacity(crate::insert::INSERT_SLOTS),
+            insert_returns: AssetRing::with_capacity(crate::insert::INSERT_SLOTS),
             fx_reverb_refusals: AtomicU64::new(0),
             insert_refusals: AtomicU64::new(0),
             fx_reverb_resident_bytes: AtomicUsize::new(0),

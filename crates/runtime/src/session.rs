@@ -765,6 +765,8 @@ mod voice_refusal_tests {
     /// One mistake repeated through a window is one refusal record on the
     /// command line's direct log, not one per onset. (The diagnostics queue
     /// collapses a run by itself, so only the direct log can show this.)
+    /// A plugin problem is one line for each evaluation, in the queue and on
+    /// the direct log.
     #[test]
     fn a_repeated_refusal_is_one_direct_record_a_window() {
         let mut session = Session::with_config(SessionConfig {
@@ -793,6 +795,46 @@ mod voice_refusal_tests {
             .filter(|kind| kind == "voice-refused")
             .count();
         assert_eq!(refusals, 1, "one record for one repeated refusal");
+
+        // Each note of each window gives the plugin notice again.
+        session.set_direct_diagnostic_logging(false);
+        let effect = Value::object(vec![("name".into(), Value::Str("delay".into()))]);
+        let with_plugin = || {
+            let effects = Value::List(vec![effect.clone()]);
+            sound_controls("sine", vec![("vst".into(), effects)])
+        };
+        let plugin_lines = |session: &mut Session, now: f64| -> Vec<String> {
+            session
+                .schedule_audio_live_at(now, RATE, Duration::ZERO, LiveQueryBudgetMode::Steady)
+                .unwrap_or_else(|_| panic!("a note with no plugin plays"));
+            let diagnostics = session.take_diagnostics().into_iter();
+            let lines = diagnostics.filter(|diagnostic| diagnostic.kind == PLUGIN_DIAGNOSTIC);
+            lines.map(|diagnostic| diagnostic.message).collect()
+        };
+        session.set_pattern(with_plugin()).unwrap();
+        assert_eq!(
+            plugin_lines(&mut session, 0.0),
+            ["vst skipped: this host has no plugins"]
+        );
+        assert!(plugin_lines(&mut session, 0.5).is_empty());
+        session.set_pattern(with_plugin()).unwrap();
+        assert_eq!(plugin_lines(&mut session, 0.0).len(), 1);
+
+        // A text evaluation has its own clear of the set.
+        let text = r#"note("c3").s("sine").vst("delay").fast(8)"#;
+        for _ in 0..2 {
+            session.evaluate(text).unwrap();
+            assert_eq!(session.last_path, EvaluateSource::JavaScript);
+            assert_eq!(plugin_lines(&mut session, 0.0).len(), 1);
+        }
+
+        // The direct log gets one record for each evaluation too.
+        session.set_direct_diagnostic_logging(true);
+        session.set_pattern(with_plugin()).unwrap();
+        assert!(plugin_lines(&mut session, 0.0).is_empty());
+        assert!(plugin_lines(&mut session, 0.5).is_empty());
+        let records = direct_diagnostics_for_test::take().into_iter();
+        assert_eq!(records.filter(|kind| kind == PLUGIN_DIAGNOSTIC).count(), 1);
     }
 
     #[test]
@@ -2134,6 +2176,10 @@ pub const SAMPLE_LOADING_DIAGNOSTIC: &str = "sample-loading";
 /// substituted and the rest still plays. The message is one sentence for
 /// people; direct logging prints the notice's JSON record instead.
 pub const VOICE_NOTICE_DIAGNOSTIC: &str = "voice-notice";
+/// The kind of a plugin line: a note plays with no plugin or with one value
+/// less, or the plugin thread has a problem. The set plays on. A text goes
+/// out one time for each evaluation.
+pub const PLUGIN_DIAGNOSTIC: &str = "plugin";
 /// The kind a still-loading refusal carries when its notes wait rather than
 /// being skipped: a rewind's first window held whole until its samples are
 /// in, or a sample just ahead that an unpublished update waits for.
@@ -2686,6 +2732,9 @@ pub struct Session {
     /// new score's loading refusal is news again. Awaited and skipped are
     /// kept apart, so notes skipped after a wait are still said.
     loading_refusals_reported: std::collections::BTreeSet<(&'static str, String)>,
+    /// The plugin lines already said for this score. A note gives its line
+    /// again in each window. Every install clears the set.
+    plugin_lines_reported: std::collections::BTreeSet<String>,
     /// Seconds rendered past the scheduled length, for the tail: the
     /// scheduler stops at the length, the reverbs and delays ring out into
     /// the tail, and a silence stop ends it when they have.
@@ -2954,6 +3003,7 @@ impl Session {
             export_limiter: None,
             input_warnings_reported: std::collections::BTreeSet::new(),
             loading_refusals_reported: std::collections::BTreeSet::new(),
+            plugin_lines_reported: std::collections::BTreeSet::new(),
             render_tail_secs: 0.0,
             last_gap_log: None,
             #[cfg(feature = "device-audio")]
@@ -3461,6 +3511,7 @@ impl Session {
         // A new score: its missing channels are its own news.
         self.input_warnings_reported.clear();
         self.loading_refusals_reported.clear();
+        self.plugin_lines_reported.clear();
         self.ensure_bindings()?;
         let builder = self.js.builder();
         self.js
@@ -3678,7 +3729,8 @@ impl Session {
     /// unless the host turned it on, as the `rustel` command line does. With
     /// it off, diagnostics are collected for [`Self::take_diagnostics`],
     /// which a host drains from its presentation loop; they include `.log()`
-    /// lines and the voice resolver's notices ([`VOICE_NOTICE_DIAGNOSTIC`]).
+    /// lines, the voice resolver's notices ([`VOICE_NOTICE_DIAGNOSTIC`]) and
+    /// the plugin lines ([`PLUGIN_DIAGNOSTIC`]).
     /// It also decides whether [`Self::render`] and [`Self::render_session`]
     /// print progress.
     pub fn set_direct_diagnostic_logging(&mut self, enabled: bool) {
@@ -3945,25 +3997,39 @@ impl Session {
 
     /// Queue the notices one [`rustel_voice::with_diagnostic_policy`] scope
     /// collected, as [`VOICE_NOTICE_DIAGNOSTIC`]s. A notice already pending
-    /// is not queued again, so one raised every window holds one place.
+    /// is not queued again, so one raised every window holds one place. A
+    /// plugin notice is a plugin line: see [`Self::report_plugin_line`].
     fn report_voice_notices(&mut self, notices: Vec<rustel_voice::VoiceNotice>) {
-        let notices = notices
-            .into_iter()
-            .map(|notice| (notice.message, notice.record));
-        // A plugin that did not start on the plugin thread has no note to
-        // report through, so its reason joins the notices here.
-        #[cfg(feature = "vst")]
-        let notices = notices.chain(crate::vst::take_errors().into_iter().map(|message| {
-            let record = serde_json::json!({ "vst_skipped": { "message": &message } });
-            (message, record)
-        }));
-        for (message, record) in notices {
+        for notice in notices {
+            if notice.record.get("vst_skipped").is_some() {
+                self.report_plugin_line(notice.message, notice.record);
+                continue;
+            }
             let pending = self.pending_diagnostics.iter().any(|diagnostic| {
-                diagnostic.kind == VOICE_NOTICE_DIAGNOSTIC && diagnostic.message == message
+                diagnostic.kind == VOICE_NOTICE_DIAGNOSTIC && diagnostic.message == notice.message
             });
             if !pending {
-                self.report_diagnostic(VOICE_NOTICE_DIAGNOSTIC, message, record);
+                self.report_diagnostic(VOICE_NOTICE_DIAGNOSTIC, notice.message, notice.record);
             }
+        }
+        // A problem of the plugin thread has no note to report through, so
+        // its line joins here.
+        #[cfg(feature = "vst")]
+        for message in crate::vst::take_errors() {
+            let record = serde_json::json!({ "vst_skipped": { "message": &message } });
+            self.report_plugin_line(message, record);
+        }
+    }
+
+    /// Queue one plugin line as a [`PLUGIN_DIAGNOSTIC`]. A note gives its
+    /// line again in each window, so a text goes out one time for each
+    /// evaluation. A score with a new text for each note fills the set, and
+    /// its later texts do not go out.
+    fn report_plugin_line(&mut self, message: String, record: serde_json::Value) {
+        if self.plugin_lines_reported.len() < MAX_PENDING_SESSION_DIAGNOSTICS
+            && self.plugin_lines_reported.insert(message.clone())
+        {
+            self.report_diagnostic(PLUGIN_DIAGNOSTIC, message, record);
         }
     }
 

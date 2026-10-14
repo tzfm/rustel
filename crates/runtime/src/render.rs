@@ -112,8 +112,9 @@ pub(crate) fn scalar_event_detailed(
 type NoticeTally = Vec<(String, usize)>;
 
 /// A tally for a run a person reads: direct logging on and no `--json`. A
-/// `--json` run keeps one record per notice. A host with direct logging off
-/// collects its own notices.
+/// `--json` run keeps one record per notice. The Session prints a plugin
+/// notice of such a run one time. A host with direct logging off collects
+/// its own notices.
 fn notice_tally() -> Option<NoticeTally> {
     (rustel_voice::direct_diagnostic_logging()
         && !PROGRESS_JSON.load(std::sync::atomic::Ordering::Relaxed))
@@ -523,25 +524,26 @@ pub(crate) fn render_scalar_pcm_with_refusals(
     let mut backend = scalar_backend(dispatch, library, max_polyphony);
     let pcm = rustel_audio::render_pcm(&mut backend, sample_rate, frames, &events)
         .map_err(io::Error::other)?;
-    plugin_problems(&mut refused);
+    print_plugin_problems();
     Ok((pcm, refused))
 }
 
-/// Adds the problems of the plugin host in a render to `refused`, and
-/// prints each one as a refused voice is printed.
-fn plugin_problems(refused: &mut Vec<String>) {
+/// Prints the problems of the plugin host in a render with direct logging:
+/// a warning line for a run a person reads, and a record for each other
+/// run. With direct logging off, the problems stay for the Session. The
+/// Session queues each one as a plugin line after the render.
+fn print_plugin_problems() {
     #[cfg(feature = "vst")]
-    for message in crate::vst::take_errors() {
-        if rustel_voice::direct_diagnostic_logging() {
-            let record = serde_json::json!({ "vst_skipped": { "message": &message } });
-            eprintln!("{record}");
-        }
-        if !refused.contains(&message) {
-            refused.push(message);
+    if rustel_voice::direct_diagnostic_logging() {
+        for message in crate::vst::take_errors() {
+            if notice_tally().is_some() {
+                eprintln!("warning: {message}");
+            } else {
+                let record = serde_json::json!({ "vst_skipped": { "message": &message } });
+                eprintln!("{record}");
+            }
         }
     }
-    #[cfg(not(feature = "vst"))]
-    let _ = refused;
 }
 
 fn scalar_backend(
@@ -833,7 +835,7 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
         },
         format,
     );
-    plugin_problems(&mut refused);
+    print_plugin_problems();
     written
         .map(|bytes| (bytes, refused))
         .map_err(io::Error::other)

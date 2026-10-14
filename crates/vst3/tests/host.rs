@@ -129,14 +129,15 @@ fn a_plugin_runs_with_the_values_a_score_names() {
         Resolved::Missing
     ));
 
+    // The call of a score names the key of its insert.
+    let key = InsertKey {
+        plugin: id,
+        preset: 0,
+    };
+    let called = rig.host.key("rustel-fixture", None, false);
+    assert_eq!(called.map(|found| found.map(|(key, _)| key)), Ok(Some(key)));
     let mut insert = rig.insert(0).expect("insert");
-    assert_eq!(
-        insert.key(),
-        InsertKey {
-            plugin: id,
-            preset: 0
-        }
-    );
+    assert_eq!(insert.key(), key);
     assert_eq!(block(insert.as_mut(), 1.0, 128), vec![1.0; 128]);
 
     // The audio callback sets a value and runs the plugin with no
@@ -202,6 +203,26 @@ fn a_plugin_runs_with_the_values_a_score_names() {
     // A note with no gain puts the gain back to its value at the start.
     insert.restore_params(0);
     assert_eq!(block(insert.as_mut(), 0.75, 128), vec![0.75; 128]);
+
+    // A note drops the value of a key that is no parameter, and each value
+    // after the first 16. The plugin runs with the other values.
+    let (controls, dropped) = plugin.controls(key, &[("mix", 0.9), ("gain", 0.25)]);
+    assert_eq!(
+        dropped,
+        [format!("{NAME} has no parameter with the name 'mix'")]
+    );
+    for param in controls.params() {
+        insert.set_param(*param, 0);
+    }
+    assert_eq!(block(insert.as_mut(), 1.0, 128), vec![0.25; 128]);
+    let (controls, dropped) = plugin.controls(key, &[("gain", 0.5); 17]);
+    assert_eq!(controls.params().len(), 16);
+    assert_eq!(
+        dropped,
+        [format!(
+            "a note carries 16 values for {NAME} at most, and 'gain' is one more"
+        )]
+    );
 }
 
 #[test]
@@ -218,6 +239,10 @@ fn a_preset_file_sets_the_state_of_the_plugin() {
     let names = rig.host.presets(NAME).expect("the load read the presets");
     assert_eq!(names, ["Half Level", "Other Plugin"]);
     assert_eq!(rig.host.preset(plugin, "missing"), FoundPreset::Missing);
+    assert_eq!(
+        rig.host.key(NAME, Some("missing"), false).err(),
+        Some(format!("{NAME} has no preset with the name 'missing'"))
+    );
 
     let number = |name: &str| match rig.host.preset(plugin, name) {
         FoundPreset::Number(number) => number,
@@ -280,7 +305,13 @@ fn a_preset_file_sets_the_state_of_the_plugin() {
         )
     };
     assert_eq!(prepared(1), Prepared::Unbuilt(key));
-    assert_eq!(prepared(capacity), Prepared::Unavailable);
+    let Prepared::Unavailable(reason) = prepared(capacity) else {
+        panic!("the failed build is not the answer");
+    };
+    assert!(
+        reason.starts_with(&format!("{NAME} did not start: ")),
+        "{reason}"
+    );
     assert_eq!(
         rig.host.prepared(NAME, None, false, SAMPLE_RATE, parked),
         Prepared::Ready(InsertKey { plugin, preset: 0 })
@@ -455,6 +486,43 @@ fn an_instrument_plays_the_note_it_gets() {
         after.extend(block(insert.as_mut(), 0.0, 128));
     }
     assert!(after.iter().all(|sample| *sample == 0.0));
+
+    // A note on each of the 128 keys starts and ends in one block: 256
+    // events. Each note sounds for its 100 frames, and each one ends.
+    let (mut left, mut right) = ([0.0f32; 128], [0.0f32; 128]);
+    let before = Violations::capture();
+    tripwire::audio_scope(|| {
+        for key in 0..128u8 {
+            let note = InsertNote {
+                pitch: f32::from(key),
+                velocity: 1.0,
+                frames: 100,
+            };
+            insert.note(note, 16);
+        }
+        insert.process(&mut left, &mut right);
+    });
+    let delta = Violations::capture().since(before);
+    assert!(delta.clean(), "the notes allocated or freed: {delta:?}");
+    let step = |key: i32| {
+        let hertz = 440.0 * (f64::from(key - 69) / 12.0).exp2();
+        std::f64::consts::TAU * hertz / f64::from(SAMPLE_RATE)
+    };
+    for (frame, sample) in left.iter().enumerate() {
+        let expected: f32 = match frame {
+            16..116 => (0..128)
+                .map(|key| ((frame - 16) as f64 * step(key)).sin() as f32 * TONE_LEVEL)
+                .sum(),
+            _ => 0.0,
+        };
+        assert!((sample - expected).abs() < 1e-3, "frame {frame}: {sample}");
+    }
+    assert_eq!(right, left);
+    assert!(
+        block(insert.as_mut(), 0.0, 128)
+            .iter()
+            .all(|sample| *sample == 0.0)
+    );
 }
 
 /// Not a test: the entry of a scan process. The scan test gives this binary
@@ -663,21 +731,36 @@ fn parameter_restores_follow_note_time_and_survive_a_full_queue() {
     );
     assert_eq!(block(insert.as_mut(), 1.0, 128), [0.5; 128]);
 
-    // A restore rejected by the bounded queue must not forget the
-    // delivered values a later restore still needs to clear.
-    for frame in 128..192 {
-        insert.set_param(
-            InsertParam {
-                id: PARAM_GATE,
-                value: 0.0,
-            },
-            frame,
-        );
-    }
-    insert.restore_params(0);
-    for _ in 0..2 {
+    // The queue holds 512 values. A restore rejected by the full queue
+    // must not forget the delivered values a later restore still needs to
+    // clear.
+    let gate = InsertParam {
+        id: PARAM_GATE,
+        value: 0.0,
+    };
+    let (mut left, mut right) = ([1.0; 128], [1.0; 128]);
+    let before = Violations::capture();
+    tripwire::audio_scope(|| {
+        for frame in 128..639 {
+            insert.set_param(gate, frame);
+        }
+        insert.set_param(gain(0.25), 639);
+        insert.restore_params(0);
+        insert.process(&mut left, &mut right);
+    });
+    let delta = Violations::capture().since(before);
+    assert!(
+        delta.clean(),
+        "the full queue allocated or freed: {delta:?}"
+    );
+    assert_eq!(left, [0.5; 128]);
+    for _ in 0..3 {
         assert_eq!(block(insert.as_mut(), 1.0, 128), [0.5; 128]);
     }
+    // The last of the 512 values arrives at its frame.
+    let output = block(insert.as_mut(), 1.0, 128);
+    assert_eq!(output[..127], [0.5; 127]);
+    assert_eq!(output[127], 0.25);
     let (mut left, mut right) = ([1.0; 128], [1.0; 128]);
     let before = Violations::capture();
     tripwire::audio_scope(|| {
@@ -824,8 +907,14 @@ fn live_play_does_not_wait_for_a_plugin() {
             .prepared(name, None, instrument, 44_100, InsertSlot::effect(5, 0))
     };
     assert_eq!(prepared(NAME, false), Prepared::Unbuilt(key));
-    assert_eq!(prepared(NAME, true), Prepared::Unavailable);
-    assert_eq!(prepared("no such plugin", false), Prepared::Unavailable);
+    assert_eq!(
+        prepared(NAME, true),
+        Prepared::Unavailable(format!("{NAME} is an effect: use .vst()"))
+    );
+    assert_eq!(
+        prepared("no such plugin", false),
+        Prepared::Unavailable("no plugin has the name 'no such plugin'".into())
+    );
     rig.host
         .prepare(NAME, None, false, 44_100, InsertSlot::effect(5, 0));
     until(|| (prepared(NAME, false) == Prepared::Ready(key)).then_some(()));
@@ -908,11 +997,11 @@ fn prewarming_checks_the_plugin_role_and_preserves_instrument_copies() {
     rig.plugin();
     assert_eq!(
         rig.host.warm(NAME, None, true, SAMPLE_RATE, 1),
-        Prepared::Unavailable
+        Prepared::Unavailable(format!("{NAME} is an effect: use .vst()"))
     );
     assert_eq!(
         rig.host.warm("no such plugin", None, false, SAMPLE_RATE, 1),
-        Prepared::Unavailable
+        Prepared::Unavailable("no plugin has the name 'no such plugin'".into())
     );
     let key = until(
         || match rig.host.warm(TONE_NAME, None, true, SAMPLE_RATE, 1) {
@@ -1031,7 +1120,19 @@ fn a_bundle_that_does_not_load_gives_the_reason() {
     let Resolved::Failed(error) = rig.host.resolve("broken", true) else {
         panic!("a text file loaded as a plugin");
     };
-    assert_eq!(rig.host.take_errors(), [format!("vst Broken: {error}")]);
+    // The call of a score gives the reason, so the host adds no line.
+    let reason = format!("broken did not load: {error}");
+    assert_eq!(
+        rig.host.key("broken", None, false).err(),
+        Some(reason.clone())
+    );
+    assert!(rig.host.take_errors().is_empty());
+    // A caller that waits for the plugin of a slot gets the reason too.
+    let slot = InsertSlot::effect(1, 0);
+    assert_eq!(
+        rig.host.prepared("broken", None, false, SAMPLE_RATE, slot),
+        Prepared::Unavailable(reason)
+    );
     let status = |rig: &Rig| rig.host.plugins()[0].status.clone();
     assert_eq!(status(&rig), Status::Failed(error));
     // A new scan gives the bundle a new try.

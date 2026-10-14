@@ -73,6 +73,11 @@ mod tests {
         };
         #[cfg(feature = "vst")]
         let chain = super::super::tests::plugin_chain(&session);
+        // The session plays through the plugins of a live output.
+        #[cfg(feature = "vst")]
+        session
+            .plugins_live
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let transport = session.transport();
         let generation = session.generation();
         session.inject_panic_for_test(SessionPanicPoint::Query);
@@ -83,6 +88,13 @@ mod tests {
         assert_eq!(session.active_source(), Some(source.as_str()));
         #[cfg(feature = "vst")]
         assert_eq!(super::super::tests::plugin_chain(&session), chain);
+        #[cfg(feature = "vst")]
+        assert!(
+            session
+                .plugins_live
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "the rebuilt session lost the plugins of its output"
+        );
         assert!(Arc::ptr_eq(&session.transport(), &transport));
         assert!(session.generation() > generation);
         // Recovery resumes after the time the rebuild took, so a slow machine
@@ -819,6 +831,13 @@ impl Session {
         fresh.continuity_margin = self.continuity_margin;
         // The replayed score takes over on a frame of the same device.
         fresh.live_sample_rate = self.live_sample_rate;
+        // The output keeps its plugins, so each later commit tells the
+        // plugin chains its score.
+        #[cfg(feature = "vst")]
+        {
+            let live = self.plugins_live.load(std::sync::atomic::Ordering::Relaxed);
+            fresh.plugins_live = AtomicBool::new(live);
+        }
         fresh.stop_when_silent = self.stop_when_silent;
         fresh.export_limiter = self.export_limiter;
         fresh.render_tail_secs = self.render_tail_secs;

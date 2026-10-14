@@ -941,10 +941,12 @@ impl Session {
         candidate_settings: Option<RuntimeSettings>,
         replacement_min_headroom: Duration,
     ) -> Result<(), RuntimeError> {
-        // Each installed score can report missing inputs and loading samples
-        // afresh. Both JavaScript and mini installs pass through this point.
+        // Each installed score reports its missing inputs, its loading samples
+        // and its plugin lines afresh. Both JavaScript and mini installs pass
+        // through this point.
         self.input_warnings_reported.clear();
         self.loading_refusals_reported.clear();
+        self.plugin_lines_reported.clear();
         // Live reloads preserve musical phase at the edit instant.
         // `replace_pattern` alone re-anchors at (now, queried_to), skipping the
         // unplayed horizon. Snapshot the current cycle under the old tempo and

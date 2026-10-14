@@ -321,9 +321,11 @@ fn human_live_event(event: &serde_json::Value, verbosity: u8) -> Option<String> 
         // A serial baud that could not change mid-set is reported once and
         // the writes go out at the open baud: news, not a failure. So are
         // serial writes refused, dropped late or rejected: the set plays on.
+        // A plugin line is a warning too: the note plays with no plugin or
+        // with one value less.
         if matches!(
             string(error, "kind"),
-            Some("serial-baud" | "serial-trouble")
+            Some("serial-baud" | "serial-trouble" | rustel_runtime::PLUGIN_DIAGNOSTIC)
         ) {
             return Some(format!("warning: {message}"));
         }
@@ -4944,6 +4946,15 @@ mod tests {
         assert_eq!(
             line("serial-baud", "serialbaud 9600 was ignored").as_deref(),
             Some("warning: serialbaud 9600 was ignored")
+        );
+        // A note with no plugin still plays.
+        assert_eq!(
+            line(
+                rustel_runtime::PLUGIN_DIAGNOSTIC,
+                "vst skipped: no plugin has the name 'ott'"
+            )
+            .as_deref(),
+            Some("warning: vst skipped: no plugin has the name 'ott'")
         );
         // A slow serial port is waiting and a dropped write is a warning; only
         // a port that could not be opened is an error.

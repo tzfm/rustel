@@ -774,15 +774,85 @@ fn a_live_note_plays_through_its_plugin() {
         |peak| peak > 0.05,
     );
     // The plugin is loaded, so the check of a score names a key that is no
-    // parameter of the plugin.
-    let wrong = "note('c3').vst('rustel fixture', { gian: 1, gain: 1 })";
+    // parameter of the plugin. Studio refuses such an update.
+    let wrong = "note('c3').s('sine').vst('rustel fixture', { gian: 1, gain: 0 }).fast(8)";
     let marks = rustel_runtime::lint::lint(wrong, false, None);
     let messages: Vec<&str> = marks.iter().map(|mark| mark.message.as_str()).collect();
     assert_eq!(
         messages,
         ["Rustel Fixture has no parameter \"gian\" - did you mean \"gain\"?"]
     );
+    assert!(rustel_runtime::lint::rejection(wrong, false, None).is_some());
+
+    // The engine refuses no edit for a plugin problem, and gives each
+    // problem as one warning. `reached` ends the wait.
+    let warnings = |engine: &mut StudioEngine, what: &str, reached: fn(f32) -> bool| {
+        let mut warnings = Vec::new();
+        let started = Instant::now();
+        loop {
+            let mut peak = 0.0_f32;
+            let mut note = |update: &StudioUpdate| {
+                if let StudioUpdate::Diagnostic(diagnostic) = update
+                    && diagnostic.kind == rustel_runtime::PLUGIN_DIAGNOSTIC
+                {
+                    assert_eq!(diagnostic.level, StudioDiagnosticLevel::Warning);
+                    warnings.push(diagnostic.message.clone());
+                }
+            };
+            tick_with(engine, Duration::from_millis(300), &mut note, &mut |_| {
+                peak = peak.max(master.take_levels().peak);
+                false
+            });
+            if reached(peak) {
+                return warnings;
+            }
+            assert!(started.elapsed() < Duration::from_secs(20), "{what}");
+        }
+    };
+    // The note drops the value of the wrong key alone. The plugin stays, so
+    // the set is silent at gain 0.
+    engine.evaluate(wrong, false).expect("a wrong key");
+    assert_eq!(
+        warnings(&mut engine, "the note lost its plugin", |peak| peak == 0.0),
+        ["vst value skipped: Rustel Fixture has no parameter with the name 'gian'"]
+    );
+    // A refused edit gives no line for its plugin call. Its frequency is
+    // above the limit of the output, so the score before plays on.
+    let refused = "note('c3').s('sine').freq(90000).vst('rustel fixture', { gane: 1 }).fast(8)";
+    engine
+        .evaluate(refused, false)
+        .expect_err("a frequency above the limit");
+    let said = warnings(&mut engine, "the refused edit sounds", |peak| peak == 0.0);
+    assert!(said.iter().all(|line| !line.contains("gane")), "{said:?}");
+    // A wrong plugin name: the notes play with no plugin.
+    let missing = "note('c3').s('sine').vst('no such plugin').fast(8)";
+    engine
+        .evaluate(missing, false)
+        .expect("a wrong plugin name");
+    let mut said = warnings(&mut engine, "the edit did not land", |peak| peak > 0.05);
+    said.extend(warnings(&mut engine, "the set went silent", |peak| {
+        peak > 0.05
+    }));
+    assert_eq!(
+        said,
+        ["vst skipped: no plugin has the name 'no such plugin'"]
+    );
     engine.stop(Duration::from_millis(200)).expect("stop");
+
+    // A render with direct logging off gives the dropped value the plugin
+    // kind too. A session asks the plugin host through its sample library.
+    let mut offline = rustel_runtime::Session::new().expect("render session");
+    offline.set_direct_diagnostic_logging(false);
+    let library = rustel_runtime::samples::SampleLibrary::empty();
+    offline.set_sample_library_for_test(std::sync::Arc::new(library));
+    offline.evaluate(wrong).expect("a wrong key");
+    offline.render_pcm(0.5).expect("render");
+    let diagnostics = offline.take_diagnostics().into_iter();
+    let kinds: Vec<String> = diagnostics
+        .filter(|diagnostic| diagnostic.message.contains("'gian'"))
+        .map(|diagnostic| diagnostic.kind)
+        .collect();
+    assert_eq!(kinds, [rustel_runtime::PLUGIN_DIAGNOSTIC]);
 }
 
 /// In the wait mode a start holds its downbeat, and an edit keeps the last

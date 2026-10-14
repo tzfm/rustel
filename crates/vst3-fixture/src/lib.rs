@@ -545,8 +545,9 @@ impl Tone {
     fn new() -> Self {
         Self {
             sample_rate: Cell::new(48_000.0),
-            // Room for each note with no allocation in the audio call.
-            voices: RefCell::new(Vec::with_capacity(64)),
+            // Room for a note on each key, with no allocation in the audio
+            // call.
+            voices: RefCell::new(Vec::with_capacity(128)),
             calls: Cell::new(0),
         }
     }

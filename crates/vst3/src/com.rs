@@ -541,8 +541,8 @@ impl IParameterChangesTrait for Changes {
     }
 }
 
-/// The notes one audio block carries to a plugin.
-pub(crate) const MAX_EVENTS: usize = 64;
+/// The note starts and note ends one audio block carries to a plugin.
+pub(crate) const MAX_EVENTS: usize = 256;
 
 /// The note events of one audio block. The list has a fixed size, so a new
 /// event costs no allocation. The audio thread fills the list before the
@@ -593,8 +593,8 @@ impl Events {
             let start = event.r#type == Event_::EventTypes_::kNoteOnEvent as u16;
             (event.sampleOffset, start)
         };
-        // An insertion sort: the list is short, and the sort makes no
-        // allocation.
+        // An insertion sort: most blocks carry a few events, and the sort
+        // makes no allocation. `MAX_EVENTS` bounds the work of a full block.
         for at in 1..events.len() {
             let mut slot = at;
             while slot > 0 && place(&events[slot - 1]) > place(&events[slot]) {

@@ -220,8 +220,8 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 /// A score plays through a plugin from a folder in `RUSTEL_VST3_PATH`: with
-/// a value by name, with a preset file, and dry with a notice when the name
-/// of the value is wrong. The plugin is the fixture gain.
+/// a value by name, with a preset file, and with the other values and a
+/// warning when the name of a value is wrong. The plugin is the fixture gain.
 #[cfg(feature = "vst")]
 #[test]
 fn a_render_goes_through_the_plugin_a_score_names() {
@@ -281,10 +281,15 @@ fn a_render_goes_through_the_plugin_a_score_names() {
     assert!(scaled(&quarter, 0.25));
     let (half, _) = render(r#".vst("rustel fixture", { preset: "Half Level" })"#);
     assert!(scaled(&half, 0.5));
-    let (wrong, notice) = render(r#".vst("rustel fixture", { mix: 0.25 })"#);
-    assert_eq!(wrong, dry);
+    // A key that is no parameter drops its value alone. The plugin runs
+    // with the other value. The warning counts the onset at the end of the
+    // render too.
+    let (wrong, notice) = render(r#".vst("rustel fixture", { mix: 0.9, gain: 0.25 })"#);
+    assert!(scaled(&wrong, 0.25));
     assert!(
-        notice.contains("Rustel Fixture has no parameter with the name 'mix'"),
+        notice.contains(
+            "warning: vst value skipped: Rustel Fixture has no parameter with the name 'mix' (2 onsets)"
+        ),
         "{notice}"
     );
 

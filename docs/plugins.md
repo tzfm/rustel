@@ -79,9 +79,16 @@ s("hh*8").vst("valhalla supermassive", {
 - The plugin takes the values at the start of the note. A slider move reaches
   the plugin with the next note.
 - A parameter with no value on a later note goes back to its start value.
-- A note carries 8 parameter values at most for each plugin.
-- A note with more values, or with a name the plugin does not have, plays
-  with no plugin. Studio marks the name and gives the nearest one.
+- A note carries 16 parameter values at most for each plugin.
+- Rustel drops each value after the first 16, and each value with a name the
+  plugin does not have. The note keeps its plugin.
+- Studio refuses an update with a wrong parameter name of a loaded plugin.
+  The last score plays on, and Studio marks the name and gives the nearest
+  one.
+
+A plugin name with no plugin, a preset name with no file, or a dropped value
+gives one warning for each evaluation. The warning shows in the Studio log,
+and as a `warning:` line of `rustel play`.
 
 ## Presets
 
@@ -95,8 +102,8 @@ note("c2 eb2").vsti("serum 2", { preset: "Dark Bass" })
 ## Chains
 
 - `.vsti()` gives the plugin the pitch, the `velocity` and the length of each
-  note. The `s` of the note makes no sound. One plugin copy holds 32 notes at
-  one time.
+  note. The `s` of the note makes no sound. One plugin copy holds 128 notes
+  at one time, one for each key.
 - Each `.vst()` call adds one effect to the chain, in call order. A chain
   holds 4 effects at most.
 - `.vst()` with an instrument, or `.vsti()` with an effect, plays the note

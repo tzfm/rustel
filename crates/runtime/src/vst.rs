@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use rustel_audio::{InsertControls, InsertKey, InsertParam, InsertSlot, MAX_INSERT_PARAMS};
+use rustel_audio::{InsertControls, InsertKey, InsertSlot};
 pub use rustel_vst3::{Host, ParamInfo, PluginInfo, Resolved, Status, canonical, serve};
 
 /// Folders with plugins, in place of the standard VST3 folders of the
@@ -181,48 +181,19 @@ pub fn scanning() -> bool {
 /// The numbers the audio engine carries for a `.vst()` request.
 ///
 /// The host loads the plugin on first use and does not wait: `Ok(None)`
-/// means the plugin loads now.
+/// means the plugin loads now. A note drops a value the plugin does not
+/// take and keeps its plugin: see [`rustel_vst3::Plugin::controls`]. The
+/// reason is a notice of the conversion, so a conversion that drops its
+/// notices says nothing.
 pub(crate) fn controls(
     request: &rustel_voice::PluginRequest<'_>,
 ) -> Result<Option<InsertControls>, String> {
-    let (plugin, loaded) = match host().resolve(request.name, false) {
-        Resolved::Ready(plugin, loaded) => (plugin, loaded),
-        Resolved::Pending => return Ok(None),
-        Resolved::Missing => {
-            return Err(format!("no plugin has the name '{}'", request.name));
-        }
-        Resolved::Failed(reason) => {
-            return Err(format!("{} did not load: {reason}", request.name));
-        }
+    let Some((key, loaded)) = host().key(request.name, request.preset, request.instrument)? else {
+        return Ok(None);
     };
-    let name = loaded.name();
-    match (request.instrument, loaded.is_instrument()) {
-        (true, false) => return Err(format!("{name} is an effect: use .vst()")),
-        (false, true) => return Err(format!("{name} is an instrument: use .vsti()")),
-        _ => {}
-    }
-    let preset = match request.preset {
-        None => 0,
-        Some(preset) => match host().preset(plugin, preset) {
-            rustel_vst3::FoundPreset::Number(number) => number,
-            // The host reads the preset folder now.
-            rustel_vst3::FoundPreset::Pending => return Ok(None),
-            rustel_vst3::FoundPreset::Missing => {
-                return Err(format!("{name} has no preset with the name '{preset}'"));
-            }
-        },
-    };
-    let mut controls = InsertControls::new(InsertKey { plugin, preset });
-    for (param, value) in request.params {
-        let id = loaded
-            .param(param)
-            .ok_or_else(|| format!("{name} has no parameter with the name '{param}'"))?;
-        let value = *value as f32;
-        if !controls.push(InsertParam { id, value }) {
-            return Err(format!(
-                "a note carries {MAX_INSERT_PARAMS} values for a plugin at most"
-            ));
-        }
+    let (controls, dropped) = loaded.controls(key, request.params);
+    for reason in dropped {
+        rustel_voice::plugin_value_skipped(request, &reason);
     }
     Ok(Some(controls))
 }
@@ -827,7 +798,7 @@ pub(crate) fn pending(
             preset,
         } = request;
         match host.prepared(name, preset.as_deref(), instrument, sample_rate, slot) {
-            rustel_vst3::Prepared::Ready(_) | rustel_vst3::Prepared::Unavailable => {}
+            rustel_vst3::Prepared::Ready(_) | rustel_vst3::Prepared::Unavailable(_) => {}
             rustel_vst3::Prepared::Unbuilt(key) if holds(slot, key) => {}
             rustel_vst3::Prepared::Unbuilt(_) => {
                 host.prepare(name, preset.as_deref(), instrument, sample_rate, slot);

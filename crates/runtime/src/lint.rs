@@ -2238,7 +2238,8 @@ fn object_keys(
 
 /// Reports each key in the object of a plugin call that is no parameter of
 /// the plugin. The check loads no plugin: a plugin not yet loaded is not
-/// judged, and the note reports a wrong key at its start.
+/// judged. The engine then drops the value of the wrong key, keeps the
+/// plugin and gives a warning.
 #[cfg(feature = "vst")]
 fn plugin_key_problems(source: &str, diagnostics: &mut Vec<Diagnostic>) {
     let Some(host) = crate::vst::started() else {
