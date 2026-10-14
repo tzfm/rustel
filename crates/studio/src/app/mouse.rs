@@ -693,7 +693,6 @@ impl App {
         view::header_go_chip(
             self.regions.header,
             view::TransportWord {
-                evaluating: self.is_evaluating(),
                 stopping: self.is_stopping(),
                 playing: self.is_playing(),
             },

@@ -11666,7 +11666,6 @@ mod tests {
             );
 
             let word = view::TransportWord {
-                evaluating: app.is_evaluating(),
                 stopping: app.is_stopping(),
                 playing: app.is_playing(),
             };
@@ -39641,6 +39640,10 @@ struct App {
     next_frame: Instant,
     caret_activity: Instant,
     caret_visible: bool,
+    /// When the work the header's busy dot breathes for began; `None`
+    /// while the studio is idle. Held apart from `is_evaluating()` so
+    /// the dot is timed by when it started, not by how the work ends.
+    evaluating_since: Option<Instant>,
     evaluation_flash: Option<EvaluationFlash>,
     evaluation_feedback: Option<EvaluationFeedback>,
     /// Which panel `rotate_panel_focus` last landed the keyboard on, and
@@ -40145,6 +40148,7 @@ impl App {
             next_frame: now,
             caret_activity: now,
             caret_visible: true,
+            evaluating_since: None,
             evaluation_flash: None,
             evaluation_feedback: None,
             focus_rotation_flash: None,

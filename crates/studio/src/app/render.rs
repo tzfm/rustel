@@ -852,7 +852,9 @@ impl App {
             playing: self.is_playing(),
             motion: visuals.motion,
             stopping: inputs.stopping,
-            evaluating: self.is_evaluating(),
+            evaluating_for: self
+                .evaluating_since
+                .map(|since| started.saturating_duration_since(since)),
             dirty: scene.dirty,
             status: &inputs.status,
             remote_control: {
