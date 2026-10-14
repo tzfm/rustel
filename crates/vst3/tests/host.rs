@@ -273,7 +273,9 @@ fn a_preset_file_sets_the_state_of_the_plugin() {
     let errors = rig.host.take_errors();
     assert_eq!(
         errors,
-        [format!("vst {NAME}: the preset is for a different plugin")]
+        [format!(
+            "vst skipped: {NAME} did not start: the preset is for a different plugin"
+        )]
     );
 
     // Failed owners share the parked-copy bound. Forget the oldest
@@ -291,9 +293,11 @@ fn a_preset_file_sets_the_state_of_the_plugin() {
     };
     let provider = rig.host.provider(true);
     let capacity = rustel_audio::INSERT_SLOTS as u64;
+    let mut said = Vec::new();
     for chain in 2..=capacity {
         assert!(provider(key, SAMPLE_RATE, InsertSlot::effect(chain, 0)).is_none());
-        assert_eq!(rig.host.take_errors().len(), 1);
+        said = rig.host.take_errors();
+        assert_eq!(said.len(), 1);
     }
     let prepared = |chain| {
         rig.host.prepared(
@@ -312,6 +316,8 @@ fn a_preset_file_sets_the_state_of_the_plugin() {
         reason.starts_with(&format!("{NAME} did not start: ")),
         "{reason}"
     );
+    // The line of the host is the line a caller makes from the reason.
+    assert_eq!(said, [format!("vst skipped: {reason}")]);
     assert_eq!(
         rig.host.prepared(NAME, None, false, SAMPLE_RATE, parked),
         Prepared::Ready(InsertKey { plugin, preset: 0 })

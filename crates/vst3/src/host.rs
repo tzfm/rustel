@@ -1581,9 +1581,17 @@ impl Host {
                 Build::Ready(Box::new(copy))
             }
             Err(error) => {
-                let name = plugin.name();
-                state.errors.push(format!("vst {name}: {error}"));
-                Build::Failed(state.built, format!("{name} did not start: {error}"))
+                // A caller that asks `Host::prepared` for the slot makes the
+                // same line from the reason. A caller that says each text one
+                // time then says the fault one time.
+                let reason = format!("{} did not start: {error}", plugin.name());
+                let call = if plugin.is_instrument() {
+                    "vsti"
+                } else {
+                    "vst"
+                };
+                state.errors.push(format!("{call} skipped: {reason}"));
+                Build::Failed(state.built, reason)
             }
         };
         state.builds.insert(build, result);

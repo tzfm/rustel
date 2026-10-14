@@ -597,6 +597,7 @@ pub(super) fn callback_argument<'js>(
             cells,
             explicit_ownership_complete: false,
             excluded_frame_ids: Rc::new(exclusions.finish()),
+            shadow: None,
         },
     )
 }

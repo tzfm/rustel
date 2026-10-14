@@ -32,6 +32,14 @@ mod tests {
             SessionPanicPoint::Install,
         ] {
             let mut session = playing_session();
+            // A score before ran a plugin call. The replay runs none, and
+            // the rebuilt session still knows the call.
+            #[cfg(feature = "vst")]
+            {
+                let plugin = format!("{GOOD}.vst('Delay')");
+                session.evaluate(&plugin).expect("plugin score");
+                session.evaluate(GOOD).expect("initial score");
+            }
             let transport = session.transport();
             let generation = session.generation();
             let cycle = session.cycle_at_time(0.5);
@@ -41,6 +49,11 @@ mod tests {
                 .expect_err("candidate panics");
             assert_panic(error, &format!("{point:?}"));
             assert_eq!(session.active_source(), Some(GOOD));
+            #[cfg(feature = "vst")]
+            assert!(
+                session.ran_plugin_calls(),
+                "the rebuilt session lost its plugin call"
+            );
             assert!(Arc::ptr_eq(&session.transport(), &transport));
             assert!(!transport.is_stopped());
             assert!(session.generation() > generation);
@@ -240,6 +253,25 @@ mod tests {
                     .expect("good source still schedules")
                     .is_empty()
             );
+        }
+        // The commit seam reads the lanes of a candidate that do not play,
+        // and the read panics 2 times. The score in play stays.
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        {
+            let _plugins = super::super::tests::fixture_plugins();
+            let mut session = playing_session();
+            let relaxed = std::sync::atomic::Ordering::Relaxed;
+            session.plugins_live.store(true, relaxed);
+            session.plugin_rate.store(48_000, relaxed);
+            let candidate = format!("$: {CANDIDATE}\n_$: {GOOD}.vst('rustel fixture')");
+            let stopped = AtomicBool::new(false);
+            for now in [0.1, 0.2] {
+                session.schedule_through(now, now).expect("cover");
+                session.inject_panic_for_test(SessionPanicPoint::Query);
+                let reload = session.reload_live(&candidate, false, &stopped, || now + 0.05);
+                reload.expect_err("the read of the muted lane panics");
+                assert_eq!(session.active_source(), Some(GOOD));
+            }
         }
     }
 
@@ -863,12 +895,13 @@ impl Session {
         // The output keeps its plugins and its rate. Its names source reads
         // the chains of this session, so the rebuilt session keeps the same
         // chains. Each lane keeps its number, so the replayed score has the
-        // chains it had.
+        // chains it had. A plugin call of an evaluation before stays known.
         #[cfg(feature = "vst")]
         {
             let live = self.plugins_live.load(std::sync::atomic::Ordering::Relaxed);
             fresh.plugins_live = AtomicBool::new(live);
             fresh.plugin_rate = std::mem::take(&mut self.plugin_rate);
+            fresh.ran_plugin_calls = self.ran_plugin_calls;
             fresh.chains = self.chains.clone();
             fresh.lanes = std::mem::take(&mut self.lanes);
         }

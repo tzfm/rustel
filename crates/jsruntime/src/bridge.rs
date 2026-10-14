@@ -141,6 +141,11 @@ pub struct NativePatternWrapper<'js> {
     /// aggregate Rust memory; that runtime-total bound is outside this slice.
     #[qjs(skip_trace)]
     pub(super) excluded_frame_ids: Rc<HashSet<CallbackId>>,
+    /// The lanes of a score that do not play: its muted lanes and the lanes
+    /// a solo drops. Each note has the lane tag and the plugin bindings it
+    /// has when it plays. Only a wrapper an evaluation stages has it, and
+    /// only when a plugin call ran: see [`JsRuntime::query_shadow`].
+    pub(super) shadow: Option<rquickjs::Class<'js, NativePatternWrapper<'js>>>,
 }
 
 pub(super) const STEPALT_OWNERSHIP_OPERATION: &str = "stepalt ownership";
@@ -237,6 +242,7 @@ impl<'js> NativePatternWrapper<'js> {
             cells: Vec::new(),
             explicit_ownership_complete: false,
             excluded_frame_ids: Rc::new(HashSet::new()),
+            shadow: None,
         }
     }
 
@@ -258,6 +264,7 @@ impl<'js> NativePatternWrapper<'js> {
             cells: self.cells.clone(),
             explicit_ownership_complete: self.explicit_ownership_complete,
             excluded_frame_ids: self.excluded_frame_ids.clone(),
+            shadow: None,
         }
     }
 }
@@ -466,6 +473,7 @@ pub(super) fn derive_wrapper_with_policy<'js>(
                 FrameHarvestPolicy::ExplicitSourcesComplete
             ),
             excluded_frame_ids: Rc::new(excluded_frame_ids),
+            shadow: None,
         },
     )
 }
@@ -590,6 +598,10 @@ pub(super) struct BridgeFrame<'js> {
     pub(super) alloc: std::rc::Rc<Cell<CallbackId>>,
     /// Callback-local construction paths stay the same on repeated queries.
     plugin_scope: RefCell<Option<PluginScope>>,
+    /// The plugin name of each plugin call that ran in a score evaluation,
+    /// one time each, in call order. A callback scope does not change the
+    /// list. `None` in each other frame.
+    plugin_names: RefCell<Option<Vec<String>>>,
     /// Created here and not yet owned by a wrapper, so still resolvable.
     pub(super) pending: RefCell<Vec<(CallbackId, Function<'js>, Option<String>)>>,
     /// Cells taken from wrappers RETURNED by callbacks. A transformer may hand
@@ -603,7 +615,8 @@ pub(super) struct BridgeFrame<'js> {
     pub(super) suppressed: RefCell<HashSet<CallbackId>>,
 }
 
-struct PluginScope {
+#[derive(Clone)]
+pub(super) struct PluginScope {
     path: String,
     plugins: u32,
     callbacks: u32,
@@ -624,6 +637,7 @@ impl<'js> BridgeFrame<'js> {
         Self {
             alloc,
             plugin_scope: RefCell::new(None),
+            plugin_names: RefCell::new(None),
             pending: RefCell::new(Vec::new()),
             harvested: RefCell::new(Vec::new()),
             suppressed: RefCell::new(HashSet::new()),
@@ -633,6 +647,7 @@ impl<'js> BridgeFrame<'js> {
     pub(super) fn evaluation(alloc: std::rc::Rc<Cell<CallbackId>>) -> Self {
         Self {
             plugin_scope: RefCell::new(Some(PluginScope::new(String::new()))),
+            plugin_names: RefCell::new(Some(Vec::new())),
             ..Self::new(alloc)
         }
     }
@@ -646,12 +661,31 @@ impl<'js> BridgeFrame<'js> {
         frame
     }
 
-    pub(super) fn next_plugin_binding(&self) -> Option<String> {
+    /// The binding of the next plugin call. `name` is the plugin name of
+    /// the call, and the frame of a score evaluation keeps it.
+    pub(super) fn next_plugin_binding(&self, name: &str) -> Option<String> {
         let mut scope = self.plugin_scope.borrow_mut();
         let scope = scope.as_mut()?;
         let id = scope.plugins;
         scope.plugins = id.checked_add(1)?;
+        if let Some(names) = self.plugin_names.borrow_mut().as_mut()
+            && !names.iter().any(|known| known == name)
+        {
+            names.push(name.to_owned());
+        }
         Some(format!("{}p{id}", scope.path))
+    }
+
+    /// The plugin names the frame keeps: see [`Self::next_plugin_binding`].
+    pub(super) fn take_plugin_names(&self) -> Vec<String> {
+        let mut names = self.plugin_names.borrow_mut();
+        names.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    /// True when a plugin call ran in the score evaluation of the frame.
+    pub(super) fn ran_plugin_calls(&self) -> bool {
+        let names = self.plugin_names.borrow();
+        names.as_ref().is_some_and(|names| !names.is_empty())
     }
 
     pub(super) fn next_callback_scope(&self) -> Option<String> {
@@ -663,6 +697,22 @@ impl<'js> BridgeFrame<'js> {
     }
 
     pub(super) fn with_plugin_scope<R>(&self, path: Option<String>, f: impl FnOnce() -> R) -> R {
+        self.in_plugin_scope(path.map(PluginScope::new), f)
+    }
+
+    /// A copy of the plugin scope now: see [`Self::in_plugin_scope`].
+    pub(super) fn copy_plugin_scope(&self) -> Option<PluginScope> {
+        self.plugin_scope.borrow().clone()
+    }
+
+    /// Runs `f` in `scope`, and then puts the scope of now back. In a copy
+    /// of the scope from before some code, a second run of that code gives
+    /// each plugin call and each callback the binding of the first run.
+    pub(super) fn in_plugin_scope<R>(
+        &self,
+        scope: Option<PluginScope>,
+        f: impl FnOnce() -> R,
+    ) -> R {
         struct Restore<'a> {
             slot: &'a RefCell<Option<PluginScope>>,
             prior: Option<PluginScope>,
@@ -674,7 +724,7 @@ impl<'js> BridgeFrame<'js> {
         }
         let _restore = Restore {
             slot: &self.plugin_scope,
-            prior: self.plugin_scope.replace(path.map(PluginScope::new)),
+            prior: self.plugin_scope.replace(scope),
         };
         f()
     }

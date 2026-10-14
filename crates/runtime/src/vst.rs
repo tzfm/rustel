@@ -226,7 +226,7 @@ fn text_signature(calls: &[crate::lint::NamedPlugin]) -> Signature {
 }
 
 /// The signature of each plugin chain of a score text. True marks the chain
-/// of a muted lane: the lane makes no note, and keeps the chain it had
+/// of a muted lane: the lane plays no note, and keeps the chain it had
 /// before its mute.
 fn text_chains(source: &str) -> Vec<(Signature, bool)> {
     let chains = crate::lint::plugin_chains(source).into_iter();
@@ -653,8 +653,9 @@ fn new_chain() -> u64 {
 /// ```
 ///
 /// With fewer chains than lanes, the owner is a new lane: a lane with a
-/// rest keeps its chain. A muted lane makes no note, so its chain serves
-/// the next lane that needs these plugins.
+/// rest keeps its chain. A muted lane plays no note, so its chain serves
+/// the next lane that needs these plugins. A note of a lane that does not
+/// play takes only a chain of its own lane: see [`Self::id_of`].
 ///
 /// A chain that left the text goes after [`CHAIN_GRACE`], when no owner
 /// took it.
@@ -726,15 +727,24 @@ impl ChainRegistry {
         self.owners.keys().filter(same).count()
     }
 
-    /// The number of the chain of an owner.
+    /// The number of the chain of an owner of a note that plays: see
+    /// [`Self::id_of`].
     fn id(&mut self, owner: ChainOwner, now: Instant) -> u64 {
+        self.id_of(owner, true, now)
+    }
+
+    /// The number of the chain of an owner. `sounds` is false for a note of
+    /// a lane that does not play: a muted lane, or a lane a solo drops. Such
+    /// a note takes only a chain of its own lane, so a lane that plays keeps
+    /// its chain through a rest.
+    fn id_of(&mut self, owner: ChainOwner, sounds: bool, now: Instant) -> u64 {
         self.accessed += 1;
         let (used, epoch) = (self.accessed, self.epoch);
         if let Some(chain) = self.owners.get_mut(&owner) {
             (chain.used, chain.epoch, chain.seen) = (used, epoch, now);
             return chain.id;
         }
-        let id = self.take_unused(&owner).unwrap_or_else(new_chain);
+        let id = self.take_unused(&owner, sounds).unwrap_or_else(new_chain);
         // Only the text of an owner leaves here. The callback owns the
         // copies and their tails.
         if self.owners.len() == Self::CAPACITY {
@@ -754,8 +764,9 @@ impl ChainRegistry {
 
     /// Takes the number of a chain the score did not use since its last
     /// change, for an owner with a new text: see [`ChainRegistry`]. A chain
-    /// of the same lane goes first.
-    fn take_unused(&mut self, owner: &ChainOwner) -> Option<u64> {
+    /// of the same lane goes first. A note of a lane that does not play,
+    /// with `sounds` false, takes only a chain of its own lane.
+    fn take_unused(&mut self, owner: &ChainOwner, sounds: bool) -> Option<u64> {
         let signature = owner.signature();
         let lanes = self.wanted.as_ref();
         let lanes = lanes.and_then(|wanted| wanted.live.get(&signature));
@@ -768,10 +779,10 @@ impl ChainRegistry {
             }
         };
         let plugins = |owner: &ChainOwner| owner.plugins.iter().flatten().count();
-        let unused = self
-            .owners
-            .iter()
-            .filter(|(old, chain)| chain.epoch < self.epoch && old.grows_to(owner) && fits(old));
+        let own_lane = |old: &ChainOwner| sounds || old.lane == owner.lane;
+        let unused = self.owners.iter().filter(|(old, chain)| {
+            chain.epoch < self.epoch && own_lane(old) && old.grows_to(owner) && fits(old)
+        });
         let found = unused
             .min_by_key(|(old, chain)| {
                 let more = plugins(owner) - plugins(old);
@@ -1005,10 +1016,15 @@ fn locked(chains: &Mutex<Chains>) -> std::sync::MutexGuard<'_, Chains> {
 }
 
 /// The number of the chain of a note of the score in play of a session.
-/// `chains` are the chains of that session.
-pub(crate) fn live_chain(chains: &Mutex<Chains>, value: &serde_json::Value) -> Option<u64> {
+/// `chains` are the chains of that session. `sounds` is false for a note of
+/// a lane that does not play: see [`ChainRegistry::id_of`].
+pub(crate) fn live_chain(
+    chains: &Mutex<Chains>,
+    value: &serde_json::Value,
+    sounds: bool,
+) -> Option<u64> {
     let owner = ChainOwner::from_value(value)?;
-    Some(locked(chains).playing.id(owner, Instant::now()))
+    Some(locked(chains).playing.id_of(owner, sounds, Instant::now()))
 }
 
 /// The chains of one render to a file. A render has chains of its own: its
@@ -1057,26 +1073,32 @@ pub(crate) fn score_changed(chains: &Mutex<Chains>, source: Option<&str>) {
 }
 
 /// Plans the chains of the score text `source` before the text goes in
-/// play. `haps` are notes of the text. Gives the plugin copies the notes
-/// need, each for the chain its note has when the text is in play: see
-/// [`ensure`]. The plan changes no chain of the score in play, and the
-/// commit of the text takes the plan: see [`score_changed`]. A new plan
-/// starts from the plan before. A new lane then keeps its chain, and so its
-/// copies, from one try of an edit to the next.
+/// play. `haps` are notes of the text, and `shadow` are notes of its lanes
+/// that do not play. Gives the plugin copies the notes need, each for the
+/// chain its note has when the text is in play: see [`wants`]. The plan
+/// changes no chain of the score in play, and the commit of the text takes
+/// the plan: see [`score_changed`]. A new plan starts from the plan before.
+/// A new lane then keeps its chain, and so its copies, from one try of an
+/// edit to the next.
 ///
 /// No chain of the score in play goes while the session has a plan. The
 /// session ends each plan: with the commit of its text, with a new plan, or
 /// with [`forget_plan`].
 // Only the session of a live output plans: see `Session::reload_live`.
 #[cfg_attr(not(feature = "device-audio"), allow(dead_code))]
-pub(crate) fn plan(chains: &Mutex<Chains>, source: &str, haps: &[crate::HapJson]) -> Vec<Want> {
+pub(crate) fn plan(
+    chains: &Mutex<Chains>,
+    source: &str,
+    haps: &[crate::HapJson],
+    shadow: &[crate::HapJson],
+) -> Vec<Want> {
     let text = text_chains(source);
     let now = Instant::now();
     let mut chains = locked(chains);
     let (planned, ended) = chains.plan(source, Some(text), now);
-    let needed = wants(haps, |value| {
+    let needed = wants(haps, shadow, |value, sounds| {
         let owner = ChainOwner::from_value(value)?;
-        Some(planned.id(owner, now))
+        Some(planned.id_of(owner, sounds, now))
     });
     drop(chains);
     end_chains(ended);
@@ -1125,6 +1147,10 @@ pub(crate) struct Want {
     slot: InsertSlot,
     name: String,
     preset: Option<String>,
+    /// False for a copy of a lane that does not play now: a muted lane, or
+    /// a lane a solo drops. The copy loads for the end of the mute or of
+    /// the solo, and nothing waits for it.
+    sounds: bool,
 }
 
 impl Want {
@@ -1133,25 +1159,35 @@ impl Want {
     pub(crate) fn name(&self) -> &str {
         &self.name
     }
+
+    /// True for a copy of a lane that plays now.
+    #[cfg(feature = "device-audio")]
+    pub(crate) fn sounds(&self) -> bool {
+        self.sounds
+    }
 }
 
 /// The plugin copies the notes of the haps need, each one time, in the
-/// order of the notes. `chain_of` gives the number of the chain of a note
-/// value: [`live_chain`] for a note of the score in play, and the registry
-/// of a plan for a note of a text that is not in play.
+/// order of the notes. The copies of `shadow`, the notes of the lanes that
+/// do not play, come after the others. `chain_of` gives the number of the
+/// chain of a note value, with false for a note of `shadow`: [`live_chain`]
+/// for a note of the score in play, and the registry of a plan for a note
+/// of a text that is not in play.
 pub(crate) fn wants(
     haps: &[crate::HapJson],
-    mut chain_of: impl FnMut(&serde_json::Value) -> Option<u64>,
+    shadow: &[crate::HapJson],
+    mut chain_of: impl FnMut(&serde_json::Value, bool) -> Option<u64>,
 ) -> Vec<Want> {
     let mut wants: Vec<Want> = Vec::new();
-    for hap in haps {
+    let shadow = shadow.iter().map(|hap| (hap, false));
+    for (hap, sounds) in haps.iter().map(|hap| (hap, true)).chain(shadow) {
         let crate::ValueJson::Raw(value) = &hap.value else {
             continue;
         };
         let Some(object) = value.as_object() else {
             continue;
         };
-        let Some(chain) = chain_of(value) else {
+        let Some(chain) = chain_of(value, sounds) else {
             continue;
         };
         let instrument = object.get("vsti").map(|plugin| {
@@ -1183,6 +1219,7 @@ pub(crate) fn wants(
                     slot,
                     name: name.to_owned(),
                     preset,
+                    sounds,
                 });
             }
         }
@@ -1190,33 +1227,59 @@ pub(crate) fn wants(
     wants
 }
 
+/// Starts the load of each plugin in `names` that is not loaded, with no
+/// wait, and takes the name out of `names`. The names are the plugin names
+/// of the plugin calls an evaluation ran: see
+/// [`rustel_jsruntime::ScoreEffects::plugins`]. A name the host cannot
+/// serve does nothing here: the note reports the reason. While the host
+/// reads the plugin folders, the plugin list is not complete: see
+/// [`scanning`]. A name the host does not know then stays in `names`, and
+/// a later call starts its load.
+pub(crate) fn load(names: &mut Vec<String>) {
+    let host = host();
+    names.retain(|name| {
+        // The read comes first: a read that ends before the answer keeps
+        // the name for one more call and loses no load.
+        let scanning = host.scanning();
+        matches!(host.resolve(name, false), Resolved::Pending) && scanning
+    });
+}
+
 /// Makes the host build each copy in `wants` that is not ready, with no
 /// wait, at the sample rate of the output. The builds run in the order of
 /// the list, so a caller gives the copies of the lanes that sound first.
-/// Gives the copies that are not ready: a plugin in its load, or a copy in
-/// its build. A copy the host cannot make is not in the list: the note
-/// reports the reason. A copy with a build in the line gets no second
-/// build, so a caller looks as often as it needs.
-pub(crate) fn ensure(wants: &[Want], sample_rate: u32) -> Vec<&Want> {
-    let mut pending = Vec::new();
+/// Gives the copies of lanes that play and that are not ready: a plugin in
+/// its load, or a copy in its build. Gives also the line of each copy the
+/// host cannot make, with its reason, as the note of the copy or the host
+/// says it. A copy with a build in the line gets no second build, so a
+/// caller looks as often as it needs.
+pub(crate) fn ensure(wants: &[Want], sample_rate: u32) -> (Vec<&Want>, Vec<String>) {
+    let (mut pending, mut lines) = (Vec::new(), Vec::new());
     for want in wants {
         let Want {
             instrument,
             slot,
             name,
             preset,
+            sounds,
         } = want;
         let (host, preset) = (host(), preset.as_deref());
         match host.prepared(name, preset, *instrument, sample_rate, *slot) {
-            rustel_vst3::Prepared::Ready(_) | rustel_vst3::Prepared::Unavailable(_) => {}
+            rustel_vst3::Prepared::Ready(_) => {}
+            rustel_vst3::Prepared::Unavailable(reason) => {
+                let call = if *instrument { "vsti" } else { "vst" };
+                lines.push(format!("{call} skipped: {reason}"));
+            }
             // The build starts now, or behind the load of the plugin.
             rustel_vst3::Prepared::Unbuilt(_) | rustel_vst3::Prepared::Pending => {
                 host.prepare(name, preset, *instrument, sample_rate, *slot);
-                pending.push(want);
+                if *sounds {
+                    pending.push(want);
+                }
             }
         }
     }
-    pending
+    (pending, lines)
 }
 
 /// Starts the host and the read of each plugin bundle with no plugin names
@@ -1602,9 +1665,10 @@ mod tests {
         assert_eq!(chains.playing.named(), [after]);
     }
 
-    /// A lane keeps its number through an edit. A muted lane makes no note.
-    /// A new muted lane changes no chain of a lane that plays. The chain of
-    /// a muted lane serves the next lane that needs its plugins.
+    /// A lane keeps its number through an edit. A muted lane plays no note.
+    /// A new muted lane changes no chain of a lane that plays, also when a
+    /// note of the muted lane asks first. The chain of a muted lane serves
+    /// the next lane that needs its plugins.
     #[test]
     fn a_muted_lane_takes_no_chain_from_a_lane_that_plays() {
         let mut lanes = LaneTable::default();
@@ -1618,20 +1682,24 @@ mod tests {
         let chain = registry.id(lane(0, 0), start);
 
         // A new muted lane above with the same plugin: the lane that plays
-        // keeps its number and its chain. Only its call number moves.
+        // keeps its number and its chain. Only its call number moves. A note
+        // of the muted lane asks first, while the lane that plays rests: it
+        // takes no chain of that lane.
         let muted = format!("_$: note(\"e2\").vsti(\"serum\")\n{lead}");
         assert_eq!(play(&mut lanes, &muted), [1, 0]);
         registry.score_changed(text_with_mutes(&[serum, serum], 1), start);
+        let hidden = registry.id_of(lane(1, 0), false, start);
+        assert_ne!(hidden, chain);
         assert_eq!(registry.id(lane(0, 1), start), chain);
         assert!(registry.settle(start + CHAIN_GRACE).is_empty());
 
         // The end of the mute: a mute mark changes no lane number. The lane
-        // never had a chain, so its chain is new.
+        // keeps the chain of its mute.
         let open = muted.replacen("_$", "$", 1);
         assert_eq!(play(&mut lanes, &open), [1, 0]);
         registry.score_changed(text(&[serum, serum]), start);
         let other = registry.id(lane(1, 0), start);
-        assert_ne!(other, chain);
+        assert_eq!(other, hidden);
         assert_eq!(registry.id(lane(0, 1), start), chain);
 
         // The first lane has its mute again, and one more lane with the
@@ -1720,11 +1788,7 @@ mod tests {
         assert_eq!(export.active_source(), Some(score));
         // The 2 sessions share no registry: the same note has 2 chains.
         assert_ne!(chain(&mut export), chain(&mut playing));
-        // A warm and a count of the plugins of the export call no host,
-        // also with a sample library.
-        #[cfg(feature = "device-audio")]
-        export.set_sample_library_for_test(crate::samples::SampleLibrary::empty().into());
-        export.kick_sample_loads(2.0);
+        // A count of the plugins of the export calls no host.
         let ceiling = Duration::from_millis(50);
         assert_eq!(export.plugins_pending(0.0, 2.0, ceiling), 0);
         // An edit of the export waits for no plugin, and a launch prepares
@@ -1756,20 +1820,28 @@ mod tests {
         assert_eq!(render.chain(&crate::ValueJson::Null), None);
         // A session has a different number for the same note.
         let live = Mutex::new(Chains::new());
-        let playing = live_chain(&live, &value).expect("a chain");
+        let playing = live_chain(&live, &value, true).expect("a chain");
         assert_ne!(playing, chain);
 
         // The plan of a text gives each copy its notes need, one time. A
         // note of the score in play keeps its chain. A new note takes a
-        // number of the plan, and makes no chain in the score in play.
+        // number of the plan, and makes no chain in the score in play. The
+        // copies of a lane that does not play come last, and do not sound.
         let mut new = value.clone();
         new["__rustel_lane"] = "plan".into();
         new["vsti"] = serde_json::json!({"name": "Tone", "__rustel_binding": "p1", "preset": 2});
-        let needed = plan(&live, "a text", &[hap(&value), hap(&new), hap(&new)]);
+        let mut muted = value.clone();
+        muted["__rustel_lane"] = "muted".into();
+        let haps = [hap(&value), hap(&new), hap(&new)];
+        let needed = plan(&live, "a text", &haps, &[hap(&muted), hap(&value)]);
         let slots: Vec<InsertSlot> = needed.iter().map(|want| want.slot).collect();
-        let made = slots[1].chain;
+        let (made, silent) = (slots[1].chain, slots[3].chain);
         let (effect, tone) = (InsertSlot::effect(made, 0), InsertSlot::instrument(made));
-        assert_eq!(slots, [InsertSlot::effect(playing, 0), effect, tone]);
+        let muted = InsertSlot::effect(silent, 0);
+        assert_eq!(slots, [InsertSlot::effect(playing, 0), effect, tone, muted]);
+        assert!(silent != made && silent != playing);
+        let sounds: Vec<bool> = needed.iter().map(|want| want.sounds).collect();
+        assert_eq!(sounds, [true, true, true, false]);
         let tone = &needed[2];
         assert!(tone.instrument && !needed[1].instrument);
         assert_eq!(tone.name, "Tone");

@@ -181,6 +181,13 @@ fn waits_for_words(sounds: bool, plugins: bool) -> &'static str {
     }
 }
 
+/// The message a launch logs when it lets its line pass for its sounds,
+/// its plugin copies or both.
+pub(super) fn launch_wait_message(sounds: bool, plugins: bool) -> String {
+    let waits_for = waits_for_words(sounds, plugins);
+    format!("{waits_for} still loading - the launch takes the first line after them")
+}
+
 impl StudioEngine {
     /// Whether starts and edits wait for their sounds, as the master bus
     /// says this turn. Leaving wait lets a held start and a held edit land
@@ -460,14 +467,13 @@ impl StudioEngine {
         if !sounds && !plugins {
             return false;
         }
-        self.launch_takes_next_line(now, waits_for_words(sounds, plugins));
+        self.launch_takes_next_line(now, &launch_wait_message(sounds, plugins));
         true
     }
 
     /// The pending launch lets the line within its head-room pass and aims
-    /// at the next one. The first line it lets pass is logged, with what the
-    /// launch waits for.
-    pub(super) fn launch_takes_next_line(&mut self, now: f64, waits_for: &str) {
+    /// at the next one. The first line it lets pass is logged as `said`.
+    pub(super) fn launch_takes_next_line(&mut self, now: f64, said: &str) {
         let cps = self.session.cps().max(1e-6);
         let cycle_now = self.session.cycle_at_time(now);
         let headroom_cycles = self.launch_headroom() * cps;
@@ -477,9 +483,7 @@ impl StudioEngine {
         pending.boundary_cycle = next_boundary(cycle_now, pending.unit_cycles, headroom_cycles);
         pending.boundary_time = now + (pending.boundary_cycle - cycle_now) / cps;
         if !std::mem::replace(&mut pending.waited, true) {
-            self.log_launch(&format!(
-                "{waits_for} still loading - the launch takes the first line after them"
-            ));
+            self.log_launch(said);
         }
     }
 
@@ -636,9 +640,9 @@ impl StudioEngine {
             cue.plugins += self.load.start_plugins;
         }
         // A held edit or a launch counts the copies the session holds its
-        // text for.
+        // text for. The async mode waits for no copy, and counts none.
         #[cfg(feature = "vst")]
-        {
+        if self.waits_for_sounds() {
             let held = self.load.held_edit.iter().map(|held| &held.source);
             let launch = self.pending_launch.iter().map(|pending| &pending.source);
             for source in held.chain(launch) {

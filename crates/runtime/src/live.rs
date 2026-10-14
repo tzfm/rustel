@@ -892,6 +892,10 @@ impl LiveFileProducer {
         )?;
         if let Some(started) = continuation_started {
             let elapsed = started.elapsed();
+            // A look at the plugin copies ahead caps itself by the cover, so
+            // no reserve holds its time: see `Session::plugin_turn`.
+            #[cfg(feature = "vst")]
+            let elapsed = elapsed.saturating_sub(session.take_look_ahead_time());
             self.continuation_window.record(elapsed);
         }
         Ok(step)

@@ -816,6 +816,15 @@ fn a_live_note_plays_through_its_plugin() {
         warnings(&mut engine, "the note lost its plugin", |peak| peak == 0.0),
         ["vst value skipped: Rustel Fixture has no parameter with the name 'gian'"]
     );
+    // A muted lane plays no note, and the evaluation gives the line of its
+    // wrong preset.
+    let muted = "$: note('c3').s('sine').vst('rustel fixture', { gain: 0 }).fast(8)\n\
+                 _$: note('c3').s('sine').vst('rustel fixture', { preset: 'no such preset' })";
+    engine.evaluate(muted, false).expect("a wrong preset");
+    assert_eq!(
+        warnings(&mut engine, "the muted lane sounds", |peak| peak == 0.0),
+        ["vst skipped: Rustel Fixture has no preset with the name 'no such preset'"]
+    );
     // A refused edit gives no line for its plugin call. Its frequency is
     // above the limit of the output, so the score before plays on.
     let refused = "note('c3').s('sine').freq(90000).vst('rustel fixture', { gane: 1 }).fast(8)";
@@ -860,9 +869,11 @@ fn a_live_note_plays_through_its_plugin() {
 /// at gain 0 and the last score is silent, so each note with no plugin is
 /// heard. The load of the plugin takes 600 ms, as the load of a large plugin
 /// does. The session reads the notes of an edit, so a chain from a helper
-/// function waits too. A launch loads its plugin during its countdown, and
+/// function waits too. A launch loads its plugin during its countdown in
+/// each mode, also with the plugin name in a variable. In the wait mode it
 /// takes the first line after the load. In the async mode the first notes
-/// play dry.
+/// of a start and an edit play dry, and a launch plays on its line. A launch
+/// whose text takes longer to read than its countdown takes a later line.
 #[cfg(feature = "vst")]
 #[test]
 fn a_wait_start_and_a_wait_edit_play_no_note_before_their_plugin() {
@@ -872,7 +883,8 @@ fn a_wait_start_and_a_wait_edit_play_no_note_before_their_plugin() {
     enum Play {
         Start,
         Edit,
-        Launch,
+        /// A launch on the next line of this many cycles.
+        Launch(f64),
     }
     let _engine = one_engine();
     // The plugin thread reads a variable of the process when it loads or
@@ -891,8 +903,12 @@ fn a_wait_start_and_a_wait_edit_play_no_note_before_their_plugin() {
     // The chain of this score comes from a helper function.
     let helper =
         "const fx = p => p.vst('rustel fixture', { gain: 0 }); fx(note('c3').s('sine')).fast(8)";
-    // The peak of the window, the cycle of the first onset, and if the
-    // engine held the score and then played it.
+    // The plugin name of this score is in a variable.
+    let variable =
+        "const name = 'rustel fixture'; note('c3').s('sine').vst(name, { gain: 0 }).fast(8)";
+    // The peak of the window, the cycle of the first onset, the countdown of
+    // a launch after its arm, and if the engine held the score and then
+    // played it.
     let heard = |mode: LoadMode, play: Play, score: &str| {
         let _plugins = fixture_plugins();
         let mut engine = silent_engine();
@@ -904,6 +920,7 @@ fn a_wait_start_and_a_wait_edit_play_no_note_before_their_plugin() {
                 .expect("a start");
             tick_for(&mut engine, Duration::from_millis(300), &mut || {});
         }
+        let mut countdown = None;
         let held = match play {
             Play::Start => {
                 engine.evaluate_and_start(score, false).expect("a start");
@@ -911,14 +928,14 @@ fn a_wait_start_and_a_wait_edit_play_no_note_before_their_plugin() {
                 cue.is_some_and(|cue| cue.waiting && cue.plugins == 1)
             }
             Play::Edit => engine.evaluate(score, false).expect("an edit").held,
-            // The next beat comes before the load ends. The countdown
-            // builds the copy.
-            Play::Launch => {
+            // The countdown builds the copy.
+            Play::Launch(unit) => {
                 let armed = engine
-                    .arm_launch(score, false, 0.25, false)
+                    .arm_launch(score, false, unit, false)
                     .expect("a launch");
-                let cue = engine.snapshot().loading;
-                armed.is_some() && cue.is_some_and(|cue| cue.plugins == 1)
+                let snapshot = engine.snapshot();
+                countdown = snapshot.launch;
+                armed.is_some() && snapshot.loading.is_some_and(|cue| cue.plugins == 1)
             }
         };
         let (mut peak, mut first_onset) = (0.0_f32, None);
@@ -948,27 +965,62 @@ fn a_wait_start_and_a_wait_edit_play_no_note_before_their_plugin() {
         let landed =
             !held || play == Play::Start || matches!(engine.take_launch_outcome(), Some(Ok(_)));
         engine.stop(Duration::from_millis(200)).expect("stop");
-        (peak, first_onset, held && landed)
+        (peak, first_onset, countdown, held && landed)
     };
-    let (peak, first_onset, held) = heard(LoadMode::Wait, Play::Start, score);
+    let (peak, first_onset, _, held) = heard(LoadMode::Wait, Play::Start, score);
     assert!(held, "the start waits, and the header counts 1 plugin");
     assert_eq!(peak, 0.0, "a note of the start played with no plugin");
     assert_eq!(first_onset, Some(0.0), "the start began on cycle 0");
     for edit in [score, helper] {
-        let (peak, _, held) = heard(LoadMode::Wait, Play::Edit, edit);
+        let (peak, _, _, held) = heard(LoadMode::Wait, Play::Edit, edit);
         assert!(held, "the edit waits for the load, then lands: {edit}");
         assert_eq!(
             peak, 0.0,
             "a note of the edit played with no plugin: {edit}"
         );
     }
-    let (peak, _, held) = heard(LoadMode::Wait, Play::Launch, score);
-    assert!(held, "the launch lands after the load");
-    assert_eq!(peak, 0.0, "a note of the launch played with no plugin");
+    // The next beat comes before the load ends.
+    for launch in [score, variable] {
+        let (peak, _, _, held) = heard(LoadMode::Wait, Play::Launch(0.25), launch);
+        assert!(held, "the launch lands after the load: {launch}");
+        assert_eq!(
+            peak, 0.0,
+            "a note of the launch played with no plugin: {launch}"
+        );
+    }
     for play in [Play::Start, Play::Edit] {
-        let (peak, _, held) = heard(LoadMode::Async, play, score);
+        let (peak, _, _, held) = heard(LoadMode::Async, play, score);
         assert!(!held && peak > 0.05, "async, {play:?}: peak {peak}");
     }
+    // The next cycle comes after the load. The async mode holds nothing, and
+    // the launch plays on its line with its plugin.
+    let (peak, first_onset, countdown, held) = heard(LoadMode::Async, Play::Launch(1.0), score);
+    assert!(!held && peak == 0.0, "async launch: peak {peak}");
+    assert_eq!(
+        first_onset,
+        countdown.map(|launch| launch.boundary_cycle),
+        "the async launch keeps its line"
+    );
+    // The first evaluation of this text takes a second, as a text that fills
+    // a table at its first run does. The arm reads the text past the fire
+    // time of the next beat, so the launch aims at a later line, and lands on
+    // a line with its plugin.
+    let slow = format!(
+        "if (!globalThis.filled) {{
+  const until = Date.now() + 1000; while (Date.now() < until) {{}}
+  globalThis.filled = true
+}}
+{score}"
+    );
+    let (peak, first_onset, countdown, _) = heard(LoadMode::Wait, Play::Launch(0.25), &slow);
+    let countdown = countdown.expect("the countdown of the slow launch");
+    assert!(countdown.seconds_left > 0.0, "{countdown:?}");
+    let first_onset = first_onset.expect("the slow launch lands");
+    assert!(
+        first_onset >= countdown.boundary_cycle && first_onset % 0.25 == 0.0,
+        "the slow launch lands on {first_onset}, not on a line after {countdown:?}"
+    );
+    assert_eq!(peak, 0.0, "a note of the slow launch played with no plugin");
     no_plugin_work();
     // SAFETY: as above.
     unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_ENV) };
@@ -1018,9 +1070,11 @@ fn the_idle_sweep_unloads_a_plugin_no_tab_names() {
 /// An edit that leaves a plugin call as it is keeps the copy of the call: a
 /// lane above, a mute of that lane, new notes on the plugin lane, a new
 /// label, a mute of the plugin lane, and the score with no label. No note
-/// plays with no plugin, and no new copy is built. The plugin is the
-/// fixture at gain 0, so a note with no plugin is heard. A lane that leaves
-/// the score gives its copy back.
+/// plays with no plugin, and no new copy is built. A lane muted from the
+/// start gets its copy during the mute, and a lane with its first note 6
+/// cycles ahead gets its copy before that note. The plugin is the fixture
+/// at gain 0, so a note with no plugin is heard. A lane that leaves the
+/// score gives its copy back.
 #[cfg(feature = "vst")]
 #[test]
 fn a_plugin_lane_keeps_its_copy_through_edits_above_and_gives_it_back_at_its_end() {
@@ -1071,7 +1125,46 @@ fn a_plugin_lane_keeps_its_copy_through_edits_above_and_gives_it_back_at_its_end
         assert_eq!(peak_of(&mut engine, 800), 0.0, "a dry note after: {edit}");
         assert_eq!(copies(), 1, "{edit}");
     }
-    // The plugin lane leaves the score: its copy ends after the tail.
+    // A lane muted from the start gets its copy during the mute. The end of
+    // the mute builds nothing.
+    let hidden =
+        format!("{labeled}\n_$: note('e3').s('sine').vst('rustel fixture', {{ gain: 0 }}).fast(8)");
+    engine.evaluate(&hidden, false).expect("a muted lane");
+    let started = Instant::now();
+    while copies() != 2 {
+        assert_eq!(peak_of(&mut engine, 300), 0.0, "a dry muted note");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the muted lane got no copy"
+        );
+    }
+    let open = hidden.replace("_$:", "$:");
+    engine.evaluate(&open, false).expect("the end of the mute");
+    assert_eq!(peak_of(&mut engine, 800), 0.0, "a dry note after the mute");
+    assert_eq!(copies(), 2, "the end of the mute built a copy");
+    // A lane with its first note 6 cycles ahead gets its copy 4 cycles or
+    // more before that note, and the note plays through the plugin. The
+    // output asks for a copy about a second before its note at most. The
+    // tempo is 2 cycles a second here.
+    let first = engine.snapshot().cycle.floor() as u64 + 6;
+    let third = "$: note('g3').s('sine').vst('rustel fixture', { gain: 0 })";
+    let later = format!("setCps(2)\n{open}\n{third}.mask(\"<0!{first} 1!64>\")");
+    engine.evaluate(&later, false).expect("a later lane");
+    while copies() != 3 {
+        assert_eq!(peak_of(&mut engine, 50), 0.0, "a dry note");
+        let cycle = engine.snapshot().cycle;
+        assert!(cycle < (first - 4) as f64, "no copy ahead at {cycle}");
+    }
+    let started = Instant::now();
+    while engine.snapshot().cycle < (first + 1) as f64 {
+        assert_eq!(peak_of(&mut engine, 300), 0.0, "a dry later note");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the later lane did not play"
+        );
+    }
+    assert_eq!(copies(), 3, "the copy of the later lane");
+    // The plugin lanes leave the score: their copies end after the tail.
     engine
         .evaluate("$: note('c5').s('sine').gain(0)", false)
         .expect("a score with no plugin");

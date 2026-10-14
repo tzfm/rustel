@@ -88,7 +88,8 @@ s("hh*8").vst("valhalla supermassive", {
 
 A plugin name with no plugin, a preset name with no file, or a dropped value
 gives one warning for each evaluation. The warning shows in the Studio log,
-and as a `warning:` line of `rustel play`.
+and as a `warning:` line of `rustel play`. A muted lane and a lane a solo
+drops give the warning of a plugin name or a preset name too.
 
 ## Presets
 
@@ -153,9 +154,9 @@ The next note wakes the same copy, with no load. A lane you remove, or put in
 a comment, gives its copies back after the tail of its sound. The tail has 30
 seconds at most.
 
-A muted lane (`_$:`) keeps the copies it had when it played. A new lane with
-the same plugins takes these copies. The muted lane then loads new copies at
-the end of its mute.
+A muted lane (`_$:`) and a lane a solo (`S$:`) drops play no note, and keep
+their plugin copies. Rustel loads the copies of such a lane while it is
+silent, so the end of the mute or of the solo loads nothing.
 
 Rustel reads the chains from the text of the score. Each arm of a `stack()`
 is a chain. The text does not show a chain from a variable or from a
@@ -168,6 +169,10 @@ Rustel loads a plugin on a thread of its own when you evaluate a score. The
 audio does not stop. Until the plugin is ready, an effect note plays dry and
 an instrument note is silent.
 
+While the score plays, Rustel loads the plugin copies of the next 16 cycles.
+A lane with its first note later in the score has its copies before that
+note.
+
 An edit waits for the plugin copies its notes need. Rustel reads the notes of
 the edit near the cycle in play, and loads each copy that is not ready. A
 chain the edit keeps has its copy, so an edit with no new chain waits for no
@@ -176,12 +181,16 @@ the edit plays. If no copy becomes ready in 20 seconds, the wait ends. The
 edit then plays, and a note with no copy plays with no plugin until its copy
 is ready.
 
-Studio has two load modes under Settings ▸ Advanced ▸ Playback. In the wait
-mode, a start waits for the plugin copies of its first 2 cycles, and an edit
-waits as above. A launch on a cycle line loads its plugin copies during the
-countdown. If a copy is not ready at the line, the launch takes the first line
-after the copy is ready. In the async mode, the score starts at once, and an
-edit plays at once.
+Studio has two load modes under Settings ▸ Advanced ▸ Playback. In each mode,
+Studio evaluates the text of a launch on a cycle line during the countdown,
+reads its notes, and loads its plugin copies. If this work still runs a short
+time before the line, the launch takes the first line after the work. Until a
+score runs a plugin call, a launch with no `vst` in its text loads its plugin
+copies at its line. In the wait mode, a start waits for the plugin copies of
+its first 2 cycles, and an edit waits as above. If a copy of a launch is not
+ready at the line, the launch takes the first line after the copy is ready. In
+the async mode, the score starts at once, an edit plays at once, and a launch
+does not wait for its plugin copies.
 
 `rustel play` waits for the plugin copies of the first 4 cycles at its start.
 They load while the samples load. With `--watch`, a save with a plugin copy

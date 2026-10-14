@@ -234,6 +234,7 @@ mod ownership_cap_tests {
                         cells: Vec::new(),
                         explicit_ownership_complete: false,
                         excluded_frame_ids: Rc::new(excluded),
+                        shadow: None,
                     },
                 )
                 .map_err(|error| error.to_string())

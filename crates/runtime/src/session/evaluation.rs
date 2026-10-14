@@ -691,6 +691,11 @@ impl Session {
                 {
                     self.staged_hydra = Some(effects.hydra.take().unwrap_or_default());
                 }
+                // Each door that evaluates a text comes here. The plugins of
+                // the calls the score ran load at the next look at the plugin
+                // copies, after the copies of the lanes that play.
+                #[cfg(feature = "vst")]
+                self.keep_ran_plugins(&effects.plugins);
                 match self.js.active_pattern() {
                     Some(pattern) => Ok(EvaluatedScore::JavaScript {
                         pattern,
@@ -879,16 +884,17 @@ impl Session {
         // the commit reads the clock, so its time takes nothing from the
         // takeover margin.
         #[cfg(all(feature = "vst", feature = "device-audio"))]
-        if !self.plugin_seam(
+        let Some(plan_lines) = self.plugin_seam(
             &evaluated,
             source,
             hold,
             realtime_cps,
             probe_elapsed,
             &mut clock,
-        )? {
+        )?
+        else {
             return Ok(());
-        }
+        };
         let sampled_now = clock();
         let now = match earliest_now {
             Some(earliest_now) if !sampled_now.is_finite() || sampled_now < earliest_now => {
@@ -906,7 +912,13 @@ impl Session {
             restart_transport,
             candidate_settings,
             Self::live_replacement_takeover_headroom(realtime_cps, probe_elapsed),
-        )
+        )?;
+        // The commit forgot the plugin lines said before. The lines of the
+        // plan go out now, so a note of the score with the same line gives
+        // no second one.
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        self.report_plugin_lines(plan_lines);
+        Ok(())
     }
 
     pub(super) fn evaluated_realtime_cps(
@@ -1132,6 +1144,7 @@ impl Session {
                     cps,
                     samples,
                     preload,
+                    plugins: _kept_at_the_evaluation,
                     gamepad,
                     hydra: _taken_before_the_no_pattern_arms,
                     ..
@@ -1141,6 +1154,7 @@ impl Session {
                     cps,
                     samples,
                     preload,
+                    plugins: _kept_at_the_evaluation,
                     gamepad,
                     ..
                 } = effects;
@@ -1293,11 +1307,14 @@ impl Session {
         self.recovered_source = None;
         self.js.snapshot_active_as_last_good();
         // The lanes of this text are now the lanes of the score in play, and
-        // the chains of this session get the text.
+        // the chains of this session get the text. The looks at the plugin
+        // copies of the cycles ahead start again with the new score.
         #[cfg(feature = "vst")]
         {
             self.lanes.install(source);
             crate::vst::score_changed(&self.chains, Some(source));
+            #[cfg(feature = "device-audio")]
+            self.plugin_ahead.restart();
         }
         Ok(())
     }

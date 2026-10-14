@@ -717,6 +717,9 @@ impl JsRuntime {
                 };
                 let ownership_refusal = take_ownership_refusal();
                 let ownership_refused = ownership_refusal.is_some();
+                // The lanes of the score that do not play: see
+                // `NativePatternWrapper::shadow`.
+                let mut shadow: Option<rquickjs::Class<NativePatternWrapper>> = None;
                 let evaluated: rquickjs::Class<NativePatternWrapper> = match evaluated_result {
                     Ok(_) if ownership_refusal.is_some() => ownership_refusal_wrapper(
                         &ctx,
@@ -731,9 +734,18 @@ impl JsRuntime {
                             // score, and can throw from the score's own lines
                             // (an eager callback rethrown by a method they
                             // call).
-                            finish
+                            let finished = finish
                                 .call((evaluated,))
-                                .map_err(|error| score_error(describe_js_error(&ctx, error)))?
+                                .map_err(|error| score_error(describe_js_error(&ctx, error)))?;
+                            let host = lane_host.as_object();
+                            shadow = host
+                                .get(LANE_SHADOW)
+                                .map_err(|error| QueryError::Message(error.to_string()))?;
+                            if shadow.is_some() {
+                                host.remove(LANE_SHADOW)
+                                    .map_err(|error| QueryError::Message(error.to_string()))?;
+                            }
+                            finished
                         } else {
                             evaluated
                         };
@@ -919,6 +931,23 @@ impl JsRuntime {
                     // bounded candidate is published.
                     return Err(QueryError::Policy(policy));
                 }
+                // The plugin names of the calls that ran go with the effects
+                // of the score.
+                if let Some(effects) = self.effect_transaction.borrow_mut().as_mut() {
+                    effects.plugins = frame.take_plugin_names();
+                }
+                // A score with a shadow stages a wrapper of its own that holds
+                // it. A value the score returned keeps no shadow: a muted lane
+                // returns the one shared silence value.
+                let wrapper = match shadow {
+                    Some(shadow) => {
+                        let mut staged = NativePatternWrapper::clone(&wrapper.borrow());
+                        staged.shadow = Some(shadow);
+                        new_wrapper(&ctx, staged)
+                            .map_err(|error| QueryError::Message(error.to_string()))?
+                    }
+                    None => wrapper,
+                };
                 if stage_candidate {
                     host_score_candidate(&ctx)
                         .map_err(|error| QueryError::Message(error.to_string()))?

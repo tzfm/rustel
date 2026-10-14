@@ -1524,12 +1524,20 @@ pub(super) fn play_live(
     while device.report().playback_latency_nanos == 0 && Instant::now() < lead_deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
+    const WARM_QUERY_CEILING: Duration = Duration::from_secs(2);
     // First-start prefetch: kick every sample the first cycles reference
     // and give the library a bounded window to settle (disk-cache hits are
     // milliseconds; cold fetches get a few seconds), then deliver, so the
     // FIRST bar has its drums. Mid-set loads stay fully async.
     let mut warmup_error = session
         .with_panic_recovery(device.clock_seconds(), |session| {
+            // This look starts the loads and the builds of the plugin copies
+            // of the first cycles, so they load while the samples load. A
+            // score with no plugin call asks nothing here.
+            #[cfg(feature = "vst")]
+            if session.ran_plugin_calls() {
+                session.plugins_pending(0.0, 4.0, WARM_QUERY_CEILING);
+            }
             session.prefetch_samples(4.0, Duration::from_secs(8));
             Ok(())
         })
@@ -1555,7 +1563,6 @@ pub(super) fn play_live(
     // Startup only. A mid-set save never blocks, because holding the producer
     // for a network is how music stops.
     const PRELOAD_CEILING: Duration = Duration::from_secs(60);
-    const WARM_QUERY_CEILING: Duration = Duration::from_secs(2);
     let preload_started = Instant::now();
     // Several rounds, because resolution is a chain: a name resolves to a
     // bank, a bank to a URL, and a soundfont lists its files only after the
@@ -1609,9 +1616,10 @@ pub(super) fn play_live(
         );
     }
     // The downbeat waits for the plugin copies of the cycles of the
-    // prefetch too. The prefetch started their builds, so they load while
-    // the samples load. The wait goes on while a copy became ready in the
-    // last `PLUGIN_WAIT`, as the wait of an edit does.
+    // prefetch too. The look before the prefetch started their loads and
+    // builds, so they load while the samples load. The wait goes on while a
+    // copy became ready in the last `PLUGIN_WAIT`, as the wait of an edit
+    // does.
     #[cfg(feature = "vst")]
     if warmup_error.is_none() {
         let (mut pending, mut progress) = (usize::MAX, Instant::now());
