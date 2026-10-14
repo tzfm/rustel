@@ -1,4 +1,4 @@
-//! `^J` - the smart action: what the caret is on, and what can be done to it.
+//! `^J` - the quick action: what the caret is on, and what can be done to it.
 //!
 //! Typing `slider(800, 100, 4000)` by hand to get a fader is four numbers
 //! and a lot of punctuation for one idea. Put the caret on the `800` that
@@ -39,9 +39,9 @@ fn field_value_x(area: Rect) -> u16 {
 /// make the popup unreadable.
 const FIELD_CHARS: usize = 24;
 
-const STALE_SOURCE: &str = "the score or scene changed - close and reopen smart action";
+const STALE_SOURCE: &str = "the score or scene changed - close and reopen quick action";
 
-/// What the smart action found at the caret, and so what it can offer.
+/// What the quick action found at the caret, and so what it can offer.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Target {
     /// A plain number in the score: the `800` of `.lpf(800)`. Making it a
@@ -386,7 +386,7 @@ pub(super) fn spans_one_whole_call(source: &str, range: &std::ops::Range<usize>)
     depth == 0 && !inside.contains("slider(")
 }
 
-/// The smart action, open at the caret.
+/// The quick action, open at the caret.
 #[derive(Clone, Debug)]
 pub(super) struct SmartAction {
     pub(super) scene: SceneId,
@@ -779,7 +779,7 @@ pub(super) fn geometry(frame: Rect, anchor: (u16, u16), rows: u16) -> Rect {
 }
 
 impl App {
-    /// Whether the smart action has anything to offer where the caret
+    /// Whether the quick action has anything to offer where the caret
     /// stands. The Edit menu greys its row out when it has not, rather
     /// than opening and answering with a status line nobody was looking
     /// at.
@@ -818,7 +818,7 @@ impl App {
                 .is_some_and(|sound| sample_paste(&source, caret, sound).is_some())
     }
 
-    /// `^J`, or Edit ▸ Smart action. Reads what the caret is on and opens
+    /// `^J`, or Edit ▸ Quick action. Reads what the caret is on and opens
     /// the menu over it.
     pub(super) fn open_smart_action(&mut self) {
         let scene = self.scenes.current().id;
@@ -899,18 +899,18 @@ impl App {
             .filter(|sound| sample_paste(&source, caret, sound).is_some());
         let status = match (&target, &sample) {
             (Target::Nothing(why), None) => {
-                self.status = format!("smart action: {why}");
+                self.status = format!("quick action: {why}");
                 self.dirty_frame = true;
                 return;
             }
             // A number the fader refuses is still said, beside the paste.
             (Target::Nothing(why), Some(sound)) if on_number => {
-                format!("smart action: {why} \u{b7} Enter pastes {sound}")
+                format!("quick action: {why} \u{b7} Enter pastes {sound}")
             }
             (Target::Nothing(_), Some(sound)) => {
-                format!("smart action: Enter pastes {sound} \u{b7} Esc closes")
+                format!("quick action: Enter pastes {sound} \u{b7} Esc closes")
             }
-            _ => "smart action: Enter chooses \u{b7} Esc closes".into(),
+            _ => "quick action: Enter chooses \u{b7} Esc closes".into(),
         };
         self.dismiss_dialogs(None);
         self.smart_action = Some(SmartAction {
@@ -1025,7 +1025,7 @@ impl App {
             return;
         };
         if !written {
-            form.error = Some("could not write the fader - close and reopen smart action".into());
+            form.error = Some("could not write the fader - close and reopen quick action".into());
             self.dirty_frame = true;
             return;
         }
@@ -1054,13 +1054,13 @@ impl App {
                 .is_none_or(|scene| scene.editor.source() != state.original)
         {
             self.smart_action = Some(state);
-            self.status = format!("smart action: {STALE_SOURCE}");
+            self.status = format!("quick action: {STALE_SOURCE}");
             self.dirty_frame = true;
             return;
         }
         if self.replace_range_in_scene(scene, range, &plain).is_none() {
             self.smart_action = Some(state);
-            self.status = "could not remove the fader - close and reopen smart action".into();
+            self.status = "could not remove the fader - close and reopen quick action".into();
             self.dirty_frame = true;
             return;
         }
@@ -1117,7 +1117,7 @@ impl App {
         Some((state, rows))
     }
 
-    /// Keys and pastes belong to the open smart action, including its
+    /// Keys and pastes belong to the open quick action, including its
     /// menu, which ignores pasted text. The mouse can still reach the score.
     pub(super) fn smart_action_event(&mut self, terminal_event: &Event) -> bool {
         match terminal_event {
@@ -1289,18 +1289,18 @@ impl App {
             sample_paste(&entry.editor.source(), caret, sound)
         });
         let Some((range, text)) = landing else {
-            self.status = format!("smart action: nowhere at the caret takes {sound}");
+            self.status = format!("quick action: nowhere at the caret takes {sound}");
             return;
         };
         if self.replace_range_in_scene(scene, range, &text).is_none() {
             self.smart_action = Some(state);
-            self.status = "could not paste the sample - close and reopen smart action".into();
+            self.status = "could not paste the sample - close and reopen quick action".into();
             return;
         }
         self.status = format!("pasted {sound}");
     }
 
-    /// A smart action belongs to the score it opened on. Leaving that
+    /// A quick action belongs to the score it opened on. Leaving that
     /// score cancels it before an edit and evaluation can target different scenes.
     pub(super) fn close_smart_action_on_scene_change(&mut self) {
         if self
@@ -1320,7 +1320,7 @@ impl App {
             self.status = if wrote {
                 "fader added \u{b7} evaluate when ready".into()
             } else {
-                "smart action closed".into()
+                "quick action closed".into()
             };
         }
         self.lint_pending = true;
@@ -1408,7 +1408,7 @@ pub(super) fn render(
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .title(" \u{2318} smart action ")
+            .title(" \u{2318} quick action ")
             .style(Style::default().bg(theme.overlay).fg(theme.foreground)),
         area,
     );

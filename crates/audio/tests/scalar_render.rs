@@ -33,6 +33,7 @@ fn fm_chain(stages: &[Option<(f32, f32)>]) -> rustel_audio::FmControls {
 
 fn controls(waveform: Waveform, pan: Option<f32>) -> OscillatorControls {
     OscillatorControls {
+        kabel: None,
         limit: None,
         live_controls: [0; 3],
         preview_epoch: 0,
@@ -76,7 +77,7 @@ fn controls(waveform: Waveform, pan: Option<f32>) -> OscillatorControls {
         compressor: None,
         partials: None,
         transient: None,
-        fx_stages: [None; rustel_audio::MAX_FX_STAGES],
+        fx_stages: [const { None }; rustel_audio::MAX_FX_STAGES],
         vowel: None,
         coarse: None,
         crush: None,
@@ -156,7 +157,7 @@ fn velocity_postgain_and_release_are_not_discarded() {
         sustain: 1.0,
         release_secs: 0.02,
     };
-    let mut scaled = full;
+    let mut scaled = full.clone();
     scaled.velocity = 0.5;
     scaled.postgain = 0.4;
     let full = render_pcm(
@@ -200,7 +201,7 @@ fn postgain_scales_the_distorted_output_rather_than_the_drive() {
         postgain: 1.0,
         algorithm: 0,
     });
-    let mut scaled = full;
+    let mut scaled = full.clone();
     scaled.postgain = 0.5;
     let render = |controls| {
         render_pcm(
@@ -239,7 +240,7 @@ fn two_identical_fm_notes_sound_the_same_wherever_they_start() {
             &mut ScalarBackend::new(),
             48_000,
             onset as usize + 8_000,
-            &[OnsetEvent::new(onset, 130.81, 1.0, 0.1).with_controls(controls)],
+            &[OnsetEvent::new(onset, 130.81, 1.0, 0.1).with_controls(controls.clone())],
         )
         .expect("render")
     };
@@ -272,7 +273,7 @@ fn an_fm_note_hears_its_modulators_from_the_start_of_its_quantum() {
             &mut ScalarBackend::new(),
             48_000,
             onset as usize + 8_000,
-            &[OnsetEvent::new(onset, 130.81, 1.0, 0.1).with_controls(controls)],
+            &[OnsetEvent::new(onset, 130.81, 1.0, 0.1).with_controls(controls.clone())],
         )
         .expect("render")
     };
@@ -433,7 +434,7 @@ fn duck_sidechain_dips_the_target_orbit_exponentially() {
             compressor: None,
             partials: None,
             transient: None,
-            fx_stages: [None; rustel_audio::MAX_FX_STAGES],
+            fx_stages: [const { None }; rustel_audio::MAX_FX_STAGES],
             vowel: None,
             coarse: None,
             crush: None,
@@ -689,7 +690,7 @@ fn every_duck_trigger_dips_in_an_offline_render() {
             compressor: None,
             partials: None,
             transient: None,
-            fx_stages: [None; rustel_audio::MAX_FX_STAGES],
+            fx_stages: [const { None }; rustel_audio::MAX_FX_STAGES],
             vowel: None,
             coarse: None,
             crush: None,
@@ -808,7 +809,7 @@ fn same_frame_ducks_leave_the_last_admitted_depth_in_charge() {
     ];
     let last_admitted = 1.0 - 0.2f64.sqrt();
     for (case, ducks) in cases {
-        let mut events = vec![tone];
+        let mut events = vec![tone.clone()];
         events.extend(ducks);
         let pcm = render_pcm(&mut ScalarBackend::new(), 48_000, 124_000, &events).expect("render");
         let rms = |from: usize, to: usize| {
@@ -887,7 +888,13 @@ fn synth_sources_produce_their_characteristic_output() {
         pulsewidth: 0.5,
         width_lfo: None,
     });
-    let plain = render_pcm(&mut ScalarBackend::new(), 48_000, 24_000, &[pulse]).expect("pulse");
+    let plain = render_pcm(
+        &mut ScalarBackend::new(),
+        48_000,
+        24_000,
+        std::slice::from_ref(&pulse),
+    )
+    .expect("pulse");
     assert!(rms(&plain, 2_000, 10_000) > 0.01, "pulse must sound");
     let mut modulated = pulse;
     modulated.controls.fm = Some(fm_chain(&[Some((2.0, 2.04))]));
@@ -1177,7 +1184,7 @@ fn late_duck_trigger_ramps_from_now_instead_of_stepping() {
         compressor: None,
         partials: None,
         transient: None,
-        fx_stages: [None; rustel_audio::MAX_FX_STAGES],
+        fx_stages: [const { None }; rustel_audio::MAX_FX_STAGES],
         vowel: None,
         coarse: None,
         crush: None,
@@ -1313,7 +1320,7 @@ fn live_consumer_arms_the_duck_a_full_hold_ramp_early() {
             compressor: None,
             partials: None,
             transient: None,
-            fx_stages: [None; rustel_audio::MAX_FX_STAGES],
+            fx_stages: [const { None }; rustel_audio::MAX_FX_STAGES],
             vowel: None,
             coarse: None,
             crush: None,
@@ -1566,7 +1573,8 @@ fn nan_feedback_modulators_on_one_orbit_keep_the_delay_bounded() {
     });
     c.lfos[0] = Some(nan_lfo(ModTarget::DelayFeedback, 0.5));
     // Each voice adds `1 - 0.5` to the feedback of the shared delay.
-    let events = [110.0, 165.0, 220.0].map(|hz| OnsetEvent::new(0, hz, 0.5, 0.5).with_controls(c));
+    let events =
+        [110.0, 165.0, 220.0].map(|hz| OnsetEvent::new(0, hz, 0.5, 0.5).with_controls(c.clone()));
     let pcm = render_pcm(&mut ScalarBackend::new(), 48_000, 48_000, &events).expect("render");
     let peak = pcm.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
     assert!(peak < 100.0, "the orbit feedback went above 1, peak {peak}");
@@ -1671,6 +1679,7 @@ fn negative_depth_tremolo_stays_finite_at_unity_gain() {
         let mut c = controls(Waveform::Sawtooth, None);
         if in_stage {
             c.fx_stages[0] = Some(rustel_audio::FxStage {
+                kabel: None,
                 stretch: None,
                 transient: None,
                 gain: 1.0,
@@ -2023,8 +2032,13 @@ fn live_consumer_preserves_fractional_onset_lead() {
         .with_onset_lead(0.75)
         .with_generation(1)
         .with_controls(oscillator);
-    let offline = render_pcm(&mut ScalarBackend::new(), SAMPLE_RATE, FRAMES, &[onset])
-        .expect("offline render");
+    let offline = render_pcm(
+        &mut ScalarBackend::new(),
+        SAMPLE_RATE,
+        FRAMES,
+        std::slice::from_ref(&onset),
+    )
+    .expect("offline render");
 
     let ring = rustel_audio::Ring::new(4);
     assert!(ring.push(rustel_audio::AudioEvent {
@@ -2036,7 +2050,7 @@ fn live_consumer_preserves_fractional_onset_lead() {
         freq_hz: onset.freq_hz,
         gain: onset.gain,
         duration_secs: onset.duration_secs,
-        controls: onset.controls,
+        controls: onset.controls.clone(),
         sample: onset.sample,
         wavetable: onset.wavetable,
         synth: onset.synth,
@@ -2774,6 +2788,7 @@ fn fxi_aims_a_modulator_at_one_stage_and_not_another() {
     let render = |fxi: Option<u8>| {
         let mut c = controls(Waveform::Sawtooth, None);
         let stage = |cutoff: f32| rustel_audio::FxStage {
+            kabel: None,
             stretch: None,
             transient: None,
             gain: 1.0,
@@ -3060,8 +3075,13 @@ fn an_event_level_cut_chokes_the_previous_voice_in_the_group() {
     let first = OnsetEvent::new(0, 220.0, 1.0, 2.0).with_cut(Some(f32::MAX));
     let second = OnsetEvent::new(u64::from(sr) / 2, 493.9, 1.0, 2.0).with_cut(Some(f32::MAX));
 
-    let choked =
-        render_pcm(&mut ScalarBackend::new(), sr, sr as usize, &[first, second]).expect("render");
+    let choked = render_pcm(
+        &mut ScalarBackend::new(),
+        sr,
+        sr as usize,
+        &[first, second.clone()],
+    )
+    .expect("render");
     let alone = render_pcm(&mut ScalarBackend::new(), sr, sr as usize, &[second])
         .expect("render second alone");
 

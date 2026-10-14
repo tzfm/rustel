@@ -8,6 +8,12 @@ authors and are included here to test an independent implementation
 against them. Upstream documentation examples are part of the Strudel
 project and carry its AGPL-3.0 licence.
 
+## KabelSalat examples - 8 score(s)
+
+- froos
+- luiiuuuiiiii
+- pulu
+
 ## generated - 680 score(s)
 
 - rustel corpus generator
@@ -75,6 +81,7 @@ project and carry its AGPL-3.0 licence.
 - rustel maintainers
 - Rymdljus, Atraeus, Janeishly, Multidroid
 
-## upstream docs - 452 score(s)
+## upstream docs - 454 score(s)
 
+- Aria (@glossing) and Strudel contributors
 - the Strudel project (AGPL-3.0)

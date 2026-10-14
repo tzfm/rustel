@@ -321,7 +321,7 @@ impl App {
                     if editor.saving.as_ref().is_some_and(|sheet| sheet.closing) {
                         // The second Esc: leave, and let the changes go.
                         self.close_theme_editor(editor, false);
-                        self.status = "theme changes discarded".into();
+                        self.set_notice("theme changes discarded".into());
                         return true;
                     }
                     editor.saving = None;
@@ -991,18 +991,18 @@ impl App {
                     self.prefs.theme = Some(name);
                     self.save_prefs_soon();
                     self.flush_prefs();
-                    self.status = format!(
+                    self.set_notice(format!(
                         "theme saved and kept - {}",
                         status_file_path(&path, self.ui_settings.show_full_paths)
-                    );
+                    ));
                     self.close_theme_editor(editor, true);
                 } else if saving.closing {
                     // Saved on the way out: the file is written and in the
                     // list, and the studio wears what it had before.
-                    self.status = format!(
+                    self.set_notice(format!(
                         "theme saved - {}",
                         status_file_path(&path, self.ui_settings.show_full_paths)
-                    );
+                    ));
                     self.close_theme_editor(editor, false);
                 } else {
                     editor.draft = draft.clone();
@@ -1013,10 +1013,10 @@ impl App {
                     editor.rebuild_code();
                     editor.loaded = editor.draft.to_json();
                     self.apply_theme_draft(&draft);
-                    self.status = format!(
+                    self.set_notice(format!(
                         "theme saved - {}",
                         status_file_path(&path, self.ui_settings.show_full_paths)
-                    );
+                    ));
                     self.theme_editor = Some(editor);
                 }
             }
@@ -1068,14 +1068,14 @@ impl App {
         }
         self.prefs.theme = Some(self.theme.name.clone());
         self.save_prefs_soon();
-        self.status = match super::super::prefs::StudioPrefs::path() {
+        self.set_notice(match super::super::prefs::StudioPrefs::path() {
             Some(path) => format!(
                 "theme {} - remembered in {}",
                 self.theme.name,
                 status_file_path(&path, self.ui_settings.show_full_paths)
             ),
             None => format!("theme {}", self.theme.name),
-        };
+        });
         // A camera theme kept is a solid background until the camera opens,
         // or for good while the setting is off: say which, or the first
         // frame arrives as a surprise - or never.

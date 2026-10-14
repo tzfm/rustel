@@ -591,8 +591,9 @@ fn lint_with_scan(
         } else {
             rustel_transpiler::unresolved_reads(source)
         };
-        // A KabelSalat call is refused whole, so no name in its graph is
-        // judged here, the patterns lifted from it included.
+        // A KabelSalat graph has its own node names and local registrations.
+        // The graph compiler resolves them when an event is queried. The
+        // score checker does not execute graph code or guess its namespace.
         let in_graph = |at: usize| {
             let calls = &output.kabelsalat_calls;
             let after = calls.partition_point(|call| call.stringified.start <= at);
@@ -606,16 +607,6 @@ fn lint_with_scan(
                 .filter(|&(from, _)| !in_graph(from))
                 .collect()
         };
-        // Each KabelSalat call outside another's graph is refused: Rustel does
-        // not run KabelSalat.
-        for call in &output.kabelsalat_calls {
-            diagnostics.push(Diagnostic {
-                level: Level::Value,
-                message: "`K(…)` needs kabelsalat, strudel.cc's custom-DSP language, which this engine does not implement".to_owned(),
-                from: call.name.start,
-                to: call.name.end,
-            });
-        }
         // Resolve non-call references too: a stray word is valid JavaScript,
         // but reading an undefined global fails just as surely as calling one.
         // The parser knows scopes, destructuring and property keys; a token
@@ -688,6 +679,9 @@ fn lint_with_scan(
         // `note("c").sine` reads `undefined`: a sound or a global value is not
         // a pattern method, and the pattern queries as silence.
         for name in values_read_off_patterns(&code, &unresolved_reads, &registered) {
+            if in_graph(name.start) {
+                continue;
+            }
             if diagnostics.len() >= MAX_DIAGNOSTICS {
                 break;
             }
@@ -3252,6 +3246,23 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
     }
 
     #[test]
+    fn register_aliases_publish_methods_without_hiding_typos() {
+        let source = "const rg = register; rg('startFrom', (c, p) => p.filterWhen(x => x.gte(c))); note('c3').startFrom(8)";
+        assert!(check(source).is_empty(), "{:?}", check(source));
+        assert!(rejection(source, false, None).is_none());
+        let typo = source.replace(".startFrom(8)", ".stratFrom(8)");
+        assert!(
+            check(&typo)
+                .iter()
+                .any(|d| d.message.contains("unknown function `stratFrom`"))
+        );
+        let setup = LintContext::from_setup_sources([
+            "const rg = register; rg('startFrom', (c, p) => p.filterWhen(x => x.gte(c)))",
+        ]);
+        assert!(lint_with("note('c3').startFrom(8)", false, None, &setup).is_empty());
+    }
+
+    #[test]
     fn a_method_on_something_the_score_owns_is_not_read_as_an_engine_name() {
         // A local, a member chain, and `window` - the global object under
         // another name. None of them is the engine's, so what is called on
@@ -3279,33 +3290,44 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
     }
 
     #[test]
-    fn a_kabelsalat_graph_is_reported_before_the_score_is_played() {
-        // The transpiler rewrites `K(expr)` into `worklet('expr')`, so the body
-        // never reaches the name scan as code, and the scan skips the
-        // capitalised `K`. Without this, `check` reports nothing and the score
-        // refuses only at evaluation.
+    fn a_kabelsalat_effect_uses_the_graph_namespace() {
         let source = "$: s(\"bd\").FX(K(() => audioin().out()))";
-        let diagnostics = check(source);
-        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert!(diagnostics[0].message.contains("kabelsalat"));
-        assert_eq!(&source[diagnostics[0].from..diagnostics[0].to], "K");
-        // A refusal, not a note: the score genuinely will not run.
-        assert!(rejection(source, false, None).is_some());
+        assert!(check(source).is_empty(), "{:?}", check(source));
+        assert!(rejection(source, false, None).is_none());
     }
 
     #[test]
-    fn a_kabelsalat_call_on_a_receiver_is_reported_like_a_bare_one() {
-        // Pins that a call on a receiver is reported and a `K(` in a comment
-        // is not.
-        let source = "$: s(\"bd\").K(osc(2))\n// K(not code)";
-        let member = source.find(".K(").expect("the member call") + 1;
-        let kabelsalat = check(source)
-            .into_iter()
-            .filter(|d| d.message.contains("kabelsalat"))
-            .map(|d| (d.from, d.to))
-            .collect::<Vec<_>>();
-        assert_eq!(kabelsalat, [(member, member + 1)], "{:?}", check(source));
-        assert!(rejection(source, false, None).is_some());
+    fn a_kabelsalat_call_on_a_receiver_is_accepted_like_a_bare_one() {
+        let source = "$: note(\"c3\").K(sine(sFreq).out())\n// K(not code)";
+        assert!(check(source).is_empty(), "{:?}", check(source));
+        assert!(rejection(source, false, None).is_none());
+    }
+
+    #[test]
+    fn kabelsalat_oscillator_methods_are_not_pattern_properties() {
+        for graph in [
+            "n(sFreq).sine().out()",
+            "noise().hold(impulse(4)).range(220, 660).sine().out()",
+            "pick(sine(1).range(0, 3), 220, 330, 440).sine().out()",
+        ] {
+            for prefix in ["K", "note('c3').K"] {
+                let source = format!("{prefix}(() => {graph})");
+                let diagnostics = check(&source);
+                assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+            }
+        }
+
+        for source in [
+            "note('c3').K(() => n(sFreq).sine().out()); n(0).sine()",
+            "K(() => n(sFreq).sine().out(), n(0).sine())",
+        ] {
+            let diagnostics = check(source);
+            let finding = diagnostics
+                .iter()
+                .find(|finding| finding.message.contains("is not a pattern method"))
+                .unwrap_or_else(|| panic!("missing pattern finding for {source}: {diagnostics:?}"));
+            assert_eq!(finding.from, source.rfind("sine").unwrap());
+        }
     }
 
     /// The checker reports only the size refusal for a source past the
@@ -3329,50 +3351,27 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
     }
 
     #[test]
-    fn a_kabelsalat_call_in_another_ones_later_arguments_is_reported_too() {
-        let source = "$: K(a, K(b))";
-        let kabelsalat = check(source)
-            .into_iter()
-            .filter(|d| d.message.contains("kabelsalat"))
-            .map(|d| d.from)
-            .collect::<Vec<_>>();
-        assert_eq!(kabelsalat, [3, 8], "{:?}", check(source));
+    fn kabelsalat_later_arguments_keep_their_own_graph_namespace() {
+        let source = "$: K(sine(sFreq).out(), K(noise().out()))";
+        assert!(check(source).is_empty(), "{:?}", check(source));
     }
 
     #[test]
-    fn a_kabelsalat_graph_is_one_refusal_and_no_unknown_name_or_function() {
+    fn graph_names_are_checked_during_graph_compilation() {
         for source in ["$: K(K(x))", "$: K(foo(x))"] {
-            let diagnostics = check(source);
-            assert_eq!(
-                diagnostics
-                    .iter()
-                    .filter(|d| d.message.contains("kabelsalat"))
-                    .count(),
-                1,
-                "{source}: {diagnostics:?}"
-            );
-            assert!(
-                !diagnostics.iter().any(|d| d.message.starts_with("unknown")),
-                "{source}: {diagnostics:?}"
-            );
+            assert!(check(source).is_empty(), "{source}: {:?}", check(source));
         }
     }
 
     #[test]
-    fn a_capital_k_that_is_not_a_call_is_left_alone() {
-        for source in [
-            "const K = 1\n$: s(\"bd\").gain(K)",
-            "$: s(\"bd\").gain(myK)",
-            "$: s(\"bd\").gain(obj.K)",
-        ] {
-            assert!(
-                !check(source)
-                    .iter()
-                    .any(|d| d.message.contains("kabelsalat")),
-                "{source}: {:?}",
-                check(source)
-            );
-        }
+    fn graph_names_do_not_hide_unknown_names_outside_the_graph() {
+        let source = "$: K(sine(sFreq).out()).gain(missingGain)";
+        let diagnostics = check(source);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].message, "unknown name `missingGain`");
+
+        let source = "const K = 1\n$: s(\"bd\").gain(K)";
+        assert!(check(source).is_empty(), "{:?}", check(source));
     }
 
     #[test]

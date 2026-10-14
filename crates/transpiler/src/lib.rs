@@ -19,14 +19,15 @@ use oxc_ast::ast::{
     ExportDefaultDeclaration, ExportFromDeclaration, ExportNamedDeclaration, Expression,
     ForOfStatement, IfStatement, ImportDeclaration, ImportExpression, ImportMeta,
     JSXAttributeValue, JSXText, NewExpression, ObjectExpression, ObjectPropertyKind, Program,
-    RegExpLiteral, Statement, TemplateLiteral, VariableDeclarationKind,
+    RegExpLiteral, Statement, TemplateLiteral, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, VisitMut, walk, walk_mut};
 use oxc_codegen::{Codegen, CodegenOptions};
 use oxc_parser::Parser;
-use oxc_semantic::SemanticBuilder;
+use oxc_semantic::{Scoping, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType};
-use oxc_syntax::xml_entities::XML_ENTITIES;
+use oxc_syntax::{symbol::SymbolId, xml_entities::XML_ENTITIES};
+use std::collections::HashSet;
 use std::path::Path;
 
 mod arrange_marks;
@@ -1443,11 +1444,11 @@ pub fn setup_definitions(source: &str) -> SetupDefinitions {
         let mut names = collector.names;
         // A registered name is reachable exactly like a global one, so the
         // two lists are one list to a caller.
-        names.extend(collector.registrations.names);
+        let registrations = registration_hints_from_program(&parsed.program);
+        names.extend(registrations.names);
         SetupDefinitions {
             names,
-            has_dynamic_names: collector.has_dynamic_names
-                || collector.registrations.has_dynamic_names,
+            has_dynamic_names: collector.has_dynamic_names || registrations.has_dynamic_names,
             top_level_declarations: top_level_declarations(&parsed.program),
         }
     })
@@ -1509,7 +1510,6 @@ fn is_shared_global(expression: &Expression<'_>) -> bool {
 struct SetupCollector {
     names: Vec<String>,
     has_dynamic_names: bool,
-    registrations: RegistrationCollector,
 }
 
 impl SetupCollector {
@@ -1560,9 +1560,7 @@ impl<'a> Visit<'a> for SetupCollector {
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        if is_public_registration_call(call) {
-            self.registrations.collect_argument(call.arguments.first());
-        } else if call.callee.is_specific_member_access("Object", "assign")
+        if call.callee.is_specific_member_access("Object", "assign")
             && call
                 .arguments
                 .first()
@@ -1595,16 +1593,6 @@ impl<'a> Visit<'a> for SetupCollector {
     }
 }
 
-fn is_public_registration_call(call: &CallExpression<'_>) -> bool {
-    call.callee.is_specific_id("register")
-        || call
-            .callee
-            .is_specific_member_access("rustelScope", "register")
-        || call
-            .callee
-            .is_specific_member_access("globalThis", "register")
-}
-
 fn static_template_value<'a, 'b>(template: &'b TemplateLiteral<'a>) -> Option<&'b str> {
     if !template.expressions.is_empty() || template.quasis.len() != 1 {
         return None;
@@ -1612,13 +1600,36 @@ fn static_template_value<'a, 'b>(template: &'b TemplateLiteral<'a>) -> Option<&'
     template.quasis[0].value.cooked.map(|value| value.as_str())
 }
 
-#[derive(Default)]
-struct RegistrationCollector {
+struct RegistrationCollector<'s> {
+    scoping: &'s Scoping,
+    aliases: HashSet<SymbolId>,
     names: Vec<String>,
     has_dynamic_names: bool,
 }
 
-impl RegistrationCollector {
+impl RegistrationCollector<'_> {
+    fn is_registration(&self, expression: &Expression<'_>) -> bool {
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) => {
+                let symbol = identifier
+                    .reference_id
+                    .get()
+                    .and_then(|id| self.scoping.get_reference(id).symbol_id());
+                match symbol {
+                    Some(symbol) => self.aliases.contains(&symbol),
+                    None => identifier.name == "register",
+                }
+            }
+            expression => expression.as_member_expression().is_some_and(|member| {
+                member.static_property_name() == Some("register")
+                    && matches!(member.object().get_inner_expression(), Expression::Identifier(id)
+                        if matches!(id.name.as_str(), "window" | "globalThis" | "rustelScope")
+                            && id.reference_id.get().is_some_and(|reference|
+                                self.scoping.get_reference(reference).symbol_id().is_none()))
+            }),
+        }
+    }
+
     fn push(&mut self, name: &str) {
         // Keep this linear in source size. Hosts already place these names in
         // a set; deduplicating here with a scan would make a setup file full
@@ -1658,9 +1669,23 @@ impl RegistrationCollector {
     }
 }
 
-impl<'a> Visit<'a> for RegistrationCollector {
+impl<'a> Visit<'a> for RegistrationCollector<'_> {
+    fn visit_variable_declarator(&mut self, declaration: &VariableDeclarator<'a>) {
+        if let BindingPattern::BindingIdentifier(identifier) = &declaration.id
+            && let Some(symbol) = identifier.symbol_id.get()
+            && !self.scoping.symbol_is_mutated(symbol)
+            && declaration
+                .init
+                .as_ref()
+                .is_some_and(|init| self.is_registration(init))
+        {
+            self.aliases.insert(symbol);
+        }
+        walk::walk_variable_declarator(self, declaration);
+    }
+
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        if is_public_registration_call(call) {
+        if self.is_registration(&call.callee) {
             self.collect_argument(call.arguments.first());
         }
         walk::walk_call_expression(self, call);
@@ -1728,7 +1753,13 @@ pub fn awaits_in_code(source: &str) -> bool {
 }
 
 fn registration_hints_from_program(program: &Program<'_>) -> RegistrationHints {
-    let mut collector = RegistrationCollector::default();
+    let semantic = SemanticBuilder::new().build(program).semantic;
+    let mut collector = RegistrationCollector {
+        scoping: semantic.scoping(),
+        aliases: HashSet::new(),
+        names: Vec::new(),
+        has_dynamic_names: false,
+    };
     collector.visit_program(program);
     let final_expression_is_registration = program.body.last().is_some_and(|statement| {
         let Statement::ExpressionStatement(statement) = statement else {
@@ -1737,7 +1768,7 @@ fn registration_hints_from_program(program: &Program<'_>) -> RegistrationHints {
         let Expression::CallExpression(call) = &statement.expression else {
             return false;
         };
-        is_public_registration_call(call)
+        collector.is_registration(&call.callee)
     });
     RegistrationHints {
         names: collector.names,
@@ -2668,9 +2699,9 @@ fn kabelsalat_calls<'a>(source: &'a str, regexes: &RegexLiteralRanges) -> Vec<Ka
 ///
 /// The `m(…)` and `S(…)` patterns in a graph are lifted out as code, and the
 /// rest of the graph is reprinted and quoted as the template. A `K(` inside
-/// a graph or a lifted pattern is left as written; the runtime refuses `K`
-/// as it refuses `worklet`. KabelSalat calls in the later arguments are
-/// rewritten from the same listing, so the output stays linear in the source.
+/// a graph or a lifted pattern is left as written. KabelSalat calls in the
+/// later arguments are rewritten from the same listing, so the output stays
+/// linear in the source.
 fn rewrite_kabelsalat(source: &str, regexes_are_present: bool) -> String {
     let regexes = RegexLiteralRanges::parse_if_present(source, regexes_are_present);
     let mut output = String::with_capacity(source.len() + 32);
@@ -2684,7 +2715,7 @@ fn rewrite_kabelsalat(source: &str, regexes_are_present: bool) -> String {
             cursor = call.close + 1;
             continue;
         };
-        let (template, patterns) = extract_pattern_placeholders(graph.trim(), regexes_are_present);
+        let (template, patterns) = extract_pattern_placeholders(graph.trim());
         let template = if patterns.is_empty() {
             normalize_kabel_expression(&template)
         } else {
@@ -2704,60 +2735,62 @@ fn rewrite_kabelsalat(source: &str, regexes_are_present: bool) -> String {
     output
 }
 
-fn extract_pattern_placeholders(
-    expression: &str,
-    regexes_are_present: bool,
-) -> (String, Vec<String>) {
-    let bytes = expression.as_bytes();
-    let regexes = RegexLiteralRanges::parse_if_present(expression, regexes_are_present);
+/// Calls lifted into worklet inputs, paired with their pattern expressions.
+/// Only a bare `m` with a string literal is mini notation. Graph methods such
+/// as `fm` and `m` keep their arguments in the graph's lexical scope.
+#[derive(Default)]
+struct KabelPatternCalls(Vec<(std::ops::Range<usize>, std::ops::Range<usize>)>);
+
+impl<'a> Visit<'a> for KabelPatternCalls {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        let callee = call.callee.without_parentheses();
+        let is_wrap = callee.is_specific_id("S")
+            || matches!(callee, Expression::StaticMemberExpression(member) if member.property.name == "S");
+        let is_mini = callee.is_specific_id("m")
+            && call.arguments.first().is_some_and(|argument| {
+                argument.as_expression().is_some_and(|expression| {
+                    matches!(
+                        expression.without_parentheses(),
+                        Expression::StringLiteral(_)
+                    )
+                })
+            });
+        if is_wrap || is_mini {
+            let span = call.span;
+            let pattern = if is_wrap {
+                call.arguments.first().map_or_else(
+                    || span.end as usize - 1..span.end as usize - 1,
+                    |argument| {
+                        let span = argument.span();
+                        span.start as usize..span.end as usize
+                    },
+                )
+            } else {
+                span.start as usize..span.end as usize
+            };
+            self.0
+                .push((span.start as usize..span.end as usize, pattern));
+            return;
+        }
+        walk::walk_call_expression(self, call);
+    }
+}
+
+fn extract_pattern_placeholders(expression: &str) -> (String, Vec<String>) {
+    let allocator = Allocator::default();
+    let mut calls = KabelPatternCalls::default();
+    if let Ok(parsed) = Parser::new(&allocator, expression, SourceType::mjs()).parse_expression() {
+        calls.visit_expression(&parsed);
+    }
+    calls.0.sort_unstable_by_key(|(call, _)| call.start);
     let mut template = String::with_capacity(expression.len());
-    let mut patterns = Vec::new();
+    let mut patterns = Vec::with_capacity(calls.0.len());
     let mut cursor = 0usize;
-    let mut index = 0usize;
-    while index < bytes.len() {
-        if matches!(bytes[index], b'\'' | b'"' | b'`') {
-            index = scan_quoted(bytes, index, bytes[index]);
-            continue;
-        }
-        if bytes[index..].starts_with(b"//") || bytes[index..].starts_with(b"/*") {
-            index = scan_comment(expression, index);
-            continue;
-        }
-        if let Some(end) = regexes.end_at(index) {
-            index = end;
-            continue;
-        }
-        let name = if bytes[index..].starts_with(b"m(") {
-            Some(("m", index + 1))
-        } else if bytes[index..].starts_with(b"S(")
-            && !bytes
-                .get(index.wrapping_sub(1))
-                .is_some_and(is_identifier_byte)
-        {
-            Some(("S", index + 1))
-        } else {
-            None
-        };
-        let Some((name, open)) = name else {
-            index += 1;
-            continue;
-        };
-        let Some(close) = matching_delimiter(bytes, open, b'(', b')', &regexes) else {
-            break;
-        };
-        template.push_str(&expression[cursor..index]);
+    for (call, pattern) in calls.0 {
+        template.push_str(&expression[cursor..call.start]);
         template.push_str(&format!("pat[{}]", patterns.len()));
-        let pattern = if name == "S" {
-            split_top_level(&expression[open + 1..close], ',', &regexes, open + 1)
-                .first()
-                .map(|arg| arg.trim().to_string())
-                .unwrap_or_default()
-        } else {
-            expression[index..=close].to_string()
-        };
-        patterns.push(pattern);
-        cursor = close + 1;
-        index = cursor;
+        patterns.push(expression[pattern].to_string());
+        cursor = call.end;
     }
     template.push_str(&expression[cursor..]);
     (normalize_kabel_expression(&template), patterns)
@@ -3028,10 +3061,9 @@ fn collect_widgets(
         let Some(close) = matching_delimiter(bytes, open, b'(', b')', regexes) else {
             break;
         };
-        // Widgets inside a KabelSalat graph are not recorded: the call fails
-        // when the score runs, so no control there could drive it. The
-        // arguments after the graph are scanned, even when `K` is also a
-        // widget method.
+        // Widgets inside a KabelSalat graph belong to its source template,
+        // not to the score's controls. Arguments after the graph are scanned,
+        // even when `K` is also a widget method.
         if let Ok(call) = kabelsalat.binary_search_by_key(&name_start, |call| call.name) {
             index = kabelsalat[call].stringified().end;
             continue;
@@ -4189,6 +4221,33 @@ mod tests {
         assert!(unrelated.names.is_empty());
         assert!(!unrelated.has_dynamic_names);
         assert!(!unrelated.final_expression_is_registration);
+    }
+
+    #[test]
+    fn registration_aliases_follow_bindings_and_keep_static_names() {
+        let source = r#"
+            const rg = register;
+            const alias = rg;
+            alias('startFrom', (cycle, pat) => pat);
+            { const rg = () => {}; rg('unrelated', callback); }
+            ((register) => register('shadowed', callback))(() => {});
+            const browserRegister = window.register;
+            browserRegister(['endAt', 'playWhen'], callback);
+            rg('breakAt', callback)
+        "#;
+        let hints = registration_hints(source);
+        assert_eq!(hints.names, ["startFrom", "endAt", "playWhen", "breakAt"]);
+        assert!(!hints.has_dynamic_names);
+        assert!(hints.final_expression_is_registration);
+        assert_eq!(setup_definitions(source).names, hints.names);
+
+        let dynamic = registration_hints("const rg = register; rg(methodName, callback)");
+        assert!(dynamic.has_dynamic_names);
+        assert!(dynamic.final_expression_is_registration);
+        let reassigned =
+            registration_hints("let rg = register; rg = () => {}; rg('unrelated', callback)");
+        assert!(reassigned.names.is_empty());
+        assert!(!reassigned.final_expression_is_registration);
     }
 
     /// Deep nesting used to abort the process on a stack overflow rather than
@@ -5385,6 +5444,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn kabelsalat_keeps_graph_calls_in_their_lexical_scope() {
+        for expression in [
+            "sine(b).fm(sine(b), 2)",
+            "fm(sine(b))",
+            "sum(b)",
+            "obj.m('bd')",
+            "obj. /* member */ m('bd')",
+            "obj?.m('bd')",
+            "new m('bd')",
+            "m(b)",
+            "m(2)",
+            "m(`bd`)",
+            "m('b' + 'd')",
+            "obj['S'](b)",
+        ] {
+            let (_, patterns) = extract_pattern_placeholders(expression);
+            assert!(patterns.is_empty(), "{expression}: {patterns:?}");
+        }
+
+        let result = transpile_for_layout(
+            "K(() => { const b = 2; Node.prototype.fm = function(x) { return this.add(x); }; sine(b).fm(sine(b)).out(); })",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.output.contains(".fm(sine(b))"), "{}", result.output);
+        assert!(
+            unresolved_reads(&result.output)
+                .iter()
+                .all(|(name, _)| name != "b"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn kabelsalat_lifts_only_pattern_call_expressions() {
+        for expression in ["m('bd')", "m /* mini */ ('bd')", "m (('bd'))"] {
+            let (template, patterns) = extract_pattern_placeholders(expression);
+            assert_eq!(template, "pat[0]", "{expression}");
+            assert_eq!(patterns, [expression], "{expression}");
+        }
+        let (template, patterns) = extract_pattern_placeholders(
+            "add(sine(b).fm(b), m('0 1'), S /* pattern */ (note('c')), pattern.S(m('2 3')))",
+        );
+        assert_eq!(template, "add(sine(b).fm(b), pat[0], pat[1], pat[2])");
+        assert_eq!(patterns, ["m('0 1')", "note('c')", "m('2 3')"]);
+    }
+
     /// A chain of KabelSalat calls, each in the previous one's later
     /// arguments, is rewritten from one listing of the source.
     #[test]
@@ -5447,8 +5554,7 @@ mod tests {
         }
     }
 
-    /// A KabelSalat call in a pattern lifted out of a graph is left as code,
-    /// for the runtime to refuse.
+    /// A KabelSalat call in a pattern lifted out of a graph is left as code.
     #[test]
     fn a_kabelsalat_call_in_a_lifted_pattern_is_left_as_code() {
         assert_eq!(

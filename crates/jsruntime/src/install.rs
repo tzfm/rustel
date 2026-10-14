@@ -15,6 +15,8 @@ mod extensions;
 /// default build refuses the names instead, from `unsupported`.
 #[cfg(feature = "hydra")]
 mod hydra;
+pub(crate) mod kabelsalat;
+pub(crate) mod worklet;
 #[cfg(feature = "hydra")]
 pub use hydra::HYDRA_SCOPE_POLICY;
 mod native_surface;
@@ -45,6 +47,12 @@ pub fn reference_entries() -> impl Iterator<Item = &'static rustel_core::referen
         .chain(surface::REFERENCE_ENTRIES.iter())
         .chain(compat::REFERENCE_ENTRIES.iter())
         .chain(crate::surface::JOIN_REFERENCE_ENTRIES.iter())
+}
+
+/// Graph-scoped reference entries, separate from same-named pattern functions.
+pub fn kabelsalat_reference_entries()
+-> impl Iterator<Item = &'static rustel_core::reference::ReferenceEntry> {
+    kabelsalat::reference_entries()
 }
 
 fn install_logger<'js>(
@@ -101,6 +109,7 @@ impl JsRuntime {
         with_ctx(&self.ctx, |ctx| -> Result<(), String> {
             let surface = foundation::install(self, ctx.clone())?;
             install_logger(self, &ctx, &surface.globals)?;
+            kabelsalat::install(&ctx).map_err(|error| error.to_string())?;
             generators::install(self, ctx.clone(), &surface)?;
             #[cfg(feature = "extensions")]
             extensions::install(&ctx, &surface.proto, &surface.globals)?;

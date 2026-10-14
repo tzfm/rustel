@@ -265,6 +265,7 @@ fn live_gain_stays_after_nonlinear_fx_when_a_silent_voice_fades_in() {
             ..OscillatorControls::default()
         };
         controls.fx_stages[0] = Some(rustel_audio::FxStage {
+            kabel: None,
             stretch: None,
             transient: None,
             gain: 0.8,

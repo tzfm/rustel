@@ -41,6 +41,15 @@ impl ReferencePanel {
         panel
     }
 
+    /// Suggestions for the namespace available at the caret.
+    pub fn browse_in(reference: &Reference, query: &str, scope: ReferenceScope) -> Self {
+        let mut panel = Self::browse_for(reference, query);
+        panel.scope = scope;
+        panel.selected = 0;
+        panel.refresh(reference);
+        panel
+    }
+
     /// A word list instead of the reference: the names valid inside the
     /// string the caret stands in, searched for what is already typed.
     /// Enter puts the chosen name in the word's place.
@@ -164,6 +173,7 @@ impl ReferencePanel {
             query: String::new(),
             results: Vec::new(),
             snippets_last: false,
+            scope: ReferenceScope::All,
             selected: 0,
             rows: Vec::new(),
             sounds: Vec::new(),
@@ -322,7 +332,7 @@ impl ReferencePanel {
                 vocabulary.names.iter().take(count).map(String::as_str),
             );
         } else {
-            self.results = reference.search_with(&self.query, self.snippets_last);
+            self.results = reference.search_in(&self.query, self.snippets_last, self.scope);
         }
         self.rows = self.with_alias_rows(reference, self.grouped_rows(reference));
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));

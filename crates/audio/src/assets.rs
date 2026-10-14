@@ -51,8 +51,13 @@ unsafe impl<T: Copy + Send> Sync for AssetRing<T> {}
 impl<T: Copy> AssetRing<T> {
     #[cfg(any(feature = "device-audio", test))]
     pub fn new() -> Self {
-        let mut slots = Vec::with_capacity(ASSET_RING_CAPACITY);
-        slots.resize_with(ASSET_RING_CAPACITY, || std::cell::UnsafeCell::new(None));
+        Self::with_capacity(ASSET_RING_CAPACITY)
+    }
+
+    #[cfg(any(feature = "device-audio", test))]
+    fn with_capacity(capacity: usize) -> Self {
+        let mut slots = Vec::with_capacity(capacity);
+        slots.resize_with(capacity, || std::cell::UnsafeCell::new(None));
         Self {
             slots,
             head: AtomicUsize::new(0),
@@ -128,11 +133,122 @@ pub(crate) struct FxReverbInstall {
 #[derive(Clone, Copy)]
 pub(crate) struct ReturnedFxReverb(pub *mut crate::reverb::OrbitReverb);
 
+/// A producer-prepared graph and its return baton. Graph storage is never
+/// allocated or destroyed by the callback.
+#[derive(Clone, Copy)]
+pub(crate) struct KabelInstall {
+    pub graph: *mut rustel_kabel::Graph,
+}
+#[derive(Clone, Copy)]
+pub(crate) struct ReturnedKabel(pub *mut rustel_kabel::Graph);
+
+pub(crate) const MAX_KABEL_PROGRAMS: usize = 4096;
+
+/// Immutable graph code retained until every queued use has finished.
+pub(crate) struct PreparedKabelProgram {
+    pub program: rustel_kabel::Program,
+    pub until_frame: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ProgramInstall {
+    pub program: *mut PreparedKabelProgram,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ReturnedProgram(pub *mut PreparedKabelProgram);
+
+// SAFETY: the SPSC baton pass transfers unique ownership of each allocation.
+unsafe impl Send for ProgramInstall {}
+unsafe impl Send for ReturnedProgram {}
+
+// SAFETY: unique graph ownership moves through the same SPSC baton pass.
+unsafe impl Send for KabelInstall {}
+unsafe impl Send for ReturnedKabel {}
+
 // SAFETY: same SPSC baton pass as the sample pointers below.
 unsafe impl Send for ReverbInstall {}
 unsafe impl Send for ReturnedReverb {}
 unsafe impl Send for FxReverbInstall {}
 unsafe impl Send for ReturnedFxReverb {}
+
+const KABEL_RETIRING: usize = 1 << (usize::BITS - 1);
+
+/// Keeps prepared graph programs alive until a scheduling window has been
+/// published or discarded. Hold this on the producer across queue backpressure.
+#[derive(Default)]
+#[must_use = "Keep this reservation until prepared events are published or discarded"]
+pub struct KabelPublication {
+    channel: Option<std::sync::Arc<SampleChannel>>,
+}
+
+impl std::fmt::Debug for KabelPublication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KabelPublication")
+            .field("active", &self.channel.is_some())
+            .finish()
+    }
+}
+
+impl KabelPublication {
+    #[cfg(feature = "device-audio")]
+    pub(crate) fn is_active(&self) -> bool {
+        self.channel.is_some()
+    }
+
+    #[cfg(any(feature = "device-audio", test))]
+    pub(crate) fn new(channel: std::sync::Arc<SampleChannel>) -> Self {
+        let state = &channel.active_kabel_publications;
+        let mut current = state.load(Ordering::Acquire);
+        loop {
+            if current == KABEL_RETIRING {
+                // Only the producer waits. Callback retirement is bounded and
+                // releases its reservation during unwinding as well.
+                std::thread::yield_now();
+                current = state.load(Ordering::Acquire);
+                continue;
+            }
+            assert!(
+                current < KABEL_RETIRING - 1,
+                "too many KabelSalat publications"
+            );
+            match state.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+        Self {
+            channel: Some(channel),
+        }
+    }
+}
+
+impl Drop for KabelPublication {
+    fn drop(&mut self) {
+        if let Some(channel) = &self.channel {
+            // Every event publication precedes this release. The callback reads
+            // it before scanning event rings, so an ended reservation cannot
+            // hide an event that still references its program.
+            channel
+                .active_kabel_publications
+                .fetch_sub(1, Ordering::Release);
+        }
+    }
+}
+
+pub(crate) struct KabelRetirement<'a>(&'a AtomicUsize);
+
+impl Drop for KabelRetirement<'_> {
+    fn drop(&mut self) {
+        // Returns precede the next producer's acquisition and cache reclamation.
+        self.0.store(0, Ordering::Release);
+    }
+}
 
 /// Both directions plus the leak counter, shared by the device (producer
 /// side) and the callback (consumer side).
@@ -145,6 +261,14 @@ pub(crate) struct SampleChannel {
     pub fx_reverb_returns: AssetRing<ReturnedFxReverb>,
     /// Stage reverbs refused by the install queue or callback byte budget.
     pub fx_reverb_refusals: AtomicU64,
+    pub kabel_installs: AssetRing<KabelInstall>,
+    pub kabel_returns: AssetRing<ReturnedKabel>,
+    pub program_installs: AssetRing<ProgramInstall>,
+    pub program_returns: AssetRing<ReturnedProgram>,
+    pub program_resident_bytes: AtomicUsize,
+    pub active_kabel_publications: AtomicUsize,
+    pub kabel_refusals: AtomicU64,
+    pub kabel_resident_bytes: AtomicUsize,
     /// Stage reverb bytes currently admitted by the callback, including
     /// boxes leased to active voices.
     pub fx_reverb_resident_bytes: AtomicUsize,
@@ -156,6 +280,15 @@ pub(crate) struct SampleChannel {
 }
 
 impl SampleChannel {
+    /// Excludes new producer reservations while the callback returns idle state.
+    /// The callback makes one attempt and never waits for a producer.
+    pub(crate) fn try_kabel_retirement(&self) -> Option<KabelRetirement<'_>> {
+        self.active_kabel_publications
+            .compare_exchange(0, KABEL_RETIRING, Ordering::AcqRel, Ordering::Relaxed)
+            .ok()
+            .map(|_| KabelRetirement(&self.active_kabel_publications))
+    }
+
     #[cfg(any(feature = "device-audio", test))]
     pub fn new() -> Self {
         Self {
@@ -166,6 +299,14 @@ impl SampleChannel {
             fx_reverb_installs: AssetRing::new(),
             fx_reverb_returns: AssetRing::new(),
             fx_reverb_refusals: AtomicU64::new(0),
+            kabel_installs: AssetRing::new(),
+            kabel_returns: AssetRing::new(),
+            program_installs: AssetRing::with_capacity(512),
+            program_returns: AssetRing::with_capacity(512),
+            program_resident_bytes: AtomicUsize::new(0),
+            active_kabel_publications: AtomicUsize::new(0),
+            kabel_refusals: AtomicU64::new(0),
+            kabel_resident_bytes: AtomicUsize::new(0),
             fx_reverb_resident_bytes: AtomicUsize::new(0),
             leaked: AtomicU64::new(0),
         }
@@ -182,7 +323,29 @@ impl SampleChannel {
     /// Like [`Self::reclaim`], and `returned_fx` sees each returned stage
     /// reverb before it is freed. The producer uses it to drop the cached
     /// fingerprint of a box that the callback evicted or refused.
-    pub fn reclaim_with_fx(&self, mut returned_fx: impl FnMut(*mut crate::reverb::OrbitReverb)) {
+    pub fn reclaim_with_fx(&self, returned_fx: impl FnMut(*mut crate::reverb::OrbitReverb)) {
+        self.reclaim_with_processors(returned_fx, |_| {});
+    }
+
+    pub fn reclaim_with_processors(
+        &self,
+        returned_fx: impl FnMut(*mut crate::reverb::OrbitReverb),
+        returned_kabel: impl FnMut(*mut rustel_kabel::Graph),
+    ) {
+        self.reclaim_with_programs(returned_fx, returned_kabel, |_| {});
+    }
+
+    pub fn reclaim_with_programs(
+        &self,
+        mut returned_fx: impl FnMut(*mut crate::reverb::OrbitReverb),
+        mut returned_kabel: impl FnMut(*mut rustel_kabel::Graph),
+        mut returned_program: impl FnMut(*mut PreparedKabelProgram),
+    ) {
+        while let Some(returned) = self.program_returns.pop() {
+            returned_program(returned.0);
+            // SAFETY: the callback returned the unique program baton.
+            drop(unsafe { Box::from_raw(returned.0) });
+        }
         while let Some(returned) = self.returns.pop() {
             // SAFETY: the pointer completed the full baton pass - boxed by
             // the producer, installed and displaced by the callback - and
@@ -191,6 +354,11 @@ impl SampleChannel {
         }
         while let Some(returned) = self.reverb_returns.pop() {
             // SAFETY: same pass for reverbs.
+            drop(unsafe { Box::from_raw(returned.0) });
+        }
+        while let Some(returned) = self.kabel_returns.pop() {
+            returned_kabel(returned.0);
+            // SAFETY: the callback returned unique ownership to the producer.
             drop(unsafe { Box::from_raw(returned.0) });
         }
         while let Some(returned) = self.fx_reverb_returns.pop() {
@@ -215,6 +383,14 @@ impl Drop for SampleChannel {
         while let Some(install) = self.reverb_installs.pop() {
             // SAFETY: never reached the consumer; unique ownership here.
             drop(unsafe { Box::from_raw(install.reverb) });
+        }
+        while let Some(install) = self.program_installs.pop() {
+            // SAFETY: this program never left the producer queue.
+            drop(unsafe { Box::from_raw(install.program) });
+        }
+        while let Some(install) = self.kabel_installs.pop() {
+            // SAFETY: the install never left the producer queue.
+            drop(unsafe { Box::from_raw(install.graph) });
         }
         while let Some(install) = self.fx_reverb_installs.pop() {
             // SAFETY: never reached the consumer; unique ownership here.
@@ -348,6 +524,145 @@ mod tests {
         )))
     }
 
+    fn boxed_graph() -> *mut rustel_kabel::Graph {
+        let program = rustel_kabel::Program::from_json(
+            r#"{"nodes":[{"type":"n","value":0.25},{"type":"output","inputs":[0]}]}"#,
+        )
+        .expect("graph program");
+        Box::into_raw(Box::new(
+            rustel_kabel::Graph::new(&program, 8_000.0).expect("graph"),
+        ))
+    }
+
+    #[test]
+    fn graph_baton_crosses_threads_and_returns_unique_ownership() {
+        let channel = std::sync::Arc::new(SampleChannel::new());
+        let pointer = boxed_graph();
+        channel
+            .kabel_installs
+            .push(KabelInstall { graph: pointer })
+            .ok()
+            .expect("install");
+        let consumer_channel = std::sync::Arc::clone(&channel);
+        std::thread::spawn(move || {
+            let install = consumer_channel
+                .kabel_installs
+                .pop()
+                .expect("published graph");
+            // SAFETY: this consumer uniquely owns the popped install baton.
+            let mut graph = unsafe { Box::from_raw(install.graph) };
+            assert_eq!(graph.process([0.0; 2], 1.0, 0.0), [0.25, 0.0]);
+            let returned = ReturnedKabel(Box::into_raw(graph));
+            consumer_channel
+                .kabel_returns
+                .push(returned)
+                .ok()
+                .expect("return");
+        })
+        .join()
+        .expect("consumer");
+        let mut returned = Vec::new();
+        channel.reclaim_with_processors(|_| {}, |graph| returned.push(graph));
+        assert_eq!(returned, [pointer]);
+        channel.reclaim_with_processors(|_| {}, |_| panic!("graph returned twice"));
+    }
+
+    fn boxed_program() -> *mut PreparedKabelProgram {
+        Box::into_raw(Box::new(PreparedKabelProgram {
+            program: rustel_kabel::Program::from_json(
+                r#"{"nodes":[{"type":"n","value":0.25},{"type":"output","inputs":[0]}]}"#,
+            )
+            .expect("program"),
+            until_frame: 128,
+        }))
+    }
+
+    #[test]
+    fn program_baton_crosses_threads_and_returns_unique_ownership() {
+        let channel = std::sync::Arc::new(SampleChannel::new());
+        let pointer = boxed_program();
+        channel
+            .program_installs
+            .push(ProgramInstall { program: pointer })
+            .ok()
+            .expect("install");
+        let consumer = std::sync::Arc::clone(&channel);
+        std::thread::spawn(move || {
+            let install = consumer.program_installs.pop().expect("program install");
+            // SAFETY: popping transferred the unique baton to this consumer.
+            let program = unsafe { Box::from_raw(install.program) };
+            assert_eq!(program.until_frame, 128);
+            consumer
+                .program_returns
+                .push(ReturnedProgram(Box::into_raw(program)))
+                .ok()
+                .expect("return");
+        })
+        .join()
+        .expect("consumer");
+        let mut returned = Vec::new();
+        channel.reclaim_with_programs(|_| {}, |_| {}, |program| returned.push(program));
+        assert_eq!(returned, [pointer]);
+        channel.reclaim_with_programs(|_| {}, |_| {}, |_| panic!("program returned twice"));
+    }
+
+    #[test]
+    fn retirement_excludes_publication_and_orders_returned_storage() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        let channel = Arc::new(SampleChannel::new());
+        let retirement = channel
+            .try_kabel_retirement()
+            .expect("idle publication counter");
+        assert!(channel.try_kabel_retirement().is_none());
+        let started = Arc::new(AtomicBool::new(false));
+        let acquired = Arc::new(AtomicBool::new(false));
+        let producer_channel = Arc::clone(&channel);
+        let producer_started = Arc::clone(&started);
+        let producer_acquired = Arc::clone(&acquired);
+        let producer = std::thread::spawn(move || {
+            producer_started.store(true, Ordering::Release);
+            let _publication = KabelPublication::new(Arc::clone(&producer_channel));
+            producer_acquired.store(true, Ordering::Release);
+            let returned = producer_channel
+                .kabel_returns
+                .pop()
+                .expect("retired before admission");
+            // SAFETY: the callback transferred unique ownership through the ring.
+            drop(unsafe { Box::from_raw(returned.0) });
+            assert!(producer_channel.try_kabel_retirement().is_none());
+        });
+        while !started.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        assert!(!acquired.load(Ordering::Acquire));
+        channel
+            .kabel_returns
+            .push(ReturnedKabel(boxed_graph()))
+            .ok()
+            .expect("return");
+        drop(retirement);
+        producer.join().expect("producer");
+        assert!(acquired.load(Ordering::Acquire));
+        assert!(channel.try_kabel_retirement().is_some());
+    }
+
+    #[test]
+    fn retirement_unwind_releases_producer_admission() {
+        let channel = std::sync::Arc::new(SampleChannel::new());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _retirement = channel.try_kabel_retirement().unwrap();
+            panic!("retirement interrupted");
+        }));
+        assert!(result.is_err());
+        let first = KabelPublication::new(std::sync::Arc::clone(&channel));
+        let second = KabelPublication::new(std::sync::Arc::clone(&channel));
+        assert!(channel.try_kabel_retirement().is_none());
+        drop(first);
+        assert!(channel.try_kabel_retirement().is_none());
+        drop(second);
+        assert!(channel.try_kabel_retirement().is_some());
+    }
+
     #[test]
     fn channel_drop_frees_each_queued_baton() {
         let channel = SampleChannel::new();
@@ -372,6 +687,30 @@ mod tests {
         channel.reverb_returns.push(orbit).ok().expect("push");
         let stage = ReturnedFxReverb(boxed_room());
         channel.fx_reverb_returns.push(stage).ok().expect("push");
+        channel
+            .kabel_installs
+            .push(KabelInstall {
+                graph: boxed_graph(),
+            })
+            .ok()
+            .expect("push");
+        channel
+            .kabel_returns
+            .push(ReturnedKabel(boxed_graph()))
+            .ok()
+            .expect("push");
+        channel
+            .program_installs
+            .push(ProgramInstall {
+                program: boxed_program(),
+            })
+            .ok()
+            .expect("push");
+        channel
+            .program_returns
+            .push(ReturnedProgram(boxed_program()))
+            .ok()
+            .expect("push");
         drop(channel); // must not leak (miri/asan would flag)
     }
 }

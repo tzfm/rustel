@@ -2637,10 +2637,16 @@ fn play_tip(error: &clap::Error) -> Option<String> {
 /// draws, or a JSON projection of the entry for scripting.
 #[cfg(feature = "studio")]
 fn run_doc(name: &str, json: bool) -> Result<(), RuntimeError> {
-    use rustel_studio::reference::{Reference, entry_body};
+    use rustel_studio::reference::{Reference, ReferenceScope, entry_body};
     let reference = Reference::load_all();
-    let entry = reference
-        .resolve(name)
+    let resolved = reference.resolve(name);
+    // Score entries take precedence; graph-only names follow the Hydra fallback.
+    let entry = resolved
+        .filter(|&index| {
+            reference.entry(index).is_some_and(|entry| {
+                reference.lookup_in(&entry.name, ReferenceScope::Kabelsalat) != Some(index)
+            })
+        })
         .and_then(|index| reference.entry(index))
         .cloned();
     #[cfg(feature = "hydra")]
@@ -2662,6 +2668,7 @@ fn run_doc(name: &str, json: bool) -> Result<(), RuntimeError> {
             keywords: Vec::new(),
         })
     });
+    let entry = entry.or_else(|| resolved.and_then(|index| reference.entry(index)).cloned());
     let entry =
         entry.ok_or_else(|| RuntimeError::Message(format!("no reference entry for `{name}`")))?;
     if json {

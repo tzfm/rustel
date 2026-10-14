@@ -49,15 +49,18 @@ pub mod warp;
 mod wavetable_kernel;
 pub mod zzfx;
 
+pub use assets::KabelPublication;
+pub use rustel_kabel;
+
 pub use backend::{
-    AudioBackend, BYTEBEAT_EXPRESSIONS, BusMod, CompressorControls, DelayControls, DuckControls,
-    DuckTarget, EnvMod, Envelope, EnvelopeParam, FilterControls, FilterEnvelope, FilterLfoKind,
-    FilterStages, FmControls, FmOperator, FmRoute, FmWave, FxStage, LfoMod, MAX_BUSES,
-    MAX_DUCK_TARGETS, MAX_FM_OPERATORS, MAX_FM_ROUTES, MAX_FX_STAGES, MAX_PARTIALS, MAX_VOICE_MODS,
-    ModTarget, ModulatorParam, OnsetEvent, OscillatorControls, PartialsControls, PhaserControls,
-    PitchEnvControls, PulseWidthLfoControls, ReverbControls, ShapeControls, StaticBiquad,
-    SynthSource, TransientControls, TremoloControls, VibratoControls, VowelControls, Waveform,
-    WavetableControls, fm_operator_slot,
+    AudioBackend, BYTEBEAT_EXPRESSIONS, BusMod, CompactKabelControls, CompressorControls,
+    DelayControls, DuckControls, DuckTarget, EnvMod, Envelope, EnvelopeParam, FilterControls,
+    FilterEnvelope, FilterLfoKind, FilterStages, FmControls, FmOperator, FmRoute, FmWave, FxStage,
+    KabelControls, LfoMod, MAX_BUSES, MAX_DUCK_TARGETS, MAX_FM_OPERATORS, MAX_FM_ROUTES,
+    MAX_FX_STAGES, MAX_PARTIALS, MAX_VOICE_MODS, ModTarget, ModulatorParam, OnsetEvent,
+    OscillatorControls, PartialsControls, PhaserControls, PitchEnvControls, PulseWidthLfoControls,
+    ReverbControls, ShapeControls, StaticBiquad, SynthSource, TransientControls, TremoloControls,
+    VibratoControls, VowelControls, Waveform, WavetableControls, fm_operator_slot,
 };
 pub use buffer::{AudioBufferError, AudioBufferPreference, AudioBufferRange};
 pub use convolution_kernel::{ConvolutionKernelKind, selected_convolution_kernel_kind};
@@ -98,8 +101,8 @@ pub use sample::{
     format_sample_bytes, sample_pcm_ceiling, set_sample_pcm_ceiling,
 };
 pub use scalar::{
-    MAX_ACTIVE_VOICES, MAX_CONFIGURABLE_POLYPHONY, MAX_ORBITS, MAX_PENDING_EVENTS, MAX_POLYPHONY,
-    ScalarBackend,
+    MAX_ACTIVE_VOICES, MAX_CONFIGURABLE_POLYPHONY, MAX_KABEL_BYTES, MAX_KABEL_GRAPHS, MAX_ORBITS,
+    MAX_PENDING_EVENTS, MAX_POLYPHONY, ScalarBackend,
 };
 pub use supersaw_kernel::{SupersawKernelKind, selected_supersaw_kernel_kind};
 pub use warp::{WarpMode, warp_phase};

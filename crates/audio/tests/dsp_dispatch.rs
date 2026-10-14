@@ -164,6 +164,7 @@ fn render_voice(dispatch: DspDispatch, custom: bool) -> Vec<f32> {
     });
     event.controls.reverb = Some(room);
     event.controls.fx_stages[0] = Some(FxStage {
+        kabel: None,
         stretch: None,
         transient: None,
         gain: 1.0,

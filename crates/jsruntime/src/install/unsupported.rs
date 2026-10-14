@@ -50,37 +50,40 @@ pub(crate) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
     },
     ReferenceEntry {
         name: "K",
-        synonyms: &["worklet"],
-        summary: "unsupported Kabelsalat DSP call",
-        description: "Rustel does not implement Strudel's Kabelsalat custom-DSP language. Calling K() or worklet() causes a score evaluation error; during live playback, the last successful score keeps playing. Use Rustel's built-in synths for synthesis.",
-        params: &[],
-        examples: &[],
-        tags: &["rustel", "audio"],
-        no_autocomplete: true,
+        synonyms: &[],
+        summary: "build a KabelSalat audio graph",
+        description: "Runs a KabelSalat graph for each event. Pass a graph expression or a callback containing graph code. Use sFreq for the event frequency and sGate for its gate. End each output with .out(). Use audioin() to process the sound entering this stage. K serializes the graph code for worklet; worklet itself accepts source text, not a callback. The graph runs in the native audio engine. Mondo syntax and external MIDI or mouse graph controls are not supported.\n\nMethods installed through register() have an underscore bypass. For example, ._abs() passes the signal through unchanged instead of applying .abs(). The standalone _ helper is an alias for n, the constant node constructor.",
+        params: &[ReferenceParam {
+            name: "graph",
+            r#type: "expression | function",
+            description: "KabelSalat graph code. Use S(pattern) for pattern inputs.",
+        }],
+        examples: &["note(\"c3 e3 g3\").K(sine(sFreq).mul(sGate).out())"],
+        tags: &["kabelsalat", "audio"],
+        no_autocomplete: false,
         deprecated: false,
         origin: "rustel",
     },
     ReferenceEntry {
-        name: "S",
+        name: "worklet",
         synonyms: &[],
-        summary: "unsupported Kabelsalat DSP call",
-        description: "An unsupported Kabelsalat call. Calling S() causes a score evaluation error; during live playback, the last successful score keeps playing.",
-        params: &[],
-        examples: &[],
-        tags: &["rustel", "audio"],
-        no_autocomplete: true,
-        deprecated: false,
-        origin: "rustel",
-    },
-    ReferenceEntry {
-        name: "audioin",
-        synonyms: &[],
-        summary: "unsupported; use Rustel's in input",
-        description: "An unsupported Kabelsalat call. Calling audioin() causes a score evaluation error; during live playback, the last successful score keeps playing. Use s(\"in\") for Rustel audio input.",
-        params: &[],
-        examples: &[],
-        tags: &["rustel", "external_io"],
-        no_autocomplete: true,
+        summary: "run KabelSalat graph source text",
+        description: "Runs KabelSalat source text for each event. This is the source-text form emitted by K. Use K(expression) or K(() => { ... }) to write graph code directly; worklet does not accept a callback. Inside the source text, sFreq and sGate describe the current event, and pat contains the values of any additional input patterns in argument order. S(pattern) extraction belongs to K and is not performed inside a worklet source string. The graph runs in the native audio engine.",
+        params: &[
+            ReferenceParam {
+                name: "source",
+                r#type: "string",
+                description: "KabelSalat graph statements as a single-quoted string; double quotes denote mini-notation. Call .out() to connect each output.",
+            },
+            ReferenceParam {
+                name: "...patterns",
+                r#type: "Pattern | string | number",
+                description: "Optional input patterns. Their event values are available as pat[0], pat[1], and so on.",
+            },
+        ],
+        examples: &["note(\"c3 e3 g3\").worklet('sine(sFreq).mul(sGate).out()')"],
+        tags: &["kabelsalat", "audio"],
+        no_autocomplete: false,
         deprecated: false,
         origin: "rustel",
     },
@@ -121,13 +124,12 @@ fn refuse<'js>(
             &format!("{name}() is not supported."),
         ));
     }
-    let public_name = if name == "worklet" { "K" } else { name };
-    Err(rquickjs::Exception::throw_message(
-        &ctx,
-        &format!(
-            "{public_name}() needs kabelsalat, strudel.cc's custom-DSP language, which this engine does not implement. The score will not run until that chain is removed. Live, the last good score keeps playing."
-        ),
-    ))
+    let message = if name == "K" {
+        "K() expects graph code, for example K(sine(220).out())".to_string()
+    } else {
+        format!("{name}() is available inside K() graph code")
+    };
+    Err(rquickjs::Exception::throw_message(&ctx, &message))
 }
 
 /// The visuals names, in a build with no visuals.
@@ -201,15 +203,7 @@ pub(super) fn install<'js>(
     #[cfg(feature = "hydra")]
     let _ = runtime;
 
-    for name in [
-        "K",
-        "worklet",
-        "audioin",
-        "S",
-        "loadOrc",
-        "getDuration",
-        "getDur",
-    ] {
+    for name in ["K", "audioin", "S", "loadOrc", "getDuration", "getDur"] {
         let current: rquickjs::Value = globals.get(name).map_err(|error| error.to_string())?;
         if !current.is_undefined() {
             continue;

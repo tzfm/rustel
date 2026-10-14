@@ -1954,6 +1954,7 @@ const REFERENCE_ROWS: &[Row] = &[
     Row::ReferenceCategory(Category::FmMatrix),
     Row::ReferenceCategory(Category::Bind),
     Row::ReferenceCategory(Category::Internals),
+    Row::ReferenceCategory(Category::Kabelsalat),
 ];
 
 /// Cache controls at the top of the Sources page, before imports and
@@ -2179,6 +2180,7 @@ impl Row {
             Self::ReferenceCategory(Category::FmMatrix) => "FM routing matrix",
             Self::ReferenceCategory(Category::Bind) => "bind & join",
             Self::ReferenceCategory(Category::Internals) => "pattern internals",
+            Self::ReferenceCategory(Category::Kabelsalat) => "KabelSalat",
         }
     }
 
@@ -2267,6 +2269,9 @@ impl Row {
             }
             Self::ReferenceCategory(Category::Internals) => {
                 "withHap, splitQueries and other hap plumbing · tag:internals lists them anyway"
+            }
+            Self::ReferenceCategory(Category::Kabelsalat) => {
+                "K() graphs, nodes and inputs · tag:kabelsalat lists them anyway"
             }
         }
     }
@@ -7502,7 +7507,7 @@ mod tests {
             Category::ALL
         );
         sheet.key(KeyCode::Left, &mut settings, &features);
-        assert!(settings.shows_category(Category::Internals));
+        assert!(settings.shows_category(Category::Kabelsalat));
     }
 
     #[test]

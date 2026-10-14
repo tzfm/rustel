@@ -40,6 +40,43 @@ fn direct_gain_lpf_and_lpq_follow_distinct_native_cells() {
 }
 
 #[test]
+fn graph_sources_and_effects_keep_existing_slider_bindings_through_gc_and_updates() {
+    let runtime = runtime();
+    for expression in [
+        "K(sine(sFreq).out()).gain(sliderWithID('graphGain', .5)).lpf(sliderWithID('graphFilter', 800))",
+        "s('sine').gain(sliderWithID('graphGain', .5)).lpf(sliderWithID('graphFilter', 800)).worklet('sine(sFreq).out()')",
+        "s('sine').gain(sliderWithID('graphGain', .5)).lpf(sliderWithID('graphFilter', 800)).FX(K(audioin().out()))",
+    ] {
+        evaluate(&runtime, expression);
+        let bindings = [
+            runtime.slider_binding("graphGain").unwrap(),
+            runtime.slider_binding("graphFilter").unwrap(),
+            0,
+        ];
+        runtime.run_gc();
+        runtime.run_gc();
+        assert!(
+            query(&runtime)
+                .iter()
+                .all(|hap| hap.live_controls == bindings),
+            "{expression}"
+        );
+        assert!(runtime.set_slider_value("graphGain", 0.75).unwrap());
+        assert!(runtime.set_slider_value("graphFilter", 1600.0).unwrap());
+        let haps = query(&runtime);
+        assert!(!haps.is_empty(), "{expression}");
+        assert!(
+            haps.iter().all(|hap| {
+                hap.live_controls == bindings
+                    && hap.value.get("gain").and_then(rustel_core::Value::as_f64) == Some(0.75)
+                    && hap.value.get("cutoff").and_then(rustel_core::Value::as_f64) == Some(1600.0)
+            }),
+            "{expression}"
+        );
+    }
+}
+
+#[test]
 fn pitch_combinators_after_sliders_keep_their_bound_controls_on_every_voice() {
     let runtime = runtime();
     for expression in [
@@ -103,6 +140,8 @@ fn transformed_and_overwritten_values_cannot_retarget_sustained_voices() {
         "s('sine').lpf(sliderWithID('x', 800)).lpf(800)",
         "s('sine').gain(sliderWithID('x', .5)).fmap(x => x)",
         "s('sine').n(sliderWithID('x', 2))",
+        "K(sine(sFreq).out()).gain(sliderWithID('x', .5)).fmap(x => x)",
+        "s('sine').gain(sliderWithID('x', .5)).fmap(x => x).worklet('sine(sFreq).out()')",
     ] {
         evaluate(&runtime, expression);
         assert!(

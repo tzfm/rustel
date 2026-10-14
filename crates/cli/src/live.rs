@@ -2136,17 +2136,15 @@ pub(super) fn play_live(
         let mut pushed_ui_ids = Vec::new();
         let mut reverbs = rustel_audio::LiveReverbBatch::default();
         let mut push_audio = |event: rustel_audio::QueuedAudioEvent| {
-            let pushed = device.push(event);
-            if pushed {
-                reverbs.observe(&device, &event);
-                if ui_events_enabled {
-                    pushed_ui_ids.push(rustel_runtime::ui_events::UiAcceptedOnset {
-                        generation: event.generation,
-                        onset_id: event.onset_id,
-                        frequency_hz: Some(event.freq_hz),
-                        gain: Some(event.gain),
-                    });
-                }
+            reverbs.observe_prepared(&device, &event);
+            let pushed = device.push(event.clone());
+            if pushed && ui_events_enabled {
+                pushed_ui_ids.push(rustel_runtime::ui_events::UiAcceptedOnset {
+                    generation: event.generation,
+                    onset_id: event.onset_id,
+                    frequency_hz: Some(event.freq_hz),
+                    gain: Some(event.gain),
+                });
             }
             pushed
         };
@@ -2170,27 +2168,30 @@ pub(super) fn play_live(
         };
         let step_result = first_install.step(session, |session| {
             if reload {
-                producer.step_with_clock(
+                producer.step_with_clock_and_preparation(
                     session,
                     elapsed,
                     || device.render_frontier_seconds(),
                     sample_rate,
-                    &mut set_generation,
-                    &mut push_audio,
-                )
-            } else if ui_events_enabled || device.generation() != session.generation() {
-                producer.step_unwatched_with_clock_and_cutover(
-                    session,
-                    || device.render_frontier_seconds(),
-                    sample_rate,
+                    |events| {
+                        device
+                            .prepare_kabel_events(events)
+                            .map_err(rustel_runtime::RuntimeError::ResourceLimit)
+                    },
                     &mut set_generation,
                     &mut push_audio,
                 )
             } else {
-                producer.step_unwatched_with_clock(
+                producer.step_unwatched_with_clock_and_cutover_and_preparation(
                     session,
                     || device.render_frontier_seconds(),
                     sample_rate,
+                    |events| {
+                        device
+                            .prepare_kabel_events(events)
+                            .map_err(rustel_runtime::RuntimeError::ResourceLimit)
+                    },
+                    &mut set_generation,
                     &mut push_audio,
                 )
             }

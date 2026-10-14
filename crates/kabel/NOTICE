@@ -1,0 +1,4 @@
+The DSP algorithms in this crate are adapted from KabelSalat by Felix Roos
+(https://github.com/felixroos/kabelsalat), licensed under AGPL-3.0-or-later.
+KabelSalat's synthesizer builds on NoiseCraft by Maxime Chevalier-Boisvert
+(https://github.com/maximecb/noisecraft).

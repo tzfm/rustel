@@ -80,6 +80,7 @@ mod report_tests {
                 fx_reverb_returns: 6,
                 fx_reverb_refusals: 0,
                 leaked: 7,
+                ..AssetQueuePressureSnapshot::default()
             },
             ..LiveDeviceReport::default()
         }

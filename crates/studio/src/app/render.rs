@@ -59,11 +59,11 @@ struct VisualReadings {
     hydra_webcam: Option<rustel_runtime::hydra::HydraWebcamStatus>,
 }
 
-/// The smart action's popup as the frame draws it: the cell it hangs from,
+/// The quick action's popup as the frame draws it: the cell it hangs from,
 /// its rows, and the caret in its form.
 type SmartPopup = ((u16, u16), Vec<String>, Option<(u16, u16)>);
 
-/// What sits over the view - the precision slider, the smart action, the
+/// What sits over the view - the precision slider, the quick action, the
 /// replay edit and help - and the theme editor, lent to the paint half for
 /// the frame and handed back once it is painted.
 struct Overlays {
@@ -1628,7 +1628,7 @@ impl App {
     }
 
     /// The dialogs over the score - the precision slider, the replay edit,
-    /// the smart action - then help over all of it, and on the zen row the
+    /// the quick action - then help over all of it, and on the zen row the
     /// piano's indicator, or the notes it has kept when no pulse is lit.
     fn paint_overlays(
         &self,

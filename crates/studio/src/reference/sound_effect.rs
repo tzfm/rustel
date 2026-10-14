@@ -5,7 +5,7 @@
 
 use rustel_core::controls::canonical_control_name;
 
-use super::Reference;
+use super::{Reference, ReferenceScope};
 
 /// What a call declares about the sounds of its receiver. The caller weighs
 /// these facts against the argument actually given.
@@ -38,7 +38,10 @@ impl Reference {
             });
         }
         let renumbers = control == Some("n");
-        let Some(entry) = self.resolve(callee).and_then(|index| self.entry(index)) else {
+        let Some(entry) = self
+            .lookup_in(callee, ReferenceScope::Pattern)
+            .and_then(|index| self.entry(index))
+        else {
             return control.map(|_| SoundEffect {
                 renumbers,
                 ..SoundEffect::default()

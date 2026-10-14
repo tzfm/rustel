@@ -1,0 +1,25 @@
+/*
+  @by Aria (@glossing) and Strudel contributors
+  @origin upstream docs
+  @source https://codeberg.org/uzu/strudel/src/commit/a3302cf16746d2f6f7c706be47f1ca85db497aa5/packages/core/pattern.mjs#L4446
+  @license AGPL-3.0-or-later
+  SPDX-License-Identifier: AGPL-3.0-or-later
+  @duration 8
+  @changes 2026-10-13: Source code unmodified except for removed JSDoc prefixes.
+
+Copyright (C) 2025 Strudel contributors - see <https://codeberg.org/uzu/strudel/src/branch/main/packages/core/pattern.mjs>
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public License for more details. You should have received a copy of the GNU Affero General Public License along with this program.  If not, see <https://www.gnu.org/licenses/>.
+*/
+note("A c e".fast(4)).transpose("<0 2 4 6 8>")
+  .scale("F:minor").transpose("12")
+  .s("saw")
+  .K(
+    // audioin().mul(sGate.adsr(0.001, 0.3, 0, 0.2)) // as effect
+    saw(saw(sFreq / "2!3 16").mul(8).add(sFreq).lag("0!3 0.1")).mul(0.3) // as source
+    .mul(sGate.adsr(0, 0.15, 0.5, "0.1!3 1"))
+    .lpf(sGate.adsr(0, 0.2, 0.3, 0.2).mul(1).add(0))
+    .add(x => x.delay(S("0.3 0.2".fast(2))).mul(0.7))
+    .add(x => x.delay("0.03 [0.08 0.01] 0.01 0.013").mul(0.77)).mul(0.7)
+    .add(x => x.delay(.13).mul(0.7))
+    .out()
+  )

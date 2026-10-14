@@ -244,3 +244,201 @@ fn the_completion_retargets_to_the_string_the_caret_is_in() {
     studio.settle();
     row_containing(&studio.rows(), "search: bd");
 }
+
+#[test]
+fn ctrl_d_uses_kabelsalat_documentation_inside_graphs() {
+    for (text, name, signature) in [
+        (
+            "$: note(\"c3\").K(() => sine(sFreq).out())",
+            "sine",
+            "sine(freq, sync, phase)",
+        ),
+        (
+            "$: note(\"c3\").K(() => sine(sFreq).mul(sGate.adsr(.01, .2, .5, .1)).out())",
+            "adsr",
+            "adsr(gate, att, dec, sus, rel)",
+        ),
+        (
+            "$: note(\"c3\").K(() => { Node.prototype.m = function(x) { return this.add(x) }; sine(sFreq).m(sGate.adsr(.01, .2, .5, .1)).out() })",
+            "adsr",
+            "adsr(gate, att, dec, sus, rel)",
+        ),
+    ] {
+        let mut studio = hermetic();
+        studio.set_score(text);
+        studio.set_caret(text.find(name).expect("graph function") + name.len() - 1);
+        studio.chord("ctrl+d");
+
+        assert_eq!(studio.reference_tab(), Some("reference"));
+        assert_eq!(studio.status(), format!("reference - {name}"));
+        row_containing(&studio.rows(), signature);
+        assert_eq!(studio.score(), text, "reading help leaves the graph intact");
+    }
+}
+
+#[test]
+fn ctrl_d_keeps_pattern_documentation_outside_graphs_and_inside_s() {
+    for (text, name, signature) in [
+        ("$: sine.range(0, 12)", "sine", "sine()"),
+        (
+            "$: note(\"c3\").adsr(.01, .2, .5, .1)",
+            "adsr",
+            "adsr(time, time, gain, time)",
+        ),
+        (
+            "$: note(\"c3\").K(() => sine(S(note(\"c3\").adsr(.01, .2, .5, .1))).out())",
+            "adsr",
+            "adsr(time, time, gain, time)",
+        ),
+        (
+            "$: note(\"c3\").K(() => sine(pat[0]).out(), note(\"c3\").adsr(.01, .2, .5, .1))",
+            "adsr",
+            "adsr(time, time, gain, time)",
+        ),
+        (
+            "$: note(\"c3\").worklet(\"sine(pat[0]).out()\", note(\"c3\").adsr(.01, .2, .5, .1))",
+            "adsr",
+            "adsr(time, time, gain, time)",
+        ),
+    ] {
+        let mut studio = hermetic();
+        studio.set_score(text);
+        studio.set_caret(text.find(name).expect("pattern function") + name.len() - 1);
+        studio.chord("ctrl+d");
+
+        assert_eq!(studio.reference_tab(), Some("reference"));
+        assert_eq!(studio.status(), format!("reference - {name}"));
+        row_containing(&studio.rows(), signature);
+        assert_eq!(
+            studio.score(),
+            text,
+            "reading help leaves the pattern intact"
+        );
+    }
+}
+
+#[test]
+fn kabelsalat_completion_inserts_values_without_call_parentheses() {
+    for (typed, completed) in [("sFre", "sFreq"), ("sGat", "sGate")] {
+        let mut studio = hermetic();
+        let text = format!("$: note(\"c3\").K(() => sine({typed}).out())");
+        studio.set_score(&text);
+        studio.set_caret(text.find(typed).expect("graph value") + typed.len());
+        studio.chord("ctrl+space");
+
+        assert_eq!(studio.reference_tab(), Some("reference"));
+        studio.press(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(studio.score(), text.replace(typed, completed));
+    }
+}
+
+#[test]
+fn kabelsalat_completion_distinguishes_oscillator_calls_from_pattern_signals() {
+    for (text, occurrence, expected) in [
+        (
+            "$: note(\"c3\").K(() => sine)",
+            0,
+            "$: note(\"c3\").K(() => sine())",
+        ),
+        (
+            "$: note(\"c3\").K(() => n(sFreq).sine)",
+            0,
+            "$: note(\"c3\").K(() => n(sFreq).sine())",
+        ),
+        ("$: n(sine)", 0, "$: n(sine)"),
+        (
+            "$: note(\"c3\").K(() => sine(S(sine)).out())",
+            1,
+            "$: note(\"c3\").K(() => sine(S(sine)).out())",
+        ),
+        (
+            "$: note(\"c3\").K(() => sine(pat[0]).out(), sine.range(220, 440))",
+            1,
+            "$: note(\"c3\").K(() => sine(pat[0]).out(), sine.range(220, 440))",
+        ),
+        (
+            "$: note(\"c3\").worklet(\"sine(pat[0]).out()\", sine.range(220, 440))",
+            1,
+            "$: note(\"c3\").worklet(\"sine(pat[0]).out()\", sine.range(220, 440))",
+        ),
+    ] {
+        let mut studio = hermetic();
+        studio.set_score(text);
+        let start = text
+            .match_indices("sine")
+            .nth(occurrence)
+            .expect("oscillator or pattern signal")
+            .0;
+        studio.set_caret(start + "sine".len());
+        studio.chord("ctrl+space");
+
+        assert_eq!(studio.reference_tab(), Some("reference"));
+        studio.press(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(studio.score(), expected, "completion in {text}");
+    }
+}
+
+#[test]
+fn kabelsalat_completion_preserves_qualified_helpers_and_node_properties() {
+    for (expression, typed, completed) in [
+        ("Node.parseI", "Node.parseI", "Node.parseInput()"),
+        ("Node.prototy", "Node.prototy", "Node.prototype"),
+        ("nodeRegistry.ge", "nodeRegistry.ge", "nodeRegistry.get()"),
+        ("sine(sFreq).clon", "clon", "clone()"),
+        ("sine(sFreq).inputO", "inputO", "inputOf"),
+    ] {
+        let mut studio = hermetic();
+        let text = format!("$: note(\"c3\").K(() => {expression})");
+        studio.set_score(&text);
+        studio.set_caret(text.find(typed).expect("graph helper") + typed.len());
+        studio.chord("ctrl+space");
+
+        assert_eq!(studio.reference_tab(), Some("reference"));
+        studio.press(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(studio.score(), text.replace(typed, completed));
+    }
+}
+
+#[test]
+fn kabelsalat_node_properties_join_completed_calls_without_parentheses() {
+    let mut studio = hermetic();
+    let text = "$: note(\"c3\").K(() => sine(sFreq))";
+    studio.set_score(text);
+    studio.set_caret(text.rfind(')').expect("graph boundary"));
+    studio.chord("ctrl+space");
+    studio.type_text("inputOf");
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+
+    assert_eq!(
+        studio.score(),
+        "$: note(\"c3\").K(() => sine(sFreq).inputOf)"
+    );
+}
+
+#[test]
+fn kabelsalat_completion_keeps_globals_and_node_methods_in_their_own_positions() {
+    for (expression, typed, invalid) in [
+        ("n(sFreq).sFre", "sFre", "sFreq"),
+        ("n(sFreq).registerN", "registerN", "registerNode()"),
+        ("clon", "clon", "clone()"),
+    ] {
+        let mut studio = hermetic();
+        let text = format!("$: note(\"c3\").K(() => {expression})");
+        studio.set_score(&text);
+        studio.set_caret(text.rfind(typed).expect("graph name") + typed.len());
+        studio.chord("ctrl+space");
+        studio.press(KeyCode::Enter, KeyModifiers::NONE);
+
+        let start = text.rfind(typed).expect("graph name");
+        let mut invalid_score = text.clone();
+        invalid_score.replace_range(start..start + typed.len(), invalid);
+        assert_ne!(
+            studio.score(),
+            invalid_score,
+            "{invalid} is unavailable at this graph position"
+        );
+    }
+}

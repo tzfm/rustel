@@ -888,7 +888,7 @@ impl App {
     }
 
     /// The studio's own chords for what is on screen: the panels and
-    /// sheets, the split, wrap and zen, and the smart action. `true` when
+    /// sheets, the split, wrap and zen, and the quick action. `true` when
     /// one answered.
     fn surface_chord(
         &mut self,
@@ -1061,7 +1061,7 @@ impl App {
             self.toggle_mixer_panel();
             return true;
         }
-        // The smart action. ^J is a plain 0x0A byte: every terminal
+        // The quick action. ^J is a plain 0x0A byte: every terminal
         // delivers it, no platform has claimed it, and it needs no
         // setting - the same reason ^F carries the browser.
         if primary && !shift && letter == Some('j') && !self.key_is_a_learnt_chord(key) {

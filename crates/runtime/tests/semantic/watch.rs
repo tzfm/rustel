@@ -3410,7 +3410,7 @@ fn drive_live_producer(
                     "producer pushed a replacement before publishing its generation"
                 );
                 assert!(event.confirmation.is_none(), "raw-ring fixture is unbound");
-                if ring.push(event.event) {
+                if ring.push(event.event.clone()) {
                     pushed.push(event.event);
                     true
                 } else {
@@ -4302,7 +4302,7 @@ fn watched_tempo_commit_reaches_the_consumer_and_rejection_keeps_that_clock() {
             |event| {
                 assert!(event.confirmation.is_none(), "raw-ring fixture is unbound");
                 assert!(
-                    ring.push(event.event),
+                    ring.push(event.event.clone()),
                     "fixture ring filled at initial prefill"
                 );
                 pushed.push(event.event);
@@ -4322,7 +4322,7 @@ fn watched_tempo_commit_reaches_the_consumer_and_rejection_keeps_that_clock() {
             |event| {
                 assert!(event.confirmation.is_none(), "raw-ring fixture is unbound");
                 assert!(
-                    ring.push(event.event),
+                    ring.push(event.event.clone()),
                     "fixture ring filled while observing edit"
                 );
                 pushed.push(event.event);
@@ -4351,7 +4351,7 @@ fn watched_tempo_commit_reaches_the_consumer_and_rejection_keeps_that_clock() {
                 );
                 assert!(event.confirmation.is_none(), "raw-ring fixture is unbound");
                 assert!(
-                    ring.push(event.event),
+                    ring.push(event.event.clone()),
                     "fixture ring filled at tempo cutover"
                 );
                 pushed.push(event.event);
@@ -4381,10 +4381,11 @@ fn watched_tempo_commit_reaches_the_consumer_and_rejection_keeps_that_clock() {
             .all(|event| event.generation == tempo_generation),
         "tempo replacement mixed generations: {replacement_events:?}"
     );
-    let first_replacement = *replacement_events
+    let first_replacement = replacement_events
         .iter()
         .min_by_key(|event| event.target_frame)
-        .expect("checked replacement event");
+        .expect("checked replacement event")
+        .clone();
     let last_replacement_frame = replacement_events
         .iter()
         .map(|event| event.target_frame)
@@ -4451,7 +4452,7 @@ fn watched_tempo_commit_reaches_the_consumer_and_rejection_keeps_that_clock() {
                 assert_eq!(event.generation, tempo_generation);
                 assert!(event.confirmation.is_none(), "raw-ring fixture is unbound");
                 assert!(
-                    ring.push(event.event),
+                    ring.push(event.event.clone()),
                     "fixture ring filled before rejection"
                 );
                 pushed.push(event.event);
@@ -4471,7 +4472,10 @@ fn watched_tempo_commit_reaches_the_consumer_and_rejection_keeps_that_clock() {
             |event| {
                 assert_eq!(event.generation, tempo_generation);
                 assert!(event.confirmation.is_none(), "raw-ring fixture is unbound");
-                assert!(ring.push(event.event), "fixture ring filled at rejection");
+                assert!(
+                    ring.push(event.event.clone()),
+                    "fixture ring filled at rejection"
+                );
                 pushed.push(event.event);
                 true
             },
@@ -4503,7 +4507,7 @@ fn watched_tempo_commit_reaches_the_consumer_and_rejection_keeps_that_clock() {
                 assert_eq!(event.generation, tempo_generation);
                 assert!(event.confirmation.is_none(), "raw-ring fixture is unbound");
                 assert!(
-                    ring.push(event.event),
+                    ring.push(event.event.clone()),
                     "fixture ring filled after rejection"
                 );
                 pushed.push(event.event);
@@ -4518,7 +4522,7 @@ fn watched_tempo_commit_reaches_the_consumer_and_rejection_keeps_that_clock() {
         1,
         "fixture expected one post-rejection onset: {post_rejection:?}"
     );
-    let post_rejection = post_rejection[0];
+    let post_rejection = &post_rejection[0];
     assert_eq!(post_rejection.generation, tempo_generation);
     assert_eq!(
         post_rejection.target_frame,

@@ -25,7 +25,7 @@ fn a_number_becomes_a_fader_and_the_form_writes_the_call() {
 
     studio.press(KeyCode::Char('j'), KeyModifiers::CONTROL);
     assert!(
-        studio.status().starts_with("smart action: Enter chooses"),
+        studio.status().starts_with("quick action: Enter chooses"),
         "^J opened over the number: {}",
         studio.status()
     );
@@ -67,14 +67,14 @@ fn a_number_becomes_a_fader_and_the_form_writes_the_call() {
     // write left it.
     studio.press(KeyCode::Char('j'), KeyModifiers::CONTROL);
     assert!(
-        studio.status().starts_with("smart action: Enter chooses"),
+        studio.status().starts_with("quick action: Enter chooses"),
         "^J on the fader opens its menu: {}",
         studio.status()
     );
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     assert_eq!(
         studio.status(),
-        "smart action closed",
+        "quick action closed",
         "Esc with nothing written says so plainly"
     );
     assert!(
@@ -141,7 +141,7 @@ fn the_fader_itself_can_be_taken_off_again() {
 
     studio.press(KeyCode::Char('j'), KeyModifiers::CONTROL);
     assert!(
-        studio.status().starts_with("smart action: Enter chooses"),
+        studio.status().starts_with("quick action: Enter chooses"),
         "^J on the fader opens: {}",
         studio.status()
     );
@@ -172,7 +172,7 @@ fn the_fader_itself_can_be_taken_off_again() {
     );
 }
 
-/// Edit ▸ Smart action is greyed where the caret has nothing for it. The
+/// Edit ▸ Quick action is greyed where the caret has nothing for it. The
 /// row still draws, in the muted colour, and never takes the highlight or
 /// Enter. With the caret on a number the same row is live.
 #[test]
@@ -185,17 +185,17 @@ fn the_edit_menu_greys_the_smart_action_where_it_has_nothing_to_offer() {
     studio.set_caret(end);
     studio.press(KeyCode::F(1), KeyModifiers::NONE);
     studio.press(KeyCode::Char('e'), KeyModifiers::NONE);
-    row_containing(&studio.rows(), "Smart action");
+    row_containing(&studio.rows(), "Quick action");
     let row = studio
         .rows()
         .iter()
-        .position(|row| row.contains("Smart action"))
+        .position(|row| row.contains("Quick action"))
         .expect("the row is on the dropped menu");
     let column = studio
         .rows()
         .into_iter()
         .nth(row)
-        .and_then(|text| text.find("Smart action"))
+        .and_then(|text| text.find("Quick action"))
         .expect("the label's column") as u16;
     let grey = studio
         .cell_fg(column, row as u16)
@@ -212,13 +212,13 @@ fn the_edit_menu_greys_the_smart_action_where_it_has_nothing_to_offer() {
     let lit = studio
         .rows()
         .iter()
-        .position(|row| row.contains("Smart action"))
+        .position(|row| row.contains("Quick action"))
         .and_then(|row| {
             studio
                 .rows()
                 .into_iter()
                 .nth(row)
-                .and_then(|text| text.find("Smart action"))
+                .and_then(|text| text.find("Quick action"))
                 .map(|column| (row as u16, column as u16))
         })
         .expect("the row is on the dropped menu");
@@ -230,7 +230,7 @@ fn the_edit_menu_greys_the_smart_action_where_it_has_nothing_to_offer() {
     // off), the live one's opens the offer.
     studio.press(KeyCode::Char('a'), KeyModifiers::NONE);
     assert!(
-        studio.status().starts_with("smart action: Enter chooses"),
+        studio.status().starts_with("quick action: Enter chooses"),
         "the live row answers its mnemonic: {}",
         studio.status()
     );

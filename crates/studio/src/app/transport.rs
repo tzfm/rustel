@@ -74,7 +74,7 @@ impl ErrorOwner {
 
 pub(super) const ERROR_OWNER_COUNT: usize = ErrorOwner::ALL.len();
 
-const TRANSIENT_ERROR_DURATION: Duration = Duration::from_secs(5);
+const TRANSIENT_MESSAGE_DURATION: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub(super) struct OwnedError {
@@ -104,7 +104,7 @@ impl AppErrors {
             expires_at: owner
                 .transient_alert()
                 .is_some()
-                .then_some(now + TRANSIENT_ERROR_DURATION),
+                .then_some(now + TRANSIENT_MESSAGE_DURATION),
         });
     }
 
@@ -146,6 +146,26 @@ impl AppErrors {
 }
 
 impl App {
+    pub(super) fn set_notice(&mut self, message: String) {
+        self.status_notice = Some((message.clone(), Instant::now() + TRANSIENT_MESSAGE_DURATION));
+        self.status = message;
+        self.dirty_frame = true;
+    }
+
+    /// Retire a confirmation without clearing a newer prompt or error.
+    pub(super) fn expire_notice(&mut self, now: Instant) {
+        let Some((message, deadline)) = &self.status_notice else {
+            return;
+        };
+        if self.status != *message {
+            self.status_notice = None;
+        } else if now >= *deadline {
+            self.status.clear();
+            self.status_notice = None;
+            self.dirty_frame = true;
+        }
+    }
+
     pub(super) fn settle_stopped_transport(&mut self) {
         self.audio_advisory.reset();
         self.worker.discard_visual_updates();

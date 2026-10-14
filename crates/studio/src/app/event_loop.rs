@@ -157,6 +157,7 @@ impl App {
         }
 
         let now = Instant::now();
+        self.expire_notice(now);
         #[cfg(feature = "remote-control")]
         self.expire_remote_activity(now);
         self.follow_loading_line(now);

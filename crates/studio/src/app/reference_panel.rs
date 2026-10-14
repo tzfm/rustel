@@ -7,6 +7,7 @@
 //! file behind a sound. Bank machine ranking lives in `bank_context.rs`.
 
 use super::*;
+use crate::reference::{ReferenceMode, ReferenceScope, TagFilter};
 
 /// How often the samples tab re-reads what the library knows while open.
 pub(super) const CATALOGUE_REFRESH: Duration = Duration::from_millis(1_000);
@@ -155,12 +156,19 @@ impl App {
     pub(super) fn confirm_reference_name(&mut self, name: String) -> Result<(), RuntimeError> {
         let entry = self.reference_panel.as_ref().and_then(|panel| {
             (panel.tab == Tab::Reference && panel.vocabulary.is_none())
-                .then(|| self.reference.lookup(&name))
+                .then(|| match panel.mode {
+                    ReferenceMode::Browse => panel.selected_result(),
+                    ReferenceMode::Entry { index, .. } => Some(index),
+                })
                 .flatten()
         });
         let call = entry
             .and_then(|index| self.reference.entry(index))
             .is_some_and(|entry| entry.inserts_as_call());
+        let documentation = entry.filter(|_| call).map(|index| {
+            let panel = self.reference_panel.as_ref().expect("selected reference");
+            self.reference_entry_panel(index, panel.scope, Some(&panel.query))
+        });
         if call {
             if let Some(anchor) = self.reference_anchor.as_mut() {
                 anchor.landing = Landing::Call;
@@ -186,10 +194,14 @@ impl App {
                     .unwrap_or_default();
                 self.anchor_reference_as(&word, range, Landing::Call);
             }
-        } else if entry.is_some()
+        } else if let Some(entry) = entry.and_then(|index| self.reference.entry(index))
             && let Some(anchor) = self.reference_anchor.as_mut()
         {
-            anchor.landing = Landing::Bare;
+            anchor.landing = if entry.tags.iter().any(|tag| tag == "method") {
+                Landing::Member
+            } else {
+                Landing::Bare
+            };
         }
         self.stop_preview();
         self.set_reference_panel(None);
@@ -197,12 +209,34 @@ impl App {
         self.focus = Focus::Editor;
         self.armed_slider = None;
         self.insert_reference_name(name)?;
-        if call && let Some(index) = entry {
-            self.set_reference_panel(Some(ReferencePanel::open(&self.reference, index)));
+        if let Some(panel) = documentation {
+            self.set_reference_panel(Some(panel));
             self.install_catalogue();
         }
         self.dirty_frame = true;
         Ok(())
+    }
+
+    /// Direct help and inserted calls retain the namespace of their list.
+    /// An explicit tag search remains the reader's chosen browse filter.
+    pub(super) fn reference_entry_panel(
+        &self,
+        index: usize,
+        scope: ReferenceScope,
+        query: Option<&str>,
+    ) -> ReferencePanel {
+        let mut panel = ReferencePanel::open(&self.reference, index);
+        panel.scope = scope;
+        if let Some(query) = query.filter(|query| TagFilter::parse(query).name.is_some()) {
+            panel.query = query.to_owned();
+        }
+        panel.refresh(&self.reference);
+        panel.selected = panel
+            .results
+            .iter()
+            .position(|&found| found == index)
+            .map_or(0, |position| panel.row_of_result(position));
+        panel
     }
 
     /// A name chosen in the reference column lands in the text: over the
@@ -238,6 +272,23 @@ impl App {
             });
         let (written, inside) = match landing {
             Landing::Bare => (name, None),
+            Landing::Member => {
+                let source = self.editor().source();
+                let lead = match at
+                    .start
+                    .checked_sub(1)
+                    .and_then(|before| source.as_bytes().get(before))
+                {
+                    Some(b')' | b']') => ".",
+                    _ => "",
+                };
+                let joined = source
+                    .as_bytes()
+                    .get(at.end)
+                    .is_some_and(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$'));
+                let tail = if joined { "." } else { "" };
+                (format!("{lead}{name}{tail}"), None)
+            }
             Landing::Quoted => (format!("\"{name}\""), None),
             Landing::Call => {
                 let source = self.editor().source();
@@ -326,9 +377,10 @@ impl App {
         // Quotes ask for values of the active argument. Everywhere else
         // starts with the function's docs so its arguments are visible.
         if self.string_completion_at_caret().is_some() {
-            let argument_reference = self
-                .enclosing_call_at_caret()
-                .and_then(|(callee, _)| self.reference.resolve(&callee));
+            let argument_reference = self.enclosing_call_at_caret().and_then(|(callee, range)| {
+                self.reference
+                    .lookup_in(&callee, self.reference_name_scope_at(range.start))
+            });
             if self.open_string_completion() {
                 if let Some(panel) = self.reference_panel.as_mut() {
                     panel.argument_reference = argument_reference;
@@ -352,7 +404,9 @@ impl App {
         // use, even when it is also an alias (`lp` names `lpf`). Once the
         // call has its opening bracket, its documentation is the answer.
         let unfinished_link = self.chain_position_at_caret().is_some_and(|range| {
-            (enclosing.is_none() || source[..range.start.0].ends_with('.'))
+            (enclosing.is_none()
+                || source[..range.start.0].ends_with('.')
+                || source[range.start.0..range.end.0].contains('.'))
                 && !source[range.end.0..].trim_start().starts_with('(')
         });
         if unfinished_link && let Some(panel) = self.chain_completion_panel() {
@@ -364,18 +418,24 @@ impl App {
             self.dirty_frame = true;
             return;
         }
-        // A callee under the caret takes precedence over the enclosing call.
-        // Argument values and object keys must not select a function.
+        // A callee or graph input under the caret takes precedence over
+        // the enclosing call. Other argument values keep the call's help.
         let caret = self.editor().primary_selection().head;
         let word = self.word_range_at_caret();
         let code = rustel_runtime::lint::code_only(&source);
-        let callee = word.as_ref().filter(|(name, range)| {
+        let named_entry = word.as_ref().filter(|(name, range)| {
             range.start < caret
                 && caret <= range.end
                 && code.get(range.start.0..range.end.0) == Some(name.as_str())
-                && code[range.end.0..].trim_start().starts_with('(')
+                && (code[range.end.0..].trim_start().starts_with('(')
+                    || (self.reference_scope_at(range.start).is_kabelsalat()
+                        && self
+                            .reference
+                            .lookup_in(name, ReferenceScope::Kabelsalat)
+                            .and_then(|index| self.reference.entry(index))
+                            .is_some_and(|entry| !entry.inserts_as_call())))
         });
-        let Some((word, range)) = callee.cloned().or(enclosing).or(word) else {
+        let Some((word, range)) = named_entry.cloned().or(enclosing).or(word) else {
             let mut panel = ReferencePanel::browse_for(&self.reference, "");
             panel.snippets_last = !self.caret_on_blank_line();
             panel.refresh(&self.reference);
@@ -388,14 +448,15 @@ impl App {
             self.dirty_frame = true;
             return;
         };
-        match self.reference.lookup(&word) {
+        let scope = self.reference_name_scope_at(range.start);
+        match self.reference.lookup_in(&word, scope) {
             Some(index) => {
-                self.set_reference_panel(Some(ReferencePanel::open(&self.reference, index)));
+                self.set_reference_panel(Some(self.reference_entry_panel(index, scope, None)));
                 self.reference_anchor = None;
                 self.status = format!("reference - {word}");
             }
             None => {
-                let mut panel = ReferencePanel::browse_for(&self.reference, &word);
+                let mut panel = ReferencePanel::browse_in(&self.reference, &word, scope);
                 panel.snippets_last = !self.caret_on_blank_line();
                 panel.refresh(&self.reference);
                 self.set_reference_panel(Some(panel));
@@ -411,7 +472,11 @@ impl App {
 
     fn open_argument_reference(&mut self, index: usize) {
         self.stop_preview();
-        self.set_reference_panel(Some(ReferencePanel::open(&self.reference, index)));
+        let scope = self.enclosing_call_at_caret().map_or_else(
+            || self.reference_scope_at_caret(),
+            |(_, range)| self.reference_name_scope_at(range.start),
+        );
+        self.set_reference_panel(Some(self.reference_entry_panel(index, scope, None)));
         self.reference_anchor = None;
         if let Some(entry) = self.reference.entry(index) {
             self.status = format!("reference - {}", entry.name);

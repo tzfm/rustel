@@ -151,7 +151,7 @@ mod voice_refusal_tests {
                 device.set_generation(generation, takeover, TakeoverCut::None);
             },
             |event| {
-                pushed.push(event);
+                pushed.push(event.clone());
                 device.push(event)
             },
         );
@@ -291,7 +291,7 @@ mod voice_refusal_tests {
                         device.set_generation(generation, takeover, TakeoverCut::None);
                     },
                     |event| {
-                        pushed.push(event);
+                        pushed.push(event.clone());
                         device.push(event)
                     },
                 )
@@ -437,7 +437,7 @@ mod voice_refusal_tests {
                     device.set_generation(selected, takeover, TakeoverCut::None);
                 },
                 |event| {
-                    assert!(device.push(event));
+                    assert!(device.push(event.clone()));
                     events.push(event);
                     true
                 },
@@ -6820,36 +6820,54 @@ mod tests {
 
     #[test]
     fn a_definition_only_register_update_goes_silent_and_publishes_the_method() {
-        let mut session = Session::with_config(SessionConfig::default()).expect("session");
-        let stopped = std::sync::atomic::AtomicBool::new(false);
-        session
-            .reload_at_cancellable("$: s('bd')", false, 0.0, &stopped)
-            .expect("initial live score");
+        for definition in [
+            "register('double', (amount, pat) => pat.add(amount))",
+            "const rg = register; rg('double', (amount, pat) => pat.add(amount))",
+        ] {
+            let mut session = Session::with_config(SessionConfig::default()).expect("session");
+            let stopped = std::sync::atomic::AtomicBool::new(false);
+            session
+                .reload_at_cancellable("$: s('bd')", false, 0.0, &stopped)
+                .expect("initial live score");
 
+            session
+                .reload_at_cancellable(definition, false, 0.1, &stopped)
+                .expect("definition-only register update");
+            assert!(
+                session
+                    .query(Fraction::ZERO, Fraction::ONE)
+                    .expect("silent definition query")
+                    .is_empty(),
+                "a definition-only update should install silence"
+            );
+
+            session
+                .reload_at_cancellable("$: pure(1).double(2)", false, 0.2, &stopped)
+                .expect("registered method in a later update");
+            let haps = session
+                .query(Fraction::ZERO, Fraction::ONE)
+                .expect("registered method query");
+            assert_eq!(haps.len(), 1, "{haps:?}");
+            assert_eq!(haps[0].value, rustel_core::Value::F64(3.0));
+        }
+
+        let mut session = Session::with_config(SessionConfig::default()).expect("session");
         session
-            .reload_at_cancellable(
-                "register('double', (amount, pat) => pat.add(amount))",
+            .reload_at(
+                "const rg = register; rg('startFrom', (c, p) => p.filterWhen(x => x.gte(c))); pure(7).startFrom(1)",
                 false,
-                0.1,
-                &stopped,
+                0.0,
             )
-            .expect("definition-only register update");
+            .expect("aliased registration and method call");
         assert!(
             session
                 .query(Fraction::ZERO, Fraction::ONE)
-                .expect("silent definition query")
-                .is_empty(),
-            "a definition-only update should install silence"
+                .unwrap()
+                .is_empty()
         );
-
-        session
-            .reload_at_cancellable("$: pure(1).double(2)", false, 0.2, &stopped)
-            .expect("registered method in a later update");
-        let haps = session
-            .query(Fraction::ZERO, Fraction::ONE)
-            .expect("registered method query");
-        assert_eq!(haps.len(), 1, "{haps:?}");
-        assert_eq!(haps[0].value, rustel_core::Value::F64(3.0));
+        let haps = session.query(Fraction::ONE, Fraction::from(2)).unwrap();
+        assert_eq!(haps.len(), 1);
+        assert_eq!(haps[0].value, rustel_core::Value::F64(7.0));
 
         let function_error = "Error converting from js 'function' into type 'NativePatternWrapper'";
         assert!(
@@ -15692,8 +15710,8 @@ mod tests {
         let active = session.js.active_pattern().expect("active indexed graph");
         assert_eq!(
             active.reachable_callbacks().len(),
-            4,
-            "the final graph must own one source callback and three returned callbacks, but not the construction-only indexed callback"
+            5,
+            "the final graph must own one source callback, three returned callbacks, and the native event finalizer, but not the construction-only indexed callback"
         );
 
         let snapshot = |session: &Session| {

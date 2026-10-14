@@ -436,7 +436,7 @@ fn backend(workload: Workload) -> ScalarBackend {
     }
     for voice in 0..workload.voices {
         assert!(
-            backend.try_note_prepared(event(workload.kind, voice)),
+            backend.try_note_prepared(event(workload.kind, voice).into_prepared()),
             "{} refused voice {voice}",
             workload.id
         );

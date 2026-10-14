@@ -32,18 +32,22 @@ pub(super) enum CellPayload<'js> {
 #[derive(Trace, JsLifetime)]
 pub struct CallbackCell<'js> {
     pub(super) payload: CellPayload<'js>,
+    #[qjs(skip_trace)]
+    pub(super) kabelsalat: bool,
 }
 
 impl<'js> CallbackCell<'js> {
     pub(super) fn function(func: Function<'js>) -> Self {
         Self {
             payload: CellPayload::Function(func),
+            kabelsalat: false,
         }
     }
 
     pub(super) fn value(value: rquickjs::Value<'js>) -> Self {
         Self {
             payload: CellPayload::Value(value),
+            kabelsalat: false,
         }
     }
 

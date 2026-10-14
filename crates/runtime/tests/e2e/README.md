@@ -1,6 +1,6 @@
 # The corpus suite
 
-The suite evaluates and renders 1484 scores, then compares each result with a
+The suite evaluates and renders 1494 scores, then compares each result with a
 committed golden. Run it before you open a pull request:
 
 ```sh
@@ -52,9 +52,10 @@ Run it locally or dispatch Heavy CI for the current commit.
 | directory | scores | what they are |
 |---|---|---|
 | `scores/corpus/generated` | 680 | fuzzed combinations of the pattern surface |
+| `scores/corpus/kabelsalat` | 8 | published graph examples adapted to `K()` |
 | `scores/corpus/regressions` | 100 | one score per bug that has been fixed |
 | `scores/corpus/songs` | 186 | complete pieces, credited in `ATTRIBUTION.md` |
-| `scores/docs` | 452 | upstream documentation examples, with exact duplicates removed |
+| `scores/docs` | 454 | upstream documentation examples, with exact duplicates removed |
 | `scores/probes` | 66 | narrow synthesis cases - one oscillator, one filter |
 
 Each score is an ordinary `.strudel` file. Play one, and press Ctrl+C to stop:
@@ -72,6 +73,21 @@ The bakery scores are the featured patterns this engine can render on its
 own. A pattern that fetches a third-party sample bank is not included. Its
 golden would depend on an external repository, and an offline run would
 record silence.
+
+### KabelSalat examples
+
+`scores/docs/kabelsalat/` preserves the two `K()` examples from
+[Strudel's pattern documentation](https://codeberg.org/uzu/strudel/src/commit/a3302cf16746d2f6f7c706be47f1ca85db497aa5/packages/core/pattern.mjs#L4446).
+`scores/corpus/kabelsalat/` adapts eight
+[KabelSalat examples](https://codeberg.org/froos/kabelsalat/src/commit/d114e806b6fd8ca948f19613db2cf787e4dcd1d6/examples).
+Both sources use AGPL-3.0-or-later. Each score records its author, pinned
+source, licence and changes. The licence text is in the repository's
+`LICENSE` and `crates/jsruntime/LICENSE-kabelsalat`.
+
+The standalone graphs run inside `K(() => { ... }).slow(16)`. At the default
+0.5 cycles per second, one voice lasts 32 seconds, longer than the eight-second
+capture. Their internal clocks and feedback continue through the whole render.
+No score needs a sample bank, Mondo or an external controller.
 
 ## Duplicate documentation examples
 
