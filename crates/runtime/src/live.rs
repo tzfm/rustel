@@ -191,6 +191,7 @@ pub struct LiveFileProducer {
     query_tail_window: ContinuationWindow,
     prebake_state: PrebakeState,
     pending: VecDeque<QueuedAudioEvent>,
+    pending_publication: Option<rustel_audio::KabelPublication>,
     /// One past the latest target any scheduled event has carried. Monotone;
     /// the engine freezes it when the library forgets a sample, since
     /// nothing scheduled afterwards can name that sample.
@@ -333,6 +334,7 @@ impl LiveFileProducer {
             query_tail_window: ContinuationWindow::default(),
             prebake_state: PrebakeState::Ready,
             pending: VecDeque::new(),
+            pending_publication: None,
             scheduled_through_frame: 0,
             generation_needs_prefill: true,
             pending_generation: None,
@@ -417,6 +419,7 @@ impl LiveFileProducer {
             query_tail_window: ContinuationWindow::default(),
             prebake_state: PrebakeState::Ready,
             pending: VecDeque::new(),
+            pending_publication: None,
             scheduled_through_frame: 0,
             generation_needs_prefill: true,
             pending_generation: None,
@@ -613,6 +616,35 @@ impl LiveFileProducer {
         set_generation: impl FnMut(u64, u64, TakeoverCut),
         push: impl FnMut(QueuedAudioEvent) -> bool,
     ) -> Result<LiveProducerStep, RuntimeError> {
+        self.step_with_clock_and_preparation(
+            session,
+            observed_at,
+            schedule_now,
+            sample_rate,
+            |_| Ok(rustel_audio::KabelPublication::default()),
+            set_generation,
+            push,
+        )
+    }
+
+    /// Prepare each converted window before publishing its generation or events.
+    /// A preparation error rejects the replacement and preserves the audible score.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "preparation, generation publication and ring delivery are separate ordered hooks"
+    )]
+    pub fn step_with_clock_and_preparation(
+        &mut self,
+        session: &mut Session,
+        observed_at: Duration,
+        schedule_now: impl FnMut() -> f64,
+        sample_rate: u32,
+        prepare: impl FnMut(
+            &[rustel_audio::AudioEvent],
+        ) -> Result<rustel_audio::KabelPublication, RuntimeError>,
+        set_generation: impl FnMut(u64, u64, TakeoverCut),
+        push: impl FnMut(QueuedAudioEvent) -> bool,
+    ) -> Result<LiveProducerStep, RuntimeError> {
         self.sync_panic_recovery(session);
         let started = self.begin_turn();
         let result = self.step_with_clock_inner(
@@ -620,6 +652,7 @@ impl LiveFileProducer {
             observed_at,
             schedule_now,
             sample_rate,
+            prepare,
             set_generation,
             push,
         );
@@ -627,18 +660,26 @@ impl LiveFileProducer {
         result
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "keeps the public preparation and publication hooks explicit through the watch pass"
+    )]
     fn step_with_clock_inner(
         &mut self,
         session: &mut Session,
         observed_at: Duration,
         mut schedule_now: impl FnMut() -> f64,
         sample_rate: u32,
+        prepare: impl FnMut(
+            &[rustel_audio::AudioEvent],
+        ) -> Result<rustel_audio::KabelPublication, RuntimeError>,
         set_generation: impl FnMut(u64, u64, TakeoverCut),
         mut push: impl FnMut(QueuedAudioEvent) -> bool,
     ) -> Result<LiveProducerStep, RuntimeError> {
         session.consume_audio_confirmations();
         if session.transport().is_stopped() {
             self.pending.clear();
+            self.pending_publication = None;
             return Ok(LiveProducerStep {
                 watch: WatchPoll::Stopped,
                 prebake_watch: WatchPoll::Stopped,
@@ -653,12 +694,15 @@ impl LiveFileProducer {
             let mut backpressured = false;
             if !self.pending.is_empty() {
                 let ring_started = Instant::now();
-                while let Some(event) = self.pending.front().copied() {
+                while let Some(event) = self.pending.front().cloned() {
                     if !push(event) {
                         backpressured = true;
                         break;
                     }
                     self.pending.pop_front();
+                    if self.pending.is_empty() {
+                        self.pending_publication = None;
+                    }
                     pushed += 1;
                 }
                 session.record_producer_ring_push(ring_started.elapsed(), pushed, backpressured);
@@ -846,11 +890,12 @@ impl LiveFileProducer {
             && !matches!(watches.score, WatchPoll::Stopped)
             && !matches!(watches.prebake, WatchPoll::Stopped))
         .then(Instant::now);
-        let step = self.finish_step(
+        let step = self.finish_step_with_preparation(
             session,
             watches,
             &mut schedule_now,
             sample_rate,
+            prepare,
             set_generation,
             push,
         )?;
@@ -886,6 +931,7 @@ impl LiveFileProducer {
     /// rollback and loading-deferred line cut.
     fn supersede_cutover(&mut self, installed: crate::ReloadEvent) {
         self.pending.clear();
+        self.pending_publication = None;
         self.pending_generation = Some(installed.generation_after);
         self.pending_reload_event = Some(installed);
         self.pending_reload_visible = true;
@@ -977,6 +1023,7 @@ impl LiveFileProducer {
     /// invisible same-graph cutover, not a synthetic save.
     pub fn arm_output_recovery_requery(&mut self, generation_before: u64, generation_after: u64) {
         self.pending.clear();
+        self.pending_publication = None;
         self.starving_since = None;
         self.generation_needs_prefill = true;
         self.prefill_candidate_committed = false;
@@ -1209,8 +1256,29 @@ impl LiveFileProducer {
     pub fn shield_reload_with_clock(
         &mut self,
         session: &mut Session,
+        schedule_now: impl FnMut() -> f64,
+        sample_rate: u32,
+        push: impl FnMut(QueuedAudioEvent) -> bool,
+    ) -> Result<bool, RuntimeError> {
+        self.shield_reload_with_clock_and_preparation(
+            session,
+            schedule_now,
+            sample_rate,
+            |_| Ok(rustel_audio::KabelPublication::default()),
+            push,
+        )
+    }
+
+    /// Prepare a shield window once before any event crosses the ring. A
+    /// backpressured window keeps its reservation until it drains or is replaced.
+    pub fn shield_reload_with_clock_and_preparation(
+        &mut self,
+        session: &mut Session,
         mut schedule_now: impl FnMut() -> f64,
         sample_rate: u32,
+        mut prepare: impl FnMut(
+            &[rustel_audio::AudioEvent],
+        ) -> Result<rustel_audio::KabelPublication, RuntimeError>,
         mut push: impl FnMut(QueuedAudioEvent) -> bool,
     ) -> Result<bool, RuntimeError> {
         self.sync_panic_recovery(session);
@@ -1221,7 +1289,7 @@ impl LiveFileProducer {
         let mut first_pushed = 0usize;
         if !self.pending.is_empty() {
             let first_push_started = Instant::now();
-            while let Some(event) = self.pending.front().copied() {
+            while let Some(event) = self.pending.front().cloned() {
                 if !push(event) {
                     session.record_producer_ring_push(
                         first_push_started.elapsed(),
@@ -1231,6 +1299,9 @@ impl LiveFileProducer {
                     return Ok(false);
                 }
                 self.pending.pop_front();
+                if self.pending.is_empty() {
+                    self.pending_publication = None;
+                }
                 first_pushed += 1;
             }
             session.record_producer_ring_push(first_push_started.elapsed(), first_pushed, false);
@@ -1263,6 +1334,27 @@ impl LiveFileProducer {
                 | LiveAudioScheduleError::CandidateRefusedScore(_),
             ) => return Ok(false),
         };
+        let publication = match prepare(&batch.events) {
+            Ok(publication) => publication,
+            Err(error) => {
+                #[cfg(feature = "midi")]
+                drop(session.take_pending_midi());
+                #[cfg(feature = "osc")]
+                drop(session.take_pending_osc());
+                #[cfg(feature = "serial")]
+                drop(session.take_pending_serial());
+                return Err(error);
+            }
+        };
+        if session.transport().is_stopped() {
+            #[cfg(feature = "midi")]
+            drop(session.take_pending_midi());
+            #[cfg(feature = "osc")]
+            drop(session.take_pending_osc());
+            #[cfg(feature = "serial")]
+            drop(session.take_pending_serial());
+            return Err(RuntimeError::Cancelled);
+        }
         let tail_started = batch.tail_started;
         let room = MAX_PENDING_BACKLOG.saturating_sub(self.pending.len());
         let dropped = batch.events.len().saturating_sub(room);
@@ -1274,6 +1366,9 @@ impl LiveFileProducer {
                 .take(room)
                 .map(QueuedAudioEvent::from),
         );
+        if !self.pending.is_empty() {
+            self.pending_publication = Some(publication);
+        }
         if dropped > 0 && !self.backlog_dropped_reported {
             self.backlog_dropped_reported = true;
             let message = format!(
@@ -1298,12 +1393,15 @@ impl LiveFileProducer {
         let mut second_saturated = false;
         if !self.pending.is_empty() {
             let second_push_started = Instant::now();
-            while let Some(event) = self.pending.front().copied() {
+            while let Some(event) = self.pending.front().cloned() {
                 if !push(event) {
                     second_saturated = true;
                     break;
                 }
                 self.pending.pop_front();
+                if self.pending.is_empty() {
+                    self.pending_publication = None;
+                }
                 second_pushed += 1;
             }
             session.record_producer_ring_push(
@@ -1388,12 +1486,36 @@ impl LiveFileProducer {
         set_generation: impl FnMut(u64, u64, TakeoverCut),
         push: impl FnMut(QueuedAudioEvent) -> bool,
     ) -> Result<LiveProducerStep, RuntimeError> {
+        self.step_unwatched_with_clock_and_cutover_and_preparation(
+            session,
+            schedule_now,
+            sample_rate,
+            |_| Ok(rustel_audio::KabelPublication::default()),
+            set_generation,
+            push,
+        )
+    }
+
+    /// Prepare each converted window before publishing its generation or events.
+    /// A preparation error rejects the replacement and preserves the audible score.
+    pub fn step_unwatched_with_clock_and_cutover_and_preparation(
+        &mut self,
+        session: &mut Session,
+        schedule_now: impl FnMut() -> f64,
+        sample_rate: u32,
+        prepare: impl FnMut(
+            &[rustel_audio::AudioEvent],
+        ) -> Result<rustel_audio::KabelPublication, RuntimeError>,
+        set_generation: impl FnMut(u64, u64, TakeoverCut),
+        push: impl FnMut(QueuedAudioEvent) -> bool,
+    ) -> Result<LiveProducerStep, RuntimeError> {
         self.sync_panic_recovery(session);
         let started = self.begin_turn();
         let result = self.step_unwatched_with_clock_and_cutover_inner(
             session,
             schedule_now,
             sample_rate,
+            prepare,
             set_generation,
             push,
         );
@@ -1406,12 +1528,16 @@ impl LiveFileProducer {
         session: &mut Session,
         mut schedule_now: impl FnMut() -> f64,
         sample_rate: u32,
+        prepare: impl FnMut(
+            &[rustel_audio::AudioEvent],
+        ) -> Result<rustel_audio::KabelPublication, RuntimeError>,
         set_generation: impl FnMut(u64, u64, TakeoverCut),
         push: impl FnMut(QueuedAudioEvent) -> bool,
     ) -> Result<LiveProducerStep, RuntimeError> {
         session.consume_audio_confirmations();
         if session.transport().is_stopped() {
             self.pending.clear();
+            self.pending_publication = None;
             return Ok(LiveProducerStep {
                 watch: WatchPoll::Stopped,
                 prebake_watch: WatchPoll::Stopped,
@@ -1428,7 +1554,7 @@ impl LiveFileProducer {
         };
         let measure_continuation = watch != WatchPoll::Stopped;
         let continuation_started = measure_continuation.then(Instant::now);
-        let step = self.finish_step(
+        let step = self.finish_step_with_preparation(
             session,
             WatchResults {
                 score: watch.clone(),
@@ -1436,6 +1562,7 @@ impl LiveFileProducer {
             },
             &mut schedule_now,
             sample_rate,
+            prepare,
             set_generation,
             push,
         )?;
@@ -1445,12 +1572,40 @@ impl LiveFileProducer {
         Ok(step)
     }
 
+    #[cfg(test)]
     fn finish_step(
+        &mut self,
+        session: &mut Session,
+        watches: WatchResults,
+        schedule_now: impl FnMut() -> f64,
+        sample_rate: u32,
+        set_generation: impl FnMut(u64, u64, TakeoverCut),
+        push: impl FnMut(QueuedAudioEvent) -> bool,
+    ) -> Result<LiveProducerStep, RuntimeError> {
+        self.finish_step_with_preparation(
+            session,
+            watches,
+            schedule_now,
+            sample_rate,
+            |_| Ok(rustel_audio::KabelPublication::default()),
+            set_generation,
+            push,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "preparation, generation publication and ring delivery are separate ordered hooks"
+    )]
+    fn finish_step_with_preparation(
         &mut self,
         session: &mut Session,
         watches: WatchResults,
         mut schedule_now: impl FnMut() -> f64,
         sample_rate: u32,
+        mut prepare: impl FnMut(
+            &[rustel_audio::AudioEvent],
+        ) -> Result<rustel_audio::KabelPublication, RuntimeError>,
         mut set_generation: impl FnMut(u64, u64, TakeoverCut),
         mut push: impl FnMut(QueuedAudioEvent) -> bool,
     ) -> Result<LiveProducerStep, RuntimeError> {
@@ -1484,6 +1639,7 @@ impl LiveFileProducer {
                 self.pending_prebake_report = None;
             }
             self.pending.clear();
+            self.pending_publication = None;
             return Ok(LiveProducerStep {
                 watch,
                 prebake_watch,
@@ -1523,12 +1679,15 @@ impl LiveFileProducer {
         let mut backpressured = false;
         if !self.pending.is_empty() {
             let first_push_started = Instant::now();
-            while let Some(event) = self.pending.front().copied() {
+            while let Some(event) = self.pending.front().cloned() {
                 if !push(event) {
                     backpressured = true;
                     break;
                 }
                 self.pending.pop_front();
+                if self.pending.is_empty() {
+                    self.pending_publication = None;
+                }
                 pushed += 1;
             }
             session.record_producer_ring_push(first_push_started.elapsed(), pushed, backpressured);
@@ -1892,52 +2051,6 @@ impl LiveFileProducer {
             let takeover_cut = takeover
                 .map(|(_, intent)| intent)
                 .unwrap_or(TakeoverCut::None);
-            if self.check_takeover_freshness
-                && !self.prefill_waiting_for_progress
-                && batch.dispositions.skipped_loading == 0
-                && let Some(takeover_time) = takeover_time
-            {
-                let publication_now = schedule_now();
-                // A CUT takeover (a rewind's restart) publishes a moment
-                // late rather than failing. Its cycle zero was slid to this
-                // turn's clock before the query (`slide_pending_rewind_anchor`)
-                // if it had fallen behind, so what is late here is only the
-                // query and conversion time since: the consumer latches a
-                // restart floor at the cut flip and sounds those past-due
-                // first onsets whole, at the floor. Refusing instead would
-                // roll back a restart whose line cut the consumer may
-                // already have fired, leaving that room silent. An ordinary
-                // edit still refuses to publish into the past: its takeover
-                // is where the outgoing score's retained events stop, and a
-                // late publication would ask rendered frames to change.
-                if session.transport().is_stopped()
-                    || (publication_now > takeover_time && takeover_cut == TakeoverCut::None)
-                {
-                    if let WindowReservation::Ready(key) = reservation {
-                        session.cancel_unpublished_audio_confirmation(key);
-                    }
-                    // This window has already consumed its query. Neither its
-                    // events nor external intents may survive as a retry.
-                    #[cfg(feature = "midi")]
-                    drop(session.take_pending_midi());
-                    #[cfg(feature = "osc")]
-                    drop(session.take_pending_osc());
-                    #[cfg(feature = "serial")]
-                    drop(session.take_pending_serial());
-                    drop(batch);
-                    if session.transport().is_stopped() {
-                        return Err(RuntimeError::Cancelled);
-                    }
-                    let error = RuntimeError::Message(
-                        "replacement prefill finished after its takeover".into(),
-                    );
-                    return Err(self.roll_back_refused_replacement(
-                        session,
-                        &mut schedule_now,
-                        &error,
-                    ));
-                }
-            }
             // A rewind's first window is a restart, shaped like a transport
             // start: every track the score names should land on its first
             // beat. A window that published with skipped-loading onsets
@@ -2003,6 +2116,98 @@ impl LiveFileProducer {
                         loading: true,
                     },
                 ));
+            }
+            // Allocation and bounded resource admission belong to the producer.
+            // Complete the entire window before either its confirmation or its
+            // generation becomes visible to the audio callback.
+            let publication = match prepare(&batch.events) {
+                Ok(publication) => publication,
+                Err(error) => {
+                    if let WindowReservation::Ready(key) = reservation {
+                        session.cancel_unpublished_audio_confirmation(key);
+                    }
+                    #[cfg(feature = "midi")]
+                    drop(session.take_pending_midi());
+                    #[cfg(feature = "osc")]
+                    drop(session.take_pending_osc());
+                    #[cfg(feature = "serial")]
+                    drop(session.take_pending_serial());
+                    drop(batch);
+                    if self.generation_needs_prefill && self.pending_generation.is_some() {
+                        return Err(self.roll_back_refused_replacement(
+                            session,
+                            &mut schedule_now,
+                            &error,
+                        ));
+                    }
+                    if self.generation_needs_prefill {
+                        self.prefill_candidate_committed = true;
+                    }
+                    return Err(error);
+                }
+            };
+            // Preparation may outlast a Stop request even after the query
+            // completed. Keep every output of that window unpublished.
+            if session.transport().is_stopped() {
+                if let WindowReservation::Ready(key) = reservation {
+                    session.cancel_unpublished_audio_confirmation(key);
+                }
+                #[cfg(feature = "midi")]
+                drop(session.take_pending_midi());
+                #[cfg(feature = "osc")]
+                drop(session.take_pending_osc());
+                #[cfg(feature = "serial")]
+                drop(session.take_pending_serial());
+                if self.generation_needs_prefill {
+                    self.prefill_candidate_committed = true;
+                }
+                return Err(RuntimeError::Cancelled);
+            }
+            if self.check_takeover_freshness
+                && !self.prefill_waiting_for_progress
+                && batch.dispositions.skipped_loading == 0
+                && let Some(takeover_time) = takeover_time
+            {
+                let publication_now = schedule_now();
+                // A CUT takeover (a rewind's restart) publishes a moment
+                // late rather than failing. Its cycle zero was slid to this
+                // turn's clock before the query (`slide_pending_rewind_anchor`)
+                // if it had fallen behind, so what is late here is only the
+                // query and conversion time since: the consumer latches a
+                // restart floor at the cut flip and sounds those past-due
+                // first onsets whole, at the floor. Refusing instead would
+                // roll back a restart whose line cut the consumer may
+                // already have fired, leaving that room silent. An ordinary
+                // edit still refuses to publish into the past: its takeover
+                // is where the outgoing score's retained events stop, and a
+                // late publication would ask rendered frames to change.
+                if session.transport().is_stopped()
+                    || (publication_now > takeover_time && takeover_cut == TakeoverCut::None)
+                {
+                    if let WindowReservation::Ready(key) = reservation {
+                        session.cancel_unpublished_audio_confirmation(key);
+                    }
+                    // This window has already consumed its query. Neither its
+                    // events nor external intents may survive as a retry.
+                    #[cfg(feature = "midi")]
+                    drop(session.take_pending_midi());
+                    #[cfg(feature = "osc")]
+                    drop(session.take_pending_osc());
+                    #[cfg(feature = "serial")]
+                    drop(session.take_pending_serial());
+                    drop(batch);
+                    if session.transport().is_stopped() {
+                        return Err(RuntimeError::Cancelled);
+                    }
+                    let error = RuntimeError::Message(
+                        "replacement prefill finished after its takeover".into(),
+                    );
+                    return Err(self.roll_back_refused_replacement(
+                        session,
+                        &mut schedule_now,
+                        &error,
+                    ));
+                }
             }
             self.prefill_waiting_for_progress = false;
             let takeover_frame = takeover_time
@@ -2185,7 +2390,6 @@ impl LiveFileProducer {
                     .take(room)
                     .enumerate()
                     .map(|(index, event)| QueuedAudioEvent {
-                        event,
                         // Only an event the device can certify carries a
                         // receipt. This condition is the opposite of the
                         // one that counts `uncertifiable`, so the ordinals
@@ -2202,8 +2406,12 @@ impl LiveFileProducer {
                             .get(index)
                             .copied()
                             .flatten(),
+                        event,
                     }),
             );
+            if !self.pending.is_empty() {
+                self.pending_publication = Some(publication);
+            }
             if dropped > 0 && !self.backlog_dropped_reported {
                 self.backlog_dropped_reported = true;
                 let message = format!(
@@ -2227,12 +2435,15 @@ impl LiveFileProducer {
             let pushed_before = pushed;
             if !self.pending.is_empty() {
                 let second_push_started = Instant::now();
-                while let Some(event) = self.pending.front().copied() {
+                while let Some(event) = self.pending.front().cloned() {
                     if !push(event) {
                         backpressured = true;
                         break;
                     }
                     self.pending.pop_front();
+                    if self.pending.is_empty() {
+                        self.pending_publication = None;
+                    }
                     pushed += 1;
                 }
                 session.record_producer_ring_push(
@@ -2303,6 +2514,169 @@ impl LiveFileProducer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn preparation_stop_score() -> String {
+        let score = "K(sine(sFreq).out()).note('c4').fast(8)".to_owned();
+        #[cfg(feature = "midi")]
+        let score = format!("stack({score}, note('c4').fast(8).midi('out'))");
+        #[cfg(feature = "osc")]
+        let score = format!("stack({score}, note('c4').fast(8).osc(57120))");
+        #[cfg(feature = "serial")]
+        let score =
+            format!("stack({score}, note('c4').fast(8).serial(115200, true, false, 'out'))");
+        score
+    }
+
+    #[test]
+    fn stop_during_preparation_discards_initial_and_steady_windows() {
+        use rustel_audio::device::ManualLiveOutput;
+
+        for steady in [false, true] {
+            let mut session = Session::new().expect("session");
+            session.set_schedule_lead(0.0);
+            session.evaluate(&preparation_stop_score()).expect("score");
+            session.restart_transport_at(0.0);
+            let generation = session.generation();
+            let output = ManualLiveOutput::new(48_000, generation).expect("output");
+            session
+                .bind_audio_confirmations(output.device().confirmations())
+                .expect("bind output");
+            let mut producer =
+                LiveFileProducer::unwatched(Duration::from_millis(2)).expect("producer");
+            if steady {
+                producer
+                    .step_unwatched_with_clock(&mut session, || 0.0, 48_000, |_| true)
+                    .expect("initial prefill");
+                #[cfg(feature = "midi")]
+                assert!(!session.take_pending_midi().is_empty());
+                #[cfg(feature = "osc")]
+                assert!(!session.take_pending_osc().is_empty());
+                #[cfg(feature = "serial")]
+                assert!(!session.take_pending_serial().is_empty());
+            }
+            let transport = session.transport();
+            let error = producer
+                .step_unwatched_with_clock_and_cutover_and_preparation(
+                    &mut session,
+                    || if steady { 1.0 } else { 0.0 },
+                    48_000,
+                    |events| {
+                        assert!(events.iter().any(|event| event.controls.kabel.is_some()));
+                        transport.stop();
+                        Ok(rustel_audio::KabelPublication::default())
+                    },
+                    |_, _, _| panic!("a stopped window must not publish a generation"),
+                    |_| panic!("a stopped window must not publish an event"),
+                )
+                .expect_err("Stop cancels prepared publication");
+            assert!(matches!(error, RuntimeError::Cancelled));
+            assert_eq!(session.generation(), generation);
+            assert_eq!(output.device().generation(), generation);
+            assert!(producer.pending.is_empty());
+            assert!(producer.pending_publication.is_none());
+            assert_eq!(producer.prefill_candidate_committed, !steady);
+            #[cfg(feature = "midi")]
+            assert!(session.take_pending_midi().is_empty());
+            #[cfg(feature = "osc")]
+            assert!(session.take_pending_osc().is_empty());
+            #[cfg(feature = "serial")]
+            assert!(session.take_pending_serial().is_empty());
+        }
+    }
+
+    #[test]
+    fn prepared_publication_survives_backpressure_until_drain_or_replacement() {
+        for replace in [false, true] {
+            let mut session = Session::new().expect("session");
+            session.set_schedule_lead(0.0);
+            session.evaluate("note('c4')").expect("score");
+            session.restart_transport_at(0.0);
+            let mut producer =
+                LiveFileProducer::unwatched(Duration::from_millis(2)).expect("producer");
+            let first = producer
+                .step_unwatched_with_clock_and_cutover_and_preparation(
+                    &mut session,
+                    || 0.0,
+                    48_000,
+                    |events| {
+                        assert!(!events.is_empty());
+                        Ok(rustel_audio::KabelPublication::default())
+                    },
+                    |_, _, _| panic!("initial window does not replace a generation"),
+                    |_| false,
+                )
+                .expect("prepare backpressured window");
+            assert!(first.backpressured);
+            assert!(producer.pending_publication.is_some());
+            if replace {
+                let generation = session.generation();
+                producer.arm_replacement(generation, generation + 1);
+            } else {
+                let second = producer
+                    .step_unwatched_with_clock(&mut session, || 0.0, 48_000, |_| true)
+                    .expect("drain prepared window");
+                assert_eq!(second.pushed, first.pending);
+            }
+            assert!(producer.pending.is_empty());
+            assert!(producer.pending_publication.is_none());
+        }
+    }
+
+    #[test]
+    fn processor_preparation_refusal_keeps_the_confirmed_score() {
+        use rustel_audio::device::ManualLiveOutput;
+
+        let mut session = Session::new().expect("session");
+        session.set_schedule_lead(0.0);
+        session.set_continuity_margin(0.125);
+        session.evaluate_mini("~").expect("silent score");
+        session.restart_transport_at(0.0);
+        let original = session.generation();
+        let mut output = ManualLiveOutput::new(48_000, original).expect("output");
+        session
+            .bind_audio_confirmations(output.device().confirmations())
+            .expect("bind output");
+        let mut producer = LiveFileProducer::unwatched(Duration::from_millis(2)).expect("producer");
+        producer
+            .step_unwatched_with_clock_and_cutover(
+                &mut session,
+                || 0.0,
+                48_000,
+                |_, _, _| panic!("initial prefill must not replace a generation"),
+                |event| output.device().push(event),
+            )
+            .expect("initial prefill");
+        output.render(&mut [0.0_f32; 256]);
+        session.consume_audio_confirmations();
+        assert_eq!(session.confirmed_audio_generation(), Some(original));
+
+        let now = output.device().clock_seconds();
+        let candidate = session.reload_at("~ ~", true, now).expect("replacement");
+        producer.arm_replacement(original, candidate);
+        let error = producer
+            .step_unwatched_with_clock_and_cutover_and_preparation(
+                &mut session,
+                || now,
+                48_000,
+                |_| {
+                    Err(RuntimeError::ResourceLimit(
+                        "processor budget exhausted".into(),
+                    ))
+                },
+                |_, _, _| panic!("refused preparation published the replacement"),
+                |_| panic!("refused preparation published an event"),
+            )
+            .expect_err("processor admission rejects the replacement");
+        assert!(
+            error.to_string().contains("processor budget exhausted"),
+            "{error}"
+        );
+        assert_eq!(output.device().generation(), original);
+        assert_eq!(session.confirmed_audio_generation(), Some(original));
+        assert_eq!(session.active_source(), Some("~"));
+        assert!(!producer.prefill_candidate_committed);
+        assert!(producer.pending.is_empty());
+    }
 
     #[test]
     fn a_prefill_that_outlasts_its_takeover_keeps_the_confirmed_score() {
@@ -2969,6 +3343,154 @@ mod tests {
         assert!(refused.scheduler_events > 0);
         assert_eq!(refused.converted_audio_events, 0);
         assert!(refused.refused_voices > 0);
+    }
+
+    #[test]
+    fn reload_shield_prepares_once_and_keeps_its_reservation_across_backpressure() {
+        let mut session = Session::new().expect("session");
+        session
+            .evaluate("K(sine(sFreq).out()).note('c4').fast(4)")
+            .expect("score");
+        let mut producer = LiveFileProducer::unwatched(Duration::from_millis(2)).expect("producer");
+        producer
+            .step_unwatched_with_clock_and_cutover(
+                &mut session,
+                || 0.0,
+                48_000,
+                |_, _, _| panic!("initial generation must not cut over"),
+                |_| true,
+            )
+            .expect("initial prefill");
+
+        let mut prepared = 0;
+        assert!(
+            producer
+                .shield_reload_with_clock_and_preparation(
+                    &mut session,
+                    || 0.0,
+                    48_000,
+                    |events| {
+                        assert!(!events.is_empty());
+                        assert!(events.iter().all(|event| event.controls.kabel.is_some()));
+                        prepared += 1;
+                        Ok(rustel_audio::KabelPublication::default())
+                    },
+                    |_| false,
+                )
+                .expect("prepare shield")
+        );
+        assert_eq!(prepared, 1);
+        let pending = producer.pending.len();
+        assert!(pending > 0);
+        assert!(producer.pending_publication.is_some());
+        assert!(
+            !producer
+                .shield_reload_with_clock_and_preparation(
+                    &mut session,
+                    || 0.0,
+                    48_000,
+                    |_| panic!("a blocked window must not prepare its resources again"),
+                    |_| false,
+                )
+                .expect("blocked shield retry")
+        );
+        assert_eq!(producer.pending.len(), pending);
+        assert!(producer.pending_publication.is_some());
+
+        let drained = producer
+            .step_unwatched_with_clock_and_cutover_and_preparation(
+                &mut session,
+                || 0.0,
+                48_000,
+                |events| {
+                    assert!(
+                        events.is_empty(),
+                        "draining the shield must not prepare its resources again"
+                    );
+                    Ok(rustel_audio::KabelPublication::default())
+                },
+                |_, _, _| panic!("shield cannot replace the current generation"),
+                |_| true,
+            )
+            .expect("drain shield");
+        assert_eq!(drained.pushed, pending);
+        assert!(producer.pending.is_empty());
+        assert!(producer.pending_publication.is_none());
+    }
+
+    #[test]
+    fn reload_shield_preparation_refusal_publishes_no_events() {
+        let mut session = Session::new().expect("session");
+        session.evaluate("note('c4').fast(4)").expect("score");
+        let mut producer = LiveFileProducer::unwatched(Duration::from_millis(2)).expect("producer");
+        producer
+            .step_unwatched_with_clock_and_cutover(
+                &mut session,
+                || 0.0,
+                48_000,
+                |_, _, _| panic!("initial generation must not cut over"),
+                |_| true,
+            )
+            .expect("initial prefill");
+        let generation = session.generation();
+        let error = producer
+            .shield_reload_with_clock_and_preparation(
+                &mut session,
+                || 0.0,
+                48_000,
+                |_| {
+                    Err(RuntimeError::ResourceLimit(
+                        "processor budget exhausted".into(),
+                    ))
+                },
+                |_| panic!("a refused shield must not publish events"),
+            )
+            .expect_err("refused preparation");
+        assert!(error.to_string().contains("processor budget exhausted"));
+        assert_eq!(session.generation(), generation);
+        assert!(producer.pending.is_empty());
+        assert!(producer.pending_publication.is_none());
+    }
+
+    #[test]
+    fn stop_during_reload_shield_preparation_discards_the_window() {
+        let mut session = Session::new().expect("session");
+        session.evaluate(&preparation_stop_score()).expect("score");
+        let mut producer = LiveFileProducer::unwatched(Duration::from_millis(2)).expect("producer");
+        producer
+            .step_unwatched_with_clock(&mut session, || 0.0, 48_000, |_| true)
+            .expect("initial prefill");
+        #[cfg(feature = "midi")]
+        assert!(!session.take_pending_midi().is_empty());
+        #[cfg(feature = "osc")]
+        assert!(!session.take_pending_osc().is_empty());
+        #[cfg(feature = "serial")]
+        assert!(!session.take_pending_serial().is_empty());
+        let generation = session.generation();
+        let transport = session.transport();
+        let error = producer
+            .shield_reload_with_clock_and_preparation(
+                &mut session,
+                || 0.0,
+                48_000,
+                |events| {
+                    assert!(events.iter().any(|event| event.controls.kabel.is_some()));
+                    transport.stop();
+                    Ok(rustel_audio::KabelPublication::default())
+                },
+                |_| panic!("a stopped shield must not publish events"),
+            )
+            .expect_err("Stop cancels prepared shield publication");
+        assert!(matches!(error, RuntimeError::Cancelled));
+        assert_eq!(session.generation(), generation);
+        assert!(producer.pending.is_empty());
+        assert!(producer.pending_publication.is_none());
+        #[cfg(feature = "midi")]
+        assert!(session.take_pending_midi().is_empty());
+        #[cfg(feature = "osc")]
+        assert!(session.take_pending_osc().is_empty());
+        #[cfg(feature = "serial")]
+        assert!(session.take_pending_serial().is_empty());
     }
 
     #[test]
@@ -4437,7 +4959,7 @@ mod tests {
                     device.set_generation(generation, takeover, cut);
                 },
                 |event| {
-                    let pushed = device.push(event);
+                    let pushed = device.push(event.clone());
                     if pushed {
                         sent.events.push((
                             event.generation,

@@ -28,7 +28,7 @@ fn serial_tripwire_test() -> MutexGuard<'static, ()> {
 
 struct AudioState {
     frames: AtomicU64,
-    held: Option<AudioEvent>,
+    held: Option<AudioEvent<rustel_audio::CompactKabelControls>>,
     consumed: Vec<u64>,
 }
 
@@ -58,7 +58,9 @@ fn callback(st: &mut AudioState, ring: &Ring, generation: u64, stopped: &AtomicB
 #[test]
 fn ring_callback_path_has_no_allocation_or_free() {
     let _serial = serial_tripwire_test();
-    assert!(!std::mem::needs_drop::<AudioEvent>());
+    assert!(!std::mem::needs_drop::<
+        AudioEvent<rustel_audio::CompactKabelControls>,
+    >());
 
     let ring = Ring::new(64);
     for i in 0..16u64 {
@@ -176,6 +178,7 @@ fn fx_reverb_test_controls(params: rustel_audio::reverb::ReverbParams) -> Oscill
         ..OscillatorControls::default()
     };
     controls.fx_stages[0] = Some(rustel_audio::FxStage {
+        kabel: None,
         stretch: None,
         transient: None,
         gain: 1.0,
@@ -242,7 +245,10 @@ fn fx_reverb_delivery_and_retirement_have_no_callback_allocation() {
         lp_start_hz: 0.0,
         lp_end_hz: 0.0,
     };
-    let controls = fx_reverb_test_controls(params);
+    let controls = OnsetEvent::new(0, 440.0, 0.5, 1.0)
+        .with_controls(fx_reverb_test_controls(params))
+        .into_prepared()
+        .controls;
     let mut prepared = (0..33)
         .map(|_| {
             Box::new(rustel_audio::reverb::OrbitReverb::generate_streaming(
@@ -317,7 +323,10 @@ fn fx_reverb_eviction_preserves_a_leased_room_without_callback_allocation() {
     let incoming_pointer = std::ptr::from_ref(incoming.as_ref());
     assert!(backend.install_fx_reverb(leased).is_none());
     assert!(backend.install_fx_reverb(idle).is_none());
-    let controls = fx_reverb_test_controls(params(1_000.0));
+    let controls = OnsetEvent::new(0, 440.0, 0.5, 1.0)
+        .with_controls(fx_reverb_test_controls(params(1_000.0)))
+        .into_prepared()
+        .controls;
     let mut output = [0.0; 256];
     let mut retired = None;
 
@@ -413,7 +422,11 @@ fn inline_fx_reverb_returns_remain_prepared_after_reinitialization() {
     });
     let mut output = [0.0f32; 128 * 2];
     // Offline generation may allocate, but its later return must not.
-    backend.note(OnsetEvent::new(0, 440.0, 0.5, 1.0).with_controls(controls));
+    backend.note(OnsetEvent::new(0, 440.0, 0.5, 1.0).with_controls(controls.clone()));
+    let controls = OnsetEvent::new(0, 440.0, 0.5, 1.0)
+        .with_controls(controls)
+        .into_prepared()
+        .controls;
     backend.process_block(&mut output, 128);
     let before = Violations::capture();
     tripwire::audio_scope(|| backend.reset_at(0));
@@ -593,6 +606,7 @@ fn pooled_fx_stage_state_activates_and_retires_without_callback_allocation() {
     let mut backend = ScalarBackend::prepared(48_000, 1).expect("scalar init");
     let mut controls = OscillatorControls::default();
     controls.fx_stages[0] = Some(rustel_audio::FxStage {
+        kabel: None,
         stretch: None,
         transient: None,
         gain: 1.0,
@@ -646,6 +660,7 @@ fn pooled_fm_state_activates_and_retires_without_callback_allocation() {
         mod_slot: Some(0),
     });
     let controls = OscillatorControls {
+        kabel: None,
         limit: None,
         envelope: Envelope {
             attack_secs: 0.0,
@@ -912,7 +927,7 @@ fn live_held_events_survive_future_breaks_and_generation_changes_without_allocat
             synth: None,
             cut: None,
         };
-        assert!(ring.push(event));
+        assert!(ring.push(event.clone()));
         let generation = AtomicU64::new(1);
         let takeover = AtomicU64::new(0);
         let line_arm = AtomicU64::new(0);
@@ -1037,6 +1052,7 @@ fn live_ring_preserves_the_complete_oscillator_control_bundle() {
     let _serial = serial_tripwire_test();
     let ring = Ring::new(2);
     let controls = OscillatorControls {
+        kabel: None,
         limit: None,
         live_controls: [0; 3],
         preview_epoch: 7,
@@ -1095,7 +1111,7 @@ fn live_ring_preserves_the_complete_oscillator_control_bundle() {
         compressor: None,
         partials: None,
         transient: None,
-        fx_stages: [None; rustel_audio::MAX_FX_STAGES],
+        fx_stages: [const { None }; rustel_audio::MAX_FX_STAGES],
         vowel: None,
         coarse: None,
         crush: None,
@@ -1110,7 +1126,7 @@ fn live_ring_preserves_the_complete_oscillator_control_bundle() {
         gain: 1.0,
         duration_secs: 0.1,
         ui_visuals: 0,
-        controls,
+        controls: controls.clone(),
         sample: None,
         wavetable: None,
         synth: None,
@@ -1143,7 +1159,11 @@ fn live_ring_preserves_the_complete_oscillator_control_bundle() {
     assert_eq!(report.accepted, 1);
     let mut reference = ScalarBackend::prepared(48_000, 1).expect("reference scalar");
     assert!(
-        reference.try_note_prepared(OnsetEvent::new(0, 440.0, 1.0, 0.1).with_controls(controls))
+        reference.try_note_prepared(
+            OnsetEvent::new(0, 440.0, 1.0, 0.1)
+                .with_controls(controls)
+                .into_prepared()
+        )
     );
     let mut expected = [0.0f32; 128 * 2];
     reference.process_block(&mut expected, 128);
@@ -1191,6 +1211,7 @@ fn live_pending_slots_reuse_retired_event_storage_without_allocating() {
     let _serial = serial_tripwire_test();
     let ring = Ring::new(16);
     let controls = OscillatorControls {
+        kabel: None,
         limit: None,
         envelope: Envelope {
             attack_secs: 0.0,
@@ -1210,7 +1231,7 @@ fn live_pending_slots_reuse_retired_event_storage_without_allocating() {
             gain: 0.5,
             duration_secs: 0.000_1,
             ui_visuals: 0,
-            controls,
+            controls: controls.clone(),
             sample: None,
             wavetable: None,
             synth: None,
@@ -1261,7 +1282,7 @@ fn live_pending_slots_reuse_retired_event_storage_without_allocating() {
         gain: 0.5,
         duration_secs: 0.000_1,
         ui_visuals: 0,
-        controls,
+        controls: controls.clone(),
         sample: None,
         wavetable: None,
         synth: None,
@@ -1779,4 +1800,53 @@ fn immediate_piano_chords_and_releases_are_allocation_free() {
             .iter()
             .all(|sample| sample.is_finite() && sample.abs() < 0.000001)
     );
+}
+
+#[test]
+fn kabel_delivery_render_and_delay_reset_have_no_callback_allocation() {
+    let _serial = serial_tripwire_test();
+    let program = rustel_audio::rustel_kabel::Program::from_json(
+        r#"{"nodes":[{"type":"n","value":1},{"type":"n","value":0.001},{"type":"delay","inputs":[0,1]},{"type":"output","inputs":[2]}]}"#,
+    ).unwrap();
+    let mut prepared = Some(Box::new(
+        rustel_audio::rustel_kabel::Graph::new(&program, 48_000.0).unwrap(),
+    ));
+    let mut backend = ScalarBackend::prepared(48_000, 2).unwrap();
+    let controls = OscillatorControls {
+        kabel: Some(rustel_audio::KabelControls {
+            program: std::sync::Arc::new(program),
+            start_secs: 0.0,
+            gate_end_secs: 0.001,
+            end_secs: 0.01,
+        }),
+        ..OscillatorControls::default()
+    };
+    backend.prepare_kabel(&controls).unwrap();
+    let event = OnsetEvent::new(0, 440.0, 0.5, 0.001)
+        .with_controls(controls)
+        .into_prepared();
+    let mut output = [0.0f32; 256];
+    let mut heard = false;
+    let before = Violations::capture();
+    tripwire::audio_scope(|| {
+        assert!(backend.install_kabel(prepared.take().unwrap()).is_none());
+        assert!(backend.try_note_prepared(event));
+        backend.process_block(&mut output, 128);
+        heard |= output.iter().any(|sample| sample.abs() > 1e-6);
+        backend.reset_at(0);
+        assert!(backend.try_note_prepared(event));
+        for _ in 0..8 {
+            backend.process_block(&mut output, 128);
+        }
+        backend.reset_at(0);
+        assert!(backend.try_note_prepared(event));
+        backend.process_block(&mut output, 128);
+    });
+    let delta = Violations::capture().since(before);
+    assert!(
+        delta.clean(),
+        "KabelSalat lifecycle allocated or freed: {delta:?}"
+    );
+    assert!(heard);
+    assert_eq!(backend.missing_kabel_events(), 0);
 }

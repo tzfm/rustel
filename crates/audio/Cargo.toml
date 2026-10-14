@@ -17,6 +17,7 @@ device-audio = ["dep:cpal", "cpal/pulseaudio"]
 test-support = []
 
 [dependencies]
+rustel-kabel = { path = "../kabel" }
 # Partitioned FFT convolution for the generated-IR room reverb.
 # Plans and scratch are allocated at generation time on the producer side; the
 # audio callback only executes preplanned transforms.

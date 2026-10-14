@@ -54,6 +54,28 @@ fn doc_resolves_the_installed_tempo_alias() {
     );
 }
 
+#[cfg(feature = "studio")]
+#[test]
+fn doc_preserves_score_names_and_resolves_exact_graph_names() {
+    for (name, graph) in [("sine", false), ("s", false), ("S", true), ("sFreq", true)] {
+        let output = run(&["doc", name, "--json"]);
+        assert!(output.status.success(), "{name}: {output:?}");
+        let entry: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            entry["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tag| tag == "kabelsalat"),
+            graph,
+            "{name}: {entry}"
+        );
+        if graph {
+            assert_eq!(entry["name"], name);
+        }
+    }
+}
+
 #[cfg(all(feature = "studio", feature = "hydra"))]
 #[test]
 fn doc_hydra_names_link_to_setup_in_human_and_json_modes() {

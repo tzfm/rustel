@@ -263,7 +263,7 @@ const DOCUMENTED: &[Documented] = &[
     },
     Documented {
         chord: "ctrl+j",
-        row: "Smart action at the caret",
+        row: "Quick action at the caret",
         enhanced_only: false,
         setup: Some(caret_on_a_number),
         check: Check::SmartAction,
@@ -558,9 +558,9 @@ fn every_documented_chord_is_honoured() {
                     // fader", and Enter again writes the call without
                     // evaluating. The form arrives filled from the number.
                     assert!(
-                        studio.status().starts_with("smart action: Enter chooses"),
+                        studio.status().starts_with("quick action: Enter chooses"),
                         "the documented chord `{chord}` ({capabilities:?}) did not open the \
-                         smart action: {}",
+                         quick action: {}",
                         studio.status()
                     );
                     studio.press(KeyCode::Enter, KeyModifiers::NONE);
@@ -577,7 +577,7 @@ fn every_documented_chord_is_honoured() {
                         studio.source()
                     );
                     assert!(
-                        !studio.status().starts_with("smart action:"),
+                        !studio.status().starts_with("quick action:"),
                         "the documented chord `{chord}` ({capabilities:?}) left the smart \
                          action open: {}",
                         studio.status()

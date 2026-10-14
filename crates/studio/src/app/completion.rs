@@ -10,6 +10,7 @@
 
 use super::string_roles::StringRole;
 use super::*;
+use crate::reference::{ReferenceMode, ReferenceScope};
 use rustel_runtime::lint::scan;
 
 /// The word the reference column was opened on.
@@ -29,6 +30,8 @@ pub(super) enum Landing {
     /// The name itself: a sound inside a string, a misspelt function put
     /// right.
     Bare,
+    /// A node property, without call brackets but joined into its chain.
+    Member,
     /// In quotes: the caret was in a call that takes a string but no
     /// quotes had been typed yet, so `chord(` becomes `chord("C^7")`
     /// rather than `chord(C^7)`.
@@ -44,12 +47,68 @@ impl App {
     /// The word under the caret and where it sits, when there is one.
     pub(super) fn word_range_at_caret(&self) -> Option<(String, Range<ByteOffset>)> {
         let editor = self.editor();
-        word_before(editor.document(), editor.primary_selection().head)
+        let (word, range) = word_before(editor.document(), editor.primary_selection().head)?;
+        let source = editor.source();
+        let qualified = reference_name_range(&source, range.start.0..range.end.0);
+        if qualified.start == range.start.0 {
+            Some((word, range))
+        } else {
+            Some((
+                source[qualified.clone()].to_owned(),
+                ByteOffset(qualified.start)..ByteOffset(qualified.end),
+            ))
+        }
+    }
+
+    /// A callee uses the namespace before its name. Its arguments can
+    /// switch namespace themselves, as `K` and `S` do.
+    pub(super) fn reference_scope_at(&self, at: ByteOffset) -> ReferenceScope {
+        reference_scope(&self.editor().source(), at.0)
+    }
+
+    pub(super) fn reference_scope_at_caret(&self) -> ReferenceScope {
+        self.reference_scope_at(self.editor().primary_selection().head)
+    }
+
+    /// A node member shares graph documentation with its global form, but
+    /// only members belong in the list behind that documentation.
+    pub(super) fn reference_name_scope_at(&self, at: ByteOffset) -> ReferenceScope {
+        let scope = self.reference_scope_at(at);
+        if scope.is_kabelsalat() && self.editor().source()[..at.0].trim_end().ends_with('.') {
+            ReferenceScope::KabelsalatMember
+        } else {
+            scope
+        }
+    }
+
+    fn chain_reference_scope(&self, range: &Range<ByteOffset>) -> ReferenceScope {
+        let scope = self.reference_name_scope_at(range.start);
+        if scope.is_kabelsalat() && range.is_empty() {
+            ReferenceScope::KabelsalatMember
+        } else {
+            scope
+        }
+    }
+
+    fn completion_scope_at_caret(&self) -> ReferenceScope {
+        if let Some(range) = self.chain_position_at_caret() {
+            return self.chain_reference_scope(&range);
+        }
+        let caret = self.editor().primary_selection().head;
+        let scope = self.reference_scope_at(caret);
+        let name = self
+            .word_range_at_caret()
+            .filter(|(_, range)| range.start < caret && caret <= range.end)
+            .or_else(|| self.enclosing_call_at_caret());
+        name.filter(|(_, range)| self.reference_scope_at(range.start) == scope)
+            .map_or(scope, |(_, range)| {
+                self.reference_name_scope_at(range.start)
+            })
     }
 
     /// The name and range of the innermost call whose `(` is open at the
     /// caret, as in `setcpm(|`. Brackets in strings, comments and regexes
-    /// are ignored. The name must touch its `(`; any other `(` groups, and
+    /// are ignored. Parentheses without a preceding name only group, and
     /// the walk continues outward.
     pub(super) fn enclosing_call_at_caret(&self) -> Option<(String, Range<ByteOffset>)> {
         self.enclosing_call_argument_at_caret()
@@ -588,11 +647,15 @@ impl App {
         if !typed.is_empty() && to > caret.0 {
             let whole = source.get(start.0 + from..to)?;
             let tail = source.get(caret.0..to)?;
-            if self.reference.lookup(whole).is_some() || self.reference.lookup(tail).is_none() {
+            let scope = self.reference_scope_at(caret);
+            if self.reference.lookup_in(whole, scope).is_some()
+                || self.reference.lookup_in(tail, scope).is_none()
+            {
                 return None;
             }
         }
-        Some(ByteOffset(start.0 + from)..caret)
+        let range = reference_name_range(&source, start.0 + from..caret.0);
+        Some(ByteOffset(range.start)..caret)
     }
 
     /// The completion list for a new link in a chain, anchored to the
@@ -601,7 +664,8 @@ impl App {
     pub(super) fn chain_completion_panel(&mut self) -> Option<ReferencePanel> {
         let range = self.chain_position_at_caret()?;
         let typed = self.editor().document().slice(range.clone()).ok()?;
-        let panel = ReferencePanel::browse_for(&self.reference, &typed);
+        let panel =
+            ReferencePanel::browse_in(&self.reference, &typed, self.chain_reference_scope(&range));
         self.reference_anchor = None;
         self.anchor_reference_as(&typed, range, Landing::Call);
         Some(panel)
@@ -692,7 +756,8 @@ impl App {
         // is decided before the focus rule below: a panel left open behind
         // the editor must answer about the new word on the first press,
         // not spend one taking the keyboard back.
-        let asked = self.word_range_at_caret().map(|(word, _)| word);
+        let asked_word = self.word_range_at_caret();
+        let asked = asked_word.as_ref().map(|(word, _)| word.clone());
         let showing = self
             .reference_panel
             .as_ref()
@@ -703,8 +768,25 @@ impl App {
         let new_link = self.focus == Focus::Editor
             && asked.is_none()
             && self.chain_position_at_caret().is_some();
-        let retarget =
-            self.reference_panel.is_some() && ((asked.is_some() && asked != showing) || new_link);
+        // Equal names can describe different graph and pattern entries.
+        let other_scope = self
+            .reference_panel
+            .as_ref()
+            .is_some_and(|panel| match panel.mode {
+                ReferenceMode::Entry { index, .. } => asked_word
+                    .as_ref()
+                    .and_then(|(word, range)| {
+                        self.reference
+                            .lookup_in(word, self.reference_scope_at(range.start))
+                    })
+                    .is_some_and(|asked| asked != index),
+                ReferenceMode::Browse => {
+                    panel.scope != ReferenceScope::All
+                        && panel.scope != self.completion_scope_at_caret()
+                }
+            });
+        let retarget = self.reference_panel.is_some()
+            && ((asked.is_some() && asked != showing) || new_link || other_scope);
         // Open but not in front of you, and nothing new to ask: the chord
         // brings you back to it. Pressing it again from there puts it away.
         if self.reference_panel.is_some()
@@ -737,7 +819,11 @@ impl App {
                     // as a call.
                     panel
                 } else {
-                    let anchor = self.word_range_at_caret();
+                    let scope = self.completion_scope_at_caret();
+                    let namespace = self.reference_scope_at_caret();
+                    let anchor = self
+                        .word_range_at_caret()
+                        .filter(|(_, range)| self.reference_scope_at(range.start) == namespace);
                     // With the caret inside a call the reference knows, the
                     // chord opens the entry for that call. A word under the
                     // caret asks for a completion instead: after `x=>x.pl`
@@ -748,16 +834,24 @@ impl App {
                     let typing = anchor
                         .as_ref()
                         .is_some_and(|(_, range)| range.end >= caret && range.start < caret);
+                    let enclosing = self.enclosing_call_at_caret();
                     let entry = if typing {
                         None
                     } else {
-                        self.enclosing_call_at_caret()
-                            .and_then(|(word, _)| self.reference.lookup(&word))
+                        enclosing.as_ref().and_then(|(word, range)| {
+                            let callee_scope = self.reference_name_scope_at(range.start);
+                            (self.reference_scope_at(range.start) == namespace)
+                                .then(|| self.reference.lookup_in(word, callee_scope))
+                                .flatten()
+                        })
                     };
                     let panel = match (entry, &anchor) {
-                        (Some(index), _) => ReferencePanel::open(&self.reference, index),
+                        (Some(index), _) => self.reference_entry_panel(index, scope, None),
                         (None, Some((word, _))) => {
-                            ReferencePanel::browse_for(&self.reference, word)
+                            ReferencePanel::browse_in(&self.reference, word, scope)
+                        }
+                        (None, None) if enclosing.is_some() => {
+                            ReferencePanel::browse_in(&self.reference, "", scope)
                         }
                         (None, None) => ReferencePanel::browse(&self.reference),
                     };
@@ -833,25 +927,65 @@ impl App {
     }
 }
 
+/// `S` inside a graph changes back to pattern expressions.
+/// The nearest graph boundary wins, including a new `K` nested inside `S`.
+fn reference_scope(source: &str, caret: usize) -> ReferenceScope {
+    let Some(prefix) = source.get(..caret) else {
+        return ReferenceScope::Pattern;
+    };
+    let code = rustel_runtime::lint::code_only(prefix);
+    let mut pattern_input = false;
+    for open in scan::open_parens(&code, code.len()) {
+        let Some(name) = scan::name_before(&code, open) else {
+            continue;
+        };
+        match &code[name] {
+            "K" if call_argument_index(&code, open) == 0 => {
+                return if pattern_input {
+                    ReferenceScope::Pattern
+                } else {
+                    ReferenceScope::Kabelsalat
+                };
+            }
+            "S" => pattern_input = true,
+            _ => {}
+        }
+    }
+    ReferenceScope::Pattern
+}
+
+/// Static graph helpers keep their receiver when searched or replaced.
+/// Ordinary node methods remain unqualified names such as `sine`.
+fn reference_name_range(source: &str, name: Range<usize>) -> Range<usize> {
+    if name.start > 0 && source.as_bytes()[name.start - 1] == b'.' {
+        let receiver = scan::name_ending_at(source, name.start - 1);
+        if matches!(&source[receiver.clone()], "Node" | "nodeRegistry") {
+            return receiver.start..name.end;
+        }
+    }
+    name
+}
+
 fn enclosing_call_argument(source: &str, caret: usize) -> Option<(Range<usize>, usize)> {
     let code = rustel_runtime::lint::code_only(source.get(..caret)?);
     scan::open_parens(&code, code.len()).find_map(|open| {
-        let name = scan::name_ending_at(&code, open);
-        if name.is_empty() {
-            return None;
-        }
-        let mut depth = 0usize;
-        let mut argument = 0;
-        for byte in code.as_bytes()[open + 1..].iter().copied() {
-            match byte {
-                b'(' | b'[' | b'{' => depth += 1,
-                b')' | b']' | b'}' => depth = depth.saturating_sub(1),
-                b',' if depth == 0 => argument += 1,
-                _ => {}
-            }
-        }
-        Some((name, argument))
+        let name = reference_name_range(&code, scan::name_before(&code, open)?);
+        Some((name, call_argument_index(&code, open)))
     })
+}
+
+fn call_argument_index(code: &str, open: usize) -> usize {
+    let mut depth = 0usize;
+    let mut argument = 0;
+    for byte in code.as_bytes()[open + 1..].iter().copied() {
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => argument += 1,
+            _ => {}
+        }
+    }
+    argument
 }
 
 /// The offset and byte of the `"` or `'` that `before_caret` leaves open.
@@ -935,7 +1069,67 @@ pub(super) fn word_before(
 
 #[cfg(test)]
 mod argument_context_tests {
-    use super::enclosing_call_argument;
+    use super::{ReferenceScope, enclosing_call_argument, reference_scope};
+
+    #[test]
+    fn graph_and_pattern_boundaries_follow_the_caret_context() {
+        for (source, scope) in [
+            ("sine(", ReferenceScope::Pattern),
+            ("note('c3').K(() => sine(", ReferenceScope::Kabelsalat),
+            (
+                "note('c3').worklet (() => {\n sine(",
+                ReferenceScope::Pattern,
+            ),
+            ("K(() => S(note('c3').adsr(", ReferenceScope::Pattern),
+            ("K(() => m(note('c3').adsr(", ReferenceScope::Kabelsalat),
+            ("K(() => node.m(sine(", ReferenceScope::Kabelsalat),
+            ("K(() => m('unfinished", ReferenceScope::Kabelsalat),
+            ("K(() => sine(220).out(), sine(", ReferenceScope::Pattern),
+            (
+                "worklet('sine(pat[0]).out()', sine(",
+                ReferenceScope::Pattern,
+            ),
+            (
+                "K(() => { let a = 2, b = 3; sine(",
+                ReferenceScope::Kabelsalat,
+            ),
+            ("K(() => sine(S(note('c3')), ", ReferenceScope::Kabelsalat),
+            (
+                "K(() => S(note('c3').K(() => sine(",
+                ReferenceScope::Kabelsalat,
+            ),
+            ("S(note('c3').K(() => sine(", ReferenceScope::Kabelsalat),
+            ("K(() => sine(220)).adsr(", ReferenceScope::Pattern),
+            ("// K(() =>\nsine(", ReferenceScope::Pattern),
+            ("'K(() => S('; sine(", ReferenceScope::Pattern),
+            ("const pattern = /K\\(/; sine(", ReferenceScope::Pattern),
+            ("K(() => { /* S( */ sine(", ReferenceScope::Kabelsalat),
+            ("K(() => { // S(\n sine(", ReferenceScope::Kabelsalat),
+            (
+                "K(() => poly({name: 'S(', voice: sine(",
+                ReferenceScope::Kabelsalat,
+            ),
+            ("K(() => { /* S(", ReferenceScope::Kabelsalat),
+            ("K(() => S('unfinished K(", ReferenceScope::Pattern),
+        ] {
+            assert_eq!(reference_scope(source, source.len()), scope, "{source}");
+        }
+        // The opening parenthesis switches the arguments, never the
+        // callee whose name appears before it.
+        let source = "note('c3').K(() => S(note('c4')))";
+        assert_eq!(
+            reference_scope(source, source.find("K(").unwrap()),
+            ReferenceScope::Pattern
+        );
+        assert_eq!(
+            reference_scope(source, source.find("S(").unwrap()),
+            ReferenceScope::Kabelsalat
+        );
+        assert_eq!(
+            reference_scope(source, source.find("S(").unwrap() + 2),
+            ReferenceScope::Pattern
+        );
+    }
 
     #[test]
     fn counts_only_the_enclosing_calls_argument_separators() {
@@ -953,6 +1147,9 @@ mod argument_context_tests {
             ("outer(1, inner(2, 3), ", "outer", 2),
             ("lfo({ control: 'gain', shape: '", "lfo", 0),
             ("lfo({ shape: 'sine' }, '", "lfo", 1),
+            ("K(() => Node.parseInput (", "Node.parseInput", 0),
+            ("K(() => nodeRegistry.get(", "nodeRegistry.get", 0),
+            ("K(() => input.sine(", "sine", 0),
         ] {
             let (name, actual) = enclosing_call_argument(source, source.len())
                 .unwrap_or_else(|| panic!("missing call: {source}"));
@@ -960,5 +1157,184 @@ mod argument_context_tests {
             assert_eq!(actual, argument, "{source}");
         }
         assert!(enclosing_call_argument("s(\"bd\")", 7).is_none());
+    }
+}
+
+#[cfg(test)]
+mod scoped_completion_tests {
+    use super::*;
+    use crate::editor::{Editor, Selection};
+
+    fn seed(app: &mut App, marked: &str) {
+        let caret = marked.find('|').expect("caret marker");
+        app.scenes.current_mut().editor = Editor::new(&marked.replace('|', "")).expect("editor");
+        app.editor_mut()
+            .set_selection(Selection::caret(ByteOffset(caret)))
+            .expect("caret");
+        app.set_reference_panel(None);
+        app.reference_anchor = None;
+        app.focus = Focus::Editor;
+    }
+
+    #[test]
+    fn completion_switches_namespace_at_graph_and_pattern_inputs() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut app = crate::app::tests::support::app_over(directory.path());
+        for (marked, scope, query) in [
+            ("K(|", ReferenceScope::Kabelsalat, ""),
+            ("K(() => S(|", ReferenceScope::Pattern, ""),
+            ("K(() => si|)", ReferenceScope::Kabelsalat, "si"),
+            ("K(() => sFreq.si|)", ReferenceScope::KabelsalatMember, "si"),
+            ("K(() => sine(220)|)", ReferenceScope::KabelsalatMember, ""),
+            ("K(() => Node.|)", ReferenceScope::Kabelsalat, "Node."),
+            (
+                "K(() => Node.parseI|)",
+                ReferenceScope::Kabelsalat,
+                "Node.parseI",
+            ),
+            ("K(() => S(note('c3').ad|))", ReferenceScope::Pattern, "ad"),
+        ] {
+            seed(&mut app, marked);
+            app.toggle_reference_browse();
+            let panel = app.reference_panel.as_ref().expect("completion");
+            assert_eq!(panel.scope, scope, "{marked}");
+            assert_eq!(panel.query, query, "{marked}");
+            assert_eq!(
+                app.reference_anchor
+                    .as_ref()
+                    .map(|anchor| anchor.word.as_str()),
+                (!query.is_empty() || scope == ReferenceScope::KabelsalatMember).then_some(query),
+                "{marked}"
+            );
+        }
+    }
+
+    #[test]
+    fn graph_completion_separates_global_inputs_and_node_members() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut app = crate::app::tests::support::app_over(directory.path());
+        for (marked, allowed, excluded) in [
+            ("K(() => sFre|)", "sFreq", "apply2"),
+            ("K(() => sFreq.|)", "apply2", "sFreq"),
+            ("K(() => app|)", "sFreq", "apply2"),
+            ("K(() => sFreq.sFre|)", "apply2", "sFreq"),
+            ("K(() => Node.parseI|)", "Node.parseInput", "apply2"),
+        ] {
+            seed(&mut app, marked);
+            app.toggle_reference_browse();
+            let panel = app.reference_panel.as_ref().expect("completion");
+            let excluded = app.reference.lookup_in(excluded, panel.scope).unwrap();
+            assert!(!panel.results.contains(&excluded), "{marked}");
+            // Emptying the query keeps its namespace, including after a
+            // partially typed global name on a node.
+            let mut panel = panel.clone();
+            panel.query.clear();
+            panel.refresh(&app.reference);
+            let allowed = app.reference.lookup_in(allowed, panel.scope).unwrap();
+            assert!(panel.results.contains(&allowed), "{marked}");
+            assert!(!panel.results.contains(&excluded), "{marked}");
+        }
+    }
+
+    #[test]
+    fn help_and_inserted_calls_keep_their_namespace_when_returning_to_the_list() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut app = crate::app::tests::support::app_over(directory.path());
+        for (marked, scope) in [
+            ("sine|.range(0, 1)", ReferenceScope::Pattern),
+            ("K(() => sine|(220))", ReferenceScope::Kabelsalat),
+            (
+                "K(() => sFreq.sine|(220))",
+                ReferenceScope::KabelsalatMember,
+            ),
+        ] {
+            seed(&mut app, marked);
+            app.toggle_reference_at_caret();
+            let panel = app.reference_panel.as_ref().expect("documentation");
+            assert_eq!(panel.scope, scope, "{marked}");
+            let mut panel = panel.clone();
+            assert!(panel.collapse(), "{marked}");
+            assert_eq!(
+                panel.selected_result(),
+                app.reference.lookup_in("sine", scope),
+                "{marked}"
+            );
+        }
+
+        for (marked, scope, query) in [
+            ("K(() => sin|)", ReferenceScope::Kabelsalat, "sin"),
+            (
+                "K(() => sFreq.sin|)",
+                ReferenceScope::KabelsalatMember,
+                "sin",
+            ),
+            (
+                "K(() => sin|)",
+                ReferenceScope::Kabelsalat,
+                "tag:kabelsalat sine",
+            ),
+        ] {
+            seed(&mut app, marked);
+            app.toggle_reference_browse();
+            let mut panel = app.reference_panel.take().unwrap();
+            panel.query = query.to_owned();
+            panel.refresh(&app.reference);
+            let graph_sine = app.reference.lookup_in("sine", scope).unwrap();
+            panel.selected = panel.row_of_result(
+                panel
+                    .results
+                    .iter()
+                    .position(|&index| index == graph_sine)
+                    .unwrap(),
+            );
+            app.reference_panel = Some(panel);
+            app.confirm_reference_name("sine".to_owned()).unwrap();
+            let panel = app.reference_panel.as_ref().expect("inserted call help");
+            assert_eq!(panel.scope, scope, "{marked}");
+            assert_eq!(
+                panel.query,
+                if query.starts_with("tag:") {
+                    query
+                } else {
+                    "sine"
+                }
+            );
+            assert_eq!(panel.selected_result(), Some(graph_sine));
+        }
+    }
+
+    #[test]
+    fn same_spelling_retargets_completion_between_graph_and_pattern() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut app = crate::app::tests::support::app_over(directory.path());
+        seed(
+            &mut app,
+            "sine|.range(0, 1)\nnote('c3').K(() => sine(220).out())",
+        );
+        let source = app.editor().source();
+        let pattern = source.find("sine").unwrap() + 4;
+        let graph = source.rfind("sine").unwrap() + 4;
+        for (before, after, scope) in [
+            (pattern, graph, ReferenceScope::Kabelsalat),
+            (graph, pattern, ReferenceScope::Pattern),
+        ] {
+            app.focus = Focus::Editor;
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(before)))
+                .unwrap();
+            app.toggle_reference_at_caret();
+            app.focus = Focus::Editor;
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(after)))
+                .unwrap();
+            app.toggle_reference_browse();
+            let panel = app.reference_panel.as_ref().expect("completion");
+            assert_eq!(panel.scope, scope);
+            assert_eq!(panel.query, "sine");
+            assert_eq!(
+                panel.selected_result(),
+                app.reference.lookup_in("sine", scope)
+            );
+        }
     }
 }

@@ -2,6 +2,7 @@
 //! how the status line names that list or the lack of one.
 
 use super::*;
+use crate::reference::ReferenceScope;
 
 /// What a string handed to a function stands for, and so what list
 /// completes it.
@@ -48,6 +49,12 @@ impl App {
     /// One word in one entry is the whole cost of teaching the editor about
     /// a new function. Nothing here is a second catalogue to keep in sync.
     pub(super) fn string_role(&self, callee: &str) -> Option<StringRole> {
+        // Graph nodes share names with pattern functions. Their string
+        // arguments do not inherit those functions' sound or scale lists.
+        let scope = self.string_callee_scope(callee);
+        if scope.is_kabelsalat() {
+            return None;
+        }
         let by_name = |name: &str| match name {
             "s" | "sound" => Some(StringRole::Sound),
             // `.bank(…)` completes by machine, not by sound: its string
@@ -98,7 +105,7 @@ impl App {
         let argument = self.completion_argument_index(callee);
         let entry = self
             .reference
-            .resolve(callee)
+            .lookup_in(callee, scope)
             .and_then(|index| self.reference.entry(index));
         // Historical core names describe their first argument only. In
         // particular, a second string in `s("bd", "…")` must not borrow
@@ -121,15 +128,25 @@ impl App {
     /// Metadata queries away from this call retain the first-argument
     /// answer; completion within it always uses the actual position.
     fn completion_argument_index(&self, callee: &str) -> usize {
+        let scope = self.string_callee_scope(callee);
         self.enclosing_call_argument_at_caret()
             .filter(|(active, _, _)| {
                 active == callee
                     || self
                         .reference
-                        .resolve(active)
-                        .is_some_and(|index| Some(index) == self.reference.resolve(callee))
+                        .lookup_in(active, scope)
+                        .is_some_and(|index| Some(index) == self.reference.lookup_in(callee, scope))
             })
             .map_or(0, |(_, _, argument)| argument)
+    }
+
+    fn string_callee_scope(&self, callee: &str) -> ReferenceScope {
+        self.enclosing_call_at_caret()
+            .filter(|(active, _)| active == callee)
+            .map_or_else(
+                || self.reference_scope_at_caret(),
+                |(_, range)| self.reference_scope_at(range.start),
+            )
     }
 
     /// Dotted documentation rows belong to an object argument rather than
@@ -175,7 +192,13 @@ impl App {
         &self,
         callee: &str,
     ) -> Option<&'static rustel_core::reference::ReferenceChoiceSet> {
-        let entry = self.reference.entry(self.reference.resolve(callee)?)?;
+        let scope = self.string_callee_scope(callee);
+        if scope.is_kabelsalat() {
+            return None;
+        }
+        let entry = self
+            .reference
+            .entry(self.reference.lookup_in(callee, scope)?)?;
         let param =
             self.string_parameter_at_argument(entry, self.completion_argument_index(callee))?;
         rustel_core::reference::reference_choices(&entry.name, &param.name)
@@ -219,5 +242,49 @@ impl App {
             _ => "nothing to complete inside this string",
         };
         Some(refusal.to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editor::{Editor, Selection};
+
+    #[test]
+    fn graph_calls_do_not_borrow_pattern_string_choices() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut app = crate::app::tests::support::app_over(directory.path());
+        for (marked, callee, expected) in [
+            ("s(\"bd|\")", "s", Some(StringRole::Sound)),
+            ("K(() => s(\"bd|\"))", "s", None),
+            ("K(() => S(\"bd|\"))", "S", None),
+            ("K(() => S(s(\"bd|\")))", "s", Some(StringRole::Sound)),
+            ("K(() => scale(\"c:major|\"))", "scale", None),
+        ] {
+            let at = marked.find('|').expect("caret marker");
+            app.scenes.current_mut().editor =
+                Editor::new(&marked.replace('|', "")).expect("editor");
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(at)))
+                .expect("caret");
+            assert_eq!(app.string_role(callee), expected, "{marked}");
+        }
+        for (marked, choices) in [
+            ("s(\"bd\").warpmode(\"asym|\")", true),
+            ("K(() => warpmode(\"asym|\"))", false),
+            ("K(() => S(s(\"bd\").warpmode(\"asym|\")))", true),
+        ] {
+            let at = marked.find('|').expect("caret marker");
+            app.scenes.current_mut().editor =
+                Editor::new(&marked.replace('|', "")).expect("editor");
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(at)))
+                .expect("caret");
+            assert_eq!(
+                app.string_choice_set("warpmode").is_some(),
+                choices,
+                "{marked}"
+            );
+        }
     }
 }

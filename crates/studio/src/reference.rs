@@ -166,6 +166,7 @@ pub struct Entry {
 pub struct Reference {
     entries: Vec<Entry>,
     by_name: HashMap<String, usize>,
+    by_kabel_name: HashMap<String, usize>,
     revision: String,
     /// Documented but filtered out by the `known` predicate; reported,
     /// not shown.
@@ -173,6 +174,22 @@ pub struct Reference {
     /// Categories the settings hide from the browse list and the
     /// suggestions. Lookup by name still finds their entries.
     hidden: Vec<Category>,
+}
+
+/// The namespace available at the editor caret. The full browser keeps both.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReferenceScope {
+    #[default]
+    All,
+    Pattern,
+    Kabelsalat,
+    KabelsalatMember,
+}
+
+impl ReferenceScope {
+    pub fn is_kabelsalat(self) -> bool {
+        matches!(self, Self::Kabelsalat | Self::KabelsalatMember)
+    }
 }
 
 /// A kind of entry the settings hide from the browse list and the editor
@@ -190,15 +207,18 @@ pub enum Category {
     Bind,
     /// Hap and query plumbing such as `withHap` and `splitQueries`.
     Internals,
+    /// KabelSalat graph builders, nodes and inputs.
+    Kabelsalat,
 }
 
 impl Category {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Osc,
         Self::Serial,
         Self::FmMatrix,
         Self::Bind,
         Self::Internals,
+        Self::Kabelsalat,
     ];
 
     /// The tag an entry carries to belong to this category.
@@ -209,6 +229,7 @@ impl Category {
             Self::FmMatrix => "fm_matrix",
             Self::Bind => "bind",
             Self::Internals => "internals",
+            Self::Kabelsalat => "kabelsalat",
         }
     }
 
@@ -429,6 +450,7 @@ pub struct ReferencePanel {
     /// wanting one is a reason to make room for it, not a reason to be
     /// told it does not exist.
     pub snippets_last: bool,
+    pub scope: ReferenceScope,
     /// The row the cursor is on - a row of [`ReferencePanel::browse_rows`],
     /// not a position in `results`, because a grouped list has headings
     /// between the names. Where the list is not grouped the two are the
@@ -830,7 +852,7 @@ mod tests {
                     .iter()
                     .any(|example| example.contains("._pianoroll("))
             );
-            assert_eq!(reference.lookup("_"), None);
+            assert_eq!(reference.lookup_in("_", ReferenceScope::Pattern), None);
             assert_eq!(
                 reference.lookup("_gain"),
                 None,
@@ -1074,13 +1096,14 @@ mod tests {
         ];
 
         /// Every installed musical name needs a reference entry. The per-table
-        /// rows count through [`Reference::lookup`], which forgives case; the
+        /// rows count through pattern lookup, which forgives case; the
         /// engine's names, chord symbols, scales and sounds must match an entry's
         /// name or synonym exactly.
         #[test]
         fn reference_census_every_installed_name_has_an_entry() {
             let reference = Reference::load_all();
-            let has_entry = |name: &str| reference.lookup(name).is_some();
+            let has_entry =
+                |name: &str| reference.lookup_in(name, ReferenceScope::Pattern).is_some();
 
             // Each installed surface and the names it puts in a score's reach.
             let mut surfaces: Vec<(&'static str, Vec<String>, bool)> = Vec::new();
@@ -1213,8 +1236,12 @@ mod tests {
                     if !seen.insert(name.clone()) {
                         continue;
                     }
-                    let covered = if *exact {
+                    let covered = if *label == "engine names" {
+                        // S and audioin are installed score guards whose use is
+                        // documented in the graph namespace.
                         reference.documents(name)
+                    } else if *exact {
+                        reference.by_name.contains_key(name)
                     } else {
                         has_entry(name)
                     };
@@ -1261,7 +1288,7 @@ mod tests {
                     "{name} is allowlisted as undocumented but the engine does not install it"
                 );
                 assert!(
-                    !reference.documents(name),
+                    !reference.by_name.contains_key(*name),
                     "{name} is allowlisted as undocumented but the reference has a page for it"
                 );
             }
@@ -1309,8 +1336,11 @@ mod tests {
             let mut stray: Vec<&str> = Vec::new();
             for index in 0..reference.len() {
                 let entry = reference.entry(index).expect("entry");
-                // A snippet is lines to paste, not a name the engine installs.
-                if entry.snippet.is_some() {
+                // Snippets are lines to paste. Graph names live in a separate
+                // namespace, whose installation coverage is checked by jsruntime.
+                if entry.snippet.is_some()
+                    || reference.by_kabel_name.get(&entry.name) == Some(&index)
+                {
                     continue;
                 }
                 if !installed.contains(&entry.name) {
@@ -4687,10 +4717,11 @@ mod tests {
         #[test]
         fn a_misspelt_name_searches_to_its_nearest_real_one() {
             let reference = Reference::load_all();
-            assert_eq!(first_result(&reference, "lpff"), "lpf");
-            assert_eq!(first_result(&reference, "gian"), "gain");
-            assert_eq!(first_result(&reference, "gain"), "gain");
-            let panel = ReferencePanel::browse_for(&reference, "lpff");
+            for (query, expected) in [("lpff", "lpf"), ("gian", "gain"), ("gain", "gain")] {
+                let results = reference.search_in(query, false, ReferenceScope::Pattern);
+                assert_eq!(reference.entry(results[0]).unwrap().name, expected);
+            }
+            let panel = ReferencePanel::browse_in(&reference, "lpff", ReferenceScope::Pattern);
             assert_eq!(panel.query, "lpff");
             assert_eq!(reference.entry(panel.results[0]).unwrap().name, "lpf");
         }
@@ -4839,7 +4870,7 @@ mod tests {
         }
 
         #[test]
-        fn search_ranks_prefix_matches_first_and_hides_nothing_from_the_list() {
+        fn search_ranks_prefix_matches_first_and_lists_entries_without_bypasses() {
             let reference = Reference::load_all();
             let names_for = |query: &str| {
                 reference
@@ -4858,14 +4889,18 @@ mod tests {
             // The exact name beats the longer names that start with it.
             assert_eq!(names_for("fast")[0], "fast");
             assert_eq!(names_for("cutoff")[0], "lpf", "an exact synonym wins too");
-            assert_eq!(reference.search("").len(), reference.len());
+            let listed = reference.search("");
+            let bypasses = reference.search("tag:bypass");
+            assert!(!bypasses.is_empty());
+            assert!(bypasses.iter().all(|index| !listed.contains(index)));
+            assert_eq!(listed.len() + bypasses.len(), reference.len());
             assert!(reference.search("zzzzqqq").is_empty());
         }
 
         #[test]
         fn underscore_search_discovers_inline_painters_without_one_letter_typo_matches() {
             let reference = Reference::load(engine_knows());
-            let results = reference.search("_");
+            let results = reference.search_in("_", false, ReferenceScope::Pattern);
             assert!(!results.is_empty());
             assert!(
                 results
@@ -4894,12 +4929,14 @@ mod tests {
                 // The capital asks for `cycleStruct`, not `cyclesPer`.
                 ("cycleS", "isobite"),
             ] {
-                let matches = reference.search(query);
+                let matches = reference.search_in(query, false, ReferenceScope::Pattern);
                 assert_eq!(reference.entry(matches[0]).unwrap().name, wanted, "{query}");
             }
             let unavailable = Reference::load(|name| name == "pianoroll");
             assert!(
-                unavailable.search("_").is_empty(),
+                unavailable
+                    .search_in("_", false, ReferenceScope::Pattern)
+                    .is_empty(),
                 "only installed inline names are offered"
             );
         }
@@ -4907,13 +4944,14 @@ mod tests {
         #[test]
         fn inline_search_rows_and_completion_keep_the_underscore() {
             let reference = Reference::load(engine_knows());
-            let mut panel = ReferencePanel::browse_for(&reference, "_piano");
+            let mut panel =
+                ReferencePanel::browse_in(&reference, "_piano", ReferenceScope::Pattern);
             assert_eq!(
                 panel.confirm(&reference),
                 PanelAction::Insert("_pianoroll".into())
             );
 
-            let panel = ReferencePanel::browse_for(&reference, "_");
+            let panel = ReferencePanel::browse_in(&reference, "_", ReferenceScope::Pattern);
             let area = Rect::new(0, 0, 80, 26);
             let mut buffer = Buffer::empty(area);
             ReferenceView {
@@ -5160,7 +5198,7 @@ mod tests {
                     .map(|index| reference.entry(index).unwrap().name.clone())
                     .collect()
             };
-            let everything = reference.search("").len();
+            let everything = reference.len();
             assert_eq!(reference.hidden_len(), 0);
             for name in ["squiz", "osc", "fadeInTime", "oschost", "serial"] {
                 assert!(names(&reference, "").contains(&name.to_owned()), "{name}");
@@ -6414,5 +6452,140 @@ mod tag_discovery_tests {
         assert!(!draw(&bindings).contains("^F returns"));
         bindings.unbind(BindAction::Reference);
         assert!(draw(&bindings).contains("click returns"));
+    }
+}
+
+#[cfg(test)]
+mod kabelsalat_tests {
+    use super::*;
+
+    #[test]
+    fn graph_bypasses_only_appear_when_explicitly_requested() {
+        let reference = Reference::load_all();
+        for (query, scope) in [
+            ("", ReferenceScope::KabelsalatMember),
+            ("tag:kabelsalat", ReferenceScope::All),
+            ("abs", ReferenceScope::KabelsalatMember),
+        ] {
+            let results = reference.search_in(query, false, scope);
+            assert!(!results.is_empty());
+            assert!(results.iter().all(|&index| {
+                !reference
+                    .entry(index)
+                    .unwrap()
+                    .tags
+                    .iter()
+                    .any(|tag| tag == "bypass")
+            }));
+        }
+        let explicit = reference.search_in("_abs", false, ReferenceScope::KabelsalatMember);
+        assert_eq!(reference.entry(explicit[0]).unwrap().name, "_abs");
+        let underscored = reference.search_in("_", false, ReferenceScope::KabelsalatMember);
+        assert!(
+            underscored
+                .iter()
+                .any(|&index| reference.entry(index).unwrap().name == "_abs")
+        );
+        let tagged = reference.search("tag:bypass");
+        assert!(tagged.contains(&explicit[0]));
+        assert_eq!(
+            reference.lookup_in("_abs", ReferenceScope::KabelsalatMember),
+            Some(explicit[0])
+        );
+    }
+
+    #[test]
+    fn graph_names_keep_their_own_docs_and_call_syntax() {
+        let reference = Reference::load_all();
+        assert_eq!(
+            reference.lookup("S"),
+            reference.lookup_in("S", ReferenceScope::Kabelsalat)
+        );
+        for name in ["sine", "adsr", "seq", "add"] {
+            let pattern = reference.lookup_in(name, ReferenceScope::Pattern).unwrap();
+            let graph = reference
+                .lookup_in(name, ReferenceScope::Kabelsalat)
+                .unwrap();
+            assert_ne!(pattern, graph, "{name} needs separate documentation");
+            assert_eq!(reference.lookup(name), Some(pattern));
+            let entry = reference.entry(graph).unwrap();
+            assert!(Category::Kabelsalat.files(entry));
+            assert!(entry.inserts_as_call(), "graph {name} is callable");
+            assert!(entry.params.iter().all(|param| param.choices.is_empty()));
+        }
+        for name in ["sFreq", "sGate", "pat", "PI"] {
+            let index = reference
+                .lookup_in(name, ReferenceScope::Kabelsalat)
+                .unwrap();
+            let entry = reference.entry(index).unwrap();
+            assert!(!entry.inserts_as_call(), "{name} is a value");
+            assert_eq!(entry.signature(), name);
+            assert!(reference.lookup_in(name, ReferenceScope::Pattern).is_none());
+        }
+    }
+
+    #[test]
+    fn graph_completion_distinguishes_globals_from_node_members() {
+        let reference = Reference::load_all();
+        let globals = reference.search_in("", false, ReferenceScope::Kabelsalat);
+        let members = reference.search_in("", false, ReferenceScope::KabelsalatMember);
+        for name in ["sFreq", "sGate", "Node", "Node.parseInput", "S"] {
+            let index = reference
+                .lookup_in(name, ReferenceScope::Kabelsalat)
+                .unwrap();
+            assert!(globals.contains(&index), "{name} is a graph global");
+            assert!(!members.contains(&index), "{name} is not a node member");
+        }
+        for name in ["apply2", "channel", "type"] {
+            let index = reference
+                .lookup_in(name, ReferenceScope::Kabelsalat)
+                .unwrap();
+            assert!(members.contains(&index), "{name} is a node member");
+            assert!(!globals.contains(&index), "{name} is not a graph global");
+        }
+        let sine = reference
+            .lookup_in("sine", ReferenceScope::Kabelsalat)
+            .unwrap();
+        assert!(globals.contains(&sine));
+        assert!(members.contains(&sine));
+    }
+
+    #[test]
+    fn hidden_graphs_leave_completion_but_remain_reachable_by_tag_and_help() {
+        let mut reference = Reference::load_all();
+        let graph = reference.search_in("", false, ReferenceScope::Kabelsalat);
+        assert!(graph.len() > 100);
+        for &index in &graph {
+            assert!(Category::Kabelsalat.files(reference.entry(index).unwrap()));
+        }
+        let pattern = reference.search_in("", false, ReferenceScope::Pattern);
+        assert!(pattern.iter().all(|index| !graph.contains(index)));
+        let tagged = reference.search("tag:kabelsalat");
+        let k = reference.lookup("worklet").unwrap();
+        assert!(tagged.contains(&k));
+        reference.set_hidden([Category::Kabelsalat]);
+        assert!(
+            reference
+                .search_in("", false, ReferenceScope::Kabelsalat)
+                .is_empty()
+        );
+        assert!(!reference.search("").contains(&k));
+        assert_eq!(reference.search("tag:kabelsalat"), tagged);
+        assert_eq!(
+            reference.search_in("tag:kabelsalat", false, ReferenceScope::Pattern),
+            tagged
+        );
+        for index in graph {
+            let entry = reference.entry(index).unwrap();
+            assert_eq!(
+                reference.lookup_in(&entry.name, ReferenceScope::Kabelsalat),
+                Some(index)
+            );
+        }
+        let midi = reference
+            .lookup_in("midifreq", ReferenceScope::Kabelsalat)
+            .unwrap();
+        assert!(reference.entry(midi).unwrap().no_autocomplete);
+        assert!(tagged.contains(&midi));
     }
 }

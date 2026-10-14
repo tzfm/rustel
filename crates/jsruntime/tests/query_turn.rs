@@ -157,6 +157,93 @@ fn enter_supervised_child(test_name: &str, marker: &str, timeout: Duration) -> b
     }
 }
 
+#[test]
+fn kabelsalat_query_refusals_leave_the_heap_ready_for_the_next_score() {
+    if !enter_supervised_child(
+        "kabelsalat_query_refusals_leave_the_heap_ready_for_the_next_score",
+        "RUSTEL_KABEL_QUERY_CHILD",
+        Duration::from_secs(10),
+    ) {
+        return;
+    }
+    let runtime = semantic_runtime("worklet('n(1).out()')");
+    let cancelled = AtomicBool::new(false);
+    for (source, message) in [
+        ("worklet('midifreq().out()')", Some("live control input")),
+        (
+            r#"worklet('n(1).raw("unknown(t)").out()')"#,
+            Some("unknown"),
+        ),
+        ("worklet('n(Infinity).out()')", Some("finite")),
+        ("worklet('while (true) {}')", None),
+        (
+            r#"worklet('const x = n(1); x.out(); Object.defineProperty(x, "ins", {get() { while (true) {} }});')"#,
+            None,
+        ),
+        (
+            "worklet('n(1).out()').fmap(value => Object.defineProperty(value, 'freq', {enumerable: true, get() { while (true) {} }}))",
+            None,
+        ),
+    ] {
+        runtime
+            .evaluate_score(source, &TranspileOptions::default())
+            .unwrap_or_else(|error| panic!("install {source}: {error}"));
+        let budget = if message.is_some() {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_millis(40)
+        };
+        let start = Instant::now();
+        let result = runtime.query_cancellable(
+            Slot::Active,
+            0,
+            Fraction::ZERO,
+            Fraction::ONE,
+            budget,
+            &cancelled,
+        );
+        if let Some(message) = message {
+            assert!(
+                result.expect("contained graph error").is_empty(),
+                "{source}"
+            );
+            let thrown = runtime.take_query_throw().expect("graph diagnostic");
+            assert!(thrown.contains(message), "{source}: {thrown}");
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    Err(QueryError::Limit(QueryLimit::JsCpuDeadline { millis: 40 }))
+                ),
+                "{source}: {result:?}"
+            );
+            assert!(start.elapsed() < Duration::from_secs(3), "{source}");
+        }
+        assert_clean(&runtime, source);
+        runtime
+            .evaluate_score(
+                "worklet('n(pat[0]).out()', 2).worklet('n(pat[0] * 10 + pat[1]).out()', 3)",
+                &TranspileOptions::default(),
+            )
+            .expect("install recovery graph");
+        let haps =
+            query_active(&runtime, Fraction::ZERO, Fraction::ONE).expect("query recovery graph");
+        assert_eq!(haps.len(), 1, "{source}");
+        let graph = haps[0]
+            .value
+            .get("workletGraph")
+            .and_then(Value::as_str)
+            .expect("compiled recovery graph");
+        let program = rustel_kabel::Program::from_json(graph).expect("native recovery program");
+        let output = rustel_kabel::Graph::new(&program, 48_000.0)
+            .expect("recovery state")
+            .process([0.0; 2], 1.0, 0.0);
+        assert_eq!(output, [23.0; 2], "{source}");
+        runtime.run_gc();
+        assert_clean(&runtime, "KabelSalat recovery");
+    }
+}
+
 const QUERY_HOST_ENTRY_CASES: &[(&str, &str)] = &[
     ("value", "pure('x').fmap(value => { while (true) {} })"),
     (
@@ -9680,7 +9767,8 @@ fn stepalt_drops_filtered_sidecars_even_when_a_retained_source_is_opaque() {
     }
     assert_eq!(
         rustel_jsruntime::cells_live(),
-        baseline + 1,
+        // The retained query and its final event compiler each own one cell.
+        baseline + 2,
         "the retained opaque source conservatively rooted a filtered source sidecar"
     );
     let values = query_active(&runtime, Fraction::ZERO, Fraction::ONE)

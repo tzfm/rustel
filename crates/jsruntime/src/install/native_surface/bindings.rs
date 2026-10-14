@@ -123,6 +123,7 @@ fn define_method<'js>(
         }
         "partials" | "phases" => ("", 1),
         "FX" => ("", 0),
+        "worklet" => ("", 1),
         "xfade" => ("", 2),
         "filterHaps" => ("", 1),
         "filterValues" | "withQuerySpan" => ("value", 1),
@@ -484,6 +485,18 @@ pub(super) fn install<'js>(
         set_function_length(&free, 1)?;
         globals.set(name, free).map_err(|error| error.to_string())?;
     }
+    define_method(
+        proto,
+        "worklet",
+        Function::new(ctx.clone(), super::super::worklet::method)
+            .map_err(|error| error.to_string())?,
+    )?;
+    let worklet = Function::new(ctx.clone(), super::super::worklet::free)
+        .map_err(|error| error.to_string())?;
+    set_function_length(&worklet, 1)?;
+    globals
+        .set("worklet", worklet)
+        .map_err(|error| error.to_string())?;
     define_method(
         proto,
         "FX",

@@ -115,7 +115,9 @@ impl Default for FilterControls {
 /// `pan: None` preserves the distinction between a mono source
 /// upmix and an explicitly inserted centered stereo panner.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct OscillatorControls {
+pub struct OscillatorControls<K = KabelControls> {
+    /// KabelSalat runs at the beginning of the main effects chain.
+    pub kabel: Option<K>,
     /// Host-only direct slider bindings: gain, lowpass cutoff, then lowpass
     /// resonance. Zero is unbound. Tokens never cross score evaluations or
     /// arbitrary value maps.
@@ -244,7 +246,7 @@ pub struct OscillatorControls {
     /// effects before the gain stage.
     pub transient: Option<TransientControls>,
     /// `.FX(...)` stages, run in order BEFORE this voice's own params.
-    pub fx_stages: [Option<FxStage>; MAX_FX_STAGES],
+    pub fx_stages: [Option<FxStage<K>>; MAX_FX_STAGES],
     /// `partials`/`phases` (or `n` on a synth sound): a custom PeriodicWave
     /// built from the base waveform's Fourier terms.
     pub partials: Option<PartialsControls>,
@@ -376,6 +378,35 @@ pub const MAX_VOICE_MODS: usize = 4;
 /// silently dropping an effect.
 pub const MAX_FX_STAGES: usize = 3;
 
+/// Producer-owned graph code and its absolute worklet gates. Only the compact
+/// program identity crosses the callback boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KabelControls {
+    pub program: std::sync::Arc<rustel_kabel::Program>,
+    pub start_secs: f64,
+    pub gate_end_secs: f64,
+    pub end_secs: f64,
+}
+
+/// Compact callback reference to a producer-prepared immutable graph program.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CompactKabelControls {
+    pub program: rustel_kabel::ProgramId,
+    pub start_secs: f64,
+    pub gate_end_secs: f64,
+    pub end_secs: f64,
+}
+impl From<KabelControls> for CompactKabelControls {
+    fn from(controls: KabelControls) -> Self {
+        Self {
+            program: controls.program.id(),
+            start_secs: controls.start_secs,
+            gate_end_secs: controls.gate_end_secs,
+            end_secs: controls.end_secs,
+        }
+    }
+}
+
 /// One `.FX(...)` stage: a complete effects pass the voice runs before its
 /// own params. The hap's own controls always come last.
 ///
@@ -383,7 +414,8 @@ pub const MAX_FX_STAGES: usize = 3;
 /// delay and an inline reverb. `orbit` and `duckorbit` have no effect inside
 /// a stage.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct FxStage {
+pub struct FxStage<K = KabelControls> {
+    pub kabel: Option<K>,
     /// `gain × velocity` for this stage. The gain default is 0.8, so a stage
     /// naming no gain still attenuates; velocity's default is 1.
     /// The FX-loop chain runs stretch and the transient shaper first, ahead of
@@ -1005,9 +1037,10 @@ impl DuckControls {
     }
 }
 
-impl Default for OscillatorControls {
+impl<K> Default for OscillatorControls<K> {
     fn default() -> Self {
         Self {
+            kabel: None,
             live_controls: [0; 3],
             preview_epoch: 0,
             choke_only: false,
@@ -1052,7 +1085,7 @@ impl Default for OscillatorControls {
             limit: None,
             partials: None,
             transient: None,
-            fx_stages: [None; MAX_FX_STAGES],
+            fx_stages: [const { None }; MAX_FX_STAGES],
         }
     }
 }
@@ -1060,7 +1093,7 @@ impl Default for OscillatorControls {
 /// Rust-owned onset description for the scalar oscillator or bundled-sample family.
 /// Sample-accurate timing uses `onset_frame`.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct OnsetEvent {
+pub struct OnsetEvent<K = KabelControls> {
     pub onset_frame: u64,
     pub generation: u64,
     pub ui_visuals: u64,
@@ -1077,7 +1110,7 @@ pub struct OnsetEvent {
     pub gain: f32,
     /// Note length in seconds (gate/envelope duration).
     pub duration_secs: f32,
-    pub controls: OscillatorControls,
+    pub controls: OscillatorControls<K>,
     /// `None` selects the oscillator family.
     pub sample: Option<crate::SampleControls>,
     /// `wt_` sounds: the wavetable oscillator instead of one-shot playback.
@@ -1092,7 +1125,7 @@ pub struct OnsetEvent {
     pub cut: Option<f32>,
 }
 
-impl OnsetEvent {
+impl<K> OnsetEvent<K> {
     /// Place the onset between output frames (see `onset_lead`).
     #[must_use]
     pub fn with_onset_lead(mut self, lead: f32) -> Self {
@@ -1150,7 +1183,7 @@ impl OnsetEvent {
         self
     }
 
-    pub fn with_controls(mut self, controls: OscillatorControls) -> Self {
+    pub fn with_controls(mut self, controls: OscillatorControls<K>) -> Self {
         self.controls = controls;
         self
     }
@@ -1166,6 +1199,15 @@ impl OnsetEvent {
     }
 }
 
+impl OnsetEvent<KabelControls> {
+    /// Convert producer-owned graph code to callback-safe identities after
+    /// preparing its resources. Call this on the producer: conversion releases
+    /// the event's shared ownership of each immutable program.
+    pub fn into_prepared(self) -> OnsetEvent<CompactKabelControls> {
+        self.map_kabel(CompactKabelControls::from)
+    }
+}
+
 /// Pluggable offline/real-time audio backend. Implementations accept only
 /// Rust-owned params and produce interleaved stereo `f32` PCM.
 pub trait AudioBackend {
@@ -1174,6 +1216,11 @@ pub trait AudioBackend {
 
     /// Clear voices/schedule/clock without tearing down capacity.
     fn reset(&mut self);
+
+    /// Prepare resources for a note on the producer thread.
+    fn prepare_note(&mut self, _event: &OnsetEvent) -> Result<(), String> {
+        Ok(())
+    }
 
     /// Submit a note. Offline renderers may buffer until [`process_block`].
     fn note(&mut self, event: OnsetEvent);
@@ -1283,6 +1330,102 @@ pub fn bytebeat_sample(expression: u8, t: f64) -> f64 {
 /// `funcValue & 255` - the low byte of the expression's ToInt32 value.
 pub fn bytebeat_byte(value: f64) -> u8 {
     (to_int32(value) & 255) as u8
+}
+
+impl<K> OscillatorControls<K> {
+    pub(crate) fn map_kabel<L>(self, mut map: impl FnMut(K) -> L) -> OscillatorControls<L> {
+        OscillatorControls {
+            kabel: self.kabel.map(&mut map),
+            live_controls: self.live_controls,
+            preview_epoch: self.preview_epoch,
+            choke_only: self.choke_only,
+            piano: self.piano,
+            noise: self.noise,
+            waveform: self.waveform,
+            envelope: self.envelope,
+            worklet_begin_secs: self.worklet_begin_secs,
+            lfo_end_secs: self.lfo_end_secs,
+            filter_lfo_end_secs: self.filter_lfo_end_secs,
+            modulator_release_secs: self.modulator_release_secs,
+            velocity: self.velocity,
+            postgain: self.postgain,
+            pan: self.pan,
+            filters: self.filters,
+            distort: self.distort,
+            delay: self.delay,
+            duck: self.duck,
+            reverb: self.reverb,
+            dry: self.dry,
+            stretch: self.stretch,
+            fm: self.fm,
+            orbit: self.orbit,
+            lfos: self.lfos,
+            bus_mods: self.bus_mods,
+            bus: self.bus,
+            busgain: self.busgain,
+            channels: self.channels,
+            envs: self.envs,
+            phaser: self.phaser,
+            tremolo: self.tremolo,
+            vowel: self.vowel,
+            coarse: self.coarse,
+            crush: self.crush,
+            shape: self.shape,
+            vibrato: self.vibrato,
+            pitch_env: self.pitch_env,
+            djf: self.djf,
+            compressor: self.compressor,
+            limit: self.limit,
+            transient: self.transient,
+            fx_stages: self
+                .fx_stages
+                .map(|stage| stage.map(|stage| stage.map_kabel(&mut map))),
+            partials: self.partials,
+        }
+    }
+}
+
+impl<K> FxStage<K> {
+    pub(crate) fn map_kabel<L>(self, mut map: impl FnMut(K) -> L) -> FxStage<L> {
+        FxStage {
+            kabel: self.kabel.map(&mut map),
+            stretch: self.stretch,
+            transient: self.transient,
+            gain: self.gain,
+            filters: self.filters,
+            vowel: self.vowel,
+            coarse: self.coarse,
+            crush: self.crush,
+            shape: self.shape,
+            distort: self.distort,
+            tremolo: self.tremolo,
+            compressor: self.compressor,
+            pan_x: self.pan_x,
+            phaser: self.phaser,
+            delay: self.delay,
+            dry: self.dry,
+            room: self.room,
+        }
+    }
+}
+
+impl<K> OnsetEvent<K> {
+    pub(crate) fn map_kabel<L>(self, mut map: impl FnMut(K) -> L) -> OnsetEvent<L> {
+        OnsetEvent {
+            onset_frame: self.onset_frame,
+            generation: self.generation,
+            ui_visuals: self.ui_visuals,
+            onset_lead: self.onset_lead,
+            freq_hz: self.freq_hz,
+            gain: self.gain,
+            duration_secs: self.duration_secs,
+            controls: self.controls.map_kabel(&mut map),
+            sample: self.sample,
+            wavetable: self.wavetable,
+            synth: self.synth,
+            cut: self.cut,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,28 @@
+/*
+  @title karplus
+  @by froos
+  @origin KabelSalat examples
+  @duration 8
+  @source https://codeberg.org/froos/kabelsalat/src/commit/d114e806b6fd8ca948f19613db2cf787e4dcd1d6/examples/karplus.js
+  @license AGPL-3.0-or-later
+  @changes 2026-10-13: Wrap the graph in K() and use .slow(16) to sustain one graph during capture.
+  SPDX-License-Identifier: AGPL-3.0-or-later
+*/
+K(() => {
+// some karplus-strong thing
+
+let imp = impulse(6);
+
+let damp = sine(0.2).range(0.4, 0.7);
+let burst = noise().hold(impulse(1)).range(0.005, 0.009);
+
+noise()
+  .mul(imp.perc(burst))
+  .add((x) => x.delay(burst).filter(damp))
+  .mul(imp.adsr(0.02, 0.5, 0))
+  .filter(0.8)
+  .mul(noise().hold(imp))
+  .add((x) => x.delay(0.25).mul(sine(0.1).range(0.5, 0.8)))
+  .mul(1.4)
+  .out();
+}).slow(16)

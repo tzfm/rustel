@@ -41,7 +41,7 @@ Use these alternatives if the terminal or operating system takes a shortcut.
 | Devices | ^P |
 | Master volume | ^⇧↑ / ^⇧↓; Ctrl+F12 / Ctrl+F11 |
 | Slider under the caret | Alt+↑ / Alt+↓ |
-| Smart action at the caret | ^J |
+| Quick action at the caret | ^J |
 | Zen mode | ^K or F11 |
 | Word wrap | ^U |
 | Previous / next scene | ^[ / ^]; F6 / F7 |
@@ -179,7 +179,8 @@ order. A name from one script only stays available to every scene. An import
 in a prebake shares all its names with every score in the set.
 
 The script runs in the score sandbox, with the limits of a prebake. A helper
-with a browser page or kabelsalat dependency does not work. Studio does not
+that needs a browser page does not work. [KabelSalat graphs](kabelsalat.md)
+run through `K` or `worklet`; graph node names are local to the graph. Studio does not
 check a score with an import for unknown function names: the script defines
 names Studio does not read before the script runs. See
 [Script imports](../SECURITY.md#script-imports) for the security rules.
@@ -309,7 +310,7 @@ search `lpf` and Enter writes `lpf`. When two names differ only in case, the
 row shows the camelCase name. A capital in your search text selects the names
 with this capital first: `cycleS` puts `cycleStruct` before `cyclesPer`.
 
-Settings ▸ Reference has one switch for each of five kinds of entry. All five
+Settings ▸ Reference has one switch for each of six kinds of entry. All six
 are on by default. Turn one off to hide the kind from the reference and the
 suggestions:
 
@@ -321,10 +322,12 @@ suggestions:
 - **bind & join**: `bind`, `innerJoin`, `appLeft` and the rest of the family.
   You use them to write new pattern functions.
 - **pattern internals**: `withHap`, `splitQueries` and other hap plumbing.
+- **KabelSalat**: `K()`, `S()`, graph nodes and inputs such as `sFreq` and
+  `sGate`. This setting does not change score playback.
 
 A hidden kind stays in reach. `tag:osc`, `tag:serial`, `tag:fm_matrix`,
-`tag:bind` and `tag:internals` list the kind anyway, and Ctrl+D still opens
-the documentation.
+`tag:bind`, `tag:internals` and `tag:kabelsalat` list the kind anyway, and
+Ctrl+D still opens the documentation.
 
 In the panel, Tab goes to the next tab. The examples tab has parts, tracks,
 sound design, and Hydra visuals. The generator tab makes new music from a
@@ -374,7 +377,7 @@ mouse move takes 35 ms. With a lowpass envelope on the same note, such as
 `lpenv` or `lpattack`, an `lpf` slider changes from the next note. Any other
 control changes from the next note.
 
-Ctrl+J opens the smart action at the caret. On a number, it can create a slider.
+Ctrl+J opens the quick action at the caret. On a number, it can create a slider.
 On a slider, it can change or remove the control. These source edits require
 an update before they change playback.
 

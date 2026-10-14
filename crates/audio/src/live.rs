@@ -94,7 +94,7 @@ pub struct LiveBlockReport {
 /// object reaches a real-time thread.
 pub struct LiveScalarBackend {
     scalar: ScalarBackend,
-    held: Option<QueuedAudioEvent>,
+    held: Option<QueuedAudioEvent<crate::CompactKabelControls>>,
     generation: u64,
     sample_rate: u32,
     /// Frames of the stop ramp already rendered; `None` while not stopped.
@@ -265,6 +265,73 @@ impl LiveScalarBackend {
         self.scalar.orbit_mix(orbit, frames)
     }
 
+    /// Prepare one graph per worklet before this backend enters the callback.
+    /// Repeated calls reuse compatible idle state. Use `install_kabel` to
+    /// supply additional independent processors for overlapping voices.
+    pub fn prepare_kabel(&mut self, controls: &crate::OscillatorControls) -> Result<(), String> {
+        self.scalar.prepare_kabel(controls)
+    }
+
+    /// Supply independent graph state prepared by the producer. Returns the
+    /// box when the bounded pool is full, so destruction stays with the caller.
+    pub fn install_kabel(
+        &mut self,
+        graph: Box<rustel_kabel::Graph>,
+    ) -> Option<Box<rustel_kabel::Graph>> {
+        self.scalar.install_kabel(graph)
+    }
+
+    /// Retire expired immutable code only after protecting every queued reference.
+    #[cfg_attr(not(feature = "device-audio"), allow(dead_code))]
+    pub(crate) fn retire_kabel_programs(
+        &mut self,
+        channel: &crate::assets::SampleChannel,
+        score: &Ring,
+        immediate: &Ring,
+    ) {
+        if !self.scalar.has_expired_kabel_programs() && !self.scalar.has_only_idle_kabel() {
+            return;
+        }
+        let Some(_retirement) = channel.try_kabel_retirement() else {
+            return;
+        };
+        self.scalar.begin_kabel_program_retirement();
+        if let Some(event) = &self.held {
+            for controls in crate::scalar::kabel_controls(&event.controls) {
+                self.scalar.protect_kabel_program(controls.program);
+            }
+        }
+        score.protect_kabel_programs(&mut self.scalar);
+        immediate.protect_kabel_programs(&mut self.scalar);
+        let slots = channel
+            .program_returns
+            .capacity()
+            .saturating_sub(channel.program_returns.len());
+        self.scalar.retire_kabel_programs(slots, |program| {
+            let returned = crate::assets::ReturnedProgram(Box::into_raw(program));
+            if channel.program_returns.push(returned).is_err() {
+                channel.leaked.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let slots = channel
+            .kabel_returns
+            .capacity()
+            .saturating_sub(channel.kabel_returns.len());
+        self.scalar.retire_idle_kabel(slots, |graph| {
+            let returned = crate::assets::ReturnedKabel(Box::into_raw(graph));
+            if channel.kabel_returns.push(returned).is_err() {
+                channel.leaked.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        channel
+            .kabel_resident_bytes
+            .store(self.scalar.kabel_resident_bytes(), Ordering::Release);
+        channel.program_resident_bytes.store(
+            self.scalar.kabel_program_resident_bytes(),
+            Ordering::Release,
+        );
+    }
+
     /// Install prepared reverbs between audio blocks. Return displaced boxes
     /// to the producer for destruction. Defer FX installs when their return
     /// ring has no space for a refusal.
@@ -330,6 +397,59 @@ impl LiveScalarBackend {
                 }
             }
         }
+        let pending = channel.program_installs.len();
+        for _ in 0..pending {
+            if channel.program_returns.len() == channel.program_returns.capacity() {
+                break;
+            }
+            let Some(install) = channel.program_installs.pop() else {
+                break;
+            };
+            // SAFETY: the producer transfers unique allocation ownership by SPSC.
+            let program = unsafe { Box::from_raw(install.program) };
+            let return_program = |program| {
+                let returned = crate::assets::ReturnedProgram(Box::into_raw(program));
+                if channel.program_returns.push(returned).is_err() {
+                    channel.leaked.fetch_add(1, Ordering::Relaxed);
+                }
+            };
+            if let Some(rejected) = self.scalar.install_kabel_program(program, return_program) {
+                channel.kabel_refusals.fetch_add(1, Ordering::Relaxed);
+                return_program(rejected);
+            }
+        }
+        channel.program_resident_bytes.store(
+            self.scalar.kabel_program_resident_bytes(),
+            Ordering::Release,
+        );
+        let pending = channel.kabel_installs.len();
+        for _ in 0..pending {
+            let slots = channel
+                .kabel_returns
+                .capacity()
+                .saturating_sub(channel.kabel_returns.len());
+            if slots == 0 {
+                break;
+            }
+            let Some(install) = channel.kabel_installs.pop() else {
+                break;
+            };
+            // SAFETY: the SPSC install transfers unique producer ownership.
+            let graph = unsafe { Box::from_raw(install.graph) };
+            let return_graph = |graph| {
+                let returned = crate::assets::ReturnedKabel(Box::into_raw(graph));
+                if channel.kabel_returns.push(returned).is_err() {
+                    channel.leaked.fetch_add(1, Ordering::Relaxed);
+                }
+            };
+            if let Some(rejected) = self.scalar.install_kabel(graph) {
+                channel.kabel_refusals.fetch_add(1, Ordering::Relaxed);
+                return_graph(rejected);
+            }
+        }
+        channel
+            .kabel_resident_bytes
+            .store(self.scalar.kabel_resident_bytes(), Ordering::Release);
         channel.fx_reverb_resident_bytes.store(
             self.scalar.fx_reverb_resident_bytes(),
             std::sync::atomic::Ordering::Release,
@@ -506,7 +626,7 @@ impl LiveScalarBackend {
         output: &mut [f32],
         frames: usize,
         start_frame: u64,
-        events: impl Iterator<Item = QueuedAudioEvent>,
+        events: impl Iterator<Item = QueuedAudioEvent<crate::CompactKabelControls>>,
         flip: LiveFlipAtomics<'_>,
         is_stopped: bool,
     ) -> LiveBlockReport {
@@ -999,7 +1119,7 @@ mod sample_lifetime_tests {
                 line_arm: &line,
             };
             let ring = Ring::new(4);
-            assert!(ring.push(event));
+            assert!(ring.push(event.clone()));
             let (_, original_deadline) = event.sample_end_frame(&decoded, RATE).unwrap();
             // The producer reads the frontier after a successful push:
             // either the next block's start or the announced in-flight end.
@@ -1571,5 +1691,350 @@ mod tests {
             }
         });
         assert_eq!((report.stale, report.accepted), (1, 3));
+    }
+}
+
+#[cfg(test)]
+mod kabel_program_lifetime_tests {
+    use super::*;
+    use crate::assets::{
+        KabelInstall, KabelPublication, PreparedKabelProgram, ProgramInstall, ReturnedProgram,
+        SampleChannel,
+    };
+    use crate::{AudioEvent, CompactKabelControls, KabelControls, OscillatorControls};
+    use rustel_kabel::{Graph, Program, ProgramId};
+    use std::sync::Arc;
+
+    fn program(value: usize) -> Program {
+        Program::from_json(&format!(
+            r#"{{"nodes":[{{"type":"n","value":{value}}},{{"type":"output","inputs":[0]}}]}}"#
+        ))
+        .unwrap()
+    }
+
+    fn event(code: Program) -> AudioEvent {
+        AudioEvent {
+            onset_id: 1,
+            generation: 1,
+            target_frame: 0,
+            onset_lead: 0.0,
+            freq_hz: 220.0,
+            gain: 0.5,
+            duration_secs: 1.0,
+            ui_visuals: 0,
+            controls: OscillatorControls {
+                kabel: Some(KabelControls {
+                    program: code.into(),
+                    start_secs: 0.0,
+                    gate_end_secs: 1.0,
+                    end_secs: 1.0,
+                }),
+                ..OscillatorControls::default()
+            },
+            sample: None,
+            wavetable: None,
+            synth: None,
+            cut: None,
+        }
+    }
+
+    fn publish(channel: &SampleChannel, code: Program, until_frame: u64) {
+        let pointer = Box::into_raw(Box::new(PreparedKabelProgram {
+            program: code,
+            until_frame,
+        }));
+        assert!(
+            channel
+                .program_installs
+                .push(ProgramInstall { program: pointer })
+                .is_ok()
+        );
+    }
+
+    fn returned(channel: &SampleChannel) -> Vec<ProgramId> {
+        let mut ids = Vec::new();
+        while let Some(ReturnedProgram(pointer)) = channel.program_returns.pop() {
+            // SAFETY: popping the return baton transfers unique ownership back
+            // to this producer. Each allocation is reconstructed exactly once.
+            let entry = unsafe { Box::from_raw(pointer) };
+            ids.push(entry.program.id());
+        }
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn unpublished_guard_then_ring_reference_protect_expired_program() {
+        let channel = Arc::new(SampleChannel::new());
+        let (score, immediate) = (Ring::new(4), Ring::new(4));
+        let mut live = LiveScalarBackend::new(1000, 4).unwrap();
+        let code = program(1);
+        let publication = KabelPublication::new(Arc::clone(&channel));
+        publish(&channel, code, 0);
+        live.drain_reverb_installs(&channel);
+        live.retire_kabel_programs(&channel, &score, &immediate);
+        assert!(returned(&channel).is_empty());
+        assert!(live.scalar.kabel_program_resident_bytes() > 0);
+        // A producer can pause arbitrarily between installing the code and
+        // publishing the event: only dropping its reservation permits scans.
+        assert!(score.push(event(code)));
+        drop(publication);
+        live.retire_kabel_programs(&channel, &score, &immediate);
+        assert!(returned(&channel).is_empty());
+        assert!(score.pop().is_some());
+        live.retire_kabel_programs(&channel, &score, &immediate);
+        assert_eq!(returned(&channel), [code.id()]);
+        assert_eq!(live.scalar.kabel_program_resident_bytes(), 0);
+        assert_eq!(channel.leaked.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn canceled_overlapping_publications_release_without_leaking_programs() {
+        let channel = Arc::new(SampleChannel::new());
+        let (score, immediate) = (Ring::new(4), Ring::new(4));
+        let mut live = LiveScalarBackend::new(1000, 4).unwrap();
+        let code = program(1);
+        let first = KabelPublication::new(Arc::clone(&channel));
+        let second = KabelPublication::new(Arc::clone(&channel));
+        publish(&channel, code, 0);
+        live.drain_reverb_installs(&channel);
+        drop(first);
+        live.retire_kabel_programs(&channel, &score, &immediate);
+        assert!(returned(&channel).is_empty());
+        assert_eq!(channel.active_kabel_publications.load(Ordering::Acquire), 1);
+        drop(second);
+        live.retire_kabel_programs(&channel, &score, &immediate);
+        assert_eq!(returned(&channel), [code.id()]);
+        assert_eq!(channel.active_kabel_publications.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn held_pending_and_both_rings_protect_code_until_their_last_reference() {
+        let channel = SampleChannel::new();
+        let (score, immediate) = (Ring::new(4), Ring::new(4));
+        let mut live = LiveScalarBackend::new(1000, 4).unwrap();
+        let codes: Vec<_> = (1..=5).map(program).collect();
+        for code in &codes {
+            publish(&channel, *code, 0);
+        }
+        live.drain_reverb_installs(&channel);
+        assert!(score.push(event(codes[0])));
+        assert!(immediate.push(event(codes[1])));
+        live.held = Some(event(codes[2]).map_kabel(CompactKabelControls::from).into());
+        assert!(
+            live.scalar.try_note_prepared(
+                OnsetEvent::new(100, 220.0, 0.5, 1.0)
+                    .with_controls(event(codes[3]).controls)
+                    .into_prepared()
+            )
+        );
+        live.retire_kabel_programs(&channel, &score, &immediate);
+        assert_eq!(returned(&channel), [codes[4].id()]);
+        assert!(score.pop().is_some());
+        assert!(immediate.pop().is_some());
+        live.held = None;
+        live.scalar.reset_at(1);
+        live.retire_kabel_programs(&channel, &score, &immediate);
+        assert_eq!(
+            returned(&channel),
+            codes[..4].iter().map(Program::id).collect::<Vec<_>>()
+        );
+        assert_eq!(live.scalar.kabel_program_resident_bytes(), 0);
+    }
+
+    #[test]
+    fn queued_worklets_keep_idle_graph_capacity_until_canceled() {
+        for location in 0..4 {
+            let channel = SampleChannel::new();
+            let (score, immediate) = (Ring::new(4), Ring::new(4));
+            let mut live = LiveScalarBackend::new(1000, 4).unwrap();
+            let code = program(1);
+            assert!(
+                live.scalar
+                    .install_kabel(Box::new(Graph::new(&code, 1000.0).unwrap()))
+                    .is_none()
+            );
+            match location {
+                0 => assert!(score.push(event(code))),
+                1 => assert!(immediate.push(event(code))),
+                2 => {
+                    live.held = Some(event(code).map_kabel(CompactKabelControls::from).into());
+                }
+                _ => assert!(
+                    live.scalar.try_note_prepared(
+                        OnsetEvent::new(100, 220.0, 0.5, 1.0)
+                            .with_controls(event(code).controls)
+                            .into_prepared()
+                    )
+                ),
+            }
+            // Graph demand protects storage even before its code install arrives.
+            live.retire_kabel_programs(&channel, &score, &immediate);
+            assert_eq!(channel.kabel_returns.len(), 0);
+            assert!(live.scalar.kabel_resident_bytes() > 0);
+            let _ = score.pop();
+            let _ = immediate.pop();
+            live.held = None;
+            live.scalar.reset_at(1);
+            live.retire_kabel_programs(&channel, &score, &immediate);
+            assert_eq!(channel.kabel_returns.len(), 1);
+            assert_eq!(live.scalar.kabel_resident_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn republished_program_keeps_the_longest_lease_and_returns_displaced_box() {
+        let channel = SampleChannel::new();
+        let (score, immediate) = (Ring::new(4), Ring::new(4));
+        let mut live = LiveScalarBackend::new(1000, 4).unwrap();
+        let code = program(1);
+        publish(&channel, code, 100);
+        publish(&channel, code, 10);
+        live.drain_reverb_installs(&channel);
+        assert_eq!(returned(&channel), [code.id()]);
+        live.scalar.reset_at(20);
+        live.retire_kabel_programs(&channel, &score, &immediate);
+        assert!(returned(&channel).is_empty());
+        live.scalar.reset_at(100);
+        live.retire_kabel_programs(&channel, &score, &immediate);
+        assert_eq!(returned(&channel), [code.id()]);
+    }
+
+    #[test]
+    fn saturated_return_queue_defers_retirement_without_dropping_code() {
+        let channel = SampleChannel::new();
+        let (score, immediate) = (Ring::new(4), Ring::new(4));
+        let mut live = LiveScalarBackend::new(1000, 4).unwrap();
+        let code = program(1);
+        publish(&channel, code, 0);
+        live.drain_reverb_installs(&channel);
+        for _ in 0..channel.program_returns.capacity() {
+            let entry = Box::new(PreparedKabelProgram {
+                program: code,
+                until_frame: 0,
+            });
+            assert!(
+                channel
+                    .program_returns
+                    .push(ReturnedProgram(Box::into_raw(entry)))
+                    .is_ok()
+            );
+        }
+        live.retire_kabel_programs(&channel, &score, &immediate);
+        assert!(live.scalar.kabel_program_resident_bytes() > 0);
+        assert_eq!(returned(&channel).len(), channel.program_returns.capacity());
+        live.retire_kabel_programs(&channel, &score, &immediate);
+        assert_eq!(returned(&channel), [code.id()]);
+        assert_eq!(channel.leaked.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn event_published_after_install_pass_retries_until_next_block_assets_arrive() {
+        let channel = SampleChannel::new();
+        let ring = Ring::new(4);
+        let mut live = LiveScalarBackend::new(1000, 4).unwrap();
+        live.generation = 1;
+        let code = program(1);
+        let (generation, takeover, cut, arm) = (
+            AtomicU64::new(1),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+        );
+        let flip = LiveFlipAtomics {
+            generation: &generation,
+            takeover_frame: &takeover,
+            takeover_cut: &cut,
+            line_arm: &arm,
+        };
+        let stopped = AtomicBool::new(false);
+        let mut output = [0.0; 128];
+        live.drain_reverb_installs(&channel);
+        assert!(ring.push(event(code)));
+        assert_eq!(
+            live.process_block_with(&mut output, 64, 0, &ring, flip, &stopped)
+                .accepted,
+            1
+        );
+        assert!(output.iter().all(|sample| *sample == 0.0));
+        assert_eq!(live.scalar.missing_kabel_events(), 0);
+        // The two SPSC rings are independent: assets published after the
+        // install snapshot are available at the following callback boundary.
+        publish(&channel, code, 1000);
+        let graph = Box::new(Graph::new(&code, 1000.0).unwrap());
+        assert!(
+            channel
+                .kabel_installs
+                .push(KabelInstall {
+                    graph: Box::into_raw(graph)
+                })
+                .is_ok()
+        );
+        live.drain_reverb_installs(&channel);
+        live.process_block_with(&mut output, 64, 64, &ring, flip, &stopped);
+        assert!(output.iter().any(|sample| sample.abs() > 0.01));
+        assert_eq!(live.scalar.missing_kabel_events(), 0);
+        assert_eq!(channel.leaked.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(feature = "device-audio")]
+    #[test]
+    fn callback_install_render_reset_and_retirement_allocate_and_free_nothing() {
+        let _guard = crate::device::tests::tripwire_assertion_guard();
+        assert!(crate::tripwire::allocator_is_armed());
+        let channel = Arc::new(SampleChannel::new());
+        let (score, immediate) = (Ring::new(4), Ring::new(4));
+        let mut live = LiveScalarBackend::new(1000, 4).unwrap();
+        live.generation = 1;
+        let code = program(1);
+        let publication = KabelPublication::new(Arc::clone(&channel));
+        publish(&channel, code, 0);
+        let graph = Box::new(Graph::new(&code, 1000.0).unwrap());
+        assert!(
+            channel
+                .kabel_installs
+                .push(KabelInstall {
+                    graph: Box::into_raw(graph)
+                })
+                .is_ok()
+        );
+        let (generation, takeover, cut, arm) = (
+            AtomicU64::new(1),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+        );
+        let flip = LiveFlipAtomics {
+            generation: &generation,
+            takeover_frame: &takeover,
+            takeover_cut: &cut,
+            line_arm: &arm,
+        };
+        let stopped = AtomicBool::new(false);
+        let mut output = [0.0; 128];
+
+        let before = crate::tripwire::Violations::capture();
+        crate::tripwire::audio_scope(|| {
+            live.drain_reverb_installs(&channel);
+            live.retire_kabel_programs(&channel, &score, &immediate);
+        });
+        assert!(crate::tripwire::Violations::capture().since(before).clean());
+        assert!(returned(&channel).is_empty());
+        assert!(score.push(event(code)));
+        drop(publication);
+
+        let before = crate::tripwire::Violations::capture();
+        crate::tripwire::audio_scope(|| {
+            live.process_block_with(&mut output, 64, 0, &score, flip, &stopped);
+            live.retire_kabel_programs(&channel, &score, &immediate);
+            live.scalar.reset_at(1000);
+            live.retire_kabel_programs(&channel, &score, &immediate);
+        });
+        assert!(crate::tripwire::Violations::capture().since(before).clean());
+        assert!(output.iter().any(|sample| sample.abs() > 0.01));
+        assert_eq!(returned(&channel), [code.id()]);
+        assert_eq!(channel.kabel_returns.len(), 1);
+        assert_eq!(live.scalar.kabel_resident_bytes(), 0);
+        assert_eq!(channel.leaked.load(Ordering::Relaxed), 0);
     }
 }

@@ -277,17 +277,17 @@ impl App {
                 scene.saved_source_revision = source_revision;
                 scene.refresh_dirty();
                 self.clear_error(ErrorOwner::Save);
-                self.status = if still_pending {
-                    format!(
+                if still_pending {
+                    self.status = format!(
                         "saved editor revision {}; a newer save is still pending…",
                         editor_revision.0
-                    )
+                    );
                 } else {
-                    format!(
+                    self.set_notice(format!(
                         "saved {}",
                         status_file_path(&path, self.ui_settings.show_full_paths)
-                    )
-                };
+                    ));
+                }
             }
             Err(error) => {
                 scene.refresh_dirty();

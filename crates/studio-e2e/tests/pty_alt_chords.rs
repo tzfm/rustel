@@ -173,6 +173,24 @@ impl Terminal {
         false
     }
 
+    /// Match the current screen, including cells the diff painter retained
+    /// from the previous tab, without accepting text from an older frame.
+    fn wait_for_screen(&mut self, needle: &str, budget: Duration) -> bool {
+        let stop = Instant::now() + budget;
+        while Instant::now() < stop {
+            let mut screen = Screen::new(80, 24);
+            screen.feed(&self.text());
+            if screen.contains(needle) {
+                return true;
+            }
+            if self.child.try_wait().expect("child polls").is_some() {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
     fn write(&mut self, bytes: &[u8]) {
         self.writer.write_all(bytes).expect("the pty takes input");
         self.writer.flush().expect("the pty flushes");
@@ -480,10 +498,11 @@ fn probe_alt_chords_through_a_real_pty() {
         "the reference browser never opened:\n{}",
         terminal.diagnostics()
     );
-    let mark = terminal.buffer.lock().unwrap().len();
     terminal.write(b"\t"); // the samples tab
+    // The count row may retain letters from the reference tab. Reconstruct
+    // the full screen: fresh bytes alone can contain only "ounds".
     assert!(
-        terminal.wait_for_since(mark, "sounds", Duration::from_secs(10)),
+        terminal.wait_for_screen("sounds", Duration::from_secs(10)),
         "the samples tab never opened:\n{}",
         terminal.diagnostics()
     );

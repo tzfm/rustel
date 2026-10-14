@@ -1,0 +1,21 @@
+/*
+  @title distortedguitar
+  @by froos
+  @origin KabelSalat examples
+  @duration 8
+  @source https://codeberg.org/froos/kabelsalat/src/commit/d114e806b6fd8ca948f19613db2cf787e4dcd1d6/examples/distortedguitar.js
+  @license AGPL-3.0-or-later
+  @changes 2026-10-13: Wrap the graph in K() and use .slow(16) to sustain one graph during capture.
+  SPDX-License-Identifier: AGPL-3.0-or-later
+*/
+K(() => {
+saw([55, 110, 220, 330])
+  .lpf(sine(0.25).range(0.3, 0.7))
+  .mix(2)
+  .mul(impulse(4).perc(0.1).lag(0.05))
+  .add((x) => x.delay(saw(0.01).range(0.005, 0.02)).mul(0.9))
+  .add((x) => x.delay(0.3).mul(0.7))
+  .fold()
+  .mul(0.6)
+  .out();
+}).slow(16)

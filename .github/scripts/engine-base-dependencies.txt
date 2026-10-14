@@ -22,6 +22,7 @@ rustel-audio
 rustel-core
 rustel-engine
 rustel-fraction
+rustel-kabel
 rustel-mini
 rustel-scheduler
 rustel-voice

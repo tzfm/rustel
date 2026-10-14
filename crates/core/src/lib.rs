@@ -573,6 +573,17 @@ impl Hap {
         self
     }
 
+    fn with_unchanged_live_controls(self, input: &Hap) -> Self {
+        let mut mapped = self.with_pitch_live_controls(input);
+        if input.slider_binding != 0
+            && let Some(before) = input.value.as_f64()
+            && mapped.value.as_f64() == Some(before)
+        {
+            mapped.slider_binding = input.slider_binding;
+        }
+        mapped
+    }
+
     /// `Hap.show(true)` - the compact snapshot serialiser.
     ///
     /// Sigils: `⇜` whole starts before part · `(…)` fragment · `⇝` whole ends
@@ -808,6 +819,9 @@ pub enum LookupFlow {
     Add,
     /// `keep` / `keepif`: the left value is the result.
     Left,
+    /// Native augmentation retains the left object's named audio controls.
+    /// The result is an object, so a raw slider binding does not survive.
+    LeftControls,
     /// The right value is the result.
     Right,
     /// `set`: right replaces scalars/arrays; objects merge right over left.
@@ -2090,6 +2104,53 @@ fn query_stack_child<T>(query: impl FnOnce() -> Vec<T>) -> Vec<T> {
     } else {
         haps
     }
+}
+
+// Keep callback temporaries out of the recursive query dispatcher. The child
+// query finishes before entering this helper, so its frame is not multiplied
+// by every node in a pattern graph.
+fn map_js_haps(
+    haps: Vec<Hap>,
+    id: CallbackId,
+    preserve_controls: bool,
+    predicate: Option<fn(&Value) -> bool>,
+) -> Vec<Hap> {
+    let mut out = Vec::with_capacity(haps.len());
+    for hap in haps {
+        // Every iteration can enter QuickJS, and a wide query holds tens of
+        // thousands of haps. Check inside the loop so callback and GC work
+        // cannot keep the producer occupied after cancellation or a deadline.
+        if budget_exhausted() || cancellation_requested() || query_deadline_expired() {
+            return Vec::new();
+        }
+        let mapped = hap.with_value(|v| {
+            if let Some(predicate) = predicate {
+                // Final event inspection consumes JS containers once, after
+                // all user callbacks have run.
+                let value = materialize_js_value(v);
+                return if predicate(&value) {
+                    materialize_js_value(&host_call_value(id, &value))
+                } else {
+                    value
+                };
+            }
+            let value = host_call_value(id, v);
+            if preserve_controls {
+                // Trusted control rewrites consume their result here, so
+                // compare native values before retaining bindings. User fmap
+                // keeps opaque JS identity.
+                materialize_js_value(&value)
+            } else {
+                value
+            }
+        });
+        out.push(if preserve_controls {
+            mapped.with_unchanged_live_controls(&hap)
+        } else {
+            mapped
+        });
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -3467,7 +3528,7 @@ fn applied_pick_lookup(
                 })
             }
         }
-        LookupFlow::Infer | LookupFlow::Add => {
+        LookupFlow::Infer | LookupFlow::Add | LookupFlow::LeftControls => {
             if left.pick_lookup.is_none() && right.pick_lookup.is_none() {
                 return None;
             }
@@ -3486,6 +3547,7 @@ fn applied_pick_lookup(
 fn applied_live_controls(flow: LookupFlow, left: &Hap, right: &Hap) -> ([u64; 3], u64) {
     match flow {
         LookupFlow::Left => (left.live_controls, left.slider_binding),
+        LookupFlow::LeftControls => (left.live_controls, 0),
         LookupFlow::Right => (right.live_controls, right.slider_binding),
         LookupFlow::Set => {
             // Opaque objects can run score code when materialized. Refuse the
@@ -4167,6 +4229,8 @@ enum Node {
     Join(Pattern, JoinMode),
     /// `fmap` with a USER callback. Holds only the opaque id.
     FmapJs(Pattern, CallbackId),
+    /// Trusted host finalization retains unchanged native control bindings.
+    FmapJsPreservingControls(Pattern, CallbackId, Option<fn(&Value) -> bool>),
     /// A user-authored `new Pattern(state => …)`. Holds only the opaque id.
     JsQuery(CallbackId),
     Timeline(Pattern, Pattern, TimelineState),
@@ -4231,7 +4295,8 @@ fn inherited_runtime_settings(node: &Node) -> Option<settings::RuntimeSettings> 
         | Node::PatternOfPure(pattern, _, _)
         | Node::PatternOfDynamic(pattern, _)
         | Node::Join(pattern, _)
-        | Node::FmapJs(pattern, _) => pattern.runtime_settings.clone(),
+        | Node::FmapJs(pattern, _)
+        | Node::FmapJsPreservingControls(pattern, _, _) => pattern.runtime_settings.clone(),
         Node::Extension(extension) => from_patterns(extension.children()),
         Node::Timeline(time_pattern, pattern, _) => pattern
             .runtime_settings
@@ -5126,24 +5191,9 @@ impl Pattern {
                 out
             }
 
-            Node::FmapJs(pat, id) => {
-                let id = *id;
-                let haps = pat.query(state);
-                let mut out = Vec::with_capacity(haps.len());
-                for hap in haps {
-                    // Every iteration enters QuickJS, and a wide query holds
-                    // tens of thousands of haps: `chop(32).slow(0.001)` maps
-                    // about 69k of them. With a JS heap that large each call
-                    // adds GC work, so an unbounded loop can occupy the
-                    // producer thread for minutes with no audio and no
-                    // response to SIGINT. The check must be inside the loop:
-                    // a check on the finished vector is too late.
-                    if budget_exhausted() || cancellation_requested() || query_deadline_expired() {
-                        return Vec::new();
-                    }
-                    out.push(hap.with_value(|v| host_call_value(id, v)));
-                }
-                out
+            Node::FmapJs(pat, id) => map_js_haps(pat.query(state), *id, false, None),
+            Node::FmapJsPreservingControls(pat, id, predicate) => {
+                map_js_haps(pat.query(state), *id, true, *predicate)
             }
 
             Node::JsQuery(id) => host_call_query(*id, state),
@@ -6298,6 +6348,34 @@ impl Pattern {
         Pattern::of(Node::PatternOfDynamic(self.clone(), Arc::new(f))).with_steps(steps)
     }
 
+    /// Native control augmentation using `outerBind` timing. The receiver's
+    /// named live controls survive only when the combined values are unchanged.
+    /// Both patterns remain explicit dependencies for callback ownership.
+    pub fn outer_bind_controls(
+        &self,
+        inputs: Pattern,
+        combine: impl Fn(&Value, &Value) -> Value + Send + Sync + 'static,
+    ) -> Self {
+        let combine = Arc::new(combine);
+        Pattern::of(Node::PatternOfHap(
+            self.clone(),
+            vec![inputs.clone()],
+            Arc::new(move |outer| {
+                let outer = outer.clone();
+                let combine = combine.clone();
+                inputs.map_haps_preserving_live(move |inner| {
+                    Some(
+                        inner
+                            .with_value(|value| combine(&outer.value, value))
+                            .with_pitch_live_controls(&outer),
+                    )
+                })
+            }),
+        ))
+        .outer_join()
+        .with_steps(self.steps)
+    }
+
     /// `fmap` with a user JS callback. **Marks the pattern impure.**
     ///
     /// The step count survives, as in every other `fmap` here. Without it the
@@ -6307,6 +6385,25 @@ impl Pattern {
     pub fn fmap_js(&self, id: CallbackId) -> Self {
         let steps = self.steps;
         Pattern::of(Node::FmapJs(self.clone(), id)).with_steps(steps)
+    }
+
+    /// Trusted host metadata rewrite, with the same callback ownership and
+    /// query limits as `fmap_js`. This must not implement user-authored maps:
+    /// those deliberately invalidate slider provenance even for equal values.
+    pub fn fmap_js_preserving_controls(&self, id: CallbackId) -> Self {
+        Pattern::of(Node::FmapJsPreservingControls(self.clone(), id, None)).with_steps(self.steps)
+    }
+
+    /// Materialize final event values, then apply a trusted metadata rewrite
+    /// only where the native predicate matches. Unmatched values avoid a JS
+    /// round-trip. This belongs after every user-authored transform.
+    pub fn finalize_js_controls_if(&self, id: CallbackId, predicate: fn(&Value) -> bool) -> Self {
+        Pattern::of(Node::FmapJsPreservingControls(
+            self.clone(),
+            id,
+            Some(predicate),
+        ))
+        .with_steps(self.steps)
     }
 
     /// `innerJoin` - the inner hap's whole survives. `register()`'s default.
@@ -7231,7 +7328,8 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
         | Node::AddContext(pattern, _)
         | Node::PatternOfDynamic(pattern, _)
         | Node::Join(pattern, _)
-        | Node::FmapJs(pattern, _) => take_child(pattern, out),
+        | Node::FmapJs(pattern, _)
+        | Node::FmapJsPreservingControls(pattern, _, _) => take_child(pattern, out),
         // The kept constructions are children in every sense that matters
         // here: each is a graph of its own, taken apart on the same worklist.
         Node::PatternOfPure(pattern, _, memo) => {
@@ -7420,6 +7518,7 @@ fn compute_purity(node: &Node) -> purity::Purity {
 
         // Any node holding a callback id is impure and contributes it.
         Node::FmapJs(p, id)
+        | Node::FmapJsPreservingControls(p, id, _)
         | Node::WithQuerySpanJs(p, id)
         | Node::FilterValuesJs(p, id)
         | Node::FilterHapsJs(p, id)

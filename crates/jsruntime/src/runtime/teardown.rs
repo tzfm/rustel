@@ -48,6 +48,7 @@ impl Drop for JsRuntime {
         let last_good = self.last_good_active.borrow_mut().take();
         let import_surface = self.import_surface.take();
         with_ctx(&self.ctx, |ctx| {
+            crate::install::kabelsalat::clear(&ctx);
             if let Some(saved) = last_good {
                 let _ = saved.restore(&ctx);
             }

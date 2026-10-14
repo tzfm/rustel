@@ -76,6 +76,17 @@ in their own work; this collective credit does not transfer ownership.
   `crates/core/src/tonaljs_scales.rs` contains its generated scale dictionary.
   See [crates/core/LICENSE-tonal](crates/core/LICENSE-tonal).
 
+- **KabelSalat** - AGPL-3.0-or-later, by Felix Roos.
+  `crates/jsruntime/src/install/kabelsalat/` ports the graph and library
+  modules from [KabelSalat](https://codeberg.org/froos/kabelsalat), revision
+  `d114e806b6fd8ca948f19613db2cf787e4dcd1d6`. `crates/kabel/` adapts its graph
+  operations and audio processors to Rust. The graph compiler, module wiring
+  and bounded graph serialization are implemented in Rust. See
+  [crates/jsruntime/LICENSE-kabelsalat](crates/jsruntime/LICENSE-kabelsalat).
+  The scores in `crates/runtime/tests/e2e/scores/corpus/kabelsalat/` adapt
+  examples from the same revision under the same licence. Each score credits
+  its author and records its source and changes.
+
 - **fdlibm and V8** - Sun's permissive fdlibm notice and V8's BSD-3-Clause
   license. `crates/core/src/fdlibm.rs` adapts Sun's routines as implemented in
   V8's `src/base/ieee754.cc`. The original Sun and V8 copyright and permission
@@ -777,3 +788,8 @@ Rustel. The adapted text lives in `crates/core/src/control_catalog.rs`,
 `UPSTREAM_DOC_REVISION` in `crates/studio/src/reference.rs` records
 its source revision. The text is redistributed under the same licence as
 the rest of this project.
+
+The two scores in `crates/runtime/tests/e2e/scores/docs/kabelsalat/` come from
+Aria (@glossing)'s examples in `packages/core/pattern.mjs` at Strudel revision
+`a3302cf16746d2f6f7c706be47f1ca85db497aa5`. Their headers preserve the
+Strudel contributors' copyright and AGPL-3.0-or-later notice.

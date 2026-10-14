@@ -3045,7 +3045,9 @@ impl StudioEngine {
         );
         let mut reverbs = LiveReverbBatch::default();
         for event in &events {
-            reverbs.observe(&live.device, event);
+            reverbs
+                .observe(&live.device, event)
+                .map_err(RuntimeError::ResourceLimit)?;
         }
         reverbs.flush(&live.device);
         // A three-note chord after a seven-note one leaves four groups
@@ -3075,7 +3077,7 @@ impl StudioEngine {
             });
         }
         for event in events {
-            if !live.device.push(event) {
+            if !live.device.push(event.clone()) {
                 return Err(RuntimeError::Message(
                     "the device is busy; try the preview again".into(),
                 ));
@@ -4727,15 +4729,20 @@ impl StudioEngine {
                 text_from: self.text_from_generation,
             };
             let mut reverbs = LiveReverbBatch::default();
-            let shield = live.producer.shield_reload_with_clock(
+            let shield = live.producer.shield_reload_with_clock_and_preparation(
                 &mut self.session,
                 || device.clock_seconds(),
                 device.sample_rate(),
+                |events| {
+                    device
+                        .prepare_kabel_events(events)
+                        .map_err(RuntimeError::ResourceLimit)
+                },
                 |event| {
-                    let pushed = device.push(event);
+                    reverbs.observe_prepared(device, &event);
+                    let pushed = device.push(event.clone());
                     if pushed {
                         played.note(&event, device.render_frontier_frames());
-                        reverbs.observe(device, &event);
                         shield_audio.push(UiAcceptedOnset {
                             generation: event.generation,
                             onset_id: event.onset_id,
@@ -5394,39 +5401,46 @@ impl StudioEngine {
                 text_from: self.text_from_generation,
             };
             let mut reverbs = LiveReverbBatch::default();
-            let result = live.producer.step_unwatched_with_clock_and_cutover(
-                &mut self.session,
-                || device.render_frontier_seconds(),
-                device.sample_rate(),
-                |generation, takeover_frame, cut| {
-                    // The external outputs retire the old generation's
-                    // onsets at the same frame the audio does, so nothing
-                    // hangs.
-                    external.take_over(
-                        device.generation(),
-                        generation,
-                        takeover_frame,
-                        retire_frame(device, takeover_frame),
-                        cut,
-                        device.sample_rate(),
-                    );
-                    device.set_generation(generation, takeover_frame, cut);
-                },
-                |event| {
-                    let pushed = device.push(event);
-                    if pushed {
-                        played.note(&event, device.render_frontier_frames());
-                        reverbs.observe(device, &event);
-                        accepted_audio.push(UiAcceptedOnset {
-                            generation: event.generation,
-                            onset_id: event.onset_id,
-                            frequency_hz: Some(event.freq_hz),
-                            gain: Some(event.gain),
-                        });
-                    }
-                    pushed
-                },
-            );
+            let result = live
+                .producer
+                .step_unwatched_with_clock_and_cutover_and_preparation(
+                    &mut self.session,
+                    || device.render_frontier_seconds(),
+                    device.sample_rate(),
+                    |events| {
+                        device
+                            .prepare_kabel_events(events)
+                            .map_err(RuntimeError::ResourceLimit)
+                    },
+                    |generation, takeover_frame, cut| {
+                        // The external outputs retire the old generation's
+                        // onsets at the same frame the audio does, so nothing
+                        // hangs.
+                        external.take_over(
+                            device.generation(),
+                            generation,
+                            takeover_frame,
+                            retire_frame(device, takeover_frame),
+                            cut,
+                            device.sample_rate(),
+                        );
+                        device.set_generation(generation, takeover_frame, cut);
+                    },
+                    |event| {
+                        reverbs.observe_prepared(device, &event);
+                        let pushed = device.push(event.clone());
+                        if pushed {
+                            played.note(&event, device.render_frontier_frames());
+                            accepted_audio.push(UiAcceptedOnset {
+                                generation: event.generation,
+                                onset_id: event.onset_id,
+                                frequency_hz: Some(event.freq_hz),
+                                gain: Some(event.gain),
+                            });
+                        }
+                        pushed
+                    },
+                );
             let preparation_started = Instant::now();
             reverbs.flush(device);
             live.producer
@@ -6811,7 +6825,7 @@ fn note_sample_use(
     // publication precedes the push, and each render chunk rechecks it.
     let event = AudioEvent {
         target_frame: event.target_frame.max(render_frontier),
-        ..*event
+        ..event.clone()
     };
     // A decode can become ready during the query, after this turn's bank
     // installations. Its queued PCM already determines the note's horizon.
@@ -11745,7 +11759,7 @@ pub(super) mod tests {
                 || output.device().clock_seconds(),
                 RATE,
                 |event| {
-                    assert!(output.device().push(event));
+                    assert!(output.device().push(event.clone()));
                     queued.push(event);
                     true
                 },
@@ -11959,7 +11973,7 @@ pub(super) mod tests {
                         device.set_generation(generation, takeover, cut);
                     },
                     |event| {
-                        assert!(device.push(event));
+                        assert!(device.push(event.clone()));
                         queued.push(event);
                         true
                     },

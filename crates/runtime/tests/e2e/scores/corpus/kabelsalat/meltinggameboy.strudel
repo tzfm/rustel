@@ -1,0 +1,21 @@
+/*
+  @title meltinggameboy
+  @by froos
+  @origin KabelSalat examples
+  @duration 8
+  @source https://codeberg.org/froos/kabelsalat/src/commit/d114e806b6fd8ca948f19613db2cf787e4dcd1d6/examples/meltinggameboy.js
+  @license AGPL-3.0-or-later
+  @changes 2026-10-13: Wrap the graph in K() and use .slow(16) to sustain one graph during capture.
+  SPDX-License-Identifier: AGPL-3.0-or-later
+*/
+K(() => {
+saw(
+  sine(0.2)
+    .range([200, 300, 400], [600, 700, 800])
+    .hold(impulse([2, 6]))
+)
+  .mix()
+  .mul(impulse([2, 3]).perc(0.04).slide(10))
+  .filter(sine(0.1).range(0.5, 0.7))
+  .out();
+}).slow(16)

@@ -216,6 +216,7 @@ fn native_event(event: &FixtureEvent, sample_rate: u32) -> OnsetEvent {
         event.duration_seconds,
     )
     .with_controls(OscillatorControls {
+        kabel: None,
         limit: None,
         live_controls: [0; 3],
         preview_epoch: 0,
@@ -316,7 +317,7 @@ fn native_event(event: &FixtureEvent, sample_rate: u32) -> OnsetEvent {
         compressor: None,
         partials: None,
         transient: None,
-        fx_stages: [None; rustel_audio::MAX_FX_STAGES],
+        fx_stages: [const { None }; rustel_audio::MAX_FX_STAGES],
         vowel: None,
         coarse: None,
         crush: None,

@@ -34,7 +34,7 @@
 //! | the sample library and its sources | `sample_sources.rs` |
 //! | files dropped on the studio, bank rename | `sample_import.rs` |
 //! | the prebake tabs: global and per-set setup | `prebakes.rs` |
-//! | ^J, the smart action at the caret | `smart_action.rs` |
+//! | ^J, the quick action at the caret | `smart_action.rs` |
 //! | the computer piano | `piano_mode.rs` |
 //! | jumping to the first error | `error_navigation.rs` |
 //! | pasting into prompts | `prompt_paste.rs` |
@@ -1729,7 +1729,7 @@ mod tests {
         }
 
         /// `enclosing_call_at_caret` ignores brackets in strings, comments and
-        /// regexes, and requires the name to touch its `(`.
+        /// regexes, and permits whitespace between the name and its `(`.
         #[test]
         fn the_enclosing_call_is_read_past_strings_and_comments() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -1741,7 +1741,7 @@ mod tests {
                 ("$: note(\"c\").when(/(/, x => x.fast(", Some("fast")),
                 ("$: note(\"c\").when(/(/, ", Some("when")),
                 ("// setcpm(", None),
-                ("$: setcpm (", None),
+                ("$: setcpm (", Some("setcpm")),
             ] {
                 app.scenes.current_mut().editor =
                     super::super::super::editor::Editor::new(source).expect("editor");
@@ -32189,7 +32189,7 @@ mod tests {
         }
     }
     mod smart_action {
-        //! Tests for smart action.
+        //! Tests for quick action.
 
         use super::super::*;
         use super::support::*;
@@ -32850,7 +32850,7 @@ mod tests {
             assert!(quoted.contains("in a comment"), "{quoted}");
         }
 
-        /// The Edit menu's Smart action row is grey where the action has nothing
+        /// The Edit menu's Quick action row is grey where the action has nothing
         /// to offer: inside a pattern string or a comment. It is live on a number
         /// in code and inside a `slider(` call.
         #[test]
@@ -32864,7 +32864,7 @@ mod tests {
                     .into_iter()
                     .flat_map(|menu| menu.items)
                     .find(|item| item.kind == MenuItemKind::Action(MenuAction::SmartAction))
-                    .expect("the Smart action row")
+                    .expect("the Quick action row")
                     .enabled
             };
             let caret = |app: &mut App, at: usize| {
@@ -33004,7 +33004,7 @@ mod tests {
             assert!(offered > 20, "only {offered} carets offered a fader");
         }
 
-        /// The caret in the smart action's form sits on the text it is editing.
+        /// The caret in the quick action's form sits on the text it is editing.
         ///
         /// It was drawn one cell to its left, because the row's prefix was
         /// counted in two places and the two disagreed by the inset the renderer
@@ -33262,7 +33262,7 @@ mod tests {
             );
             assert!(
                 app.status
-                    .starts_with("smart action: a comment sits inside this slider("),
+                    .starts_with("quick action: a comment sits inside this slider("),
                 "{}",
                 app.status
             );
@@ -33633,7 +33633,7 @@ mod tests {
             assert!(offered > 30, "only {offered} carets offered the paste");
         }
 
-        /// The Edit menu's Smart action row is live where the latest sample can
+        /// The Edit menu's Quick action row is live where the latest sample can
         /// be pasted, and stays grey where it cannot.
         #[test]
         fn a_recorded_sample_lights_the_smart_action_row_where_it_can_be_pasted() {
@@ -33647,7 +33647,7 @@ mod tests {
                     .into_iter()
                     .flat_map(|menu| menu.items)
                     .find(|item| item.kind == MenuItemKind::Action(MenuAction::SmartAction))
-                    .expect("the Smart action row")
+                    .expect("the Quick action row")
                     .enabled
             };
             let caret = |app: &mut App, at: usize| {
@@ -34085,6 +34085,11 @@ mod tests {
                     "saved first.strudel".to_owned()
                 };
                 assert_eq!(app.status, expected);
+                let deadline = app.status_notice.as_ref().expect("save notice").1;
+                app.expire_notice(deadline - Duration::from_millis(1));
+                assert_eq!(app.status, expected);
+                app.expire_notice(deadline);
+                assert!(app.status.is_empty());
             }
         }
 
@@ -36625,6 +36630,11 @@ mod tests {
                 "{}",
                 app.status
             );
+            app.status_notice.as_mut().expect("theme save notice").1 = Instant::now();
+            app.dirty_frame = false;
+            app.pump_turn();
+            assert!(app.status.is_empty());
+            assert!(app.dirty_frame, "expiry redraws without a keypress");
         }
 
         /// A roll of the randomize row waits until the arrows stop. The palette
@@ -37334,6 +37344,36 @@ mod tests {
                 [ErrorOwner::Interface]
             );
             assert!(errors.visible().is_none());
+        }
+
+        #[test]
+        fn theme_notices_expire_without_clearing_prompts_or_errors() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.keep_theme();
+            assert!(app.status.contains("remembered in"));
+            let old_deadline = Instant::now();
+            app.status_notice.as_mut().unwrap().1 = old_deadline;
+            app.keep_theme();
+            app.expire_notice(old_deadline);
+            assert!(
+                !app.status.is_empty(),
+                "repeating a notice renews its lifetime"
+            );
+
+            let deadline = app.status_notice.as_ref().unwrap().1;
+            app.request_quit();
+            let prompt = app.status.clone();
+            app.expire_notice(deadline);
+            assert_eq!(app.status, prompt, "the quit prompt still needs an answer");
+            assert!(app.status_notice.is_none());
+
+            app.keep_theme();
+            app.set_error(ErrorOwner::Save, "save failed".into());
+            let deadline = app.status_notice.as_ref().unwrap().1;
+            app.expire_notice(deadline);
+            assert!(app.status.is_empty(), "a hidden notice expires too");
+            assert_eq!(app.errors.visible(), Some("save failed"));
         }
 
         #[test]
@@ -39393,6 +39433,7 @@ struct App {
     /// same quarter second every other device light does.
     input_lit_at: Option<Instant>,
     status: String,
+    status_notice: Option<(String, Instant)>,
     errors: AppErrors,
     next_save_request_id: u64,
     quit: bool,
@@ -39558,7 +39599,7 @@ struct App {
     /// by Esc, an edit, or a press anywhere else.
     armed_slider: Option<(SceneId, usize)>,
     slider_precision: Option<slider_precision::PrecisionSlider>,
-    /// The smart action's menu, open at the caret.
+    /// The quick action's menu, open at the caret.
     smart_action: Option<smart_action::SmartAction>,
     replay_edit: Option<replay_edit::ReplayEdit>,
     /// How loud a sample preview plays, 1.0 being unity. It goes past unity
@@ -39899,6 +39940,7 @@ impl App {
             resting_output: None,
             input_lit_at: None,
             status: clipboard_status.into(),
+            status_notice: None,
             errors: AppErrors::default(),
             next_save_request_id: 1,
             quit: false,

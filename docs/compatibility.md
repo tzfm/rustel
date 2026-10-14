@@ -7,7 +7,7 @@ Studio's reference describes each call and its limits.
 
 | Feature | Limit |
 | --- | --- |
-| KabelSalat: `K`, `worklet`, `S`, `audioin` | Custom DSP is not implemented. These calls report an error. |
+| KabelSalat external inputs | Graphs run natively with `K`, `worklet`, `S` and `audioin`. MIDI, CC and pointer nodes have no native input and report an error. See [KabelSalat graphs](kabelsalat.md) for the supported API and resource limits. |
 | Csound: `loadOrc` | Orchestra loading is not implemented. The call reports an error. |
 | `getDuration`, `getDur` | Sample-duration lookup is not implemented. These calls report an error. |
 | `mondo` and `tidal` template tags | These alternative languages are not registered. |

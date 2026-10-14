@@ -857,6 +857,8 @@ impl JsRuntime {
                 {
                     return Err(score_error(message));
                 }
+                let wrapper = crate::install::worklet::finalize(&ctx, wrapper)
+                    .map_err(|error| score_error(describe_js_error(&ctx, error)))?;
                 // Anything a callback handed back must be owned by the graph
                 // that survives, not dropped with the frame.
                 let ownership_complete = wrapper.borrow().explicit_ownership_complete;

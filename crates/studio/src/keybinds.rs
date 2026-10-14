@@ -279,7 +279,7 @@ impl BindAction {
             Self::Jobs => "background jobs",
             Self::Memory => "memory breakdown",
             Self::Export => "export scene",
-            Self::SmartAction => "smart action",
+            Self::SmartAction => "quick action",
             Self::Split => "split the editor",
             Self::HopPane => "hop between panes",
             Self::Undo => "undo",

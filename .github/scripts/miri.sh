@@ -43,7 +43,9 @@ miri -p rustel-audio --test ring_roles --test no_alloc_callback -- \
 
 # The producer and the consumer on two threads, under 16 thread schedules.
 MIRIFLAGS="$MIRIFLAGS -Zmiri-many-seeds=0..16" \
-  miri -p rustel-audio --lib -- observed_depth_stays_bounded ownership_tests
+  miri -p rustel-audio --lib -- observed_depth_stays_bounded ownership_tests \
+    baton_crosses_threads snapshots_share_published_slots_safely_with_the_producer \
+    retirement_excludes_publication
 
 # AVX2 kernels. Miri reports only the CPU features of the build, so this build
 # turns AVX2 on.

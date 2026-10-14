@@ -20,7 +20,9 @@ impl From<&rustel_core::reference::ReferenceEntry> for Entry {
                     name: param.name.to_owned(),
                     r#type: param.r#type.to_owned(),
                     description: param.description.to_owned(),
-                    choices: rustel_core::reference::reference_choices(entry.name, param.name)
+                    choices: (!entry.tags.contains(&"kabelsalat"))
+                        .then(|| rustel_core::reference::reference_choices(entry.name, param.name))
+                        .flatten()
                         .map(|set| {
                             set.choices
                                 .iter()
@@ -54,14 +56,15 @@ impl Entry {
     /// sound names and snippets do not receive them.
     pub fn inserts_as_call(&self) -> bool {
         self.snippet.is_none()
-            && !self.tags.iter().any(|tag| tag == "sound")
-            && !rustel_runtime::lint::global_values().contains(self.name.as_str())
+            && !self.tags.iter().any(|tag| tag == "sound" || tag == "value")
+            && (self.tags.iter().any(|tag| tag == "kabelsalat")
+                || !rustel_runtime::lint::global_values().contains(self.name.as_str()))
     }
 
     /// The signature line: `lpf(frequency)` plus its other names.
     pub fn signature(&self) -> String {
         // A snippet is lines, not a call: its name is its heading.
-        if self.snippet.is_some() {
+        if self.snippet.is_some() || self.tags.iter().any(|tag| tag == "value") {
             return self.name.clone();
         }
         let params = self
@@ -189,6 +192,15 @@ impl Reference {
         };
         reference.ingest_all_natives(&known);
         reference.ingest_snippets();
+        for documented in rustel_jsruntime::kabelsalat_reference_entries() {
+            let mut entry = Entry::from(documented);
+            entry.origin.clear();
+            let index = reference.entries.len();
+            for name in std::iter::once(&entry.name).chain(&entry.synonyms) {
+                reference.by_kabel_name.insert(name.clone(), index);
+            }
+            reference.entries.push(entry);
+        }
         reference
     }
 
@@ -440,7 +452,22 @@ impl Reference {
         if word.is_empty() {
             return None;
         }
-        self.lookup_spelling(word)
+        self.by_name
+            .get(word)
+            .or_else(|| self.by_kabel_name.get(word))
+            .copied()
+            .or_else(|| self.lookup_spelling(word))
+    }
+
+    /// Resolve colliding names in the namespace where the score uses them.
+    pub fn lookup_in(&self, word: &str, scope: ReferenceScope) -> Option<usize> {
+        match scope {
+            ReferenceScope::All => self.resolve(word),
+            ReferenceScope::Pattern => self.lookup_spelling(word),
+            ReferenceScope::Kabelsalat | ReferenceScope::KabelsalatMember => {
+                self.by_kabel_name.get(word).copied()
+            }
+        }
     }
 
     fn lookup_spelling(&self, word: &str) -> Option<usize> {
@@ -474,7 +501,7 @@ impl Reference {
     /// the names that ARE the spelling - a chord symbol like `+`, `-` or
     /// `^7` - so the catalogues check against the exact word.
     pub fn documents(&self, name: &str) -> bool {
-        self.by_name.contains_key(name)
+        self.by_name.contains_key(name) || self.by_kabel_name.contains_key(name)
     }
 
     /// The entry a name resolves to, exact spelling first.
@@ -492,8 +519,9 @@ impl Reference {
 
     /// Entries matching a query, best first: the exact name, then names
     /// that start with it, then names and synonyms that contain it, then
-    /// summaries that mention it. An empty query lists everything,
-    /// hidden-from-completion entries last. A [`Category`] the settings
+    /// summaries that mention it. An empty query lists ordinary entries,
+    /// hidden-from-completion entries last. Graph bypasses require an
+    /// underscore query or `tag:bypass`. A [`Category`] the settings
     /// hide stays out unless a `tag:` word names the category.
     ///
     /// A `tag:` word narrows the field before any of that ranking happens -
@@ -514,6 +542,12 @@ impl Reference {
     /// most of them: typing `midike` to reach `midikeys` offered three
     /// snippets first.
     pub fn search_with(&self, query: &str, snippets_last: bool) -> Vec<usize> {
+        self.search_in(query, snippets_last, ReferenceScope::All)
+    }
+
+    /// Complete within one namespace. An explicit tag still browses every
+    /// matching entry, including entries hidden in settings.
+    pub fn search_in(&self, query: &str, snippets_last: bool, scope: ReferenceScope) -> Vec<usize> {
         let filter = TagFilter::parse(query);
         let query = filter.rest;
         let mut ranked = self
@@ -521,6 +555,36 @@ impl Reference {
             .iter()
             .enumerate()
             .filter(|(_, entry)| filter.admits(entry) && self.offers(entry, &filter))
+            // Bypasses share one convention; browse the operations unless
+            // the reader explicitly asks for their disabled forms.
+            .filter(|(_, entry)| {
+                query.starts_with('_')
+                    || filter
+                        .name
+                        .is_some_and(|name| name.eq_ignore_ascii_case("bypass"))
+                    || !Category::Kabelsalat.files(entry)
+                    || !entry.tags.iter().any(|tag| tag == "bypass")
+            })
+            .filter(|(index, entry)| {
+                if filter.name.is_some() || scope == ReferenceScope::All {
+                    return true;
+                }
+                let graph = self.by_kabel_name.get(&entry.name) == Some(index);
+                match scope {
+                    ReferenceScope::Kabelsalat => {
+                        graph
+                            && !entry.no_autocomplete
+                            && !entry.tags.iter().any(|tag| tag == "method")
+                    }
+                    ReferenceScope::KabelsalatMember => {
+                        graph
+                            && !entry.no_autocomplete
+                            && !entry.tags.iter().any(|tag| tag == "global")
+                    }
+                    ReferenceScope::Pattern => !graph,
+                    ReferenceScope::All => true,
+                }
+            })
             // An underscore asks for an inline/underscored callable, not a
             // one-character typo for `H`, `i`, `n`, etc. Keep fuzzy matching
             // within that family so partial names and typos still work.

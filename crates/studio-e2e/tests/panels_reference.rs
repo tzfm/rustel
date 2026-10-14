@@ -14,7 +14,7 @@ static AUDIO_CALLBACK_ALLOCATOR: rustel_audio::tripwire::TripwireAlloc =
     rustel_audio::tripwire::TripwireAlloc;
 
 use crossterm::event::{KeyCode, KeyModifiers};
-use rustel_studio_e2e::{PanelKind, hermetic, hermetic_sized, row_containing};
+use rustel_studio_e2e::{PanelKind, hermetic, hermetic_sized, reopen_over, row_containing};
 
 /// No terminal size hides a tab. The labels are measured from one table and
 /// drawn from the geometry the hit-test reads. From the widest studio to
@@ -266,6 +266,102 @@ fn the_reference_setting_hides_osc_entries() {
         studio.status(),
         "reference - squiz",
         "a hidden name still opens"
+    );
+}
+
+#[test]
+fn kabelsalat_visibility_survives_a_reopen_and_can_be_restored() {
+    let mut studio = hermetic();
+    let close_column = |studio: &mut rustel_studio_e2e::Hermetic| {
+        for _ in 0..3 {
+            if studio.reference_tab().is_none() {
+                break;
+            }
+            studio.press(KeyCode::Esc, KeyModifiers::NONE);
+        }
+        assert_eq!(studio.reference_tab(), None);
+    };
+    let lists_worklet = |studio: &mut rustel_studio_e2e::Hermetic| {
+        studio
+            .rows()
+            .iter()
+            .any(|row| row.contains("worklet") && row.contains("KabelSalat graph source"))
+    };
+    let browse = |studio: &mut rustel_studio_e2e::Hermetic, query: &str| {
+        studio.set_score("$: ");
+        studio.press(KeyCode::End, KeyModifiers::NONE);
+        studio.chord("ctrl+d");
+        studio.type_text(query);
+    };
+    let select_kabelsalat = |studio: &mut rustel_studio_e2e::Hermetic| {
+        studio.chord("ctrl+o");
+        for _ in 0..5 {
+            studio.press(KeyCode::Tab, KeyModifiers::NONE);
+        }
+        for _ in 0..6 {
+            if studio.rows().iter().any(|row| row.contains("▸ KabelSalat")) {
+                return;
+            }
+            studio.press(KeyCode::Down, KeyModifiers::NONE);
+        }
+        panic!(
+            "KabelSalat setting is missing:\n{}",
+            studio.rows().join("\n")
+        );
+    };
+
+    browse(&mut studio, "worklet");
+    assert!(lists_worklet(&mut studio), "KabelSalat starts listed");
+    close_column(&mut studio);
+
+    select_kabelsalat(&mut studio);
+    studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+
+    browse(&mut studio, "worklet");
+    assert!(
+        !lists_worklet(&mut studio),
+        "the switch updates the browser"
+    );
+    close_column(&mut studio);
+    studio.set_score("$: note(60).wor");
+    studio.press(KeyCode::End, KeyModifiers::NONE);
+    studio.chord("ctrl+f");
+    assert!(!lists_worklet(&mut studio), "the switch updates completion");
+    close_column(&mut studio);
+
+    // Quitting through the editor flushes the debounced preferences.
+    studio.chord("ctrl+q");
+    studio.chord("ctrl+q");
+    assert!(studio.wants_quit());
+    let mut studio = reopen_over(studio);
+    browse(&mut studio, "worklet");
+    assert!(!lists_worklet(&mut studio), "the hidden category is saved");
+    close_column(&mut studio);
+    browse(&mut studio, "tag:kabelsalat worklet");
+    assert!(
+        lists_worklet(&mut studio),
+        "the explicit tag still finds it"
+    );
+    close_column(&mut studio);
+
+    studio.set_score("$: note(60).worklet(");
+    studio.press(KeyCode::End, KeyModifiers::NONE);
+    studio.chord("ctrl+d");
+    assert_eq!(
+        studio.status(),
+        "reference - worklet",
+        "hidden help still opens"
+    );
+    close_column(&mut studio);
+
+    select_kabelsalat(&mut studio);
+    studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    browse(&mut studio, "worklet");
+    assert!(
+        lists_worklet(&mut studio),
+        "switching on restores the category"
     );
 }
 

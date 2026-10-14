@@ -3631,6 +3631,7 @@ name = "rustel-audio"
 version = "0.1.2"
 dependencies = [
  "cpal",
+ "rustel-kabel",
  "rustfft",
  "serde",
  "serde_json",
@@ -3705,8 +3706,17 @@ dependencies = [
  "rustel-core",
  "rustel-ext",
  "rustel-fraction",
+ "rustel-kabel",
  "rustel-mini",
  "rustel-transpiler",
+ "serde_json",
+]
+
+[[package]]
+name = "rustel-kabel"
+version = "0.1.2"
+dependencies = [
+ "serde",
  "serde_json",
 ]
 

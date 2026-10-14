@@ -62,7 +62,7 @@ pub use bridge::*;
 pub use constants::supported_global_names;
 use constants::*;
 use host::*;
-pub use install::reference_entries;
+pub use install::{kabelsalat_reference_entries, reference_entries};
 use pattern::*;
 pub use runtime::*;
 /// What the engine says when setup asks for something only a score may do.

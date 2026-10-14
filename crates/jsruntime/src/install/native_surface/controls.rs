@@ -162,26 +162,30 @@ pub(super) fn fx<'js>(
     let values = choose_lookup(&ctx, &args.0)?;
     let (effects, mut nested) = reify_pattern_list(&ctx, &values.into_value())?;
     sidecars.append(&mut nested);
-    let pattern = receiver.app_left_with(effects, |current, effects| {
-        let current = rustel_core::materialize_js_value(current);
-        let mut controls = match current {
-            Value::Object(controls) => controls,
-            _ => rustel_core::OrderedMap::new(),
-        };
-        let mut combined = match controls
-            .get("FX")
-            .cloned()
-            .unwrap_or(Value::List(Vec::new()))
-        {
-            Value::List(values) => values,
-            value => vec![value],
-        };
-        match rustel_core::materialize_js_value(effects) {
-            Value::List(values) => combined.extend(values),
-            value => combined.push(value),
-        }
-        controls.insert("FX".into(), Value::List(combined));
-        Value::Object(controls)
-    });
+    let pattern = receiver.app_left_with_lookup(
+        effects,
+        |current, effects| {
+            let current = rustel_core::materialize_js_value(current);
+            let mut controls = match current {
+                Value::Object(controls) => controls,
+                _ => rustel_core::OrderedMap::new(),
+            };
+            let mut combined = match controls
+                .get("FX")
+                .cloned()
+                .unwrap_or(Value::List(Vec::new()))
+            {
+                Value::List(values) => values,
+                value => vec![value],
+            };
+            match rustel_core::materialize_js_value(effects) {
+                Value::List(values) => combined.extend(values),
+                value => combined.push(value),
+            }
+            controls.insert("FX".into(), Value::List(combined));
+            Value::Object(controls)
+        },
+        rustel_core::LookupFlow::LeftControls,
+    );
     derive_wrapper(ctx, pattern, &sidecars)
 }

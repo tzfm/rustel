@@ -123,6 +123,7 @@ pub fn input_retry_delay(attempts: u64) -> Duration {
 /// Coalesces one producer turn's shared-orbit reverb requests. The final
 /// scheduled parameters for each orbit are prepared once after the turn.
 pub struct LiveReverbBatch {
+    publication: Option<crate::KabelPublication>,
     requested: [Option<crate::reverb::ReverbParams>; crate::scalar::MAX_ORBITS],
 }
 
@@ -130,6 +131,7 @@ impl Default for LiveReverbBatch {
     fn default() -> Self {
         Self {
             requested: [None; crate::scalar::MAX_ORBITS],
+            publication: None,
         }
     }
 }
@@ -141,7 +143,22 @@ impl LiveReverbBatch {
 
     /// Observe one event without constructing an orbit impulse response.
     /// Per-voice `.FX()` reverbs keep their distinct bounded cache.
-    pub fn observe(&mut self, device: &LiveScalarDevice, event: &crate::AudioEvent) {
+    pub fn observe(
+        &mut self,
+        device: &LiveScalarDevice,
+        event: &crate::AudioEvent,
+    ) -> Result<(), String> {
+        let publication = device.ensure_kabel(event)?;
+        if publication.is_active() && self.publication.is_none() {
+            self.publication = Some(publication);
+        }
+        self.observe_prepared(device, event);
+        Ok(())
+    }
+
+    /// Observe an event whose worklet resources were prepared with its complete
+    /// scheduling window before generation publication.
+    pub fn observe_prepared(&mut self, device: &LiveScalarDevice, event: &crate::AudioEvent) {
         if let Some(reverb) = event.controls.reverb {
             self.request_orbit(
                 usize::from(event.controls.orbit),
@@ -176,6 +193,20 @@ impl LiveReverbBatch {
     }
 }
 
+#[derive(Clone, Copy)]
+struct KabelReservation {
+    delays: usize,
+    bytes: usize,
+    pointer: usize,
+    until_secs: f64,
+}
+
+#[derive(Clone, Copy)]
+struct KabelProgramReservation {
+    id: rustel_kabel::ProgramId,
+    pointer: usize,
+}
+
 /// One continuously running output fed by the scheduler through a
 /// fixed-capacity SPSC ring. The query thread owns pushes and generation
 /// changes; the audio callback owns DSP and pops.
@@ -195,6 +226,8 @@ pub struct LiveScalarDevice {
     /// Recently shipped `.FX()` stage reverbs. The pointer identity lets the
     /// producer forget a fingerprint when the callback returns that box.
     fx_reverb_cache: std::sync::Mutex<Vec<(crate::reverb::ReverbParams, usize, usize)>>,
+    kabel_cache: std::sync::Mutex<Vec<KabelReservation>>,
+    program_cache: std::sync::Mutex<Vec<KabelProgramReservation>>,
     shared: LiveShared,
     sample_rate: u32,
     channels: u16,
@@ -256,6 +289,9 @@ pub struct AssetQueuePressureSnapshot {
     pub fx_reverb_installs: u64,
     pub fx_reverb_returns: u64,
     pub fx_reverb_refusals: u64,
+    pub kabel_installs: u64,
+    pub kabel_returns: u64,
+    pub kabel_refusals: u64,
     pub leaked: u64,
 }
 
@@ -613,6 +649,9 @@ impl LiveShared {
                 fx_reverb_installs: self.samples.fx_reverb_installs.len() as u64,
                 fx_reverb_returns: self.samples.fx_reverb_returns.len() as u64,
                 fx_reverb_refusals: self.samples.fx_reverb_refusals.load(Ordering::Acquire),
+                kabel_installs: self.samples.kabel_installs.len() as u64,
+                kabel_returns: self.samples.kabel_returns.len() as u64,
+                kabel_refusals: self.samples.kabel_refusals.load(Ordering::Acquire),
                 leaked: self.samples.leaked.load(Ordering::Acquire),
             },
             cutover_race_blocks: self.cutover_race_blocks.load(Ordering::Acquire),
@@ -661,6 +700,17 @@ impl LiveShared {
                 // SAFETY: the same exclusive handoff applies to stage IRs.
                 drop(unsafe { Box::from_raw(install.reverb) });
             }
+        }
+        // Every replacement discards queued onsets and resets their producer
+        // reservations. Pending K assets must follow those events even at the
+        // same rate, or they consume capacity the fresh cache cannot account for.
+        while let Some(install) = self.samples.program_installs.pop() {
+            // SAFETY: both callbacks are stopped. The queued program is ours.
+            drop(unsafe { Box::from_raw(install.program) });
+        }
+        while let Some(install) = self.samples.kabel_installs.pop() {
+            // SAFETY: both callbacks are stopped during stream replacement.
+            drop(unsafe { Box::from_raw(install.graph) });
         }
         let frames = rebase_frame_rate(
             self.frames.load(Ordering::Acquire),
@@ -1418,14 +1468,196 @@ impl LiveScalarDevice {
         }
     }
 
+    /// Prepare independent native graph state for this event on the producer.
+    /// Cache entries reserve processors through their whole sounding interval.
+    /// Pitch changes reuse storage while overlapping voices remain independent.
+    pub fn ensure_kabel(
+        &self,
+        event: &crate::AudioEvent,
+    ) -> Result<crate::KabelPublication, String> {
+        self.prepare_kabel_events(std::slice::from_ref(event))
+    }
+
+    /// Prepare a complete scheduling window transactionally before publishing
+    /// its generation. Failure leaves the current cache and install queue intact.
+    /// Keep the returned reservation until all events are published or discarded.
+    pub fn prepare_kabel_events(
+        &self,
+        events: &[crate::AudioEvent],
+    ) -> Result<crate::KabelPublication, String> {
+        if !events.iter().any(|event| {
+            crate::scalar::kabel_controls(&event.controls)
+                .next()
+                .is_some()
+        }) {
+            return Ok(crate::KabelPublication::default());
+        }
+        let publication = crate::KabelPublication::new(self.shared.samples.clone());
+        self.reclaim_assets();
+        let mut cache = self.kabel_cache.lock().expect("producer KabelSalat cache");
+        let mut program_cache = self
+            .program_cache
+            .lock()
+            .expect("producer KabelSalat program cache");
+        let mut staged_programs = program_cache.clone();
+        let mut prepared_programs: Vec<Box<crate::assets::PreparedKabelProgram>> = Vec::new();
+        let mut staged = cache.clone();
+        let mut prepared = Vec::new();
+        let mut resident: usize = staged.iter().map(|entry| entry.bytes).sum();
+        let sr = f64::from(self.sample_rate);
+        // A callback activates all its onsets before retiring finished voices.
+        // Reserve one host block plus the downstream filter-ring allowance.
+        let block_frames = self
+            .reported_buffer_frames
+            .unwrap_or(self.requested_buffer_frames)
+            .max(4096);
+        for event in events {
+            let start = event.target_frame as f64 / sr;
+            let end = crate::scalar::kabel_controls(&event.controls)
+                .map(|controls| controls.end_secs)
+                .fold(start, f64::max)
+                + 0.01
+                + (f64::from(block_frames) + 384.0) / sr;
+            let until_frame = (end * sr).ceil() as u64;
+            for controls in crate::scalar::kabel_controls(&event.controls) {
+                let id = controls.program.id();
+                let existing = staged_programs.iter().position(|entry| entry.id == id);
+                // Republish code in every window. A callback may already have
+                // retired a cached box before this reservation started.
+                {
+                    if existing.is_none()
+                        && staged_programs.len() >= crate::assets::MAX_KABEL_PROGRAMS
+                    {
+                        self.shared
+                            .samples
+                            .kabel_refusals
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Err(
+                            "KabelSalat program storage exceeds the 4096-program limit".into()
+                        );
+                    }
+                    // One install per identity in this window. Extending an already
+                    // published lease replaces its box and returns the old baton.
+                    let pointer = if let Some(prepared) = prepared_programs
+                        .iter_mut()
+                        .find(|prepared| prepared.program.id() == id)
+                    {
+                        prepared.until_frame = prepared.until_frame.max(until_frame);
+                        (&**prepared as *const crate::assets::PreparedKabelProgram) as usize
+                    } else {
+                        let prepared = Box::new(crate::assets::PreparedKabelProgram {
+                            program: *controls.program,
+                            until_frame,
+                        });
+                        let pointer =
+                            (&*prepared as *const crate::assets::PreparedKabelProgram) as usize;
+                        prepared_programs.push(prepared);
+                        pointer
+                    };
+                    let reservation = KabelProgramReservation { id, pointer };
+                    if let Some(index) = existing {
+                        staged_programs[index] = reservation;
+                    } else {
+                        staged_programs.push(reservation);
+                    }
+                }
+                let delays = controls.program.delay_count();
+                if let Some(entry) = staged
+                    .iter_mut()
+                    .filter(|entry| entry.until_secs <= start && entry.delays >= delays)
+                    .min_by_key(|entry| entry.delays)
+                {
+                    entry.until_secs = end;
+                    continue;
+                }
+                let graph = Box::new(rustel_kabel::Graph::new(&controls.program, sr)?);
+                let bytes = crate::scalar::kabel_graph_bytes(&graph);
+                if staged.len() >= crate::MAX_KABEL_GRAPHS
+                    || bytes > crate::MAX_KABEL_BYTES.saturating_sub(resident)
+                {
+                    self.shared
+                        .samples
+                        .kabel_refusals
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(
+                        "KabelSalat graph storage exceeds the 128-graph or 64 MiB limit".into(),
+                    );
+                }
+                resident += bytes;
+                staged.push(KabelReservation {
+                    delays,
+                    bytes,
+                    pointer: (&*graph as *const rustel_kabel::Graph) as usize,
+                    until_secs: end,
+                });
+                prepared.push(graph);
+            }
+        }
+        let queue = &self.shared.samples.kabel_installs;
+        if prepared.len() > queue.capacity().saturating_sub(queue.len()) {
+            self.shared
+                .samples
+                .kabel_refusals
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(
+                "KabelSalat preparation queue is full; reduce simultaneous worklets".into(),
+            );
+        }
+        let programs = &self.shared.samples.program_installs;
+        if prepared_programs.len() > programs.capacity().saturating_sub(programs.len()) {
+            self.shared
+                .samples
+                .kabel_refusals
+                .fetch_add(1, Ordering::Relaxed);
+            return Err("KabelSalat program preparation queue is full; reduce worklets in the scheduling window".into());
+        }
+        for program in prepared_programs {
+            let pointer = Box::into_raw(program);
+            // This producer reserved the entire window above. The consumer
+            // can only increase the available queue capacity.
+            if let Err(install) = programs.push(crate::assets::ProgramInstall { program: pointer })
+            {
+                // SAFETY: the rejected baton never left this producer.
+                drop(unsafe { Box::from_raw(install.program) });
+                return Err("KabelSalat program queue ownership changed unexpectedly".into());
+            }
+        }
+        for graph in prepared {
+            let pointer = Box::into_raw(graph);
+            // Only this producer adds installs. The consumer can only make
+            // more room after the complete-window capacity check above.
+            if let Err(install) = queue.push(crate::assets::KabelInstall { graph: pointer }) {
+                // SAFETY: the rejected install never left the producer.
+                drop(unsafe { Box::from_raw(install.graph) });
+                return Err("KabelSalat preparation queue ownership changed unexpectedly".into());
+            }
+        }
+        *cache = staged;
+        *program_cache = staged_programs;
+        Ok(publication)
+    }
+
     fn reclaim_assets(&self) {
         let mut cache = self
             .fx_reverb_cache
             .lock()
             .expect("producer fx reverb cache");
-        self.shared.samples.reclaim_with_fx(|returned| {
-            cache.retain(|(_, _, installed)| *installed != returned as usize);
-        });
+        let mut kabel = self.kabel_cache.lock().expect("producer KabelSalat cache");
+        let mut programs = self
+            .program_cache
+            .lock()
+            .expect("producer KabelSalat program cache");
+        self.shared.samples.reclaim_with_programs(
+            |returned| {
+                cache.retain(|(_, _, installed)| *installed != returned as usize);
+            },
+            |returned| {
+                kabel.retain(|entry| entry.pointer != returned as usize);
+            },
+            |returned| {
+                programs.retain(|entry| entry.pointer != returned as usize);
+            },
+        );
     }
 
     pub fn start_default(initial_generation: u64) -> Result<Self, DevicePlaybackError> {
@@ -1512,6 +1744,8 @@ impl LiveScalarDevice {
             input: None,
             reverb_cache: std::sync::Mutex::new(vec![None; crate::scalar::MAX_ORBITS]),
             fx_reverb_cache: std::sync::Mutex::new(Vec::with_capacity(8)),
+            kabel_cache: std::sync::Mutex::new(Vec::with_capacity(crate::MAX_KABEL_GRAPHS)),
+            program_cache: std::sync::Mutex::new(Vec::new()),
             shared,
             sample_rate: facts.sample_rate_hz(),
             channels: facts.channels(),
@@ -2777,8 +3011,10 @@ impl LiveScalarDevice {
     /// state, which it cannot see. A handful of loads and two short locks.
     pub fn memory(&self) -> LiveDeviceMemory {
         use std::mem::{size_of, size_of_val};
-        let ring =
-            |ring: &Ring| ring.pushed().min(ring.capacity()) * size_of::<crate::QueuedAudioEvent>();
+        let ring = |ring: &Ring| {
+            ring.pushed().min(ring.capacity())
+                * size_of::<crate::QueuedAudioEvent<crate::CompactKabelControls>>()
+        };
         let orbit_reverbs: usize = self
             .reverb_cache
             .lock()
@@ -2820,7 +3056,32 @@ impl LiveScalarDevice {
             input: self.shared.input.touched_bytes(),
             record: self.shared.record.touched_bytes(),
             reverbs: orbit_reverbs + stage_reverbs,
-            backend: self.backend_bytes,
+            backend: self.backend_bytes
+                + self
+                    .kabel_cache
+                    .lock()
+                    .expect("producer KabelSalat cache")
+                    .iter()
+                    .map(|entry| entry.bytes)
+                    .sum::<usize>()
+                    .max(
+                        self.shared
+                            .samples
+                            .kabel_resident_bytes
+                            .load(Ordering::Acquire),
+                    )
+                + (self
+                    .program_cache
+                    .lock()
+                    .expect("producer KabelSalat program cache")
+                    .len()
+                    * size_of::<crate::assets::PreparedKabelProgram>())
+                .max(
+                    self.shared
+                        .samples
+                        .program_resident_bytes
+                        .load(Ordering::Acquire),
+                ),
             analysis: size_of_val(&**master)
                 + master.sides.as_deref().map_or(0, size_of_val)
                 + visual_taps * size_of::<LiveAnalysisTap>(),
@@ -3151,6 +3412,22 @@ impl LiveScalarDevice {
             .lock()
             .expect("producer fx reverb cache")
             .clear();
+        self.kabel_cache
+            .lock()
+            .expect("producer KabelSalat cache")
+            .clear();
+        self.program_cache
+            .lock()
+            .expect("producer KabelSalat program cache")
+            .clear();
+        self.shared
+            .samples
+            .program_resident_bytes
+            .store(0, Ordering::Release);
+        self.shared
+            .samples
+            .kabel_resident_bytes
+            .store(0, Ordering::Release);
         self.shared
             .samples
             .fx_reverb_resident_bytes
@@ -3937,7 +4214,10 @@ impl ScalarDevice {
         }
         backend.forbid_inline_reverb();
         for event in events {
-            backend.note(*event);
+            backend
+                .prepare_kabel_event(event)
+                .map_err(DevicePlaybackError::ResourceLimit)?;
+            backend.note(event.clone());
         }
 
         let written = Arc::new(AtomicU64::new(0));
@@ -4332,6 +4612,7 @@ fn write_live_output_inner<T>(
     // Pointer writes only: adopt freshly decoded samples into the bank and
     // hand displaced ones back for the producer to free.
     backend.drain_sample_installs(&shared.samples);
+    backend.retire_kabel_programs(&shared.samples, &shared.ring, &shared.immediate);
     backend.drain_reverb_installs(&shared.samples);
     for update in shared.live_controls.drain_available() {
         backend.set_live_control(update);
@@ -4654,12 +4935,12 @@ fn write_output<T>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     // The allocation counters are process-wide, so a positive-control canary
     // must not overlap another test's zero-delta assertion.
     static TRIPWIRE_ASSERTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn tripwire_assertion_guard() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn tripwire_assertion_guard() -> std::sync::MutexGuard<'static, ()> {
         TRIPWIRE_ASSERTION_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -5758,7 +6039,7 @@ mod tests {
                         sustain: 1.0,
                         release_secs: 0.0001,
                     };
-                    assert!(a.shared.ring.push(queued.event));
+                    assert!(a.shared.ring.push(queued.event.clone()));
                     if !tracked_b || !measured {
                         queued.confirmation = None;
                     }
@@ -6371,7 +6652,7 @@ mod tests {
                     gain: 0.1,
                     duration_secs: 1.0,
                     ui_visuals: 0,
-                    controls,
+                    controls: controls.clone(),
                     sample: None,
                     synth: Some(crate::SynthSource::ZzFx {
                         params: crate::zzfx::ZzfxParams {
@@ -6847,7 +7128,7 @@ mod tests {
             let mut queued = confirmation_event(offer, 0, 0);
             queued.event.duration_secs = 0.001;
             assert!(channel.publish(offer));
-            assert!(shared.ring.push_queued(queued));
+            assert!(shared.ring.push_queued(queued.clone()));
             let mut backend = confirmation_backend(&shared, 2);
             let mut meters = test_meter();
             let mut output = [0.5f32; 256];
@@ -6884,7 +7165,7 @@ mod tests {
                 cut: None,
             });
             assert!(channel.publish(offer));
-            assert!(shared.ring.push_queued(queued));
+            assert!(shared.ring.push_queued(queued.clone()));
             let mut backend = confirmation_backend(&shared, 2);
             let mut meters = test_meter();
             let mut output = [0.0f32; 256];
@@ -6955,7 +7236,7 @@ mod tests {
                 });
                 queued.expected_sample_identity = expected_known.then_some(replacement_identity);
                 assert!(channel.publish(offer));
-                assert!(shared.ring.push_queued(queued));
+                assert!(shared.ring.push_queued(queued.clone()));
                 let mut backend = confirmation_backend(&shared, 4);
                 let mut meters = test_meter();
                 let mut output = [0.0f32; 256];
@@ -7061,7 +7342,7 @@ mod tests {
                     warp_lfo_shape: 0,
                 });
                 assert!(channel.publish(offer));
-                assert!(shared.ring.push_queued(queued));
+                assert!(shared.ring.push_queued(queued.clone()));
                 let mut backend = confirmation_backend(&shared, 2);
                 let mut meters = test_meter();
                 let mut output = [0.0f32; 256];
@@ -7191,7 +7472,7 @@ mod tests {
                     });
                 }
                 assert!(channel.publish(offer));
-                assert!(shared.ring.push_queued(queued));
+                assert!(shared.ring.push_queued(queued.clone()));
                 let mut backend = confirmation_backend(&shared, 2);
                 let mut meters = test_meter();
                 let mut output = [0.0f32; 256];
@@ -7342,8 +7623,8 @@ mod tests {
                         wavetable: None,
                         cut: None,
                     };
-                    assert!(expected_shared.ring.push(score));
-                    let mut piano = score;
+                    assert!(expected_shared.ring.push(score.clone()));
+                    let mut piano = score.clone();
                     piano.controls.piano = true;
                     piano.gain = 0.1;
                     match control {
@@ -7368,7 +7649,7 @@ mod tests {
                         "output pair" => shared.orbit_pairs[1].store(1, Ordering::Relaxed),
                         _ => unreachable!(),
                     }
-                    assert!(shared.ring.push(score));
+                    assert!(shared.ring.push(score.clone()));
                     let mut output = [0.0f32; 512];
                     let mut expected = [0.0f32; 512];
                     let mut meter = test_meter();
@@ -7381,7 +7662,7 @@ mod tests {
                         4,
                         &expected_shared,
                     );
-                    assert!(shared.immediate.push(piano));
+                    assert!(shared.immediate.push(piano.clone()));
                     assert!(expected_shared.immediate.push(piano));
                     let before = tripwire::Violations::capture();
                     tripwire::audio_scope(|| {
@@ -7439,8 +7720,8 @@ mod tests {
                 cut,
             };
             let score = event(220.0, None, false);
-            assert!(shared.ring.push(score));
-            assert!(expected_shared.ring.push(score));
+            assert!(shared.ring.push(score.clone()));
+            assert!(expected_shared.ring.push(score.clone()));
             let mut future = event(110.0, None, false);
             future.target_frame = 480_000;
             assert!(shared.ring.push(future));
@@ -7490,7 +7771,7 @@ mod tests {
             assert_eq!(backend.pressure_observation().active_voices, 3);
             let mut release = event(440.0, Some(1.0), true);
             release.controls.choke_only = true;
-            assert!(shared.immediate.push(release));
+            assert!(shared.immediate.push(release.clone()));
             for _ in 0..16 {
                 write_live_output(&mut backend, &mut meter, &mut output, 2, &shared);
                 write_live_output(
@@ -7503,7 +7784,7 @@ mod tests {
             }
             assert_eq!(backend.pressure_observation().active_voices, 2);
             release.cut = Some(2.0);
-            assert!(shared.immediate.push(release));
+            assert!(shared.immediate.push(release.clone()));
             for _ in 0..16 {
                 write_live_output(&mut backend, &mut meter, &mut output, 2, &shared);
                 write_live_output(
@@ -8052,6 +8333,61 @@ mod tests {
 
         #[cfg(feature = "test-support")]
         #[test]
+        fn pending_stop_preserves_new_kabel_assets_and_discards_old_onsets() {
+            let _tripwire_guard = tripwire_assertion_guard();
+            let program = rustel_kabel::Program::from_json(
+                r#"{"nodes":[{"type":"n","value":0.25},{"type":"output","inputs":[0]}]}"#,
+            )
+            .unwrap();
+            let note = |frame| {
+                let mut event = resume_tone(frame);
+                event.controls.kabel = Some(crate::KabelControls {
+                    program: program.into(),
+                    start_secs: frame as f64 / 48_000.0,
+                    gate_end_secs: frame as f64 / 48_000.0 + 1.0,
+                    end_secs: frame as f64 / 48_000.0 + 1.0,
+                });
+                event
+            };
+            let mut manual = ManualLiveOutput::new(48_000, 7).unwrap();
+            let mut output = [0.0; 128 * 2];
+            let initial = note(0);
+            let publication = manual.device().ensure_kabel(&initial).unwrap();
+            assert!(manual.device().push(initial));
+            drop(publication);
+            manual.render(&mut output);
+            assert!(output.iter().any(|sample| sample.abs() > 1e-6));
+
+            let old = [note(2048), note(128)];
+            let publication = manual.device().prepare_kabel_events(&old).unwrap();
+            assert!(manual.device().push(old[0].clone()));
+            assert!(manual.device().push_immediate(old[1].clone()));
+            drop(publication);
+            manual.device().stop();
+            manual.device().resume();
+
+            let new = [note(640), note(640)];
+            let publication = manual.device().prepare_kabel_events(&new).unwrap();
+            assert!(manual.device().push(new[0].clone()));
+            assert!(manual.device().push_immediate(new[1].clone()));
+            drop(publication);
+            let before = tripwire::Violations::capture();
+            for _ in 0..4 {
+                manual.render(&mut output);
+                assert_eq!(manual.device().report().accepted_events, 1);
+            }
+            assert!(!manual.device().stop_pending());
+            manual.render(&mut output);
+            assert!(output.iter().any(|sample| sample.abs() > 1e-6));
+            assert_eq!(manual.device().report().accepted_events, 3);
+            assert_eq!(manual.device().report().refused_voices, 0);
+            assert_eq!(manual.device().report().ring_depth, 0);
+            let violations = tripwire::Violations::capture().since(before);
+            assert!(violations.clean(), "Stop/resume allocated: {violations:?}");
+        }
+
+        #[cfg(feature = "test-support")]
+        #[test]
         fn resuming_a_pending_stop_finishes_the_fade_before_admitting_new_notes() {
             let _tripwire_guard = tripwire_assertion_guard();
             for before_resume in [0, 1] {
@@ -8582,6 +8918,204 @@ mod tests {
             assert_eq!(stage.params(), params);
             assert_eq!(device.shared.samples.reverb_installs.len(), 0);
             assert_eq!(device.shared.samples.fx_reverb_installs.len(), 0);
+        }
+
+        fn kabel_event(program: rustel_kabel::Program, second: u64) -> crate::AudioEvent {
+            crate::AudioEvent {
+                onset_id: second,
+                generation: 7,
+                ui_visuals: 0,
+                target_frame: second * 48_000,
+                onset_lead: 0.0,
+                freq_hz: 440.0,
+                gain: 1.0,
+                duration_secs: 0.1,
+                sample: None,
+                wavetable: None,
+                synth: None,
+                cut: None,
+                controls: crate::OscillatorControls {
+                    kabel: Some(crate::KabelControls {
+                        program: program.into(),
+                        start_secs: second as f64,
+                        gate_end_secs: second as f64 + 0.05,
+                        end_secs: second as f64 + 0.1,
+                    }),
+                    ..crate::OscillatorControls::default()
+                },
+            }
+        }
+
+        fn kabel_program() -> rustel_kabel::Program {
+            rustel_kabel::Program::from_json(
+                r#"{"nodes":[{"type":"n","value":0.25},{"type":"output","inputs":[0]}]}"#,
+            )
+            .expect("program")
+        }
+
+        #[test]
+        fn finished_kabel_voices_release_capacity_for_a_larger_patch() {
+            let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
+            device.silent.take().expect("callback").stop();
+            let code = kabel_program();
+            let events: Vec<_> = (0..128)
+                .map(|id| {
+                    let mut event = kabel_event(code, 0);
+                    event.onset_id = id;
+                    event
+                })
+                .collect();
+            let mut backend = crate::LiveScalarBackend::new(48_000, 128).unwrap();
+            let first = device
+                .prepare_kabel_events(&events[..64])
+                .expect("first graph batch");
+            backend.drain_reverb_installs(&device.shared.samples);
+            let second = device
+                .prepare_kabel_events(&events[64..])
+                .expect("second graph batch");
+            backend.drain_reverb_installs(&device.shared.samples);
+            for event in events {
+                assert!(device.shared.ring.push(event));
+            }
+            drop((first, second));
+            let delay = rustel_kabel::Program::from_json(
+                r#"{"nodes":[{"type":"n","value":0.25},{"type":"n","value":0.001},{"type":"delay","inputs":[0,1]},{"type":"output","inputs":[2]}]}"#,
+            ).unwrap();
+            let next = kabel_event(delay, 1);
+            assert!(
+                device
+                    .prepare_kabel_events(std::slice::from_ref(&next))
+                    .is_err()
+            );
+            let generation = AtomicU64::new(7);
+            let zero = AtomicU64::new(0);
+            let flip = crate::LiveFlipAtomics {
+                generation: &generation,
+                takeover_frame: &zero,
+                takeover_cut: &zero,
+                line_arm: &zero,
+            };
+            let stopped = AtomicBool::new(false);
+            let mut output = [0.0; 1024];
+            let mut audible = false;
+            let mut returned = 0;
+            for block in 0..32 {
+                backend.process_block_with(
+                    &mut output,
+                    512,
+                    block * 512,
+                    &device.shared.ring,
+                    flip,
+                    &stopped,
+                );
+                audible |= output.iter().any(|sample| sample.abs() > 0.01);
+                backend.retire_kabel_programs(
+                    &device.shared.samples,
+                    &device.shared.ring,
+                    &device.shared.immediate,
+                );
+                returned += device.shared.samples.kabel_returns.len();
+                device.reclaim_assets();
+            }
+            assert!(audible, "the first window rendered before retirement");
+            assert_eq!(returned, 128);
+            let _publication = device
+                .prepare_kabel_events(&[next])
+                .expect("idle processors were reclaimed");
+            assert_eq!(device.kabel_cache.lock().unwrap().len(), 1);
+            assert_eq!(device.shared.samples.kabel_installs.len(), 1);
+            assert_eq!(device.shared.samples.leaked.load(Ordering::Relaxed), 0);
+        }
+
+        #[test]
+        fn kabel_window_refusal_publishes_no_partial_assets() {
+            let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
+            device.silent.take().expect("callback").stop();
+            let events: Vec<_> = (1..=513)
+                .map(|second| kabel_event(kabel_program(), second))
+                .collect();
+            let error = device
+                .prepare_kabel_events(&events)
+                .expect_err("program queue limit");
+            assert!(error.contains("program preparation queue"), "{error}");
+            assert_eq!(device.shared.samples.program_installs.len(), 0);
+            assert_eq!(device.shared.samples.kabel_installs.len(), 0);
+            assert!(device.kabel_cache.lock().unwrap().is_empty());
+            assert!(device.program_cache.lock().unwrap().is_empty());
+            let _publication = device.prepare_kabel_events(&events[..1]).expect("recovery");
+            assert_eq!(device.shared.samples.program_installs.len(), 1);
+            assert_eq!(device.shared.samples.kabel_installs.len(), 1);
+        }
+
+        #[test]
+        fn mixed_reverb_batch_keeps_its_kabel_publication_until_drop() {
+            let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
+            device.silent.take().expect("callback").stop();
+            let graph = kabel_event(kabel_program(), 1);
+            let mut plain = graph.clone();
+            plain.controls.kabel = None;
+            let active = &device.shared.samples.active_kabel_publications;
+            let mut batch = LiveReverbBatch::default();
+            batch.observe(&device, &plain).expect("ordinary event");
+            assert_eq!(active.load(Ordering::Acquire), 0);
+            batch.observe(&device, &graph).expect("graph event");
+            assert_eq!(active.load(Ordering::Acquire), 1);
+            batch.observe(&device, &plain).expect("ordinary event");
+            batch.observe(&device, &graph).expect("another graph event");
+            assert_eq!(active.load(Ordering::Acquire), 1);
+            drop(batch);
+            assert_eq!(active.load(Ordering::Acquire), 0);
+        }
+
+        #[test]
+        fn kabel_program_lease_extension_keeps_new_cache_entry() {
+            let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
+            device.silent.take().expect("callback").stop();
+            let program = kabel_program();
+            let first = kabel_event(program, 1);
+            let _first_publication = device
+                .prepare_kabel_events(&[first.clone(), first])
+                .expect("first lease");
+            assert_eq!(device.shared.samples.program_installs.len(), 1);
+            let _extended_publication = device
+                .prepare_kabel_events(&[kabel_event(program, 2)])
+                .expect("extended lease");
+            assert_eq!(device.shared.samples.program_installs.len(), 2);
+            let old = device
+                .shared
+                .samples
+                .program_installs
+                .pop()
+                .expect("old lease");
+            let new = device
+                .shared
+                .samples
+                .program_installs
+                .pop()
+                .expect("new lease");
+            // The stopped callback leaves both batons exclusively owned here.
+            assert!(unsafe { (*new.program).until_frame > (*old.program).until_frame });
+            device
+                .shared
+                .samples
+                .program_returns
+                .push(crate::assets::ReturnedProgram(old.program))
+                .ok()
+                .expect("return old lease");
+            device.reclaim_assets();
+            let cache = device.program_cache.lock().unwrap();
+            assert_eq!(cache.len(), 1);
+            assert_eq!(cache[0].pointer, new.program as usize);
+            drop(cache);
+            device
+                .shared
+                .samples
+                .program_returns
+                .push(crate::assets::ReturnedProgram(new.program))
+                .ok()
+                .expect("return new lease");
+            device.reclaim_assets();
+            assert!(device.program_cache.lock().unwrap().is_empty());
         }
 
         /// An output's reverbs are counted where the producer ships them. The
@@ -9625,6 +10159,36 @@ mod tests {
         }
 
         #[test]
+        fn recycled_stream_discards_pending_kabel_at_every_sample_rate() {
+            for new_rate in [48_000, 44_100] {
+                let mut device = LiveScalarDevice::start_silent(48_000, 7).unwrap();
+                device.silent.take().unwrap().stop();
+                let event = kabel_event(kabel_program(), 1);
+                let publication = device
+                    .prepare_kabel_events(std::slice::from_ref(&event))
+                    .unwrap();
+                let channel = &device.shared.samples;
+                assert_eq!(channel.program_installs.len(), 1);
+                assert_eq!(channel.kabel_installs.len(), 1);
+
+                // The old callback has joined and replacement callbacks remain
+                // gated while queues and their producer reservations are reset.
+                device.shared.prepare_recycled_stream(48_000, new_rate);
+                device.clear_reverb_caches();
+                drop(publication);
+
+                assert_eq!(channel.program_installs.len(), 0);
+                assert_eq!(channel.kabel_installs.len(), 0);
+                assert!(device.kabel_cache.lock().unwrap().is_empty());
+                assert!(device.program_cache.lock().unwrap().is_empty());
+                let _publication = device.prepare_kabel_events(&[event]).unwrap();
+                assert_eq!(channel.program_installs.len(), 1);
+                assert_eq!(channel.kabel_installs.len(), 1);
+                assert_eq!(channel.leaked.load(Ordering::Relaxed), 0);
+            }
+        }
+
+        #[test]
         fn recycled_stream_discards_only_rate_specific_pending_reverbs() {
             use crate::assets::{
                 FxReverbInstall, ReturnedFxReverb, ReturnedReverb, ReturnedSample,
@@ -10177,7 +10741,7 @@ mod tests {
             };
             let render = |cut_at: Option<u64>| -> f32 {
                 let shared = LiveShared::new(1);
-                assert!(shared.ring.push(long_note));
+                assert!(shared.ring.push(long_note.clone()));
                 let mut backend = LiveScalarBackend::new(48_000, 4).expect("live scalar");
                 let mut output = [0.0f32; 128 * 2];
                 let mut start = 0u64;

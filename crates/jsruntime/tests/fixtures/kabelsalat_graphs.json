@@ -1,0 +1,739 @@
+[
+  {
+    "name": "empty",
+    "source": "",
+    "graph": {"nodes": [
+      {"type":"exit","inputs":[]}
+    ]}
+  },
+  {
+    "name": "inputs",
+    "source": "sine(sFreq / 2 + pat[0]).mul(sGate).out()",
+    "graph": {"nodes": [
+      {"type":"n","value":113,"inputs":[]},
+      {"type":"sine","inputs":[0]},
+      {"type":"gate","inputs":[]},
+      {"type":"mul","inputs":[1,2]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[3,4]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[3,6]},
+      {"type":"exit","inputs":[5,7]}
+    ]}
+  },
+  {
+    "name": "defaults",
+    "source": "sine().out()",
+    "graph": {"nodes": [
+      {"type":"sine","inputs":[]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[0,1]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[0,3]},
+      {"type":"exit","inputs":[2,4]}
+    ]}
+  },
+  {
+    "name": "channels",
+    "source": "sine([100,200,300]).mul([.1,.2]).out([0,1,2])",
+    "graph": {"nodes": [
+      {"type":"n","value":100,"inputs":[]},
+      {"type":"sine","inputs":[0]},
+      {"type":"n","value":0.1,"inputs":[]},
+      {"type":"mul","inputs":[1,2]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[3,4]},
+      {"type":"n","value":200,"inputs":[]},
+      {"type":"sine","inputs":[6]},
+      {"type":"n","value":0.2,"inputs":[]},
+      {"type":"mul","inputs":[7,8]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[9,10]},
+      {"type":"n","value":300,"inputs":[]},
+      {"type":"sine","inputs":[12]},
+      {"type":"n","value":0.1,"inputs":[]},
+      {"type":"mul","inputs":[13,14]},
+      {"type":"n","value":2,"inputs":[]},
+      {"type":"output","inputs":[15,16]},
+      {"type":"exit","inputs":[5,11,17]}
+    ]}
+  },
+  {
+    "name": "feedback",
+    "source": "sine(220).add(x => x.mul(.5)).out()",
+    "graph": {"nodes": [
+      {"type":"n","value":220,"inputs":[]},
+      {"type":"sine","inputs":[0]},
+      {"type":"n","value":0.5,"inputs":[]},
+      {"type":"mul","inputs":[4,2]},
+      {"type":"add","inputs":[1,3]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[4,5]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[4,7]},
+      {"type":"exit","inputs":[6,8]}
+    ]}
+  },
+  {
+    "name": "feedback_poly",
+    "source": "sine(220).add(x => x.mul([.2,.4])).out()",
+    "graph": {"nodes": [
+      {"type":"n","value":220,"inputs":[]},
+      {"type":"sine","inputs":[0]},
+      {"type":"n","value":0.2,"inputs":[]},
+      {"type":"mul","inputs":[4,2]},
+      {"type":"add","inputs":[1,3]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[4,5]},
+      {"type":"n","value":0.4,"inputs":[]},
+      {"type":"mul","inputs":[9,7]},
+      {"type":"add","inputs":[1,8]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[9,10]},
+      {"type":"exit","inputs":[6,11]}
+    ]}
+  },
+  {
+    "name": "fork",
+    "source": "sine(220).fork(3).out([0,1,2])",
+    "graph": {"nodes": [
+      {"type":"n","value":220,"inputs":[]},
+      {"type":"sine","inputs":[0]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[1,2]},
+      {"type":"sine","inputs":[0]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[4,5]},
+      {"type":"sine","inputs":[0]},
+      {"type":"n","value":2,"inputs":[]},
+      {"type":"output","inputs":[7,8]},
+      {"type":"exit","inputs":[3,6,9]}
+    ]}
+  },
+  {
+    "name": "map",
+    "source": "n([1,2,3]).map((x,i) => x.mul(i+1)).out([0,1,2])",
+    "graph": {"nodes": [
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"mul","inputs":[0,1]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[2,3]},
+      {"type":"n","value":2,"inputs":[]},
+      {"type":"n","value":2,"inputs":[]},
+      {"type":"mul","inputs":[5,6]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[7,8]},
+      {"type":"n","value":3,"inputs":[]},
+      {"type":"n","value":3,"inputs":[]},
+      {"type":"mul","inputs":[10,11]},
+      {"type":"n","value":2,"inputs":[]},
+      {"type":"output","inputs":[12,13]},
+      {"type":"exit","inputs":[4,9,14]}
+    ]}
+  },
+  {
+    "name": "channel",
+    "source": "sine([110,220,330]).channel(4).out()",
+    "graph": {"nodes": [
+      {"type":"n","value":220,"inputs":[]},
+      {"type":"sine","inputs":[0]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[1,2]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[1,4]},
+      {"type":"exit","inputs":[3,5]}
+    ]}
+  },
+  {
+    "name": "split",
+    "source": "sine([110,220]).split(([left,right]) => left.add(right)).out()",
+    "graph": {"nodes": [
+      {"type":"n","value":110,"inputs":[]},
+      {"type":"sine","inputs":[0]},
+      {"type":"n","value":220,"inputs":[]},
+      {"type":"sine","inputs":[2]},
+      {"type":"add","inputs":[1,3]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[4,5]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[4,7]},
+      {"type":"exit","inputs":[6,8]}
+    ]}
+  },
+  {
+    "name": "mix_mono",
+    "source": "sine([110,220,330]).mix().out()",
+    "graph": {"nodes": [
+      {"type":"n","value":110,"inputs":[]},
+      {"type":"sine","inputs":[0]},
+      {"type":"n","value":220,"inputs":[]},
+      {"type":"sine","inputs":[2]},
+      {"type":"n","value":330,"inputs":[]},
+      {"type":"sine","inputs":[4]},
+      {"type":"mix","inputs":[1,3,5]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[6,7]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[6,9]},
+      {"type":"exit","inputs":[8,10]}
+    ]}
+  },
+  {
+    "name": "mix_stereo",
+    "source": "sine([110,220,330]).mix(2).out()",
+    "graph": {"nodes": [
+      {"type":"n","value":110,"inputs":[]},
+      {"type":"sine","inputs":[0]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"mul","inputs":[1,2]},
+      {"type":"n","value":220,"inputs":[]},
+      {"type":"sine","inputs":[4]},
+      {"type":"n","value":0.7071067811865476,"inputs":[]},
+      {"type":"mul","inputs":[5,6]},
+      {"type":"n","value":330,"inputs":[]},
+      {"type":"sine","inputs":[8]},
+      {"type":"n","value":6.123233995736766e-17,"inputs":[]},
+      {"type":"mul","inputs":[9,10]},
+      {"type":"add","inputs":[3,7,11]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[12,13]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"mul","inputs":[1,15]},
+      {"type":"n","value":0.7071067811865475,"inputs":[]},
+      {"type":"mul","inputs":[5,17]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"mul","inputs":[9,19]},
+      {"type":"add","inputs":[16,18,20]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[21,22]},
+      {"type":"exit","inputs":[14,23]}
+    ]}
+  },
+  {
+    "name": "pan",
+    "source": "sine(220).pan(.25).out()",
+    "graph": {"nodes": [
+      {"type":"n","value":220,"inputs":[]},
+      {"type":"sine","inputs":[0]},
+      {"type":"n","value":0.25,"inputs":[]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"add","inputs":[2,3]},
+      {"type":"n","value":3.141592653589793,"inputs":[]},
+      {"type":"n","value":0.25,"inputs":[]},
+      {"type":"mul","inputs":[4,5,6]},
+      {"type":"cos","inputs":[7]},
+      {"type":"mul","inputs":[1,8]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[9,10]},
+      {"type":"sin","inputs":[7]},
+      {"type":"mul","inputs":[1,12]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[13,14]},
+      {"type":"exit","inputs":[11,15]}
+    ]}
+  },
+  {
+    "name": "module",
+    "source": "const voice=module('voice',freq=>freq.sine().mul(.2)); voice(n(sFreq)).out(); n(330).voice().out()",
+    "graph": {"nodes": [
+      {"type":"n","value":220,"inputs":[]},
+      {"type":"sine","inputs":[0]},
+      {"type":"n","value":0.2,"inputs":[]},
+      {"type":"mul","inputs":[1,2]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[3,4]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[3,6]},
+      {"type":"n","value":330,"inputs":[]},
+      {"type":"sine","inputs":[8]},
+      {"type":"n","value":0.2,"inputs":[]},
+      {"type":"mul","inputs":[9,10]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[11,12]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[11,14]},
+      {"type":"exit","inputs":[5,7,13,15]}
+    ]}
+  },
+  {
+    "name": "register",
+    "source": "register('twice',x=>x.add(x)); n(2).twice().out()",
+    "graph": {"nodes": [
+      {"type":"n","value":2,"inputs":[]},
+      {"type":"add","inputs":[0,0]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[1,2]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[1,4]},
+      {"type":"exit","inputs":[3,5]}
+    ]}
+  },
+  {
+    "name": "shared",
+    "source": "const x = noise(); x.add(x).out()",
+    "graph": {"nodes": [
+      {"type":"noise","inputs":[]},
+      {"type":"add","inputs":[0,0]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[1,2]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[1,4]},
+      {"type":"exit","inputs":[3,5]}
+    ]}
+  },
+  {
+    "name": "filters",
+    "source": "saw(sFreq).hpf(.2).lpf(.7,.1).bpf(.2,.4).out()",
+    "graph": {"nodes": [
+      {"type":"n","value":220,"inputs":[]},
+      {"type":"saw","inputs":[0]},
+      {"type":"n","value":0.2,"inputs":[]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"filter","inputs":[1,2,3]},
+      {"type":"sub","inputs":[1,4]},
+      {"type":"n","value":0.7,"inputs":[]},
+      {"type":"n","value":0.1,"inputs":[]},
+      {"type":"filter","inputs":[5,6,7]},
+      {"type":"n","value":0.2,"inputs":[]},
+      {"type":"n","value":0.4,"inputs":[]},
+      {"type":"bpf","inputs":[8,9,10]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[11,12]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[11,14]},
+      {"type":"exit","inputs":[13,15]}
+    ]}
+  },
+  {
+    "name": "biquads",
+    "source": "sine(sFreq).qlpf(1000).qhpf(200).qbpf(500).qnf(700).qapf(800).out()",
+    "graph": {"nodes": [
+      {"type":"n","value":220,"inputs":[]},
+      {"type":"sine","inputs":[0]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"n","value":1000,"inputs":[]},
+      {"type":"n","value":10,"inputs":[]},
+      {"type":"qf","inputs":[1,2,3,4]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"n","value":200,"inputs":[]},
+      {"type":"n","value":10,"inputs":[]},
+      {"type":"qf","inputs":[5,6,7,8]},
+      {"type":"n","value":2,"inputs":[]},
+      {"type":"n","value":500,"inputs":[]},
+      {"type":"n","value":10,"inputs":[]},
+      {"type":"qf","inputs":[9,10,11,12]},
+      {"type":"n","value":3,"inputs":[]},
+      {"type":"n","value":700,"inputs":[]},
+      {"type":"n","value":10,"inputs":[]},
+      {"type":"qf","inputs":[13,14,15,16]},
+      {"type":"n","value":3,"inputs":[]},
+      {"type":"n","value":800,"inputs":[]},
+      {"type":"n","value":10,"inputs":[]},
+      {"type":"qf","inputs":[17,18,19,20]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[21,22]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[21,24]},
+      {"type":"exit","inputs":[23,25]}
+    ]}
+  },
+  {
+    "name": "lfnoise",
+    "source": "lfnoise(4).out()",
+    "graph": {"nodes": [
+      {"type":"noise","inputs":[]},
+      {"type":"n","value":4,"inputs":[]},
+      {"type":"impulse","inputs":[1]},
+      {"type":"hold","inputs":[0,2]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[3,4]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[3,6]},
+      {"type":"exit","inputs":[5,7]}
+    ]}
+  },
+  {
+    "name": "rangex",
+    "source": "sine(1).rangex(100,1000).out()",
+    "graph": {"nodes": [
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"sine","inputs":[0]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"add","inputs":[1,2]},
+      {"type":"n","value":2,"inputs":[]},
+      {"type":"div","inputs":[3,4]},
+      {"type":"n","value":1000,"inputs":[]},
+      {"type":"log","inputs":[6]},
+      {"type":"n","value":100,"inputs":[]},
+      {"type":"log","inputs":[8]},
+      {"type":"sub","inputs":[7,9]},
+      {"type":"mul","inputs":[5,10]},
+      {"type":"add","inputs":[11,9]},
+      {"type":"exp","inputs":[12]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[13,14]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[13,16]},
+      {"type":"exit","inputs":[15,17]}
+    ]}
+  },
+  {
+    "name": "raw",
+    "source": "n(2).raw`$input * Math.sin(time)`.out()",
+    "graph": {"nodes": [
+      {"type":"n","value":2,"inputs":[]},
+      {"type":"raw","value":"$input * Math.sin(time)","inputs":[0]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[1,2]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[1,4]},
+      {"type":"exit","inputs":[3,5]}
+    ]}
+  },
+  {
+    "name": "bytebeat",
+    "source": "time().mul(8000).bytebeat`t >> 4 | t`.out()",
+    "graph": {"nodes": [
+      {"type":"time","inputs":[]},
+      {"type":"n","value":8000,"inputs":[]},
+      {"type":"mul","inputs":[0,1]},
+      {"type":"bytebeat","value":"t >> 4 | t","inputs":[2]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[3,4]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[3,6]},
+      {"type":"exit","inputs":[5,7]}
+    ]}
+  },
+  {
+    "name": "floatbeat",
+    "source": "time().mul(8000).floatbeat`t & 255`.out()",
+    "graph": {"nodes": [
+      {"type":"time","inputs":[]},
+      {"type":"n","value":8000,"inputs":[]},
+      {"type":"mul","inputs":[0,1]},
+      {"type":"bytebeat","value":"t & 255","inputs":[2]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[3,4]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[3,6]},
+      {"type":"exit","inputs":[5,7]}
+    ]}
+  },
+  {
+    "name": "bypass",
+    "source": "n(2)._mul(100).out()",
+    "graph": {"nodes": [
+      {"type":"n","value":2,"inputs":[]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[0,1]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[0,3]},
+      {"type":"exit","inputs":[2,4]}
+    ]}
+  },
+  {
+    "name": "manual_node",
+    "source": "node('add').withIns(n(2),n(3)).out()",
+    "graph": {"nodes": [
+      {"type":"n","value":2,"inputs":[]},
+      {"type":"n","value":3,"inputs":[]},
+      {"type":"add","inputs":[0,1]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[2,3]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[2,5]},
+      {"type":"exit","inputs":[4,6]}
+    ]}
+  },
+  {
+    "name": "clone",
+    "source": "const x=sine(220); x.add(x.clone()).out()",
+    "graph": {"nodes": [
+      {"type":"n","value":220,"inputs":[]},
+      {"type":"sine","inputs":[0]},
+      {"type":"sine","inputs":[0]},
+      {"type":"add","inputs":[1,2]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[3,4]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[3,6]},
+      {"type":"exit","inputs":[5,7]}
+    ]}
+  },
+  {
+    "name": "apply",
+    "source": "sine(220).apply(x=>x.mul(.5)).apply2((a,b)=>a.add(b)).out()",
+    "graph": {"nodes": [
+      {"type":"n","value":220,"inputs":[]},
+      {"type":"sine","inputs":[0]},
+      {"type":"n","value":0.5,"inputs":[]},
+      {"type":"mul","inputs":[1,2]},
+      {"type":"add","inputs":[3,3]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[4,5]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[4,7]},
+      {"type":"exit","inputs":[6,8]}
+    ]}
+  },
+  {
+    "name": "over",
+    "source": "n(2).over(x=>x.mul(3)).out()",
+    "graph": {"nodes": [
+      {"type":"n","value":2,"inputs":[]},
+      {"type":"n","value":3,"inputs":[]},
+      {"type":"mul","inputs":[0,1]},
+      {"type":"add","inputs":[0,2]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[3,4]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[3,6]},
+      {"type":"exit","inputs":[5,7]}
+    ]}
+  },
+  {
+    "name": "constant_aliases",
+    "source": "B(2).add(_(3)).out()",
+    "graph": {"nodes": [
+      {"type":"n","value":2,"inputs":[]},
+      {"type":"n","value":3,"inputs":[]},
+      {"type":"add","inputs":[0,1]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[2,3]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[2,5]},
+      {"type":"exit","inputs":[4,6]}
+    ]}
+  },
+  {
+    "name": "scope",
+    "source": "sine([220,330]).scope(1,2).out()",
+    "graph": {"nodes": [
+      {"type":"n","value":220,"inputs":[]},
+      {"type":"sine","inputs":[0]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"n","value":2,"inputs":[]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"scope","inputs":[1,2,3,4]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[5,6]},
+      {"type":"n","value":330,"inputs":[]},
+      {"type":"sine","inputs":[8]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"n","value":2,"inputs":[]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"scope","inputs":[9,10,11,12]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[13,14]},
+      {"type":"exit","inputs":[7,15]}
+    ]}
+  },
+  {
+    "name": "range",
+    "source": "sine(2).range(10,20).remap(10,20,-1,1).clip(-.5,.5).out()",
+    "graph": {"nodes": [
+      {"type":"n","value":2,"inputs":[]},
+      {"type":"sine","inputs":[0]},
+      {"type":"n","value":10,"inputs":[]},
+      {"type":"n","value":20,"inputs":[]},
+      {"type":"range","inputs":[1,2,3]},
+      {"type":"n","value":10,"inputs":[]},
+      {"type":"n","value":20,"inputs":[]},
+      {"type":"n","value":-1,"inputs":[]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"remap","inputs":[4,5,6,7,8]},
+      {"type":"n","value":-0.5,"inputs":[]},
+      {"type":"n","value":0.5,"inputs":[]},
+      {"type":"clip","inputs":[9,10,11]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[12,13]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[12,15]},
+      {"type":"exit","inputs":[14,16]}
+    ]}
+  },
+  {
+    "name": "pick",
+    "source": "pick(n([1,2,3]),1).out()",
+    "graph": {"nodes": [
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"pick","inputs":[0,1]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[2,3]},
+      {"type":"n","value":2,"inputs":[]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"pick","inputs":[5,6]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[7,8]},
+      {"type":"n","value":3,"inputs":[]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"pick","inputs":[10,11]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[12,13]},
+      {"type":"exit","inputs":[4,9,14]}
+    ]}
+  },
+  {
+    "name": "trig",
+    "source": "impulse(4).trig(.2).out()",
+    "graph": {"nodes": [
+      {"type":"n","value":4,"inputs":[]},
+      {"type":"impulse","inputs":[0]},
+      {"type":"n","value":0.2,"inputs":[]},
+      {"type":"trig","inputs":[1,2]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[3,4]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[3,6]},
+      {"type":"exit","inputs":[5,7]}
+    ]}
+  },
+  {
+    "name": "feedback_helper",
+    "source": "feedback(x=>x.mul(.5).add(1)).out()",
+    "graph": {"nodes": [
+      {"type":"n","value":0.5,"inputs":[]},
+      {"type":"mul","inputs":[4,0]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"add","inputs":[1,2]},
+      {"type":"add","inputs":[3]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[4,5]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[4,7]},
+      {"type":"exit","inputs":[6,8]}
+    ]}
+  },
+  {
+    "name": "midi_note",
+    "source": "n(69).midinote().out()",
+    "graph": {"nodes": [
+      {"type":"n","value":69,"inputs":[]},
+      {"type":"midinote","inputs":[0]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[1,2]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[1,4]},
+      {"type":"exit","inputs":[3,5]}
+    ]}
+  },
+  {
+    "name": "output_sum",
+    "source": "n(1).out(0);n(2).out(0);n(3).out(1)",
+    "graph": {"nodes": [
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[0,1]},
+      {"type":"n","value":2,"inputs":[]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[3,4]},
+      {"type":"n","value":3,"inputs":[]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[6,7]},
+      {"type":"exit","inputs":[2,5,8]}
+    ]}
+  },
+  {
+    "name": "singleton_channel",
+    "source": "sine([220]).out([1])",
+    "graph": {"nodes": [
+      {"type":"n","value":220,"inputs":[]},
+      {"type":"sine","inputs":[0]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[1,2]},
+      {"type":"exit","inputs":[3]}
+    ]}
+  },
+  {
+    "name": "nested_poly",
+    "builder_only": true,
+    "source": "poly(n([1,2]),n([3,4])).add([10,20]).out()",
+    "graph": {"nodes": [
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"n","value":3,"inputs":[]},
+      {"type":"poly","inputs":[0,1]},
+      {"type":"n","value":10,"inputs":[]},
+      {"type":"add","inputs":[2,3]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[4,5]},
+      {"type":"n","value":2,"inputs":[]},
+      {"type":"n","value":4,"inputs":[]},
+      {"type":"poly","inputs":[7,8]},
+      {"type":"n","value":20,"inputs":[]},
+      {"type":"add","inputs":[9,10]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[11,12]},
+      {"type":"exit","inputs":[6,13]}
+    ]}
+  },
+  {
+    "name": "ar",
+    "source": "ar(sGate,.02,.1).out()",
+    "graph": {"nodes": [
+      {"type":"gate","inputs":[]},
+      {"type":"n","value":0.02,"inputs":[]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"n","value":0.1,"inputs":[]},
+      {"type":"adsr","inputs":[0,1,2,3,4]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[5,6]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[5,8]},
+      {"type":"exit","inputs":[7,9]}
+    ]}
+  },
+  {
+    "name": "ad",
+    "source": "ad(sGate,.02,.1).out()",
+    "graph": {"nodes": [
+      {"type":"gate","inputs":[]},
+      {"type":"n","value":0.02,"inputs":[]},
+      {"type":"n","value":0.1,"inputs":[]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"adsr","inputs":[0,1,2,3,2]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[4,5]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[4,7]},
+      {"type":"exit","inputs":[6,8]}
+    ]}
+  },
+  {
+    "name": "perc",
+    "source": "perc(sGate,.1).out()",
+    "graph": {"nodes": [
+      {"type":"gate","inputs":[]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"n","value":0.1,"inputs":[]},
+      {"type":"adsr","inputs":[0,1,2,3,4]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[5,6]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[5,8]},
+      {"type":"exit","inputs":[7,9]}
+    ]}
+  },
+  {
+    "name": "module_metadata",
+    "source": "const f=module('voice', x=>x.sine()); const a=f(n(220)); a.ins[0].out(); a.out()",
+    "graph": {"nodes": [
+      {"type":"n","value":220,"inputs":[]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[0,1]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[0,3]},
+      {"type":"sine","inputs":[0]},
+      {"type":"n","value":0,"inputs":[]},
+      {"type":"output","inputs":[5,6]},
+      {"type":"n","value":1,"inputs":[]},
+      {"type":"output","inputs":[5,8]},
+      {"type":"exit","inputs":[2,4,7,9]}
+    ]}
+  }
+]

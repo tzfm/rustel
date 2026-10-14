@@ -1,0 +1,25 @@
+/*
+  @by Aria (@glossing) and Strudel contributors
+  @origin upstream docs
+  @source https://codeberg.org/uzu/strudel/src/commit/a3302cf16746d2f6f7c706be47f1ca85db497aa5/packages/core/pattern.mjs#L4461
+  @license AGPL-3.0-or-later
+  SPDX-License-Identifier: AGPL-3.0-or-later
+  @duration 8
+  @changes 2026-10-13: Source code unmodified except for removed JSDoc prefixes.
+
+Copyright (C) 2025 Strudel contributors - see <https://codeberg.org/uzu/strudel/src/branch/main/packages/core/pattern.mjs>
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public License for more details. You should have received a copy of the GNU Affero General Public License along with this program.  If not, see <https://www.gnu.org/licenses/>.
+*/
+n("<0 1 <2 3 2 4>>*16")
+  .scale("G#2:minor").sometimes(x => x.transpose("12 | 24"))
+  .K(() => {
+    const att = S(rand.range(0, 0.05))
+    const dec = S(rand.range(0.05, 0.2))
+    let f = n(sFreq);
+    const mod = sine(f).mul("0.1 | 0.2 | 0.3")
+      .add("[[1.5 1] | 1 | 2 | 4 | [6 4@3]]*2")
+    saw(f.mul(mod))
+    .mul(sGate.ad(att, dec))
+    .add(x => x.delay(0.4).mul(0.3))
+    .out()
+  }).fxr(1).room(0.3)

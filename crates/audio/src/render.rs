@@ -17,7 +17,8 @@ pub fn render_pcm(
     backend.init(sample_rate)?;
     backend.reset();
     for e in events {
-        backend.note(*e);
+        backend.prepare_note(e)?;
+        backend.note(e.clone());
     }
     let mut pcm = vec![0.0f32; frames * 2];
     // Process in 128-frame blocks (Dough's native block size) for realism.
@@ -351,7 +352,8 @@ pub fn write_wav_controlled(
             .saturating_add(scheduler_lookahead)
             .saturating_add(2 * BLOCK) as u64;
         while next_event < queued.len() && queued[next_event].onset_frame < admit_before {
-            backend.note(queued[next_event]);
+            backend.prepare_note(&queued[next_event])?;
+            backend.note(queued[next_event].clone());
             next_event += 1;
         }
         if render_count > 0 {

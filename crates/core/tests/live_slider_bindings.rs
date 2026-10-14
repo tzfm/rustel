@@ -76,6 +76,97 @@ fn arbitrary_maps_drop_bindings_even_when_the_result_is_equal() {
 }
 
 #[test]
+fn trusted_host_maps_preserve_only_unchanged_controls_and_keep_callback_ownership() {
+    struct Host;
+    impl rustel_core::CallbackHost for Host {
+        fn call_value(&self, id: usize, value: &Value) -> Result<Value, String> {
+            let mut value = value.clone();
+            if id == 8 {
+                if let Value::Object(controls) = &mut value {
+                    controls.insert("gain".into(), Value::F64(0.75));
+                } else {
+                    value = Value::F64(0.75);
+                }
+            }
+            Ok(value)
+        }
+
+        fn call_query(&self, _: usize, _: &rustel_core::State) -> Result<Vec<Hap>, String> {
+            unreachable!("this fixture only maps values")
+        }
+    }
+    let raw = pure(Value::F64(0.5)).with_slider_binding(41);
+    let bound = control(
+        &control(&sound(), "gain", raw.clone()),
+        "lpf",
+        pure(Value::F64(800.0)).with_slider_binding(42),
+    );
+    let mapped = bound.fmap_js_preserving_controls(7);
+    assert!(mapped.purity().impure);
+    assert_eq!(mapped.purity().reachable, [7]);
+    rustel_core::with_callback_host(&Host, || {
+        assert_eq!(query(mapped).live_controls, [41, 42, 0]);
+        assert_eq!(
+            query(bound.fmap_js_preserving_controls(8)).live_controls,
+            [0, 42, 0]
+        );
+        assert_eq!(query(bound.fmap_js(7)).live_controls, [0; 3]);
+        assert_eq!(
+            query(control(
+                &sound(),
+                "gain",
+                raw.fmap_js_preserving_controls(7)
+            ))
+            .live_controls,
+            [41, 0, 0]
+        );
+        assert_eq!(
+            query(control(
+                &sound(),
+                "gain",
+                raw.fmap_js_preserving_controls(8)
+            ))
+            .live_controls,
+            [0; 3]
+        );
+    });
+}
+
+#[test]
+fn native_outer_control_bind_preserves_timing_and_tracks_both_dependencies() {
+    let receiver = control(
+        &sound(),
+        "gain",
+        pure(Value::F64(0.5)).with_slider_binding(41),
+    )
+    .slow(Fraction::from(2));
+    let mapped = receiver.outer_bind_controls(
+        pure(Value::F64(12.0)).fast(Fraction::from(2)),
+        |current, input| {
+            let Value::Object(mut controls) = current.clone() else {
+                unreachable!()
+            };
+            controls.insert("extra".into(), input.clone());
+            Value::Object(controls)
+        },
+    );
+    let haps = mapped.query_arc(Fraction::ZERO, Fraction::ONE);
+    assert_eq!(haps.len(), 2);
+    for hap in haps {
+        assert_eq!(hap.live_controls, [41, 0, 0]);
+        assert_eq!(hap.whole.unwrap().end, Fraction::from(2));
+        assert_eq!(hap.part.duration(), Fraction::new(1, 2));
+    }
+    let callbacks = receiver
+        .fmap_js(7)
+        .outer_bind_controls(pure(Value::F64(12.0)).fmap_js(8), |current, _| {
+            current.clone()
+        });
+    assert!(callbacks.purity().impure);
+    assert_eq!(callbacks.purity().reachable, [7, 8]);
+}
+
+#[test]
 fn note_sample_index_and_timing_values_do_not_become_audio_bindings() {
     let raw = pure(Value::F64(2.0)).with_slider_binding(41);
     for name in ["note", "n", "speed", "pan"] {

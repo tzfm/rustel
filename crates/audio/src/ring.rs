@@ -8,21 +8,22 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use crate::backend::{CompactKabelControls, KabelControls};
 use crate::{DecodedSample, OscillatorControls, SampleControls, SampleId};
 
 /// Scheduling metadata travels beside, rather than inside, the musical event.
 /// Ordinary/offline callers continue to submit untracked `AudioEvent`s.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct QueuedAudioEvent {
-    pub event: AudioEvent,
+pub struct QueuedAudioEvent<K = KabelControls> {
+    pub event: AudioEvent<K>,
     pub confirmation: Option<crate::confirmation::ConfirmationOnset>,
     /// Expected immutable body for an actual sample onset. Unknown bodies
     /// may still play, but cannot certify a tracked recovery window.
     pub expected_sample_identity: Option<u64>,
 }
 
-impl From<AudioEvent> for QueuedAudioEvent {
-    fn from(event: AudioEvent) -> Self {
+impl<K> From<AudioEvent<K>> for QueuedAudioEvent<K> {
+    fn from(event: AudioEvent<K>) -> Self {
         Self {
             event,
             confirmation: None,
@@ -31,17 +32,18 @@ impl From<AudioEvent> for QueuedAudioEvent {
     }
 }
 
-impl std::ops::Deref for QueuedAudioEvent {
-    type Target = AudioEvent;
+impl<K> std::ops::Deref for QueuedAudioEvent<K> {
+    type Target = AudioEvent<K>;
 
     fn deref(&self) -> &Self::Target {
         &self.event
     }
 }
 
-/// What crosses into the audio callback. Plain data, `Copy`, no pointers.
+/// A scheduled voice. The audio ring uses compact graph handles so its
+/// payload stays `Copy` and has no owned pointers.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct AudioEvent {
+pub struct AudioEvent<K = KabelControls> {
     pub onset_id: u64,
     pub generation: u64,
     pub ui_visuals: u64,
@@ -51,7 +53,7 @@ pub struct AudioEvent {
     pub freq_hz: f32,
     pub gain: f32,
     pub duration_secs: f32,
-    pub controls: OscillatorControls,
+    pub controls: OscillatorControls<K>,
     pub sample: Option<SampleControls>,
     pub wavetable: Option<crate::backend::WavetableControls>,
     pub synth: Option<crate::backend::SynthSource>,
@@ -60,7 +62,7 @@ pub struct AudioEvent {
     pub cut: Option<f32>,
 }
 
-impl AudioEvent {
+impl<K> AudioEvent<K> {
     /// A conservative frame after which this onset cannot read its bank
     /// sample. `decoded` must be the body selected by this event. Queued
     /// events must retain that body until this frame even after a score edit.
@@ -146,7 +148,7 @@ pub struct Ring {
     /// producer first reaches it, not when a device opens. Opening an output
     /// to audition one sound used to write every slot of a ring sized for
     /// the densest score, tens of megabytes, only to free it on the stop.
-    buf: UnsafeCell<Box<[MaybeUninit<QueuedAudioEvent>]>>,
+    buf: UnsafeCell<Box<[MaybeUninit<QueuedAudioEvent<CompactKabelControls>>]>>,
     mask: usize,
     head: AtomicUsize,
     tail: AtomicUsize,
@@ -260,11 +262,13 @@ impl Ring {
 
     /// Limit this drain to the current queue length, so producer refills cannot
     /// extend it. Each consumed entry uses the ordinary SPSC check.
-    pub fn drain_available(&self) -> impl Iterator<Item = AudioEvent> + '_ {
+    pub fn drain_available(&self) -> impl Iterator<Item = AudioEvent<CompactKabelControls>> + '_ {
         std::iter::from_fn(|| self.pop()).take(self.len())
     }
 
-    pub(crate) fn drain_queued_available(&self) -> impl Iterator<Item = QueuedAudioEvent> + '_ {
+    pub(crate) fn drain_queued_available(
+        &self,
+    ) -> impl Iterator<Item = QueuedAudioEvent<CompactKabelControls>> + '_ {
         std::iter::from_fn(|| self.pop_queued()).take(self.len())
     }
 
@@ -272,7 +276,7 @@ impl Ring {
     pub(crate) fn drain_queued_before(
         &self,
         end: usize,
-    ) -> impl Iterator<Item = QueuedAudioEvent> + '_ {
+    ) -> impl Iterator<Item = QueuedAudioEvent<CompactKabelControls>> + '_ {
         std::iter::from_fn(|| self.pop_queued()).take(self.len_before(end))
     }
 
@@ -302,7 +306,7 @@ impl Ring {
         }
         // SAFETY: sole producer; slot unpublished until Release store.
         unsafe {
-            (*self.buf.get())[tail & self.mask].write(e);
+            (*self.buf.get())[tail & self.mask].write(e.map_kabel(CompactKabelControls::from));
         }
         self.tail.store(tail.wrapping_add(1), Ordering::Release);
         let d = tail.wrapping_add(1).wrapping_sub(head);
@@ -341,11 +345,34 @@ impl Ring {
         self.producer.store(0, Ordering::Release);
     }
 
-    pub fn pop(&self) -> Option<AudioEvent> {
+    /// Protect code referenced by the consumer snapshot without releasing slots.
+    /// This is a consumer operation under the same single-thread rule as `pop`.
+    /// The fixed-purpose visitor cannot reenter this ring and release its head.
+    pub(crate) fn protect_kabel_programs(&self, scalar: &mut crate::ScalarBackend) {
+        if !claim(&self.consumer, "consumer") {
+            self.role_conflicts.fetch_add(1, Ordering::Relaxed);
+            debug_assert!(false, "the audio ring allows exactly one consumer");
+            return;
+        }
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
+        for offset in 0..tail.wrapping_sub(head) {
+            let index = head.wrapping_add(offset);
+            // SAFETY: the sole consumer retains the head throughout this visit.
+            // Acquire observes initialized slots up to tail. The producer cannot
+            // overwrite any of those slots until the consumer releases the head.
+            let event = unsafe { (*self.buf.get())[index & self.mask].assume_init_ref() };
+            for controls in crate::scalar::kabel_controls(&event.controls) {
+                scalar.protect_kabel_program(controls.program);
+            }
+        }
+    }
+
+    pub fn pop(&self) -> Option<AudioEvent<CompactKabelControls>> {
         self.pop_queued().map(|queued| queued.event)
     }
 
-    fn pop_queued(&self) -> Option<QueuedAudioEvent> {
+    fn pop_queued(&self) -> Option<QueuedAudioEvent<CompactKabelControls>> {
         if !claim(&self.consumer, "consumer") {
             self.role_conflicts.fetch_add(1, Ordering::Relaxed);
             debug_assert!(
@@ -472,7 +499,7 @@ mod tests {
 
     #[test]
     fn payload_has_no_drop_glue() {
-        assert!(!std::mem::needs_drop::<AudioEvent>());
+        assert!(!std::mem::needs_drop::<AudioEvent<CompactKabelControls>>());
     }
 
     #[test]
@@ -627,5 +654,231 @@ mod ownership_tests {
             Some(2),
             "drain must proceed"
         );
+    }
+}
+
+impl<K> QueuedAudioEvent<K> {
+    pub(crate) fn map_kabel<L>(self, mut map: impl FnMut(K) -> L) -> QueuedAudioEvent<L> {
+        QueuedAudioEvent {
+            event: self.event.map_kabel(&mut map),
+            confirmation: self.confirmation,
+            expected_sample_identity: self.expected_sample_identity,
+        }
+    }
+}
+
+impl<K> AudioEvent<K> {
+    pub(crate) fn map_kabel<L>(self, mut map: impl FnMut(K) -> L) -> AudioEvent<L> {
+        AudioEvent {
+            onset_id: self.onset_id,
+            generation: self.generation,
+            ui_visuals: self.ui_visuals,
+            target_frame: self.target_frame,
+            onset_lead: self.onset_lead,
+            freq_hz: self.freq_hz,
+            gain: self.gain,
+            duration_secs: self.duration_secs,
+            controls: self.controls.map_kabel(&mut map),
+            sample: self.sample,
+            wavetable: self.wavetable,
+            synth: self.synth,
+            cut: self.cut,
+        }
+    }
+}
+
+#[cfg(test)]
+mod kabel_snapshot_tests {
+    use super::*;
+    use crate::{FilterControls, FxStage, ScalarBackend};
+    use rustel_kabel::{Program, ProgramId};
+
+    fn program(value: usize) -> Program {
+        Program::from_json(&format!(r#"{{"nodes":[{{"type":"n","value":{value}}}]}}"#)).unwrap()
+    }
+
+    fn controls(program: Program) -> KabelControls {
+        KabelControls {
+            program: program.into(),
+            start_secs: 0.0,
+            gate_end_secs: 1.0,
+            end_secs: 1.0,
+        }
+    }
+
+    fn event(id: u64, program: Program) -> AudioEvent {
+        let mut event = super::tests::ev(id);
+        event.controls.kabel = Some(controls(program));
+        event
+    }
+
+    fn stage(program: Program) -> FxStage {
+        FxStage {
+            kabel: Some(controls(program)),
+            stretch: None,
+            transient: None,
+            gain: 1.0,
+            filters: FilterControls::default(),
+            vowel: None,
+            coarse: None,
+            crush: None,
+            shape: None,
+            distort: None,
+            tremolo: None,
+            compressor: None,
+            pan_x: None,
+            phaser: None,
+            delay: None,
+            dry: 1.0,
+            room: None,
+        }
+    }
+
+    fn bank(programs: &[Program]) -> ScalarBackend {
+        let mut backend = ScalarBackend::with_kabel_program_bank_for_test(programs.len());
+        for program in programs {
+            let entry = Box::new(crate::assets::PreparedKabelProgram {
+                program: *program,
+                until_frame: 0,
+            });
+            assert!(backend.install_kabel_program(entry, drop).is_none());
+        }
+        backend
+    }
+
+    fn retire(backend: &mut ScalarBackend) -> Vec<ProgramId> {
+        let mut retired = Vec::new();
+        backend.retire_kabel_programs(16, |entry| retired.push(entry.program.id()));
+        retired.sort();
+        retired
+    }
+
+    #[test]
+    fn empty_snapshot_never_reads_uninitialized_slots() {
+        let code = program(1);
+        let mut backend = bank(&[code]);
+        Ring::new(4).protect_kabel_programs(&mut backend);
+        assert_eq!(retire(&mut backend), [code.id()]);
+    }
+
+    #[test]
+    fn wrapped_snapshot_protects_main_and_every_fx_without_consuming() {
+        let codes: Vec<_> = (0..6).map(program).collect();
+        let mut backend = bank(&codes);
+        let ring = Ring::new(4);
+        for id in 0..3 {
+            assert!(ring.push(super::tests::ev(id)));
+            assert_eq!(ring.pop().unwrap().onset_id, id);
+        }
+        let mut first = event(3, codes[0]);
+        for (index, slot) in first.controls.fx_stages.iter_mut().enumerate() {
+            *slot = Some(stage(codes[index + 1]));
+        }
+        assert!(ring.push(first));
+        assert!(ring.push(event(4, codes[4])));
+        assert!(ring.push(super::tests::ev(5)));
+        assert!(ring.push(event(6, codes[0])));
+        backend.begin_kabel_program_retirement();
+        ring.protect_kabel_programs(&mut backend);
+        assert_eq!(retire(&mut backend), [codes[5].id()]);
+        assert_eq!(
+            ring.drain_available()
+                .map(|event| event.onset_id)
+                .collect::<Vec<_>>(),
+            [3, 4, 5, 6]
+        );
+        backend.begin_kabel_program_retirement();
+        ring.protect_kabel_programs(&mut backend);
+        assert_eq!(
+            retire(&mut backend),
+            codes[..5].iter().map(Program::id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn snapshot_protects_programs_when_counters_wrap() {
+        let codes: Vec<_> = (0..4).map(program).collect();
+        let mut backend = bank(&codes);
+        let ring = Ring::new(4);
+        ring.head.store(usize::MAX - 1, Ordering::Relaxed);
+        ring.tail.store(usize::MAX - 1, Ordering::Relaxed);
+        for (index, code) in codes[..3].iter().enumerate() {
+            assert!(ring.push(event(index as u64, *code)));
+        }
+
+        backend.begin_kabel_program_retirement();
+        ring.protect_kabel_programs(&mut backend);
+        assert_eq!(retire(&mut backend), [codes[3].id()]);
+        assert_eq!(
+            ring.drain_available()
+                .map(|event| event.onset_id)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        backend.begin_kabel_program_retirement();
+        ring.protect_kabel_programs(&mut backend);
+        assert_eq!(
+            retire(&mut backend),
+            codes[..3].iter().map(Program::id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn snapshot_refuses_a_second_consumer_thread() {
+        let ring = std::sync::Arc::new(Ring::new(2));
+        assert!(ring.pop().is_none());
+        let other = std::sync::Arc::clone(&ring);
+        let outcome = std::thread::spawn(move || {
+            let mut backend = bank(&[]);
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                other.protect_kabel_programs(&mut backend);
+            }))
+        })
+        .join()
+        .unwrap();
+        assert_eq!(outcome.is_err(), cfg!(debug_assertions));
+        assert_eq!(ring.role_conflicts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn snapshots_share_published_slots_safely_with_the_producer() {
+        const ITEMS: u64 = if cfg!(miri) { 8 } else { 512 };
+        let code = program(1);
+        let ring = std::sync::Arc::new(Ring::new(4));
+        let producer_ring = std::sync::Arc::clone(&ring);
+        let producer = std::thread::spawn(move || {
+            for id in 0..ITEMS {
+                while !producer_ring.push(event(id, code)) {
+                    std::thread::yield_now();
+                }
+            }
+        });
+        let mut backend = bank(&[code]);
+        for expected in 0..ITEMS {
+            let event = loop {
+                ring.protect_kabel_programs(&mut backend);
+                if let Some(event) = ring.pop() {
+                    break event;
+                }
+                std::thread::yield_now();
+            };
+            assert_eq!(event.onset_id, expected);
+            assert_eq!(event.controls.kabel.unwrap().program, code.id());
+        }
+        producer.join().unwrap();
+        assert_eq!(ring.role_conflicts.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn callback_payload_contains_handles_instead_of_inline_programs() {
+        use std::mem::{needs_drop, size_of};
+        let compact = size_of::<QueuedAudioEvent<CompactKabelControls>>();
+        let producer = size_of::<QueuedAudioEvent>();
+        assert_eq!(size_of::<CompactKabelControls>(), 32);
+        assert!(compact <= 4352, "callback event grew to {compact} bytes");
+        assert!(compact <= size_of::<QueuedAudioEvent<()>>() + 4 * 32);
+        assert_eq!(producer, compact, "producer events must share graph code");
+        assert!(!needs_drop::<QueuedAudioEvent<CompactKabelControls>>());
+        assert!(!needs_drop::<OscillatorControls<CompactKabelControls>>());
     }
 }

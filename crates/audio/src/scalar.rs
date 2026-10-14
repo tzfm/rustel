@@ -2,9 +2,10 @@
 
 use crate::DspDispatch;
 use crate::backend::{
-    AudioBackend, BusMod, CompressorControls, EnvMod, Envelope, FmControls, FxStage, LfoMod,
-    MAX_VOICE_MODS, OnsetEvent, OscillatorControls, PartialsControls, PhaserControls,
-    PitchEnvControls, ShapeControls, TremoloControls, VibratoControls, VowelControls, Waveform,
+    AudioBackend, BusMod, CompactKabelControls, CompressorControls, EnvMod, Envelope, FmControls,
+    FxStage, LfoMod, MAX_VOICE_MODS, OnsetEvent, OscillatorControls, PartialsControls,
+    PhaserControls, PitchEnvControls, ShapeControls, TremoloControls, VibratoControls,
+    VowelControls, Waveform,
 };
 use crate::sample::{
     DecodedSample, SampleBank, SampleId, SampleResamplingMode, bundled_sample, stop_secs_for,
@@ -199,13 +200,13 @@ mod held_piano_tests {
     fn held_piano_release_bypasses_full_prepared_voice_and_pending_capacity() {
         let mut backend = ScalarBackend::prepared(48_000, 2).unwrap();
         backend.set_max_polyphony(2);
-        assert!(backend.try_note_prepared(held(110.0, None)));
-        assert!(backend.try_note_prepared(held(440.0, Some(1.0))));
+        assert!(backend.try_note_prepared(held(110.0, None).into_prepared()));
+        assert!(backend.try_note_prepared(held(440.0, Some(1.0)).into_prepared()));
         advance(&mut backend, 1);
         assert_eq!(backend.voices.len(), 2);
         // Normal admission would refuse this because all prepared voice
         // capacity is occupied. A key-up is not a third voice.
-        assert!(backend.try_note_prepared(release(backend.frame, 1.0)));
+        assert!(backend.try_note_prepared(release(backend.frame, 1.0).into_prepared()));
         advance(&mut backend, 16);
         assert_eq!(backend.voices.len(), 1);
         assert_eq!(backend.voices[0].freq_hz, 110.0);
@@ -215,10 +216,10 @@ mod held_piano_tests {
         for (freq, group) in [(110.0, None), (440.0, Some(1.0))] {
             let mut event = held(freq, group);
             event.onset_frame = 128;
-            assert!(backend.try_note_prepared(event));
+            assert!(backend.try_note_prepared(event.into_prepared()));
         }
         assert_eq!(backend.pending.len(), backend.pending.capacity());
-        assert!(backend.try_note_prepared(release(129, 1.0)));
+        assert!(backend.try_note_prepared(release(129, 1.0).into_prepared()));
         advance(&mut backend, 18);
         assert_eq!(backend.voices.len(), 1);
         assert_eq!(backend.voices[0].freq_hz, 110.0);
@@ -475,7 +476,9 @@ mod voice_layout_tests {
         assert!(backend.try_note_prepared(OnsetEvent::new(0, 220.0, 0.5, 0.1)));
         assert!(
             backend.try_note_prepared(
-                OnsetEvent::new(0, 330.0, 0.5, 0.1).with_controls(fm_controls())
+                OnsetEvent::new(0, 330.0, 0.5, 0.1)
+                    .with_controls(fm_controls())
+                    .into_prepared()
             )
         );
         backend.process_block(&mut [0.0; 2], 1);
@@ -496,9 +499,13 @@ mod voice_layout_tests {
         assert_eq!(backend.fm_state_pool.len(), 2);
 
         for frequency in [440.0, 550.0] {
-            assert!(backend.try_note_prepared(
-                OnsetEvent::new(0, frequency, 0.5, 0.1).with_controls(fm_controls())
-            ));
+            assert!(
+                backend.try_note_prepared(
+                    OnsetEvent::new(0, frequency, 0.5, 0.1)
+                        .with_controls(fm_controls())
+                        .into_prepared()
+                )
+            );
         }
         backend.process_block(&mut [0.0; 2], 1);
 
@@ -714,6 +721,113 @@ impl FxDelayLine {
 /// would hand one pattern hundreds of MiB.
 pub(crate) const MAX_FX_REVERB_BYTES: usize = 64 * 1024 * 1024;
 
+/// Maximum resident native worklet storage, including graphs currently playing.
+pub const MAX_KABEL_BYTES: usize = 64 * 1024 * 1024;
+/// Bounds callback activation, return slots and graph search work.
+pub const MAX_KABEL_GRAPHS: usize = 128;
+
+pub(crate) fn kabel_controls<K>(controls: &OscillatorControls<K>) -> impl Iterator<Item = &K> {
+    controls.kabel.iter().chain(
+        controls
+            .fx_stages
+            .iter()
+            .flatten()
+            .filter_map(|stage| stage.kabel.as_ref()),
+    )
+}
+
+pub(crate) fn kabel_graph_bytes(graph: &rustel_kabel::Graph) -> usize {
+    std::mem::size_of::<rustel_kabel::Graph>() + graph.heap_bytes()
+}
+
+#[derive(Debug)]
+struct KabelState {
+    graph: Box<rustel_kabel::Graph>,
+    start_secs: f64,
+    gate_end_secs: f64,
+    end_secs: f64,
+    time: f64,
+}
+
+impl KabelState {
+    fn process(&mut self, input: f32, quantum_secs: f64, sample_rate: f64) -> (f32, f32) {
+        if quantum_secs < self.start_secs || quantum_secs >= self.end_secs {
+            return (0.0, 0.0);
+        }
+        // Worklets receive the left input channel and expose two outputs.
+        // Their time starts at the first quantum that passes the start gate.
+        let gate = if quantum_secs > self.gate_end_secs {
+            0.0
+        } else {
+            1.0
+        };
+        let out = self.graph.process([f64::from(input); 2], gate, self.time);
+        self.time += 1.0 / sample_rate;
+        (out[0] as f32, out[1] as f32)
+    }
+}
+
+#[allow(clippy::vec_box)]
+fn lease_kabel(
+    pool: &mut Vec<Box<rustel_kabel::Graph>>,
+    programs: &[Box<crate::assets::PreparedKabelProgram>],
+    controls: CompactKabelControls,
+) -> KabelState {
+    let program =
+        find_kabel_program(programs, controls.program).expect("admitted program is installed");
+    let index = pool
+        .iter()
+        .enumerate()
+        .filter(|(_, graph)| graph.can_reuse(program))
+        .min_by_key(|(_, graph)| graph.heap_bytes())
+        .map(|(index, _)| index)
+        .expect("KabelSalat graph admission reserves every stage");
+    let mut graph = pool.swap_remove(index);
+    let restarted = graph.restart(program);
+    debug_assert!(restarted);
+    KabelState {
+        graph,
+        start_secs: controls.start_secs,
+        gate_end_secs: controls.gate_end_secs,
+        end_secs: controls.end_secs,
+        time: 0.0,
+    }
+}
+
+fn find_kabel_program(
+    programs: &[Box<crate::assets::PreparedKabelProgram>],
+    id: rustel_kabel::ProgramId,
+) -> Option<&rustel_kabel::Program> {
+    programs
+        .binary_search_by_key(&id, |entry| entry.program.id())
+        .ok()
+        .map(|index| &programs[index].program)
+}
+
+fn kabel_available(
+    pool: &[Box<rustel_kabel::Graph>],
+    programs: &[Box<crate::assets::PreparedKabelProgram>],
+    controls: &OscillatorControls<CompactKabelControls>,
+) -> bool {
+    let mut used = [false; MAX_KABEL_GRAPHS];
+    for controls in kabel_controls(controls) {
+        let Some(program) = find_kabel_program(programs, controls.program) else {
+            return false;
+        };
+        let index = pool
+            .iter()
+            .enumerate()
+            .filter(|(index, graph)| !used[*index] && graph.can_reuse(program))
+            .min_by_key(|(_, graph)| graph.heap_bytes())
+            .map(|(index, _)| index);
+        let Some(index) = index else {
+            return false;
+        };
+        used[index] = true;
+    }
+    true
+}
+
 // Each stereo reverb accounts for at least one partition, matching history,
 // work and accumulator per channel, even for an empty IR. Scratch and tails
 // only increase that minimum. Reserve return slots for every box the existing
@@ -804,9 +918,10 @@ struct VoiceRenderControls {
     partials: Option<PartialsControls>,
 }
 
-impl From<OscillatorControls> for VoiceRenderControls {
-    fn from(controls: OscillatorControls) -> Self {
+impl<K> From<OscillatorControls<K>> for VoiceRenderControls {
+    fn from(controls: OscillatorControls<K>) -> Self {
         let OscillatorControls {
+            kabel: _,
             live_controls: _,
             preview_epoch: _,
             choke_only: _,
@@ -920,6 +1035,7 @@ struct Voice {
     /// Wet send into the orbit reverb (0 = no send).
     reverb_wet: f32,
     dry_gain: f32,
+    kabel: Option<KabelState>,
     stretch: Option<Box<[crate::stretch::Stretch; 2]>>,
     orbit: usize,
     freq_hz: f32,
@@ -1085,8 +1201,12 @@ fn retire_voice_resources(
     zzfx_pool: &mut Vec<Box<[f32]>>,
     stretch_pool: &mut Vec<Box<[crate::stretch::Stretch; 2]>>,
     fx_stage_state_pool: &mut Vec<Box<FxStageStates>>,
+    kabel_pool: &mut Vec<Box<rustel_kabel::Graph>>,
 ) {
     pressure.retire(voice);
+    if let Some(kabel) = voice.kabel.take() {
+        kabel_pool.push(kabel.graph);
+    }
     if let Some(state) = voice.fm_state.take() {
         fm_state_pool.push(state);
     }
@@ -1110,6 +1230,9 @@ fn retire_voice_resources(
     if let Some(mut stages) = voice.fx_stage_state.take() {
         for slot in stages.iter_mut() {
             if let Some(stage) = slot {
+                if let Some(kabel) = stage.kabel.take() {
+                    kabel_pool.push(kabel.graph);
+                }
                 if let Some(state) = stage.compressor.take() {
                     compressor_pool.push(state);
                 }
@@ -1216,6 +1339,7 @@ fn apply_fx_stage(
     hap_duration_secs: f32,
     block_n: f32,
     sample_rate: f32,
+    quantum_secs: f64,
     // The transient shaper's frame-based begin and end gate.
     transient_live: bool,
     // Tremolo and phaser share the gate with f32-rounded begin and end times.
@@ -1233,7 +1357,11 @@ fn apply_fx_stage(
     // desynchronises its envelope from the left's.
     let mut right = if stereo { right } else { left };
 
-    // Stretch and the transient shaper come FIRST, ahead of the gain stage
+    if let Some(kabel) = &mut state.kabel {
+        (left, right) = kabel.process(left, quantum_secs, f64::from(sample_rate));
+    }
+
+    // Stretch and the transient shaper precede the gain stage
     if let (Some(vocoder), Some(factor)) = (state.stretch.as_mut(), stage.stretch) {
         left = vocoder[0].process(left, factor);
         if stereo {
@@ -1478,7 +1606,8 @@ fn voice_fx_pre_distort(
 struct FxStageState {
     /// Immutable stage configuration is cold unless `.FX()` is active, so it
     /// lives with this already-pooled state instead of inflating every voice.
-    controls: FxStage,
+    controls: FxStage<CompactKabelControls>,
+    kabel: Option<KabelState>,
     filters: FilterChain,
     /// Present only for a stereo path, matching the main chain's split.
     filters_right: Option<FilterChain>,
@@ -3669,7 +3798,7 @@ struct PendingEvents {
 }
 
 struct PendingEventSlot {
-    event: Option<OnsetEvent>,
+    event: Option<OnsetEvent<CompactKabelControls>>,
     confirmation: Option<crate::confirmation::ConfirmationOnset>,
     expected_sample_identity: Option<u64>,
     next_free: Option<usize>,
@@ -3692,13 +3821,13 @@ impl PendingEvents {
         self.slots.capacity().min(self.order.capacity())
     }
 
-    fn push(&mut self, event: OnsetEvent) {
+    fn push(&mut self, event: OnsetEvent<CompactKabelControls>) {
         self.push_with_confirmation(event, None, None);
     }
 
     fn push_with_confirmation(
         &mut self,
-        event: OnsetEvent,
+        event: OnsetEvent<CompactKabelControls>,
         confirmation: Option<crate::confirmation::ConfirmationOnset>,
         expected_sample_identity: Option<u64>,
     ) {
@@ -3731,14 +3860,14 @@ impl PendingEvents {
     /// surviving event. Reused slots are always appended to `order`, so
     /// simultaneous onsets retain trigger order even after many removals.
     #[cfg(test)]
-    fn retain(&mut self, mut keep: impl FnMut(&OnsetEvent) -> bool) {
+    fn retain(&mut self, mut keep: impl FnMut(&OnsetEvent<CompactKabelControls>) -> bool) {
         self.retain_with_confirmation(|event, _, _| keep(event));
     }
 
     fn retain_with_confirmation(
         &mut self,
         mut keep: impl FnMut(
-            &OnsetEvent,
+            &OnsetEvent<CompactKabelControls>,
             Option<crate::confirmation::ConfirmationOnset>,
             Option<u64>,
         ) -> bool,
@@ -3790,6 +3919,15 @@ impl Default for OrbitGains {
 /// computed one sample at a time.
 #[derive(Default)]
 pub struct ScalarBackend {
+    #[allow(clippy::vec_box)]
+    kabel_programs: Vec<Box<crate::assets::PreparedKabelProgram>>,
+    kabel_program_protected: Vec<bool>,
+    kabel_queued: bool,
+    #[allow(clippy::vec_box)]
+    kabel_pool: Vec<Box<rustel_kabel::Graph>>,
+    kabel_bytes: usize,
+    kabel_count: usize,
+    missing_kabel_events: u64,
     max_polyphony: PolyphonyLimit,
     sample_rate: u32,
     sample_resampling_mode: SampleResamplingMode,
@@ -4095,6 +4233,9 @@ impl ScalarBackend {
             .as_deref()
             .map_or(0, std::mem::size_of_val);
         stretch
+            + self.kabel_programs.capacity() * size_of::<Box<crate::assets::PreparedKabelProgram>>()
+            + self.kabel_program_protected.capacity() * size_of::<bool>()
+            + self.kabel_bytes
             + self.fx_stage_state_pool.len() * size_of::<FxStageStates>()
             + self.compressor_pool.len() * size_of::<CompressorState>()
             + self.fm_state_pool.len() * size_of::<FmState>()
@@ -4251,7 +4392,7 @@ impl ScalarBackend {
     /// installs between blocks.
     /// Sidechain scheduling, shared by both intake paths: queue the trigger
     /// for its ARM time (10 ms before the onset), never arm immediately.
-    fn arm_duck(&mut self, event: &OnsetEvent) {
+    fn arm_duck<K>(&mut self, event: &OnsetEvent<K>) {
         self.arm_duck_at(event.onset_frame, event.controls.duck);
     }
 
@@ -4333,6 +4474,339 @@ impl ScalarBackend {
     /// Live-path policy switch: forbid IR synthesis at activation time.
     pub fn forbid_inline_reverb(&mut self) {
         self.allow_inline_reverb = false;
+    }
+
+    /// Installs a processor prepared off the callback, returning refused storage
+    /// to the caller for destruction on the producer thread.
+    pub fn install_kabel(
+        &mut self,
+        graph: Box<rustel_kabel::Graph>,
+    ) -> Option<Box<rustel_kabel::Graph>> {
+        let bytes = kabel_graph_bytes(&graph);
+        if self.kabel_count == MAX_KABEL_GRAPHS
+            || bytes > MAX_KABEL_BYTES.saturating_sub(self.kabel_bytes)
+        {
+            return Some(graph);
+        }
+        // Pre-init installs are a producer operation. Init reserves the same
+        // full return capacity before live callback delivery starts.
+        if self.kabel_pool.capacity() < MAX_KABEL_GRAPHS {
+            self.kabel_pool
+                .reserve(MAX_KABEL_GRAPHS - self.kabel_pool.len());
+        }
+        self.kabel_bytes += bytes;
+        self.kabel_count += 1;
+        self.kabel_pool.push(graph);
+        None
+    }
+
+    pub(crate) fn has_only_idle_kabel(&self) -> bool {
+        self.kabel_count != 0 && self.kabel_pool.len() == self.kabel_count
+    }
+
+    /// Returns storage only when no active or queued graph can need it.
+    /// Call after protecting all external queues and scanning pending onsets.
+    pub(crate) fn retire_idle_kabel(
+        &mut self,
+        max_returns: usize,
+        mut retire: impl FnMut(Box<rustel_kabel::Graph>),
+    ) {
+        if self.kabel_queued || !self.has_only_idle_kabel() {
+            return;
+        }
+        for _ in 0..max_returns.min(self.kabel_pool.len()) {
+            let graph = self.kabel_pool.pop().expect("idle processor");
+            self.kabel_bytes -= kabel_graph_bytes(&graph);
+            self.kabel_count -= 1;
+            retire(graph);
+        }
+    }
+
+    pub fn kabel_resident_bytes(&self) -> usize {
+        self.kabel_bytes
+    }
+
+    /// Onsets refused because their complete worklet chain was not prepared.
+    pub fn missing_kabel_events(&self) -> u64 {
+        self.missing_kabel_events
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_kabel_program_bank_for_test(capacity: usize) -> Self {
+        Self {
+            kabel_programs: Vec::with_capacity(capacity),
+            kabel_program_protected: vec![false; capacity],
+            ..Self::default()
+        }
+    }
+
+    /// The immutable bank retains code while compact onsets wait for activation.
+    /// Returned boxes must be destroyed by the producer, never by the callback.
+    pub(crate) fn install_kabel_program(
+        &mut self,
+        mut entry: Box<crate::assets::PreparedKabelProgram>,
+        mut retire: impl FnMut(Box<crate::assets::PreparedKabelProgram>),
+    ) -> Option<Box<crate::assets::PreparedKabelProgram>> {
+        let index = match self
+            .kabel_programs
+            .binary_search_by_key(&entry.program.id(), |old| old.program.id())
+        {
+            Ok(index) => {
+                entry.until_frame = entry
+                    .until_frame
+                    .max(self.kabel_programs[index].until_frame);
+                retire(std::mem::replace(&mut self.kabel_programs[index], entry));
+                return None;
+            }
+            Err(index) => index,
+        };
+        if self.kabel_programs.len() == self.kabel_programs.capacity() {
+            return Some(entry);
+        }
+        self.kabel_programs.insert(index, entry);
+        None
+    }
+
+    pub(crate) fn kabel_program_resident_bytes(&self) -> usize {
+        self.kabel_programs.len() * std::mem::size_of::<crate::assets::PreparedKabelProgram>()
+    }
+
+    pub(crate) fn has_expired_kabel_programs(&self) -> bool {
+        self.kabel_programs
+            .iter()
+            .any(|entry| entry.until_frame <= self.frame)
+    }
+
+    pub(crate) fn begin_kabel_program_retirement(&mut self) {
+        self.kabel_program_protected.fill(false);
+        self.kabel_queued = false;
+    }
+
+    pub(crate) fn protect_kabel_program(&mut self, id: rustel_kabel::ProgramId) {
+        self.kabel_queued = true;
+        if let Ok(index) = self
+            .kabel_programs
+            .binary_search_by_key(&id, |entry| entry.program.id())
+        {
+            self.kabel_program_protected[index] = true;
+        }
+    }
+
+    pub(crate) fn retire_kabel_programs(
+        &mut self,
+        max_returns: usize,
+        mut retire: impl FnMut(Box<crate::assets::PreparedKabelProgram>),
+    ) {
+        for event in self
+            .pending
+            .slots
+            .iter()
+            .filter_map(|slot| slot.event.as_ref())
+        {
+            for controls in kabel_controls(&event.controls) {
+                self.kabel_queued = true;
+                if let Ok(index) = self
+                    .kabel_programs
+                    .binary_search_by_key(&controls.program, |entry| entry.program.id())
+                {
+                    self.kabel_program_protected[index] = true;
+                }
+            }
+        }
+        let mut index = self.kabel_programs.len();
+        let mut returned = 0;
+        // Remove backwards to preserve sorted lookup and protection indices.
+        while index > 0 && returned < max_returns {
+            index -= 1;
+            if self.kabel_programs[index].until_frame <= self.frame
+                && !self.kabel_program_protected[index]
+            {
+                retire(self.kabel_programs.remove(index));
+                returned += 1;
+            }
+        }
+    }
+
+    fn prepare_kabel_code(&mut self, controls: &OscillatorControls) -> Result<(), String> {
+        self.kabel_program_protected
+            .resize(crate::assets::MAX_KABEL_PROGRAMS, false);
+        if self.kabel_programs.capacity() < crate::assets::MAX_KABEL_PROGRAMS {
+            self.kabel_programs
+                .reserve(crate::assets::MAX_KABEL_PROGRAMS - self.kabel_programs.len());
+        }
+        for controls in kabel_controls(controls) {
+            let until_frame =
+                (controls.end_secs.max(0.0) * f64::from(self.sample_rate)).ceil() as u64;
+            let until_frame = until_frame.saturating_add(256);
+            if let Some(entry) = self
+                .kabel_programs
+                .iter_mut()
+                .find(|entry| entry.program.id() == controls.program.id())
+            {
+                entry.until_frame = entry.until_frame.max(until_frame);
+                continue;
+            }
+            let entry = Box::new(crate::assets::PreparedKabelProgram {
+                program: *controls.program,
+                until_frame,
+            });
+            if self.install_kabel_program(entry, drop).is_some() {
+                return Err(
+                    "KabelSalat immutable program storage exceeds the 4096-program limit".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Prepares independent state for every worklet in a voice. Producer only:
+    /// graph construction allocates. Repeated calls reuse compatible idle state.
+    pub fn prepare_kabel(&mut self, controls: &OscillatorControls) -> Result<(), String> {
+        self.prepare_kabel_code(controls)?;
+        let programs: Vec<_> = kabel_controls(controls)
+            .map(|kabel| kabel.program.as_ref())
+            .collect();
+        self.prepare_kabel_programs(&programs)
+    }
+
+    fn prepare_kabel_programs(
+        &mut self,
+        programs: &[&rustel_kabel::Program],
+    ) -> Result<(), String> {
+        let mut used = [false; MAX_KABEL_GRAPHS];
+        let mut protected = [false; MAX_KABEL_GRAPHS];
+        // Previously admitted future events retain their capacity even when
+        // this admission concerns a disjoint interval.
+        for event in self
+            .pending
+            .slots
+            .iter()
+            .filter_map(|slot| slot.event.as_ref())
+        {
+            for controls in kabel_controls(&event.controls) {
+                let Some(program) = self
+                    .kabel_programs
+                    .iter()
+                    .find(|entry| entry.program.id() == controls.program)
+                    .map(|entry| &entry.program)
+                else {
+                    protected.fill(true);
+                    continue;
+                };
+                if let Some(index) = self
+                    .kabel_pool
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, graph)| !protected[*index] && graph.can_reuse(program))
+                    .min_by_key(|(_, graph)| graph.heap_bytes())
+                    .map(|(index, _)| index)
+                {
+                    protected[index] = true;
+                }
+            }
+        }
+        let mut programs = programs.to_vec();
+        programs.sort_unstable_by_key(|program| std::cmp::Reverse(program.delay_count()));
+        for program in programs {
+            let index = self
+                .kabel_pool
+                .iter()
+                .enumerate()
+                .filter(|(index, graph)| !used[*index] && graph.can_reuse(program))
+                .min_by_key(|(_, graph)| graph.heap_bytes())
+                .map(|(index, _)| index);
+            let index = match index {
+                Some(index) => index,
+                None => {
+                    let graph = Box::new(rustel_kabel::Graph::new(
+                        program,
+                        f64::from(self.sample_rate),
+                    )?);
+                    let bytes = kabel_graph_bytes(&graph);
+                    while self.kabel_count == MAX_KABEL_GRAPHS
+                        || bytes > MAX_KABEL_BYTES.saturating_sub(self.kabel_bytes)
+                    {
+                        let Some(index) = (0..self.kabel_pool.len())
+                            .find(|&index| !used[index] && !protected[index])
+                        else {
+                            return Err(
+                                "KabelSalat graph storage exceeds the 128-graph or 64 MiB limit"
+                                    .into(),
+                            );
+                        };
+                        let last = self.kabel_pool.len() - 1;
+                        let old = self.kabel_pool.swap_remove(index);
+                        used.swap(index, last);
+                        protected.swap(index, last);
+                        used[last] = false;
+                        protected[last] = false;
+                        self.kabel_bytes -= kabel_graph_bytes(&old);
+                        self.kabel_count -= 1;
+                        // Offline admission owns destruction on its caller.
+                        drop(old);
+                    }
+                    if self.install_kabel(graph).is_some() {
+                        return Err(
+                            "KabelSalat graph storage exceeds the 128-graph or 64 MiB limit".into(),
+                        );
+                    }
+                    self.kabel_pool.len() - 1
+                }
+            };
+            used[index] = true;
+        }
+        Ok(())
+    }
+
+    /// Offline admission prepares the peak overlap, rather than retaining one
+    /// processor for every event in a long score. The extra quantum covers
+    /// callback retirement after a worklet's final quantum.
+    pub fn prepare_kabel_event(&mut self, event: &OnsetEvent) -> Result<(), String> {
+        if kabel_controls(&event.controls).next().is_none() {
+            return Ok(());
+        }
+        self.prepare_kabel_code(&event.controls)?;
+        let compact = event.clone().map_kabel(CompactKabelControls::from);
+        let sr = f64::from(self.sample_rate);
+        let interval = |event: &OnsetEvent<CompactKabelControls>| {
+            let begin = event.onset_frame as f64 / sr;
+            let end = kabel_controls(&event.controls)
+                .map(|kabel| kabel.end_secs)
+                .fold(
+                    begin + f64::from(event.duration_secs + event.controls.envelope.release_secs),
+                    f64::max,
+                );
+            (begin, (end * sr / 128.0).ceil() * 128.0 / sr + 128.0 / sr)
+        };
+        let (begin, end) = interval(&compact);
+        let mut times = vec![begin];
+        for slot in &self.pending.slots {
+            if let Some(pending) = &slot.event {
+                let (start, _) = interval(pending);
+                if start >= begin && start < end {
+                    times.push(start);
+                }
+            }
+        }
+        times.sort_unstable_by(f64::total_cmp);
+        times.dedup();
+        for time in times {
+            let mut programs: Vec<rustel_kabel::Program> = kabel_controls(&event.controls)
+                .map(|kabel| *kabel.program)
+                .collect();
+            for slot in &self.pending.slots {
+                if let Some(pending) = &slot.event {
+                    let (start, stop) = interval(pending);
+                    if start <= time && time < stop {
+                        programs.extend(kabel_controls(&pending.controls).filter_map(|kabel| {
+                            find_kabel_program(&self.kabel_programs, kabel.program).copied()
+                        }));
+                    }
+                }
+            }
+            self.prepare_kabel_programs(&programs.iter().collect::<Vec<_>>())?;
+        }
+        Ok(())
     }
 
     /// Hand a stage reverb, generated off the audio thread, to the pool.
@@ -4684,11 +5158,11 @@ impl ScalarBackend {
 
     /// Submit only if the preallocated real-time capacity is sufficient.
     /// Returns false rather than allocating inside the callback.
-    pub fn try_note_prepared(&mut self, event: OnsetEvent) -> bool {
+    pub fn try_note_prepared(&mut self, event: OnsetEvent<CompactKabelControls>) -> bool {
         self.try_note_prepared_with_confirmation(event, None, None)
     }
 
-    fn queue_choke(&mut self, event: OnsetEvent) -> bool {
+    fn queue_choke<K>(&mut self, event: OnsetEvent<K>) -> bool {
         let Some(group) = event.cut else {
             return true;
         };
@@ -4711,7 +5185,7 @@ impl ScalarBackend {
 
     pub(crate) fn try_note_prepared_with_confirmation(
         &mut self,
-        event: OnsetEvent,
+        event: OnsetEvent<CompactKabelControls>,
         confirmation: Option<crate::confirmation::ConfirmationOnset>,
         expected_sample_identity: Option<u64>,
     ) -> bool {
@@ -4772,6 +5246,7 @@ impl ScalarBackend {
                 &mut self.zzfx_ring_pool,
                 &mut self.stretch_pool,
                 &mut self.fx_stage_state_pool,
+                &mut self.kabel_pool,
             );
         }
         self.pressure.clear_active();
@@ -4832,7 +5307,12 @@ impl ScalarBackend {
 
     /// A choke is also used as an internal note-off. It never needs a
     /// voice slot and must remain possible when the polyphony cap is full.
-    fn choke_previous(voices: &mut [Voice], event: &OnsetEvent, frame: u64, sample_rate: u32) {
+    fn choke_previous<K>(
+        voices: &mut [Voice],
+        event: &OnsetEvent<K>,
+        frame: u64,
+        sample_rate: u32,
+    ) {
         let Some(cut) = event
             .cut
             .or_else(|| event.sample.and_then(|sample| sample.cut))
@@ -5387,6 +5867,16 @@ impl AudioBackend for ScalarBackend {
         // Smaller than the compressor pool because each line is far larger:
         // 384 KiB at 48 kHz against 10 KiB. Sixteen covers sixteen voices
         // delaying in one stage, or five using all three.
+        if self.kabel_pool.capacity() < MAX_KABEL_GRAPHS {
+            self.kabel_pool
+                .reserve(MAX_KABEL_GRAPHS - self.kabel_pool.len());
+        }
+        self.kabel_program_protected
+            .resize(crate::assets::MAX_KABEL_PROGRAMS, false);
+        if self.kabel_programs.capacity() < crate::assets::MAX_KABEL_PROGRAMS {
+            self.kabel_programs
+                .reserve(crate::assets::MAX_KABEL_PROGRAMS - self.kabel_programs.len());
+        }
         self.fx_delay_pool = (0..16).map(|_| FxDelayLine::new(sample_rate)).collect();
         self.zzfx_ring_pool = (0..8)
             .map(|_| vec![0.0f32; (sample_rate as usize) * 2].into_boxed_slice())
@@ -5435,6 +5925,10 @@ impl AudioBackend for ScalarBackend {
         self.reset_at(0);
     }
 
+    fn prepare_note(&mut self, event: &OnsetEvent) -> Result<(), String> {
+        self.prepare_kabel_event(event)
+    }
+
     fn note(&mut self, event: OnsetEvent) {
         if event.controls.choke_only {
             let _ = self.queue_choke(event);
@@ -5447,6 +5941,10 @@ impl AudioBackend for ScalarBackend {
             self.pending_ceiling_drops += 1;
             self.pressure.pending_ceiling_drops =
                 self.pressure.pending_ceiling_drops.saturating_add(1);
+            return;
+        }
+        if self.prepare_kabel_event(&event).is_err() {
+            self.missing_kabel_events += 1;
             return;
         }
         self.arm_duck(&event);
@@ -5463,7 +5961,8 @@ impl AudioBackend for ScalarBackend {
         }
         self.ensure_fx_stage_state_pool(self.voices.capacity());
         self.ensure_fm_state_pool(self.voices.capacity());
-        self.pending.push(event);
+        self.pending
+            .push(event.map_kabel(CompactKabelControls::from));
     }
 
     fn process_block(&mut self, out: &mut [f32], frames: usize) {
@@ -5525,6 +6024,7 @@ impl AudioBackend for ScalarBackend {
         let missing_reverb_events = &mut self.missing_reverb_events;
         let voice_ceiling_drops = &mut self.voice_ceiling_drops;
         let pressure = &mut self.pressure;
+        let missing_kabel_events = &mut self.missing_kabel_events;
         let dispatch = self.dispatch;
         let supersaw_kernel = dispatch.supersaw();
         let wavetable_kernel = dispatch.wavetable();
@@ -5558,6 +6058,26 @@ impl AudioBackend for ScalarBackend {
                     // dense-but-sane score never reaches this.
                     *voice_ceiling_drops += 1;
                     pressure.voice_ceiling_drops = pressure.voice_ceiling_drops.saturating_add(1);
+                    #[cfg(feature = "device-audio")]
+                    if let (Some(consumer), Some(tag)) = (&mut *confirmations, confirmation) {
+                        consumer.activation(tag, crate::confirmation::ActivationOutcome::VoiceRefused);
+                    }
+                    return false;
+                }
+                if !kabel_available(&self.kabel_pool, &self.kabel_programs, &e.controls) {
+                    // Asset installs and onsets use independent SPSC queues. A
+                    // producer may publish this onset after this block's asset
+                    // snapshot. Keep it pending until the next install pass.
+                    // Its program identity remains protected from retirement.
+                    let deadline = kabel_controls(&e.controls)
+                        .map(|controls| (controls.end_secs.max(0.0) * sr).ceil() as u64)
+                        .max()
+                        .unwrap_or(e.onset_frame)
+                        .saturating_add(256);
+                    if start < deadline {
+                        return true;
+                    }
+                    *missing_kabel_events += 1;
                     #[cfg(feature = "device-audio")]
                     if let (Some(consumer), Some(tag)) = (&mut *confirmations, confirmation) {
                         consumer.activation(tag, crate::confirmation::ActivationOutcome::VoiceRefused);
@@ -5890,6 +6410,12 @@ impl AudioBackend for ScalarBackend {
                 if let Some(natural_stop_secs) = natural_stop_secs {
                     source_stop_secs = source_stop_secs.min(natural_stop_secs);
                 }
+                if let Some(end) = kabel_controls(&e.controls).map(|kabel| kabel.end_secs).reduce(f64::max) {
+                    // Worklets silence their outputs after their final quantum,
+                    // even if the underlying sample would have played longer.
+                    let end_frame = (end * sr / 128.0).ceil() * 128.0;
+                    source_stop_secs = ((end_frame - e.onset_frame as f64) / sr) as f32;
+                }
                 let stop_secs = stop_secs_for(
                     source_stop_secs,
                     has_filters || e.controls.vowel.is_some(),
@@ -6006,7 +6532,7 @@ impl AudioBackend for ScalarBackend {
                     | VoiceSource::Noise { .. }
                     | VoiceSource::One => false,
                 };
-                let stereo_source = source_stereo
+                let stereo_source = source_stereo || e.controls.kabel.is_some()
                 // A StereoPanner UPMIXES: a mono voice that reaches one comes
                 // out stereo, and everything after it is two channels. The
                 // mono chain carries a single sample and applies pan only at
@@ -6022,7 +6548,7 @@ impl AudioBackend for ScalarBackend {
                 // silences the decorrelation and leaves the wrong channel's
                 // wet signal in place.
                 || e.controls.fx_stages.iter().flatten().any(|stage| {
-                    stage.pan_x.is_some() || stage.room.is_some()
+                    stage.kabel.is_some() || stage.pan_x.is_some() || stage.room.is_some()
                 });
                 let mut voice_controls = e.controls;
                 if matches!(source, VoiceSource::Sbd { .. }) {
@@ -6059,6 +6585,7 @@ impl AudioBackend for ScalarBackend {
                     .saturating_add(u64::try_from(faded).unwrap_or(u64::MAX));
                 // Lease before the Voice literal so the FX-stage block can
                 // borrow the same pool without overlapping the main-chain pop.
+                let kabel = e.controls.kabel.map(|controls| lease_kabel(&mut self.kabel_pool, &self.kabel_programs, controls));
                 let stretch = e.controls.stretch.and_then(|_| self.stretch_pool.pop());
                 let fx_stage_state = if voice_controls.fx_stages.iter().all(Option::is_none) {
                     None
@@ -6077,8 +6604,18 @@ impl AudioBackend for ScalarBackend {
                     let stretch_pool = &mut self.stretch_pool;
                     let missed = &mut missed_stage_reverb;
 
+                    let mut source_is_mono = !source_stereo;
                     for (slot, stage) in stages.iter_mut().zip(voice_controls.fx_stages) {
-                        *slot = stage.map(|stage| FxStageState {
+                        *slot = stage.map(|stage| {
+                            if stage.kabel.is_some() {
+                                source_is_mono = false;
+                            }
+                            let stage_source_is_mono = source_is_mono;
+                            if stage.pan_x.is_some() || stage.room.is_some() {
+                                source_is_mono = false;
+                            }
+                            FxStageState {
+                            kabel: stage.kabel.map(|controls| lease_kabel(&mut self.kabel_pool, &self.kabel_programs, controls)),
                             controls: stage,
                             filters: {
                                 let mut chain = FilterChain::new(stage.filters, sample_rate);
@@ -6111,7 +6648,7 @@ impl AudioBackend for ScalarBackend {
                                     state
                                 })
                             }),
-                            source_is_mono: !source_stereo,
+                            source_is_mono: stage_source_is_mono,
                             stretch: stage.stretch.and_then(|_| stretch_pool.pop()),
                             transient: stage
                                 .transient
@@ -6173,7 +6710,7 @@ impl AudioBackend for ScalarBackend {
                                     }
                                 }
                             }),
-                        });
+                        }});
                     }
                     Some(stages)
                 };
@@ -6203,6 +6740,7 @@ impl AudioBackend for ScalarBackend {
                     delay_wet,
                     reverb_wet,
                     dry_gain: e.controls.dry.unwrap_or(1.0),
+                    kabel,
                     // Leased from the pool built at init. An exhausted pool
                     // means the voice plays without the vocoder rather than
                     // allocating FFT state under the callback deadline.
@@ -7490,11 +8028,18 @@ impl AudioBackend for ScalarBackend {
                     // the main gain, the vocoder's delay leads a gain that
                     // moves, and a nonlinear shaper hears the level it is
                     // given.
-                    let split_gain =
-                        (has_stages || stretched || v.transient.is_some()) && v.fx_post_gain != 0.0;
+                    let has_kabel = v.kabel.is_some()
+                        || v.fx_stage_state.as_ref().is_some_and(|stages| {
+                            stages.iter().flatten().any(|stage| stage.kabel.is_some())
+                        });
+                    let split_gain = has_kabel
+                        || (has_stages || stretched || v.transient.is_some())
+                            && v.fx_post_gain != 0.0;
                     // With no stages the split is invisible, so keep the
                     // single multiply the rest of the engine expects.
-                    let scale = if split_gain {
+                    let scale = if split_gain && v.fx_post_gain == 0.0 {
+                        0.0
+                    } else if split_gain {
                         v.amplitude_scale / v.fx_post_gain * env
                     } else {
                         v.amplitude_scale * env * live_gain
@@ -7515,11 +8060,15 @@ impl AudioBackend for ScalarBackend {
                                 v.hap_duration_secs,
                                 block_n,
                                 sr as f32,
+                                (abs / 128 * 128) as f64 / sr,
                                 transient_open && note_alive,
                                 lfo_live,
                                 &stage_adds,
                             );
                         }
+                    }
+                    if let Some(kabel) = &mut v.kabel {
+                        (wave_l, wave_r) = kabel.process(wave_l, (abs / 128 * 128) as f64 / sr, sr);
                     }
                     // Signal order: earlier .FX() stages -> vocoder ->
                     // transient shaper -> main gain -> filters -> ... ->
@@ -7963,6 +8512,7 @@ impl AudioBackend for ScalarBackend {
         let zzfx_pool = &mut self.zzfx_ring_pool;
         let stretch_pool = &mut self.stretch_pool;
         let fx_stage_state_pool = &mut self.fx_stage_state_pool;
+        let kabel_pool = &mut self.kabel_pool;
         let pressure = &mut self.pressure;
         self.voices.retain_mut(|v| {
             let age = (end.saturating_sub(v.start_frame)) as f32 / sr as f32;
@@ -7980,6 +8530,7 @@ impl AudioBackend for ScalarBackend {
                     zzfx_pool,
                     stretch_pool,
                     fx_stage_state_pool,
+                    kabel_pool,
                 );
                 false
             }
@@ -8138,7 +8689,7 @@ mod fm_carrier_tests {
     #[test]
     fn a_sine_carrier_past_nyquist_follows_its_unclamped_phase() {
         let tables = prepared_tables(RATE as u32);
-        let controls = VoiceRenderControls::from(OscillatorControls {
+        let controls = VoiceRenderControls::from(OscillatorControls::<crate::KabelControls> {
             waveform: Waveform::Sine,
             ..OscillatorControls::default()
         });
@@ -8214,7 +8765,7 @@ mod steady_oscillator_tests {
             (Waveform::Sine, Some(custom_wave())),
         ];
         for (waveform, partials) in voices {
-            let controls = VoiceRenderControls::from(OscillatorControls {
+            let controls = VoiceRenderControls::from(OscillatorControls::<crate::KabelControls> {
                 waveform,
                 partials,
                 ..OscillatorControls::default()
@@ -8315,7 +8866,7 @@ mod pending_event_tests {
     use super::PendingEvents;
     use crate::backend::OnsetEvent;
 
-    fn event(onset_frame: u64) -> OnsetEvent {
+    fn event(onset_frame: u64) -> OnsetEvent<crate::CompactKabelControls> {
         OnsetEvent::new(onset_frame, onset_frame as f32, 1.0, 0.1)
     }
 
@@ -8875,7 +9426,7 @@ mod source_gone_tests {
         let mut backend = ScalarBackend::prepared(RATE, 4).expect("backend");
         let pcm = DecodedSample::from_parts(RATE, 1, vec![0.5; RATE as usize * 4]).expect("pcm");
         assert!(backend.install_sample(id, Box::new(pcm)).is_ok());
-        assert!(backend.try_note_prepared(sample_event(id)));
+        assert!(backend.try_note_prepared(sample_event(id).into_prepared()));
 
         let sounding = render(&mut backend);
         assert!(
@@ -8918,7 +9469,7 @@ mod source_gone_tests {
             let pcm = DecodedSample::from_parts(RATE, 1, vec![0.5; RATE as usize]).expect("pcm");
             assert!(backend.install_sample(id, Box::new(pcm)).is_ok());
             backend.set_orbit_gains(&gains);
-            assert!(backend.try_note_prepared(sample_event(id)));
+            assert!(backend.try_note_prepared(sample_event(id).into_prepared()));
             let out = render(&mut backend);
             let peak = out
                 .iter()
@@ -8947,7 +9498,7 @@ mod source_gone_tests {
     #[test]
     fn a_voice_with_no_slot_never_starts() {
         let mut backend = ScalarBackend::prepared(RATE, 4).expect("backend");
-        let started = backend.try_note_prepared(sample_event(SampleId(9)));
+        let started = backend.try_note_prepared(sample_event(SampleId(9)).into_prepared());
         let _ = render(&mut backend);
         assert!(backend.voices.is_empty(), "started: {started}");
         assert!(render(&mut backend).iter().all(|sample| *sample == 0.0));
@@ -8993,7 +9544,7 @@ mod sample_resampling_mode_tests {
                 nudge_secs: 0.0,
                 cut: None,
             });
-            assert!(backend.try_note_prepared(event));
+            assert!(backend.try_note_prepared(event.into_prepared()));
             let mut output = [0.0; FRAMES * 2];
             backend.process_block(&mut output, FRAMES);
             output
@@ -9107,12 +9658,14 @@ mod sample_lifetime_tests {
         decoded: DecodedSample,
         audible_after_secs: f32,
     ) {
-        let (id, end_frame) = queued(event).sample_end_frame(&decoded, RATE).unwrap();
+        let (id, end_frame) = queued(event.clone())
+            .sample_end_frame(&decoded, RATE)
+            .unwrap();
         assert_eq!(id, ID);
         let audible_after = event.onset_frame + (audible_after_secs * RATE as f32).ceil() as u64;
         let mut backend = ScalarBackend::prepared(RATE, 4).expect("backend");
         assert!(backend.install_sample(id, Box::new(decoded)).is_ok());
-        assert!(backend.try_note_prepared(event));
+        assert!(backend.try_note_prepared(event.into_prepared()));
         let mut frame = 0;
         let mut sounded_late = false;
         let mut output = [0.0; BLOCK * 2];
@@ -9141,7 +9694,9 @@ mod sample_lifetime_tests {
         sample.reversed = true;
         sample.nudge_secs = 0.3;
         event.controls.envelope.release_secs = 0.05;
-        let (_, end_frame) = queued(event).sample_end_frame(&decoded, RATE).unwrap();
+        let (_, end_frame) = queued(event.clone())
+            .sample_end_frame(&decoded, RATE)
+            .unwrap();
         let lifetime = (end_frame - event.onset_frame) as f64 / f64::from(RATE);
         // A 5/8 slice of a one-second source at quarter speed gates for 2.5 s,
         // regardless of its 0.1 s source hap, then takes its release and ring.
@@ -9163,7 +9718,9 @@ mod sample_lifetime_tests {
             frequency_hz: 800.0,
             q: 2.0,
         });
-        let (_, end_frame) = queued(event).sample_end_frame(&decoded, RATE).unwrap();
+        let (_, end_frame) = queued(event.clone())
+            .sample_end_frame(&decoded, RATE)
+            .unwrap();
         let lifetime = (end_frame - event.onset_frame) as f64 / f64::from(RATE);
         // The remaining 0.1 s takes 0.2 s at half speed, beginning at 0.3 s.
         assert!((0.515..0.52).contains(&lifetime), "{lifetime}");
@@ -9185,7 +9742,9 @@ mod sample_lifetime_tests {
                 event.sample = None;
                 event.wavetable = Some(wavetable());
             }
-            let (_, end_frame) = queued(event).sample_end_frame(&decoded, RATE).unwrap();
+            let (_, end_frame) = queued(event.clone())
+                .sample_end_frame(&decoded, RATE)
+                .unwrap();
             let lifetime = (end_frame - event.onset_frame) as f64 / f64::from(RATE);
             assert!((0.565..0.57).contains(&lifetime), "{lifetime}");
             assert_rendered_lifetime(event, decoded.clone(), 0.45);
@@ -9246,7 +9805,7 @@ mod sbd_signal_path_tests {
 
     fn render(sample_rate: u32, gain: f32, frames: usize) -> Vec<f32> {
         let mut backend = ScalarBackend::prepared(sample_rate, 1).expect("SBD backend");
-        assert!(backend.try_note_prepared(event(gain)));
+        assert!(backend.try_note_prepared(event(gain).into_prepared()));
         let mut output = vec![0.0; frames * 2];
         backend.process_block(&mut output, frames);
         output.into_iter().step_by(2).collect()
@@ -9263,7 +9822,7 @@ mod sbd_signal_path_tests {
         hit.onset_frame = ONSET;
         hit.generation = 1;
         let mut backend = ScalarBackend::prepared(48_000, 2).expect("backend");
-        assert!(backend.try_note_prepared(hit));
+        assert!(backend.try_note_prepared(hit.into_prepared()));
         assert!(!backend.kept_onset_stands_for(ONSET, 2, true), "pending");
         // 150 ms: the graph is running, 50 ms before its source starts.
         let mut output = vec![0.0; 7_200 * 2];
@@ -9293,7 +9852,7 @@ mod sbd_signal_path_tests {
         hit.onset_frame = ONSET;
         hit.generation = 1;
         let mut backend = ScalarBackend::prepared(48_000, 2).expect("backend");
-        assert!(backend.try_note_prepared(hit));
+        assert!(backend.try_note_prepared(hit.into_prepared()));
         let mut output = vec![0.0; 7_200 * 2];
         backend.process_block(&mut output, 7_200);
         backend.hand_over_from(2, ONSET + 2, 7_200);
@@ -9313,7 +9872,7 @@ mod sbd_signal_path_tests {
         let mut hit = OnsetEvent::new(ONSET, 220.0, 0.5, 1.0);
         hit.generation = 1;
         let mut backend = ScalarBackend::prepared(48_000, 2).expect("backend");
-        assert!(backend.try_note_prepared(hit));
+        assert!(backend.try_note_prepared(hit.into_prepared()));
         let mut output = vec![0.0; 9_700 * 2];
         backend.process_block(&mut output, 9_700);
         backend.hand_over_from(2, ONSET + 1, 9_700);
@@ -9332,7 +9891,7 @@ mod sbd_signal_path_tests {
             let mut hit = event(1.0);
             hit.onset_frame = onset;
             hit.generation = 1;
-            assert!(backend.try_note_prepared(hit));
+            assert!(backend.try_note_prepared(hit.into_prepared()));
         }
         let mut output = vec![0.0; 7_300 * 2];
         backend.process_block(&mut output, 7_300);
@@ -9761,5 +10320,103 @@ mod wavetable_boundary_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod kabel_capacity_tests {
+    use super::*;
+
+    fn program(delays: usize) -> rustel_kabel::Program {
+        let mut nodes = vec![
+            r#"{"type":"n","value":0.25}"#.to_owned(),
+            r#"{"type":"n","value":0.001}"#.to_owned(),
+        ];
+        for _ in 0..delays {
+            nodes.push(r#"{"type":"delay","inputs":[0,1]}"#.into());
+        }
+        nodes.push(format!(
+            r#"{{"type":"output","inputs":[{}]}}"#,
+            if delays == 0 { 0 } else { nodes.len() - 1 }
+        ));
+        rustel_kabel::Program::from_json(&format!(r#"{{"nodes":[{}]}}"#, nodes.join(","))).unwrap()
+    }
+
+    fn full_idle_pool() -> ScalarBackend {
+        let mut backend = ScalarBackend {
+            sample_rate: 1000,
+            ..ScalarBackend::default()
+        };
+        let code = program(0);
+        for _ in 0..MAX_KABEL_GRAPHS {
+            assert!(
+                backend
+                    .install_kabel(Box::new(rustel_kabel::Graph::new(&code, 1000.0).unwrap()))
+                    .is_none()
+            );
+        }
+        backend
+    }
+
+    #[test]
+    fn offline_idle_capacity_recovers_for_larger_graphs() {
+        let mut backend = full_idle_pool();
+        let delay = program(1);
+        backend
+            .prepare_kabel_programs(&[&delay])
+            .expect("idle capacity is replaceable");
+        assert_eq!(backend.kabel_count, MAX_KABEL_GRAPHS);
+        assert!(
+            backend
+                .kabel_pool
+                .iter()
+                .any(|graph| graph.can_reuse(&delay))
+        );
+    }
+
+    #[test]
+    fn offline_eviction_preserves_used_slots_when_pool_moves() {
+        let mut backend = full_idle_pool();
+        let two = program(2);
+        let one = program(1);
+        backend.prepare_kabel_programs(&[&two]).unwrap();
+        backend.prepare_kabel_programs(&[&two, &one, &two]).unwrap();
+        for code in [&two, &two, &one] {
+            let index = backend
+                .kabel_pool
+                .iter()
+                .position(|graph| graph.can_reuse(code))
+                .expect("independent state for every stage");
+            let graph = backend.kabel_pool.swap_remove(index);
+            assert!(graph.can_reuse(code));
+        }
+    }
+
+    #[test]
+    fn offline_eviction_keeps_previously_admitted_future_capacity() {
+        let mut backend = full_idle_pool();
+        let plain = program(0);
+        let mut future = OnsetEvent::new(100_000, 440.0, 0.5, 1.0);
+        future.controls.kabel = Some(crate::KabelControls {
+            program: plain.into(),
+            start_secs: 100.0,
+            gate_end_secs: 101.0,
+            end_secs: 101.0,
+        });
+        backend.prepare_kabel_code(&future.controls).unwrap();
+        for _ in 0..MAX_KABEL_GRAPHS {
+            backend
+                .pending
+                .push(future.clone().map_kabel(CompactKabelControls::from));
+        }
+        let delay = program(1);
+        assert!(backend.prepare_kabel_programs(&[&delay]).is_err());
+        assert_eq!(backend.kabel_pool.len(), MAX_KABEL_GRAPHS);
+        assert!(
+            backend
+                .kabel_pool
+                .iter()
+                .all(|graph| graph.can_reuse(&plain))
+        );
     }
 }

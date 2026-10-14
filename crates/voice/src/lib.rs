@@ -1571,6 +1571,7 @@ mod tests {
             "delay": 0.5, "room": 0.6
         }]}"#,
         )[0]
+        .clone()
         .expect("the stage resolved");
 
         assert!(stage.vowel.is_some(), "vowel was dropped");
@@ -1597,6 +1598,7 @@ mod tests {
             &BundledOnly,
         )
         .expect("resolve")[0]
+            .clone()
             .expect("the stage still exists");
         assert!((stage.gain - 0.8).abs() < 1e-6, "got {}", stage.gain);
     }
@@ -1614,6 +1616,7 @@ mod tests {
                 &BundledOnly,
             )
             .expect("resolve")[0]
+                .as_ref()
                 .expect("stage")
                 .tremolo
                 .expect("tremolo")
@@ -1635,14 +1638,14 @@ mod tests {
         assert!(none.iter().all(Option::is_none), "no FX means no stages");
 
         let two = stages(r#"{"s": "sine", "FX": [{"coarse": 4}, {"cutoff": 500, "gain": 0.5}]}"#);
-        let first = two[0].expect("first stage");
+        let first = two[0].as_ref().expect("first stage");
         assert_eq!(first.coarse, Some(4.0));
         assert!(
             (first.gain - 0.8).abs() < 1e-6,
             "an unnamed gain is 0.8, not 1: got {}",
             first.gain
         );
-        let second = two[1].expect("second stage");
+        let second = two[1].as_ref().expect("second stage");
         assert!((second.gain - 0.5).abs() < 1e-6);
         assert_eq!(
             second.filters.lowpass.map(|f| f.frequency_hz),
@@ -1656,8 +1659,8 @@ mod tests {
         let many = stages(
             r#"{"s": "sine", "FX": [{"coarse": 2}, {"coarse": 3}, {"coarse": 4}, {"coarse": 5}]}"#,
         );
-        assert_eq!(many[0].and_then(|s| s.coarse), Some(2.0));
-        assert_eq!(many[2].and_then(|s| s.coarse), Some(4.0));
+        assert_eq!(many[0].as_ref().and_then(|s| s.coarse), Some(2.0));
+        assert_eq!(many[2].as_ref().and_then(|s| s.coarse), Some(4.0));
         assert_eq!(many.len(), rustel_audio::MAX_FX_STAGES);
     }
 
@@ -2378,7 +2381,18 @@ fn resolve_voice_at(
             let modulator_release = optional_f64(object.get("release"), "release")?
                 .unwrap_or(0.01)
                 .max(optional_f64(object.get("FXrelease"), "FXrelease")?.unwrap_or(0.0));
+            let kabel_end = target_time + duration_secs + modulator_release;
+            let kabel =
+                kabel_controls(object, target_time, target_time + duration_secs, kabel_end)?;
+            let mut stages = fx_stages(object, target_time, musical_time, cps, samples)?;
+            for stage in stages.iter_mut().flatten() {
+                if let Some(kabel) = &mut stage.kabel {
+                    kabel.gate_end_secs = target_time + duration_secs;
+                    kabel.end_secs = kabel_end;
+                }
+            }
             let controls = rustel_audio::OscillatorControls {
+                kabel,
                 preview_epoch: 0,
                 choke_only: false,
                 piano: false,
@@ -2456,7 +2470,7 @@ fn resolve_voice_at(
                 phaser: phaser_controls(object, target_time)?,
                 // The shaper is built whenever `transient` is
                 // present, letting `transsustain` default to 0.
-                fx_stages: fx_stages(object, target_time, musical_time, cps, samples)?,
+                fx_stages: stages,
                 transient: transient_controls(object)?,
                 tremolo: tremolo_controls(object, musical_time, cps)?,
                 vowel: vowel_controls(object)?,
@@ -5638,6 +5652,33 @@ fn diode_controls(value: serde_json::Value) -> Result<rustel_audio::DistortContr
     })
 }
 
+fn kabel_controls(
+    object: &serde_json::Map<String, serde_json::Value>,
+    start_secs: f64,
+    gate_end_secs: f64,
+    end_secs: f64,
+) -> Result<Option<rustel_audio::KabelControls>, String> {
+    let Some(graph) = object.get("workletGraph") else {
+        if object.contains_key("workletSrc") {
+            return Err("KabelSalat worklet source was not compiled by the score runtime".into());
+        }
+        return Ok(None);
+    };
+    let graph = graph
+        .as_str()
+        .ok_or("workletGraph must be a serialized KabelSalat graph")?;
+    let program = rustel_audio::rustel_kabel::Program::from_json(graph)?;
+    if !start_secs.is_finite() || !gate_end_secs.is_finite() || !end_secs.is_finite() {
+        return Err("KabelSalat worklet timing must be finite".into());
+    }
+    Ok(Some(rustel_audio::KabelControls {
+        program: std::sync::Arc::new(program),
+        start_secs,
+        gate_end_secs,
+        end_secs,
+    }))
+}
+
 /// One `.FX(...)` stage - a complete per-voice effects chain per entry of
 /// `FX`.
 fn fx_stage_controls(
@@ -5659,6 +5700,7 @@ fn fx_stage_controls(
     let gain = optional_f64(object.get("gain"), "gain")?.unwrap_or(0.8)
         * optional_f64(object.get("velocity"), "velocity")?.unwrap_or(1.0);
     Ok(rustel_audio::FxStage {
+        kabel: kabel_controls(object, target_time, target_time, target_time)?,
         gain: checked_f32(gain, "gain")?,
         filters: filter_controls(object)?,
         stretch: optional_f64(object.get("stretch"), "stretch")?
@@ -5708,7 +5750,7 @@ fn fx_stages(
     cps: f64,
     samples: &dyn SampleLookup,
 ) -> Result<[Option<rustel_audio::FxStage>; rustel_audio::MAX_FX_STAGES], String> {
-    let mut stages = [None; rustel_audio::MAX_FX_STAGES];
+    let mut stages = [const { None }; rustel_audio::MAX_FX_STAGES];
     let Some(serde_json::Value::Array(entries)) = object.get("FX") else {
         return Ok(stages);
     };
@@ -6707,7 +6749,7 @@ mod lfo_time_base_tests {
         )
         .expect("resolve");
         let controls = &event.controls;
-        let stage = controls.fx_stages[0].expect("stage");
+        let stage = controls.fx_stages[0].as_ref().expect("stage");
         let phase0 = |pick: &dyn Fn(&rustel_audio::LfoMod) -> bool| {
             let lfo = controls.lfos.iter().flatten().find(|lfo| pick(lfo));
             lfo.expect("lfo").phase0

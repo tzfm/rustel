@@ -1198,7 +1198,7 @@ pub struct MenuContext<'a> {
     pub can_undo: bool,
     pub can_redo: bool,
     pub has_selection: bool,
-    /// The caret is somewhere the smart action has an answer for.
+    /// The caret is somewhere the quick action has an answer for.
     pub can_smart_action: bool,
     /// The scene on screen is played from its own cycle zero.
     pub scene_rewinds: bool,
@@ -1474,7 +1474,7 @@ pub fn menus(cx: &MenuContext) -> Vec<Menu> {
             // the footer.
             MenuItem::action(
                 MenuAction::SmartAction,
-                "Smart action\u{2026}",
+                "Quick action\u{2026}",
                 'a',
                 hint(BindAction::SmartAction),
             )

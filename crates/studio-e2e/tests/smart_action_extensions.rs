@@ -107,7 +107,7 @@ fn a_value_outside_the_range_is_pulled_in_and_said() {
         !studio
             .rows()
             .iter()
-            .any(|row| row.contains("⌘ smart action") || row.contains("value pulled")),
+            .any(|row| row.contains("⌘ quick action") || row.contains("value pulled")),
         "written and away: the form is gone:\n{}",
         studio.screen()
     );
@@ -168,7 +168,7 @@ fn a_half_typed_slider_is_finished_by_the_form() {
 
         studio.press(KeyCode::Char('j'), KeyModifiers::CONTROL);
         assert!(
-            studio.status().starts_with("smart action: Enter chooses"),
+            studio.status().starts_with("quick action: Enter chooses"),
             "the started call is offered, not refused ({before}): {}",
             studio.status()
         );

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- KabelSalat guide tests read examples with Unix or Windows line endings.
+- Methods defined through aliases such as `const rg = register` pass score checks and remain available in later updates.
+- Studio names the caret menu Quick action. Theme and score save confirmations clear after five seconds.
+- `K(...)` runs KabelSalat synths and effects through a Rust graph builder and audio engine. Supports patterned inputs, polyphony, feedback and `.FX(K(...))`. See [KabelSalat graphs](https://github.com/tzfm/rustel/blob/main/docs/kabelsalat.md) for examples and limits.
+- Custom KabelSalat methods such as `.fm(...)` keep their arguments inside the graph. Calls with local variables no longer fail with an undefined variable error.
+- The corpus includes ten published KabelSalat scores with source links, author credits and AGPL-3.0-or-later notices.
+- Studio reference and completion include KabelSalat functions, node methods and inputs under `tag:kabelsalat`. Help inside `K(...)` uses graph definitions. Underscore bypass methods appear only when searched with `_` or `tag:bypass`. Settings > Reference > KabelSalat hides these entries from suggestions and browsing.
 - The lint no longer reports `unknown bank "gm_pad"` on a working score. The bank check read the sample banks but not the General MIDI names, which are the only holders of banks such as `gm_pad`. The score played either way, and `s("halo").bank("gm_pad")` and `s("gm_pad_halo")` now lint the same.
 - Studio no longer pauses animated themes during the first sample-library refresh.
 
