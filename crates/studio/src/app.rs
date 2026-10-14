@@ -11706,6 +11706,77 @@ mod tests {
                 "a load that holds nothing is not a wait"
             );
         }
+
+        /// While a job runs, the word keeps saying what the transport is
+        /// doing - an evaluation is a job, not a transport state - and the
+        /// logo dot lights for it: brief work is seen without a word ever
+        /// changing.
+        #[test]
+        fn while_evaluating_the_word_stays_and_the_dot_lights() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let scene = app.scenes.current().id;
+            let in_flight = |app: &mut App, scene: SceneId| {
+                app.inflight.insert(
+                    7,
+                    PendingEvaluation {
+                        request_id: 7,
+                        scene,
+                        editor_revision: app.editor().revision(),
+                        source: Arc::from("$: s(\"kick\")"),
+                        launch: Launch::Now,
+                        rewind: false,
+                        record: true,
+                    },
+                );
+                app.evaluating_since = Some(Instant::now());
+            };
+
+            // Playing, an update in flight.
+            app.snapshot = Some(sounding(true, false));
+            in_flight(&mut app, scene);
+            assert!(app.is_evaluating());
+            let buffer = frame(&mut app, 80);
+            let y = header_y(&buffer);
+            let row = row_text(&buffer, y);
+            assert!(row.contains("PLAYING"), "{row}");
+            assert!(!row.contains("EVALUATING"), "{row}");
+            assert_eq!(
+                buffer[(1, y)].symbol(),
+                crate::terminal::symbol("●"),
+                "the dot lights for the work"
+            );
+
+            // The answer lands: the beat pulse returns to the same cell,
+            // whatever the cycle says it looks like.
+            app.inflight.clear();
+            app.evaluating_since = None;
+            let buffer = frame(&mut app, 80);
+            let y = header_y(&buffer);
+            let beat = view::beat_pulse(
+                true,
+                app.snapshot.as_ref().map(|snapshot| snapshot.cycle),
+                &app.theme,
+            );
+            assert_eq!(buffer[(1, y)].symbol(), beat.0, "the beat returns");
+            assert_eq!(buffer[(1, y)].fg, beat.1, "in the beat's colour");
+
+            // Stopped, the first update in flight: the word keeps saying
+            // STOPPED rather than swapping to a word too brief to read.
+            app.snapshot = Some(sounding(false, false));
+            in_flight(&mut app, scene);
+            let buffer = frame(&mut app, 80);
+            let y = (0..buffer.area.height)
+                .find(|y| row_text(&buffer, *y).contains("STOPPED"))
+                .expect("the header is drawn");
+            let row = row_text(&buffer, y);
+            assert!(!row.contains("EVALUATING"), "{row}");
+            assert_eq!(
+                buffer[(1, y)].symbol(),
+                crate::terminal::symbol("●"),
+                "the dot lights while stopped too"
+            );
+        }
     }
     mod log_panel {
         //! Tests for `app/log_panel.rs`.
