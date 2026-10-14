@@ -5,13 +5,14 @@
 //! the plugin list, or with [`scan_in_background`]. Before this, the
 //! process loads no plugin code.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use rustel_audio::{InsertControls, InsertKey, InsertSlot};
+use rustel_transpiler::LaneStatement;
 pub use rustel_vst3::{Host, ParamInfo, PluginInfo, Resolved, Status, canonical, serve};
 
 /// Folders with plugins, in place of the standard VST3 folders of the
@@ -229,9 +230,288 @@ fn text_chains(source: &str) -> Vec<(Signature, bool)> {
     chains.map(signature).collect()
 }
 
+/// A lane of a score: a labeled statement, or a score with no label.
+struct Lane {
+    /// The number stays while an edit keeps the lane in the text.
+    number: u64,
+    label: String,
+    body: String,
+}
+
+/// The lanes of the scores of one session.
+///
+/// An edit gives a lane a new place, a new label, a mute mark or a new
+/// body. The lane keeps its number through such an edit: see [`pair`]. A
+/// plugin note of a labeled statement carries the number, so the owner of
+/// its chain keeps its lane: see [`ChainOwner`].
+#[derive(Default)]
+pub(crate) struct LaneTable {
+    /// The lanes of the score in play, in text order.
+    lanes: Vec<Lane>,
+    /// The last text the session read that is not in play, with its lanes.
+    /// A new lane then keeps its number from one try of an edit to the
+    /// next.
+    candidate: Option<(String, Vec<Lane>)>,
+    /// The lanes of the score the output plays, until the output plays the
+    /// score in play. A rollback puts that score back. Each of its lanes
+    /// then keeps its number.
+    audible: Vec<Lane>,
+    /// True when the output plays the score in play.
+    heard: bool,
+    /// The number of the next new lane. No number comes a second time.
+    next: u64,
+}
+
+impl LaneTable {
+    /// Reads the lanes of a score text before its evaluation. Gives the
+    /// lane number of each labeled statement, in text order, for
+    /// [`rustel_transpiler::TranspileOptions::lane_numbers`]. A text with
+    /// no scan gets no numbers and changes no lane, also when it goes in
+    /// play.
+    pub(crate) fn read(&mut self, source: &str) -> Vec<u64> {
+        let Some(statements) = rustel_transpiler::lane_statements(source) else {
+            self.candidate = None;
+            return Vec::new();
+        };
+        let tried = self.candidate.as_ref();
+        let tried = tried.map_or(&[][..], |(_, lanes)| lanes);
+        let paired = pair(&statements, &self.lanes, tried, &self.audible);
+        let lane = |(statement, number): (LaneStatement, Option<u64>)| Lane {
+            number: number.unwrap_or_else(|| {
+                self.next += 1;
+                self.next - 1
+            }),
+            label: statement.label,
+            body: statement.body,
+        };
+        let lanes: Vec<Lane> = statements.into_iter().zip(paired).map(lane).collect();
+        // A score with no label has no statement that carries a number.
+        let labeled = lanes.iter().filter(|lane| !lane.label.is_empty());
+        let numbers = labeled.map(|lane| lane.number).collect();
+        self.candidate = Some((source.to_owned(), lanes));
+        numbers
+    }
+
+    /// The score with the text `source` goes in play: the lanes of the last
+    /// read are now the lanes of the score in play. A read of a different
+    /// text changes nothing here. A score with no read, such as a
+    /// mini-notation score, has no lanes of its own. The lanes of the score
+    /// before stay for a rollback when the output plays that score: see
+    /// [`Self::mark_audible`].
+    pub(crate) fn install(&mut self, source: &str) {
+        let read = self.candidate.take_if(|(text, _)| text == source);
+        if let Some((_, lanes)) = read {
+            let before = std::mem::replace(&mut self.lanes, lanes);
+            // The output plays the score before until it plays this one.
+            if std::mem::take(&mut self.heard) {
+                self.audible = before;
+            }
+        }
+    }
+
+    /// The output plays the score in play. A rollback then puts this score
+    /// back, so the lanes of the score before go.
+    #[cfg(any(feature = "device-audio", test))]
+    pub(crate) fn mark_audible(&mut self) {
+        self.heard = true;
+        self.audible.clear();
+    }
+
+    /// Forgets the last read. The label rewrite did not use its lane
+    /// numbers, so no note carries them. A commit of that text then changes
+    /// no lane of the score in play.
+    pub(crate) fn forget_read(&mut self) {
+        self.candidate = None;
+    }
+}
+
+/// What rule 1, 2 or 3 of [`pair`] compares. A statement and a lane with
+/// the same key fit the rule. `None` for a label that rule 3 does not pair.
+fn rule_key<'a>(rule: u8, label: &'a str, body: &'a str) -> Option<(&'a str, &'a str)> {
+    match rule {
+        1 => Some((label, body)),
+        2 => Some(("", body)),
+        _ => {
+            // `_lead` and `lead_` are the lane `lead` with a mute mark.
+            let name = label.trim_matches('_');
+            (name != "$").then_some((name, ""))
+        }
+    }
+}
+
+/// The most pairs of a statement and a lane that rule 4 of [`pair`]
+/// compares: 512 statements with 512 lanes. The compare runs before each
+/// evaluation, so its time has a limit. With more pairs, each statement
+/// that rules 1 to 3 did not pair is a new lane.
+const MAX_LANE_PAIRS: usize = 1 << 18;
+
+/// Gives each statement of a new score text its lane.
+///
+/// `playing` has the lanes of the score in play. `tried` has the lanes of
+/// the last text the session read. It gives only its new lanes: a text that
+/// did not go in play moves no lane of the score in play. `audible` has the
+/// lanes of the score the output plays, when that score is not in play. It
+/// gives a lane by rule 1 only: a rollback reads the text of that score
+/// again. The result has the number of the lane of each statement, or
+/// `None` for a new lane. A statement takes a lane by the first rule that
+/// fits:
+///
+/// ```text
+///   1. the same label and the same body
+///   2. the same body: the label is new, or has a new mark
+///   3. the same label name, with no `_` at its ends: the body is new.
+///      Not for `$`: this label names no lane.
+///   4. the 2 bodies name the same plugin, or their equal start plus
+///      their equal end is half of the shorter body or more
+/// ```
+///
+/// Rules 1 to 3 pair in text order: see [`in_order`]. In rule 4 the best
+/// pair goes first: the most plugin names in common, then the most equal
+/// bytes, then the nearest place. An edited lane then keeps its number
+/// when a new lane comes above it in the same edit. A statement with no
+/// pair is a new lane, and a lane with no pair left the score.
+fn pair(
+    statements: &[LaneStatement],
+    playing: &[Lane],
+    tried: &[Lane],
+    audible: &[Lane],
+) -> Vec<Option<u64>> {
+    let mut numbers: Vec<Option<u64>> = vec![None; statements.len()];
+    // The numbers with a statement, and the numbers of the score in play.
+    let mut taken = HashSet::new();
+    let kept: HashSet<u64> = playing.iter().map(|lane| lane.number).collect();
+    // True for a lane with no statement yet. `tried` gives its new lanes
+    // only.
+    let free = |taken: &HashSet<u64>, lane: &Lane, new_only: bool| {
+        let kept = new_only && kept.contains(&lane.number);
+        !(kept || taken.contains(&lane.number))
+    };
+    let known = [(playing, false), (tried, true)];
+    for rule in 1..=3 {
+        let heard = (rule == 1).then_some((audible, false));
+        for (lanes, new_only) in known.into_iter().chain(heard) {
+            // The places of the lanes and of the statements with no pair
+            // yet, by key.
+            let mut olds: HashMap<_, Vec<usize>> = HashMap::new();
+            for (place, lane) in lanes.iter().enumerate() {
+                let key = rule_key(rule, &lane.label, &lane.body);
+                if let Some(key) = key.filter(|_| free(&taken, lane, new_only)) {
+                    olds.entry(key).or_default().push(place);
+                }
+            }
+            let mut news: HashMap<_, Vec<usize>> = HashMap::new();
+            for (place, statement) in statements.iter().enumerate() {
+                let key = rule_key(rule, &statement.label, &statement.body);
+                let open = numbers[place].is_none();
+                if let Some(key) = key.filter(|key| open && olds.contains_key(key)) {
+                    news.entry(key).or_default().push(place);
+                }
+            }
+            for (key, news) in news {
+                for (new, old) in in_order(&news, &olds[&key]) {
+                    numbers[new] = Some(lanes[old].number);
+                    taken.insert(lanes[old].number);
+                }
+            }
+        }
+    }
+    // Rule 4. The statements and the lanes with no pair yet.
+    let open: Vec<usize> = (0..statements.len())
+        .filter(|at| numbers[*at].is_none())
+        .collect();
+    let mut left = Vec::new();
+    for (lanes, new_only) in known {
+        let lanes = lanes.iter().enumerate();
+        left.extend(lanes.filter(|(_, lane)| free(&taken, lane, new_only)));
+    }
+    let count = open.len().saturating_mul(left.len());
+    if count == 0 || count > MAX_LANE_PAIRS {
+        return numbers;
+    }
+    let left: Vec<(usize, &Lane, Vec<String>)> = left
+        .into_iter()
+        .map(|(place, lane)| (place, lane, plugin_names(&lane.body)))
+        .collect();
+    let mut pairs = Vec::new();
+    for at in open {
+        let statement = &statements[at];
+        let names = plugin_names(&statement.body);
+        for (place, lane, theirs) in &left {
+            let shared = names.iter().filter(|name| theirs.contains(name)).count();
+            let equal = equal_ends(&statement.body, &lane.body);
+            let shorter = statement.body.len().min(lane.body.len());
+            if shared > 0 || (shorter > 0 && 2 * equal >= shorter) {
+                let nearest = place.abs_diff(at);
+                let order = (std::cmp::Reverse(shared), std::cmp::Reverse(equal), nearest);
+                pairs.push((order, at, lane.number));
+            }
+        }
+    }
+    // Pairs of the same order stay in text order.
+    pairs.sort_by_key(|(order, ..)| *order);
+    for (_, at, number) in pairs {
+        if numbers[at].is_none() && taken.insert(number) {
+            numbers[at] = Some(number);
+        }
+    }
+    numbers
+}
+
+/// Pairs the statements and the lanes that fit one rule, each as its place
+/// in its text. No pair crosses a pair, so lanes with equal text keep their
+/// order: the k-th statement takes the k-th lane when the 2 lists have the
+/// same length. If not, each place of the shorter list takes the nearest
+/// place of the longer list that leaves a place for each place after it.
+fn in_order(news: &[usize], olds: &[usize]) -> Vec<(usize, usize)> {
+    let flip = news.len() > olds.len();
+    let (short, long) = if flip { (olds, news) } else { (news, olds) };
+    let mut pairs = Vec::with_capacity(short.len());
+    let mut at = 0;
+    for (count, place) in short.iter().enumerate() {
+        let last = long.len() - (short.len() - count);
+        // The longer list is in order: the next place is nearer until it
+        // is past this one.
+        while at < last && long[at + 1].abs_diff(*place) < long[at].abs_diff(*place) {
+            at += 1;
+        }
+        pairs.push(if flip {
+            (long[at], *place)
+        } else {
+            (*place, long[at])
+        });
+        at += 1;
+    }
+    pairs
+}
+
+/// The count of the bytes that 2 lane bodies have in common at their start
+/// and at their end. No byte counts 2 times.
+fn equal_ends(one: &str, other: &str) -> usize {
+    let (one, other) = (one.as_bytes(), other.as_bytes());
+    let equal = |(byte, same): &(&u8, &u8)| byte == same;
+    let start = one.iter().zip(other).take_while(equal).count();
+    let rest = one.len().min(other.len()) - start;
+    let ends = one.iter().rev().zip(other.iter().rev());
+    start + ends.take(rest).take_while(equal).count()
+}
+
+/// The plugin names in the text of a lane body, in their compare form.
+fn plugin_names(body: &str) -> Vec<String> {
+    let mut names: Vec<String> = names_in_source(body)
+        .iter()
+        .map(|name| canonical(name))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// A chain owns its copies independently of the output orbit and controls.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct ChainOwner {
+    /// `#` and the lane number for a note of a labeled statement: see
+    /// [`LaneTable`]. The run-time name for a lane with no statement. Empty
+    /// for a note with no lane.
     lane: String,
     plugins: [Option<PluginOwner>; rustel_audio::EFFECT_CHAIN + 1],
 }
@@ -364,11 +644,12 @@ fn new_chain() -> u64 {
 /// the host.
 ///
 /// An edit of a score often gives a chain a new owner text and leaves the
-/// chain as it was: a `$:` lane above moves the lane number, a plugin call
-/// above moves the call number, and one more effect at the end makes the
-/// list longer. A new copy of each plugin for such an edit costs memory and
-/// load time, and the old copy plays on for a time. So an owner with a new
-/// text takes the number of a chain that the new score does not use:
+/// chain as it was: a plugin call above moves the call number, one more
+/// effect at the end makes the list longer, and a `.p("$")` call above
+/// moves the name of a lane with no statement. A new copy of each plugin
+/// for such an edit costs memory and load time, and the old copy plays on
+/// for a time. So an owner with a new text takes the number of a chain that
+/// the new score does not use:
 ///
 /// ```text
 ///   1. a chain with the same plugins, when the chains with these plugins
@@ -993,6 +1274,14 @@ mod tests {
         text_with_mutes(chains, 0)
     }
 
+    /// Reads a score text and puts the score in play. Gives the lane number
+    /// of each labeled statement.
+    fn play(lanes: &mut LaneTable, score: &str) -> Vec<u64> {
+        let numbers = lanes.read(score);
+        lanes.install(score);
+        numbers
+    }
+
     #[test]
     fn plugin_ownership_separates_patterns_and_survives_control_edits() {
         let mut registry = ChainRegistry::new();
@@ -1036,7 +1325,8 @@ mod tests {
 
     /// An edit that leaves a plugin call as it is keeps the chain of the
     /// call, and so its copies: a lane above, a mute, a call above, one
-    /// more effect at the end.
+    /// more effect at the end. The lanes here have no statement, so a lane
+    /// above moves their names.
     #[test]
     fn an_edit_keeps_the_chains_the_new_score_still_has() {
         let mut registry = ChainRegistry::new();
@@ -1051,7 +1341,7 @@ mod tests {
         assert_ne!(lead, bass);
         assert_eq!(registry.named(), [bass, lead]);
 
-        // A `$:` lane with no plugin above: each lane has a new number.
+        // A `$` lane with no plugin above: each lane has a new name.
         registry.score_changed(text(&[serum, zyklop]), start);
         assert_eq!(
             registry.id(owner("$1", &[], Some((0, "serum"))), start),
@@ -1226,46 +1516,82 @@ mod tests {
         assert_eq!(registry.named(), [after]);
     }
 
-    /// A muted lane makes no note. A new muted lane changes no chain of a
-    /// lane that plays. The chain of a muted lane serves the next lane that
-    /// needs its plugins.
+    /// A lane keeps its number through an edit. A muted lane makes no note.
+    /// A new muted lane changes no chain of a lane that plays. The chain of
+    /// a muted lane serves the next lane that needs its plugins.
     #[test]
     fn a_muted_lane_takes_no_chain_from_a_lane_that_plays() {
+        let mut lanes = LaneTable::default();
         let mut registry = ChainRegistry::new();
         let start = Instant::now();
         let serum: &[(bool, &str)] = &[(true, "serum")];
-        let lane = |lane: &str, call: u32| owner(lane, &[], Some((call, "serum")));
+        let lane = |lane: u64, call: u32| owner(&format!("#{lane}"), &[], Some((call, "serum")));
+        let lead = r#"$: note("c2").vsti("serum")"#;
+        assert_eq!(play(&mut lanes, lead), [0]);
         registry.score_changed(text(&[serum]), start);
-        let lead = registry.id(lane("$0", 0), start);
+        let chain = registry.id(lane(0, 0), start);
 
-        // A new muted lane above with the same plugin: its call moves the
-        // call number of the lane that plays, and that lane keeps its
-        // chain.
+        // A new muted lane above with the same plugin: the lane that plays
+        // keeps its number and its chain. Only its call number moves.
+        let muted = format!("_$: note(\"e2\").vsti(\"serum\")\n{lead}");
+        assert_eq!(play(&mut lanes, &muted), [1, 0]);
         registry.score_changed(text_with_mutes(&[serum, serum], 1), start);
-        assert_eq!(registry.id(lane("$0", 1), start), lead);
+        assert_eq!(registry.id(lane(0, 1), start), chain);
         assert!(registry.settle(start + CHAIN_GRACE).left.is_empty());
 
-        // The end of the mute: the lane never had a chain, so its chain is
-        // new. The lane that plays keeps its chain.
+        // The end of the mute: a mute mark changes no lane number. The lane
+        // never had a chain, so its chain is new.
+        let open = muted.replacen("_$", "$", 1);
+        assert_eq!(play(&mut lanes, &open), [1, 0]);
         registry.score_changed(text(&[serum, serum]), start);
-        let other = registry.id(lane("$0", 0), start);
-        assert_ne!(other, lead);
-        assert_eq!(registry.id(lane("$1", 1), start), lead);
+        let other = registry.id(lane(1, 0), start);
+        assert_ne!(other, chain);
+        assert_eq!(registry.id(lane(0, 1), start), chain);
 
         // The first lane has its mute again, and one more lane with the
-        // plugin comes: the 2 chains serve the 2 lanes that play.
+        // plugin comes: the chain of the muted lane serves the new lane.
+        let more = format!("{muted}\n$: note(\"g2\").vsti(\"serum\")");
+        assert_eq!(play(&mut lanes, &more), [1, 0, 2]);
         registry.score_changed(text_with_mutes(&[serum, serum, serum], 1), start);
-        let (first, second) = (
-            registry.id(lane("$0", 1), start),
-            registry.id(lane("$1", 2), start),
-        );
-        assert_ne!(first, second);
-        assert!([lead, other].contains(&first) && [lead, other].contains(&second));
+        assert_eq!(registry.id(lane(0, 1), start), chain);
+        assert_eq!(registry.id(lane(2, 2), start), other);
         assert!(registry.settle(start + CHAIN_GRACE).left.is_empty());
         // The end of that mute needs one chain more.
+        assert_eq!(play(&mut lanes, &more.replacen("_$", "$", 1)), [1, 0, 2]);
         registry.score_changed(text(&[serum, serum, serum]), start);
-        let third = registry.id(lane("$0", 0), start);
-        assert!(third != lead && third != other);
+        let third = registry.id(lane(1, 0), start);
+        assert!(third != chain && third != other);
+
+        // 2 lanes with equal text keep their order below a new lane, and an
+        // edit of the first one leaves the number of the second one.
+        let mut lanes = LaneTable::default();
+        let (hat, twin) = (r#"$: s("hh")"#, r#"$: s("bd").vst("ott")"#);
+        assert_eq!(play(&mut lanes, &format!("{twin}\n{twin}")), [0, 1]);
+        assert_eq!(
+            play(&mut lanes, &format!("{hat}\n{twin}\n{twin}")),
+            [2, 0, 1]
+        );
+        let score = format!("{hat}\n$: s(\"bd*2\").vst(\"ott\")\n{twin}");
+        assert_eq!(play(&mut lanes, &score), [2, 0, 1]);
+        // An edit of a lane and a new lane with its plugin above, in one
+        // evaluation: the edited lane keeps its number.
+        let score = format!(
+            "$: s(\"cp\").vst(\"ott\")\n{}",
+            score.replace("bd*2", "bd*4")
+        );
+        assert_eq!(play(&mut lanes, &score), [3, 2, 0, 1]);
+        // A new label, then a mute mark on it.
+        let score = score.replace(r#"$: s("bd*4")"#, r#"kick: s("bd*4")"#);
+        assert_eq!(play(&mut lanes, &score), [3, 2, 0, 1]);
+        assert_eq!(
+            play(&mut lanes, &score.replace("kick:", "_kick:")),
+            [3, 2, 0, 1]
+        );
+        // A score with no label is one lane, and keeps it with a label.
+        let mut lanes = LaneTable::default();
+        let bare = r#"note("c2").vsti("serum")"#;
+        assert!(play(&mut lanes, bare).is_empty());
+        assert_eq!(play(&mut lanes, &format!("score: {bare}")), [0]);
     }
 
     /// A text does not show a chain with its calls in 2 statements. Such a
@@ -1410,5 +1736,117 @@ mod tests {
             names_in_source(source),
             ["ott", "valhalla supermassive", "Serum 2"]
         );
+    }
+
+    /// The rules of [`pair`], each before the next one.
+    #[test]
+    fn a_statement_takes_its_lane_by_the_first_rule_that_fits() {
+        // Rule 1 before rule 2: a mute mark stays with its lane when 2 lanes
+        // with one body change places.
+        let mut lanes = LaneTable::default();
+        assert_eq!(play(&mut lanes, "$: s(\"bd\")\n_$: s(\"bd\")"), [0, 1]);
+        assert_eq!(play(&mut lanes, "_$: s(\"bd\")\n$: s(\"bd\")"), [1, 0]);
+        // Rule 2 before rule 3: the body is the lane when 2 lanes change
+        // labels.
+        let mut lanes = LaneTable::default();
+        let score = "lead: note(\"c e\")\nbass: note(\"c1\")";
+        assert_eq!(play(&mut lanes, score), [0, 1]);
+        let score = "lead: note(\"c1\")\nbass: note(\"c e\")";
+        assert_eq!(play(&mut lanes, score), [1, 0]);
+        // Rule 3: a new body under the label name, with a mute mark at
+        // each end. The label `$` is no name.
+        let score = "_lead: s(\"hh*8\")\nbass_: s(\"cp\")\n$: note(\"g\")";
+        assert_eq!(play(&mut lanes, score), [1, 0, 2]);
+        let score = score.replace("note(\"g\")", "s(\"sd*4\").gain(.5)");
+        assert_eq!(play(&mut lanes, &score), [1, 0, 3]);
+
+        // Rule 4: a lane with half of its text is the same lane. A lane
+        // with less is a new lane.
+        let mut lanes = LaneTable::default();
+        assert_eq!(play(&mut lanes, r#"$: note("c e g").lpf(800)"#), [0]);
+        assert_eq!(play(&mut lanes, r#"$: note("c e g a").lpf(800)"#), [0]);
+        assert_eq!(play(&mut lanes, r#"$: s("hh*8").gain(.5)"#), [1]);
+        assert_eq!(equal_ends("aaaa", "aaaaaa"), 4);
+        // A text with no code has no lane of the score before.
+        assert!(play(&mut lanes, "// later").is_empty());
+        assert_eq!(play(&mut lanes, r#"$: s("hh*8").gain(.5)"#), [3]);
+        // The pair with the most plugin names goes before the pair with the
+        // most equal bytes. A name ignores upper case.
+        let mut lanes = LaneTable::default();
+        let score = r#"$: note("c e").vsti("serum").vst("ott")"#;
+        assert_eq!(play(&mut lanes, score), [0]);
+        let score = "$: s(\"bd\").vsti(\"Serum\").vst(\"OTT\")\n$: note(\"c e\").vsti(\"serum\")";
+        assert_eq!(play(&mut lanes, score), [0, 1]);
+        // Then the nearest place: the last lane takes the lane at its place.
+        let mut lanes = LaneTable::default();
+        let score = "$: note(\"c\")\n$: note(\"e\")\n$: s(\"sd\")";
+        assert_eq!(play(&mut lanes, score), [0, 1, 2]);
+        let score = "$: s(\"hh\")\n$: note(\"e\")\n$: s(\"cp\")\n$: note(\"c\")";
+        assert_eq!(play(&mut lanes, score), [3, 1, 2, 0]);
+
+        // A text that does not go in play: its new lane keeps its number at
+        // the next read, also with an edit.
+        let mut lanes = LaneTable::default();
+        let (lead, clap) = (
+            r#"lead: note("c2").vsti("serum")"#,
+            r#"$: s("cp").vst("ott")"#,
+        );
+        assert_eq!(play(&mut lanes, lead), [0]);
+        let tried = format!("{lead}\n{clap}");
+        assert_eq!(lanes.read(&tried), [0, 1]);
+        assert_eq!(lanes.read(&tried.replace("cp", "cp*2")), [0, 1]);
+        // A score with no read takes no lanes of a different text.
+        lanes.install("bd sd");
+        assert_eq!(lanes.lanes.len(), 1);
+        assert_eq!(play(&mut lanes, &tried), [0, 1]);
+        // A text with no scan changes no lane when it goes in play.
+        let deep = format!(
+            "$: {}",
+            "(".repeat(rustel_transpiler::MAX_SOURCE_NESTING + 1)
+        );
+        assert!(play(&mut lanes, &deep).is_empty());
+        assert_eq!(play(&mut lanes, &tried), [0, 1]);
+        // A text that does not go in play moves no lane of the score in
+        // play: the lane that comes back keeps its number.
+        let tried = format!("{lead}\n$: s(\"hh\")");
+        assert_eq!(lanes.read(&tried), [0, 1]);
+        let back = format!("{tried}\n{}", clap.replace("cp", "cp*4"));
+        assert_eq!(lanes.read(&back), [0, 2, 1]);
+        // A read the label rewrite did not use changes no lane of the score
+        // in play: the lane this read did not see keeps its number.
+        lanes.read(lead);
+        lanes.forget_read();
+        lanes.install(lead);
+        assert_eq!(lanes.read(&format!("{lead}\n{clap}")), [0, 1]);
+
+        // The output plays a score. 2 scores after it are not audible: an
+        // edit of a lane, then a score with no such lane. A rollback gives
+        // each lane of the first score its number.
+        let mut lanes = LaneTable::default();
+        let (kick, serum) = (r#"$: s("bd")"#, r#"$: note("c2").vsti("serum")"#);
+        let score = format!("{kick}\n{serum}");
+        assert_eq!(play(&mut lanes, &score), [0, 1]);
+        lanes.mark_audible();
+        assert_eq!(play(&mut lanes, &score.replace("c2", "c2 e2")), [0, 1]);
+        assert_eq!(play(&mut lanes, kick), [0]);
+        assert_eq!(play(&mut lanes, &score), [0, 1]);
+        // The output plays the score with no such lane: the lane is new.
+        assert_eq!(play(&mut lanes, kick), [0]);
+        lanes.mark_audible();
+        assert_eq!(play(&mut lanes, &score), [0, 2]);
+
+        // An edit of each lane of a long score keeps each number. Past the
+        // limit of the compare, each statement is a new lane.
+        let long = |count: usize, tail: &str| -> String {
+            let lane = |at: usize| format!("$: s(\"bd\").n({at}){tail}\n");
+            (0..count).map(lane).collect()
+        };
+        for (count, first) in [(400, 0), (600, 600)] {
+            let mut lanes = LaneTable::default();
+            play(&mut lanes, &long(count, ""));
+            let numbers = play(&mut lanes, &long(count, ".gain(.5)"));
+            let kept: Vec<u64> = (first..first + count as u64).collect();
+            assert_eq!(numbers, kept);
+        }
     }
 }

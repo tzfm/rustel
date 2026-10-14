@@ -970,6 +970,19 @@ fn vst_names_are_text_and_values_are_patterns() {
         shown.contains("vst:[{name:Comp __rustel_binding:p1 params:{name:0.3}}]"),
         "{shown}"
     );
+
+    // A score with no label gives a note no lane. A plugin note of a labeled
+    // statement carries `#` and the number of its lane.
+    assert!(!shown.contains("__rustel_lane"), "{shown}");
+    let mut session = Session::new().expect("session");
+    session
+        .evaluate(r#"lead: note("c3").vsti("Synth One")"#)
+        .expect("a score with a lane");
+    let haps = session.query(Fraction::ZERO, Fraction::ONE).expect("query");
+    assert_eq!(
+        haps[0].value.show(),
+        "note:c3 vsti:{name:Synth One __rustel_binding:p0} __rustel_lane:#0"
+    );
 }
 
 #[test]

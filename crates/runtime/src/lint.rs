@@ -4777,7 +4777,7 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
     #[test]
     fn the_transpiled_output_names_every_pattern_strings_quote() {
         assert_eq!(
-            mini_string_offsets("s(m('bd [hh sd', 5)).gain(0.5).p('$');"),
+            mini_string_offsets("s(m('bd [hh sd', 5)).gain(0.5).p('$', 0);"),
             [5]
         );
         assert_eq!(

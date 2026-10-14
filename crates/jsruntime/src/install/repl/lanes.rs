@@ -10,11 +10,13 @@ const ANONYMOUS_INDEX: usize = 1;
 const ALL_TRANSFORM: usize = 2;
 const SILENCE: usize = 3;
 const STACK: usize = 4;
+/// The tag of each lane with a lane number, by lane name. See `collect`.
+const TAGS: usize = 5;
 
-fn new_patterns<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<rquickjs::Object<'js>> {
-    let patterns = rquickjs::Object::new(ctx.clone())?;
-    patterns.set_prototype(None)?;
-    Ok(patterns)
+fn bare_object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<rquickjs::Object<'js>> {
+    let object = rquickjs::Object::new(ctx.clone())?;
+    object.set_prototype(None)?;
+    Ok(object)
 }
 
 fn state<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<rquickjs::Array<'js>> {
@@ -49,8 +51,18 @@ fn collect<'js>(
             id = rquickjs::String::from_str(ctx.clone(), &name)?.into_value();
         }
     }
+    // The label rewrite gives a labeled statement its lane number as the
+    // second argument. The plugin notes of the lane then carry `#<number>`.
+    let tag = common::argument(&ctx, &args.0, 1)
+        .as_number()
+        .filter(|number| *number >= 0.0 && number.fract() == 0.0)
+        .map(|number| format!("#{}", number as u64));
     let patterns: rquickjs::Object = state.get(PATTERNS)?;
-    patterns.set(id, this.0.clone())?;
+    patterns.set(id.clone(), this.0.clone())?;
+    // With no number, this removes the tag of an earlier lane with the same
+    // name.
+    let tags: rquickjs::Object = state.get(TAGS)?;
+    tags.set(id, tag)?;
     Ok(this.0)
 }
 
@@ -64,7 +76,8 @@ fn quiet<'js>(
 
 fn reset<'js>(ctx: Ctx<'js>) -> rquickjs::Result<()> {
     let state = state(&ctx)?;
-    state.set(PATTERNS, new_patterns(&ctx)?)?;
+    state.set(PATTERNS, bare_object(&ctx)?)?;
+    state.set(TAGS, bare_object(&ctx)?)?;
     state.set(ANONYMOUS_INDEX, 0_u32)?;
     state.set(ALL_TRANSFORM, rquickjs::Value::new_null(ctx))
 }
@@ -82,6 +95,7 @@ fn finish<'js>(
 ) -> rquickjs::Result<rquickjs::Value<'js>> {
     let state = state(&ctx)?;
     let patterns: rquickjs::Object = state.get(PATTERNS)?;
+    let tags: rquickjs::Object = state.get(TAGS)?;
     let mut lanes = Vec::new();
     let mut solo_active = false;
     for entry in patterns.props::<String, rquickjs::Value>() {
@@ -93,7 +107,10 @@ fn finish<'js>(
         }
         if !solo_active || solo {
             let (pattern, sidecar) = reify_bridged(&ctx, &pattern)?;
-            // Only a plugin note carries the name of its lane. Each note
+            // A lane with no number has its name as tag.
+            let tag: Option<String> = tags.get(name.as_str())?;
+            let tag = tag.unwrap_or(name);
+            // Only a plugin note carries the tag of its lane. Each note
             // keeps its slider bindings.
             let pattern = pattern.fmap_keeping_live(move |value| {
                 let plugin = |controls: &rustel_core::OrderedMap| {
@@ -111,7 +128,7 @@ fn finish<'js>(
                 if !plugin(&controls) {
                     return None;
                 }
-                controls.insert("__rustel_lane".into(), Value::Str(name.clone()));
+                controls.insert("__rustel_lane".into(), Value::Str(tag.clone()));
                 Some(Value::Object(controls))
             });
             lanes.push(derive_wrapper(ctx.clone(), pattern, &[sidecar])?.into_value());
@@ -170,7 +187,7 @@ pub(super) fn install<'js>(
     state
         .set(
             PATTERNS,
-            new_patterns(ctx).map_err(|error| error.to_string())?,
+            bare_object(ctx).map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
     state
@@ -194,6 +211,9 @@ pub(super) fn install<'js>(
                 .get::<_, rquickjs::Value>("stack")
                 .map_err(|error| error.to_string())?,
         )
+        .map_err(|error| error.to_string())?;
+    state
+        .set(TAGS, bare_object(ctx).map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())?;
 
     let host = host_stack(ctx).map_err(|error| error.to_string())?;

@@ -184,7 +184,7 @@ mod tests {
                 let lane = match controls.get("__rustel_lane") {
                     Some(Value::Str(lane)) => lane.clone(),
                     None => String::new(),
-                    _ => panic!("lane name"),
+                    _ => panic!("lane tag"),
                 };
                 let mut plugins: Vec<_> = controls.get("vsti").into_iter().collect();
                 if let Some(Value::List(effects)) = controls.get("vst") {
@@ -216,10 +216,13 @@ mod tests {
           bass: note("g2").vsti("synth");
           $: s("bd");
         "#;
+        // A labeled statement gives its plugin notes the tag `#<number>`. With
+        // no lane numbers from the host, the number is the place of the
+        // statement.
         let expected = vec![
-            ("lead".into(), vec!["p0".into(), "p2".into()]),
-            ("lead".into(), vec!["p1".into(), "p2".into()]),
-            ("bass".into(), vec!["p3".into()]),
+            ("#0".into(), vec!["p0".into(), "p2".into()]),
+            ("#0".into(), vec!["p1".into(), "p2".into()]),
+            ("#1".into(), vec!["p3".into()]),
             (String::new(), vec![]),
         ];
         assert_eq!(bindings(&runtime, source), expected);
@@ -239,13 +242,44 @@ mod tests {
         assert_eq!(
             reused,
             vec![
-                ("one".into(), vec!["p0".into()]),
-                ("one".into(), vec!["p0".into()]),
-                ("two".into(), vec!["p0".into()]),
-                ("$0".into(), vec!["p0".into()]),
-                ("$1".into(), vec!["p0".into()])
+                ("#0".into(), vec!["p0".into()]),
+                ("#0".into(), vec!["p0".into()]),
+                ("#1".into(), vec!["p0".into()]),
+                ("#2".into(), vec!["p0".into()]),
+                ("#3".into(), vec!["p0".into()])
             ]
         );
+
+        // The lane tag of each note of `lanes`, for the lane numbers of a
+        // host.
+        let lane_tags = |lanes: &str, numbers: &[u64]| -> Vec<String> {
+            let options = TranspileOptions {
+                lane_numbers: numbers.to_vec(),
+                ..TranspileOptions::default()
+            };
+            let source = format!(r#"const fx = note("c3").vst("effect"); {lanes}"#);
+            runtime.evaluate_score(&source, &options).expect("evaluate");
+            let notes = query_bindings(&runtime, 0);
+            notes.into_iter().map(|(lane, _)| lane).collect()
+        };
+        // The tag has the lane number of the host. A lane above changes no
+        // tag below.
+        assert_eq!(lane_tags("lead: fx; $: fx;", &[4, 1000]), ["#4", "#1000"]);
+        assert_eq!(
+            lane_tags("$: fx; lead: fx; $: fx;", &[5_000_000_000, 4, 1000]),
+            ["#5000000000", "#4", "#1000"]
+        );
+        // A lane with no number keeps its run-time name, and the `$` count
+        // goes on. The last lane of a name gives the tag. The solo rule reads
+        // the name.
+        for (lanes, tags) in [
+            ("$: fx; fx.p('$'); fx.p('hand');", vec!["#0", "$1", "hand"]),
+            ("lead: fx; fx.p('lead');", vec!["lead"]),
+            ("fx.p('lead'); lead: fx;", vec!["#0"]),
+            ("lead: fx; S$: fx;", vec!["#1"]),
+        ] {
+            assert_eq!(lane_tags(lanes, &[]), tags, "{lanes}");
+        }
     }
 
     #[test]

@@ -65,9 +65,10 @@ mod tests {
         let source = GOOD.to_owned();
         #[cfg(feature = "vst")]
         let source = {
-            let source = format!("{GOOD}.vst('Delay').orbit(1)");
+            let source = format!("$: {GOOD}.vst('Delay').orbit(1)");
             session.evaluate(&source).expect("plugin source");
-            let moved = source.replace("orbit(1)", "orbit(2)");
+            // A new lane above: the plugin lane keeps its number.
+            let moved = format!("$: s('hh')\n{}", source.replace("orbit(1)", "orbit(2)"));
             session.reload_at(&moved, false, 0.1).expect("move plugin");
             moved
         };
@@ -88,6 +89,12 @@ mod tests {
         assert_eq!(session.active_source(), Some(source.as_str()));
         #[cfg(feature = "vst")]
         assert_eq!(super::super::tests::plugin_chain(&session), chain);
+        #[cfg(feature = "vst")]
+        assert_eq!(
+            super::super::tests::plugin_note(&session)["__rustel_lane"],
+            "#0",
+            "the rebuilt session lost its lanes"
+        );
         #[cfg(feature = "vst")]
         assert!(
             session
@@ -832,11 +839,13 @@ impl Session {
         // The replayed score takes over on a frame of the same device.
         fresh.live_sample_rate = self.live_sample_rate;
         // The output keeps its plugins, so each later commit tells the
-        // plugin chains its score.
+        // plugin chains its score. Each lane keeps its number, so the
+        // replayed score has the chains it had.
         #[cfg(feature = "vst")]
         {
             let live = self.plugins_live.load(std::sync::atomic::Ordering::Relaxed);
             fresh.plugins_live = AtomicBool::new(live);
+            fresh.lanes = std::mem::take(&mut self.lanes);
         }
         fresh.stop_when_silent = self.stop_when_silent;
         fresh.export_limiter = self.export_limiter;

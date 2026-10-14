@@ -2710,6 +2710,10 @@ pub struct Session {
     /// output: see [`Self::attach_plugins`].
     #[cfg(feature = "vst")]
     plugins_live: AtomicBool,
+    /// The lanes of the scores of this session, each with the number its
+    /// plugin notes carry.
+    #[cfg(feature = "vst")]
+    lanes: crate::vst::LaneTable,
     /// Files the most recent `preload(...)` asked for, until a caller waits.
     preload_requested: usize,
     /// Whether a setup this session ran picks sample variants: it writes an
@@ -2997,6 +3001,8 @@ impl Session {
             last_source: None,
             #[cfg(feature = "vst")]
             plugins_live: AtomicBool::new(false),
+            #[cfg(feature = "vst")]
+            lanes: crate::vst::LaneTable::default(),
             preload_requested: 0,
             prebake_selects_variants: false,
             stop_when_silent: None,
@@ -6477,13 +6483,21 @@ mod playback_reanchor_tests {
 
 #[cfg(test)]
 mod tests {
+    /// The first plugin note of the first cycle.
     #[cfg(feature = "vst")]
-    pub(super) fn plugin_chain(session: &Session) -> u64 {
+    pub(super) fn plugin_note(session: &Session) -> serde_json::Value {
         let report = session
             .query_report(Fraction::ZERO, Fraction::ONE)
             .expect("query");
-        let value = serde_json::to_value(&report.haps[0].value).expect("value");
-        crate::vst::live_chain(&value).expect("plugin chain")
+        let values = report.haps.iter();
+        let mut values = values.map(|hap| serde_json::to_value(&hap.value).expect("value"));
+        let note = values.find(|value| value.get("vst").or(value.get("vsti")).is_some());
+        note.expect("plugin note")
+    }
+
+    #[cfg(feature = "vst")]
+    pub(super) fn plugin_chain(session: &Session) -> u64 {
+        crate::vst::live_chain(&plugin_note(session)).expect("plugin chain")
     }
 
     /// `setGainCurve` shapes every gain, the default 0.8 included, as
@@ -18571,7 +18585,7 @@ mod tests {
         #[cfg(feature = "vst")]
         {
             let mut session = Session::new().expect("session");
-            let source = r#"s("sine").vst("Delay").orbit(1)"#;
+            let source = r#"$: s("sine").vst("Delay").orbit(1)"#;
             session.evaluate(source).expect("audible plugin source");
             session
                 .mark_audible_generation(session.generation())
@@ -18581,16 +18595,28 @@ mod tests {
             assert_eq!(session.plugin_calls_for_source(&moved)[0].orbit, Some(2));
             session.reload_at(&moved, false, 0.1).expect("move to two");
             assert_eq!(plugin_chain(&session), chain);
-            let moved = source.replace("orbit(1)", "orbit(3)");
-            assert!(matches!(
-                session.evaluate_cancellable(&moved, &AtomicBool::new(true)),
-                Err(RuntimeError::Cancelled)
-            ));
-            assert_eq!(plugin_chain(&session), chain);
+            // A cancelled text with a different lane. Then an edit of the
+            // lane and a new lane above in one evaluation: the lane keeps
+            // its number, and so its chain.
+            let moved = format!("$: s(\"hh\")\n{}", source.replace("orbit(1)", "orbit(3)"));
+            let other = r#"$: note("a1 e2").lpf(400)"#;
+            for cancelled in [other, moved.as_str()] {
+                assert!(matches!(
+                    session.evaluate_cancellable(cancelled, &AtomicBool::new(true)),
+                    Err(RuntimeError::Cancelled)
+                ));
+                assert_eq!(plugin_chain(&session), chain);
+            }
             session
                 .reload_at(&moved, false, 0.2)
                 .expect("move to three");
+            assert_eq!(plugin_note(&session)["__rustel_lane"], "#0");
             assert_eq!(plugin_chain(&session), chain);
+            // A score with no plugin lane is not audible too. The rollback
+            // gives the plugin lane the number it had.
+            session
+                .reload_at(other, false, 0.25)
+                .expect("no plugin lane");
             assert_eq!(
                 session
                     .rollback_to_previous_source(0.3)
@@ -18598,6 +18624,7 @@ mod tests {
                 RollbackAttempt::Applied
             );
             assert_eq!(session.active_source(), Some(source));
+            assert_eq!(plugin_note(&session)["__rustel_lane"], "#0");
             assert_eq!(plugin_chain(&session), chain);
         }
     }

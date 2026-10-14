@@ -645,6 +645,10 @@ impl Session {
                 .iter()
                 .map(|method| (*method).to_owned())
                 .collect(),
+            // Each lane of the text gets its number before the evaluation,
+            // so a plugin note names the same lane after an edit.
+            #[cfg(feature = "vst")]
+            lane_numbers: self.lanes.read(source),
             ..TranspileOptions::default()
         };
         let evaluated = match seed {
@@ -664,6 +668,13 @@ impl Session {
                 cancellation,
             ),
         };
+        // The label rewrite found a different count of labeled statements
+        // and wrote places. No note carries the lane numbers of this read,
+        // so the commit keeps the lanes of the score in play.
+        #[cfg(feature = "vst")]
+        if matches!(&evaluated, Ok((output, ..)) if output.lanes_by_place) {
+            self.lanes.forget_read();
+        }
         match evaluated {
             // `effects.hydra` is taken below, and only the visuals build has
             // one to take.
@@ -1259,6 +1270,9 @@ impl Session {
         self.last_source = Some(Arc::from(source));
         self.recovered_source = None;
         self.js.snapshot_active_as_last_good();
+        // The lanes of this text are now the lanes of the score in play.
+        #[cfg(feature = "vst")]
+        self.lanes.install(source);
         #[cfg(feature = "vst")]
         if self.plugins_live.load(std::sync::atomic::Ordering::Relaxed) {
             crate::vst::score_changed(Some(source));
@@ -1638,8 +1652,18 @@ impl Session {
 
     /// Install a retained payload without consulting the current generation.
     /// `None` clears an older textual target after a direct Pattern cutover.
+    /// The lane table learns when the payload is the score in play.
     #[cfg(feature = "device-audio")]
     pub(super) fn install_rollback_source(&mut self, captured: Option<AudibleSource>) {
+        #[cfg(feature = "vst")]
+        if captured
+            .as_ref()
+            .is_some_and(|audible| audible.generation == self.generation())
+        {
+            // The output plays the score in play. The lane table keeps the
+            // lanes of this score for a rollback from the next one.
+            self.lanes.mark_audible();
+        }
         self.audible_source = captured;
     }
 

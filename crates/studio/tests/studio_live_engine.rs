@@ -985,11 +985,12 @@ fn the_idle_sweep_unloads_a_plugin_no_tab_names() {
     assert!(!play_and_sweep("note('c3').s('sine')"), "no tab does");
 }
 
-/// An edit that leaves a plugin call as it is keeps the copy of the call.
-/// A lane above gives the plugin lane a new number, and a mute of that lane
-/// gives the number back: no note plays with no plugin, and no new copy is
-/// built. The plugin is the fixture at gain 0, so a note with no plugin is
-/// heard. A lane that leaves the score gives its copy back.
+/// An edit that leaves a plugin call as it is keeps the copy of the call: a
+/// lane above, a mute of that lane, new notes on the plugin lane, a new
+/// label, a mute of the plugin lane, and the score with no label. No note
+/// plays with no plugin, and no new copy is built. The plugin is the
+/// fixture at gain 0, so a note with no plugin is heard. A lane that leaves
+/// the score gives its copy back.
 #[cfg(feature = "vst")]
 #[test]
 fn a_plugin_lane_keeps_its_copy_through_edits_above_and_gives_it_back_at_its_end() {
@@ -1025,7 +1026,17 @@ fn a_plugin_lane_keeps_its_copy_through_edits_above_and_gives_it_back_at_its_end
     }
     let above = format!("$: note('c5').s('sine').gain(0)\n{lane}");
     let muted = format!("_$: note('c5').s('sine').gain(0)\n{lane}");
-    for edit in [above.as_str(), muted.as_str(), lane, above.as_str()] {
+    // An edit of the plugin lane and a new lane above in one evaluation.
+    let both = above.replace("fast(8)", "fast(4)");
+    // A label, a mute mark on it, and the score with no label.
+    let named = lane.replace("$:", "lead:");
+    let off = lane.replace("$:", "_lead:");
+    let bare = lane.replace("$: ", "");
+    let labeled = format!("score: {bare}");
+    let edits: [&str; 9] = [
+        &above, &muted, lane, &both, &named, &off, &named, &bare, &labeled,
+    ];
+    for edit in edits {
         engine.evaluate(edit, false).expect("an edit");
         assert_eq!(peak_of(&mut engine, 800), 0.0, "a dry note after: {edit}");
         assert_eq!(copies(), 1, "{edit}");

@@ -133,6 +133,18 @@ of each chain the edit does not change:
 - A lane you add, remove or mute above the lane.
 - One more `.vst()` call at the end of the chain. Only the new effect loads.
 
+A lane is a labeled statement, such as `$:` or `lead:`, or a score with no
+label. A lane stays the same lane when you move it, mute it or give it a new
+label. A lane you edit stays the same lane in one of these cases:
+
+- It keeps its label. The label `$` does not count.
+- It keeps a plugin name.
+- Its start and its end together keep half of its text or more.
+
+The text counts more than the label. When one edit copies `lead:` to
+`lead2:` and gives `lead:` a new text, `lead2:` is the lane that played.
+`lead:` is then a new lane.
+
 A chain with a different plugin, a different preset, or fewer effects gets
 new copies. The copies before play their tail, then end.
 
