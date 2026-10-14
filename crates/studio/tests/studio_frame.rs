@@ -140,6 +140,8 @@ fn a_complete_frame_draws_every_surface_in_solid_blocks() {
                     prebake_rows: Default::default(),
                     keybind_rows: Vec::new(),
                     trust_rows: Vec::new(),
+                    #[cfg(feature = "vst")]
+                    vst_page: Default::default(),
                     sets_folder: String::new(),
                     recordings_folder: String::new(),
                     set_limiter: None,
@@ -472,6 +474,8 @@ fn a_sheet_paints_over_a_visuals_dock() {
                     prebake_rows: Default::default(),
                     keybind_rows: Vec::new(),
                     trust_rows: Vec::new(),
+                    #[cfg(feature = "vst")]
+                    vst_page: Default::default(),
                     sets_folder: String::new(),
                     recordings_folder: String::new(),
                     set_limiter: None,

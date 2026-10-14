@@ -50,7 +50,7 @@ fn from_environment(stream_is_terminal: bool) -> bool {
 }
 
 pub fn stdout_on() -> bool {
-    from_environment(std::io::stdout().is_terminal())
+    from_environment(rustel_runtime::stdio::out().is_terminal())
 }
 
 pub fn stderr_on() -> bool {

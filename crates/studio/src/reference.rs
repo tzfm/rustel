@@ -45,6 +45,8 @@ mod snippets;
 mod text;
 mod view;
 mod vocabulary;
+#[cfg(feature = "vst")]
+mod vst;
 
 #[cfg(test)]
 use audition::render_sample_shape;
@@ -85,6 +87,8 @@ pub use vocabulary::{
     color_vocabulary, edo_vocabulary, pretty_notation, scale_notes, scale_vocabulary, tuning_notes,
     tuning_vocabulary,
 };
+#[cfg(feature = "vst")]
+pub use vst::{PluginRow, PluginWords, VstTab, key_words};
 
 /// Variant rows an expanded bank shows at most; a soundfont with hundreds
 /// of files is still one sound to a score.
@@ -264,6 +268,10 @@ pub enum Tab {
     /// Every scale, the ones music actually uses first, each opening onto
     /// its twelve tonics and playable.
     Scales,
+    /// The VST3 plugins the host found, each opening onto its parameters
+    /// and presets.
+    #[cfg(feature = "vst")]
+    Vst,
     #[cfg(feature = "hydra")]
     Generator,
     #[cfg(feature = "hydra")]
@@ -374,6 +382,21 @@ pub struct Vocabulary {
     /// colours read as words is a list nobody can pick from.
     pub swatches: bool,
     bank_compatibility: Option<BankCompatibility>,
+    /// What a word list of a plugin call holds. The App fills such a list
+    /// again when the plugin host has news.
+    #[cfg(feature = "vst")]
+    plugin: Option<PluginWords>,
+}
+
+impl Vocabulary {
+    /// The first `count` names `query` finds, the nearest first.
+    fn rank(&self, query: &str, count: usize) -> Vec<usize> {
+        #[cfg(feature = "vst")]
+        if matches!(self.plugin, Some(PluginWords::Names { .. })) {
+            return vst::rank_names(query, &self.names);
+        }
+        super::fuzzy::rank(query, self.names.iter().take(count).map(String::as_str))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -516,6 +539,10 @@ pub struct ReferencePanel {
     pub scale_query: String,
     pub scale_selected: usize,
     pub open_scale: Option<String>,
+    /// The vst tab: the plugin list, its search, its cursor and what is
+    /// open.
+    #[cfg(feature = "vst")]
+    pub vst: VstTab,
     /// Where each tab's list is scrolled to. Cells, because the scroll is
     /// settled in the geometry pass (the one place the height is known) and
     /// geometry takes `&self`. The scroll keeps a margin of rows around the
@@ -1390,33 +1417,53 @@ mod tests {
         }
 
         /// The aliases shown are the other NAMES a thing answers to, not the
-        /// same name in another case.
+        /// same name in another case. An experimental call says so on a line
+        /// of the origin kind.
         #[test]
-        fn an_entry_lists_only_aliases_that_are_a_different_name() {
+        fn an_entry_lists_real_aliases_and_marks_an_experimental_call() {
             let reference = Reference::load_all();
-            let body = |name: &str| {
+            let body = |name: &str, kind: BodyKind| {
                 let index = *reference.by_name.get(name).expect("documented");
                 let entry = reference.entry(index).expect("entry");
                 entry_body(entry, 60)
                     .into_iter()
-                    .filter(|line| line.kind == BodyKind::Synonyms)
+                    .filter(|line| line.kind == kind)
                     .map(|line| line.text)
                     .collect::<Vec<_>>()
             };
             // `setcpm` is `setCpm` typed differently; upstream documents it
             // under the lowercase fold, so the entry carries both.
             assert!(
-                body("setCpm").is_empty(),
+                body("setCpm", BodyKind::Synonyms).is_empty(),
                 "the lowercase spelling was listed as an alias: {:?}",
-                body("setCpm")
+                body("setCpm", BodyKind::Synonyms)
             );
             // Real aliases stay.
-            assert_eq!(body("stack"), vec!["also polyrhythm, pr".to_owned()]);
+            assert_eq!(
+                body("stack", BodyKind::Synonyms),
+                vec!["also polyrhythm, pr".to_owned()]
+            );
             // And the lowercase spelling still finds the entry.
             assert_eq!(
                 reference.by_name.get("setcpm"),
                 reference.by_name.get("setCpm")
             );
+            // The VST3 calls are experimental. So is each call whose text
+            // says so, and the body says it one time. A stable call has no
+            // mark.
+            for name in ["vst", "vsti"] {
+                assert_eq!(body(name, BodyKind::Origin), ["experimental"], "{name}");
+            }
+            for index in 0..reference.len() {
+                let entry = reference.entry(index).expect("entry");
+                if entry.description.starts_with("*Experimental*") {
+                    let name = entry.name.as_str();
+                    assert_eq!(body(name, BodyKind::Origin), ["experimental"], "{name}");
+                    let prose = body(name, BodyKind::Prose);
+                    assert!(!prose.contains(&"*Experimental*".to_owned()), "{name}");
+                }
+            }
+            assert!(body("stack", BodyKind::Origin).is_empty());
         }
 
         #[test]
@@ -4410,13 +4457,19 @@ mod tests {
                 "unchanged is a no-op"
             );
 
-            // Tab walks the column: reference, samples, chords, and - in a
-            // build with visuals - the snippet shelf, then round again.
+            // Tab walks the column: reference, samples, chords, scales, the
+            // plugins in a build with them, and - in a build with visuals -
+            // the snippet shelf, then round again.
             panel.toggle_tab();
             assert_eq!(panel.tab, Tab::Chords);
             panel.toggle_tab();
             assert_eq!(panel.tab, Tab::Scales);
             panel.toggle_tab();
+            #[cfg(feature = "vst")]
+            {
+                assert_eq!(panel.tab, Tab::Vst);
+                panel.toggle_tab();
+            }
             #[cfg(feature = "hydra")]
             {
                 assert_eq!(panel.tab, Tab::Generator);

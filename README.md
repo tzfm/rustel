@@ -29,8 +29,8 @@ Rustel is a native port of [Strudel](https://strudel.cc), written in Rust
 for Linux, macOS, and Windows. It supports command-line use, live coding
 in your preferred editor, and a studio that runs in a terminal.
 
-Play synths and samples, control MIDI/OSC devices, add live visuals, and
-export audio. No browser is required.
+Play synths, samples, and VST3 instruments and effects. Control MIDI/OSC
+devices, add live visuals, and export audio. No browser is required.
 
 ## What you get
 
@@ -41,6 +41,7 @@ export audio. No browser is required.
 | **Your editor** | Run `rustel play song.strudel --watch` and edit in any editor. Audio keeps running across saves. |
 | **Session tapes** | Studio logs each installed update with its time. See [sessions](docs/sessions.md). |
 | **Hardware** | Speakers, audio input, MIDI, OSC, and serial. MIDI clock can follow or lead. See [hardware](docs/hardware.md). |
+| **Plugins** | VST3 effects and instruments from a score: `.vsti("serum 2").vst("ott")`. See [plugins](docs/plugins.md). |
 | **Visuals** | Scope, piano roll, spectrum, and [Hydra](docs/hydra.md) in the terminal. |
 | **Offline render** | Export to WAV or MP3 with repeatable output. |
 
@@ -64,6 +65,15 @@ and play, and **Ctrl+G** (or **F8**) to stop. Studio shows the keys your
 terminal supports in its menus and **Settings → Keybinds**.
 
 Press **Ctrl+Q** twice to quit. Use Control on macOS too.
+
+A score also plays your VST3 plugins. `.vsti()` plays the notes on an
+instrument plugin, and `.vst()` sends them through an effect plugin:
+
+```js
+note("c2 e2 g2").vsti("serum 2").vst("ott", { depth: 0.5 })
+```
+
+`rustel vst` lists the plugins on your machine. See [plugins](docs/plugins.md).
 
 ## Command line
 
@@ -183,6 +193,7 @@ against the same goldens. Add that run when you change the DSP kernels.
 
 - [Guides by task](docs/README.md)
 - [Studio guide](docs/studio.md) · [Installation and updates](rustelup/README.md)
+- [VST3 plugins](docs/plugins.md) · [Hardware](docs/hardware.md)
 - [Strudel compatibility](docs/compatibility.md) · [Engine overview](docs/overview.md)
 - [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 

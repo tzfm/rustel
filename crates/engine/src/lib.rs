@@ -79,7 +79,7 @@ pub use rustel_transpiler as transpiler;
 
 #[cfg(feature = "session")]
 pub use rustel_runtime::{
-    PlayReport, QUERY_WORKER_STACK_BYTES, RenderFormat, RenderReport, RuntimeError,
-    ScoreImportAccess, ScoreSampleAccess, Session, SessionConfig, SessionDiagnostic,
+    PLUGIN_DIAGNOSTIC, PlayReport, QUERY_WORKER_STACK_BYTES, RenderFormat, RenderReport,
+    RuntimeError, ScoreImportAccess, ScoreSampleAccess, Session, SessionConfig, SessionDiagnostic,
     VOICE_NOTICE_DIAGNOSTIC,
 };

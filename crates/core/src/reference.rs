@@ -669,8 +669,9 @@ pub struct ReferenceEntry {
     /// The headings the entry is listed under; the first is where it is
     /// filed. Some tags are also read as declarations: `combiners` and
     /// `selectors` by the studio's `sound_effect`, `selectors` by the lint's
-    /// `rebinds_words`, and `sound` by the studio reference's
-    /// `Entry::inserts_as_call`.
+    /// `rebinds_words`, `sound` by the studio reference's
+    /// `Entry::inserts_as_call`, and `experimental` by the studio
+    /// reference's `entry_body`.
     pub tags: &'static [&'static str],
     pub no_autocomplete: bool,
     pub deprecated: bool,

@@ -99,6 +99,8 @@ impl App {
             Tab::Samples => panel.sound_rows().len(),
             Tab::Chords => panel.chord_rows().len(),
             Tab::Scales => panel.scale_rows().len(),
+            #[cfg(feature = "vst")]
+            Tab::Vst => panel.vst.rows().len(),
             #[cfg(feature = "hydra")]
             Tab::Examples | Tab::Generator => panel.snippet_lines().len(),
         };
@@ -402,7 +404,8 @@ impl App {
     /// any it does not know, so it gets its own vocabulary; the rest ignore
     /// the sequence harmlessly. Sent on change or a terminal-owned reset.
     pub(super) fn follow_pointer_shape(&mut self, x: u16, y: u16) {
-        let _ = self.write_pointer_shape(x, y, &mut std::io::stdout().lock());
+        let out = rustel_runtime::stdio::out();
+        let _ = self.write_pointer_shape(x, y, &mut out.lock());
     }
 
     pub(super) fn note_pointer_shape_event(&mut self, event: &Event) {

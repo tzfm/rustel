@@ -104,7 +104,7 @@ pub(super) fn run_samples_cache(
         .collect();
     if list {
         if json {
-            println!(
+            outln!(
                 "{}",
                 serde_json::json!({
                     "sample_cache": sample_cache_dir().display().to_string(),
@@ -112,13 +112,13 @@ pub(super) fn run_samples_cache(
                 })
             );
         } else {
-            println!("{}", style::bold(on, "Shipped sample packs"));
-            println!(
+            outln!("{}", style::bold(on, "Shipped sample packs"));
+            outln!(
                 "{}",
                 style::dim(on, &format!("cache: {}", sample_cache_dir().display()))
             );
             for row in &rows {
-                println!(
+                outln!(
                     "  {:<26} {:>4} sounds {:>5}/{:<5} files {:>8}",
                     row.name,
                     row.sounds,
@@ -127,7 +127,7 @@ pub(super) fn run_samples_cache(
                     style::cyan(on, &bytes_label(row.bytes)),
                 );
             }
-            println!(
+            outln!(
                 "{}",
                 style::dim(on, "`rustel samples cache [PACK…]` fetches what is missing")
             );
@@ -198,7 +198,7 @@ pub(super) fn run_samples_cache(
                 "cache": sample_cache_dir().display().to_string(),
             }
         });
-        println!("{summary}");
+        outln!("{summary}");
         if !failures.is_empty() {
             return Err(RuntimeError::Message(format!(
                 "{} file(s) failed to fetch; see the failures in the report",
@@ -209,7 +209,7 @@ pub(super) fn run_samples_cache(
     }
 
     if queued_total == 0 {
-        println!(
+        outln!(
             "{} {}",
             style::green(on, "✓"),
             style::bold(
@@ -279,7 +279,7 @@ pub(super) fn run_samples_cache(
     if progress {
         eprintln!();
     }
-    println!(
+    outln!(
         "{} {} in {seconds}s - {} pack(s), {missing_total} file(s) total",
         style::green(on, "✓"),
         style::bold(on, &format!("cached {queued_total} file(s)")),
@@ -356,14 +356,14 @@ pub(super) fn run_samples_clear(json: bool, options: &ClearOptions) -> Result<()
         let scope =
             "digest-named downloaded files and the score-selected namespace; other files are kept";
         if json {
-            println!(
+            outln!(
                 "{}",
                 serde_json::json!({ "sample_cache": {
                 "status": "dry_run", "path": dir.display().to_string(), "scope": scope,
             } })
             );
         } else {
-            println!("Would clear {}: {scope}", dir.display());
+            outln!("Would clear {}: {scope}", dir.display());
         }
         return Ok(());
     }
@@ -381,7 +381,7 @@ pub(super) fn run_samples_clear(json: bool, options: &ClearOptions) -> Result<()
         .map(|(_, size)| size)
         .sum();
     if json {
-        println!(
+        outln!(
             "{}",
             serde_json::json!({
                 "sample_cache": {
@@ -393,13 +393,13 @@ pub(super) fn run_samples_clear(json: bool, options: &ClearOptions) -> Result<()
         );
     } else {
         let on = style::stdout_on();
-        println!(
+        outln!(
             "{} {} ({})",
             style::green(on, "✓"),
             style::bold(on, "sample cache cleared"),
             bytes_label(removed),
         );
-        println!(
+        outln!(
             "{}",
             style::dim(
                 on,

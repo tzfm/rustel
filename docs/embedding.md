@@ -193,7 +193,8 @@ cargo doc -p rustel-engine --features session --open
 
 The engine writes nothing to stderr by default. A Session collects score
 diagnostics, including `.log()` lines and the voice resolver's notices (kind
-`voice-notice`); drain them with `take_diagnostics()` and show them in the
+`voice-notice`, or `plugin` for a `.vst()` or `.vsti()` call the host does
+not serve). Drain them with `take_diagnostics()` and show them in the
 application's UI. `set_direct_diagnostic_logging(true)` prints them as JSON
 lines instead. Without a Session, `voice::with_diagnostic_policy(false, ..)`
 returns the notices raised while it resolves voices, each a sentence and its

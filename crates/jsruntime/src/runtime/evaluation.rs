@@ -216,7 +216,7 @@ impl JsRuntime {
                 // SAFETY: a live Ctx always has a live owning runtime.
                 let runtime = unsafe { rquickjs::qjs::JS_GetRuntime(ctx.as_raw().as_ptr()) };
                 let _pending_job_guard = PendingJobGuard { runtime };
-                let frame = BridgeFrame::new(alloc);
+                let frame = BridgeFrame::setup(alloc);
                 let _scope = BridgeScope::push(&frame);
                 rustel_core::with_callback_host(self, || {
                     self.with_deadline(budget, || {
@@ -669,7 +669,7 @@ impl JsRuntime {
                 runtime,
                 enabled: stage_candidate,
             };
-            let frame = BridgeFrame::new(alloc);
+            let frame = BridgeFrame::evaluation(alloc);
             let _scope = BridgeScope::push(&frame);
             rustel_core::with_callback_host(self, || {
                 let lane_host =
@@ -684,7 +684,11 @@ impl JsRuntime {
                         .call::<(), ()>(())
                         .map_err(|error| QueryError::Message(describe_js_error(&ctx, error)))?;
                 }
-                self.timeline_state.reset();
+                // Each score starts its timelines again. The score in play
+                // keeps its offsets until this score goes in play: see
+                // `restore_last_good_active`.
+                let offsets = self.timeline_state.take();
+                self.last_good_timeline.borrow_mut().get_or_insert(offsets);
                 // setDefaultJoin is score-scoped: reset before user code.
                 rustel_core::compose::set_default_alignment(rustel_core::compose::Alignment::In);
                 // Scores containing `await` (the transpiler awaits bare
@@ -1260,6 +1264,7 @@ impl JsRuntime {
         if let Err(error) = evaluation {
             self.discard_slider_candidate();
             self.discard_voicing_candidate();
+            self.restore_last_good_timeline();
             return Err(error);
         }
         if let Err(error) = self.commit_score_candidates() {
@@ -1304,11 +1309,13 @@ impl JsRuntime {
             (_, Some(policy)) => {
                 self.discard_slider_candidate();
                 self.discard_voicing_candidate();
+                self.restore_last_good_timeline();
                 Err(policy)
             }
             (Err(error), None) => {
                 self.discard_slider_candidate();
                 self.discard_voicing_candidate();
+                self.restore_last_good_timeline();
                 Err(error)
             }
             (Ok(()), None) => {

@@ -34,6 +34,7 @@ mod report_tests {
             max_playback_latency_nanos: 18_000_000,
             max_callback_gap_nanos: 7_000_000,
             callback_errors: 2,
+            callback_xruns: 6,
             callback_scope_misses: 3,
             callback_allocations: 4,
             callback_frees: 5,
@@ -79,6 +80,7 @@ mod report_tests {
                 fx_reverb_installs: 5,
                 fx_reverb_returns: 6,
                 fx_reverb_refusals: 0,
+                insert_refusals: 0,
                 leaked: 7,
                 ..AssetQueuePressureSnapshot::default()
             },
@@ -193,6 +195,7 @@ mod report_tests {
                 device: device_fixture(),
                 producer: producer_fixture(),
                 callback_deadline_misses: 2,
+                callback_xruns: 1,
                 producer_refusals: 3,
                 host_gap_nanos: 4,
                 cause: EnginePressureCause::DspOverload,
@@ -243,11 +246,15 @@ mod report_tests {
                 "max_callback_gap_nanos",
                 "recent_host_gap_nanos",
                 "callback_errors",
+                "callback_xruns",
+                "recent_callback_xruns",
                 "callback_scope_misses",
                 "callback_allocations",
                 "callback_frees",
             ],
         );
+        assert_eq!(value["dsp"]["callback_xruns"], 6);
+        assert_eq!(value["dsp"]["recent_callback_xruns"], 1);
         assert_keys(
             &value["scheduler"],
             &[
@@ -404,6 +411,8 @@ const REPEAT_WINDOW: Duration = Duration::from_secs(10);
 pub enum EnginePressureCause {
     #[default]
     Healthy,
+    /// The audio backend reported an underrun, without identifying its cause.
+    DeviceUnderrun,
     DspOverload,
     ProducerOverload,
     HostStarvation,
@@ -418,6 +427,7 @@ impl EnginePressureCause {
     pub const fn code(self) -> &'static str {
         match self {
             Self::Healthy => "healthy",
+            Self::DeviceUnderrun => "device_underrun",
             Self::DspOverload => "dsp_overload",
             Self::ProducerOverload => "producer_overload",
             Self::HostStarvation => "host_starvation",
@@ -429,6 +439,7 @@ impl EnginePressureCause {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Healthy => "healthy",
+            Self::DeviceUnderrun => "audio device underrun",
             Self::DspOverload => "DSP deadline missed",
             Self::ProducerOverload => "scheduler fell behind",
             Self::HostStarvation => "audio host gap",
@@ -465,6 +476,8 @@ pub struct EnginePressureSnapshot {
     pub producer: ProducerLoadSnapshot,
     /// Callback deadline misses since the prior projection.
     pub callback_deadline_misses: u64,
+    /// Backend underrun notifications since the prior projection.
+    pub callback_xruns: u64,
     /// Transactional producer refusals since the prior projection.
     pub producer_refusals: u64,
     /// A newly observed host gap beyond two device periods, otherwise zero.
@@ -554,6 +567,7 @@ impl EnginePressureSnapshot {
 pub struct EnginePressureMonitor {
     stream_id: u64,
     callback_deadline_misses: u64,
+    callback_xruns: u64,
     producer_refusals: u64,
     callback_errors: u64,
     ring_refusals: u64,
@@ -589,6 +603,7 @@ impl EnginePressureMonitor {
             self.stream_id = device.stream_id;
             self.callback_deadline_misses = 0;
             self.callback_errors = 0;
+            self.callback_xruns = 0;
             self.ring_refusals = 0;
             self.max_callback_gap_nanos = 0;
             self.recent_cause = EnginePressureCause::Healthy;
@@ -620,6 +635,8 @@ impl EnginePressureMonitor {
 
         let callback_errors = device.callback_errors.saturating_sub(self.callback_errors);
         self.callback_errors = device.callback_errors;
+        let callback_xruns = device.callback_xruns.saturating_sub(self.callback_xruns);
+        self.callback_xruns = device.callback_xruns;
         let ring_refusals = device.ring_refusals.saturating_sub(self.ring_refusals);
         self.ring_refusals = device.ring_refusals;
 
@@ -660,7 +677,9 @@ impl EnginePressureMonitor {
             || hard_drops > 0
             || pool_misses > 0;
 
-        let immediate = if callback_deadline_misses > 0
+        let immediate = if callback_xruns > 0 {
+            EnginePressureCause::DeviceUnderrun
+        } else if callback_deadline_misses > 0
             || device.realtime_load.slow_load_basis_points > 10_000
         {
             EnginePressureCause::DspOverload
@@ -692,6 +711,7 @@ impl EnginePressureMonitor {
                 EnginePressureLevel::Warning
             }
             EnginePressureCause::VoicePressure
+            | EnginePressureCause::DeviceUnderrun
             | EnginePressureCause::DspOverload
             | EnginePressureCause::ProducerOverload
             | EnginePressureCause::HostStarvation
@@ -725,6 +745,7 @@ impl EnginePressureMonitor {
             device,
             producer,
             callback_deadline_misses,
+            callback_xruns,
             producer_refusals,
             host_gap_nanos,
             cause,
@@ -826,8 +847,21 @@ mod tests {
     }
 
     #[test]
-    fn dsp_producer_host_voice_and_refusal_are_distinct() {
+    fn device_dsp_producer_host_voice_and_refusal_are_distinct() {
         let now = Instant::now();
+
+        let mut device = report(1_000);
+        device.callback_xruns = 1;
+        let sample = EnginePressureMonitor::default().sample_at(device, producer(0), 128, now);
+        assert_eq!(sample.cause, EnginePressureCause::DeviceUnderrun);
+        assert_eq!(sample.level, EnginePressureLevel::Warning);
+        assert_eq!(sample.callback_xruns, 1);
+        assert_eq!(sample.callback_deadline_misses, 0);
+        assert_eq!(sample.device.callback_errors, 0);
+        device.realtime_load.callbacks_over_100_percent = 1;
+        let combined = EnginePressureMonitor::default().sample_at(device, producer(0), 128, now);
+        assert_eq!(combined.cause, EnginePressureCause::DeviceUnderrun);
+        assert_eq!(combined.callback_deadline_misses, 1);
 
         let mut dsp = report(8_000);
         dsp.realtime_load.callbacks_over_100_percent = 1;
@@ -981,31 +1015,51 @@ mod tests {
     }
 
     #[test]
-    fn a_recycled_stream_restarts_callback_deltas_without_recounting_producer_failures() {
+    fn device_changes_restart_callback_deltas_without_recounting_producer_failures() {
         let now = Instant::now();
         let mut monitor = EnginePressureMonitor::default();
         let mut first_device = report(1_000);
         first_device.stream_id = 1;
+        first_device.callback_xruns = 3;
         first_device.realtime_load.callbacks_over_100_percent = 5;
         let mut first_producer = producer(1_000);
         first_producer.atomic_refusals = 7;
         let first = monitor.sample_at(first_device, first_producer, 128, now);
         assert_eq!(first.callback_deadline_misses, 5);
+        assert_eq!(first.callback_xruns, 3);
         assert_eq!(first.producer_refusals, 7);
 
-        let mut recycled_device = report(1_000);
-        recycled_device.stream_id = 2;
-        recycled_device.realtime_load.callbacks_over_100_percent = 2;
         let mut same_producer = producer(1_000);
         same_producer.atomic_refusals = 7;
+        // Recycling retains the device ID and shared callback counters.
         let recycled = monitor.sample_at(
-            recycled_device,
+            first_device,
             same_producer,
             128,
             now + Duration::from_secs(3),
         );
-        assert_eq!(recycled.callback_deadline_misses, 2);
+        assert_eq!(recycled.callback_deadline_misses, 0);
+        assert_eq!(recycled.callback_xruns, 0);
         assert_eq!(recycled.producer_refusals, 0);
+
+        let mut new_device = report(1_000);
+        new_device.stream_id = 2;
+        new_device.callback_xruns = 1;
+        new_device.realtime_load.callbacks_over_100_percent = 2;
+        let changed =
+            monitor.sample_at(new_device, same_producer, 128, now + Duration::from_secs(4));
+        assert_eq!(changed.callback_deadline_misses, 2);
+        assert_eq!(changed.callback_xruns, 1);
+        assert_eq!(changed.producer_refusals, 0);
+        let unchanged =
+            monitor.sample_at(new_device, same_producer, 128, now + Duration::from_secs(5));
+        assert_eq!(unchanged.callback_deadline_misses, 0);
+        assert_eq!(unchanged.callback_xruns, 0);
+        new_device.callback_xruns = 2;
+        let new_underrun =
+            monitor.sample_at(new_device, same_producer, 128, now + Duration::from_secs(6));
+        assert_eq!(new_underrun.callback_xruns, 1);
+        assert_eq!(new_underrun.cause, EnginePressureCause::DeviceUnderrun);
     }
 
     /// The level read after one late callback at each offset in `at`.
@@ -1025,18 +1079,28 @@ mod tests {
     #[test]
     fn one_isolated_hiccup_warns_and_does_not_turn_red() {
         let now = Instant::now();
-        let mut monitor = EnginePressureMonitor::default();
-        let mut device = report(2_000);
-        device.realtime_load.callbacks_over_100_percent = 1;
-        let first = monitor.sample_at(device, producer(0), 128, now);
-        assert_eq!(first.cause, EnginePressureCause::DspOverload);
-        assert_eq!(first.level, EnginePressureLevel::Warning);
-        // Held for the usual moment at the same level, then gone.
-        let held = monitor.sample_at(device, producer(0), 128, now + Duration::from_secs(1));
-        assert_eq!(held.cause, EnginePressureCause::DspOverload);
-        assert_eq!(held.level, EnginePressureLevel::Warning);
-        let later = monitor.sample_at(device, producer(0), 128, now + Duration::from_secs(3));
-        assert_eq!(later.level, EnginePressureLevel::Normal);
+        for cause in [
+            EnginePressureCause::DspOverload,
+            EnginePressureCause::DeviceUnderrun,
+        ] {
+            let mut monitor = EnginePressureMonitor::default();
+            let mut device = report(2_000);
+            if cause == EnginePressureCause::DeviceUnderrun {
+                device.callback_xruns = 1;
+            } else {
+                device.realtime_load.callbacks_over_100_percent = 1;
+            }
+            let first = monitor.sample_at(device, producer(0), 128, now);
+            assert_eq!(first.cause, cause);
+            assert_eq!(first.level, EnginePressureLevel::Warning);
+            // Held for the usual moment at the same level, then gone.
+            let held = monitor.sample_at(device, producer(0), 128, now + Duration::from_secs(1));
+            assert_eq!(held.cause, cause);
+            assert_eq!(held.level, EnginePressureLevel::Warning);
+            assert_eq!(held.callback_xruns, 0);
+            let later = monitor.sample_at(device, producer(0), 128, now + Duration::from_secs(3));
+            assert_eq!(later.level, EnginePressureLevel::Normal);
+        }
     }
 
     #[test]

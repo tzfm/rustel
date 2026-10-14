@@ -622,6 +622,7 @@ impl LiveFileProducer {
             schedule_now,
             sample_rate,
             |_| Ok(rustel_audio::KabelPublication::default()),
+            |_| {},
             set_generation,
             push,
         )
@@ -629,9 +630,13 @@ impl LiveFileProducer {
 
     /// Prepare each converted window before publishing its generation or events.
     /// A preparation error rejects the replacement and preserves the audible score.
+    /// `install` ships the plugin inserts of an accepted window to the output
+    /// before its generation or events publish. A refused window installs
+    /// nothing. `install` gets only the events the backlog keeps, and must not
+    /// wait for loading or build assets.
     #[allow(
         clippy::too_many_arguments,
-        reason = "preparation, generation publication and ring delivery are separate ordered hooks"
+        reason = "preparation, insert installation, generation publication and ring delivery are separate ordered hooks"
     )]
     pub fn step_with_clock_and_preparation(
         &mut self,
@@ -642,6 +647,7 @@ impl LiveFileProducer {
         prepare: impl FnMut(
             &[rustel_audio::AudioEvent],
         ) -> Result<rustel_audio::KabelPublication, RuntimeError>,
+        install: impl FnMut(&[rustel_audio::AudioEvent]),
         set_generation: impl FnMut(u64, u64, TakeoverCut),
         push: impl FnMut(QueuedAudioEvent) -> bool,
     ) -> Result<LiveProducerStep, RuntimeError> {
@@ -653,6 +659,7 @@ impl LiveFileProducer {
             schedule_now,
             sample_rate,
             prepare,
+            install,
             set_generation,
             push,
         );
@@ -662,7 +669,7 @@ impl LiveFileProducer {
 
     #[allow(
         clippy::too_many_arguments,
-        reason = "keeps the public preparation and publication hooks explicit through the watch pass"
+        reason = "keeps the public preparation, installation and publication hooks explicit through the watch pass"
     )]
     fn step_with_clock_inner(
         &mut self,
@@ -673,6 +680,7 @@ impl LiveFileProducer {
         prepare: impl FnMut(
             &[rustel_audio::AudioEvent],
         ) -> Result<rustel_audio::KabelPublication, RuntimeError>,
+        install: impl FnMut(&[rustel_audio::AudioEvent]),
         set_generation: impl FnMut(u64, u64, TakeoverCut),
         mut push: impl FnMut(QueuedAudioEvent) -> bool,
     ) -> Result<LiveProducerStep, RuntimeError> {
@@ -831,6 +839,13 @@ impl LiveFileProducer {
             // never waits on a network.
             if let Some(source) = self.score_watch.take_changed_source() {
                 session.warm_sounds_in_source(&source);
+                // A save back to the delivered text reaches no door of the
+                // session. The edit that waits for its plugin copies does not
+                // go in play, so its wait and its plan end here.
+                #[cfg(feature = "vst")]
+                if self.score_watch.is_delivered(&source) {
+                    session.cancel_plugin_hold();
+                }
             }
             if self.prebake_state == PrebakeState::RetryingScore {
                 self.prebake_state = match &score {
@@ -896,6 +911,7 @@ impl LiveFileProducer {
             &mut schedule_now,
             sample_rate,
             prepare,
+            install,
             set_generation,
             push,
         )?;
@@ -1265,12 +1281,16 @@ impl LiveFileProducer {
             schedule_now,
             sample_rate,
             |_| Ok(rustel_audio::KabelPublication::default()),
+            |_| {},
             push,
         )
     }
 
     /// Prepare a shield window once before any event crosses the ring. A
     /// backpressured window keeps its reservation until it drains or is replaced.
+    /// `install` ships the plugin inserts of the window to the output before its
+    /// events publish. It gets only the events the backlog keeps, and must not
+    /// wait for loading or build assets.
     pub fn shield_reload_with_clock_and_preparation(
         &mut self,
         session: &mut Session,
@@ -1279,6 +1299,7 @@ impl LiveFileProducer {
         mut prepare: impl FnMut(
             &[rustel_audio::AudioEvent],
         ) -> Result<rustel_audio::KabelPublication, RuntimeError>,
+        mut install: impl FnMut(&[rustel_audio::AudioEvent]),
         mut push: impl FnMut(QueuedAudioEvent) -> bool,
     ) -> Result<bool, RuntimeError> {
         self.sync_panic_recovery(session);
@@ -1358,6 +1379,12 @@ impl LiveFileProducer {
         let tail_started = batch.tail_started;
         let room = MAX_PENDING_BACKLOG.saturating_sub(self.pending.len());
         let dropped = batch.events.len().saturating_sub(room);
+        let preparation_started = Instant::now();
+        install(&batch.events[..batch.events.len().min(room)]);
+        session.record_producer_phase(
+            ProducerPhase::AssetPreparation,
+            preparation_started.elapsed(),
+        );
         self.note_scheduled_through(batch.events.iter().map(|event| event.target_frame));
         self.pending.extend(
             batch
@@ -1491,6 +1518,7 @@ impl LiveFileProducer {
             schedule_now,
             sample_rate,
             |_| Ok(rustel_audio::KabelPublication::default()),
+            |_| {},
             set_generation,
             push,
         )
@@ -1498,6 +1526,14 @@ impl LiveFileProducer {
 
     /// Prepare each converted window before publishing its generation or events.
     /// A preparation error rejects the replacement and preserves the audible score.
+    /// `install` ships the plugin inserts of an accepted window to the output
+    /// before its cutover and events. A refused window installs nothing.
+    /// `install` gets only the events the backlog keeps, and must not wait for
+    /// loading or build assets.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "preparation, insert installation, generation publication and ring delivery are separate ordered hooks"
+    )]
     pub fn step_unwatched_with_clock_and_cutover_and_preparation(
         &mut self,
         session: &mut Session,
@@ -1506,6 +1542,7 @@ impl LiveFileProducer {
         prepare: impl FnMut(
             &[rustel_audio::AudioEvent],
         ) -> Result<rustel_audio::KabelPublication, RuntimeError>,
+        install: impl FnMut(&[rustel_audio::AudioEvent]),
         set_generation: impl FnMut(u64, u64, TakeoverCut),
         push: impl FnMut(QueuedAudioEvent) -> bool,
     ) -> Result<LiveProducerStep, RuntimeError> {
@@ -1516,6 +1553,7 @@ impl LiveFileProducer {
             schedule_now,
             sample_rate,
             prepare,
+            install,
             set_generation,
             push,
         );
@@ -1523,6 +1561,10 @@ impl LiveFileProducer {
         result
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "keeps the public preparation, installation and publication hooks explicit"
+    )]
     fn step_unwatched_with_clock_and_cutover_inner(
         &mut self,
         session: &mut Session,
@@ -1531,6 +1573,7 @@ impl LiveFileProducer {
         prepare: impl FnMut(
             &[rustel_audio::AudioEvent],
         ) -> Result<rustel_audio::KabelPublication, RuntimeError>,
+        install: impl FnMut(&[rustel_audio::AudioEvent]),
         set_generation: impl FnMut(u64, u64, TakeoverCut),
         push: impl FnMut(QueuedAudioEvent) -> bool,
     ) -> Result<LiveProducerStep, RuntimeError> {
@@ -1563,6 +1606,7 @@ impl LiveFileProducer {
             &mut schedule_now,
             sample_rate,
             prepare,
+            install,
             set_generation,
             push,
         )?;
@@ -1588,6 +1632,7 @@ impl LiveFileProducer {
             schedule_now,
             sample_rate,
             |_| Ok(rustel_audio::KabelPublication::default()),
+            |_| {},
             set_generation,
             push,
         )
@@ -1595,7 +1640,7 @@ impl LiveFileProducer {
 
     #[allow(
         clippy::too_many_arguments,
-        reason = "preparation, generation publication and ring delivery are separate ordered hooks"
+        reason = "preparation, insert installation, generation publication and ring delivery are separate ordered hooks"
     )]
     fn finish_step_with_preparation(
         &mut self,
@@ -1606,6 +1651,7 @@ impl LiveFileProducer {
         mut prepare: impl FnMut(
             &[rustel_audio::AudioEvent],
         ) -> Result<rustel_audio::KabelPublication, RuntimeError>,
+        mut install: impl FnMut(&[rustel_audio::AudioEvent]),
         mut set_generation: impl FnMut(u64, u64, TakeoverCut),
         mut push: impl FnMut(QueuedAudioEvent) -> bool,
     ) -> Result<LiveProducerStep, RuntimeError> {
@@ -2328,15 +2374,27 @@ impl LiveFileProducer {
                 WindowReservation::Deferred => unreachable!("deferred before querying"),
             };
 
+            let completed = if self.pending_generation.is_some() {
+                Some(self.pending_reload_event.take().ok_or_else(|| {
+                    RuntimeError::Message(
+                        "replacement generation completed without its retained reload event".into(),
+                    )
+                })?)
+            } else {
+                None
+            };
+            let room = MAX_PENDING_BACKLOG.saturating_sub(self.pending.len());
+            let preparation_started = Instant::now();
+            install(&batch.events[..batch.events.len().min(room)]);
+            session.record_producer_phase(
+                ProducerPhase::AssetPreparation,
+                preparation_started.elapsed(),
+            );
             // A silent successful replacement still owns the consumer. For a
             // non-silent one this remains strictly before the first new event
             // crosses the ring.
             if let Some(generation) = self.pending_generation {
-                let completed = self.pending_reload_event.take().ok_or_else(|| {
-                    RuntimeError::Message(
-                        "replacement generation completed without its retained reload event".into(),
-                    )
-                })?;
+                let completed = completed.expect("validated before asset preparation");
                 // The takeover frame - where this generation's re-query
                 // cursor starts - rides with the flip so the consumer keeps
                 // the old generation's earlier onsets sounding (the reload
@@ -2565,6 +2623,7 @@ mod tests {
                         transport.stop();
                         Ok(rustel_audio::KabelPublication::default())
                     },
+                    |_| panic!("a stopped window must not install inserts"),
                     |_, _, _| panic!("a stopped window must not publish a generation"),
                     |_| panic!("a stopped window must not publish an event"),
                 )
@@ -2602,6 +2661,7 @@ mod tests {
                         assert!(!events.is_empty());
                         Ok(rustel_audio::KabelPublication::default())
                     },
+                    |_| {},
                     |_, _, _| panic!("initial window does not replace a generation"),
                     |_| false,
                 )
@@ -2663,6 +2723,7 @@ mod tests {
                         "processor budget exhausted".into(),
                     ))
                 },
+                |_| panic!("refused preparation installed inserts"),
                 |_, _, _| panic!("refused preparation published the replacement"),
                 |_| panic!("refused preparation published an event"),
             )
@@ -3375,6 +3436,7 @@ mod tests {
                         prepared += 1;
                         Ok(rustel_audio::KabelPublication::default())
                     },
+                    |events| assert!(!events.is_empty()),
                     |_| false,
                 )
                 .expect("prepare shield")
@@ -3390,6 +3452,7 @@ mod tests {
                     || 0.0,
                     48_000,
                     |_| panic!("a blocked window must not prepare its resources again"),
+                    |_| panic!("a blocked window must not install its inserts again"),
                     |_| false,
                 )
                 .expect("blocked shield retry")
@@ -3408,6 +3471,12 @@ mod tests {
                         "draining the shield must not prepare its resources again"
                     );
                     Ok(rustel_audio::KabelPublication::default())
+                },
+                |events| {
+                    assert!(
+                        events.is_empty(),
+                        "draining the shield must not install its inserts again"
+                    );
                 },
                 |_, _, _| panic!("shield cannot replace the current generation"),
                 |_| true,
@@ -3443,6 +3512,7 @@ mod tests {
                         "processor budget exhausted".into(),
                     ))
                 },
+                |_| panic!("a refused shield must not install inserts"),
                 |_| panic!("a refused shield must not publish events"),
             )
             .expect_err("refused preparation");
@@ -3478,6 +3548,7 @@ mod tests {
                     transport.stop();
                     Ok(rustel_audio::KabelPublication::default())
                 },
+                |_| panic!("a stopped shield must not install inserts"),
                 |_| panic!("a stopped shield must not publish events"),
             )
             .expect_err("Stop cancels prepared shield publication");
@@ -3981,10 +4052,12 @@ mod tests {
         producer.arm_replacement(audible, candidate_generation);
 
         let error = producer
-            .step_unwatched_with_clock_and_cutover(
+            .step_unwatched_with_clock_and_cutover_and_preparation(
                 &mut session,
                 || 0.0,
                 48_000,
+                |_| panic!("a refused candidate prepared its window"),
+                |_| panic!("a refused candidate installed inserts"),
                 |_, _, _| panic!("a refused candidate reached device cutover"),
                 |_| true,
             )
@@ -4612,7 +4685,7 @@ mod tests {
         };
 
         let held = producer
-            .finish_step(
+            .finish_step_with_preparation(
                 &mut session,
                 WatchResults {
                     score: WatchPoll::Event(installed.clone()),
@@ -4620,6 +4693,8 @@ mod tests {
                 },
                 || 0.0,
                 48_000,
+                |_| panic!("a loading window was prepared"),
+                |_| panic!("a loading window installed inserts"),
                 |generation, frame, cut| published.push((generation, frame, cut)),
                 |_| panic!("a loading window emitted audio"),
             )
@@ -4633,7 +4708,7 @@ mod tests {
         // skip-and-log contract; that is not what this test is about.)
         for _ in 0..3 {
             let held = producer
-                .finish_step(
+                .finish_step_with_preparation(
                     &mut session,
                     WatchResults {
                         score: WatchPoll::Unchanged,
@@ -4641,6 +4716,8 @@ mod tests {
                     },
                     || 0.0,
                     48_000,
+                    |_| panic!("a loading window was prepared"),
+                    |_| panic!("a loading window installed inserts"),
                     |generation, frame, cut| published.push((generation, frame, cut)),
                     |_| panic!("a loading window emitted audio"),
                 )
@@ -4654,8 +4731,10 @@ mod tests {
         assert_eq!(announced, 0);
 
         library.finish_loading_sample_for_test();
+        let prepared = std::cell::Cell::new(false);
+        let inserts_installed = std::cell::Cell::new(false);
         let ready = producer
-            .finish_step(
+            .finish_step_with_preparation(
                 &mut session,
                 WatchResults {
                     score: WatchPoll::Unchanged,
@@ -4663,8 +4742,30 @@ mod tests {
                 },
                 || 0.5,
                 48_000,
-                |generation, frame, cut| published.push((generation, frame, cut)),
-                |_| true,
+                |events| {
+                    assert!(!events.is_empty());
+                    assert!(!prepared.replace(true), "batch prepared more than once");
+                    Ok(rustel_audio::KabelPublication::default())
+                },
+                |events| {
+                    assert!(!events.is_empty());
+                    assert!(prepared.get(), "inserts installed before the preparation");
+                    assert!(
+                        !inserts_installed.replace(true),
+                        "batch installed more than once"
+                    );
+                },
+                |generation, frame, cut| {
+                    assert!(
+                        inserts_installed.get(),
+                        "cutover preceded the insert install"
+                    );
+                    published.push((generation, frame, cut));
+                },
+                |_| {
+                    assert!(inserts_installed.get(), "onset preceded the insert install");
+                    true
+                },
             )
             .expect("the save publishes once its sample is ready");
         assert!(ready.scheduled > 0, "{ready:?}");
@@ -4866,12 +4967,18 @@ mod tests {
                 .expect("replacement");
             producer.arm_replacement(generation_before, generation_after);
 
-            let mut clocks = [1.6, 1.7].into_iter();
+            let clock = std::cell::Cell::new(1.6);
             let mut published = Vec::new();
-            let result = producer.step_unwatched_with_clock_and_cutover(
+            let result = producer.step_unwatched_with_clock_and_cutover_and_preparation(
                 &mut session,
-                || clocks.next().unwrap_or(1.7),
+                || {
+                    let now = clock.get();
+                    clock.set(1.7);
+                    now
+                },
                 48_000,
+                |_| Ok(rustel_audio::KabelPublication::default()),
+                |_| assert!(from_zero, "a rejected edit installed inserts"),
                 |generation, frame, cut| published.push((generation, frame, cut)),
                 |_| true,
             );

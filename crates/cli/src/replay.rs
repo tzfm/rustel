@@ -437,8 +437,6 @@ pub(super) fn announce_active_score(
 /// The one renderer: `--follow` calls it directly and `watch-code` calls it
 /// from the other end of a pipe, so the two ergonomics cannot drift apart.
 pub(super) fn render_active_score(index: usize, total: Option<usize>, at: f64, source: &str) {
-    use std::io::Write as _;
-
     let counter = match total {
         Some(total) => format!("save {index}/{total}"),
         None => format!("save {index}"),
@@ -446,9 +444,8 @@ pub(super) fn render_active_score(index: usize, total: Option<usize>, at: f64, s
     // Home the cursor and clear, so the set redraws in place instead of
     // scrolling: the point is to sit back and watch one screen.
     if style::stdout_on() {
-        print!("\x1b[H\x1b[2J");
+        out!("\x1b[H\x1b[2J");
     }
-    println!("── {at:>8.2}s   {counter} ──\n");
-    println!("{}", style::safe_source(source.trim_end()));
-    let _ = std::io::stdout().flush();
+    outln!("── {at:>8.2}s   {counter} ──\n");
+    outln!("{}", style::safe_source(source.trim_end()));
 }

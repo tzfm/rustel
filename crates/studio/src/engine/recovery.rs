@@ -30,6 +30,10 @@ impl StudioEngine {
         self.pending_accepted_audio.clear();
         self.shield_hold.clear();
         self.cancel_pending_launch();
+        // The held edit and the launch went with the panic. The session
+        // ends their wait.
+        #[cfg(feature = "vst")]
+        self.session.cancel_plugin_hold();
         self.abandon_landing(false, true);
         self.recent_rewind = None;
         self.ui.reset();

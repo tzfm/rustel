@@ -3,7 +3,8 @@ use super::*;
 /// Print a shell auto-completion script for `rustel`, for the given shell.
 pub(super) fn run_completions(shell: clap_complete::Shell) {
     use std::io::Write as _;
-    let _ = std::io::stdout().write_all(completion_script(shell).as_bytes());
+    let out = rustel_runtime::stdio::out();
+    let _ = out.lock().write_all(completion_script(shell).as_bytes());
 }
 
 /// The completion script for a shell.
@@ -107,14 +108,14 @@ pub(super) fn install_completions(shell: clap_complete::Shell) -> Result<(), Run
     }
     std::fs::write(&path, completion_script(shell))?;
     let on = style::stdout_on();
-    println!(
+    outln!(
         "{} {} for {shell}",
         style::green(on, "wrote"),
         style::bold(on, &path.display().to_string())
     );
     match rc_line {
-        Some(line) => println!("then add this line and open a new shell:\n    {line}"),
-        None => println!("open a new shell and it completes"),
+        Some(line) => outln!("then add this line and open a new shell:\n    {line}"),
+        None => outln!("open a new shell and it completes"),
     }
     Ok(())
 }

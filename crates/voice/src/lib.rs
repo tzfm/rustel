@@ -659,7 +659,8 @@ mod tests {
     }
 
     /// With direct logging off, a scope hands its host each distinct notice
-    /// once, and a nested scope's notices stay its own.
+    /// once, and a nested scope's notices stay its own. A plugin notice
+    /// comes back with direct logging on too.
     #[test]
     fn a_quiet_scope_returns_its_notices_deduplicated() {
         let duck_to_nowhere = || {
@@ -693,6 +694,20 @@ mod tests {
 
         let (_, printed) = super::with_diagnostic_policy(true, duck_to_nowhere);
         assert!(printed.is_empty());
+
+        let request = super::PluginRequest {
+            instrument: false,
+            name: "delay",
+            preset: None,
+            params: &[],
+        };
+        let ((), kept) = super::with_diagnostic_policy(true, || {
+            for _ in 0..2 {
+                super::plugin_value_skipped(&request, "Delay has no parameter 'mix'");
+            }
+        });
+        let kept: Vec<&str> = kept.iter().map(|notice| notice.message.as_str()).collect();
+        assert_eq!(kept, ["vst value skipped: Delay has no parameter 'mix'"]);
     }
 
     /// A notice whose record has no `message` of its own still reads as a
@@ -1831,6 +1846,10 @@ impl Drop for DiagnosticPolicyGuard {
 /// notices with the result, each distinct notice once, in the order first
 /// raised, at most sixteen. A nested scope keeps its own notices; discarding
 /// them is the caller's choice.
+///
+/// A plugin notice is never written here. A note gives the notice again in
+/// each window. The scope returns it with direct logging on too, and the
+/// host says it one time.
 pub fn with_diagnostic_policy<T>(
     direct_logging: bool,
     resolve: impl FnOnce() -> T,
@@ -1949,10 +1968,13 @@ fn report_notice(message: impl Into<String>, record: serde_json::Value) {
         eprintln!("{record}");
         return;
     }
-    let notice = VoiceNotice {
-        message: message.into(),
-        record,
-    };
+    keep_notice(message.into(), record);
+}
+
+/// Keep the notice for the enclosing [`with_diagnostic_policy`] scope, each
+/// distinct notice once. Outside every scope, it is dropped.
+fn keep_notice(message: String, record: serde_json::Value) {
+    let notice = VoiceNotice { message, record };
     COLLECTED_NOTICES.with(|collected| {
         if let Some(notices) = collected.borrow_mut().as_mut()
             && notices.len() < MAX_COLLECTED_NOTICES
@@ -2007,6 +2029,32 @@ pub trait SampleLookup {
     fn bus_names(&self) -> Option<&BusNames> {
         None
     }
+
+    /// The plugin controls for a `.vst()` or `.vsti()` request, as the numbers
+    /// the audio engine carries.
+    ///
+    /// `Ok(None)` plays the note with no plugin and no notice: the plugin
+    /// loads now. `Err` plays the note with no plugin and gives the user
+    /// the reason. A host that drops one value of the request keeps the
+    /// plugin and gives the reason with [`plugin_value_skipped`]. A host
+    /// with no plugins keeps this default.
+    fn insert(
+        &self,
+        _request: &PluginRequest<'_>,
+    ) -> Result<Option<rustel_audio::InsertControls>, String> {
+        Err("this host has no plugins".into())
+    }
+}
+
+/// What a note asks of a plugin, in the names the score wrote.
+pub struct PluginRequest<'a> {
+    /// True for `.vsti()`: the plugin makes the sound from the note. False
+    /// for `.vst()`: the plugin changes the sound of the note.
+    pub instrument: bool,
+    pub name: &'a str,
+    pub preset: Option<&'a str>,
+    /// Parameter values by name, each from 0 to 1.
+    pub params: &'a [(&'a str, f64)],
 }
 
 /// Why one onset could not be converted, independently of its diagnostic text.
@@ -2248,6 +2296,7 @@ fn resolve_voice_at(
             other => other.to_string(),
         }));
     }
+    let mut plays_plugin = false;
     let (frequency, gain, controls, sample, wavetable, synth) = match value {
         serde_json::Value::Number(midi) => (
             midi_to_hz(
@@ -2277,8 +2326,15 @@ fn resolve_voice_at(
             let pan = optional_f64(object.get("pan"), "pan")?
                 .map(|pan| checked_f32(pan.clamp(0.0, 1.0), "pan"))
                 .transpose()?;
-            let wavetable = wavetable_controls(object, samples, cps)?;
-            let sample = if wavetable.is_some() {
+            // With `.vsti()` the plugin makes the sound: the note needs no
+            // sample, wavetable or synth of the engine.
+            plays_plugin = object.contains_key("vsti");
+            let wavetable = if plays_plugin {
+                None
+            } else {
+                wavetable_controls(object, samples, cps)?
+            };
+            let sample = if plays_plugin || wavetable.is_some() {
                 None
             } else {
                 sample_controls(object, samples)?
@@ -2371,9 +2427,17 @@ fn resolve_voice_at(
                 cps,
                 frequency,
             )?;
-            // A sample named `one` is the sound, not the constant signal.
-            let synth = synth_source(object, duration_secs, target_time)?
-                .filter(|synth| !(sample.is_some() && *synth == rustel_audio::SynthSource::One));
+            let synth = if plays_plugin {
+                None
+            } else {
+                // A sample named `one` is the sound, not the constant signal.
+                synth_source(object, duration_secs, target_time)?
+                    .filter(|synth| !(sample.is_some() && *synth == rustel_audio::SynthSource::One))
+            };
+            // One cycle is one bar of 4 quarter notes.
+            let clocked = |plugin: rustel_audio::InsertControls| {
+                plugin.with_clock(musical_time * cps * 4.0, (cps * 240.0) as f32)
+            };
             let orbit = optional_f64(object.get("orbit"), "orbit")?.unwrap_or(1.0);
             if !(0.0..16.0).contains(&orbit) {
                 return Err(format!("orbit {orbit} is outside the supported 0..16 range").into());
@@ -2422,7 +2486,11 @@ fn resolve_voice_at(
                     optional_f64(object.get("busgain"), "busgain")?.unwrap_or(1.0),
                     "busgain",
                 )?,
-                waveform: if sample.is_some() || wavetable.is_some() || synth.is_some() {
+                waveform: if plays_plugin
+                    || sample.is_some()
+                    || wavetable.is_some()
+                    || synth.is_some()
+                {
                     rustel_audio::Waveform::Sine
                 } else {
                     oscillator_waveform(object)?
@@ -2465,6 +2533,12 @@ fn resolve_voice_at(
                 stretch,
                 fm,
                 orbit: orbit as u8,
+                insert_chain: None,
+                effects: effect_controls(object, samples).map(|effect| effect.map(clocked)),
+                instrument: object
+                    .get("vsti")
+                    .and_then(|plugin| plugin_controls(plugin, "vsti", samples))
+                    .map(clocked),
                 lfos,
                 envs,
                 phaser: phaser_controls(object, target_time)?,
@@ -2519,6 +2593,31 @@ fn resolve_voice_at(
                 "onset {onset_id} is not an explicit note/frequency control; scalar audio supports note(...), n(...), or freq(...) only"
             ).into());
         }
+    };
+
+    // An instrument plugin makes the sound of the note. The plugin gets the
+    // pitch, velocity and length. The engine applies gain to its output.
+    let (gain, controls) = if plays_plugin {
+        let mut controls = controls;
+        controls.instrument = controls.instrument.map(|instrument| {
+            instrument.with_note(rustel_audio::InsertNote {
+                pitch: (69.0 + 12.0 * (frequency / 440.0).log2()) as f32,
+                velocity: controls.velocity.clamp(0.0, 1.0),
+                frames: (duration_secs * f64::from(sample_rate))
+                    .ceil()
+                    .clamp(1.0, f64::from(u32::MAX)) as u32,
+            })
+        });
+        (
+            if controls.instrument.is_some() {
+                gain
+            } else {
+                0.0
+            },
+            controls,
+        )
+    } else {
+        (gain, controls)
     };
 
     // `clip` (public alias `legato`) belongs to Hap duration semantics; the
@@ -5370,6 +5469,114 @@ fn tremolo_controls(
         phase_offset: checked_f32(phase_offset, "tremolophase")?,
         time_secs: checked_f32(musical_time, "tremolo time")?,
     }))
+}
+
+/// Tells the user why a note plays with no plugin.
+fn plugin_skipped(call: &str, reason: &str) {
+    let message = format!("{call} skipped: {reason}");
+    let record = serde_json::json!({ "vst_skipped": { "message": reason } });
+    report_plugin_notice(message, record);
+}
+
+/// Tells the user why a note plays with one plugin value less. A host calls
+/// this in [`SampleLookup::insert`] for each value of the request it drops.
+/// The note keeps its plugin.
+pub fn plugin_value_skipped(request: &PluginRequest<'_>, reason: &str) {
+    let call = if request.instrument { "vsti" } else { "vst" };
+    let message = format!("{call} value skipped: {reason}");
+    let record = serde_json::json!({ "vst_skipped": { "message": &message } });
+    report_plugin_notice(message, record);
+}
+
+/// Gives a plugin notice to the enclosing [`with_diagnostic_policy`] scope.
+/// The scope keeps the notice with direct logging on too, and its host says
+/// the notice one time. Outside every scope, [`report_notice`] prints or
+/// drops the notice.
+fn report_plugin_notice(message: String, record: serde_json::Value) {
+    if COLLECTED_NOTICES.with(|collected| collected.borrow().is_some()) {
+        keep_notice(message, record);
+    } else {
+        report_notice(message, record);
+    }
+}
+
+/// The effects a note asks for, in chain order. The hap carries a list
+/// under `vst`, one plugin object for each `.vst()` call. An effect the
+/// host cannot serve leaves its stage empty, and the note goes through the
+/// other effects.
+fn effect_controls(
+    object: &serde_json::Map<String, serde_json::Value>,
+    samples: &dyn SampleLookup,
+) -> [Option<rustel_audio::InsertControls>; rustel_audio::EFFECT_CHAIN] {
+    let mut effects = [None; rustel_audio::EFFECT_CHAIN];
+    let Some(serde_json::Value::Array(chain)) = object.get("vst") else {
+        return effects;
+    };
+    if chain.len() > effects.len() {
+        let most = effects.len();
+        plugin_skipped(
+            "vst",
+            &format!("a note goes through {most} effect plugins at most"),
+        );
+    }
+    for (stage, plugin) in effects.iter_mut().zip(chain) {
+        *stage = plugin_controls(plugin, "vst", samples);
+    }
+    effects
+}
+
+/// The plugin one plugin object of a hap asks for, under `call`: `vst` for
+/// an effect, `vsti` for an instrument.
+///
+/// The object is `{ name, preset, params: { key: value } }`. A request the
+/// host cannot serve is not an error: the note plays with no plugin, and
+/// the user gets one notice with the reason.
+fn plugin_controls(
+    plugin: &serde_json::Value,
+    call: &str,
+    samples: &dyn SampleLookup,
+) -> Option<rustel_audio::InsertControls> {
+    let plugin = plugin.as_object()?;
+    let skip = |reason: &str| plugin_skipped(call, reason);
+    let Some(name) = plugin.get("name").and_then(serde_json::Value::as_str) else {
+        skip("the plugin name is not text");
+        return None;
+    };
+    let preset = match plugin.get("preset") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(preset)) => Some(preset.clone()),
+        Some(serde_json::Value::Number(preset)) => Some(preset.to_string()),
+        Some(_) => {
+            skip("the preset name is not text");
+            return None;
+        }
+    };
+    let mut params = Vec::new();
+    if let Some(serde_json::Value::Object(values)) = plugin.get("params") {
+        for (key, value) in values {
+            match optional_f64(Some(value), key) {
+                Ok(Some(value)) => params.push((key.as_str(), value)),
+                Ok(None) => {}
+                Err(reason) => {
+                    skip(&reason);
+                    return None;
+                }
+            }
+        }
+    }
+    let request = PluginRequest {
+        instrument: call == "vsti",
+        name,
+        preset: preset.as_deref(),
+        params: &params,
+    };
+    match samples.insert(&request) {
+        Ok(controls) => controls,
+        Err(reason) => {
+            skip(&reason);
+            None
+        }
+    }
 }
 
 /// The vowel formant table, including the unicode aliases.

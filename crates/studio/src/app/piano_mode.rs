@@ -45,6 +45,9 @@ impl App {
     pub(super) fn close_piano_mode(&mut self) {
         if self.piano.open {
             self.piano.open = false;
+            // The engine closes Piano mode with these settings. A Stop or a
+            // focus loss sends no settings, and Piano mode stays open.
+            self.piano.pending_settings = true;
             self.silence_piano();
             self.piano.pulse_started = None;
             self.piano.notes_until =

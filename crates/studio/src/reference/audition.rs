@@ -268,6 +268,8 @@ pub fn tab_previews(tab: Tab) -> bool {
     match tab {
         Tab::Samples | Tab::Chords | Tab::Scales => true,
         Tab::Reference => false,
+        #[cfg(feature = "vst")]
+        Tab::Vst => false,
         #[cfg(feature = "hydra")]
         Tab::Examples | Tab::Generator => false,
     }

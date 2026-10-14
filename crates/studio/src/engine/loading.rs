@@ -2,8 +2,16 @@
 //! cycle zero for and what a held edit waits on in [`LoadMode::Wait`], the
 //! header's loading cue, the one line a load's late sounds are said in, and
 //! the log alerts those lines and failed imports raise and resolve.
+//!
+//! Plugins are part of the same wait, and the session decides it. A start
+//! waits for the plugin copies of its first window: see
+//! [`rustel_runtime::Session::plugins_pending`]. An edit and a launch wait
+//! while the session holds their text for its plugin copies: see
+//! [`rustel_runtime::Session::reload_live`].
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "vst")]
+use std::time::Instant;
 
 use rustel_runtime::samples::{SampleFailure, SampleLibrary, SoundReadiness, SourceState};
 use rustel_runtime::{RuntimeError, SAMPLE_LOADING_DIAGNOSTIC};
@@ -78,7 +86,8 @@ impl Followed {
     }
 }
 
-/// An edit held until the sounds its text names have loaded.
+/// An edit held until the sounds its text names have loaded, and until the
+/// session has the plugin copies of its notes.
 #[derive(Debug)]
 pub(super) struct HeldEdit {
     source: String,
@@ -94,8 +103,16 @@ pub(super) struct LoadState {
     /// What the installed score needs: its first window after a start,
     /// what its text names after an edit. Let go once none is loading.
     installed: Vec<Followed>,
-    /// A start holds its cycle zero until `installed` has loaded.
+    /// A start holds its cycle zero until `installed` has loaded and
+    /// `start_plugins` is 0.
     start_held: bool,
+    /// The plugin copies of the first window not ready, at the last look
+    /// of a held start.
+    start_plugins: usize,
+    /// The last time a copy of the first window became ready, or the start
+    /// of the wait: see [`StudioEngine::look_at_start_copies`].
+    #[cfg(feature = "vst")]
+    start_progress: Option<Instant>,
     pub(super) held_edit: Option<HeldEdit>,
     /// Sounds skipped as still loading since the last late-sounds line.
     late: BTreeSet<String>,
@@ -116,6 +133,8 @@ pub struct LoadingCue {
     pub total: usize,
     /// The bank, file or map still loading first, when there is one.
     pub loading: Option<String>,
+    /// How many of the loads not settled are plugins.
+    pub plugins: usize,
     /// A start or an edit is held until this load is over.
     pub waiting: bool,
 }
@@ -149,6 +168,16 @@ fn imports_in(source: &str) -> Vec<Followed> {
 fn push_new(followed: &mut Vec<Followed>, item: Followed) {
     if !followed.contains(&item) {
         followed.push(item);
+    }
+}
+
+/// How the log names what a launch or an edit waits for: its sounds, its
+/// plugin copies, or both.
+fn waits_for_words(sounds: bool, plugins: bool) -> &'static str {
+    match (sounds, plugins) {
+        (true, true) => "sounds and plugins",
+        (false, true) => "plugins",
+        _ => "sounds",
     }
 }
 
@@ -199,6 +228,26 @@ impl StudioEngine {
             .into_iter()
             .filter(|item| !playing.contains(item))
             .collect()
+    }
+
+    /// One look of a start at the plugin copies of its first window: see
+    /// [`rustel_runtime::Session::plugins_pending`]. The start waits while a
+    /// copy became ready in the last [`rustel_runtime::PLUGIN_WAIT`]. After
+    /// it, the start goes on, and a note with no copy plays with no plugin.
+    #[cfg(feature = "vst")]
+    fn look_at_start_copies(&mut self) -> Result<(), RuntimeError> {
+        let now = self.device_time();
+        let pending = self.session.with_panic_recovery(now, |session| {
+            Ok(session.plugins_pending(0.0, FIRST_WINDOW_CYCLES, STARTUP_SAMPLE_WARM_BUDGET))
+        })?;
+        let progress = match self.load.start_progress {
+            Some(progress) if pending >= self.load.start_plugins => progress,
+            _ => Instant::now(),
+        };
+        self.load.start_progress = Some(progress);
+        let waits = progress.elapsed() < rustel_runtime::PLUGIN_WAIT;
+        self.load.start_plugins = if waits { pending } else { 0 };
+        Ok(())
     }
 
     /// What the score just installed by a start plays in its first window,
@@ -264,7 +313,8 @@ impl StudioEngine {
     /// Hold an edit played now until the sounds its text names have loaded,
     /// in [`LoadMode::Wait`]. True when it is held: the last score keeps
     /// playing, and [`Self::take_launch_outcome`] answers the edit once it
-    /// lands. A newer edit or a stop cancels it like a pending launch.
+    /// lands. A newer edit or a stop cancels it like a pending launch. The
+    /// plugin copies of the edit build while its sounds load.
     pub fn hold_update(&mut self, source: &str, mini: bool, rewind: bool) -> bool {
         if !self.waits_for_sounds()
             || self.live.is_none()
@@ -281,6 +331,14 @@ impl StudioEngine {
         }
         self.cancel_pending_launch();
         self.launch_outcome = None;
+        #[cfg(feature = "vst")]
+        let plugins = {
+            let cycle = self.session.cycle_at_time(self.device_time());
+            self.prepare_live(source, mini, if rewind { 0.0 } else { cycle });
+            self.session.waits_for_plugins(source)
+        };
+        #[cfg(not(feature = "vst"))]
+        let plugins = false;
         self.load.held_edit = Some(HeldEdit {
             source: source.to_owned(),
             mini,
@@ -289,8 +347,33 @@ impl StudioEngine {
             followed,
         });
         self.ask_for_waited();
-        self.log_launch("update waits for its sounds");
+        let waits_for = waits_for_words(true, plugins);
+        self.log_launch(&format!("update waits for its {waits_for}"));
         true
+    }
+
+    /// Hold an edit the session holds for its plugin copies: see
+    /// [`rustel_runtime::Session::reload_live`]. The last score keeps
+    /// playing, [`Self::advance_held_edit`] lands the edit when its copies
+    /// are ready, and [`Self::take_launch_outcome`] answers it then. The
+    /// edit keeps its from-zero request and its preview mark.
+    pub(super) fn hold_for_plugins(&mut self, source: &str, mini: bool) -> StudioInstall {
+        self.launch_outcome = None;
+        self.load.held_edit = Some(HeldEdit {
+            source: source.to_owned(),
+            mini,
+            rewind: self.session.take_next_from_zero(),
+            preview: std::mem::take(&mut self.next_install_preview),
+            followed: Vec::new(),
+        });
+        self.log_launch("update waits for its plugins");
+        StudioInstall {
+            generation: self.session.generation(),
+            source_revision: source_revision(source),
+            pending_cutover: false,
+            answered_repeat: false,
+            held: true,
+        }
     }
 
     /// In [`LoadMode::Wait`], ask for what a held start, a held edit or an
@@ -319,17 +402,20 @@ impl StudioEngine {
         }
     }
 
-    /// Land a held edit once its sounds have loaded, or at once when the
-    /// mode no longer waits.
+    /// Land a held edit once its sounds have loaded and the session has its
+    /// plugin copies, or at once when the mode no longer waits.
     pub(super) fn advance_held_edit(&mut self) {
-        let due =
-            self.load.held_edit.as_ref().is_some_and(|held| {
-                !self.waits_for_sounds() || !self.loading_among(&held.followed)
-            });
-        if !due || self.live.is_none() || self.is_stopping() {
+        let waits = self.waits_for_sounds();
+        let Some(held) = self.load.held_edit.as_ref() else {
+            return;
+        };
+        let loading = waits && self.loading_among(&held.followed);
+        #[cfg(feature = "vst")]
+        let loading = loading || (waits && self.session.waits_for_plugins(&held.source));
+        if loading || self.live.is_none() || self.is_stopping() {
             return;
         }
-        let held = self.load.held_edit.take().expect("checked");
+        let mut held = self.load.held_edit.take().expect("checked");
         // The edit replaces whatever a fired launch was landing, as an
         // edit played now does.
         self.abandon_landing(false, false);
@@ -337,36 +423,67 @@ impl StudioEngine {
             self.session.start_next_from_zero();
         }
         self.next_install_preview = held.preview;
-        let outcome = self.reload_live(&held.source, held.mini);
-        if outcome.is_err() {
-            self.session.clear_next_from_zero();
+        match self.reload_live(&held.source, held.mini) {
+            Ok(Some(install)) => self.launch_outcome = Some(Ok(install)),
+            // The session holds the edit for its plugin copies again: the
+            // edit keeps its from-zero request and its preview mark.
+            Ok(None) => {
+                self.session.clear_next_from_zero();
+                held.preview = std::mem::take(&mut self.next_install_preview);
+                self.load.held_edit = Some(held);
+            }
+            Err(error) => {
+                self.session.clear_next_from_zero();
+                // The edit does not go in play: the session ends its wait.
+                #[cfg(feature = "vst")]
+                self.session.cancel_plugin_hold();
+                self.launch_outcome = Some(Err(error));
+            }
         }
-        self.launch_outcome = Some(outcome);
     }
 
-    /// In [`LoadMode::Wait`], a launch whose sounds are still loading lets
-    /// the line within its head-room pass and aims at the next one. The
-    /// first line it lets pass is logged.
+    /// In [`LoadMode::Wait`], a launch whose sounds are still loading, or
+    /// whose text the session holds for its plugin copies, lets the line
+    /// within its head-room pass and aims at the next one.
     pub(super) fn launch_waits_for_sounds(&mut self, now: f64) -> bool {
         let Some(pending) = self.pending_launch.as_ref() else {
             return false;
         };
-        if !self.waits_for_sounds() || !self.loading_among(&pending.followed) {
+        if !self.waits_for_sounds() {
             return false;
         }
-        let cps = self.session.cps().max(1e-6);
-        let cycle_now = self.session.cycle_at_time(now);
-        let headroom_cycles = self.launch_headroom() * cps;
-        let pending = self.pending_launch.as_mut().expect("checked");
-        pending.boundary_cycle = next_boundary(cycle_now, pending.unit_cycles, headroom_cycles);
-        pending.boundary_time = now + (pending.boundary_cycle - cycle_now) / cps;
-        if !std::mem::replace(&mut pending.waited, true) {
-            self.log_launch("sounds still loading - the launch takes the first line after them");
+        let sounds = self.loading_among(&pending.followed);
+        #[cfg(feature = "vst")]
+        let plugins = self.session.waits_for_plugins(&pending.source);
+        #[cfg(not(feature = "vst"))]
+        let plugins = false;
+        if !sounds && !plugins {
+            return false;
         }
+        self.launch_takes_next_line(now, waits_for_words(sounds, plugins));
         true
     }
 
-    /// The text of an edit held for its sounds.
+    /// The pending launch lets the line within its head-room pass and aims
+    /// at the next one. The first line it lets pass is logged, with what the
+    /// launch waits for.
+    pub(super) fn launch_takes_next_line(&mut self, now: f64, waits_for: &str) {
+        let cps = self.session.cps().max(1e-6);
+        let cycle_now = self.session.cycle_at_time(now);
+        let headroom_cycles = self.launch_headroom() * cps;
+        let Some(pending) = self.pending_launch.as_mut() else {
+            return;
+        };
+        pending.boundary_cycle = next_boundary(cycle_now, pending.unit_cycles, headroom_cycles);
+        pending.boundary_time = now + (pending.boundary_cycle - cycle_now) / cps;
+        if !std::mem::replace(&mut pending.waited, true) {
+            self.log_launch(&format!(
+                "{waits_for} still loading - the launch takes the first line after them"
+            ));
+        }
+    }
+
+    /// The text of an edit held for its sounds or its plugin copies.
     pub(super) fn waiting_source(&self) -> Option<&str> {
         self.load
             .held_edit
@@ -385,10 +502,20 @@ impl StudioEngine {
     }
 
     /// Follow what a start's first window plays, and hold its cycle zero
-    /// for it in [`LoadMode::Wait`].
+    /// for it in [`LoadMode::Wait`]. The plugin copies of the window hold
+    /// the start too.
     pub(super) fn follow_start(&mut self, source: &str) -> Result<(), RuntimeError> {
         self.load.installed = self.followed_in_first_window(source)?;
-        self.load.start_held = self.waits_for_sounds() && self.loading_among(&self.load.installed);
+        #[cfg(feature = "vst")]
+        {
+            self.load.start_plugins = 0;
+            self.load.start_progress = None;
+            if self.waits_for_sounds() {
+                self.look_at_start_copies()?;
+            }
+        }
+        self.load.start_held = self.waits_for_sounds()
+            && (self.loading_among(&self.load.installed) || self.load.start_plugins > 0);
         Ok(())
     }
 
@@ -399,7 +526,9 @@ impl StudioEngine {
 
     /// One turn of a held start: the layout reaches the display so its
     /// sliders can move, and cycle zero stays just ahead. False once the
-    /// first window's sounds have loaded, when the start goes on.
+    /// first window's sounds have loaded and its plugin copies are ready,
+    /// when the start goes on. A look that fails ends the wait for the
+    /// copies.
     pub(super) fn hold_start(
         &mut self,
         emit: &mut impl FnMut(StudioUpdate) -> StudioUpdateSendResult,
@@ -407,7 +536,11 @@ impl StudioEngine {
         if !self.start_is_held() {
             return false;
         }
-        if !self.loading_among(&self.load.installed) {
+        #[cfg(feature = "vst")]
+        if self.load.start_plugins > 0 && self.look_at_start_copies().is_err() {
+            self.load.start_plugins = 0;
+        }
+        if !self.loading_among(&self.load.installed) && self.load.start_plugins == 0 {
             self.load.start_held = false;
             return false;
         }
@@ -457,6 +590,7 @@ impl StudioEngine {
             source_revision: source_revision(source),
             pending_cutover: false,
             answered_repeat: false,
+            held: false,
         })
     }
 
@@ -466,33 +600,54 @@ impl StudioEngine {
         if self.live.is_none() || self.is_stopping() {
             return None;
         }
-        let library = self.session.sample_library()?;
-        let mut followed: Vec<&Followed> = Vec::new();
-        let waiting_on = self
-            .load
-            .held_edit
-            .iter()
-            .flat_map(|held| &held.followed)
-            .chain(
-                self.pending_launch
-                    .iter()
-                    .flat_map(|pending| &pending.followed),
-            );
-        for item in self.load.installed.iter().chain(waiting_on) {
-            if !followed.contains(&item) {
-                followed.push(item);
+        let mut cue = LoadingCue::default();
+        if let Some(library) = self.session.sample_library() {
+            let mut followed: Vec<&Followed> = Vec::new();
+            let waiting_on = self
+                .load
+                .held_edit
+                .iter()
+                .flat_map(|held| &held.followed)
+                .chain(
+                    self.pending_launch
+                        .iter()
+                        .flat_map(|pending| &pending.followed),
+                );
+            for item in self.load.installed.iter().chain(waiting_on) {
+                if !followed.contains(&item) {
+                    followed.push(item);
+                }
+            }
+            for item in followed {
+                item.each_file(library, |name, loading| {
+                    cue.total += 1;
+                    if loading {
+                        cue.loading.get_or_insert_with(|| name.to_owned());
+                    } else {
+                        cue.settled += 1;
+                    }
+                });
             }
         }
-        let mut cue = LoadingCue::default();
-        for item in followed {
-            item.each_file(library, |name, loading| {
-                cue.total += 1;
-                if loading {
-                    cue.loading.get_or_insert_with(|| name.to_owned());
-                } else {
-                    cue.settled += 1;
+        // A held start counts the plugin copies of its first window. The
+        // count has no names: the session counts copies.
+        if self.start_is_held() {
+            cue.total += self.load.start_plugins;
+            cue.plugins += self.load.start_plugins;
+        }
+        // A held edit or a launch counts the copies the session holds its
+        // text for.
+        #[cfg(feature = "vst")]
+        {
+            let held = self.load.held_edit.iter().map(|held| &held.source);
+            let launch = self.pending_launch.iter().map(|pending| &pending.source);
+            for source in held.chain(launch) {
+                if let Some((pending, total)) = self.session.plugins_waited_for(source) {
+                    cue.total += total;
+                    cue.settled += total - pending;
+                    cue.plugins += pending;
                 }
-            });
+            }
         }
         if cue.settled == cue.total {
             return None;
@@ -500,10 +655,15 @@ impl StudioEngine {
         cue.waiting = self.start_is_held()
             || self.load.held_edit.is_some()
             || (self.waits_for_sounds()
-                && self
-                    .pending_launch
-                    .as_ref()
-                    .is_some_and(|pending| self.loading_among(&pending.followed)));
+                && self.pending_launch.as_ref().is_some_and(|pending| {
+                    #[cfg(feature = "vst")]
+                    if let Some((copies, _)) = self.session.plugins_waited_for(&pending.source)
+                        && copies > 0
+                    {
+                        return true;
+                    }
+                    self.loading_among(&pending.followed)
+                }));
         Some(cue)
     }
 
@@ -534,12 +694,18 @@ impl StudioEngine {
 
     /// Each turn's bookkeeping: ask for what waits, let go of what has
     /// loaded, say the late-sounds line once a load is over, and resolve
-    /// the alerts whose sounds or maps have come in.
+    /// the alerts whose sounds or maps have come in. The session looks
+    /// again at the plugin copies of an armed launch, so the cue counts the
+    /// copies of now.
     pub(super) fn settle_loads(&mut self) {
         self.ask_for_waited();
+        #[cfg(feature = "vst")]
+        if let Some(pending) = self.pending_launch.as_ref() {
+            self.session.waits_for_plugins(&pending.source);
+        }
         if !self.load.installed.is_empty() && !self.loading_among(&self.load.installed) {
             self.load.installed.clear();
-            self.load.start_held = false;
+            self.load.start_held &= self.load.start_plugins > 0;
         }
         let still_waiting = self.load.held_edit.is_some()
             || self
@@ -558,10 +724,14 @@ impl StudioEngine {
     }
 
     /// Stop ends every load: a held start and edit go with the transport,
-    /// the cue with them, and what came late so far is said now.
+    /// the cue with them, and what came late so far is said now. The
+    /// session forgets the text it holds for its plugin copies.
     pub(super) fn end_loads(&mut self) {
         self.load.installed.clear();
         self.load.start_held = false;
+        self.load.start_plugins = 0;
+        #[cfg(feature = "vst")]
+        self.session.cancel_plugin_hold();
         let late = self.late_sounds();
         self.say_late(late);
         self.resolve_alerts();

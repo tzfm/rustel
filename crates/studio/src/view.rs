@@ -41,7 +41,9 @@ use super::theme::{
 };
 use super::visuals::{SourceMark, VisualRequest, VisualState};
 use rustel_runtime::ui_analysis::UiAudioAnalysisFrame;
-use rustel_runtime::{EnginePressureLevel, EnginePressureSnapshot, ProcessStats, product};
+use rustel_runtime::{
+    EnginePressureCause, EnginePressureLevel, EnginePressureSnapshot, ProcessStats, product,
+};
 
 mod layout;
 
@@ -597,6 +599,9 @@ pub struct StudioView<'a> {
     pub keybind_rows: Vec<super::settings::KeybindRow>,
     /// The origins of the Trust page.
     pub trust_rows: Vec<super::settings::TrustRow>,
+    /// The plugin folders, for the vst page. Empty while another page shows.
+    #[cfg(feature = "vst")]
+    pub vst_page: super::settings::VstPage,
     /// What the open stream costs end to end, for the devices panel.
     pub latency: Option<super::devices::LatencyReport>,
     /// The MIDI tab's rows, merged and with their boxes resolved. Empty while
@@ -1220,6 +1225,8 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
                 mappings: view.mappings,
                 bindings: view.keybind_rows,
                 trust: view.trust_rows,
+                #[cfg(feature = "vst")]
+                vst: view.vst_page,
                 capabilities: chrome.capabilities,
                 theme,
             },
@@ -2504,7 +2511,15 @@ impl Widget for Header<'_, '_> {
         // path is not here - a set's folder is nested deep and its name
         // says everything the row has room to say.
         let left_end = after_go.saturating_add(2);
+        let underrun = self
+            .chrome
+            .pressure
+            .filter(|pressure| pressure.cause == EnginePressureCause::DeviceUnderrun);
+        let warning_room = underrun.map_or(0, |pressure| {
+            UnicodeWidthStr::width(pressure.cause.label()) + 3
+        });
         let room = usize::from(area.right().saturating_sub(left_end + 1));
+        let room = room.checked_sub(warning_room).unwrap_or(room);
         // The set's name goes before the scene while there is room for
         // both; the scene wins when there is not.
         let set = self.chrome.set_name;
@@ -2542,12 +2557,28 @@ impl Widget for Header<'_, '_> {
             }),
         );
 
-        // Engine pressure has priority over process-wide counters: this is
+        // Detailed engine pressure has priority over process-wide counters: this is
         // the deadline information that says whether playback can keep up.
         // It only appears at Full - the deadline detail a tuning session
         // wants, not a glance mid-set.
         let detail = self.chrome.metric_detail;
         let mut counters_right = file_x;
+        // A recent backend underrun stays visible when metrics are hidden.
+        if let Some(pressure) = underrun {
+            let warning = pressure.cause.label();
+            let warning_width = UnicodeWidthStr::width(warning) as u16;
+            if counters_right >= left_end + warning_width + 3 {
+                let warning_x = counters_right.saturating_sub(warning_width + 3);
+                buffer.set_stringn(
+                    warning_x,
+                    area.y,
+                    warning,
+                    usize::from(warning_width),
+                    Style::default().fg(engine_pressure_color(pressure.level, theme)),
+                );
+                counters_right = warning_x;
+            }
+        }
         if detail.shows_pressure()
             && let Some(pressure) = self.chrome.pressure
         {
@@ -8832,6 +8863,7 @@ mod tests {
         let mut chrome = chrome(&theme, &master, Path::new("live.strudel"));
         let mut pressure = EnginePressureSnapshot {
             level: EnginePressureLevel::Warning,
+            cause: EnginePressureCause::DeviceUnderrun,
             ..EnginePressureSnapshot::default()
         };
         pressure.device.realtime_load.slow_load_basis_points = 2_400;
@@ -8839,7 +8871,7 @@ mod tests {
         pressure.producer.slow_load_basis_points = 1_100;
         pressure.producer.cover_end_nanos = 420_000_000;
         chrome.pressure = Some(&pressure);
-        // Pressure only draws at Full - the deadline detail a tuning
+        // Detailed pressure only draws at Full - the deadline detail a tuning
         // session wants, not what a glance mid-set gets by default.
         chrome.metric_detail = settings::MetricDetail::Full;
         chrome.stats = ProcessStats {
@@ -8857,6 +8889,27 @@ mod tests {
         let at = text.find(expected).unwrap();
         let cell = text[..at].chars().count() as u16;
         assert_eq!(buffer.cell((cell, 0)).unwrap().fg, theme.warn);
+        let warning = "audio device underrun";
+        let at = text.find(warning).expect("the recent underrun is visible");
+        let cell = text[..at].chars().count() as u16;
+        assert_eq!(buffer.cell((cell, 0)).unwrap().fg, theme.warn);
+
+        chrome.metric_detail = settings::MetricDetail::None;
+        let long_name = format!("{}.strudel", "scene".repeat(40));
+        chrome.path = Path::new(&long_name);
+        let mut buffer = Buffer::empty(area);
+        Header { chrome: &chrome }.render(area, &mut buffer);
+        let text = text_of(&buffer);
+        assert!(text.contains(warning), "{text}");
+        assert!(!text.contains(expected), "{text}");
+
+        chrome.path = Path::new("live.strudel");
+        let narrow = Rect::new(0, 0, 32, 1);
+        let mut buffer = Buffer::empty(narrow);
+        Header { chrome: &chrome }.render(narrow, &mut buffer);
+        let text = text_of(&buffer);
+        assert!(text.contains("live"), "{text}");
+        assert!(!text.contains(warning), "{text}");
     }
 
     #[test]
@@ -9248,6 +9301,8 @@ mod tests {
                         mappings: Default::default(),
                         keybind_rows: Vec::new(),
                         trust_rows: Vec::new(),
+                        #[cfg(feature = "vst")]
+                        vst_page: Default::default(),
                         latency: None,
                         caching_samples: 0,
                         importing_sources: 0,
@@ -9367,6 +9422,8 @@ mod tests {
                         mappings: Default::default(),
                         keybind_rows: Vec::new(),
                         trust_rows: Vec::new(),
+                        #[cfg(feature = "vst")]
+                        vst_page: Default::default(),
                         latency: None,
                         caching_samples: 0,
                         importing_sources: 0,
@@ -9474,6 +9531,8 @@ mod tests {
                         mappings: Default::default(),
                         keybind_rows: Vec::new(),
                         trust_rows: Vec::new(),
+                        #[cfg(feature = "vst")]
+                        vst_page: Default::default(),
                         latency: None,
                         caching_samples: 0,
                         importing_sources: 0,
@@ -9584,6 +9643,8 @@ mod tests {
                         mappings: Default::default(),
                         keybind_rows: Vec::new(),
                         trust_rows: Vec::new(),
+                        #[cfg(feature = "vst")]
+                        vst_page: Default::default(),
                         latency: None,
                         caching_samples: 0,
                         importing_sources: 0,

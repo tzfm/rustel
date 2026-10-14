@@ -181,11 +181,13 @@ fn a_new_session_collects_refused_voices_instead_of_printing_them() {
 
 /// A host that never opts into direct logging gets the voice resolver's
 /// notices and the score's `.log()` lines from `take_diagnostics`, whether it
-/// schedules or renders PCM.
+/// schedules or renders PCM. A plugin call gives one line of the plugin kind.
 #[cfg(feature = "session")]
 #[test]
 fn a_new_session_collects_voice_notices_and_log_lines() {
-    use rustel_engine::{Session, SessionConfig, SessionDiagnostic, VOICE_NOTICE_DIAGNOSTIC};
+    use rustel_engine::{
+        PLUGIN_DIAGNOSTIC, Session, SessionConfig, SessionDiagnostic, VOICE_NOTICE_DIAGNOSTIC,
+    };
 
     fn noticing_session() -> Session {
         let config = SessionConfig::default()
@@ -194,7 +196,7 @@ fn a_new_session_collects_voice_notices_and_log_lines() {
             .with_sample_rate(8_000);
         let mut session = Session::with_config(config).unwrap();
         session
-            .evaluate(r#"note("c4 e4").s("sine").duckorbit(99).log()"#)
+            .evaluate(r#"note("c4 e4").s("sine").duckorbit(99).vst("delay").log()"#)
             .unwrap();
         session
     }
@@ -209,6 +211,11 @@ fn a_new_session_collects_voice_notices_and_log_lines() {
         assert_eq!(
             messages(diagnostics, VOICE_NOTICE_DIAGNOSTIC),
             ["duck target orbit 99 does not exist"],
+            "{what}: {diagnostics:?}"
+        );
+        assert_eq!(
+            messages(diagnostics, PLUGIN_DIAGNOSTIC),
+            ["vst skipped: this host has no plugins"],
             "{what}: {diagnostics:?}"
         );
         let logs = messages(diagnostics, "log");

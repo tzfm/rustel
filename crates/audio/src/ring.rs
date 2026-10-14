@@ -875,7 +875,15 @@ mod kabel_snapshot_tests {
         let compact = size_of::<QueuedAudioEvent<CompactKabelControls>>();
         let producer = size_of::<QueuedAudioEvent>();
         assert_eq!(size_of::<CompactKabelControls>(), 32);
-        assert!(compact <= 4352, "callback event grew to {compact} bytes");
+        // A note also carries its insert chain, its effects and its
+        // instrument, with their parameter values.
+        let inserts = size_of::<Option<u64>>()
+            + (crate::insert::EFFECT_CHAIN + 1)
+                * size_of::<Option<crate::insert::InsertControls>>();
+        assert!(
+            compact <= 4352 + inserts,
+            "callback event grew to {compact} bytes"
+        );
         assert!(compact <= size_of::<QueuedAudioEvent<()>>() + 4 * 32);
         assert_eq!(producer, compact, "producer events must share graph code");
         assert!(!needs_drop::<QueuedAudioEvent<CompactKabelControls>>());

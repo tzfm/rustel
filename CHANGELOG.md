@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Scores use `.vst()` for VST3 effects and `.vsti()` for VST3 instruments, with parameters and presets. Plugin support is experimental. `rustel vst` lists your plugins. Studio lists the plugins in the reference panel and completes plugin names, parameters and presets. See [Plugins](https://github.com/tzfm/rustel/blob/main/docs/plugins.md).
+- The audio of a VST3 plugin runs in the rustel process, as in most DAWs. Studio and `rustel vst` scan each plugin bundle in a process of its own, so a plugin fault at the scan ends no host. An edit keeps the plugin copies of each call it does not change, and a plugin with no sound sleeps until its next note.
+- Studio and the CLI report device underruns apart from DSP deadline misses. A recoverable underrun keeps playback running.
+- A digit in a name has the colour of the name in the Studio editor. The `1` in `filter1on` had the number colour.
+- Stop fades an orbit routed to another output pair with the main pair. Before, the orbit kept its level through the stop fade, and the stopped output played the last block of the orbit in a loop.
 - `K(...)` binds the same note frequency on every platform. The frequency came from the host `pow`, whose last bits differ on Windows, so a score using `sFreq` produced a different event hash there and failed the corpus. The bound frequency is trimmed, as tonal frequencies already are, and the two affected golden rows are recaptured.
 - KabelSalat guide tests read examples with Unix or Windows line endings.
 - Methods defined through aliases such as `const rg = register` pass score checks and remain available in later updates.
