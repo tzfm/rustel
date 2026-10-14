@@ -167,7 +167,13 @@ fn frequency<'js>(ctx: &Ctx<'js>, object: &rquickjs::Object<'js>) -> rquickjs::R
     } else {
         rquickjs::Coerced::<f64>::from_js(ctx, octave)?.0
     };
-    Ok(freq * 2.0f64.powf(octave))
+    // The bound frequency is serialized into the event's graph, and the
+    // corpus compares event hashes exactly across hosts. Host `pow`
+    // differs in its last bits between platforms, so trim before it binds.
+    // The trim stays below 1e-8 relative, under the audio tolerance.
+    Ok(rustel_core::tonal::trim_frequency(
+        freq * 2.0f64.powf(octave),
+    ))
 }
 
 fn compile_stage<'js>(

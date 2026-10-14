@@ -63,7 +63,7 @@ pub fn hz_to_midi(frequency: f64, tuning: f64) -> f64 {
     12.0 * (frequency / tuning).log2() + 69.0
 }
 
-pub(crate) fn trim_frequency(frequency: f64) -> f64 {
+pub fn trim_frequency(frequency: f64) -> f64 {
     if frequency == 0.0 || !frequency.is_finite() {
         return frequency;
     }
