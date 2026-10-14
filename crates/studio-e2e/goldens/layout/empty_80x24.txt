@@ -1,5 +1,5 @@
   File  Edit  Scene  Transport  View  Options  Help                             
- ◉ rustel STOPPED ✓ ready   120.0 bpm · 0.50 cps · cyc                    first 
+ ◉ rustel STOPPED  ✓ ready   120.0 bpm · 0.50 cps · cy                    first 
   1 first                                                                       
   1 $: s("bd")                                                                  
   2                                                                             
