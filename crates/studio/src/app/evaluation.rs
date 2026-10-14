@@ -123,6 +123,7 @@ fn concise_evaluation_error(message: &str) -> String {
     reason.to_owned()
 }
 
+#[derive(Clone)]
 pub(super) struct PendingEvaluation {
     pub(super) request_id: u64,
     /// The scene whose text went out, at `editor_revision`.
@@ -272,6 +273,69 @@ impl App {
         }
         let scene = self.scenes.current().id;
         self.queue_evaluation_for(scene, revision, source, true);
+    }
+
+    /// Apply the focused score without a keypress, once typing has paused.
+    ///
+    /// The launch row names the line the edit lands on, the same line an
+    /// update waits for. Only while the set plays: starting the transport
+    /// is a decision the studio does not make on its own. The
+    /// text owes everything an update owes - the check, the write - and a
+    /// refusal leaves the last good score playing, said in the footer the
+    /// same way. What it never owes is the flash: that confirms a press,
+    /// and nobody pressed anything.
+    pub(super) fn auto_evaluate(&mut self) {
+        if !self.ui_settings.auto_evaluate
+            || !self.is_playing()
+            || self.is_stopping()
+            || self.current_prebake().is_some()
+            || self.current_replay().is_some()
+        {
+            return;
+        }
+        let scene = self.scenes.current();
+        if !scene.is_score() {
+            return;
+        }
+        let (id, revision) = (scene.id, scene.editor.revision());
+        let source: Arc<str> = Arc::from(scene.editor.source());
+        // What is playing is already this text, byte for byte. An auto
+        // apply has nothing to say about it, unlike a press, which is owed
+        // an answer for the gesture alone.
+        if self.install_would_be_redundant(id, &source) {
+            self.rebind_unchanged_score(id, revision, Arc::clone(&source));
+            return;
+        }
+        // Already armed for its line: pressing again would only cancel and
+        // re-arm it on the same line, and applying again is the same
+        // non-press twice over.
+        if self.armed_revision.as_deref() == Some(source_revision(&source).as_str()) {
+            return;
+        }
+        // Audio dropped into the open set plays from this update, so the
+        // set is read again before the score's sound names are judged.
+        self.refresh_set_samples();
+        if self.refuse_unclean(revision, &source) {
+            // A refused launch is not a launch: nothing inherits a line or
+            // a rewind from an update that never happened.
+            self.next_launch = Launch::Now;
+            self.next_rewind = false;
+            return;
+        }
+        self.log.push(
+            LogLevel::Debug,
+            "transport",
+            format!(
+                "auto update - {} ({} bytes)",
+                self.scenes.current().name(),
+                source.len()
+            ),
+        );
+        self.silence_preview();
+        self.playing_pane = Some(self.focused);
+        // The file is what you hear, whoever asked for the update.
+        self.write_scene(id, revision, Arc::clone(&source));
+        self.queue_evaluation(revision, source);
     }
 
     /// Queue an evaluation against a named scene rather than the focused

@@ -62,6 +62,12 @@ pub struct StudioPrefs {
     /// `off`, `beat`, `cycle`, or a number of cycles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quantise: Option<String>,
+    /// Whether a score edit applies itself once typing pauses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_evaluate: Option<bool>,
+    /// How long typing must pause first: `250ms`, `500ms`, `1s` or `2s`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typing_pause: Option<String>,
     /// `wait` or `async`. `strudel-like` still reads as async.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_mode: Option<String>,
@@ -625,6 +631,12 @@ impl StudioPrefs {
                 .as_deref()
                 .map(super::settings::Quantise::parse)
                 .unwrap_or(defaults.quantise),
+            auto_evaluate: self.auto_evaluate.unwrap_or(defaults.auto_evaluate),
+            typing_pause: self
+                .typing_pause
+                .as_deref()
+                .map(super::settings::TypingPause::parse)
+                .unwrap_or(defaults.typing_pause),
             load_mode: self
                 .load_mode
                 .as_deref()
@@ -806,6 +818,8 @@ impl StudioPrefs {
         self.clock_out = settings.clock_out.clone();
         self.clock_in = settings.clock_in.clone();
         self.quantise = Some(settings.quantise.key());
+        self.auto_evaluate = Some(settings.auto_evaluate);
+        self.typing_pause = Some(settings.typing_pause.key().to_owned());
         self.load_mode = Some(settings.load_mode.key().to_owned());
         self.animation = Some(settings.animation);
         self.highlights = Some(settings.highlights);

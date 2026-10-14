@@ -193,6 +193,15 @@ impl App {
         if self.lint_pending && now.duration_since(self.last_edit_at) >= LINT_DEBOUNCE {
             self.submit_lint();
         }
+        // Consumed whether or not it applies anything: a pause that elapsed
+        // while the set was stopped must not linger into the next play as an
+        // edit nobody made.
+        if self.auto_evaluate_due
+            && now.duration_since(self.last_edit_at) >= self.ui_settings.typing_pause.duration()
+        {
+            self.auto_evaluate_due = false;
+            self.auto_evaluate();
+        }
         let catalogue_refresh = if self.library_loading {
             CATALOGUE_LOADING_REFRESH
         } else {

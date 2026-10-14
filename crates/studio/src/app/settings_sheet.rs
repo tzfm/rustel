@@ -648,6 +648,8 @@ impl App {
                 let output_latency_changed =
                     settings.output_latency != self.ui_settings.output_latency;
                 let syntax_check_changed = settings.syntax_check != self.ui_settings.syntax_check;
+                let auto_evaluate_changed =
+                    settings.auto_evaluate != self.ui_settings.auto_evaluate;
                 // A set with a limiter of its own keeps it, so the row can
                 // change the default and this set go on sounding the same.
                 // That is the design, but it is not obvious from the sheet,
@@ -748,6 +750,13 @@ impl App {
                         SyntaxCheck::Off => {
                             "syntax check off - nothing is marked; the footer and the log still say why an update is refused"
                         }
+                    }
+                    .into();
+                } else if auto_evaluate_changed {
+                    self.status = if self.ui_settings.auto_evaluate {
+                        "auto evaluate on - a paused edit applies itself while the set plays"
+                    } else {
+                        "auto evaluate off - update applies the score"
                     }
                     .into();
                 } else if webcam_confirmed {
