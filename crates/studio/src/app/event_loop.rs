@@ -340,6 +340,16 @@ impl App {
                 .visible_after(now.saturating_duration_since(self.caret_activity));
             self.dirty_frame |= caret_visible != self.caret_visible;
             self.caret_visible = caret_visible;
+            // The busy dot breathes on wall-clock time, so the loop only
+            // has to remember when the work began and repaint the two
+            // edges: its start, and the frame the beat comes back.
+            let evaluating_since = if self.is_evaluating() {
+                Some(self.evaluating_since.unwrap_or(now))
+            } else {
+                None
+            };
+            self.dirty_frame |= evaluating_since != self.evaluating_since;
+            self.evaluating_since = evaluating_since;
             // How long a frame is allowed to take. Read each turn, so the
             // setting takes hold on the frame after it is changed rather
             // than at the next launch. Only the animated repaint is paced:

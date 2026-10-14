@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -214,24 +214,32 @@ pub enum GoState {
 
 /// What the header's transport word says, which is what the readiness
 /// chip after it is placed against.
+///
+/// Only what the transport is doing: an evaluation is a job, not a
+/// transport state - the set is still playing or stopped while it runs -
+/// so the busy signal is the logo dot breathing amber, never the word.
+/// The word is also drawn in a field as wide as the widest of them, so
+/// the chip - and the take, the clocks and the scene name after it -
+/// stays put while the word changes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TransportWord {
-    pub evaluating: bool,
     pub stopping: bool,
     pub playing: bool,
 }
 
 impl TransportWord {
-    fn text(self) -> &'static str {
-        if self.evaluating {
-            "EVALUATING"
-        } else if self.stopping {
+    /// The width of `STOPPING`, the widest word. Kept honest by a test.
+    const FIELD: usize = 8;
+
+    fn text(self) -> String {
+        let word = if self.stopping {
             "STOPPING"
         } else if self.playing {
             "PLAYING"
         } else {
             "STOPPED"
-        }
+        };
+        format!("{word:<field$}", field = Self::FIELD)
     }
 }
 
@@ -396,7 +404,9 @@ pub struct StudioChrome<'a> {
     pub motion: super::viz_panel::Motion,
     /// Stop requested; the tail is still ringing out.
     pub stopping: bool,
-    pub evaluating: bool,
+    /// A job is running, and this is how long ago it began: the logo dot
+    /// breathes amber for it. `None` when the studio is idle.
+    pub evaluating_for: Option<Duration>,
     pub dirty: bool,
     pub status: &'a str,
     /// A remote-control listener is active; the status line shows a
@@ -2214,12 +2224,11 @@ impl Widget for Header<'_, '_> {
             Style::default().bg(theme.surface).fg(theme.foreground),
         );
         let word = TransportWord {
-            evaluating: self.chrome.evaluating,
             stopping: self.chrome.stopping,
             playing: self.chrome.playing,
         };
         let state = word.text();
-        let state_color = if self.chrome.evaluating || self.chrome.stopping {
+        let state_color = if self.chrome.stopping {
             theme.warn
         } else if self.chrome.playing {
             theme.ok
@@ -2228,7 +2237,13 @@ impl Widget for Header<'_, '_> {
         };
         // The dot beats: lit on every beat, most on the downbeat, fading
         // between - the studio's own pulse, or the clock it follows.
-        let (dot, dot_color) = beat_pulse(self.chrome.playing, self.chrome.cycle, theme);
+        // While a job runs it breathes amber on wall-clock time instead:
+        // too brief to read as a word, and the transport keeps doing
+        // what the word says.
+        let (dot, dot_color) = match self.chrome.evaluating_for {
+            Some(elapsed) => busy_pulse(elapsed, theme),
+            None => beat_pulse(self.chrome.playing, self.chrome.cycle, theme),
+        };
         let name = format!(" {dot} {} ", product::NAME);
         let name_width = UnicodeWidthStr::width(name.as_str()).min(usize::from(area.width)) as u16;
         buffer.set_stringn(
@@ -2696,6 +2711,21 @@ pub fn beat_pulse(playing: bool, cycle: Option<f64>, theme: &Theme) -> (&'static
     (
         super::terminal::symbol(symbol),
         mix(theme.muted, color, brightness),
+    )
+}
+
+/// The logo dot while a job runs: the beat's own glyphs and fade, amber,
+/// on wall-clock time - the transport clock stands still while stopped,
+/// so the work is timed by the wall. The word beside it keeps saying
+/// what the transport is doing; the dot is what says the studio is busy.
+pub fn busy_pulse(elapsed: Duration, theme: &Theme) -> (&'static str, Color) {
+    const BREATH_MS: u128 = 200;
+    let phase = (elapsed.as_millis() % BREATH_MS) as f64 / BREATH_MS as f64;
+    let brightness = (1.0 - phase).powi(3) as f32;
+    let symbol = if phase < 0.2 { "●" } else { "◉" };
+    (
+        super::terminal::symbol(symbol),
+        mix(theme.muted, theme.warn, brightness),
     )
 }
 
@@ -4510,6 +4540,50 @@ mod loading_line_tests {
             .count() as u16
     }
 
+    /// The readiness chip keeps its column while the transport word
+    /// changes: every word fills a field as wide as the widest of them,
+    /// so the chip and what follows it never move sideways.
+    #[test]
+    fn the_go_chip_keeps_its_column_while_the_transport_word_changes() {
+        let area = Rect::new(0, 0, 80, 1);
+        let widest = TransportWord {
+            stopping: true,
+            playing: false,
+        };
+        let column = header_go_chip(area, widest, GoState::Unchecked).x;
+        for stopping in [false, true] {
+            for playing in [false, true] {
+                let word = TransportWord { stopping, playing };
+                assert_eq!(
+                    UnicodeWidthStr::width(word.text().as_str()),
+                    TransportWord::FIELD,
+                    "the word fills its field"
+                );
+                assert_eq!(
+                    header_go_chip(area, word, GoState::Unchecked).x,
+                    column,
+                    "the chip keeps its column"
+                );
+            }
+        }
+    }
+
+    /// The busy dot is the beat's own two glyphs in the warn colour,
+    /// breathing on wall-clock time, so a job too brief to read as a
+    /// word is still seen - and never moves anything on the row.
+    #[test]
+    fn the_busy_dot_breathes_between_the_beat_glyphs() {
+        let theme = Theme::default();
+        let (lit, lit_colour) = busy_pulse(Duration::ZERO, &theme);
+        let (half, half_colour) = busy_pulse(Duration::from_millis(100), &theme);
+        let (again, _) = busy_pulse(Duration::from_millis(400), &theme);
+        assert_eq!(lit, super::super::terminal::symbol("●"));
+        assert_eq!(half, super::super::terminal::symbol("◉"));
+        assert_eq!(again, lit, "the breath wraps");
+        assert_eq!(lit_colour, theme.warn);
+        assert_ne!(half_colour, lit_colour, "the colour fades inside a breath");
+    }
+
     /// The loading line has at least 3:1 contrast against an RGB header surface.
     #[test]
     fn the_line_reads_against_the_header_in_every_theme() {
@@ -4964,7 +5038,7 @@ mod tests {
             motion: crate::viz_panel::Motion::Off,
             playing: false,
             stopping: false,
-            evaluating: false,
+            evaluating_for: None,
             dirty: false,
             status: "ready",
             remote_control: false,
