@@ -815,6 +815,13 @@ impl LiveFileProducer {
             // never waits on a network.
             if let Some(source) = self.score_watch.take_changed_source() {
                 session.warm_sounds_in_source(&source);
+                // A save back to the delivered text reaches no door of the
+                // session. The edit that waits for its plugin copies does not
+                // go in play, so its wait and its plan end here.
+                #[cfg(feature = "vst")]
+                if self.score_watch.is_delivered(&source) {
+                    session.cancel_plugin_hold();
+                }
             }
             if self.prebake_state == PrebakeState::RetryingScore {
                 self.prebake_state = match &score {

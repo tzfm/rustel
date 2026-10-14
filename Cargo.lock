@@ -3772,6 +3772,7 @@ dependencies = [
  "rustel-transpiler",
  "rustel-voice",
  "rustel-vst3",
+ "rustel-vst3-fixture",
  "rustfft",
  "semver",
  "serde",

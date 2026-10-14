@@ -10513,12 +10513,6 @@ impl SampleLibrary {
         }
     }
 
-    /// The rate the device runs at, or the default before a device opens.
-    #[cfg(feature = "vst")]
-    pub fn render_rate(&self) -> u32 {
-        self.shared.render_rate.load(Ordering::Acquire)
-    }
-
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn render_rate_for_test(&self) -> u32 {

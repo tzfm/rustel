@@ -159,6 +159,7 @@ impl JsRuntime {
             effect_policy_refusal,
             effect_policy_owner_depth,
             last_good_active: RefCell::new(None),
+            last_good_timeline: RefCell::new(None),
             pointer: None,
         })
     }
@@ -200,6 +201,15 @@ impl JsRuntime {
 
     pub fn take_logs(&self) -> Vec<String> {
         std::mem::take(&mut self.logs.borrow_mut())
+    }
+
+    /// Run `f`, and drop the console lines it writes: the lines of a query
+    /// whose notes do not play now.
+    pub fn with_logs_dropped<R>(&self, f: impl FnOnce() -> R) -> R {
+        let kept = self.logs.borrow().len();
+        let result = f();
+        self.logs.borrow_mut().truncate(kept);
+        result
     }
 
     /// Set the cycle that `getTime()` returns. The host calls it with the

@@ -129,6 +129,8 @@ impl JsRuntime {
     pub fn snapshot_active_as_last_good(&self) {
         let _settings = self.core_settings.bind();
         self.keep_last_good_imports();
+        // The timeline offsets of this score are the offsets in play now.
+        *self.last_good_timeline.borrow_mut() = None;
         with_ctx(&self.ctx, |ctx| {
             *self.last_good_active.borrow_mut() = host_active(&ctx)
                 .ok()
@@ -152,12 +154,13 @@ impl JsRuntime {
         });
     }
 
-    /// Restore the last successfully installed active wrapper and its slider
-    /// and voicing state. Clear the active wrapper if the snapshot predates
-    /// the first successful install.
+    /// Restore the last successfully installed active wrapper and its slider,
+    /// voicing and timeline state. Clear the active wrapper if the snapshot
+    /// predates the first successful install.
     pub fn restore_last_good_active(&self) -> Result<(), QueryError> {
         let _settings = self.core_settings.bind();
         self.show_last_good_imports();
+        self.restore_last_good_timeline();
         with_ctx(&self.ctx, |ctx| -> Result<(), QueryError> {
             let restored = {
                 let saved = self.last_good_active.borrow();
@@ -214,6 +217,14 @@ impl JsRuntime {
             }
             Ok(())
         })
+    }
+
+    /// Puts back the timeline offsets an evaluation took from the last good
+    /// score, when it took them.
+    pub(super) fn restore_last_good_timeline(&self) {
+        if let Some(offsets) = self.last_good_timeline.borrow_mut().take() {
+            self.timeline_state.restore(offsets);
+        }
     }
 
     /// Clone the Rust pattern rooted in the active slot and retain this

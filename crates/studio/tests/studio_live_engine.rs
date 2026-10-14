@@ -859,11 +859,21 @@ fn a_live_note_plays_through_its_plugin() {
 /// score, until the plugin of the score is ready. The plugin is the fixture
 /// at gain 0 and the last score is silent, so each note with no plugin is
 /// heard. The load of the plugin takes 600 ms, as the load of a large plugin
-/// does. In the async mode the first notes play dry.
+/// does. The session reads the notes of an edit, so a chain from a helper
+/// function waits too. A launch loads its plugin during its countdown, and
+/// takes the first line after the load. In the async mode the first notes
+/// play dry.
 #[cfg(feature = "vst")]
 #[test]
 fn a_wait_start_and_a_wait_edit_play_no_note_before_their_plugin() {
     use rustel_studio::settings::LoadMode;
+    /// How the score goes in play.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Play {
+        Start,
+        Edit,
+        Launch,
+    }
     let _engine = one_engine();
     // The plugin thread reads a variable of the process when it loads or
     // builds the fixture.
@@ -878,32 +888,43 @@ fn a_wait_start_and_a_wait_edit_play_no_note_before_their_plugin() {
     // work. So no other thread of this process reads a variable now.
     unsafe { std::env::set_var(rustel_vst3_fixture::SLOW_ENV, "600") };
     let score = "note('c3').s('sine').vst('rustel fixture', { gain: 0 }).fast(8)";
+    // The chain of this score comes from a helper function.
+    let helper =
+        "const fx = p => p.vst('rustel fixture', { gain: 0 }); fx(note('c3').s('sine')).fast(8)";
     // The peak of the window, the cycle of the first onset, and if the
-    // engine held the start or the edit.
-    let heard = |mode: LoadMode, edit: bool| {
+    // engine held the score and then played it.
+    let heard = |mode: LoadMode, play: Play, score: &str| {
         let _plugins = fixture_plugins();
         let mut engine = silent_engine();
         let master = engine.master_bus();
         master.set_load_mode(mode);
-        let held = if edit {
+        if play != Play::Start {
             engine
                 .evaluate_and_start("silence", false)
                 .expect("a start");
             tick_for(&mut engine, Duration::from_millis(300), &mut || {});
-            let held = engine.hold_update(score, false, false);
-            if !held {
-                engine.evaluate(score, false).expect("an edit");
+        }
+        let held = match play {
+            Play::Start => {
+                engine.evaluate_and_start(score, false).expect("a start");
+                let cue = engine.snapshot().loading;
+                cue.is_some_and(|cue| cue.waiting && cue.plugins == 1)
             }
-            held
-        } else {
-            engine.evaluate_and_start(score, false).expect("a start");
-            let cue = engine.snapshot().loading;
-            cue.is_some_and(|cue| cue.waiting && cue.plugins == 1)
+            Play::Edit => engine.evaluate(score, false).expect("an edit").held,
+            // The next beat comes before the load ends. The countdown
+            // builds the copy.
+            Play::Launch => {
+                let armed = engine
+                    .arm_launch(score, false, 0.25, false)
+                    .expect("a launch");
+                let cue = engine.snapshot().loading;
+                armed.is_some() && cue.is_some_and(|cue| cue.plugins == 1)
+            }
         };
         let (mut peak, mut first_onset) = (0.0_f32, None);
         let onset_at = std::cell::Cell::new(None);
-        // The load of the plugin takes 600 ms, and the held start or edit
-        // lands after it: a slow machine needs more
+        // The load of the plugin takes 600 ms, and the held start, edit or
+        // launch lands after it: a slow machine needs more
         // than a fixed window for that, so the window ends at its
         // deadline, or 400 ms past the first onset. A note with no plugin
         // lands in that time or never.
@@ -924,20 +945,29 @@ fn a_wait_start_and_a_wait_edit_play_no_note_before_their_plugin() {
                     .is_some_and(|at| at.elapsed() >= Duration::from_millis(400))
             },
         );
-        let landed = !held || !edit || matches!(engine.take_launch_outcome(), Some(Ok(_)));
+        let landed =
+            !held || play == Play::Start || matches!(engine.take_launch_outcome(), Some(Ok(_)));
         engine.stop(Duration::from_millis(200)).expect("stop");
         (peak, first_onset, held && landed)
     };
-    let (peak, first_onset, held) = heard(LoadMode::Wait, false);
+    let (peak, first_onset, held) = heard(LoadMode::Wait, Play::Start, score);
     assert!(held, "the start waits, and the header counts 1 plugin");
     assert_eq!(peak, 0.0, "a note of the start played with no plugin");
     assert_eq!(first_onset, Some(0.0), "the start began on cycle 0");
-    let (peak, _, held) = heard(LoadMode::Wait, true);
-    assert!(held, "the edit waits for the load, then lands");
-    assert_eq!(peak, 0.0, "a note of the edit played with no plugin");
-    for edit in [false, true] {
-        let (peak, _, held) = heard(LoadMode::Async, edit);
-        assert!(!held && peak > 0.05, "async, edit {edit}: peak {peak}");
+    for edit in [score, helper] {
+        let (peak, _, held) = heard(LoadMode::Wait, Play::Edit, edit);
+        assert!(held, "the edit waits for the load, then lands: {edit}");
+        assert_eq!(
+            peak, 0.0,
+            "a note of the edit played with no plugin: {edit}"
+        );
+    }
+    let (peak, _, held) = heard(LoadMode::Wait, Play::Launch, score);
+    assert!(held, "the launch lands after the load");
+    assert_eq!(peak, 0.0, "a note of the launch played with no plugin");
+    for play in [Play::Start, Play::Edit] {
+        let (peak, _, held) = heard(LoadMode::Async, play, score);
+        assert!(!held && peak > 0.05, "async, {play:?}: peak {peak}");
     }
     no_plugin_work();
     // SAFETY: as above.

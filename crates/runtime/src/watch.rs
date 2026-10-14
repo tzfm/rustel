@@ -181,6 +181,13 @@ impl FileWatch {
         self.capacity_retry_held
     }
 
+    /// True when `source` is the text this watch delivered last. The watch
+    /// asks the session nothing for a save of this text.
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    pub(crate) fn is_delivered(&self, source: &str) -> bool {
+        matches!(&self.delivered, Snapshot::Source(delivered) if delivered == source)
+    }
+
     /// Observe a score without applying it and distinguish a newly changed
     /// identity from one already stable enough to evaluate.
     ///
@@ -320,6 +327,10 @@ impl FileWatch {
                         ApplyAttempt::Applied(generation)
                     }
                     Ok(crate::session::LiveScoreAttempt::Deferred) => ApplyAttempt::Deferred,
+                    // The edit waits for its plugin copies, and the score in
+                    // play plays on. The watch asks again with the same text.
+                    #[cfg(feature = "vst")]
+                    Ok(crate::session::LiveScoreAttempt::Waiting) => ApplyAttempt::Deferred,
                     Err(error) => ApplyAttempt::Failed(error),
                 }
             },

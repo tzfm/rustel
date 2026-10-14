@@ -205,6 +205,9 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 rustel-audio = { path = "../audio", features = ["test-support"] }
+# A plugin for the tests of the plugin wait: its first copy is not ready at
+# once.
+rustel-vst3-fixture = { path = "../vst3-fixture" }
 # Temp directories for session-log and cache tests.
 tempfile = "3"
 libc = "0.2"

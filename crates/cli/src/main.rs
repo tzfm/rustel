@@ -304,7 +304,9 @@ fn human_live_event(event: &serde_json::Value, verbosity: u8) -> Option<String> 
         // A sound the library is still fetching is not a fault of anything:
         // the set is playing and it joins when it lands. This used to print
         // as "Error:" beside the real ones, which on a save that introduces
-        // a new sound reads as the save having failed when it took.
+        // a new sound reads as the save having failed when it took. A plugin
+        // copy still loading is waiting too: the last score plays on, and the
+        // save plays when the copy is ready.
         if matches!(
             string(error, "kind"),
             Some(
@@ -6303,6 +6305,143 @@ mod tests {
             Ok(())
         }));
         assert!(delivery.ready_for(session.generation()));
+    }
+
+    /// A save with a plugin copy that is not ready says `waiting:`, and the
+    /// score in play plays on. A save back to the text in play ends the wait
+    /// and its plan. The save lands when its copy is ready, and `Updated`
+    /// comes after the line. The load of the fixture takes 600 ms, as the
+    /// load of a large plugin does.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn a_save_says_waiting_until_its_plugin_copy_is_ready() {
+        use rustel_runtime::{ReloadStatus, WatchLanguage, WatchPoll};
+
+        let temp = TempDir::new("plugin-save");
+        let plugins = temp.0.join("plugins");
+        std::fs::create_dir_all(&plugins).expect("plugin folder");
+        rustel_vst3_fixture::install(&plugins);
+        rustel_runtime::vst::pin_standard_folders(vec![plugins]);
+        let host = rustel_runtime::vst::host();
+        host.set_preset_folder(temp.0.join("presets"));
+        host.wait_idle();
+        // SAFETY: the plugin thread has no work, and no other test of this
+        // binary loads a plugin. So no other thread reads a variable now.
+        unsafe { std::env::set_var(rustel_vst3_fixture::SLOW_ENV, "600") };
+        let score = temp.0.join("song.strudel");
+        let playing = "note('c3').s('sine').gain(0).fast(8)";
+        std::fs::write(&score, playing).expect("write score");
+        let input = SourceInput {
+            file: Some(score.clone()),
+            eval: None,
+            sample_access: SampleAccessArgs::default(),
+        };
+        let mut session = Session::new().expect("session");
+        session.set_direct_diagnostic_logging(false);
+        // A note asks the plugin host through the sample library, as in a
+        // play.
+        let library = rustel_runtime::samples::SampleLibrary::empty();
+        session.set_sample_library_for_test(std::sync::Arc::new(library));
+        let cancellation = std::sync::atomic::AtomicBool::new(false);
+        let loaded = load_musician_sources(&mut session, &input, None, &cancellation)
+            .expect("load the score");
+        let device = rustel_audio::LiveScalarDevice::start_output_with_options(
+            Some(rustel_audio::SILENT_OUTPUT_NAME),
+            session.generation(),
+            live_output_options(&session, None),
+        )
+        .expect("silent output");
+        session.attach_plugins(&device);
+        let mut producer = build_live_producer(
+            &score,
+            WatchLanguage::JavaScript,
+            &loaded,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(2),
+        )
+        .expect("watched producer");
+
+        // The lines of the run, as `rustel play --watch` prints them.
+        let output = LiveOutput::new(0, false, false);
+        let mut lines = Vec::new();
+        let started = std::time::Instant::now();
+        let save = "note('c3').s('sine').vst('rustel fixture', { gain: 0 }).fast(8)";
+        // The turn of the save back to the text in play.
+        let mut back = None;
+        for turn in 0_u64.. {
+            if turn == 1 {
+                std::fs::write(&score, save).expect("save the score");
+            }
+            let at = std::time::Duration::from_millis(20 * turn);
+            let step = producer
+                .step(
+                    &mut session,
+                    at,
+                    at.as_secs_f64(),
+                    48_000,
+                    |_, _, _| {},
+                    |_| true,
+                )
+                .expect("a step");
+            let diagnostics = session.take_diagnostics().into_iter();
+            let diagnostics = diagnostics
+                .filter(|diagnostic| diagnostic.kind != rustel_runtime::VOICE_NOTICE_DIAGNOSTIC);
+            for diagnostic in diagnostics {
+                let event = serde_json::json!({
+                    "live_error": {
+                        "kind": diagnostic.kind,
+                        "message": diagnostic.message,
+                        "recoverable": diagnostic.recoverable,
+                    }
+                });
+                lines.extend(output.render(LiveDetail::Essential, &event));
+            }
+            if let WatchPoll::Event(event) = step.watch {
+                assert_eq!(event.status, ReloadStatus::Installed, "{lines:?}");
+                let event = serde_json::json!({
+                    "reload": { "path": "song.strudel", "status": "installed" }
+                });
+                lines.extend(output.render(LiveDetail::Essential, &event));
+                break;
+            }
+            // The score in play plays on.
+            assert_eq!(session.active_source(), Some(playing), "{lines:?}");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "the save did not land: {lines:?}"
+            );
+            // A save back to the text in play ends the wait of the save and
+            // its plan, and the plugin host ends the copy only the plan made.
+            // The save comes again after the load of the plugin.
+            match back {
+                None if session.plugins_waited_for(save).is_some() => {
+                    std::fs::write(&score, playing).expect("save back");
+                    back = Some(turn);
+                }
+                Some(back_turn) if turn == back_turn + 2 => {
+                    assert!(session.plugins_waited_for(save).is_none(), "{lines:?}");
+                    host.wait_idle();
+                    let copies: usize = host.plugins().iter().map(|plugin| plugin.running).sum();
+                    assert_eq!(copies, 0, "the copy only the plan made");
+                    std::fs::write(&score, save).expect("save again");
+                }
+                _ => {}
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        host.wait_idle();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_ENV) };
+        assert_eq!(
+            lines,
+            [
+                "waiting: plugin \"rustel fixture\" is still loading",
+                "Updated song.strudel",
+            ]
+        );
+        drop(device);
+        rustel_runtime::vst::pin_standard_folders(Vec::new());
     }
 
     /// A bounce's length as a person writes it: seconds, minutes, m:ss,

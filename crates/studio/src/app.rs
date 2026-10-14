@@ -4698,6 +4698,7 @@ mod tests {
                 source_revision: "r".into(),
                 pending_cutover: true,
                 answered_repeat,
+                held: false,
             };
             let installed_lines = |app: &App| {
                 app.log
@@ -5035,6 +5036,7 @@ mod tests {
                 source_revision: "r".into(),
                 pending_cutover: true,
                 answered_repeat,
+                held: false,
             }
         }
 
@@ -5233,6 +5235,7 @@ mod tests {
                     source_revision: source_revision(SCORE),
                     pending_cutover: false,
                     answered_repeat: false,
+                    held: false,
                 }),
                 success => Err(crate::EngineFailure {
                     kind: if success.is_none() {
@@ -27119,6 +27122,7 @@ mod tests {
                         source_revision: "old".into(),
                         pending_cutover: false,
                         answered_repeat: request_id == 2,
+                        held: false,
                     }),
                 });
                 if request_id == 1 {

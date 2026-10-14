@@ -168,13 +168,26 @@ Rustel loads a plugin on a thread of its own when you evaluate a score. The
 audio does not stop. Until the plugin is ready, an effect note plays dry and
 an instrument note is silent.
 
-Studio has two load modes under Settings ▸ Advanced ▸ Playback. In the wait
-mode, a start waits for the plugins of its first 2 cycles, and an edit keeps
-the last score in play until its new plugins are ready. The wait ends after
-20 seconds. In the async mode, the score starts at once.
+An edit waits for the plugin copies its notes need. Rustel reads the notes of
+the edit near the cycle in play, and loads each copy that is not ready. A
+chain the edit keeps has its copy, so an edit with no new chain waits for no
+copy. While a copy loads, the last score plays on. When the copies are ready,
+the edit plays. If no copy becomes ready in 20 seconds, the wait ends. The
+edit then plays, and a note with no copy plays with no plugin until its copy
+is ready.
 
-In the wait mode, an edit waits only for the plugin copies the new score does
-not have. An edit with no new chain waits for no plugin.
+Studio has two load modes under Settings ▸ Advanced ▸ Playback. In the wait
+mode, a start waits for the plugin copies of its first 2 cycles, and an edit
+waits as above. A launch on a cycle line loads its plugin copies during the
+countdown. If a copy is not ready at the line, the launch takes the first line
+after the copy is ready. In the async mode, the score starts at once, and an
+edit plays at once.
+
+`rustel play` waits for the plugin copies of the first 4 cycles at its start.
+They load while the samples load. With `--watch`, a save with a plugin copy
+that is not ready prints one `waiting:` line, and the last score plays on.
+`Updated` follows when the save plays. In a replay of a session tape, no save
+waits for its plugin copies.
 
 Memory grows with the number of chains. The Studio memory viewer lists each
 loaded plugin with its copies and its load time. Studio unloads a plugin with

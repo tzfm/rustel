@@ -1158,7 +1158,8 @@ fn try_send_snapshot(
     }
 }
 
-/// An evaluate the engine is holding until its cycle line.
+/// An evaluate the engine is holding until its cycle line, or until its
+/// sounds and its plugin copies are ready.
 struct ArmedRequest {
     request_id: u64,
     editor_revision: u64,
@@ -1468,6 +1469,15 @@ fn process_command(
                     playback_stopped: false,
                 })
             };
+            // An edit that waits for its plugin copies keeps the last score
+            // playing, and is answered when it lands.
+            if result.as_ref().is_ok_and(|install| install.held) {
+                *armed = Some(ArmedRequest {
+                    request_id,
+                    editor_revision,
+                });
+                return false;
+            }
             push_control(
                 pending,
                 StudioControlEvent::Evaluation(EvaluationOutcome {

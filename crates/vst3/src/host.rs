@@ -1,6 +1,6 @@
 //! The plugin list, the plugin thread, and the names a score uses.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -40,6 +40,7 @@ const PREPARE_TRIES: u32 = 4;
 
 /// What [`Host::prepare`] builds: the plugin and the preset by name, and
 /// the slot.
+#[derive(Clone, PartialEq)]
 struct Prepare {
     name: String,
     preset: Option<String>,
@@ -276,13 +277,6 @@ enum Build {
     Failed(u64, String),
 }
 
-/// A score can name its plugins before evaluation gives them chain slots.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum Target {
-    Assigned(InsertSlot),
-    Spare(usize),
-}
-
 #[derive(Default)]
 struct State {
     /// The number of a plugin is its place here plus 1. Rows are only added.
@@ -294,20 +288,21 @@ struct State {
     known_presets: HashMap<(u32, String), KnownPreset>,
     /// The preset files of each plugin, by the compare form of its name.
     preset_lists: HashMap<String, PresetList>,
-    builds: HashMap<(InsertKey, u32, Target), Build>,
+    builds: HashMap<(InsertKey, u32, InsertSlot), Build>,
     /// The builds an engine took: the mark of each is alive while the
     /// engine holds the plugin.
-    taken: HashMap<(InsertKey, u32, Target), std::sync::Weak<()>>,
-    /// The chains that left the score, with a copy an engine still holds
-    /// for the tail.
-    leaving: Vec<u64>,
+    taken: HashMap<(InsertKey, u32, InsertSlot), std::sync::Weak<()>>,
+    /// The prepared plugins with a build in the line behind a load or a
+    /// read of the preset folder: see [`Host::prepare`].
+    preparing: Vec<Prepare>,
+    /// The chains that ended: see [`Host::end_chains`]. No chain number
+    /// comes a second time, so a chain here gets no new build. An engine
+    /// holds the copy of such a chain until the end of its tail.
+    ended: HashSet<u64>,
     preset_root: Option<PathBuf>,
     worker: Option<WorkerProgram>,
     /// The completed builds so far. The count orders copies and failures.
     built: u64,
-    /// The count of the builds at the last score change: see
-    /// [`Host::score_changed`].
-    spares_before: u64,
     /// The reads of the folders in the line of the plugin thread.
     scans: usize,
     errors: Vec<String>,
@@ -405,16 +400,9 @@ impl State {
         }
     }
 
-    /// The copies of a plugin that the engines hold for the chains of the
-    /// score. A copy of a chain that left the score plays its tail and
-    /// serves no call.
-    fn held_copies(&self, plugin: u32) -> usize {
-        let held = |(build, mark): &(&(InsertKey, u32, Target), &std::sync::Weak<()>)| {
-            let leaves =
-                matches!(build.2, Target::Assigned(slot) if self.leaving.contains(&slot.chain));
-            build.0.plugin == plugin && mark.strong_count() > 0 && !leaves
-        };
-        self.taken.iter().filter(held).count()
+    /// True for a build for a slot of a chain that ended.
+    fn chain_ended(&self, build: &(InsertKey, u32, InsertSlot)) -> bool {
+        self.ended.contains(&build.2.chain)
     }
 
     /// Takes the ready copies of the builds that `ends` names out of the
@@ -423,9 +411,9 @@ impl State {
     #[allow(clippy::vec_box)]
     fn take_ready(
         &mut self,
-        ends: impl Fn(&(InsertKey, u32, Target)) -> bool,
+        ends: impl Fn(&(InsertKey, u32, InsertSlot)) -> bool,
     ) -> Vec<Box<Instance>> {
-        let ready = |(build, built): (&(InsertKey, u32, Target), &Build)| {
+        let ready = |(build, built): (&(InsertKey, u32, InsertSlot), &Build)| {
             (matches!(built, Build::Ready(_)) && ends(build)).then_some(*build)
         };
         let builds: Vec<_> = self.builds.iter().filter_map(ready).collect();
@@ -437,35 +425,9 @@ impl State {
     }
 
     /// True while an engine holds the plugin it took for this build.
-    fn held(&self, build: &(InsertKey, u32, Target)) -> bool {
+    fn held(&self, build: &(InsertKey, u32, InsertSlot)) -> bool {
         let alive = |held: &std::sync::Weak<()>| held.strong_count() > 0;
         self.taken.get(build).is_some_and(alive)
-    }
-
-    /// Reserves one ready spare for a slot. Moving ownership under the
-    /// lock keeps two upcoming chains from claiming the same copy.
-    fn assign_spare(&mut self, build: (InsertKey, u32, Target)) {
-        if self.builds.contains_key(&build) {
-            return;
-        }
-        let spare = self
-            .builds
-            .iter()
-            .filter(|(candidate, _)| {
-                candidate.0 == build.0
-                    && candidate.1 == build.1
-                    && matches!(candidate.2, Target::Spare(_))
-            })
-            .filter_map(|(candidate, built)| match built {
-                Build::Ready(copy) => Some((*candidate, copy.order())),
-                _ => None,
-            })
-            .min_by_key(|(_, order)| *order)
-            .map(|(candidate, _)| candidate);
-        if let Some(spare) = spare {
-            let copy = self.builds.remove(&spare).expect("the spare exists");
-            self.builds.insert(build, copy);
-        }
     }
 
     fn find(&self, name: &str) -> Option<usize> {
@@ -1094,114 +1056,23 @@ impl Host {
         self.enqueue(move || host.finish_unload(&keep));
     }
 
-    /// Ends each copy the host made ready for a slot of the chains in
-    /// `chains`: the score no longer has these chains, so no engine takes
-    /// the copies.
+    /// Ends the chains in `chains`: no score has these chains now. Each
+    /// copy the host made ready for a slot of the chains ends, so no engine
+    /// takes it. A build in the line for such a slot makes no copy, and no
+    /// later call starts one.
     pub fn end_chains(&self, chains: Vec<u64>) {
-        {
-            // Only a chain with a copy in an engine stays in the list.
-            let mut state = self.state();
-            state.leaving.extend(&chains);
-            let held: Vec<u64> = state
-                .taken
-                .iter()
-                .filter(|(_, mark)| mark.strong_count() > 0)
-                .filter_map(|(build, _)| match build.2 {
-                    Target::Assigned(slot) => Some(slot.chain),
-                    Target::Spare(_) => None,
-                })
-                .collect();
-            state.leaving.retain(|chain| held.contains(chain));
-        }
-        let host = self.clone();
-        self.enqueue(move || {
-            let of_chain = |build: &(InsertKey, u32, Target)| match build.2 {
-                Target::Assigned(slot) => chains.contains(&slot.chain),
-                Target::Spare(_) => false,
-            };
-            let copies = host.state().take_ready(of_chain);
-            for copy in copies {
-                copy.end_here();
-            }
-        });
-    }
-
-    /// The chains with a plugin copy: a copy an engine holds, or a copy the
-    /// host builds or keeps for a slot of the chain. A chain that left the
-    /// score is not in the list: its copy plays a tail and serves no call.
-    pub fn chains_with_copies(&self) -> Vec<u64> {
-        let state = self.state();
-        let chain = |build: &(InsertKey, u32, Target)| match build.2 {
-            Target::Assigned(slot) => Some(slot.chain),
-            Target::Spare(_) => None,
-        };
-        let taken = state.taken.iter();
-        let taken = taken.filter(|(_, mark)| mark.strong_count() > 0);
-        let built = state.builds.iter();
-        let built = built.filter(|(_, built)| !matches!(built, Build::Failed(..)));
-        let chains = taken
-            .map(|(build, _)| build)
-            .chain(built.map(|(build, _)| build));
-        let mut chains: Vec<u64> = chains
-            .filter_map(chain)
-            .filter(|chain| !state.leaving.contains(chain))
-            .collect();
-        chains.sort_unstable();
-        chains.dedup();
-        chains
-    }
-
-    /// A new score plays now. A spare copy made after this call is the
-    /// spare of an edit that waits for its plugins, and
-    /// [`Host::keep_spares`] leaves that copy as it is.
-    pub fn score_changed(&self) {
         let mut state = self.state();
-        state.spares_before = state.built;
-    }
-
-    /// Ends the spare copies a score text no longer asks for. `wanted` has
-    /// the plugins of the text by name, each with the count of its calls. A
-    /// plugin keeps as many spare copies as its calls less the copies the
-    /// engines hold for the chains of the score: a chain of the text with
-    /// no copy yet takes one. Call this after [`Host::end_chains`] for the
-    /// chains that left. The call waits for nothing.
-    pub fn keep_spares(&self, wanted: Vec<(String, usize)>) {
+        state.ended.extend(&chains);
+        let of_chain = move |build: &(InsertKey, u32, InsertSlot)| chains.contains(&build.2.chain);
+        // A ready copy ends on the plugin thread. A build in the line
+        // finds no entry: see `Host::finish`.
+        state
+            .builds
+            .retain(|build, built| matches!(built, Build::Ready(_)) || !of_chain(build));
+        drop(state);
         let host = self.clone();
-        // A score change after this call has spares of its own: this call
-        // judges only the spares from before it.
-        let before = self.state().spares_before;
         self.enqueue(move || {
-            let copies = {
-                let mut state = host.state();
-                let mut room: HashMap<u32, usize> = HashMap::new();
-                for (name, count) in &wanted {
-                    if let Some(row) = state.find(name) {
-                        *room.entry(State::number(row)).or_default() += count;
-                    }
-                }
-                for (plugin, room) in &mut room {
-                    *room = room.saturating_sub(state.held_copies(*plugin));
-                }
-                // The oldest spare copies of a plugin stay. A spare from
-                // after the last score change waits for its edit.
-                let mut spares: Vec<((InsertKey, u32, Target), u64)> = Vec::new();
-                for (build, built) in &state.builds {
-                    if let (Target::Spare(_), Build::Ready(copy)) = (build.2, built)
-                        && copy.order() <= before
-                    {
-                        spares.push((*build, copy.order()));
-                    }
-                }
-                spares.sort_by_key(|(_, order)| *order);
-                let mut ends = Vec::new();
-                for (build, _) in spares {
-                    match room.get_mut(&build.0.plugin).filter(|room| **room > 0) {
-                        Some(room) => *room -= 1,
-                        None => ends.push(build),
-                    }
-                }
-                state.take_ready(|build| ends.contains(build))
-            };
+            let copies = host.state().take_ready(of_chain);
             for copy in copies {
                 copy.end_here();
             }
@@ -1462,7 +1333,7 @@ impl Host {
         slot: InsertSlot,
         wait: bool,
     ) -> Option<Box<dyn OrbitInsert>> {
-        let build = (key, sample_rate, Target::Assigned(slot));
+        let build = (key, sample_rate, slot);
         let take = |state: &mut State| match state.builds.remove(&build) {
             Some(Build::Ready(mut copy)) => {
                 state.taken.retain(|_, held| held.strong_count() > 0);
@@ -1479,7 +1350,6 @@ impl Host {
         // so a caller that waits behind this build finds the job there.
         let finished = {
             let mut state = self.state();
-            state.assign_spare(build);
             if let Some(found) = state.builds.get(&build) {
                 if wait && matches!(found, Build::Running) {
                     // A request with no wait started this build.
@@ -1515,11 +1385,8 @@ impl Host {
             Ok(None) => return Prepared::Pending,
             Err(reason) => return Prepared::Unavailable(reason),
         };
-        let build = (key, sample_rate, Target::Assigned(slot));
-        let mut state = self.state();
-        if !state.held(&build) {
-            state.assign_spare(build);
-        }
+        let build = (key, sample_rate, slot);
+        let state = self.state();
         match state.builds.get(&build) {
             Some(Build::Ready(_)) => Prepared::Ready(key),
             Some(Build::Running) => Prepared::Pending,
@@ -1529,61 +1396,15 @@ impl Host {
         }
     }
 
-    /// Prepares `copies` unassigned copies before evaluation gives a score
-    /// its chain slots. This starts work on the plugin thread and never
-    /// waits. A later readiness check or insert reserves a ready copy for
-    /// its slot. Copies already held by an engine do not count here.
-    pub fn warm(
-        &self,
-        name: &str,
-        preset: Option<&str>,
-        instrument: bool,
-        sample_rate: u32,
-        copies: usize,
-    ) -> Prepared {
-        let key = match self.key(name, preset, instrument) {
-            Ok(Some((key, _))) => key,
-            Ok(None) => return Prepared::Pending,
-            Err(reason) => return Prepared::Unavailable(reason),
-        };
-        let copies = copies.min(MAX_PARKED);
-        let mut state = self.state();
-        let mut ready = 0;
-        let mut running = 0;
-        let mut failed = None;
-        for (build, built) in &state.builds {
-            if build.0 == key && build.1 == sample_rate && matches!(build.2, Target::Spare(_)) {
-                match built {
-                    Build::Ready(_) => ready += 1,
-                    Build::Running => running += 1,
-                    Build::Failed(_, reason) => failed = Some(reason.clone()),
-                }
-            }
-        }
-        if ready >= copies {
-            return Prepared::Ready(key);
-        }
-        if let Some(reason) = failed {
-            return Prepared::Unavailable(reason);
-        }
-        for ordinal in 0..MAX_PARKED {
-            if ready + running >= copies {
-                break;
-            }
-            let build = (key, sample_rate, Target::Spare(ordinal));
-            if let Some(claimed) = Self::claim(&mut state, build) {
-                let host = self.clone();
-                self.enqueue(move || host.finish(build, claimed));
-                running += 1;
-            }
-        }
-        Prepared::Pending
-    }
-
     /// Loads the plugin a score names and builds it for one slot, with no
     /// wait, so the plugin is ready before the first note asks. A later
     /// [`Host::insert`] for the same slot takes the plugin. A name the host
     /// cannot serve does nothing here: the note reports the reason.
+    ///
+    /// For a loaded plugin with a known preset, the call marks the build:
+    /// [`Host::prepared`] then answers [`Prepared::Pending`], and a second
+    /// call adds no job. The build of a plugin that loads now goes in the
+    /// line behind the load, one time for each slot.
     pub fn prepare(
         &self,
         name: &str,
@@ -1592,17 +1413,35 @@ impl Host {
         sample_rate: u32,
         slot: InsertSlot,
     ) {
-        if matches!(self.resolve(name, false), Resolved::Missing) {
-            return;
-        }
-        let request = Prepare {
-            name: name.to_owned(),
-            preset: preset.map(str::to_owned),
-            instrument,
-            sample_rate,
-            slot,
+        let key = match self.key(name, preset, instrument) {
+            Ok(Some((key, _))) => key,
+            // The plugin loads, or the host reads its preset folder.
+            Ok(None) => {
+                let request = Prepare {
+                    name: name.to_owned(),
+                    preset: preset.map(str::to_owned),
+                    instrument,
+                    sample_rate,
+                    slot,
+                };
+                let mut state = self.state();
+                if !state.preparing.contains(&request) {
+                    state.preparing.push(request.clone());
+                    drop(state);
+                    self.prepare_soon(request, PREPARE_TRIES);
+                }
+                return;
+            }
+            Err(_) => return,
         };
-        self.prepare_soon(request, PREPARE_TRIES);
+        let build = (key, sample_rate, slot);
+        // The build is marked and its job joins the line under one lock,
+        // as in `Host::insert`.
+        let mut state = self.state();
+        if let Some(claimed) = Self::claim_prepared(&mut state, build) {
+            let host = self.clone();
+            self.enqueue(move || host.finish(build, claimed));
+        }
     }
 
     /// Puts the build of a prepared plugin in the line of the plugin
@@ -1613,10 +1452,14 @@ impl Host {
     fn prepare_soon(&self, request: Prepare, tries: u32) {
         let host = self.clone();
         self.enqueue(move || {
-            let (plugin, loaded) = match host.resolve(&request.name, false) {
-                Resolved::Ready(plugin, loaded) => (plugin, loaded),
-                Resolved::Pending if tries > 0 => return host.prepare_soon(request, tries - 1),
-                _ => return,
+            let resolved = host.resolve(&request.name, false);
+            if matches!(resolved, Resolved::Pending) && tries > 0 {
+                return host.prepare_soon(request, tries - 1);
+            }
+            // The request leaves the line here. A later call is a new one.
+            host.state().preparing.retain(|waiting| *waiting != request);
+            let Resolved::Ready(plugin, loaded) = resolved else {
+                return;
             };
             if loaded.is_instrument() != request.instrument {
                 return;
@@ -1636,31 +1479,35 @@ impl Host {
             let build = (
                 InsertKey { plugin, preset },
                 request.sample_rate,
-                Target::Assigned(request.slot),
+                request.slot,
             );
-            // An engine holds the plugin of the slot: a spare copy would
-            // stay parked.
-            let claimed = {
-                let mut state = host.state();
-                if state.held(&build) {
-                    return;
-                }
-                state.assign_spare(build);
-                Self::claim(&mut state, build)
-            };
+            let claimed = Self::claim_prepared(&mut host.state(), build);
             if let Some(claimed) = claimed {
                 host.finish(build, claimed);
             }
         });
     }
 
+    /// [`Host::claim`] for a prepared plugin. `None` also when an engine
+    /// holds the plugin of the slot: a second copy would stay parked.
+    fn claim_prepared(
+        state: &mut State,
+        build: (InsertKey, u32, InsertSlot),
+    ) -> Option<(Arc<Plugin>, Option<PathBuf>)> {
+        if state.held(&build) {
+            return None;
+        }
+        Self::claim(state, build)
+    }
+
     /// Marks a build as started and gives what the build needs. `None`
-    /// means the build exists already, or the host has no such plugin.
+    /// means the build exists already, the chain of its slot ended, or the
+    /// host has no such plugin.
     fn claim(
         state: &mut State,
-        build: (InsertKey, u32, Target),
+        build: (InsertKey, u32, InsertSlot),
     ) -> Option<(Arc<Plugin>, Option<PathBuf>)> {
-        if state.builds.contains_key(&build) {
+        if state.builds.contains_key(&build) || state.chain_ended(&build) {
             return None;
         }
         let key = build.0;
@@ -1695,12 +1542,19 @@ impl Host {
         Some((plugin, preset))
     }
 
-    /// Builds the plugin of a claimed build. Runs on the plugin thread.
+    /// Builds the plugin of a claimed build. Runs on the plugin thread. A
+    /// build with no entry makes no copy: the chain of its slot ended, and
+    /// [`Host::end_chains`] took the entry. When the chain ends during the
+    /// build, the copy ends here.
     fn finish(
         &self,
-        build: (InsertKey, u32, Target),
+        build: (InsertKey, u32, InsertSlot),
         (plugin, preset): (Arc<Plugin>, Option<PathBuf>),
     ) {
+        let waits = |state: &State| matches!(state.builds.get(&build), Some(Build::Running));
+        if !waits(&self.state()) {
+            return;
+        }
         let retire = self.shared.jobs.clone();
         let (key, rate) = (build.0, build.1);
         let preset = preset
@@ -1713,6 +1567,13 @@ impl Host {
             contained("build", build)
         });
         let mut state = self.state();
+        if !waits(&state) {
+            drop(state);
+            if let Ok(copy) = built {
+                Box::new(copy).end_here();
+            }
+            return;
+        }
         state.built += 1;
         let result = match built {
             Ok(mut copy) => {

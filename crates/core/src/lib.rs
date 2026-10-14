@@ -764,11 +764,22 @@ pub struct TimelineState {
 }
 
 impl TimelineState {
-    pub fn reset(&self) {
-        self.offsets
+    /// Clears the offsets, and gives the offsets before.
+    pub fn take(&self) -> BTreeMap<String, Fraction> {
+        std::mem::take(
+            &mut self
+                .offsets
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    /// Puts back offsets that [`Self::take`] gave.
+    pub fn restore(&self, offsets: BTreeMap<String, Fraction>) {
+        *self
+            .offsets
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = offsets;
     }
 
     fn get(&self, key: &str) -> Option<Fraction> {

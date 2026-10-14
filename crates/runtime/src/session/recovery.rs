@@ -79,6 +79,13 @@ mod tests {
         session
             .plugins_live
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "vst")]
+        session
+            .plugin_rate
+            .store(44_100, std::sync::atomic::Ordering::Relaxed);
+        // The host of the output plays each edit at once.
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        session.set_plugin_wait(false);
         let transport = session.transport();
         let generation = session.generation();
         session.inject_panic_for_test(SessionPanicPoint::Query);
@@ -87,6 +94,8 @@ mod tests {
             .expect_err("scheduler query panics");
         assert_panic(error, "Query");
         assert_eq!(session.active_source(), Some(source.as_str()));
+        // The rebuilt session keeps the chains its output reads. A new
+        // registry gives a new number.
         #[cfg(feature = "vst")]
         assert_eq!(super::super::tests::plugin_chain(&session), chain);
         #[cfg(feature = "vst")]
@@ -101,6 +110,19 @@ mod tests {
                 .plugins_live
                 .load(std::sync::atomic::Ordering::Relaxed),
             "the rebuilt session lost the plugins of its output"
+        );
+        #[cfg(feature = "vst")]
+        assert_eq!(
+            session
+                .plugin_rate
+                .load(std::sync::atomic::Ordering::Relaxed),
+            44_100,
+            "the rebuilt session lost the rate of its output"
+        );
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        assert!(
+            !session.plugin_wait,
+            "the rebuilt session lost the wait setting of its host"
         );
         assert!(Arc::ptr_eq(&session.transport(), &transport));
         assert!(session.generation() > generation);
@@ -838,14 +860,24 @@ impl Session {
         fresh.continuity_margin = self.continuity_margin;
         // The replayed score takes over on a frame of the same device.
         fresh.live_sample_rate = self.live_sample_rate;
-        // The output keeps its plugins, so each later commit tells the
-        // plugin chains its score. Each lane keeps its number, so the
-        // replayed score has the chains it had.
+        // The output keeps its plugins and its rate. Its names source reads
+        // the chains of this session, so the rebuilt session keeps the same
+        // chains. Each lane keeps its number, so the replayed score has the
+        // chains it had.
         #[cfg(feature = "vst")]
         {
             let live = self.plugins_live.load(std::sync::atomic::Ordering::Relaxed);
             fresh.plugins_live = AtomicBool::new(live);
+            fresh.plugin_rate = std::mem::take(&mut self.plugin_rate);
+            fresh.chains = self.chains.clone();
             fresh.lanes = std::mem::take(&mut self.lanes);
+        }
+        // An edit that waits for its plugin copies waits on, with its plan in
+        // the chains: the replay plays the score in play.
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        {
+            fresh.plugin_wait = self.plugin_wait;
+            fresh.plugin_hold = self.plugin_hold.take();
         }
         fresh.stop_when_silent = self.stop_when_silent;
         fresh.export_limiter = self.export_limiter;

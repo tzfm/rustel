@@ -325,6 +325,10 @@ pub struct JsRuntime {
     /// evaluates but then fails its query probe restores this exact wrapper
     /// so the sounding score keeps its Sidecar and callback roots.
     pub(super) last_good_active: RefCell<Option<rquickjs::Persistent<rquickjs::Value<'static>>>>,
+    /// The timeline offsets of the last good score, from the first
+    /// evaluation after its snapshot. A score that does not go in play
+    /// gives them back: see [`JsRuntime::restore_last_good_active`].
+    pub(super) last_good_timeline: RefCell<Option<BTreeMap<String, Fraction>>>,
     /// The host's pointer that `mousex` and `mousey` read, if it has one.
     pub(super) pointer: Option<rustel_core::host_value::Pointer>,
 }

@@ -62,6 +62,11 @@ windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 [dev-dependencies]
 rustel-audio = { path = "../audio", features = ["test-support"] }
 rustel-jsruntime = { path = "../jsruntime", default-features = false }
+# The tests pin the plugin folders, so no test reads the plugins of the
+# machine.
+rustel-runtime = { path = "../runtime", default-features = false, features = [
+  "test-support",
+] }
 rustel-vst3-fixture = { path = "../vst3-fixture" }
 tempfile = "3"
 libc = "0.2"

@@ -883,6 +883,12 @@ fn an_unused_bundle_unloads_and_keeps_its_plugin_numbers() {
 #[test]
 fn live_play_does_not_wait_for_a_plugin() {
     let rig = Rig::new("live");
+    // A prepare before the load of the plugin: the build goes in the line
+    // behind the load, one time for the slot.
+    let early = InsertSlot::effect(4, 0);
+    for _ in 0..2 {
+        rig.host.prepare(NAME, None, false, SAMPLE_RATE, early);
+    }
     let id = until(|| match rig.host.resolve(NAME, false) {
         Resolved::Ready(id, _) => Some(id),
         Resolved::Pending => None,
@@ -915,143 +921,31 @@ fn live_play_does_not_wait_for_a_plugin() {
         prepared("no such plugin", false),
         Prepared::Unavailable("no plugin has the name 'no such plugin'".into())
     );
-    rig.host
-        .prepare(NAME, None, false, 44_100, InsertSlot::effect(5, 0));
+    // A prepare marks its build at the call, also behind a build that
+    // runs. A second look then reads a build that waits, and a second
+    // prepare adds no job.
+    let behind = InsertSlot::effect(6, 0);
+    for slot in [InsertSlot::effect(5, 0), behind, behind] {
+        rig.host.prepare(NAME, None, false, 44_100, slot);
+    }
+    let waits = rig.host.prepared(NAME, None, false, 44_100, behind);
+    assert_ne!(waits, Prepared::Unbuilt(key));
     until(|| (prepared(NAME, false) == Prepared::Ready(key)).then_some(()));
+    // The orbit has 2 copies, and each of the 3 prepared slots has one.
+    rig.host.wait_idle();
+    let built = rig.host.prepared(NAME, None, false, SAMPLE_RATE, early);
+    assert_eq!(built, Prepared::Ready(key));
+    assert_eq!(rig.host.plugins()[0].running, 5);
     let held = provider(key, 44_100, InsertSlot::effect(5, 0)).expect("the prepared plugin");
 
     // While the engine holds the plugin of the slot, a start has nothing
-    // to wait for, and one more prepare builds no spare copy.
+    // to wait for, and one more prepare builds no second copy.
     assert_eq!(prepared(NAME, false), Prepared::Ready(key));
     rig.host
         .prepare(NAME, None, false, 44_100, InsertSlot::effect(5, 0));
     rig.host.wait_idle();
     drop(held);
     assert_eq!(prepared(NAME, false), Prepared::Unbuilt(key));
-}
-
-#[test]
-fn unnamed_slots_take_distinct_prewarmed_copies() {
-    let rig = Rig::new("warm");
-    let key = InsertKey {
-        plugin: rig.plugin(),
-        preset: 0,
-    };
-    let warm = || rig.host.warm(NAME, None, false, SAMPLE_RATE, 2);
-    assert_eq!(warm(), Prepared::Pending);
-    until(|| (warm() == Prepared::Ready(key)).then_some(()));
-    for _ in 0..8 {
-        assert_eq!(warm(), Prepared::Ready(key));
-    }
-    rig.host.wait_idle();
-    assert_eq!(rig.host.plugins()[0].running, 2);
-
-    let prepared = |chain, rate| {
-        rig.host
-            .prepared(NAME, None, false, rate, InsertSlot::effect(chain, 0))
-    };
-    assert_eq!(prepared(1, 44_100), Prepared::Unbuilt(key));
-    // Each readiness check reserves its own copy. Rechecking that slot
-    // leaves the other spare available for a different chain.
-    assert_eq!(prepared(1, SAMPLE_RATE), Prepared::Ready(key));
-    assert_eq!(prepared(1, SAMPLE_RATE), Prepared::Ready(key));
-    assert_eq!(prepared(2, SAMPLE_RATE), Prepared::Ready(key));
-    assert_eq!(prepared(3, SAMPLE_RATE), Prepared::Unbuilt(key));
-    let provider = rig.host.provider(false);
-    let mut first = provider(key, SAMPLE_RATE, InsertSlot::effect(1, 0)).expect("first copy");
-    let mut second = provider(key, SAMPLE_RATE, InsertSlot::effect(2, 0)).expect("second copy");
-    first.set_param(
-        InsertParam {
-            id: PARAM_GAIN,
-            value: 0.25,
-        },
-        0,
-    );
-    assert_eq!(block(first.as_mut(), 1.0, 16), vec![0.25; 16]);
-    assert_eq!(block(second.as_mut(), 1.0, 16), vec![1.0; 16]);
-    for chain in [1, 2] {
-        rig.host
-            .prepare(NAME, None, false, SAMPLE_RATE, InsertSlot::effect(chain, 0));
-    }
-    rig.host.wait_idle();
-    assert_eq!(rig.host.plugins()[0].running, 2);
-
-    // Warm only counts unassigned copies, including while earlier copies
-    // run. An insert can take a spare directly without a readiness check.
-    assert_eq!(
-        rig.host.warm(NAME, None, false, SAMPLE_RATE, 1),
-        Prepared::Pending
-    );
-    until(|| {
-        (rig.host.warm(NAME, None, false, SAMPLE_RATE, 1) == Prepared::Ready(key)).then_some(())
-    });
-    let third = provider(key, SAMPLE_RATE, InsertSlot::effect(3, 0)).expect("third copy");
-    assert_eq!(rig.host.plugins()[0].running, 3);
-    assert_eq!(prepared(4, SAMPLE_RATE), Prepared::Unbuilt(key));
-    drop((first, second, third));
-}
-
-#[test]
-fn prewarming_checks_the_plugin_role_and_preserves_instrument_copies() {
-    let rig = Rig::new("warm-role");
-    rig.plugin();
-    assert_eq!(
-        rig.host.warm(NAME, None, true, SAMPLE_RATE, 1),
-        Prepared::Unavailable(format!("{NAME} is an effect: use .vst()"))
-    );
-    assert_eq!(
-        rig.host.warm("no such plugin", None, false, SAMPLE_RATE, 1),
-        Prepared::Unavailable("no plugin has the name 'no such plugin'".into())
-    );
-    let key = until(
-        || match rig.host.warm(TONE_NAME, None, true, SAMPLE_RATE, 1) {
-            Prepared::Ready(key) => Some(key),
-            Prepared::Pending => None,
-            other => panic!("unexpected readiness: {other:?}"),
-        },
-    );
-    let slot = InsertSlot::instrument(42);
-    rig.host.prepare(TONE_NAME, None, true, SAMPLE_RATE, slot);
-    rig.host.wait_idle();
-    let copy = (rig.host.provider(false))(key, SAMPLE_RATE, slot).expect("instrument copy");
-    assert_eq!(
-        rig.host
-            .plugins()
-            .iter()
-            .map(|plugin| plugin.running)
-            .sum::<usize>(),
-        1
-    );
-    drop(copy);
-}
-
-#[test]
-fn prewarmed_copies_keep_their_preset() {
-    let rig = Rig::new("warm-preset");
-    rig.write_preset(
-        "Half Level.vstpreset",
-        &rustel_vst3_fixture::preset(0.5, 0.0),
-    );
-    rig.plugin();
-    let warm = |preset| {
-        until(
-            || match rig.host.warm(NAME, preset, false, SAMPLE_RATE, 1) {
-                Prepared::Ready(key) => Some(key),
-                Prepared::Pending => None,
-                other => panic!("unexpected readiness: {other:?}"),
-            },
-        )
-    };
-    let default = warm(None);
-    let half = warm(Some("Half Level"));
-    assert_ne!(default, half);
-    let provider = rig.host.provider(false);
-    let slot = InsertSlot::effect(7, 0);
-    let mut quiet = provider(half, SAMPLE_RATE, slot).expect("preset copy");
-    let mut full = provider(default, SAMPLE_RATE, slot).expect("default copy");
-    assert_eq!(block(quiet.as_mut(), 1.0, 16), vec![0.5; 16]);
-    assert_eq!(block(full.as_mut(), 1.0, 16), vec![1.0; 16]);
-    assert_eq!(rig.host.plugins()[0].running, 2);
 }
 
 #[test]
@@ -1153,12 +1047,16 @@ fn walk(folder: &std::path::Path) -> Vec<PathBuf> {
     files
 }
 
-/// A spare copy stays while a call of the score text has no copy yet. With
-/// no such call the spare ends. A copy made ready for a chain that left the
-/// score ends too.
+/// A copy made ready for a chain that left the score ends, and the chain
+/// gets no new copy.
 #[test]
 fn a_copy_no_chain_of_the_score_takes_ends() {
-    let rig = Rig::new("spares");
+    let rig = Rig::new("ended");
+    // A build with the preset of a different plugin fails.
+    let mut other = rustel_vst3_fixture::preset(0.5, 0.0);
+    other[8] = b'0';
+    rig.write_preset("Other Plugin.vstpreset", &other);
+    let fails = Some("Other Plugin");
     let key = InsertKey {
         plugin: rig.plugin(),
         preset: 0,
@@ -1167,49 +1065,6 @@ fn a_copy_no_chain_of_the_score_takes_ends() {
         rig.host.wait_idle();
         rig.host.plugins()[0].running
     };
-    let warm = |copies| {
-        let warm = || rig.host.warm(NAME, None, false, SAMPLE_RATE, copies);
-        until(|| (warm() == Prepared::Ready(key)).then_some(()));
-    };
-    warm(2);
-    assert_eq!(running(), 2);
-    // The score with the 2 calls plays, and an engine takes one copy for a
-    // chain.
-    rig.host.score_changed();
-    assert!(rig.host.chains_with_copies().is_empty());
-    let provider = rig.host.provider(false);
-    let held = provider(key, SAMPLE_RATE, InsertSlot::effect(7, 0)).expect("a copy");
-    assert_eq!(rig.host.chains_with_copies(), [7]);
-    // The text has 2 calls of the plugin: the chain with no copy yet keeps
-    // the spare.
-    rig.host.keep_spares(vec![(NAME.into(), 2)]);
-    assert_eq!(running(), 2);
-    // The text has 1 call, and the engine holds its copy.
-    rig.host.keep_spares(vec![("rustel fixture".into(), 1)]);
-    assert_eq!(running(), 1);
-
-    // The chain leaves the score, and a new chain takes its place in the
-    // text. The copy of the chain that left plays its tail and serves no
-    // call: the new chain keeps the spare.
-    warm(1);
-    rig.host.score_changed();
-    rig.host.end_chains(vec![7]);
-    assert!(rig.host.chains_with_copies().is_empty());
-    rig.host.keep_spares(vec![(NAME.into(), 1)]);
-    assert_eq!(running(), 2);
-    drop(held);
-    assert_eq!(running(), 1);
-    // A text with no call of the plugin ends each spare.
-    rig.host.keep_spares(Vec::new());
-    assert_eq!(running(), 0);
-    // A spare from after the last score change is the spare of an edit
-    // that waits: the spare stays until the edit is the score.
-    warm(1);
-    rig.host.keep_spares(Vec::new());
-    assert_eq!(running(), 1);
-    rig.host.score_changed();
-    rig.host.keep_spares(Vec::new());
-    assert_eq!(running(), 0);
 
     // A copy that waits for the slot of a chain.
     let slot = InsertSlot::effect(9, 0);
@@ -1222,4 +1077,17 @@ fn a_copy_no_chain_of_the_score_takes_ends() {
     rig.host.end_chains(vec![9]);
     assert_eq!(running(), 0);
     assert_eq!(prepared(), Prepared::Unbuilt(key));
+
+    // A chain that ends with its build in the line keeps no copy, also
+    // when the build is done first. No later call builds a copy for the
+    // chain: a build with this preset fails, and `Host::take_errors` gives
+    // nothing. No chain number comes a second time.
+    let (stays, ends) = (InsertSlot::effect(10, 0), InsertSlot::effect(11, 0));
+    rig.host.prepare(NAME, None, false, SAMPLE_RATE, stays);
+    rig.host.prepare(NAME, None, false, SAMPLE_RATE, ends);
+    rig.host.end_chains(vec![11]);
+    rig.host.prepare(NAME, fails, false, SAMPLE_RATE, ends);
+    rig.host.prepare(NAME, None, false, SAMPLE_RATE, ends);
+    assert_eq!(running(), 1);
+    assert!(rig.host.take_errors().is_empty());
 }

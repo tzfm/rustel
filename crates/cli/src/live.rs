@@ -68,6 +68,10 @@ pub(super) fn run_musician(
         &input.sample_access,
     )?)?;
     session.set_direct_diagnostic_logging(output.structured());
+    // Only a replay sets `anchored`. A replay plays each save at its time
+    // on the tape.
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    session.set_plugin_wait(anchored.is_none());
     let _watcher = watch_for_interrupt(session.transport());
     let (loaded, initial_error) = if watch {
         load_watch_musician_sources(
@@ -1604,6 +1608,34 @@ pub(super) fn play_live(
             }),
         );
     }
+    // The downbeat waits for the plugin copies of the cycles of the
+    // prefetch too. The prefetch started their builds, so they load while
+    // the samples load. The wait goes on while a copy became ready in the
+    // last `PLUGIN_WAIT`, as the wait of an edit does.
+    #[cfg(feature = "vst")]
+    if warmup_error.is_none() {
+        let (mut pending, mut progress) = (usize::MAX, Instant::now());
+        while !session.transport().is_stopped() {
+            let looked = session.with_panic_recovery(device.clock_seconds(), |session| {
+                Ok(session.plugins_pending(0.0, 4.0, WARM_QUERY_CEILING))
+            });
+            let count = match looked {
+                Ok(count) => count,
+                Err(error) => {
+                    warmup_error = Some(error);
+                    break;
+                }
+            };
+            if count < pending {
+                progress = Instant::now();
+            }
+            pending = count;
+            if pending == 0 || progress.elapsed() >= rustel_runtime::PLUGIN_WAIT {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
     let mut producer = build_live_producer(path, language, loaded, DEBOUNCE, WATCH_POLL, POLL)?;
     if let Some(error) = warmup_error {
         producer.recover_after_panic(session, device.generation(), &error.to_string());
@@ -2059,6 +2091,9 @@ pub(super) fn play_live(
                         // later decodes follow it.
                         library.set_render_rate(device.sample_rate());
                     }
+                    // The plugins follow the rate of the reopened device too.
+                    #[cfg(feature = "vst")]
+                    session.set_plugin_rate(device.sample_rate());
                     session.set_schedule_lead(device.schedule_lead_seconds());
                     session.set_continuity_margin(device.continuity_margin_seconds());
                     // The stream ring and its absolute frame domain vanished.

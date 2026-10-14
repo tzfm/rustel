@@ -112,3 +112,37 @@ fn replacing_a_public_timeline_hook_does_not_freeze_the_next_save() {
     assert_eq!(haps.len(), 1);
     assert!(haps[0].show().contains("sd"), "{}", haps[0].show());
 }
+
+/// The reset of a score that does not go in play leaves the timeline
+/// offsets of the score in play: a candidate the host refuses, and a score
+/// that throws.
+#[test]
+fn a_score_that_does_not_play_keeps_the_offsets_in_play() {
+    let runtime = runtime();
+    let options = TranspileOptions::default();
+    runtime
+        .evaluate_score(r#"n("<0 1 2 3>").timeline(1)"#, &options)
+        .expect("score in play");
+    runtime.snapshot_active_as_last_good();
+    let shown = |cycle: i128, controls: &[(&str, f64)]| {
+        let (begin, end) = (Fraction::int(cycle), Fraction::int(cycle + 1));
+        let haps = runtime
+            .query_with_controls(Slot::Active, 0, begin, end, controls)
+            .expect("query");
+        haps[0].show()
+    };
+    // With no offset, the timeline starts at its event.
+    let fresh = shown(6, &[]);
+    // A query of the scheduler keeps the start of the timeline: cycle 5.
+    shown(5, &[("cyclist", 1.0)]);
+    let kept = shown(6, &[]);
+    assert_ne!(kept, fresh);
+    runtime
+        .evaluate_score("s('sd')", &options)
+        .expect("candidate");
+    runtime.restore_last_good_active().expect("restore");
+    assert_eq!(shown(6, &[]), kept, "the candidate took the offsets");
+    let thrown = runtime.evaluate_score("(() => { throw new Error('no') })()", &options);
+    assert!(thrown.is_err());
+    assert_eq!(shown(6, &[]), kept, "the score that threw took the offsets");
+}
