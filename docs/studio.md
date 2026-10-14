@@ -226,6 +226,28 @@ To start the score at cycle zero, use Ctrl+Shift+S or Shift+F5. To make this the
 scene default, enable Rewind on Play with Ctrl+Shift+U. The scene strip marks
 this setting with `⟲`.
 
+### Auto evaluate
+
+While the set plays, an edit can apply itself. Turn auto evaluate on under
+Settings ▸ Live coding. It is off by default: an update is a deliberate
+press.
+
+An edit applies only after you rest. The typing pause sets how long: 250 ms,
+500 ms, 1 s, or 2 s. The default is 500 ms.
+
+Only a clean edit applies. Text that fails the check is refused, the last
+good score keeps playing, and the footer says why. An applied edit writes
+the score's file and never flashes the pane: a flash confirms a keypress,
+and nobody pressed anything.
+
+The launch setting names the line an applied edit waits for, the same line
+an update waits for. With the launch row off, the edit plays at once. Beat
+or cycle holds it for the line the row names, and the header shows the
+`» scene` countdown while it waits.
+
+Auto evaluate works while the set plays. A stopped set stays stopped, so
+Ctrl+S remains how playback starts.
+
 ### Stopping
 
 The first Stop lets envelopes and effect tails finish. The transport shows

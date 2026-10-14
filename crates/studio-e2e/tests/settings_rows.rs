@@ -605,8 +605,11 @@ fn folder_rows_open_their_picker_and_esc_returns_to_the_sheet() {
         Some(PanelKind::Settings),
         "the Esc came back to the sheet that opened the picker"
     );
+    // The sheet keeps its scroll where the picker left it, and the first
+    // page now scrolls, so the row still standing is the one selected, not
+    // the sheet's first row.
     assert!(
-        row_with(&mut studio, "launch on").contains("launch on"),
+        selected_row(&mut studio).is_some_and(|row| row.contains("sets folder")),
         "and the sheet is still standing:\n{}",
         studio.rows().join("\n")
     );

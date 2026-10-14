@@ -1033,6 +1033,72 @@ impl Quantise {
     }
 }
 
+/// How long typing must pause before an auto evaluate applies the text.
+///
+/// Half a second by default: a burst of keys costs one apply, and a hand
+/// still on the keys is still writing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TypingPause {
+    Short,
+    #[default]
+    Medium,
+    Long,
+    Slow,
+}
+
+impl TypingPause {
+    const LADDER: [Self; 4] = [Self::Short, Self::Medium, Self::Long, Self::Slow];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Short => "250 ms",
+            Self::Medium => "500 ms",
+            Self::Long => "1 s",
+            Self::Slow => "2 s",
+        }
+    }
+
+    /// The name the preferences file keeps.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Short => "250ms",
+            Self::Medium => "500ms",
+            Self::Long => "1s",
+            Self::Slow => "2s",
+        }
+    }
+
+    pub fn parse(text: &str) -> Self {
+        Self::LADDER
+            .iter()
+            .copied()
+            .find(|pause| pause.key() == text)
+            .unwrap_or_default()
+    }
+
+    pub fn duration(self) -> std::time::Duration {
+        match self {
+            Self::Short => std::time::Duration::from_millis(250),
+            Self::Medium => std::time::Duration::from_millis(500),
+            Self::Long => std::time::Duration::from_secs(1),
+            Self::Slow => std::time::Duration::from_secs(2),
+        }
+    }
+
+    fn step(self, forwards: bool) -> Self {
+        let index = Self::LADDER
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(0);
+        let len = Self::LADDER.len();
+        Self::LADDER[if forwards {
+            (index + 1) % len
+        } else {
+            (index + len - 1) % len
+        }]
+    }
+}
+
 /// How a start or an edit meets sounds that are still loading.
 ///
 /// Wait by default: a first bar that plays its sounds whole is worth the
@@ -1400,6 +1466,13 @@ pub struct UiSettings {
     /// Show folder paths in file status messages, rather than only filenames.
     pub show_full_paths: bool,
     pub quantise: Quantise,
+    /// Whether a score edit applies itself once typing pauses. Off by
+    /// default: update is a deliberate press, and a studio that changed
+    /// the music on its own while somebody typed would be a surprise the
+    /// first time and a nuisance after.
+    pub auto_evaluate: bool,
+    /// How long typing must pause before it does.
+    pub typing_pause: TypingPause,
     pub load_mode: LoadMode,
     /// MIDI clock out, by port; none to send none.
     pub clock_out: Option<String>,
@@ -1568,6 +1641,8 @@ impl Default for UiSettings {
             frame_rate: FrameRate::default(),
             show_full_paths: false,
             quantise: Quantise::Off,
+            auto_evaluate: false,
+            typing_pause: TypingPause::Medium,
             load_mode: LoadMode::Wait,
             clock_out: None,
             clock_in: None,
@@ -1679,6 +1754,10 @@ enum Row {
     FrameRate,
     ShowFullPaths,
     Quantise,
+    /// Whether a score edit applies itself once typing pauses.
+    AutoEvaluate,
+    /// How long typing must pause before it does.
+    TypingPause,
     /// How a start or an edit meets sounds still loading.
     LoadMode,
     Animation,
@@ -1889,6 +1968,8 @@ fn step_opacity(opacity: u8, forwards: bool) -> u8 {
 const ROWS: &[Row] = &[
     Row::Quantise,
     Row::MasterLimiter,
+    Row::AutoEvaluate,
+    Row::TypingPause,
     Row::ShowMenu,
     Row::ShowHeader,
     Row::ShowFooter,
@@ -2065,6 +2146,7 @@ impl Row {
     fn group(self) -> &'static str {
         match self {
             Self::Quantise | Self::MasterLimiter | Self::LoadMode => "Playback",
+            Self::AutoEvaluate | Self::TypingPause => "Live coding",
 
             // The one latency knob: what the OUTPUT costs is a
             // machine-level choice, set once like a DAW's buffer size.
@@ -2123,6 +2205,8 @@ impl Row {
             Self::Rendering => "rendering",
             Self::FrameRate => "frame rate",
             Self::Quantise => "launch on",
+            Self::AutoEvaluate => "auto evaluate",
+            Self::TypingPause => "typing pause",
             Self::LoadMode => "load mode",
             Self::Animation => "visualizers",
             Self::Highlights => "highlights",
@@ -2200,6 +2284,8 @@ impl Row {
             Self::Rendering => "how glyphs are drawn \u{b7} Automatic favours speed",
             Self::FrameRate => "repaints a second \u{b7} drawing costs more than sound",
             Self::Quantise => "every play waits for this line · off plays now",
+            Self::AutoEvaluate => "a paused edit applies itself while the set plays",
+            Self::TypingPause => "how long typing rests before the edit applies",
             Self::LoadMode => "wait: plays once its sounds load · async: skips late notes",
             Self::Animation => "pianoroll, scope and friends draw",
             Self::Highlights => "sounding events marked in the score",
@@ -2980,6 +3066,10 @@ impl SettingsSheet {
                 // the screen up, left slows it down.
                 Row::FrameRate => settings.frame_rate = settings.frame_rate.step(!forwards),
                 Row::Quantise => settings.quantise = settings.quantise.step(forwards),
+                Row::AutoEvaluate => set_switch(&mut settings.auto_evaluate),
+                Row::TypingPause => {
+                    settings.typing_pause = settings.typing_pause.step(forwards);
+                }
                 Row::LoadMode => settings.load_mode = settings.load_mode.step(),
                 Row::Animation => set_switch(&mut settings.animation),
                 Row::Highlights => set_switch(&mut settings.highlights),

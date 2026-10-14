@@ -102,6 +102,8 @@ impl Widget for SettingsSheetView<'_> {
                 Row::Rendering => self.settings.rendering.label().to_owned(),
                 Row::FrameRate => self.settings.frame_rate.label().to_owned(),
                 Row::Quantise => self.settings.quantise.label(),
+                Row::AutoEvaluate => on_off(self.settings.auto_evaluate),
+                Row::TypingPause => self.settings.typing_pause.label().to_owned(),
                 Row::LoadMode => self.settings.load_mode.label().to_owned(),
                 Row::Animation => on_off(self.settings.animation),
                 Row::Highlights => on_off(self.settings.highlights),

@@ -52,7 +52,7 @@
 //! | the list keys every panel shares | `list_keys.rs` |
 //! | building and painting a frame | `render.rs` |
 //! | what an edit sets off | `editing.rs` |
-//! | evaluating the score, and the engine's events | `evaluation.rs` |
+//! | evaluating the score, auto evaluate, and the engine's events | `evaluation.rs` |
 //! | saving scenes, preferences and the manifest | `persistence.rs` |
 //! | quitting, play state, the errors shown | `transport.rs` |
 //!
@@ -4511,6 +4511,197 @@ mod tests {
             assert_eq!(app.focus, Focus::Editor);
         }
     }
+    mod auto_evaluate {
+        //! Tests for the auto evaluate path in `app/evaluation.rs`.
+
+        use super::super::*;
+        use super::support::*;
+
+        /// A studio playing one scene, with auto evaluate on or off. The
+        /// scene keeps the score `app_over` opened, "$: s(\"bd\")".
+        fn playing_app(directory: &std::path::Path, auto: bool) -> (App, SceneId) {
+            let mut app = app_over(directory);
+            app.ui_settings.auto_evaluate = auto;
+            app.snapshot = Some(sounding(true, false));
+            let scene = app.scenes.current().id;
+            (app, scene)
+        }
+
+        /// The evaluations one auto apply queued, pending or in flight.
+        fn queued_by(app: &App, scene: SceneId) -> Vec<PendingEvaluation> {
+            app.pending_evaluation
+                .iter()
+                .chain(app.inflight.values())
+                .filter(|pending| pending.scene == scene)
+                .cloned()
+                .collect()
+        }
+
+        fn clear_queued(app: &mut App) {
+            app.pending_evaluation = None;
+            app.inflight.clear();
+        }
+
+        /// Off is the default for a reason: nothing applies itself, and the
+        /// press stays the only way an edit becomes sound.
+        #[test]
+        fn off_leaves_the_updates_to_the_press() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene) = playing_app(directory.path(), false);
+            app.auto_evaluate();
+            assert!(
+                queued_by(&app, scene).is_empty(),
+                "no evaluation left without a press"
+            );
+        }
+
+        /// A stopped set is not started by typing. Update is how playback
+        /// starts, and the studio does not make that decision alone.
+        #[test]
+        fn a_paused_edit_does_not_start_a_stopped_set() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene) = plain_app(directory.path(), "$: s(\"bd\")\n");
+            app.ui_settings.auto_evaluate = true;
+            app.snapshot = None;
+            app.auto_evaluate();
+            assert!(
+                queued_by(&app, scene).is_empty(),
+                "a stopped set stays put until update starts it"
+            );
+        }
+
+        /// The apply itself: queued while the set plays, and no flash, because
+        /// a flash confirms a press and nobody pressed anything. The launch
+        /// row is off by default, so the edit lands at once.
+        #[test]
+        fn a_paused_edit_applies_itself_without_a_flash() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene) = playing_app(directory.path(), true);
+            app.auto_evaluate();
+            let queued = queued_by(&app, scene);
+            assert_eq!(queued.len(), 1, "the paused edit was queued");
+            assert_eq!(&*queued[0].source, "$: s(\"bd\")\n");
+            assert_eq!(queued[0].launch, Launch::Now);
+            assert!(
+                app.evaluation_feedback.is_none(),
+                "an auto apply begins no flash"
+            );
+            clear_queued(&mut app);
+        }
+
+        /// The launch row owns the line an applied edit lands on, the same
+        /// line an update waits for: off plays it at once, beat and cycle
+        /// hold it for the line the row names.
+        #[test]
+        fn the_launch_row_names_the_line_its_edits_land_on() {
+            for (quantise, launch) in [
+                (settings::Quantise::Off, Launch::Now),
+                (
+                    settings::Quantise::Beat,
+                    Launch::Quantised { unit_cycles: 0.25 },
+                ),
+                (
+                    settings::Quantise::Cycle,
+                    Launch::Quantised { unit_cycles: 1.0 },
+                ),
+            ] {
+                let directory = tempfile::tempdir().expect("temp dir");
+                let (mut app, scene) = playing_app(directory.path(), true);
+                app.ui_settings.quantise = quantise;
+                app.auto_evaluate();
+                let queued = queued_by(&app, scene);
+                assert_eq!(queued.len(), 1, "{quantise:?} queued its edit");
+                assert_eq!(
+                    queued[0].launch, launch,
+                    "{quantise:?} lands where the launch row says"
+                );
+                clear_queued(&mut app);
+            }
+        }
+
+        /// Text the checker refuses is not applied: the last good score keeps
+        /// playing, and the footer says why, as a refused update does.
+        #[test]
+        fn refused_text_keeps_the_last_good_score() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene) = playing_app(directory.path(), true);
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("$: s(\"bd\"".into()),
+                    HistoryMoment(1),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("break the score");
+            app.auto_evaluate();
+            assert!(
+                queued_by(&app, scene).is_empty(),
+                "an unclean score is not sent to the engine"
+            );
+            assert!(
+                app.status.contains("refused"),
+                "the refusal is said: {}",
+                app.status
+            );
+        }
+
+        /// The typing pause gates the apply: a pump inside the pause holds it,
+        /// and the pump after it applies. The flag is spent either way, so a
+        /// pause that elapsed while the set was stopped never fires when
+        /// playback later starts.
+        #[test]
+        fn the_typing_pause_gates_the_apply() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene) = playing_app(directory.path(), true);
+            app.dispatch_editor(Command::PasteText("$: s(\"hh\")\n".into()))
+                .expect("edit the score");
+            assert!(app.auto_evaluate_due, "the edit armed the apply");
+            app.pump_turn();
+            assert!(
+                queued_by(&app, scene).is_empty(),
+                "inside the pause nothing applies"
+            );
+            assert!(
+                app.auto_evaluate_due,
+                "the apply waits inside the pause, it is not lost"
+            );
+            let elapsed =
+                app.ui_settings.typing_pause.duration() + std::time::Duration::from_millis(50);
+            app.last_edit_at = std::time::Instant::now()
+                .checked_sub(elapsed)
+                .expect("backdate the edit");
+            // An idle worker still says stopped every 100 ms, and the drain
+            // at a pump's head is read before the apply at its end: a word
+            // landed between the two spends the pause on a set that reads
+            // stopped. Put the playing picture back, owe the pause again,
+            // and pump at once - nothing new arrives between two pumps run
+            // back to back, so the next one runs clean through.
+            let mut applied = false;
+            for _ in 0..50 {
+                app.snapshot = Some(sounding(true, false));
+                app.pump_turn();
+                if !app.auto_evaluate_due && !queued_by(&app, scene).is_empty() {
+                    applied = true;
+                    break;
+                }
+                app.auto_evaluate_due = true;
+            }
+            assert!(applied, "past the pause the edit applies");
+            clear_queued(&mut app);
+
+            // A pause that elapsed while stopped buys nothing later.
+            app.auto_evaluate_due = true;
+            app.snapshot = None;
+            app.last_edit_at = std::time::Instant::now()
+                .checked_sub(elapsed)
+                .expect("backdate the edit");
+            app.pump_turn();
+            assert!(
+                !app.auto_evaluate_due,
+                "the elapsed pause is spent stopped, not saved up"
+            );
+        }
+    }
+
     mod evaluation {
         //! Tests for `app/evaluation.rs`.
 
@@ -39098,6 +39289,9 @@ struct App {
     lint: HashMap<SceneId, LintResult>,
     /// The text changed since it was last handed to the linter.
     lint_pending: bool,
+    /// An edit paused and auto evaluate is owed a look at the text, once
+    /// the typing pause elapses.
+    auto_evaluate_due: bool,
     error_jump: Option<(SceneId, Revision)>,
     /// What the checker could judge beyond the text when it was last
     /// looked at; see [`App::lint_knowledge`].
@@ -39799,6 +39993,7 @@ impl App {
             lint: HashMap::new(),
             // Check what was opened before anything is typed.
             lint_pending: true,
+            auto_evaluate_due: false,
             error_jump: None,
             lint_knowledge: LintKnowledge::default(),
             prefs_pending: false,

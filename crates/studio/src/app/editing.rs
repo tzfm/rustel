@@ -136,6 +136,7 @@ impl App {
         }
         self.last_edit_at = Instant::now();
         self.lint_pending = true;
+        self.auto_evaluate_due = true;
         self.readiness_due = Some((scene_id, self.last_edit_at + READINESS_SETTLE));
         self.marks_muted = Some(scene_id);
         self.invalidate_maps();
