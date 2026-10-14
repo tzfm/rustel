@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- The lint no longer reports `unknown bank "gm_pad"` on a working score. The bank check read the sample banks but not the General MIDI names, which are the only holders of banks such as `gm_pad`. The score played either way, and `s("halo").bank("gm_pad")` and `s("gm_pad_halo")` now lint the same.
 - Studio no longer pauses animated themes during the first sample-library refresh.
 
 ## v0.1.2

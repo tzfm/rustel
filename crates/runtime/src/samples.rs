@@ -10489,7 +10489,8 @@ impl SampleLibrary {
     }
 
     /// Whether `.bank("name")` names a family of banks: something is called
-    /// `name_…`.
+    /// `name_…`. The General MIDI names count: `gm_pad_halo` makes `gm_pad`
+    /// a bank, the way the voice's `{bank}_{s}` rule reads it.
     pub fn knows_bank(&self, name: &str) -> bool {
         let prefix = format!("{name}_");
         let starts_with =
@@ -10497,6 +10498,7 @@ impl SampleLibrary {
         starts_with(&self.banks.read().expect("default banks"))
             || starts_with(&self.custom.read().expect("custom banks"))
             || starts_with(&self.global.read().expect("global banks"))
+            || self.gm.keys().any(|known| known.starts_with(&prefix))
     }
 
     /// Convert decoded PCM to `rate` from here on.

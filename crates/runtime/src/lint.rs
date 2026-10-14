@@ -3767,6 +3767,15 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
         // the machine with the most samples judges the number.
         assert!(machines("s(\"sd:0\").bank(\"BossDR110 AkaiXR10\")").is_empty());
         assert!(machines("s(\"sd:1\").bank(\"BossDR110 AkaiXR10\")").is_empty());
+
+        // A bank the General MIDI names alone carry is a bank all the same:
+        // the voice builds `gm_pad_halo` out of `halo` and `gm_pad`.
+        let fonts = SampleLibrary::load_default().expect("default library");
+        let fonts = |source: &str| lint(source, false, Some(&fonts));
+        assert!(fonts("s(\"halo choir\").bank(\"gm_pad\")").is_empty());
+        let diagnostics = fonts("s(\"halo\").bank(\"gm_pads\")");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].message, "unknown bank \"gm_pads\"");
     }
 
     /// A score that brings its own samples is held to them once they are
