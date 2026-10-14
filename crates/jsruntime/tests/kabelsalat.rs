@@ -51,8 +51,14 @@ fn graph_uses_final_pitch_inputs_and_controls() {
         vec![[220.0; 2], [440.0; 2]]
     );
     for (controls, expected) in [
-        ("{note: ''}", rustel_core::util::midi_to_freq(36.0)),
-        ("{note: false}", rustel_core::util::midi_to_freq(36.0)),
+        (
+            "{note: ''}",
+            rustel_core::tonal::trim_frequency(rustel_core::util::midi_to_freq(36.0)),
+        ),
+        (
+            "{note: false}",
+            rustel_core::tonal::trim_frequency(rustel_core::util::midi_to_freq(36.0)),
+        ),
         ("{note: 69, freq: '0'}", 0.0),
         ("{note: true, freq: 220}", 220.0),
     ] {

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `K(...)` binds the same note frequency on every platform. The frequency came from the host `pow`, whose last bits differ on Windows, so a score using `sFreq` produced a different event hash there and failed the corpus. The bound frequency is trimmed, as tonal frequencies already are, and the two affected golden rows are recaptured.
 - KabelSalat guide tests read examples with Unix or Windows line endings.
 - Methods defined through aliases such as `const rg = register` pass score checks and remain available in later updates.
 - Studio names the caret menu Quick action. Theme and score save confirmations clear after five seconds.

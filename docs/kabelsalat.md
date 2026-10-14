@@ -8,8 +8,9 @@ $: K(sine(sFreq).mul(0.2).out()).note("c3 e3 g3 b3")
 ```
 
 `sFreq` is the event's final frequency in Hz, including a `note` or `freq`
-control applied after `K`. `sGate` is the event's gate. `time()` starts at
-zero for each graph. Graph state belongs to one voice, so overlapping notes
+control applied after `K`. It is rounded in its last digits, so every
+platform binds the same value. `sGate` is the event's gate. `time()` starts
+at zero for each graph. Graph state belongs to one voice, so overlapping notes
 have independent oscillators, envelopes, noise generators and delay lines.
 
 ## Patterns and envelopes
