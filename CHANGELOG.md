@@ -19,6 +19,7 @@
 - The corpus includes ten published KabelSalat scores with source links, author credits and AGPL-3.0-or-later notices.
 - Studio reference and completion include KabelSalat functions, node methods and inputs under `tag:kabelsalat`. Help inside `K(...)` uses graph definitions. Underscore bypass methods appear only when searched with `_` or `tag:bypass`. Settings > Reference > KabelSalat hides these entries from suggestions and browsing.
 - The lint no longer reports `unknown bank "gm_pad"` on a working score. The bank check read the sample banks but not the General MIDI names, which are the only holders of banks such as `gm_pad`. The score played either way, and `s("halo").bank("gm_pad")` and `s("gm_pad_halo")` now lint the same.
+- The check reads a bank name without regard to case, as playback does. `.bank("TR909")` was flagged `unknown bank` while it played the machine `tr909` names.
 - Studio no longer pauses animated themes during the first sample-library refresh.
 - Studio applies a paused edit by itself while the set plays. Settings ▸ Live coding turns auto evaluate on, off by default, and sets the typing pause: how long a rest before the edit applies, 250 ms to 2 s with a 500 ms default. Only a clean edit applies, a refused one keeps the last good score playing, and an applied edit never flashes the pane. The launch setting names the line an applied edit waits for, as for an update.
 

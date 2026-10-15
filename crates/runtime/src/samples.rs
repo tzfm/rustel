@@ -10490,15 +10490,20 @@ impl SampleLibrary {
 
     /// Whether `.bank("name")` names a family of banks: something is called
     /// `name_…`. The General MIDI names count: `gm_pad_halo` makes `gm_pad`
-    /// a bank, the way the voice's `{bank}_{s}` rule reads it.
+    /// a bank, the way the voice's `{bank}_{s}` rule reads it. The name is
+    /// read without regard to case, the way playback reads the whole
+    /// spelling: `.bank("TR909")` names the machine `tr909_…` holds, and a
+    /// check that said otherwise would flag a score that plays.
     pub fn knows_bank(&self, name: &str) -> bool {
         let prefix = format!("{name}_");
-        let starts_with =
-            |names: &HashMap<String, Bank>| names.keys().any(|known| known.starts_with(&prefix));
+        let folded = prefix.to_lowercase();
+        let family =
+            |known: &str| known.starts_with(&prefix) || known.to_lowercase().starts_with(&folded);
+        let starts_with = |names: &HashMap<String, Bank>| names.keys().any(|known| family(known));
         starts_with(&self.banks.read().expect("default banks"))
             || starts_with(&self.custom.read().expect("custom banks"))
             || starts_with(&self.global.read().expect("global banks"))
-            || self.gm.keys().any(|known| known.starts_with(&prefix))
+            || self.gm.keys().any(|known| family(known))
     }
 
     /// Convert decoded PCM to `rate` from here on.
