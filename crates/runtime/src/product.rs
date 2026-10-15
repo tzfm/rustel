@@ -46,8 +46,7 @@ macro_rules! define_product {
         );
         pub const RENDER_LONG_ABOUT: &str = concat!(
             "Bounce a score to a file, offline: no audio device is opened, and the same ",
-            "score gives the same bytes every run. A VST3 plugin with randomness of its ",
-            "own is the one way the bytes differ.\n\n    ",
+            "score gives the same bytes every run.\n\n    ",
             $command_name,
             " export song.strudel                  # song.wav beside the score, 8 cycles\n    ",
             $command_name,
