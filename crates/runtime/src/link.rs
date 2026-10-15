@@ -3,7 +3,8 @@
 //!
 //! The participant is an actor thread behind a cheap handle. It keeps
 //! one UDP socket on the multicast group every participant listens on,
-//! says it is alive once a second, and answers everyone else's
+//! joined on every interface the machine has, loopback included, says
+//! it is alive once a second, and answers everyone else's
 //! announcements. Tempo is the session's own beat grid, carried in every
 //! announcement; the grid a participant changes outranks the one it
 //! heard, so a tempo someone sets reaches everyone. Transport is a
@@ -209,6 +210,10 @@ struct Measure {
 struct Actor {
     socket: UdpSocket,
     measure_socket: UdpSocket,
+    /// Every interface the session lives on: loopback for the other
+    /// participants on this machine, and the network's route for the
+    /// rest of the session.
+    interfaces: Vec<Ipv4Addr>,
     group: SocketAddr,
     inbox: Receiver<Command>,
     shared: Arc<Mutex<Shared>>,
@@ -240,21 +245,18 @@ impl Actor {
         measure_v4: Option<([u8; 4], u16)>,
         session: core::Session,
     ) -> Self {
-        // Say which interface multicast runs on. Left unsaid, the first
-        // send can stall for seconds while the kernel looks for a route,
-        // which a session that has just begun cannot wait out.
-        let interface = local_address()
-            .map(Ipv4Addr::from)
-            .unwrap_or(Ipv4Addr::UNSPECIFIED);
-        socket
-            .join_multicast_v4(&Ipv4Addr::from(wire::GROUP), &interface)
-            .ok();
+        let interfaces = session_interfaces();
+        for interface in &interfaces {
+            socket
+                .join_multicast_v4(&Ipv4Addr::from(wire::GROUP), interface)
+                .ok();
+        }
         socket.set_multicast_loop_v4(true).ok();
-        set_multicast_interface(&socket, interface);
         socket.set_read_timeout(Some(Duration::from_millis(1))).ok();
         Self {
             group: SocketAddrV4::new(Ipv4Addr::from(wire::GROUP), wire::PORT).into(),
             socket,
+            interfaces,
             measure_socket,
             inbox,
             shared,
@@ -633,7 +635,17 @@ impl Actor {
             state,
         };
         if let Some(bytes) = wire::encode_discovery(&message) {
-            let _ = self.socket.send_to(&bytes, to);
+            if to.ip().is_multicast() {
+                // The announcement goes out once per interface, so the
+                // participants on this machine and on the network both
+                // hear it.
+                for interface in &self.interfaces {
+                    set_multicast_interface(&self.socket, *interface);
+                    let _ = self.socket.send_to(&bytes, to);
+                }
+            } else {
+                let _ = self.socket.send_to(&bytes, to);
+            }
         }
     }
 
@@ -696,6 +708,19 @@ fn local_address() -> Option<[u8; 4]> {
         SocketAddr::V4(address) => Some(address.ip().octets()),
         SocketAddr::V6(_) => None,
     }
+}
+
+/// Every interface the session lives on. Loopback is always there: two
+/// participants on one machine find each other on it, with or without a
+/// network.
+fn session_interfaces() -> Vec<Ipv4Addr> {
+    let mut interfaces = vec![Ipv4Addr::LOCALHOST];
+    if let Some(address) = local_address().map(Ipv4Addr::from)
+        && !interfaces.contains(&address)
+    {
+        interfaces.push(address);
+    }
+    interfaces
 }
 
 /// Bind the shared port, allowing the other participants on this machine
@@ -886,6 +911,11 @@ mod tests {
         let first = random_id();
         let second = random_id();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn the_session_speaks_on_loopback_whatever_the_network() {
+        assert!(session_interfaces().contains(&Ipv4Addr::LOCALHOST));
     }
 
     /// Two participants on this machine, both with the port they share:

@@ -125,7 +125,8 @@ rustel studio song.strudel --link
 
 Ableton Link shares tempo and the play and stop states over the local
 network, between participants such as DAWs and rustel itself. Rustel finds
-the other participants on its own; no address is given.
+the other participants on its own; no address is given. Participants on
+this machine count too: they are found over loopback, with no network.
 
 A session that is playing starts rustel, and a session that stops stops it.
 When rustel starts or stops, the session is told the same. A tempo from a
