@@ -16763,6 +16763,52 @@ mod tests {
             );
         }
 
+        /// A save that finds the file already holding the score stays quiet -
+        /// unless the status still says the last save failed. The file came
+        /// to hold the buffer after that failure, so the failure line must
+        /// not outlive it.
+        #[test]
+        fn a_skip_replaces_a_stale_save_failure_line() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            let scene_id = app.scenes.current().id;
+            let path = app.scenes.current().path.clone();
+
+            // A real write, so the completion can be matched to a pending
+            // save and reaches the branches under test.
+            let revision = app.scenes.current().editor.revision();
+            let source = Arc::<str>::from(app.scenes.current().editor.source());
+            app.write_scene(scene_id, revision, source);
+            let request_id = app
+                .scenes
+                .current()
+                .latest_save
+                .as_ref()
+                .expect("the write registered a pending save")
+                .request_id;
+
+            // The save before this one failed, and its line still stands.
+            app.status = "save failed - the editor buffer is unchanged".into();
+
+            app.handle_save_result(SaveResult {
+                request_id,
+                path,
+                editor_revision: app.scenes.current().editor.revision(),
+                source_revision: "current".to_owned(),
+                result: Ok(false),
+            });
+
+            assert_ne!(
+                app.status, "save failed - the editor buffer is unchanged",
+                "the skip must not leave a failure that no longer stands"
+            );
+            assert!(
+                app.status.contains("already holds this score"),
+                "the line says where the score is: {}",
+                app.status
+            );
+        }
+
         #[test]
         fn a_save_that_lands_on_a_path_the_scene_no_longer_owns_is_not_taken_as_saved() {
             // The race: a write is in flight, the scene is renamed, and the

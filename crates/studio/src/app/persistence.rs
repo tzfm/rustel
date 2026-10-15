@@ -287,6 +287,16 @@ impl App {
                         "saved {}",
                         status_file_path(&path, self.ui_settings.show_full_paths)
                     ));
+                } else if self.status == "save failed - the editor buffer is unchanged" {
+                    // A skip stays quiet - playing a set you only opened says
+                    // nothing - but a failure left by an earlier save would
+                    // go stale here: the file came to hold this score since,
+                    // so the buffer is on disk and the line must not say
+                    // otherwise.
+                    self.set_notice(format!(
+                        "{} already holds this score",
+                        status_file_path(&path, self.ui_settings.show_full_paths)
+                    ));
                 }
             }
             Err(error) => {
