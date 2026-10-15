@@ -60,14 +60,18 @@ pub enum DeviceKind {
     /// The pads plugged in, numbered the way a score numbers them.
     /// Selecting one copies `gamepad(n)`.
     Gamepad,
+    /// The Link session on the local network: one row that joins it or
+    /// leaves it, and what it is doing once joined.
+    Link,
 }
 
 impl DeviceKind {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::AudioOutput,
         Self::AudioInput,
         Self::Midi,
         Self::Gamepad,
+        Self::Link,
     ];
 
     pub fn label(self) -> &'static str {
@@ -76,6 +80,7 @@ impl DeviceKind {
             Self::AudioInput => "audio in",
             Self::Midi => "midi",
             Self::Gamepad => "gamepads",
+            Self::Link => "link",
         }
     }
 
@@ -259,6 +264,9 @@ impl MidiEnablement {
 /// The rows under the MIDI ports: clock in, then clock out.
 pub const MIDI_CLOCK_ROWS: usize = 2;
 
+/// The Link tab's one row: the session and its checkbox.
+pub const LINK_ROWS: usize = 1;
+
 /// What a row of the MIDI tab is, by its index in the list.
 ///
 /// The ports come first and the clock rows after, so a device plugged in
@@ -382,6 +390,8 @@ impl DeviceInventory {
             // The MIDI tab lists merged rows, not entries: see `midi_rows`.
             DeviceKind::Midi => &[],
             DeviceKind::Gamepad => &self.gamepads,
+            // The Link tab lists one row of its own, not an entry.
+            DeviceKind::Link => &[],
         }
     }
 
@@ -407,6 +417,7 @@ impl DeviceInventory {
     pub fn row_count(&self, kind: DeviceKind) -> usize {
         match kind {
             DeviceKind::Midi => self.midi_device_count() + MIDI_CLOCK_ROWS,
+            DeviceKind::Link => LINK_ROWS,
             _ => self.entries(kind).len(),
         }
     }
@@ -932,6 +943,9 @@ pub struct DevicePanelView<'a> {
     pub clock_in: Option<&'a str>,
     /// The port MIDI clock is sent to, or `None` to send none.
     pub clock_out: Option<&'a str>,
+    /// Whether the Link session was asked for, and what it last said.
+    pub link_enabled: bool,
+    pub link: Option<rustel_runtime::link::LinkStatus>,
 }
 
 /// Rows a tab reserves for what the open stream costs. Only the audio
@@ -1212,6 +1226,70 @@ impl DevicePanelView<'_> {
             }
         }
     }
+
+    /// The Link tab: one row, a checkbox that joins the session or
+    /// leaves it. Joined, the row's other half says what the session is
+    /// doing, so the tab is also where a scan for others is watched.
+    fn render_link(&self, buffer: &mut Buffer, geometry: PanelGeometry) {
+        if geometry.list.height == 0 {
+            return;
+        }
+        let y = geometry.list.y;
+        let selected = self.panel.selected == 0;
+        if selected {
+            buffer.set_style(
+                Rect::new(geometry.list.x, y, geometry.list.width, 1),
+                Style::default().bg(self.theme.selection),
+            );
+        }
+        let text = if selected {
+            self.theme.selection_text
+        } else {
+            self.theme.foreground
+        };
+        let box_style = Style::default().fg(if self.link_enabled {
+            self.theme.ok
+        } else {
+            text
+        });
+        buffer.set_stringn(
+            geometry.list.x,
+            y,
+            if self.link_enabled { "[x]" } else { "[ ]" },
+            usize::from(MIDI_BOX_WIDTH),
+            box_style,
+        );
+        buffer.set_stringn(
+            geometry.list.x + MIDI_BOX_WIDTH + 1,
+            y,
+            "link session",
+            usize::from(geometry.list.width.saturating_sub(MIDI_BOX_WIDTH + 1)),
+            Style::default().fg(text),
+        );
+        let Some(link) = self.link else {
+            return;
+        };
+        let detail = format!("{} · {:.1} bpm", peers_word(link.peers), link.bpm);
+        let width = UnicodeWidthStr::width(detail.as_str()) as u16;
+        if width + 2 < geometry.list.width {
+            buffer.set_stringn(
+                geometry.list.right().saturating_sub(width),
+                y,
+                &detail,
+                usize::from(width),
+                Style::default().fg(self.theme.muted),
+            );
+        }
+    }
+}
+
+/// How the panel says how many others are in the session.
+fn peers_word(peers: usize) -> String {
+    match peers {
+        0 => "alone".to_owned(),
+        1 => "1 other".to_owned(),
+        count => format!("{count} others"),
+    }
 }
 
 impl Widget for DevicePanelView<'_> {
@@ -1280,6 +1358,8 @@ impl Widget for DevicePanelView<'_> {
 
         if self.panel.kind == DeviceKind::Midi {
             self.render_midi(buffer, geometry);
+        } else if self.panel.kind == DeviceKind::Link {
+            self.render_link(buffer, geometry);
         } else {
             if entries.is_empty() {
                 let message = match self.panel.kind {
@@ -1318,8 +1398,9 @@ impl Widget for DevicePanelView<'_> {
                     DeviceKind::AudioInput => entry.is_named(self.current_input),
                     // The MIDI tabs copy a port name for the score to use rather
                     // than moving playback onto it, so nothing there is active;
-                    // a pad is named by its number, so nothing is chosen there.
-                    DeviceKind::Midi | DeviceKind::Gamepad => false,
+                    // a pad is named by its number, so nothing is chosen there;
+                    // the Link tab's one row is drawn by its own hand.
+                    DeviceKind::Midi | DeviceKind::Gamepad | DeviceKind::Link => false,
                 };
                 if selected {
                     buffer.set_style(
@@ -1389,6 +1470,7 @@ impl Widget for DevicePanelView<'_> {
                 "click copies gamepad(n) and stays · Enter copies and closes · Esc closes"
             }
             DeviceKind::Midi => "Space ticks · ←/→ column or clock · Enter copies · Tab next",
+            DeviceKind::Link => "Space joins or leaves · off at each start · Tab next",
         };
         buffer.set_stringn(
             panel.x + 2,
@@ -1518,7 +1600,7 @@ mod tests {
             "gone with the pad"
         );
         rustel_core::gamepad::set_name(3, None);
-        assert_eq!(DeviceKind::ALL.last(), Some(&DeviceKind::Gamepad));
+        assert_eq!(DeviceKind::ALL.last(), Some(&DeviceKind::Link));
         assert_eq!(DeviceKind::Gamepad.label(), "gamepads");
     }
 
@@ -1562,6 +1644,8 @@ mod tests {
             midi_rows: &[],
             clock_in: None,
             clock_out: None,
+            link_enabled: false,
+            link: None,
             latency: None,
             panel,
             inventory: &inventory,
@@ -1660,6 +1744,8 @@ mod tests {
                 midi_rows: &[],
                 clock_in: None,
                 clock_out: None,
+                link_enabled: false,
+                link: None,
                 latency: None,
                 panel,
                 inventory: &inventory,
@@ -1715,6 +1801,8 @@ mod tests {
             midi_rows: &[],
             clock_in: None,
             clock_out: None,
+            link_enabled: false,
+            link: None,
             latency: None,
             panel,
             inventory: &inventory,
@@ -1760,13 +1848,15 @@ mod tests {
         panel.next_tab();
         assert_eq!(panel.kind, DeviceKind::Midi, "one MIDI tab, both ways");
         panel.next_tab();
-        assert_eq!(panel.kind, DeviceKind::Gamepad, "the pads are the last tab");
+        assert_eq!(panel.kind, DeviceKind::Gamepad);
+        panel.next_tab();
+        assert_eq!(panel.kind, DeviceKind::Link, "the session is the last tab");
         panel.next_tab();
         assert_eq!(panel.kind, DeviceKind::AudioOutput);
         panel.previous_tab();
-        assert_eq!(panel.kind, DeviceKind::Gamepad);
+        assert_eq!(panel.kind, DeviceKind::Link);
         panel.previous_tab();
-        assert_eq!(panel.kind, DeviceKind::Midi);
+        assert_eq!(panel.kind, DeviceKind::Gamepad);
     }
 
     #[test]
@@ -1861,6 +1951,8 @@ mod tests {
             midi_rows: &[],
             clock_in: None,
             clock_out: None,
+            link_enabled: false,
+            link: None,
             latency: None,
             panel: DevicePanel::default(),
             inventory: &inventory,
@@ -1915,6 +2007,8 @@ mod tests {
             midi_rows: &rows,
             clock_in: None,
             clock_out: Some("Maschine"),
+            link_enabled: false,
+            link: None,
             latency: None,
             panel,
             inventory: &inventory,
@@ -2129,6 +2223,8 @@ mod latency_draw_tests {
                 midi_rows: &[],
                 clock_in: None,
                 clock_out: None,
+                link_enabled: false,
+                link: None,
                 latency,
                 panel: DevicePanel::default(),
                 inventory: &inventory,
@@ -2171,6 +2267,72 @@ mod latency_draw_tests {
         // The row it belongs to is still there, and so is the hint.
         assert!(text.contains("48000 Hz"), "{text}");
         assert!(text.contains("Enter plays through it"), "{text}");
+    }
+
+    /// The Link tab: one row, a checkbox that joins the session or
+    /// leaves it, and what the session is doing once joined.
+    #[test]
+    fn the_link_tab_is_one_row_that_says_what_the_session_does() {
+        let inventory = DeviceInventory::default();
+        let theme = Theme::built_in_default();
+        let area = Rect::new(0, 0, 90, 30);
+        let drawn = |enabled: bool, link: Option<rustel_runtime::link::LinkStatus>| {
+            let mut buffer = Buffer::empty(area);
+            DevicePanelView {
+                midi_rows: &[],
+                clock_in: None,
+                clock_out: None,
+                link_enabled: enabled,
+                link,
+                latency: None,
+                panel: DevicePanel {
+                    kind: DeviceKind::Link,
+                    ..DevicePanel::default()
+                },
+                inventory: &inventory,
+                theme: &theme,
+                current_output: None,
+                current_input: None,
+                input_chosen: false,
+                scanning: false,
+            }
+            .render(area, &mut buffer);
+            (0..area.height)
+                .map(|y| {
+                    (area.x..area.right())
+                        .map(|x| buffer.cell((x, y)).unwrap().symbol().to_owned())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let off = drawn(false, None);
+        assert!(off.contains("[ ] link session"), "{off}");
+        assert!(off.contains("Space joins or leaves"), "{off}");
+
+        let on = drawn(
+            true,
+            Some(rustel_runtime::link::LinkStatus {
+                peers: 2,
+                bpm: 120.0,
+                playing: true,
+                cycle: 12.0,
+            }),
+        );
+        assert!(on.contains("[x] link session"), "{on}");
+        assert!(on.contains("2 others · 120.0 bpm"), "{on}");
+
+        let alone = drawn(
+            true,
+            Some(rustel_runtime::link::LinkStatus {
+                peers: 0,
+                bpm: 90.0,
+                playing: false,
+                cycle: 0.0,
+            }),
+        );
+        assert!(alone.contains("alone · 90.0 bpm"), "{alone}");
     }
 }
 

@@ -301,6 +301,25 @@ Scores can send MIDI, OSC, and serial output. Device errors appear in the Log.
 Stop sends the relevant note-off messages. See [hardware](hardware.md) for
 ports, controllers, permissions, and platform setup.
 
+### Link sessions
+
+Press Ctrl+P and use Tab to go to the `link` tab of Devices. It holds one
+checkbox. Press Space to join the session on the local network, or to leave
+it. The row then shows how many others are in it, and the tempo it runs.
+
+The session is off at each start. Joining is a thing done on purpose, because
+it puts this studio on a grid that other machines run. Start Studio with
+`rustel studio song.strudel --link` to join before the first evaluation.
+
+While the session is on, its tempo and its play and stop states are shared.
+A session that starts playing starts this studio. A session that stops stops
+it. When this studio starts or stops, the session is told the same. A new
+tempo from an evaluation is given to the session, and a tempo change made
+elsewhere is followed here.
+
+The Link session and the MIDI clock in are two outside clocks. Only one of
+them leads. Join the Link session, and the clock in is released.
+
 ## Reference
 
 Two shortcuts open the reference panel for the caret position:

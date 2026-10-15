@@ -18,6 +18,10 @@ pub mod free_memory;
 #[cfg(feature = "gamepad")]
 pub mod gamepad;
 mod hap_json;
+/// Ableton Link sync: the session's tempo and transport, shared with
+/// whatever else on the network speaks it. No feature gates it; the
+/// protocol is plain UDP and the port is off until a set asks for it.
+pub mod link;
 /// Keeping macOS's view of the MIDI ports current; a no-op elsewhere.
 #[cfg(feature = "midi")]
 pub mod midi_hotplug;

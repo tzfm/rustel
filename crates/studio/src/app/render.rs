@@ -1105,6 +1105,11 @@ impl App {
             },
             clock_in: self.ui_settings.clock_in.as_deref(),
             clock_out: self.ui_settings.clock_out.as_deref(),
+            link_enabled: self.link_enabled,
+            link: self
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.clock.link),
             caching_samples: self.caching_samples,
             library_loading: self.library_loading,
             // How far into the sample the preview has got, on this frame.
