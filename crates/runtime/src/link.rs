@@ -749,15 +749,12 @@ fn bind_socket() -> io::Result<UdpSocket> {
             return Err(error);
         }
     }
-    let address = libc::sockaddr_in {
-        sin_family: libc::AF_INET as libc::sa_family_t,
-        sin_port: wire::PORT.to_be(),
-        sin_addr: libc::in_addr {
-            s_addr: libc::INADDR_ANY,
-        },
-        sin_zero: [0; 8],
-        sin_len: 0,
-    };
+    // Only macOS and the BSDs have `sin_len`, so zero the struct and set the
+    // fields that every Unix has.
+    let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    address.sin_family = libc::AF_INET as libc::sa_family_t;
+    address.sin_port = wire::PORT.to_be();
+    address.sin_addr.s_addr = libc::INADDR_ANY;
     let bound = unsafe {
         libc::bind(
             fd,
