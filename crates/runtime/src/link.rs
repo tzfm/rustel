@@ -619,6 +619,10 @@ impl Actor {
     /// One announcement: to the group when leaving it unsaid, and to one
     /// address when answering it.
     fn send_discovery(&mut self, to: SocketAddr, response: bool, bye_bye: bool) {
+        #[cfg(feature = "test-support")]
+        if off_the_wire() {
+            return;
+        }
         self.last_announce = Some(Instant::now());
         let state = wire::PeerState {
             node_id: self.node_id,
@@ -723,10 +727,34 @@ pub fn speak_only_on_loopback() {
     LOOPBACK_ONLY.store(true, Ordering::Relaxed);
 }
 
+/// Test hook: set once by a test before its first `Link::start`, and
+/// every session of the process stays off the wire: no group joined,
+/// nothing said, so no packet arrives that the OS would ask consent to.
+#[cfg(feature = "test-support")]
+static OFF_THE_WIRE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keep every session of this process off the wire. A test installs this
+/// once, before its first `Link::start`: the session's tempo, transport
+/// and steering still work, only unheard and unsaid.
+#[cfg(feature = "test-support")]
+pub fn keep_the_session_off_the_wire() {
+    OFF_THE_WIRE.store(true, Ordering::Relaxed);
+}
+
+/// Whether every session of this process stays off the wire.
+#[cfg(feature = "test-support")]
+fn off_the_wire() -> bool {
+    OFF_THE_WIRE.load(Ordering::Relaxed)
+}
+
 /// Every interface the session lives on. Loopback is always there: two
 /// participants on one machine find each other on it, with or without a
 /// network.
 fn session_interfaces() -> Vec<Ipv4Addr> {
+    #[cfg(feature = "test-support")]
+    if off_the_wire() {
+        return Vec::new();
+    }
     #[cfg(feature = "test-support")]
     if LOOPBACK_ONLY.load(Ordering::Relaxed) {
         return vec![Ipv4Addr::LOCALHOST];

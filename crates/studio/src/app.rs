@@ -11503,6 +11503,10 @@ mod tests {
 
         #[test]
         fn the_link_tab_joins_on_space_and_leaves_on_space_again() {
+            // The checkbox is what is tested here, not the wire: the
+            // worker behind it is real, so the session stays off it,
+            // else a plain test run asks the OS for its consent.
+            rustel_runtime::link::keep_the_session_off_the_wire();
             let directory = tempfile::tempdir().expect("temp dir");
             let (mut app, _scene) = plain_app(directory.path(), "$: s(\"bd\")\n");
             app.panel = Some(crate::devices::DevicePanel {

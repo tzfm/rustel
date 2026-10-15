@@ -8672,6 +8672,10 @@ pub(super) mod tests {
         /// evaluation settled on is.
         #[test]
         fn joining_founds_the_session_on_the_scores_tempo_and_publishes_only_a_change() {
+            // The assertions here are bookkeeping, so the session stays
+            // off the wire: a plain test run must not put a socket the
+            // OS would ask its consent to.
+            rustel_runtime::link::keep_the_session_off_the_wire();
             let mut engine = StudioEngine::new(StudioConfig {
                 output: Some("silent".into()),
                 ..StudioConfig::default()
