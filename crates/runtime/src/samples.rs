@@ -10148,21 +10148,27 @@ impl SampleLibrary {
         self.knows(name) || rustel_voice::is_native_synth_sound(name)
     }
 
-    /// Whether `s("name")` can sound on a statement that plays through the
-    /// given `.bank()` names: the banked spelling the voice builds
-    /// (`{bank}_{name}`), or a native synth - whose dispatch reads the raw
-    /// name the bank never touches. The plain spelling is not an answer
-    /// here: the voice resolves the banked name and nothing else.
+    /// The machines among `banks` that do not carry `s("name")`: each is
+    /// judged by the banked spelling the voice builds (`{bank}_{name}`),
+    /// which playback reads without regard to case. A native synth is
+    /// carried by every machine - its dispatch reads the raw name the bank
+    /// never touches. The plain spelling is not an answer here: the voice
+    /// resolves the banked name and nothing else.
     ///
     /// A bank control is a pattern like any other: `.bank("A B")` alternates
-    /// banks across the statement's haps. Every name in it must hold the
-    /// sound. `ht` under `.bank("BossDR110 AkaiXR10")` fails on the BossDR110
-    /// haps when only AkaiXR10 holds `ht`.
-    pub fn knows_sound_under_banks(&self, name: &str, banks: &[String]) -> bool {
-        rustel_voice::is_native_synth_sound(name)
-            || banks
-                .iter()
-                .all(|bank| self.knows(&format!("{bank}_{name}")))
+    /// machines across the statement's haps, and `.bank("A,B")` stacks them.
+    /// A machine that lacks the voice refuses its own haps while the others
+    /// play on, so which machines go without is a question a score can act
+    /// on, and only an empty answer says the sound cannot sound at all.
+    pub fn banks_missing_sound(&self, name: &str, banks: &[String]) -> Vec<String> {
+        if rustel_voice::is_native_synth_sound(name) {
+            return Vec::new();
+        }
+        banks
+            .iter()
+            .filter(|bank| !self.knows(&format!("{bank}_{name}")))
+            .cloned()
+            .collect()
     }
 
     /// How many numbered variants `name:n` can pick from, when `name` is

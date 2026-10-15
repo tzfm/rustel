@@ -435,8 +435,32 @@ fn lint_with_scan(
                             {
                                 return None;
                             }
-                            if !library.knows_sound_under_banks(head, &banks) {
+                            // The machines that go without the voice. Every
+                            // machine does: nothing of this sound sounds, and
+                            // that is the refusal it always was. Only some do:
+                            // their haps refuse while the rest play on, the
+                            // way the engine skips a voice it cannot load, so
+                            // which machines go without is said in a note and
+                            // the score stays a playing score, as it is on
+                            // strudel.cc.
+                            let without = library.banks_missing_sound(head, &banks);
+                            if without.len() == banks.len() {
                                 return refusal(format!("unknown sound \"{head}\""));
+                            }
+                            if !without.is_empty() {
+                                let plays_from = banks
+                                    .iter()
+                                    .filter(|bank| !without.iter().any(|missing| missing == *bank))
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                return Some((
+                                    Level::Note,
+                                    format!(
+                                        "{head} not in {} - plays from {plays_from}",
+                                        without.join(", ")
+                                    ),
+                                ));
                             }
                         } else if !library.knows_sound(head) {
                             return refusal(format!("unknown sound \"{head}\""));
@@ -4053,8 +4077,11 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
         assert_eq!(checked("s(\"abcde\") // .osc()").len(), 1);
 
         // A bank control is a pattern: its machines alternate across the
-        // haps, so a sound that one machine lacks is refused on that
-        // machine's turns. Every machine must hold the sound.
+        // haps, so a sound one machine lacks is refused on that machine's
+        // turns while the others play on. The machines that go without are
+        // said in a note - the score still plays, as it does where a
+        // missing hap is logged and skipped - and only a sound no machine
+        // holds is a refusal.
         let machines = SampleLibrary::empty();
         machines
             .register_trusted_custom(
@@ -4063,15 +4090,39 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
             )
             .expect("machines");
         let machines = |source: &str| lint(source, false, Some(&machines));
-        // `ht` dies on the Boss haps: the eval says so now.
+        // `ht` goes without on the Boss haps; the XR10 haps carry it.
         let diagnostics = machines("s(\"ht:0\").bank(\"BossDR110 AkaiXR10\")");
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert_eq!(diagnostics[0].message, "unknown sound \"ht\"");
+        assert_eq!(diagnostics[0].level, Level::Note);
+        assert_eq!(
+            diagnostics[0].message,
+            "ht not in BossDR110 - plays from AkaiXR10"
+        );
+        // A voice no machine holds never sounds: the refusal it always was.
+        let diagnostics = machines("s(\"sh\").bank(\"BossDR110 AkaiXR10\")");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].message, "unknown sound \"sh\"");
         // Both machines hold `sd`, so it is valid. The engine wraps an
         // out-of-range number (`sound_index`), so `sd:1` plays on both;
         // the machine with the most samples judges the number.
         assert!(machines("s(\"sd:0\").bank(\"BossDR110 AkaiXR10\")").is_empty());
         assert!(machines("s(\"sd:1\").bank(\"BossDR110 AkaiXR10\")").is_empty());
+        // A bank is read without regard to case, as playback reads the
+        // spelling it builds from it.
+        assert!(machines("s(\"bd\").bank(\"bossdr110\")").is_empty());
+        // The fold holds on the branches that say something too: the note
+        // names the machines as written, and a sound no machine holds is
+        // still refused through a folded spelling.
+        let diagnostics = machines("s(\"ht\").bank(\"BOSSDR110 akaiXR10\")");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].level, Level::Note);
+        assert_eq!(
+            diagnostics[0].message,
+            "ht not in BOSSDR110 - plays from akaiXR10"
+        );
+        let diagnostics = machines("s(\"sh\").bank(\"bossdr110 AKAIxr10\")");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].message, "unknown sound \"sh\"");
 
         // A bank the General MIDI names alone carry is a bank all the same:
         // the voice builds `gm_pad_halo` out of `halo` and `gm_pad`.

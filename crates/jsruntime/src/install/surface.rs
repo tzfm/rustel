@@ -71,8 +71,8 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
     ReferenceEntry {
         name: "aliasBank",
         synonyms: &[],
-        summary: "Bank aliases are not supported in Rustel.",
-        description: "Accepted for compatibility; the bank and alias arguments are ignored.",
+        summary: "Custom bank aliases are not supported.",
+        description: "Accepted for compatibility; the arguments are ignored. The default aliases are already applied.",
         params: &[
             ReferenceParam {
                 name: "bank",
