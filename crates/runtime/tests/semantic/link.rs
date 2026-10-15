@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use rustel_runtime::link::{Link, speak_only_on_loopback};
 
 /// Two participants on this machine, each with a grid of their own, end
-/// up standing in one session on one grid. Skipped where the
-/// announcements never come back through the looped group.
+/// up standing in one session on one grid. A missing socket skips; a
+/// silent wire fails, so a green run proves the merge happened.
 #[test]
 #[ignore = "binds the multicast port the macOS firewall asks consent for"]
 fn two_participants_meet_on_one_grid() {
@@ -35,10 +35,11 @@ fn two_participants_meet_on_one_grid() {
         if first.status().peers >= 1 && second.status().peers >= 1 {
             break;
         }
-        if Instant::now() > discovery_deadline {
-            eprintln!("no discovery here; skipping");
-            return;
-        }
+        assert!(
+            Instant::now() < discovery_deadline,
+            "no discovery within 6 s: a firewall denial or a stack with no \
+             loopback group does this"
+        );
         thread::sleep(Duration::from_millis(100));
     }
     // Both measure, one session yields, and from then on both run the
