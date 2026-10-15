@@ -29,7 +29,16 @@ pub(super) fn bridge_callable<'js>(
     ctx: &Ctx<'js>,
     function: Function<'js>,
 ) -> rquickjs::Result<(CallbackId, Sidecar<'js>)> {
-    let id = with_bridge_frame(|frame: &BridgeFrame<'js>| frame.next_id()).ok_or_else(|| {
+    let (id, plugin_scope) = with_bridge_frame(|frame: &BridgeFrame<'js>| {
+        let id = frame.next_id();
+        (
+            id,
+            frame
+                .next_callback_scope()
+                .or_else(|| Some(format!("b{id}/"))),
+        )
+    })
+    .ok_or_else(|| {
         rquickjs::Error::new_from_js_message(
             "function",
             "Pattern",
@@ -37,10 +46,16 @@ pub(super) fn bridge_callable<'js>(
              evaluation or a query",
         )
     })?;
-    let cell = rquickjs::Class::instance(ctx.clone(), CallbackCell::function(function.clone()))?;
+    let cell = rquickjs::Class::instance(
+        ctx.clone(),
+        CallbackCell::function(function.clone(), plugin_scope.clone()),
+    )?;
     CELLS_CREATED.with(|c| c.set(c.get() + 1));
     with_bridge_frame(|frame: &BridgeFrame<'js>| {
-        frame.pending.borrow_mut().push((id, function.clone()));
+        frame
+            .pending
+            .borrow_mut()
+            .push((id, function.clone(), plugin_scope));
     });
     Ok((id, Sidecar::one(id, cell)))
 }
@@ -515,11 +530,11 @@ pub(super) fn callback_argument<'js>(
         }
         // Collected first so `take`'s mutable borrow of `ids` does not overlap
         // the wanted-check, and so no cell is allocated for an id already held.
-        let missing: Vec<(CallbackId, Function<'js>)> = frame
+        let missing: Vec<_> = frame
             .pending
             .borrow()
             .iter()
-            .filter(|(id, _)| {
+            .filter(|(id, _, _)| {
                 let excluded = querying_exclusions.contains(id)
                     || frames[index..].iter().any(|ptr| {
                         // SAFETY: every pointer remains live while its scope is stacked.
@@ -530,10 +545,10 @@ pub(super) fn callback_argument<'js>(
                     && (!excluded || reachable.contains(id) || seen_ids.contains(id))
                     && !seen_ids.contains(id)
             })
-            .map(|(id, func)| (*id, func.clone()))
+            .map(|(id, func, scope)| (*id, func.clone(), scope.clone()))
             .collect();
-        for (id, func) in missing {
-            let cell = rquickjs::Class::instance(ctx.clone(), CallbackCell::function(func))?;
+        for (id, func, scope) in missing {
+            let cell = rquickjs::Class::instance(ctx.clone(), CallbackCell::function(func, scope))?;
             CELLS_CREATED.with(|c| c.set(c.get() + 1));
             take(&mut ids, &mut cells, &mut seen_ids, true, id, cell);
         }

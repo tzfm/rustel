@@ -112,8 +112,9 @@ pub(crate) fn scalar_event_detailed(
 type NoticeTally = Vec<(String, usize)>;
 
 /// A tally for a run a person reads: direct logging on and no `--json`. A
-/// `--json` run keeps one record per notice. A host with direct logging off
-/// collects its own notices.
+/// `--json` run keeps one record per notice. The Session prints a plugin
+/// notice of such a run one time. A host with direct logging off collects
+/// its own notices.
 fn notice_tally() -> Option<NoticeTally> {
     (rustel_voice::direct_diagnostic_logging()
         && !PROGRESS_JSON.load(std::sync::atomic::Ordering::Relaxed))
@@ -223,13 +224,21 @@ pub(crate) fn scalar_events(
         .collect()
 }
 
+/// Converts a note of a live session. `chain` gives the number of the plugin
+/// chain of a note value from the chains of that session, or `None` for a
+/// note with no plugin. Only a note the voice takes asks: a refused note
+/// takes no chain from the score in play.
 pub(crate) fn live_audio_event(
     onset: &OnsetEventJson,
     sample_rate: u32,
     cps: f64,
     samples: &dyn rustel_voice::SampleLookup,
+    chain: impl FnOnce(&crate::ValueJson) -> Option<u64>,
 ) -> Result<rustel_audio::AudioEvent, rustel_voice::VoiceError> {
     let mut scalar = scalar_event_detailed(onset, sample_rate, cps, samples)?;
+    // A note of the live output has the plugin chain of its place in the
+    // score. A render gives its notes chains of its own.
+    scalar.controls.insert_chain = chain(&onset.value);
     bind_live_controls(&mut scalar, onset);
     Ok(rustel_audio::AudioEvent {
         onset_id: onset.onset_id,
@@ -487,11 +496,17 @@ pub(crate) fn render_scalar_pcm_with_refusals(
     }
     let mut notices = notice_tally();
     let mut refused: Vec<String> = Vec::new();
+    #[cfg(feature = "vst")]
+    let mut chains = crate::vst::RenderChains::new();
     let events: Vec<rustel_audio::OnsetEvent> = onsets
         .iter()
         .filter_map(|onset| {
             match tallied_scalar_event(onset, sample_rate, cps, lookup, notices.as_mut()) {
-                Ok(event) => Some(event),
+                Ok(event) => {
+                    #[cfg(feature = "vst")]
+                    let event = chains.number(event, &onset.value);
+                    Some(event)
+                }
                 Err(message) => {
                     if !refused.iter().any(|seen| seen == &message) {
                         if rustel_voice::direct_diagnostic_logging() {
@@ -511,7 +526,26 @@ pub(crate) fn render_scalar_pcm_with_refusals(
     let mut backend = scalar_backend(dispatch, library, max_polyphony);
     let pcm = rustel_audio::render_pcm(&mut backend, sample_rate, frames, &events)
         .map_err(io::Error::other)?;
+    print_plugin_problems();
     Ok((pcm, refused))
+}
+
+/// Prints the problems of the plugin host in a render with direct logging:
+/// a warning line for a run a person reads, and a record for each other
+/// run. With direct logging off, the problems stay for the session of the
+/// live output. That session queues each one as a plugin line.
+fn print_plugin_problems() {
+    #[cfg(feature = "vst")]
+    if rustel_voice::direct_diagnostic_logging() {
+        for message in crate::vst::take_errors() {
+            if notice_tally().is_some() {
+                eprintln!("warning: {message}");
+            } else {
+                let record = serde_json::json!({ "vst_skipped": { "message": &message } });
+                eprintln!("{record}");
+            }
+        }
+    }
 }
 
 fn scalar_backend(
@@ -525,6 +559,11 @@ fn scalar_backend(
         for (id, decoded) in library.take_ready() {
             let _ = backend.install_sample(id, Box::new(decoded));
         }
+    }
+    // A render waits for each plugin, so the first note has its effect.
+    #[cfg(feature = "vst")]
+    if let Some(plugins) = crate::vst::started() {
+        backend.set_insert_provider(plugins.provider(true));
     }
     #[cfg(test)]
     tests::BUILT_DISPATCH.set(Some(backend.dispatch()));
@@ -714,11 +753,17 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
     let mut notices = notice_tally();
     let mut last_refused: Option<String> = None;
     let mut refused: Vec<String> = Vec::new();
+    #[cfg(feature = "vst")]
+    let mut chains = crate::vst::RenderChains::new();
     let events: Vec<rustel_audio::OnsetEvent> = onsets
         .iter()
         .filter_map(|onset| {
             match tallied_scalar_event(onset, sample_rate, cps, lookup, notices.as_mut()) {
-                Ok(event) => Some(event),
+                Ok(event) => {
+                    #[cfg(feature = "vst")]
+                    let event = chains.number(event, &onset.value);
+                    Some(event)
+                }
                 Err(message) => {
                     if last_refused.as_deref() != Some(message.as_str()) {
                         if rustel_voice::direct_diagnostic_logging() {
@@ -777,7 +822,7 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
             observer(tick);
         }
     };
-    rustel_audio::write_wav_controlled(
+    let written = rustel_audio::write_wav_controlled(
         path,
         &mut backend,
         sample_rate,
@@ -791,9 +836,11 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
             limiter,
         },
         format,
-    )
-    .map(|bytes| (bytes, refused))
-    .map_err(io::Error::other)
+    );
+    print_plugin_problems();
+    written
+        .map(|bytes| (bytes, refused))
+        .map_err(io::Error::other)
 }
 
 /// Read a 16-bit stereo WAV the writer above produced back as interleaved
@@ -1492,7 +1539,7 @@ mod tests {
             &rustel_voice::BundledOnly,
         )
         .expect_err("unknown sample name must not be mapped to an oscillator");
-        assert!(error.contains("unknown sound"), "{error}");
+        assert!(error.contains("sd is not loaded"), "{error}");
     }
 
     #[test]
@@ -1598,7 +1645,7 @@ mod tests {
             &rustel_voice::BundledOnly,
         )
         .expect_err("sample bank lookup is case-sensitive on strudel.cc");
-        assert!(error.contains("unknown sound"), "{error}");
+        assert!(error.contains("bd is not loaded"), "{error}");
     }
 
     #[test]
@@ -1644,8 +1691,9 @@ mod tests {
             "begin": 0.1,
             "end": 0.85
         }));
-        let event = live_audio_event(&onset, 48_000, 0.5, &rustel_voice::BundledOnly)
-            .expect("live sample event");
+        let samples = rustel_voice::BundledOnly;
+        let event =
+            live_audio_event(&onset, 48_000, 0.5, &samples, |_| Some(70)).expect("live event");
         assert_eq!(
             event.sample,
             Some(rustel_audio::SampleControls {
@@ -1662,6 +1710,14 @@ mod tests {
                 cut: None,
             })
         );
+        // The event has the plugin chain its session gave. A note the voice
+        // refuses asks for no chain.
+        assert_eq!(event.controls.insert_chain, Some(70));
+        let refused = self::onset(serde_json::json!({ "s": "nosuchsound" }));
+        live_audio_event(&refused, 48_000, 0.5, &samples, |_| {
+            panic!("a refused note asked")
+        })
+        .expect_err("an unknown sound");
     }
 
     #[test]
@@ -1681,6 +1737,7 @@ mod tests {
                 48_000,
                 0.5,
                 &rustel_voice::BundledOnly,
+                |_| None,
             )
             .expect("live event")
         };
@@ -1917,7 +1974,7 @@ mod tests {
         onset.target_time = 480.25 / 48_000.0;
         let scalar = scalar_event(&onset, 48_000, 0.5, &rustel_voice::BundledOnly)
             .expect("offline conversion");
-        let live = live_audio_event(&onset, 48_000, 0.5, &rustel_voice::BundledOnly)
+        let live = live_audio_event(&onset, 48_000, 0.5, &rustel_voice::BundledOnly, |_| None)
             .expect("live conversion");
         assert_eq!(live.target_frame, scalar.onset_frame);
         assert_eq!(scalar.onset_frame, 481);

@@ -85,6 +85,7 @@ pub(super) struct StudioRuntimeSnapshot {
     pub late_events: Option<u64>,
     pub ring_refusals: Option<u64>,
     pub callback_errors: Option<u64>,
+    pub callback_xruns: Option<u64>,
     pub callback_scope_misses: Option<u64>,
     pub callback_allocations: Option<u64>,
     pub callback_frees: Option<u64>,

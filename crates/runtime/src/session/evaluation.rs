@@ -395,7 +395,7 @@ impl Session {
     }
 
     #[cfg(any(feature = "device-audio", test))]
-    fn validate_live_score_clock(phase: &str, now: f64) -> Result<(), RuntimeError> {
+    pub(super) fn validate_live_score_clock(phase: &str, now: f64) -> Result<(), RuntimeError> {
         if !now.is_finite() || now < 0.0 {
             return Err(RuntimeError::Message(format!(
                 "live score {phase} clock must be a finite non-negative number, got {now}"
@@ -569,7 +569,7 @@ impl Session {
         self.install_evaluated_score(evaluated, source, now, restart_transport, None)
     }
 
-    fn evaluate_score_cancellable(
+    pub(super) fn evaluate_score_cancellable(
         &mut self,
         source: &str,
         budget: Duration,
@@ -645,6 +645,10 @@ impl Session {
                 .iter()
                 .map(|method| (*method).to_owned())
                 .collect(),
+            // Each lane of the text gets its number before the evaluation,
+            // so a plugin note names the same lane after an edit.
+            #[cfg(feature = "vst")]
+            lane_numbers: self.lanes.read(source),
             ..TranspileOptions::default()
         };
         let evaluated = match seed {
@@ -664,6 +668,13 @@ impl Session {
                 cancellation,
             ),
         };
+        // The label rewrite found a different count of labeled statements
+        // and wrote places. No note carries the lane numbers of this read,
+        // so the commit keeps the lanes of the score in play.
+        #[cfg(feature = "vst")]
+        if matches!(&evaluated, Ok((output, ..)) if output.lanes_by_place) {
+            self.lanes.forget_read();
+        }
         match evaluated {
             // `effects.hydra` is taken below, and only the visuals build has
             // one to take.
@@ -828,6 +839,10 @@ impl Session {
         )
     }
 
+    /// With `hold`, a candidate with a plugin copy that is not ready waits
+    /// at the commit seam while the wait is on: see `Session::plugin_seam`.
+    /// It then does not go in play, and the session holds its text.
+    #[allow(clippy::too_many_arguments)]
     #[cfg(any(feature = "device-audio", test))]
     fn install_evaluated_score_with_clock<F>(
         &mut self,
@@ -836,6 +851,7 @@ impl Session {
         earliest_now: Option<f64>,
         restart_transport: bool,
         candidate_settings: Option<RuntimeSettings>,
+        #[cfg(all(feature = "vst", feature = "device-audio"))] hold: bool,
         mut clock: F,
     ) -> Result<(), RuntimeError>
     where
@@ -859,6 +875,20 @@ impl Session {
             self.staged_hydra = None;
         }
         probe?;
+        // The seam plans the plugin chains of the candidate. It runs before
+        // the commit reads the clock, so its time takes nothing from the
+        // takeover margin.
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        if !self.plugin_seam(
+            &evaluated,
+            source,
+            hold,
+            realtime_cps,
+            probe_elapsed,
+            &mut clock,
+        )? {
+            return Ok(());
+        }
         let sampled_now = clock();
         let now = match earliest_now {
             Some(earliest_now) if !sampled_now.is_finite() || sampled_now < earliest_now => {
@@ -879,7 +909,10 @@ impl Session {
         )
     }
 
-    fn evaluated_realtime_cps(evaluated: &EvaluatedScore, fallback_cps: f64) -> Option<f64> {
+    pub(super) fn evaluated_realtime_cps(
+        evaluated: &EvaluatedScore,
+        fallback_cps: f64,
+    ) -> Option<f64> {
         let cps = match evaluated {
             EvaluatedScore::JavaScript { effects, .. } => effects.cps.unwrap_or(fallback_cps),
             EvaluatedScore::MiniFallback(_) => fallback_cps,
@@ -941,10 +974,12 @@ impl Session {
         candidate_settings: Option<RuntimeSettings>,
         replacement_min_headroom: Duration,
     ) -> Result<(), RuntimeError> {
-        // Each installed score can report missing inputs and loading samples
-        // afresh. Both JavaScript and mini installs pass through this point.
+        // Each installed score reports its missing inputs, its loading samples
+        // and its plugin lines afresh. Both JavaScript and mini installs pass
+        // through this point.
         self.input_warnings_reported.clear();
-        self.loading_refusals_reported.clear();
+        self.refusals_reported.clear();
+        self.plugin_lines_reported.clear();
         // Live reloads preserve musical phase at the edit instant.
         // `replace_pattern` alone re-anchors at (now, queried_to), skipping the
         // unplayed horizon. Snapshot the current cycle under the old tempo and
@@ -1257,6 +1292,13 @@ impl Session {
         self.last_source = Some(Arc::from(source));
         self.recovered_source = None;
         self.js.snapshot_active_as_last_good();
+        // The lanes of this text are now the lanes of the score in play, and
+        // the chains of this session get the text.
+        #[cfg(feature = "vst")]
+        {
+            self.lanes.install(source);
+            crate::vst::score_changed(&self.chains, Some(source));
+        }
         Ok(())
     }
 
@@ -1579,12 +1621,13 @@ impl Session {
                     ui_visuals: hap.ui_visuals_context(),
                     log_line: None,
                 };
-                match crate::render::scalar_event_detailed(
+                let event = crate::render::scalar_event_detailed(
                     &onset,
                     self.config.sample_rate,
                     cps,
                     lookup,
-                ) {
+                );
+                match event {
                     Err(rustel_voice::VoiceError::InvalidControl(message)) => Some(message),
                     _ => None,
                 }
@@ -1631,8 +1674,18 @@ impl Session {
 
     /// Install a retained payload without consulting the current generation.
     /// `None` clears an older textual target after a direct Pattern cutover.
+    /// The lane table learns when the payload is the score in play.
     #[cfg(feature = "device-audio")]
     pub(super) fn install_rollback_source(&mut self, captured: Option<AudibleSource>) {
+        #[cfg(feature = "vst")]
+        if captured
+            .as_ref()
+            .is_some_and(|audible| audible.generation == self.generation())
+        {
+            // The output plays the score in play. The lane table keeps the
+            // lanes of this score for a rollback from the next one.
+            self.lanes.mark_audible();
+        }
         self.audible_source = captured;
     }
 
@@ -1693,6 +1746,10 @@ impl Session {
             // this evaluation does not establish what the device is playing.
             LiveScoreAttempt::Applied(_) => Ok(RollbackAttempt::Applied),
             LiveScoreAttempt::Deferred => Ok(RollbackAttempt::Deferred),
+            // A rollback does not wait for its plugin copies: see the seed
+            // in `evaluate_live_score_cancellable_seeded_guarded`.
+            #[cfg(feature = "vst")]
+            LiveScoreAttempt::Waiting => Ok(RollbackAttempt::Deferred),
         }
     }
 
@@ -1706,6 +1763,8 @@ impl Session {
     /// must retain the stable file identity. Explicit mini files do not enter
     /// QuickJS and are outside this CPU-bound claim, but still use a clock
     /// sampled after their parse rather than a stale pre-parse value.
+    /// `Waiting` means the edit waits for its plugin copies, as in
+    /// [`Self::reload_live`]: the watch layer asks again with the same text.
     #[cfg(any(feature = "device-audio", test))]
     pub(crate) fn evaluate_live_score_cancellable<F>(
         &mut self,
@@ -1718,6 +1777,10 @@ impl Session {
     where
         F: FnMut() -> f64,
     {
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        if self.waits_for_plugins(source) {
+            return Ok(LiveScoreAttempt::Waiting);
+        }
         self.evaluate_live_score_cancellable_seeded(
             source,
             mini,
@@ -1798,6 +1861,8 @@ impl Session {
                 None,
                 false,
                 settings,
+                #[cfg(all(feature = "vst", feature = "device-audio"))]
+                false,
                 clock,
             )?;
             return Ok(LiveScoreAttempt::Applied(self.generation()));
@@ -1825,8 +1890,15 @@ impl Session {
             Some(budget_now),
             false,
             None,
+            // A rollback, with its seed, does not wait for its plugin copies.
+            #[cfg(all(feature = "vst", feature = "device-audio"))]
+            seed.is_none(),
             clock,
         )?;
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        if self.holds_edit(source) {
+            return Ok(LiveScoreAttempt::Waiting);
+        }
         Ok(LiveScoreAttempt::Applied(self.generation()))
     }
 
@@ -1956,7 +2028,8 @@ impl Session {
     }
 
     /// [`Self::reload_at_cancellable`] for a playing device: the score installs
-    /// at the `clock` reading taken once it has evaluated.
+    /// at the `clock` reading taken once it has evaluated. The score never
+    /// waits for its plugin copies: see `Session::reload_live`.
     #[cfg(feature = "device-audio")]
     pub fn reload_with_clock_cancellable<F>(
         &mut self,
@@ -1971,18 +2044,26 @@ impl Session {
         let mut first_clock = Some(clock());
         let now = first_clock.unwrap_or_default();
         self.with_panic_recovery(now, |session| {
-            session.reload_with_clock_cancellable_guarded(source, mini, cancellation, || {
-                first_clock.take().unwrap_or_else(&mut clock)
-            })
+            session.reload_with_clock_cancellable_guarded(
+                source,
+                mini,
+                cancellation,
+                #[cfg(feature = "vst")]
+                false,
+                || first_clock.take().unwrap_or_else(&mut clock),
+            )
         })
     }
 
+    /// With `hold`, the score waits for its plugin copies while the wait is
+    /// on: see [`Self::reload_live`].
     #[cfg(feature = "device-audio")]
-    fn reload_with_clock_cancellable_guarded<F>(
+    pub(super) fn reload_with_clock_cancellable_guarded<F>(
         &mut self,
         source: &str,
         mini: bool,
         cancellation: &AtomicBool,
+        #[cfg(feature = "vst")] hold: bool,
         mut clock: F,
     ) -> Result<u64, RuntimeError>
     where
@@ -2010,6 +2091,8 @@ impl Session {
                     None,
                     false,
                     settings,
+                    #[cfg(feature = "vst")]
+                    false,
                     clock,
                 )?;
             } else {
@@ -2031,6 +2114,8 @@ impl Session {
                     Some(started_at),
                     false,
                     None,
+                    #[cfg(feature = "vst")]
+                    hold,
                     clock,
                 )?;
             }

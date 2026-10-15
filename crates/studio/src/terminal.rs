@@ -4,7 +4,7 @@
 //! single RAII transaction.  A normal return or an unwind restores the user's
 //! shell before the CLI reports an error.
 
-use std::io::{self, BufWriter, IsTerminal, Stdout, Write};
+use std::io::{self, BufWriter, IsTerminal, Write};
 
 use crossterm::cursor::{Hide, MoveTo, SetCursorStyle, Show};
 use crossterm::event::{
@@ -29,10 +29,16 @@ mod windows_input;
 pub use backend::StudioBackend;
 
 // Crossterm formats each changed cell through many small writes. Batch them
-// before touching stdout's lock and line buffer; draw and end_frame retain
+// before each write lands on the interface stream; draw and end_frame retain
 // their explicit flushes, including the boundary before pointer-shape output.
 const FRAME_OUTPUT_CAPACITY: usize = 64 * 1024;
-pub type StudioTerminal = Terminal<StudioBackend<BufWriter<Stdout>>>;
+pub type StudioTerminal = Terminal<StudioBackend<BufWriter<InterfaceStream>>>;
+
+/// The stream the interface draws on: a copy of the standard output of the
+/// process start. A VST3 plugin prints when it wants, so the standard output
+/// of the process goes to the null device for the session. Frames on the copy
+/// always reach the terminal.
+pub type InterfaceStream = rustel_runtime::stdio::Stream;
 
 /// The six DECSCUSR cursor shapes. Rustel starts with a steady bar, its
 /// long-standing shape; a theme may temporarily override the saved choice.
@@ -1662,22 +1668,36 @@ fn windows_terminal_input(features: &mut TerminalFeatures) -> Option<windows_inp
     Some(input)
 }
 
-/// One cell in pixels, from the window size the terminal reports; zero
-/// where it reports none (an old terminal, a multiplexer).
+/// The window size the terminal reports.
 #[cfg(unix)]
-pub fn cell_pixels_now() -> Option<(u16, u16)> {
+fn window_now() -> Option<libc::winsize> {
     let mut size = libc::winsize {
         ws_row: 0,
         ws_col: 0,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
+    // The terminal is the stream of the process start, not descriptor 1.
+    let terminal = rustel_runtime::stdio::out().descriptor()?;
     // SAFETY: TIOCGWINSZ fills a winsize we own.
-    let ok = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut size) } == 0;
-    if !ok {
-        return None;
-    }
+    let ok = unsafe { libc::ioctl(terminal, libc::TIOCGWINSZ, &mut size) } == 0;
+    ok.then_some(size)
+}
+
+/// One cell in pixels, from the window size the terminal reports. Zero
+/// where it reports none (an old terminal, a multiplexer).
+#[cfg(unix)]
+pub fn cell_pixels_now() -> Option<(u16, u16)> {
+    let size = window_now()?;
     cell_pixels_from_window(size.ws_col, size.ws_row, size.ws_xpixel, size.ws_ypixel)
+}
+
+/// The columns and the rows of the terminal. `None` when the stream of the
+/// process start gives no size.
+#[cfg(unix)]
+fn size_now() -> Option<(u16, u16)> {
+    let size = window_now()?;
+    (size.ws_col > 0 && size.ws_row > 0).then_some((size.ws_col, size.ws_row))
 }
 
 #[cfg(unix)]
@@ -1774,7 +1794,8 @@ fn queue_terminal_entry(
 
 impl TerminalSession {
     pub fn enter() -> io::Result<Self> {
-        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        let out = rustel_runtime::stdio::out();
+        if !io::stdin().is_terminal() || !out.is_terminal() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "the terminal studio needs an interactive stdin and stdout",
@@ -1783,7 +1804,7 @@ impl TerminalSession {
 
         let terminal = Terminal::new(StudioBackend::new(BufWriter::with_capacity(
             FRAME_OUTPUT_CAPACITY,
-            io::stdout(),
+            out.stream()?,
         )))?;
         enable_raw_mode()?;
 
@@ -1811,7 +1832,7 @@ impl TerminalSession {
             session.input_cell_pixels.set(session.features.cell_pixels);
             *session.windows_input.get_mut() = input;
         }
-        let mut stdout = io::stdout();
+        let mut stdout = session.terminal.backend_mut();
 
         queue_terminal_entry(
             &mut stdout,

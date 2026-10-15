@@ -33,13 +33,16 @@ pub(super) enum CellPayload<'js> {
 pub struct CallbackCell<'js> {
     pub(super) payload: CellPayload<'js>,
     #[qjs(skip_trace)]
+    pub(super) plugin_scope: Option<String>,
+    #[qjs(skip_trace)]
     pub(super) kabelsalat: bool,
 }
 
 impl<'js> CallbackCell<'js> {
-    pub(super) fn function(func: Function<'js>) -> Self {
+    pub(super) fn function(func: Function<'js>, plugin_scope: Option<String>) -> Self {
         Self {
             payload: CellPayload::Function(func),
+            plugin_scope,
             kabelsalat: false,
         }
     }
@@ -47,6 +50,7 @@ impl<'js> CallbackCell<'js> {
     pub(super) fn value(value: rquickjs::Value<'js>) -> Self {
         Self {
             payload: CellPayload::Value(value),
+            plugin_scope: None,
             kabelsalat: false,
         }
     }
@@ -588,8 +592,10 @@ impl<'js> Sidecar<'js> {
 pub(super) struct BridgeFrame<'js> {
     /// Shared with the runtime; never exposed to JS.
     pub(super) alloc: std::rc::Rc<Cell<CallbackId>>,
+    /// Callback-local construction paths stay the same on repeated queries.
+    plugin_scope: RefCell<Option<PluginScope>>,
     /// Created here and not yet owned by a wrapper, so still resolvable.
-    pub(super) pending: RefCell<Vec<(CallbackId, Function<'js>)>>,
+    pub(super) pending: RefCell<Vec<(CallbackId, Function<'js>, Option<String>)>>,
     /// Cells taken from wrappers RETURNED by callbacks. A transformer may hand
     /// back a graph that itself reaches a callback; unwrapping it to a
     /// `Pattern` and dropping its sidecar loses the only owner of that cell,
@@ -601,14 +607,80 @@ pub(super) struct BridgeFrame<'js> {
     pub(super) suppressed: RefCell<HashSet<CallbackId>>,
 }
 
+struct PluginScope {
+    path: String,
+    plugins: u32,
+    callbacks: u32,
+}
+
+impl PluginScope {
+    fn new(path: String) -> Self {
+        Self {
+            path,
+            plugins: 0,
+            callbacks: 0,
+        }
+    }
+}
+
 impl<'js> BridgeFrame<'js> {
     pub(super) fn new(alloc: std::rc::Rc<Cell<CallbackId>>) -> Self {
         Self {
             alloc,
+            plugin_scope: RefCell::new(None),
             pending: RefCell::new(Vec::new()),
             harvested: RefCell::new(Vec::new()),
             suppressed: RefCell::new(HashSet::new()),
         }
+    }
+
+    pub(super) fn evaluation(alloc: std::rc::Rc<Cell<CallbackId>>) -> Self {
+        Self {
+            plugin_scope: RefCell::new(Some(PluginScope::new(String::new()))),
+            ..Self::new(alloc)
+        }
+    }
+
+    pub(super) fn setup(alloc: std::rc::Rc<Cell<CallbackId>>) -> Self {
+        let frame = Self::new(alloc);
+        let id = frame.next_id();
+        frame
+            .plugin_scope
+            .replace(Some(PluginScope::new(format!("b{id}/"))));
+        frame
+    }
+
+    pub(super) fn next_plugin_binding(&self) -> Option<String> {
+        let mut scope = self.plugin_scope.borrow_mut();
+        let scope = scope.as_mut()?;
+        let id = scope.plugins;
+        scope.plugins = id.checked_add(1)?;
+        Some(format!("{}p{id}", scope.path))
+    }
+
+    pub(super) fn next_callback_scope(&self) -> Option<String> {
+        let mut scope = self.plugin_scope.borrow_mut();
+        let scope = scope.as_mut()?;
+        let id = scope.callbacks;
+        scope.callbacks = id.checked_add(1)?;
+        Some(format!("{}c{id}/", scope.path))
+    }
+
+    pub(super) fn with_plugin_scope<R>(&self, path: Option<String>, f: impl FnOnce() -> R) -> R {
+        struct Restore<'a> {
+            slot: &'a RefCell<Option<PluginScope>>,
+            prior: Option<PluginScope>,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.slot.replace(self.prior.take());
+            }
+        }
+        let _restore = Restore {
+            slot: &self.plugin_scope,
+            prior: self.plugin_scope.replace(path.map(PluginScope::new)),
+        };
+        f()
     }
 
     pub(super) fn next_id(&self) -> CallbackId {

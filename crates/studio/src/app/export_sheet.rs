@@ -138,10 +138,18 @@ impl App {
         self.remember_export_directory(&sheet.target.clone());
         let scene = self.scenes.current();
         let source = scene.editor.source().to_string();
+        // What play runs, the bounce runs: both setups, global first, as
+        // stored - an unsaved edit in a setup tab is the engine's business,
+        // not the bounce's.
+        let score = ExportScore {
+            source,
+            mini: self.options.mini,
+            prebakes: super::super::prebake::PrebakeScope::ALL
+                .map(|scope| self.stored_prebake(scope).to_owned()),
+        };
         match ExportJob::start(
             sheet.scene_name.clone(),
-            source,
-            self.options.mini,
+            score,
             settings,
             super::super::export::session_config(
                 &self.options.session,

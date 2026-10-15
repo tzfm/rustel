@@ -219,6 +219,215 @@ fn scratch(name: &str) -> PathBuf {
     dir.join(name)
 }
 
+/// A score plays through a plugin from a folder in `RUSTEL_VST3_PATH`: with
+/// a value by name, with a preset file, and with the other values and a
+/// warning when the name of a value is wrong. The plugin is the fixture gain.
+#[cfg(feature = "vst")]
+#[test]
+fn a_render_goes_through_the_plugin_a_score_names() {
+    let directory = tempfile::tempdir().unwrap();
+    let plugins = directory.path().join("plugins");
+    let config = directory.path().join("config");
+    let presets = config.join("vst").join(rustel_vst3_fixture::NAME);
+    std::fs::create_dir_all(&plugins).unwrap();
+    std::fs::create_dir_all(&presets).unwrap();
+    rustel_vst3_fixture::install(&plugins);
+    std::fs::write(
+        presets.join("Half Level.vstpreset"),
+        rustel_vst3_fixture::preset(0.5, 0.0),
+    )
+    .unwrap();
+    let invoke = |args: &[&str]| {
+        let child = rustel()
+            .args(args)
+            .env("RUSTEL_VST3_PATH", &plugins)
+            .env("RUSTEL_CONFIG_DIR", &config)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = wait_for_output(child, args);
+        assert!(output.status.success(), "{output:?}");
+        output
+    };
+    let render_score = |score: &str| {
+        let path = directory.path().join("take.wav");
+        let output = invoke(&[
+            "render",
+            "-e",
+            score,
+            "-o",
+            path.to_str().unwrap(),
+            "--cycles",
+            "1",
+        ]);
+        let samples: Vec<i16> = wav_pcm_of_length(&path, 2.0)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|sample| i16::from_le_bytes(*sample))
+            .collect();
+        (samples, String::from_utf8(output.stderr).unwrap())
+    };
+    let render = |effect: &str| render_score(&format!(r#"note("c3").s("sine"){effect}"#));
+    let (dry, _) = render("");
+    assert!(dry.iter().any(|sample| sample.abs() > 1_000));
+    let scaled = |wet: &[i16], gain: f32| {
+        wet.iter()
+            .zip(&dry)
+            .all(|(wet, dry)| (f32::from(*wet) - f32::from(*dry) * gain).abs() <= 1.0)
+    };
+    let (quarter, _) = render(r#".vst("rustel fixture", { gain: 0.25 })"#);
+    assert!(scaled(&quarter, 0.25));
+    let (half, _) = render(r#".vst("rustel fixture", { preset: "Half Level" })"#);
+    assert!(scaled(&half, 0.5));
+    // A key that is no parameter drops its value alone. The plugin runs
+    // with the other value. The warning counts the onset at the end of the
+    // render too.
+    let (wrong, notice) = render(r#".vst("rustel fixture", { mix: 0.9, gain: 0.25 })"#);
+    assert!(scaled(&wrong, 0.25));
+    assert!(
+        notice.contains(
+            "warning: vst value skipped: Rustel Fixture has no parameter with the name 'mix' (2 onsets)"
+        ),
+        "{notice}"
+    );
+
+    // The second plugin of the bundle is an instrument. With `.vsti()` the
+    // plugin makes the sound of the note: a 440 Hz sine with a peak of
+    // 0.8 * 0.25, for the length of the note. The sample the score names
+    // is not heard and not loaded.
+    let tone = |effect: &str| {
+        let (samples, notice) = render_score(&format!(
+            r#"note("a4 ~").s("nosuchsample").vsti("rustel fixture tone"){effect}"#
+        ));
+        let left: Vec<i16> = samples.iter().step_by(2).copied().collect();
+        (left, notice)
+    };
+    let (alone, notice) = tone("");
+    assert!(notice.is_empty(), "{notice}");
+    let (note, rest) = alone.split_at(48_000);
+    let rises = note.windows(2).filter(|pair| pair[0] <= 0 && pair[1] > 0);
+    assert_eq!(rises.count(), 440);
+    let peak = |samples: &[i16]| samples.iter().map(|sample| sample.unsigned_abs()).max();
+    let level = f32::from(peak(note).unwrap());
+    let wanted = 0.8 * rustel_vst3_fixture::TONE_LEVEL * 32_767.0;
+    assert!((level - wanted).abs() < 20.0, "peak {level}");
+    assert!(rest.iter().all(|sample| *sample == 0));
+    // The fixture scales MIDI velocity. Host gain and postgain also scale
+    // its output, before any effect on the same note.
+    for (effect, scale) in [
+        (r#".vst("rustel fixture", { gain: 0.5 })"#, 0.5),
+        (".velocity(0.5)", 0.5),
+        (".gain(0.4)", 0.5),
+        (".postgain(0.5)", 0.5),
+        (".gain(1.6).postgain(0.25)", 0.5),
+        (".gain(1.6)", 2.0),
+        (r#".gain(0).vst("rustel fixture")"#, 0.0),
+        (r#".vst("rustel fixture").postgain(0)"#, 0.0),
+    ] {
+        let (scaled, _) = tone(effect);
+        assert!(
+            (f32::from(peak(&scaled).unwrap()) - wanted * scale).abs() < 20.0,
+            "{effect}"
+        );
+        if scale == 0.0 {
+            assert!(scaled.iter().all(|sample| *sample == 0));
+        }
+    }
+    // The wrong call for a plugin gives the reason, and no sound of the
+    // plugin.
+    let (silent, notice) = render_score(r#"note("a4").vsti("rustel fixture")"#);
+    assert!(silent.iter().all(|sample| *sample == 0));
+    assert!(
+        notice.contains("Rustel Fixture is an effect: use .vst()"),
+        "{notice}"
+    );
+    let (_, notice) = render_score(r#"note("a4").vst("rustel fixture tone")"#);
+    assert!(
+        notice.contains("Rustel Fixture Tone is an instrument: use .vsti()"),
+        "{notice}"
+    );
+
+    let listed = invoke(&["vst"]);
+    assert!(String::from_utf8_lossy(&listed.stdout).contains(rustel_vst3_fixture::NAME));
+    let one = invoke(&["vst", "fixture", "--json"]);
+    let one: serde_json::Value = serde_json::from_slice(&one.stdout).unwrap();
+    assert_eq!(one["params"][0]["key"], "gain");
+    assert_eq!(one["params"][1]["key"], "beatgate");
+    assert_eq!(one["presets"][0], "Half Level");
+
+    // A plugin that prints, at its load and in each audio block, has no
+    // line in the output of a command.
+    let printing = |args: &[&str]| {
+        let child = rustel()
+            .args(args)
+            .env("RUSTEL_VST3_PATH", &plugins)
+            .env("RUSTEL_CONFIG_DIR", &config)
+            .env(rustel_vst3_fixture::PRINT_ENV, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = wait_for_output(child, args);
+        assert!(output.status.success(), "{output:?}");
+        output.stdout
+    };
+    let one: serde_json::Value =
+        serde_json::from_slice(&printing(&["vst", "fixture", "--json"])).unwrap();
+    assert_eq!(one["params"][0]["key"], "gain");
+    let path = directory.path().join("printed.wav");
+    let score = r#"note("c3").s("sine").vst("rustel fixture")"#;
+    let report = printing(&[
+        "render",
+        "-e",
+        score,
+        "-o",
+        path.to_str().unwrap(),
+        "--cycles",
+        "1",
+    ]);
+    let report = String::from_utf8_lossy(&report);
+    assert!(report.contains("printed.wav"), "{report}");
+    assert!(!report.contains("fixture prints"), "{report}");
+
+    // With no scan cache, the list command tests the bundle in a process
+    // of its own. The list has the 2 plugins of the bundle by name with no
+    // load, and the cache file keeps them for the next start.
+    let fresh = directory.path().join("fresh");
+    let child = rustel()
+        .args(["vst"])
+        .env("RUSTEL_VST3_PATH", &plugins)
+        .env("RUSTEL_CONFIG_DIR", &fresh)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let scanned = wait_for_output(child, &["vst"]);
+    let list = String::from_utf8_lossy(&scanned.stdout);
+    assert!(list.contains(rustel_vst3_fixture::TONE_NAME), "{scanned:?}");
+    let cache = std::fs::read_to_string(fresh.join("vst").join("scan.json")).unwrap();
+    assert!(cache.contains(rustel_vst3_fixture::TONE_NAME), "{cache}");
+
+    // A plugin with a fault at its load ends the scan process and not the
+    // command. With no scan cache, the command tests the bundle in a
+    // process of its own, reports the plugin and ends in the ordinary way.
+    let args = ["vst", "fixture"];
+    let child = rustel()
+        .args(args)
+        .env("RUSTEL_VST3_PATH", &plugins)
+        .env("RUSTEL_CONFIG_DIR", directory.path().join("faulty"))
+        .env(rustel_vst3_fixture::ABORT_ENV, "load")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let at_load = wait_for_output(child, &args);
+    assert_eq!(at_load.status.code(), Some(1), "{at_load:?}");
+    let said = String::from_utf8_lossy(&at_load.stderr);
+    assert!(said.contains("the plugin process ended"), "{at_load:?}");
+}
+
 #[test]
 fn config_get_and_set_use_the_user_directory() {
     let directory = tempfile::tempdir().unwrap();

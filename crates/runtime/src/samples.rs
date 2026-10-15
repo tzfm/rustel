@@ -10148,21 +10148,27 @@ impl SampleLibrary {
         self.knows(name) || rustel_voice::is_native_synth_sound(name)
     }
 
-    /// Whether `s("name")` can sound on a statement that plays through the
-    /// given `.bank()` names: the banked spelling the voice builds
-    /// (`{bank}_{name}`), or a native synth - whose dispatch reads the raw
-    /// name the bank never touches. The plain spelling is not an answer
-    /// here: the voice resolves the banked name and nothing else.
+    /// The machines among `banks` that do not carry `s("name")`: each is
+    /// judged by the banked spelling the voice builds (`{bank}_{name}`),
+    /// which playback reads without regard to case. A native synth is
+    /// carried by every machine - its dispatch reads the raw name the bank
+    /// never touches. The plain spelling is not an answer here: the voice
+    /// resolves the banked name and nothing else.
     ///
     /// A bank control is a pattern like any other: `.bank("A B")` alternates
-    /// banks across the statement's haps. Every name in it must hold the
-    /// sound. `ht` under `.bank("BossDR110 AkaiXR10")` fails on the BossDR110
-    /// haps when only AkaiXR10 holds `ht`.
-    pub fn knows_sound_under_banks(&self, name: &str, banks: &[String]) -> bool {
-        rustel_voice::is_native_synth_sound(name)
-            || banks
-                .iter()
-                .all(|bank| self.knows(&format!("{bank}_{name}")))
+    /// machines across the statement's haps, and `.bank("A,B")` stacks them.
+    /// A machine that lacks the voice refuses its own haps while the others
+    /// play on, so which machines go without is a question a score can act
+    /// on, and only an empty answer says the sound cannot sound at all.
+    pub fn banks_missing_sound(&self, name: &str, banks: &[String]) -> Vec<String> {
+        if rustel_voice::is_native_synth_sound(name) {
+            return Vec::new();
+        }
+        banks
+            .iter()
+            .filter(|bank| !self.knows(&format!("{bank}_{name}")))
+            .cloned()
+            .collect()
     }
 
     /// How many numbered variants `name:n` can pick from, when `name` is
@@ -10490,15 +10496,20 @@ impl SampleLibrary {
 
     /// Whether `.bank("name")` names a family of banks: something is called
     /// `name_…`. The General MIDI names count: `gm_pad_halo` makes `gm_pad`
-    /// a bank, the way the voice's `{bank}_{s}` rule reads it.
+    /// a bank, the way the voice's `{bank}_{s}` rule reads it. The name is
+    /// read without regard to case, the way playback reads the whole
+    /// spelling: `.bank("TR909")` names the machine `tr909_…` holds, and a
+    /// check that said otherwise would flag a score that plays.
     pub fn knows_bank(&self, name: &str) -> bool {
         let prefix = format!("{name}_");
-        let starts_with =
-            |names: &HashMap<String, Bank>| names.keys().any(|known| known.starts_with(&prefix));
+        let folded = prefix.to_lowercase();
+        let family =
+            |known: &str| known.starts_with(&prefix) || known.to_lowercase().starts_with(&folded);
+        let starts_with = |names: &HashMap<String, Bank>| names.keys().any(|known| family(known));
         starts_with(&self.banks.read().expect("default banks"))
             || starts_with(&self.custom.read().expect("custom banks"))
             || starts_with(&self.global.read().expect("global banks"))
-            || self.gm.keys().any(|known| known.starts_with(&prefix))
+            || self.gm.keys().any(|known| family(known))
     }
 
     /// Convert decoded PCM to `rate` from here on.
@@ -10948,6 +10959,14 @@ impl SampleLibrary {
         cancelled: Option<&AtomicBool>,
     ) {
         let started = std::time::Instant::now();
+        // A plugin a score named loads on the plugin thread. The wait has
+        // the same deadline and the same stop flag as the samples.
+        #[cfg(feature = "vst")]
+        if let Some(plugins) = crate::vst::started() {
+            plugins.wait_idle_within(deadline, || {
+                cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed))
+            });
+        }
         loop {
             if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
                 return;
@@ -18005,5 +18024,13 @@ impl SampleLookup for SampleLibrary {
 
     fn bus_names(&self) -> Option<&rustel_voice::BusNames> {
         Some(&self.bus_names)
+    }
+
+    #[cfg(feature = "vst")]
+    fn insert(
+        &self,
+        request: &rustel_voice::PluginRequest<'_>,
+    ) -> Result<Option<rustel_audio::InsertControls>, String> {
+        crate::vst::controls(request)
     }
 }

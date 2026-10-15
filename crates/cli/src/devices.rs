@@ -84,7 +84,7 @@ pub(super) fn run_midi_monitor(
             }
             let at = started.elapsed().as_secs_f64();
             if json {
-                println!(
+                outln!(
                     "{}",
                     serde_json::json!({
                         "t": (at * 1000.0).round() / 1000.0,
@@ -140,7 +140,7 @@ pub(super) fn run_midi_monitor(
                 }
                 other => other.kind().to_string(),
             };
-            println!("{at:8.3}  {line}");
+            outln!("{at:8.3}  {line}");
         })
         .map_err(|error| RuntimeError::Message(format!("MIDI: {error}")))?
     };
@@ -179,12 +179,12 @@ pub(super) fn run_midi_monitor(
     if learn {
         return match *learned.lock().unwrap_or_else(|e| e.into_inner()) {
             Some((channel, controller, low, high)) => {
-                println!();
-                println!("  cc{controller} on channel {channel}  (moved {low}..{high})");
-                println!();
-                println!("  const cc = await midin('{}')", port.unwrap_or("0"));
-                println!("  $: note(\"c3 e3 g3\").lpf(cc({controller}).range(200, 4000))");
-                println!();
+                outln!();
+                outln!("  cc{controller} on channel {channel}  (moved {low}..{high})");
+                outln!();
+                outln!("  const cc = await midin('{}')", port.unwrap_or("0"));
+                outln!("  $: note(\"c3 e3 g3\").lpf(cc({controller}).range(200, 4000))");
+                outln!();
                 Ok(())
             }
             None => Err(RuntimeError::Audio(
@@ -195,23 +195,23 @@ pub(super) fn run_midi_monitor(
 
     let summary = summary.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if json {
-        println!(
+        outln!(
             "{}",
             midi_summary_json(&summary, started.elapsed().as_secs_f64())
         );
         return Ok(());
     }
-    println!();
-    println!(
+    outln!();
+    outln!(
         "  {} message(s) in {:.1}s",
         summary.total,
         started.elapsed().as_secs_f64()
     );
     if summary.total == 0 {
-        println!("  nothing arrived - is the device sending, and is this the right port?");
+        outln!("  nothing arrived - is the device sending, and is this the right port?");
         return Ok(());
     }
-    println!(
+    outln!(
         "  channels: {}",
         summary
             .channels
@@ -220,7 +220,7 @@ pub(super) fn run_midi_monitor(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    println!(
+    outln!(
         "  kinds:    {}",
         summary
             .by_kind
@@ -230,10 +230,10 @@ pub(super) fn run_midi_monitor(
             .join(", ")
     );
     if !summary.controls.is_empty() {
-        println!();
-        println!("  controls seen (this is your mapping):");
+        outln!();
+        outln!("  controls seen (this is your mapping):");
         for (channel, controller, low, high, count) in &summary.controls {
-            println!(
+            outln!(
                 "    ch{channel:<2} cc{controller:<3}  range {low:>3}..{high:<3}  x{count}   ->  cc({controller})"
             );
         }
@@ -241,15 +241,15 @@ pub(super) fn run_midi_monitor(
     if !summary.notes.is_empty() {
         let lowest = summary.notes.first().map(|(n, _)| *n).unwrap_or(0);
         let highest = summary.notes.last().map(|(n, _)| *n).unwrap_or(0);
-        println!();
-        println!(
+        outln!();
+        outln!(
             "  notes seen: {} distinct, {} ({lowest}) .. {} ({highest})",
             summary.notes.len(),
             note_name(lowest),
             note_name(highest),
         );
     }
-    println!();
+    outln!();
     Ok(())
 }
 
@@ -312,13 +312,13 @@ pub(super) fn run_doctor(
         doctor_unavailable_report(dispatch, "device audio is not compiled into this binary");
 
     if json {
-        println!(
+        outln!(
             "{}",
             serde_json::to_string_pretty(&report).map_err(json_err)?
         );
     } else {
         for line in report.human_lines() {
-            println!("{line}");
+            outln!("{line}");
         }
     }
     Ok(())
@@ -366,7 +366,7 @@ pub(super) fn run_gamepad_monitor(duration: Option<f64>) -> Result<(), RuntimeEr
         std::time::Duration::from_secs_f64(seconds),
         &|| interrupted_by().is_some(),
         |line| {
-            println!("{line}");
+            outln!("{line}");
         },
     )
     .map_err(|message| RuntimeError::Audio(format!("gamepads: {message}")))
@@ -446,7 +446,7 @@ pub(super) fn run_devices(json: bool) -> Result<(), RuntimeError> {
         let gamepads_json = serde_json::json!({
             "error": "gamepads are not compiled; rebuild with --features gamepad"
         });
-        println!(
+        outln!(
             "{}",
             serde_json::json!({
                 "midi_inputs": named(&midi_inputs),
@@ -461,26 +461,26 @@ pub(super) fn run_devices(json: bool) -> Result<(), RuntimeError> {
 
     let on = style::stdout_on();
     let ports_section = |title: &str, ports: &Result<Vec<String>, String>| {
-        println!("{}", style::bold(on, title));
+        outln!("{}", style::bold(on, title));
         match ports {
-            Ok(names) if names.is_empty() => println!("  {}", style::dim(on, "(none)")),
+            Ok(names) if names.is_empty() => outln!("  {}", style::dim(on, "(none)")),
             Ok(names) => {
                 for (index, name) in names.iter().enumerate() {
-                    println!("  {} {name}", style::cyan(on, &index.to_string()));
+                    outln!("  {} {name}", style::cyan(on, &index.to_string()));
                 }
             }
-            Err(message) => println!("  {}", style::yellow(on, message)),
+            Err(message) => outln!("  {}", style::yellow(on, message)),
         }
     };
     ports_section("MIDI inputs", &midi_inputs);
     ports_section("MIDI outputs", &midi_outputs);
-    println!("{}", style::bold(on, "Audio"));
+    outln!("{}", style::bold(on, "Audio"));
     #[cfg(feature = "device-audio")]
     match &audio {
         Ok((outputs, inputs)) => {
             for (label, list) in [("output", outputs), ("input", inputs)] {
                 if list.is_empty() {
-                    println!("  {label}s: {}", style::dim(on, "(none)"));
+                    outln!("  {label}s: {}", style::dim(on, "(none)"));
                 }
                 for device in list {
                     let default = if device.is_default {
@@ -496,36 +496,36 @@ pub(super) fn run_devices(json: bool) -> Result<(), RuntimeError> {
                         .channels
                         .map(|value| value.to_string())
                         .unwrap_or_else(|| "?".into());
-                    println!("  {label}: {}{default} {rate}Hz {channels}ch", device.name);
+                    outln!("  {label}: {}{default} {rate}Hz {channels}ch", device.name);
                 }
             }
         }
-        Err(message) => println!("  {}", style::yellow(on, message)),
+        Err(message) => outln!("  {}", style::yellow(on, message)),
     }
     #[cfg(not(feature = "device-audio"))]
-    println!(
+    outln!(
         "  {}",
         style::yellow(
             on,
             "audio devices are not compiled; rebuild with --features device-audio"
         )
     );
-    println!(
+    outln!(
         "{}",
         style::dim(
             on,
             "hint: `.midi()` takes an OUTPUT name (one distinctive word) or its index"
         )
     );
-    println!("{}", style::bold(on, "Gamepads"));
+    outln!("{}", style::bold(on, "Gamepads"));
     #[cfg(feature = "gamepad")]
     match rustel_runtime::gamepad::list() {
-        Ok(pads) if pads.is_empty() => println!("  {}", style::dim(on, "(none)")),
+        Ok(pads) if pads.is_empty() => outln!("  {}", style::dim(on, "(none)")),
         Ok(pads) => {
             for (index, name) in &pads {
-                println!("  {} {name}", style::cyan(on, &index.to_string()));
+                outln!("  {} {name}", style::cyan(on, &index.to_string()));
             }
-            println!(
+            outln!(
                 "  {}",
                 style::dim(
                     on,
@@ -533,10 +533,10 @@ pub(super) fn run_devices(json: bool) -> Result<(), RuntimeError> {
                 )
             );
         }
-        Err(message) => println!("  {}", style::yellow(on, &message)),
+        Err(message) => outln!("  {}", style::yellow(on, &message)),
     }
     #[cfg(not(feature = "gamepad"))]
-    println!(
+    outln!(
         "  {}",
         style::yellow(on, "not compiled; rebuild with --features gamepad")
     );
@@ -563,7 +563,7 @@ pub(super) fn run_midi_list(json: bool) -> Result<(), RuntimeError> {
             .collect::<Vec<_>>()
     };
     if json {
-        println!(
+        outln!(
             "{}",
             serde_json::json!({
                 "midi_outputs": named(&outputs),
@@ -582,14 +582,14 @@ pub(super) fn run_midi_list(json: bool) -> Result<(), RuntimeError> {
         );
     } else {
         let on = style::stdout_on();
-        println!("{}", style::bold(on, "MIDI outputs"));
+        outln!("{}", style::bold(on, "MIDI outputs"));
         if outputs.is_empty() {
-            println!("  {}", style::dim(on, product::MIDI_NO_OUTPUTS_HINT));
+            outln!("  {}", style::dim(on, product::MIDI_NO_OUTPUTS_HINT));
         } else {
             for (index, name) in outputs.iter().enumerate() {
-                println!("  {} {name}", style::cyan(on, &index.to_string()));
+                outln!("  {} {name}", style::cyan(on, &index.to_string()));
             }
-            println!(
+            outln!(
                 "{}",
                 style::dim(
                     on,
@@ -597,14 +597,14 @@ pub(super) fn run_midi_list(json: bool) -> Result<(), RuntimeError> {
                 )
             );
         }
-        println!("{}", style::bold(on, "MIDI inputs"));
+        outln!("{}", style::bold(on, "MIDI inputs"));
         if inputs.is_empty() {
-            println!("  {}", style::dim(on, product::MIDI_NO_INPUTS_HINT));
+            outln!("  {}", style::dim(on, product::MIDI_NO_INPUTS_HINT));
         } else {
             for (index, name) in inputs.iter().enumerate() {
-                println!("  {} {name}", style::cyan(on, &index.to_string()));
+                outln!("  {} {name}", style::cyan(on, &index.to_string()));
             }
-            println!(
+            outln!(
                 "{}",
                 style::dim(
                     on,

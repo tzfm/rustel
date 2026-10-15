@@ -88,6 +88,7 @@ pub(super) fn studio_runtime_snapshot(
         late_events: device_report.map(|report| report.late_events),
         ring_refusals: device_report.map(|report| report.ring_refusals),
         callback_errors: device_report.map(|report| report.callback_errors),
+        callback_xruns: device_report.map(|report| report.callback_xruns),
         callback_scope_misses: device_report.map(|report| report.callback_scope_misses),
         callback_allocations: device_report.map(|report| report.callback_allocations),
         callback_frees: device_report.map(|report| report.callback_frees),
@@ -216,6 +217,8 @@ impl App {
             self.worker.refresh_catalogue();
             self.refresh_catalogue_metadata();
         }
+        #[cfg(feature = "vst")]
+        self.poll_plugins(now);
         self.settle_readiness(now);
         self.sync_live_material(now);
         self.send_sample_memory();
@@ -232,6 +235,12 @@ impl App {
         }
         if now.duration_since(self.readiness_polled_at) >= READINESS_POLL {
             self.poll_readiness();
+            // The plugin rows of the memory breakdown, while the breakdown
+            // shows.
+            #[cfg(feature = "vst")]
+            if self.log_panel.is_some() || self.memory_dock.is_some() {
+                self.measure_plugins();
+            }
         }
         self.settle_tape_gestures(now);
         self.watch_take();

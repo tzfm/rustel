@@ -5,6 +5,8 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+// Cargo reads the lines of a build script on its standard output.
+#[allow(clippy::disallowed_macros)]
 fn main() {
     // Cargo reruns this script when the package's features change; it reads
     // no files.

@@ -16,6 +16,8 @@ impl ReferencePanel {
         match self.tab {
             // Chords and scales are rows to press, not text to drag out.
             Tab::Chords | Tab::Scales => None,
+            #[cfg(feature = "vst")]
+            Tab::Vst => None,
             Tab::Reference => {
                 let ReferenceMode::Entry { index, scroll, .. } = self.mode else {
                     return None;

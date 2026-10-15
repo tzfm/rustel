@@ -224,3 +224,51 @@ fn a_prebake_refuses_to_export() {
         "no sheet opened, so no sheet holds the keys"
     );
 }
+
+/// The bounce runs the setups before the score, as play does: a name the
+/// set's prebake defines is there for the export instead of a refusal.
+#[test]
+fn a_prebakes_names_reach_the_export() {
+    let mut studio = hermetic();
+
+    // Onto the local prebake, the settings-sheet way: the row lives at the
+    // bottom of the sheet, Enter opens it as a tab.
+    studio.chord("ctrl+o");
+    for _ in 0..30 {
+        if studio
+            .rows()
+            .iter()
+            .any(|row| row.contains("▸ local prebake"))
+        {
+            break;
+        }
+        studio.press(KeyCode::Down, KeyModifiers::NONE);
+    }
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.set_score("globalThis.half = () => 0.5");
+    studio.chord("ctrl+s");
+    studio.settle();
+    assert_eq!(studio.status(), "prebake (local) applied");
+
+    studio.chord("ctrl+w");
+    studio.set_score("$: s('sine').gain(half())");
+    studio.chord("ctrl+shift+x");
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        studio.status().starts_with("exporting first"),
+        "{}",
+        studio.status()
+    );
+    wait_for_export(&mut studio);
+    assert!(
+        studio.status().starts_with("exported first"),
+        "the setup ran before the bounce: {}",
+        studio.status()
+    );
+    let set = studio.set_directory().join("exports");
+    assert_eq!(
+        std::fs::read_dir(&set).expect("exports directory").count(),
+        1,
+        "the bounce landed as one file"
+    );
+}

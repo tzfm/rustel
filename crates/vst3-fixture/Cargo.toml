@@ -1,0 +1,16 @@
+[package]
+name = "rustel-vst3-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "A small VST3 plugin for the plugin host tests"
+
+[lib]
+# The `cdylib` is the plugin the tests load. The `rlib` gives the tests the
+# plugin facts and puts the plugin in a VST3 bundle.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+vst3 = "0.3.0"

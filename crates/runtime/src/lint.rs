@@ -287,6 +287,8 @@ fn lint_with_scan(
         diagnostics.extend(failed_samples_imports(&imports, library).take(room));
     }
     ignored_midi_options(source, &mut diagnostics);
+    #[cfg(feature = "vst")]
+    plugin_key_problems(source, &mut diagnostics);
     let registers_voicings = source.contains("addVoicings(");
     let picks_dictionary = source.contains(".dict(") || source.contains("setDefaultVoicings(");
     // Sound names are judged only by a library that has its banks; an empty
@@ -433,8 +435,32 @@ fn lint_with_scan(
                             {
                                 return None;
                             }
-                            if !library.knows_sound_under_banks(head, &banks) {
+                            // The machines that go without the voice. Every
+                            // machine does: nothing of this sound sounds, and
+                            // that is the refusal it always was. Only some do:
+                            // their haps refuse while the rest play on, the
+                            // way the engine skips a voice it cannot load, so
+                            // which machines go without is said in a note and
+                            // the score stays a playing score, as it is on
+                            // strudel.cc.
+                            let without = library.banks_missing_sound(head, &banks);
+                            if without.len() == banks.len() {
                                 return refusal(format!("unknown sound \"{head}\""));
+                            }
+                            if !without.is_empty() {
+                                let plays_from = banks
+                                    .iter()
+                                    .filter(|bank| !without.iter().any(|missing| missing == *bank))
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                return Some((
+                                    Level::Note,
+                                    format!(
+                                        "{head} not in {} - plays from {plays_from}",
+                                        without.join(", ")
+                                    ),
+                                ));
                             }
                         } else if !library.knows_sound(head) {
                             return refusal(format!("unknown sound \"{head}\""));
@@ -2144,15 +2170,283 @@ pub fn live_sound_names(source: &str) -> Vec<NamedSound> {
     named
 }
 
-/// Whether `at` sits in a lane the engine mutes: a statement labelled by a
-/// name starting or ending with `_` (`_$:`, `$_:`, `drums_ :`). The label
-/// is read as the transpiler reads one: after any indent, with any space
-/// before its colon, or alone on the line above its statement. Inside a
-/// call, the lane is the outermost call's, whatever lines its brackets
-/// hold. `code` is the score with comments and strings blank.
-fn in_muted_lane(code: &str, at: usize) -> bool {
+/// A plugin the live code of a score asks for with a `.vst("…")` or
+/// `.vsti("…")` call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamedPlugin {
+    /// The name as written.
+    pub name: String,
+    /// True for `.vsti()`.
+    pub instrument: bool,
+    /// The place of an effect in the chain of its statement: the `.vst()`
+    /// calls before the call. 0 for an instrument.
+    pub stage: usize,
+    /// The label of the enclosing lane, when the text names one.
+    pub lane: Option<String>,
+    /// The `preset` of the call, when a quoted string gives the name.
+    pub preset: Option<String>,
+    /// The orbit of the notes: the number of the one `.orbit()` call of the
+    /// statement, or 1 with no such call. `None` when the text gives no one
+    /// number: the orbit is a pattern, or the statement has 2 such calls.
+    pub orbit: Option<usize>,
+    /// The place of each key of the object of the call, in the text.
+    pub keys: Vec<std::ops::Range<usize>>,
+}
+
+/// The place of each key in the object of a plugin call: `depth` and
+/// `in gain` for `{ depth: 0.5, "in gain": 1 }`. `open` and `close` are the
+/// brackets of the call, and `code` is the score with comments and strings
+/// blank. A key with no colon and a key in square brackets give no place.
+fn object_keys(
+    code: &str,
+    literals: &[Literal],
+    open: usize,
+    close: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let Some(start) = code[open..close].find('{').map(|at| open + at) else {
+        return Vec::new();
+    };
+    let end = scan::matching_pair(code, start, b'{', b'}').map_or(close, |end| end.min(close));
+    // The brackets open inside the object before the byte at `at`.
+    let depth_at = |at: usize| {
+        code[start + 1..at]
+            .bytes()
+            .fold(0i32, |depth, byte| match byte {
+                b'{' | b'(' | b'[' => depth + 1,
+                b'}' | b')' | b']' => depth - 1,
+                _ => depth,
+            })
+    };
+    let colon_after = |at: usize| code[at.min(end)..end].trim_start().starts_with(':');
+    let mut keys = Vec::new();
+    for literal in literals {
+        let content = &literal.content;
+        if content.start > start
+            && content.end < end
+            && !literal.open
+            && depth_at(content.start) == 0
+            && colon_after(content.end + 1)
+        {
+            keys.push(content.clone());
+        }
+    }
+    let bytes = code.as_bytes();
+    let mut at = start + 1;
+    while at < end {
+        let from = at;
+        while at < end && scan::continues_name(bytes[at]) {
+            at += 1;
+        }
+        if at == from {
+            at += 1;
+            continue;
+        }
+        // A key follows the open bracket or a comma.
+        let before = code[start..from].trim_end();
+        if (before.ends_with('{') || before.ends_with(','))
+            && depth_at(from) == 0
+            && colon_after(at)
+        {
+            keys.push(from..at);
+        }
+    }
+    keys.sort_by_key(|key| key.start);
+    keys
+}
+
+/// Reports each key in the object of a plugin call that is no parameter of
+/// the plugin. The check loads no plugin: a plugin not yet loaded is not
+/// judged. The engine then drops the value of the wrong key, keeps the
+/// plugin and gives a warning.
+#[cfg(feature = "vst")]
+fn plugin_key_problems(source: &str, diagnostics: &mut Vec<Diagnostic>) {
+    let Some(host) = crate::vst::started() else {
+        return;
+    };
+    for call in live_plugins(source) {
+        let Some(plugin) = host.loaded(&call.name).filter(|_| !call.keys.is_empty()) else {
+            continue;
+        };
+        for key in &call.keys {
+            let word = &source[key.clone()];
+            if word == "preset" || plugin.param(word).is_some() {
+                continue;
+            }
+            let mut message = format!("{} has no parameter \"{word}\"", plugin.name());
+            let known = plugin.params().iter().map(|param| param.key.as_str());
+            if let Some(near) = closest(word, known) {
+                message.push_str(&format!(" - did you mean \"{near}\"?"));
+            }
+            diagnostics.push(Diagnostic {
+                level: Level::Value,
+                message,
+                from: key.start,
+                to: key.end,
+            });
+        }
+    }
+}
+
+/// Every plugin call of the live code, in the order written. A comment and
+/// a muted lane ask for nothing here, as in [`live_sound_names`].
+pub fn live_plugins(source: &str) -> Vec<NamedPlugin> {
+    let calls = plugin_calls(source).into_iter().filter(|call| !call.muted);
+    calls.map(|call| call.plugin).collect()
+}
+
+/// A plugin chain of a score text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginChain {
+    /// The calls of the chain, in the order written.
+    pub calls: Vec<NamedPlugin>,
+    /// The lane of the chain has a mute.
+    pub muted: bool,
+}
+
+/// The plugin chains of a score text, with the chains of the muted lanes.
+/// A note goes through each plugin call that has the note in its receiver.
+/// So a chain starts at each call with no plugin call in its receiver, and
+/// has each later call with that first call in its receiver:
+///
+/// ```text
+///   stack(a.vsti("x").vst("y"), b.vst("z")).vst("w")
+///
+///   chain 1: x, y, w        chain 2: z, w
+/// ```
+///
+/// The text does not show a chain from a variable or from a function.
+pub fn plugin_chains(source: &str) -> Vec<PluginChain> {
+    let calls = plugin_calls(source);
+    let within =
+        |inner: &PluginCall, outer: &PluginCall| (outer.receiver..outer.open).contains(&inner.open);
+    let mut chains = Vec::new();
+    for (at, first) in calls.iter().enumerate() {
+        if calls[..at].iter().any(|before| within(before, first)) {
+            continue;
+        }
+        let later = calls[at + 1..].iter().filter(|call| within(first, call));
+        let chain = std::iter::once(first).chain(later);
+        chains.push(PluginChain {
+            calls: chain.map(|call| call.plugin.clone()).collect(),
+            muted: first.muted,
+        });
+    }
+    chains
+}
+
+/// A plugin call of the code.
+struct PluginCall {
+    plugin: NamedPlugin,
+    /// The open bracket of the call.
+    open: usize,
+    /// The start of the receiver of the call.
+    receiver: usize,
+    /// The lane of the call has a mute.
+    muted: bool,
+}
+
+/// Each plugin call of the code, in the order written.
+fn plugin_calls(source: &str) -> Vec<PluginCall> {
+    let code = code_only(source);
+    let literals = string_literals(source);
+    let mut plugins = Vec::new();
+    for literal in &literals {
+        let at = literal.content.start;
+        // The call is read from the code: a `vst(` in a comment on the
+        // line before a text is no call.
+        let instrument = match callee_before(&code, at.saturating_sub(1)) {
+            Some("vst") => false,
+            Some("vsti") => true,
+            _ => continue,
+        };
+        let name = &source[literal.content.clone()];
+        if name.trim().is_empty() {
+            continue;
+        }
+        // The call runs from its open bracket to its close bracket, or to
+        // the end of a text still in the works.
+        let open = scan::space_before(&code, at - 1) - 1;
+        let close = matching_paren(&code, open).unwrap_or(code.len());
+        let preset = literals.iter().find(|value| {
+            let key = code[..value.content.start - 1].trim_end();
+            let key = key.strip_suffix(':').map(str::trim_end);
+            (open..close).contains(&value.content.start)
+                && key.is_some_and(|key| &key[scan::name_ending_at(key, key.len())] == "preset")
+        });
+        let around = statement_around(&code, at);
+        // The receiver starts after the last comma of the brackets around
+        // the call. With no brackets, it starts with the statement.
+        let group = scan::open_parens(&code, open).next();
+        let receiver = match group.filter(|group| *group >= around.start) {
+            Some(group) => scan::argument_start(&code, group, open),
+            None => code[around.start..open]
+                .rfind(';')
+                .map_or(around.start, |end| around.start + end + 1),
+        };
+        // A call with a name in a variable has its place in the chain too.
+        let stage = match instrument {
+            true => 0,
+            false => code[around.start..open]
+                .match_indices("vst")
+                .filter(|(found, call)| {
+                    let at = around.start + found;
+                    let before = code[..at].chars().next_back();
+                    let named = |char: char| char.is_alphanumeric() || char == '_';
+                    let after = &code[at + call.len()..open];
+                    !before.is_some_and(named) && after.trim_start().starts_with('(')
+                })
+                .count(),
+        };
+        let statement = &code[around];
+        let mut orbits = statement.match_indices(".orbit(").map(|(found, call)| {
+            let argument = statement[found + call.len()..].trim_start();
+            let digits = argument.len()
+                - argument
+                    .trim_start_matches(|c: char| c.is_ascii_digit())
+                    .len();
+            argument[digits..]
+                .trim_start()
+                .starts_with(')')
+                .then(|| argument[..digits].parse::<usize>().ok())
+                .flatten()
+        });
+        let orbit = match (orbits.next(), orbits.next()) {
+            (None, _) => Some(1),
+            (Some(orbit), None) => orbit,
+            _ => None,
+        };
+        let plugin = NamedPlugin {
+            name: name.to_owned(),
+            instrument,
+            stage,
+            lane: lane_identity(&code, at),
+            preset: preset.map(|value| source[value.content.clone()].to_owned()),
+            orbit,
+            keys: object_keys(&code, &literals, open, close),
+        };
+        plugins.push(PluginCall {
+            plugin,
+            open,
+            receiver,
+            muted: in_muted_lane(&code, at),
+        });
+    }
+    plugins
+}
+
+/// The enclosing lane's label, after any indent or alone on the line
+/// above its statement. Inside a call, the lane is the outermost call's.
+/// `code` is the score with comments and strings blank.
+fn lane_label(code: &str, at: usize) -> Option<&str> {
+    lane_label_at(code, at).map(|(_, label)| label)
+}
+
+fn lane_label_at(code: &str, at: usize) -> Option<(usize, &str)> {
     let at = scan::open_parens(code, at).last().unwrap_or(at);
     let statement = statement_around(code, at).start;
+    let statement = code[statement..at]
+        .rfind(';')
+        .map_or(statement, |offset| statement + offset + 1);
     let above = code[..statement].trim_end();
     let head = if above.ends_with(':') {
         above.rfind('\n').map_or(0, |line| line + 1)
@@ -2162,9 +2456,45 @@ fn in_muted_lane(code: &str, at: usize) -> bool {
     let label_at = code.len() - code[head..].trim_start().len();
     let label = &code[scan::name_starting_at(code, label_at)];
     let colon = code[label_at + label.len()..].trim_start();
-    colon.starts_with(':')
-        && !colon.starts_with("::")
-        && (label.starts_with('_') || label.ends_with('_'))
+    (colon.starts_with(':') && !colon.starts_with("::") && !label.is_empty())
+        .then_some((label_at, label))
+}
+
+/// Anonymous lane names count the earlier active anonymous lanes, including
+/// lanes without plugins. Nested object keys do not count as lane labels.
+fn lane_identity(code: &str, at: usize) -> Option<String> {
+    let (label_at, label) = lane_label_at(code, at)?;
+    if !label.contains('$') {
+        return Some(label.to_owned());
+    }
+    let mut index = 0;
+    let mut depth = 0_usize;
+    let mut head = 0;
+    for (at, character) in code[..label_at].char_indices() {
+        match character {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '\n' | ';' if depth == 0 => head = at + 1,
+            ':' if depth == 0 => {
+                let candidate = code[head..at].trim();
+                if candidate.contains('$')
+                    && !candidate.starts_with('_')
+                    && !candidate.ends_with('_')
+                    && scan::name_starting_at(candidate, 0).end == candidate.len()
+                {
+                    index += 1;
+                }
+                head = at + 1;
+            }
+            _ => {}
+        }
+    }
+    Some(format!("{label}{index}"))
+}
+
+/// Whether the enclosing lane starts or ends with `_`, which mutes it.
+fn in_muted_lane(code: &str, at: usize) -> bool {
+    lane_label(code, at).is_some_and(|label| label.starts_with('_') || label.ends_with('_'))
 }
 
 /// The machines of the bank applying to `literal`, a bank on the chain it
@@ -2443,9 +2773,9 @@ fn next_boundary(source: &str, from: usize) -> usize {
     to
 }
 
-struct Literal {
+pub(crate) struct Literal {
     /// The text between the quotes.
-    content: std::ops::Range<usize>,
+    pub(crate) content: std::ops::Range<usize>,
     /// Never closed: the string runs to the end of its line, or of the
     /// source - the one being typed.
     open: bool,
@@ -2454,7 +2784,7 @@ struct Literal {
 /// Collect quoted strings for matching mini-notation diagnostics to source
 /// locations. Using [`scan_blanked`] keeps quotes inside comments and
 /// recognized regex literals from being mistaken for string boundaries.
-fn string_literals(source: &str) -> Vec<Literal> {
+pub(crate) fn string_literals(source: &str) -> Vec<Literal> {
     let mut literals = Vec::new();
     scan_blanked(source, |_, _, lexeme| {
         if let Lexeme::String(literal) = lexeme {
@@ -3747,8 +4077,11 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
         assert_eq!(checked("s(\"abcde\") // .osc()").len(), 1);
 
         // A bank control is a pattern: its machines alternate across the
-        // haps, so a sound that one machine lacks is refused on that
-        // machine's turns. Every machine must hold the sound.
+        // haps, so a sound one machine lacks is refused on that machine's
+        // turns while the others play on. The machines that go without are
+        // said in a note - the score still plays, as it does where a
+        // missing hap is logged and skipped - and only a sound no machine
+        // holds is a refusal.
         let machines = SampleLibrary::empty();
         machines
             .register_trusted_custom(
@@ -3757,15 +4090,39 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
             )
             .expect("machines");
         let machines = |source: &str| lint(source, false, Some(&machines));
-        // `ht` dies on the Boss haps: the eval says so now.
+        // `ht` goes without on the Boss haps; the XR10 haps carry it.
         let diagnostics = machines("s(\"ht:0\").bank(\"BossDR110 AkaiXR10\")");
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert_eq!(diagnostics[0].message, "unknown sound \"ht\"");
+        assert_eq!(diagnostics[0].level, Level::Note);
+        assert_eq!(
+            diagnostics[0].message,
+            "ht not in BossDR110 - plays from AkaiXR10"
+        );
+        // A voice no machine holds never sounds: the refusal it always was.
+        let diagnostics = machines("s(\"sh\").bank(\"BossDR110 AkaiXR10\")");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].message, "unknown sound \"sh\"");
         // Both machines hold `sd`, so it is valid. The engine wraps an
         // out-of-range number (`sound_index`), so `sd:1` plays on both;
         // the machine with the most samples judges the number.
         assert!(machines("s(\"sd:0\").bank(\"BossDR110 AkaiXR10\")").is_empty());
         assert!(machines("s(\"sd:1\").bank(\"BossDR110 AkaiXR10\")").is_empty());
+        // A bank is read without regard to case, as playback reads the
+        // spelling it builds from it.
+        assert!(machines("s(\"bd\").bank(\"bossdr110\")").is_empty());
+        // The fold holds on the branches that say something too: the note
+        // names the machines as written, and a sound no machine holds is
+        // still refused through a folded spelling.
+        let diagnostics = machines("s(\"ht\").bank(\"BOSSDR110 akaiXR10\")");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].level, Level::Note);
+        assert_eq!(
+            diagnostics[0].message,
+            "ht not in BOSSDR110 - plays from akaiXR10"
+        );
+        let diagnostics = machines("s(\"sh\").bank(\"bossdr110 AKAIxr10\")");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].message, "unknown sound \"sh\"");
 
         // A bank the General MIDI names alone carry is a bank all the same:
         // the voice builds `gm_pad_halo` out of `halo` and `gm_pad`.
@@ -4479,7 +4836,7 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
     #[test]
     fn the_transpiled_output_names_every_pattern_strings_quote() {
         assert_eq!(
-            mini_string_offsets("s(m('bd [hh sd', 5)).gain(0.5).p('$');"),
+            mini_string_offsets("s(m('bd [hh sd', 5)).gain(0.5).p('$', 0);"),
             [5]
         );
         assert_eq!(
@@ -4679,5 +5036,129 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
         assert!(names("s(\"superzow\").osc()").is_empty());
         assert!(names("s(\"superzow\")\n  // to SuperDirt\n  .osc()").is_empty());
         assert!(names("note(\"c3 e3\").s(\"in:1\")").is_empty());
+
+        // The plugin calls of the live code, read the same way: the kind,
+        // the preset and the one orbit of the statement.
+        let score = "$: s(\"bd\").vst(\"ott\", { depth: \"0 1\", preset: \"Loud\" })\n\
+                     // .vst(\"gone\")\n\
+                     _$: note(\"c\").vsti(\"muted synth\")\n\
+                     $: note(\"c\").vsti('serum 2').vst(name).vst(\"\")\n  .orbit(3)\n\
+                     $: s(\"hh\").vst(\"ott\").orbit(\"<1 2>\")";
+        let plugin =
+            |name: &str, instrument, preset: Option<&str>, orbit, lane: &str| NamedPlugin {
+                name: name.to_owned(),
+                instrument,
+                stage: 0,
+                lane: Some(lane.to_owned()),
+                preset: preset.map(str::to_owned),
+                orbit,
+                keys: Vec::new(),
+            };
+        let mut found = live_plugins(score);
+        let keys = std::mem::take(&mut found[0].keys);
+        assert_eq!(
+            found,
+            [
+                plugin("ott", false, Some("Loud"), Some(1), "$0"),
+                plugin("serum 2", true, None, Some(3), "$1"),
+                plugin("ott", false, None, None, "$2"),
+            ]
+        );
+        // The keys of the object, each at its place in the text. A key in
+        // a value is no key of the call.
+        let words = |score: &str| {
+            let keys = live_plugins(score).remove(0).keys;
+            keys.iter()
+                .map(|key| score[key.clone()].to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            keys.iter()
+                .map(|key| &score[key.clone()])
+                .collect::<Vec<_>>(),
+            ["depth", "preset"]
+        );
+        assert_eq!(
+            words("s(\"bd\").vst('a', { \"in gain\": 1, mix: f({ x: 1 }), 100: 0.5, tail })"),
+            ["in gain", "mix", "100"]
+        );
+        assert!(words("s(\"bd\").vst('a').fm({ depth: 1 })").is_empty());
+        // The first line of a call in a comment leaves a text with no call.
+        assert!(live_plugins("// $: s(\"bd\").vst(\n  \"ott\", { depth: 1 })").is_empty());
+        // The second effect of a statement is the second stage of the
+        // chain, also after a name in a variable.
+        let stages = |score| {
+            let plugins = live_plugins(score);
+            plugins
+                .iter()
+                .map(|plugin| plugin.stage)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            stages("$: vsti(\"a\").vst(\"b\").vst(\"c\")\n$: s(\"bd\").vst(\"d\")"),
+            [0, 0, 1, 0]
+        );
+        assert_eq!(
+            stages("$: s(\"bd\").vst (name).myvst(\"x\").vst(\"b\")"),
+            [1]
+        );
+        let lanes = live_plugins(
+            "lead: s(\"sine\").vst(\"a\")\nbass:\n stack(s(\"sine\").vst(\"b\"))\ns(\"sine\").vst(\"c\")",
+        );
+        assert_eq!(
+            lanes
+                .iter()
+                .map(|plugin| plugin.lane.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("lead"), Some("bass"), None]
+        );
+        let lanes = live_plugins(
+            "$: s(\"bd\"); $: s(\"sd\").vst(\"a\")\n_$: s(\"hh\")\n$: s(\"sine\").vst(\"b\")",
+        );
+        assert_eq!(
+            lanes
+                .iter()
+                .map(|plugin| plugin.lane.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("$1"), Some("$2")]
+        );
+    }
+
+    /// A chain has the plugin calls its notes go through: the calls of one
+    /// arm of a stack, then the calls on the stack.
+    #[test]
+    fn a_plugin_chain_has_the_calls_its_notes_go_through() {
+        let chains = |score: &str| -> Vec<(Vec<String>, bool)> {
+            let names = |chain: PluginChain| {
+                let names = chain.calls.into_iter().map(|call| call.name);
+                (names.collect(), chain.muted)
+            };
+            plugin_chains(score).into_iter().map(names).collect()
+        };
+        let chain = |names: &[&str], muted: bool| -> (Vec<String>, bool) {
+            (names.iter().map(|name| (*name).to_owned()).collect(), muted)
+        };
+        assert_eq!(
+            chains("$: note(\"c\").vsti(\"x\").vst(\"y\")\n_$: s(\"bd\")\n  .vst(\"z\")"),
+            [chain(&["x", "y"], false), chain(&["z"], true)]
+        );
+        assert_eq!(
+            chains("$: stack(a.vsti(\"x\").vst(\"y\"), b.vst(\"z\")).vst(\"w\")"),
+            [chain(&["x", "y", "w"], false), chain(&["z", "w"], false)]
+        );
+        // An object and a list in a call have commas of their own.
+        assert_eq!(
+            chains("$: stack(a.vsti(\"x\", { m: 1, n: [1, 2] }).vst(\"y\"),\n  b.vsti(\"z\"))"),
+            [chain(&["x", "y"], false), chain(&["z"], false)]
+        );
+        // Two statements on one line, and a call in a function.
+        assert_eq!(
+            chains("$: s(\"bd\").vst(\"a\"); $: s(\"sd\").vst(\"b\")"),
+            [chain(&["a"], false), chain(&["b"], false)]
+        );
+        assert_eq!(
+            chains("$: note(\"c\").vsti(\"x\").superimpose(p => p.vst(\"y\"))"),
+            [chain(&["x"], false), chain(&["y"], false)]
+        );
     }
 }

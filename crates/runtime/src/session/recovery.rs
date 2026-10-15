@@ -61,6 +61,31 @@ mod tests {
     #[test]
     fn a_scheduler_panic_restores_the_source_and_next_query_works() {
         let mut session = playing_session();
+        #[cfg(not(feature = "vst"))]
+        let source = GOOD.to_owned();
+        #[cfg(feature = "vst")]
+        let source = {
+            let source = format!("$: {GOOD}.vst('Delay').orbit(1)");
+            session.evaluate(&source).expect("plugin source");
+            // A new lane above: the plugin lane keeps its number.
+            let moved = format!("$: s('hh')\n{}", source.replace("orbit(1)", "orbit(2)"));
+            session.reload_at(&moved, false, 0.1).expect("move plugin");
+            moved
+        };
+        #[cfg(feature = "vst")]
+        let chain = super::super::tests::plugin_chain(&session);
+        // The session plays through the plugins of a live output.
+        #[cfg(feature = "vst")]
+        session
+            .plugins_live
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "vst")]
+        session
+            .plugin_rate
+            .store(44_100, std::sync::atomic::Ordering::Relaxed);
+        // The host of the output plays each edit at once.
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        session.set_plugin_wait(false);
         let transport = session.transport();
         let generation = session.generation();
         session.inject_panic_for_test(SessionPanicPoint::Query);
@@ -68,7 +93,37 @@ mod tests {
             .schedule_through(0.25, 0.75)
             .expect_err("scheduler query panics");
         assert_panic(error, "Query");
-        assert_eq!(session.active_source(), Some(GOOD));
+        assert_eq!(session.active_source(), Some(source.as_str()));
+        // The rebuilt session keeps the chains its output reads. A new
+        // registry gives a new number.
+        #[cfg(feature = "vst")]
+        assert_eq!(super::super::tests::plugin_chain(&session), chain);
+        #[cfg(feature = "vst")]
+        assert_eq!(
+            super::super::tests::plugin_note(&session)["__rustel_lane"],
+            "#0",
+            "the rebuilt session lost its lanes"
+        );
+        #[cfg(feature = "vst")]
+        assert!(
+            session
+                .plugins_live
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "the rebuilt session lost the plugins of its output"
+        );
+        #[cfg(feature = "vst")]
+        assert_eq!(
+            session
+                .plugin_rate
+                .load(std::sync::atomic::Ordering::Relaxed),
+            44_100,
+            "the rebuilt session lost the rate of its output"
+        );
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        assert!(
+            !session.plugin_wait,
+            "the rebuilt session lost the wait setting of its host"
+        );
         assert!(Arc::ptr_eq(&session.transport(), &transport));
         assert!(session.generation() > generation);
         // Recovery resumes after the time the rebuild took, so a slow machine
@@ -805,6 +860,25 @@ impl Session {
         fresh.continuity_margin = self.continuity_margin;
         // The replayed score takes over on a frame of the same device.
         fresh.live_sample_rate = self.live_sample_rate;
+        // The output keeps its plugins and its rate. Its names source reads
+        // the chains of this session, so the rebuilt session keeps the same
+        // chains. Each lane keeps its number, so the replayed score has the
+        // chains it had.
+        #[cfg(feature = "vst")]
+        {
+            let live = self.plugins_live.load(std::sync::atomic::Ordering::Relaxed);
+            fresh.plugins_live = AtomicBool::new(live);
+            fresh.plugin_rate = std::mem::take(&mut self.plugin_rate);
+            fresh.chains = self.chains.clone();
+            fresh.lanes = std::mem::take(&mut self.lanes);
+        }
+        // An edit that waits for its plugin copies waits on, with its plan in
+        // the chains: the replay plays the score in play.
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        {
+            fresh.plugin_wait = self.plugin_wait;
+            fresh.plugin_hold = self.plugin_hold.take();
+        }
         fresh.stop_when_silent = self.stop_when_silent;
         fresh.export_limiter = self.export_limiter;
         fresh.render_tail_secs = self.render_tail_secs;

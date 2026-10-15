@@ -586,7 +586,7 @@ const PACE: crate::reference::ReferenceEntry = crate::reference::ReferenceEntry 
     examples: &[
         "sound(\"bd sd cp\").pace(4)\n// The same as sound(\"{bd sd cp}%4\") or sound(\"<bd sd cp>*4\")",
     ],
-    tags: &["stepwise"],
+    tags: &["stepwise", "experimental"],
     no_autocomplete: false,
     deprecated: false,
     origin: "rustel",

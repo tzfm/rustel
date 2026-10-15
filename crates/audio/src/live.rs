@@ -245,6 +245,16 @@ impl LiveScalarBackend {
         self.scalar.pressure_observation()
     }
 
+    /// The chains the playing score has: see
+    /// [`ScalarBackend::set_named_insert_chains`].
+    pub fn set_named_insert_chains(&mut self, list: u64, named: &[u64]) {
+        self.scalar.set_named_insert_chains(list, named);
+    }
+
+    pub fn named_insert_list(&self) -> u64 {
+        self.scalar.named_insert_list()
+    }
+
     /// Route each orbit to an output pair; pair 0 is the main mix.
     pub fn set_orbit_pairs(&mut self, pairs: [u8; crate::scalar::MAX_ORBITS]) {
         if self.scalar.orbit_pairs() != pairs {
@@ -263,6 +273,59 @@ impl LiveScalarBackend {
 
     pub fn orbit_mix(&self, orbit: usize, frames: usize) -> &[f32] {
         self.scalar.orbit_mix(orbit, frames)
+    }
+
+    /// Stage prepared inserts between audio blocks and return displaced
+    /// copies to the producer. A full return ring defers new installs.
+    #[cfg_attr(not(feature = "device-audio"), allow(dead_code))]
+    pub(crate) fn drain_insert_installs(&mut self, channel: &crate::assets::SampleChannel) {
+        loop {
+            if channel.insert_returns.len() == channel.insert_returns.capacity() {
+                return;
+            }
+            let Some(retired) = self.scalar.take_retired_insert() else {
+                break;
+            };
+            let returned = crate::assets::ReturnedInsert(Box::into_raw(retired));
+            // This callback is the sole producer and a slot was free.
+            if channel.insert_returns.push(returned).is_err() {
+                channel
+                    .leaked
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let pending = channel.insert_installs.len();
+        for _ in 0..pending {
+            if channel.insert_returns.len() == channel.insert_returns.capacity() {
+                break;
+            }
+            let Some(install) = channel.insert_installs.pop() else {
+                break;
+            };
+            // SAFETY: producer-boxed pointer handed over via the SPSC ring.
+            let insert = unsafe { Box::from_raw(install.insert) };
+            // An insert prepared before the output changed its rate goes
+            // back to the producer. The producer ships a new one.
+            let refused_before = self.scalar.insert_refusals();
+            let displaced = if install.sample_rate == self.scalar.sample_rate() {
+                self.scalar.prepare_insert(install.slot, insert)
+            } else {
+                Some(insert)
+            };
+            channel.insert_refusals.fetch_add(
+                self.scalar.insert_refusals() - refused_before,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            if let Some(displaced) = displaced {
+                let returned = crate::assets::ReturnedInsert(Box::into_raw(displaced));
+                // Only this callback fills the ring, and a slot was free.
+                if channel.insert_returns.push(returned).is_err() {
+                    channel
+                        .leaked
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
     }
 
     /// Prepare one graph per worklet before this backend enters the callback.
@@ -618,9 +681,14 @@ impl LiveScalarBackend {
             events,
             flip,
             stopped.load(Ordering::Acquire),
+            None,
         )
     }
 
+    /// One block from the events given, as [`Self::process_block_with`].
+    /// With `assets`, the block also takes the inserts the producer published
+    /// before these events.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn process_block_with_events(
         &mut self,
         output: &mut [f32],
@@ -629,6 +697,7 @@ impl LiveScalarBackend {
         events: impl Iterator<Item = QueuedAudioEvent<crate::CompactKabelControls>>,
         flip: LiveFlipAtomics<'_>,
         is_stopped: bool,
+        assets: Option<&crate::assets::SampleChannel>,
     ) -> LiveBlockReport {
         let LiveFlipAtomics {
             generation: active_generation,
@@ -668,17 +737,29 @@ impl LiveScalarBackend {
                 // start a voice under the ramp.
                 self.scalar.retire_pending_at(start_frame);
                 self.scalar.process_block(&mut output[..samples], frames);
-                for frame in 0..frames {
-                    let position = *fade_pos + frame;
-                    let gain = if position + 1 >= fade_total {
+                let from = *fade_pos;
+                let ramp = |frame: usize| {
+                    let position = from + frame;
+                    if position + 1 >= fade_total {
                         0.0
                     } else {
                         1.0 - (position + 1) as f32 / fade_total as f32
-                    };
+                    }
+                };
+                for frame in 0..frames {
+                    let gain = ramp(frame);
                     output[frame * 2] *= gain;
                     output[frame * 2 + 1] *= gain;
                 }
+                // An orbit routed to another pair is not in `output`. It
+                // fades with the main pair.
+                self.scalar.scale_orbit_mix(frames, ramp);
                 *fade_pos += frames;
+            } else {
+                // No block renders after the ramp, and the device still mixes
+                // each routed orbit. The clear keeps the device from playing
+                // the last block of the ramp again.
+                self.scalar.clear_orbit_mix(frames);
             }
             // The voices live until the ramp ends. A reset after the first
             // block would end a 10 ms ramp at the block edge with a step.
@@ -933,6 +1014,11 @@ impl LiveScalarBackend {
         #[cfg(feature = "device-audio")]
         if let Some(consumer) = &mut self.scalar.confirmations {
             consumer.selected(self.generation, self.confirmation_takeover);
+        }
+        // The producer publishes inserts before their events. Take the
+        // inserts after the event ring, so each onset finds its insert.
+        if let Some(assets) = assets {
+            self.drain_insert_installs(assets);
         }
         self.scalar.process_block(output, frames);
         report
@@ -1278,6 +1364,227 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn an_insert_published_after_callback_entry_reaches_its_first_onset() {
+        use crate::assets::{InsertInstall, SampleChannel};
+        use crate::insert::{InsertControls, InsertKey, InsertParam, OrbitInsert};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        struct Probe(InsertKey, Arc<AtomicUsize>);
+        impl OrbitInsert for Probe {
+            fn key(&self) -> InsertKey {
+                self.0
+            }
+            fn set_param(&mut self, _: InsertParam, _: u32) {}
+            fn process(&mut self, _: &mut [f32], _: &mut [f32]) {
+                self.1.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let mut live = LiveScalarBackend::new(48_000, 8).expect("live backend");
+        let channel = SampleChannel::new();
+        let ring = Ring::new(8);
+        let words = Words::new();
+        let key = InsertKey {
+            plugin: 1,
+            preset: 0,
+        };
+        let processed = Arc::new(AtomicUsize::new(0));
+        live.drain_insert_installs(&channel);
+        // The producer publishes between callback entry and the event drain.
+        let insert = Box::new(Probe(key, Arc::clone(&processed))) as Box<dyn OrbitInsert>;
+        assert!(
+            channel
+                .insert_installs
+                .push(InsertInstall {
+                    slot: crate::insert::effect_slot(0, 0),
+                    sample_rate: 48_000,
+                    insert: Box::into_raw(insert),
+                })
+                .is_ok()
+        );
+        let mut event = note(1, 1, 0);
+        event.controls.orbit = 0;
+        event.controls.effects[0] = Some(InsertControls::new(key));
+        assert!(ring.push(event));
+        let report = live.process_block_with_events(
+            &mut [0.0; BLOCK * 2],
+            BLOCK,
+            0,
+            ring.drain_queued_available(),
+            words.flip(),
+            words.stopped.load(Ordering::Acquire),
+            Some(&channel),
+        );
+        assert_eq!(report.accepted, 1);
+        assert_eq!(live.scalar.missing_insert_events(), 0);
+        assert!(processed.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn a_replacement_insert_waits_for_its_first_onset() {
+        use crate::assets::{InsertInstall, ReturnedInsert, SampleChannel};
+        use crate::insert::{InsertControls, InsertKey, InsertParam, OrbitInsert};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        struct Probe(InsertKey, Arc<AtomicUsize>, Arc<AtomicUsize>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.2.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        impl OrbitInsert for Probe {
+            fn key(&self) -> InsertKey {
+                self.0
+            }
+            fn set_param(&mut self, _: InsertParam, _: u32) {}
+            fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+                if left.iter().chain(right.iter()).any(|sample| *sample != 0.0) {
+                    self.1.fetch_add(left.len(), Ordering::Relaxed);
+                }
+            }
+        }
+
+        for canceled in [false, true] {
+            let mut live = LiveScalarBackend::new(48_000, 8).expect("live backend");
+            let channel = SampleChannel::new();
+            let ring = Ring::new(8);
+            let words = Words::new();
+            let old = InsertKey {
+                plugin: 1,
+                preset: 0,
+            };
+            let new = InsertKey { plugin: 2, ..old };
+            let old_frames = Arc::new(AtomicUsize::new(0));
+            let new_frames = Arc::new(AtomicUsize::new(0));
+            let old_drops = Arc::new(AtomicUsize::new(0));
+            let new_drops = Arc::new(AtomicUsize::new(0));
+            let unused_drops = Arc::new(AtomicUsize::new(0));
+            let slot = crate::insert::effect_slot(1, 0);
+            live.scalar.install_insert(
+                slot,
+                Box::new(Probe(old, Arc::clone(&old_frames), Arc::clone(&old_drops))),
+            );
+            let mut event = note(1, 1, 0);
+            event.controls.orbit = 1;
+            event.controls.effects[0] = Some(InsertControls::new(old));
+            assert!(ring.push(event));
+
+            for block in 0..=4 {
+                let onset = (3 * BLOCK) as u64;
+                if block == 1 {
+                    let insert =
+                        Box::new(Probe(new, Arc::clone(&new_frames), Arc::clone(&new_drops)))
+                            as Box<dyn OrbitInsert>;
+                    assert!(
+                        channel
+                            .insert_installs
+                            .push(InsertInstall {
+                                slot,
+                                sample_rate: 48_000,
+                                insert: Box::into_raw(insert),
+                            })
+                            .is_ok()
+                    );
+                    words.publish(2, onset, TakeoverCut::None);
+                    let mut event = note(2, 2, onset);
+                    event.controls.orbit = 1;
+                    event.controls.effects[0] = Some(InsertControls::new(new));
+                    assert!(ring.push(event));
+                } else if block == 2 && canceled {
+                    words.publish(3, onset, TakeoverCut::None);
+                    let mut event = note(3, 3, onset);
+                    event.controls.orbit = 1;
+                    event.controls.effects[0] = Some(InsertControls::new(old));
+                    assert!(ring.push(event));
+                } else if block == 4 && !canceled {
+                    for _ in 0..channel.insert_returns.capacity() {
+                        let insert = Box::new(Probe(
+                            new,
+                            Arc::clone(&new_frames),
+                            Arc::clone(&unused_drops),
+                        )) as Box<dyn OrbitInsert>;
+                        assert!(
+                            channel
+                                .insert_returns
+                                .push(ReturnedInsert(Box::into_raw(insert)))
+                                .is_ok()
+                        );
+                    }
+                    let insert = Box::new(Probe(
+                        InsertKey { plugin: 3, ..new },
+                        Arc::clone(&new_frames),
+                        Arc::clone(&unused_drops),
+                    )) as Box<dyn OrbitInsert>;
+                    assert!(
+                        channel
+                            .insert_installs
+                            .push(InsertInstall {
+                                slot,
+                                sample_rate: 48_000,
+                                insert: Box::into_raw(insert),
+                            })
+                            .is_ok()
+                    );
+                }
+                let before = old_frames.load(Ordering::Relaxed);
+                let mut output = [0.0; BLOCK * 2];
+                live.process_block_with_events(
+                    &mut output,
+                    BLOCK,
+                    (block * BLOCK) as u64,
+                    ring.drain_queued_available(),
+                    words.flip(),
+                    words.stopped.load(Ordering::Acquire),
+                    Some(&channel),
+                );
+                assert!(output.iter().any(|sample| *sample != 0.0));
+                if block < 3 || canceled {
+                    assert!(
+                        old_frames.load(Ordering::Relaxed) > before,
+                        "the old insert processes until an accepted replacement onset"
+                    );
+                    assert_eq!(new_frames.load(Ordering::Relaxed), 0);
+                } else {
+                    assert_eq!(old_frames.load(Ordering::Relaxed), before);
+                    assert!(new_frames.load(Ordering::Relaxed) > 0);
+                }
+                assert_eq!(old_drops.load(Ordering::Relaxed), 0);
+                assert_eq!(new_drops.load(Ordering::Relaxed), 0);
+                assert_eq!(unused_drops.load(Ordering::Relaxed), 0);
+            }
+            assert_eq!(live.scalar.missing_insert_events(), 0);
+            assert_eq!(channel.insert_installs.len(), usize::from(!canceled));
+            channel.reclaim();
+            assert_eq!(old_drops.load(Ordering::Relaxed), 0);
+            live.drain_insert_installs(&channel);
+            assert_eq!(channel.insert_installs.len(), 0);
+            assert_eq!(old_drops.load(Ordering::Relaxed), 0);
+            channel.reclaim();
+            assert_eq!(old_drops.load(Ordering::Relaxed), usize::from(!canceled));
+            if !canceled {
+                assert_eq!(new_drops.load(Ordering::Relaxed), 0);
+                assert_eq!(
+                    unused_drops.load(Ordering::Relaxed),
+                    channel.insert_returns.capacity()
+                );
+            }
+            assert_eq!(channel.leaked.load(Ordering::Relaxed), 0);
+            drop(live);
+            let unused = if canceled {
+                0
+            } else {
+                channel.insert_returns.capacity() + 1
+            };
+            drop(channel);
+            assert_eq!(old_drops.load(Ordering::Relaxed), 1);
+            assert_eq!(new_drops.load(Ordering::Relaxed), 1);
+            assert_eq!(unused_drops.load(Ordering::Relaxed), unused);
+        }
+    }
 
     /// The one flip body every site calls: it names the generation it
     /// replaces as the outgoing one (across a skipped generation too),

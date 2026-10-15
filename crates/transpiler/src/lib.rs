@@ -19,7 +19,8 @@ use oxc_ast::ast::{
     ExportDefaultDeclaration, ExportFromDeclaration, ExportNamedDeclaration, Expression,
     ForOfStatement, IfStatement, ImportDeclaration, ImportExpression, ImportMeta,
     JSXAttributeValue, JSXText, NewExpression, ObjectExpression, ObjectPropertyKind, Program,
-    RegExpLiteral, Statement, TemplateLiteral, VariableDeclarationKind, VariableDeclarator,
+    PropertyKey, RegExpLiteral, Statement, TemplateLiteral, VariableDeclarationKind,
+    VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, VisitMut, walk, walk_mut};
 use oxc_codegen::{Codegen, CodegenOptions};
@@ -370,7 +371,7 @@ impl OrdinaryStringLiteralRanges {
 /// `.midi("Pilote IAC Bus 1")` reaches the call as four words: `Pilote`,
 /// `IAC`, `Bus`, `1`. The transpiler leaves the string unchanged, so a
 /// name means the same in single and double quotes.
-const PORT_NAMED_CALLS: [(&str, usize); 8] = [
+const PORT_NAMED_CALLS: [(&str, usize); 10] = [
     ("midi", 0),
     ("midin", 0),
     ("midikeys", 0),
@@ -382,6 +383,9 @@ const PORT_NAMED_CALLS: [(&str, usize); 8] = [
     ("samples", 0),
     ("samples", 1),
     ("loadSoundfont", 0),
+    // A plugin, by the name of its bundle.
+    ("vst", 0),
+    ("vsti", 0),
 ];
 
 /// The built-in `Error` family, and the argument position that carries a
@@ -435,6 +439,27 @@ impl HydraImageStringCollector {
                     self.ranges.push((span.start as usize, span.end as usize));
                 }
                 _ => {}
+            }
+        }
+        // Plugin option keys name parameters. A preset value names a file.
+        if matches!(name, "vst" | "vsti")
+            && let Some(Argument::ObjectExpression(options)) = arguments.get(1)
+        {
+            for property in &options.properties {
+                if let ObjectPropertyKind::ObjectProperty(property) = property
+                    && !property.computed
+                {
+                    if let PropertyKey::StringLiteral(literal) = &property.key {
+                        let span = literal.span();
+                        self.ranges.push((span.start as usize, span.end as usize));
+                    }
+                    if property.key.static_name().as_deref() == Some("preset")
+                        && let Expression::StringLiteral(literal) = &property.value
+                    {
+                        let span = literal.span();
+                        self.ranges.push((span.start as usize, span.end as usize));
+                    }
+                }
             }
         }
     }
@@ -941,6 +966,12 @@ pub struct TranspileOptions {
     /// Script URLs the host has run. See [`script_imports`]. With module
     /// syntax off, `import('<url>')` of one of them is still accepted.
     pub loaded_imports: Vec<String>,
+    /// The lane number of each labeled statement, in source order. A host
+    /// reads the labeled statements with [`lane_statements`]. The label
+    /// rewrite writes each number as the second argument of `.p()`. It does
+    /// not use a list with a different count. See
+    /// [`TranspileOutput::lanes_by_place`].
+    pub lane_numbers: Vec<u64>,
 }
 
 impl Default for TranspileOptions {
@@ -956,6 +987,7 @@ impl Default for TranspileOptions {
             id: None,
             allow_module_syntax: true,
             loaded_imports: Vec::new(),
+            lane_numbers: Vec::new(),
         }
     }
 }
@@ -1108,6 +1140,26 @@ pub struct TranspileOutput {
     /// Each KabelSalat call outside another call's graph, in source order;
     /// their graphs do not overlap. Empty when the source is refused.
     pub kabelsalat_calls: Vec<KabelsalatSpan>,
+    /// True when the label rewrite wrote the place of each labeled statement
+    /// (0, 1, 2, ...) as the second argument of `.p()`, and not a lane
+    /// number. [`TranspileOptions::lane_numbers`] was then empty, or did not
+    /// have one number for each labeled statement.
+    pub lanes_by_place: bool,
+}
+
+/// A lane of a score, as [`lane_statements`] reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaneStatement {
+    /// The label as written: `$`, `_$`, `lead`, `Slead`. Empty for a score
+    /// with no label.
+    pub label: String,
+    /// The code of the statement after its label, with no comment before or
+    /// after it. Each line end is `\n` and no line has whitespace at its
+    /// end, so a score saved with different line ends has the same body.
+    pub body: String,
+    /// The line of the label, counted from 1. With no label, the line where
+    /// the body starts.
+    pub line: usize,
 }
 
 /// Where a KabelSalat call sits in the score, offset by `block_offset`.
@@ -2226,7 +2278,8 @@ fn transpile_here(source: &str, options: &TranspileOptions) -> TranspileOutput {
     }
     let widget_source = splice(&mini, &mini_map, &splices);
     let kabel = rewrite_kabelsalat(&widget_source, regexes_are_present);
-    let labels = rewrite_labels(&kabel, regexes_are_present);
+    let (labels, lanes_by_place) =
+        rewrite_labels(&kabel, regexes_are_present, &options.lane_numbers);
     let samples = rewrite_bare_samples(&labels);
     let mut parsed = parse_and_print_as(&samples, SourceType::mjs(), ModuleSyntax::of(options));
     // The parser read the rewritten text; the score is what the reader sees.
@@ -2266,6 +2319,7 @@ fn transpile_here(source: &str, options: &TranspileOptions) -> TranspileOutput {
                 }
             })
             .collect(),
+        lanes_by_place,
     }
 }
 
@@ -3755,16 +3809,28 @@ fn ends_mid_expression(chain: &str) -> bool {
     }
 }
 
-/// Rewrite labeled statements (`kick: s("bd")`, `$: s("bd*4")`) to `.p('kick')`.
+/// A top-level statement of a score, in byte offsets of its text.
+struct Scanned {
+    start: usize,
+    /// The end of the identifier the statement starts with. With `colon`,
+    /// that identifier is the label.
+    name_end: usize,
+    /// The colon of the label.
+    colon: Option<usize>,
+    /// The first code after the label. With no label, `start`.
+    body_start: usize,
+    /// The end of the statement, before its `;`.
+    end: usize,
+}
+
+/// The top-level statements of `source`, in source order.
 ///
-/// Every labeled statement is rewritten even when non-label statements appear
-/// before it, as in `setcpm(140/4)` followed by `$: s("bd*4")`.
-fn rewrite_labels(source: &str, regexes_are_present: bool) -> String {
+/// The label rewrite and [`lane_statements`] share this scan, so they find
+/// the same labeled statements.
+fn scan_statements(source: &str, regexes_are_present: bool) -> Vec<Scanned> {
     let bytes = source.as_bytes();
     let regexes = RegexLiteralRanges::parse_if_present(source, regexes_are_present);
-    let mut output = String::with_capacity(source.len() + 16);
-    let mut cursor = 0usize;
-    let mut rewrote = false;
+    let mut statements = Vec::new();
     let mut index = 0usize;
 
     while index < bytes.len() {
@@ -3786,7 +3852,7 @@ fn rewrite_labels(source: &str, regexes_are_present: bool) -> String {
 
         // A label is `IDENT:` at the start of a top-level statement, with any
         // whitespace or comments before the colon (`kick : s("bd")`). Anything
-        // else is copied through and skipped, rather than ending the scan.
+        // else is a statement with no label, rather than the end of the scan.
         let mut name_end = statement_start;
         while bytes.get(name_end).is_some_and(is_identifier_byte) {
             name_end += 1;
@@ -3860,36 +3926,14 @@ fn rewrite_labels(source: &str, regexes_are_present: bool) -> String {
             end += 1;
         }
 
-        if let Some(colon_at) = label_colon {
-            output.push_str(&source[cursor..statement_start]);
-            let name = &source[statement_start..name_end];
-            // The gaps the scanner swallowed keep their line breaks: those
-            // around the colon go out before the chain, the one after it goes
-            // out after the statement, so an error reported by line lands on
-            // the score's own line.
-            output.push_str(&source[name_end..colon_at]);
-            output.push_str(&source[colon_at + 1..body_start]);
-            let body_raw = &source[body_start..end];
-            let body = body_raw.trim_end();
-            // A trailing line comment is part of the scanned span; `.p()`
-            // appended after it would be commented out and the lane lost.
-            let (chain, trivia) = split_trailing_trivia(body, regexes_are_present);
-            output.push_str(chain.trim_end());
-            output.push_str(".p(");
-            output.push_str(&quote_single(name));
-            output.push(')');
-            if !trivia.is_empty() {
-                output.push(' ');
-                output.push_str(trivia);
-            }
-            if bytes.get(end) == Some(&b';') {
-                output.push(';');
-                end += 1;
-            }
-            output.push_str(&body_raw[body.len()..]);
-            cursor = end;
-            rewrote = true;
-        } else if bytes.get(end) == Some(&b';') {
+        statements.push(Scanned {
+            start: statement_start,
+            name_end,
+            colon: label_colon,
+            body_start,
+            end,
+        });
+        if bytes.get(end) == Some(&b';') {
             end += 1;
         }
         index = if end > statement_start {
@@ -3898,13 +3942,175 @@ fn rewrite_labels(source: &str, regexes_are_present: bool) -> String {
             statement_start + 1
         };
     }
+    statements
+}
 
-    if !rewrote {
-        source.to_string()
-    } else {
-        output.push_str(&source[cursor..]);
-        output
+/// Rewrite labeled statements (`kick: s("bd")`, `$: s("bd*4")`) to
+/// `.p('kick', 0)`.
+///
+/// Every labeled statement is rewritten even when non-label statements appear
+/// before it, as in `setcpm(140/4)` followed by `$: s("bd*4")`.
+///
+/// The second argument of `.p()` is the lane number of the statement.
+/// `lane_numbers` has one number for each labeled statement, in source order.
+/// With no numbers, or with a different count, the second argument is the
+/// place of the statement among the labeled statements, and the returned flag
+/// is true.
+fn rewrite_labels(source: &str, regexes_are_present: bool, lane_numbers: &[u64]) -> (String, bool) {
+    let bytes = source.as_bytes();
+    let statements = scan_statements(source, regexes_are_present);
+    let labeled = statements
+        .iter()
+        .filter(|statement| statement.colon.is_some())
+        .count();
+    if labeled == 0 {
+        return (source.to_string(), false);
     }
+    let by_place = lane_numbers.len() != labeled;
+    let mut output = String::with_capacity(source.len() + 16);
+    let mut cursor = 0usize;
+    let mut place = 0usize;
+
+    for statement in statements {
+        let Scanned {
+            start: statement_start,
+            name_end,
+            colon: Some(colon_at),
+            body_start,
+            mut end,
+        } = statement
+        else {
+            continue;
+        };
+        output.push_str(&source[cursor..statement_start]);
+        let name = &source[statement_start..name_end];
+        // The gaps the scanner swallowed keep their line breaks: those
+        // around the colon go out before the chain, the one after it goes
+        // out after the statement, so an error reported by line lands on
+        // the score's own line.
+        output.push_str(&source[name_end..colon_at]);
+        output.push_str(&source[colon_at + 1..body_start]);
+        let body_raw = &source[body_start..end];
+        let body = body_raw.trim_end();
+        // A trailing line comment is part of the scanned span; `.p()`
+        // appended after it would be commented out and the lane lost.
+        let (chain, trivia) = split_trailing_trivia(body, regexes_are_present);
+        output.push_str(chain.trim_end());
+        output.push_str(".p(");
+        output.push_str(&quote_single(name));
+        output.push_str(", ");
+        if by_place {
+            output.push_str(&place.to_string());
+        } else {
+            output.push_str(&lane_numbers[place].to_string());
+        }
+        output.push(')');
+        place += 1;
+        if !trivia.is_empty() {
+            output.push(' ');
+            output.push_str(trivia);
+        }
+        if bytes.get(end) == Some(&b';') {
+            output.push(';');
+            end += 1;
+        }
+        output.push_str(&body_raw[body.len()..]);
+        cursor = end;
+    }
+
+    output.push_str(&source[cursor..]);
+    (output, by_place)
+}
+
+/// The lanes in the text of a score, in source order.
+///
+/// Each labeled statement (`kick: s("bd")`, `$: s("bd*4")`) is one lane. A
+/// score with no label is one lane with the empty label. Its body is the last
+/// statement with code, or empty when the score has no code.
+///
+/// This reads the score as written, with the scan of the label rewrite. The
+/// rewritten text holds source offsets, which move with each edit above a
+/// lane. A host gives each lane a number that stays, and passes the numbers
+/// of the labeled statements in [`TranspileOptions::lane_numbers`].
+///
+/// `None` when the scan did not run: [`transpile`] refuses the text for its
+/// size or nesting, or the scan got no thread. A host then passes no lane
+/// numbers.
+pub fn lane_statements(source: &str) -> Option<Vec<LaneStatement>> {
+    if check_nesting(source).is_err() {
+        return None;
+    }
+    let mut lanes = on_parse_stack(|| lane_statements_here(source))?;
+    if lanes.is_empty() {
+        lanes.push(LaneStatement {
+            label: String::new(),
+            body: String::new(),
+            line: 1,
+        });
+    }
+    Some(lanes)
+}
+
+/// The body of `lane_statements`, always called on a parse stack. Empty when
+/// the score has no code.
+fn lane_statements_here(source: &str) -> Vec<LaneStatement> {
+    let bytes = source.as_bytes();
+    let regexes_are_present = !RegexLiteralRanges::parse(source).is_empty();
+    let statements = scan_statements(source, regexes_are_present);
+    // The code of a statement and its start, with no comment before or
+    // after the code.
+    let code = |statement: &Scanned| {
+        let start = skip_trivia(bytes, statement.body_start).min(statement.end);
+        let (code, _) = split_trailing_trivia(&source[start..statement.end], regexes_are_present);
+        (start, code)
+    };
+    // The label, the offset of its line, and the code of each lane.
+    let mut lanes: Vec<(&str, usize, &str)> = statements
+        .iter()
+        .filter(|statement| statement.colon.is_some())
+        .map(|statement| {
+            let label = &source[statement.start..statement.name_end];
+            (label, statement.start, code(statement).1)
+        })
+        .collect();
+    if lanes.is_empty() {
+        // A score with no label is one lane: its last statement with code.
+        lanes.extend(
+            statements
+                .iter()
+                .rev()
+                .map(code)
+                .find(|(_, code)| !code.is_empty())
+                .map(|(start, code)| ("", start, code)),
+        );
+    }
+    let mut line = 1usize;
+    let mut counted = 0usize;
+    lanes
+        .into_iter()
+        .map(|(label, at, code)| {
+            line += source[counted..at]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
+            counted = at;
+            LaneStatement {
+                label: label.to_owned(),
+                body: normal_body(code),
+                line,
+            }
+        })
+        .collect()
+}
+
+/// `code` with `\n` for each line end and no whitespace at the end of a line.
+fn normal_body(code: &str) -> String {
+    code.replace("\r\n", "\n")
+        .replace(['\r', '\u{2028}', '\u{2029}'], "\n")
+        .split('\n')
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Append `return` to the final top-level expression statement. Public so a
@@ -4153,6 +4359,8 @@ mod tests {
             r#"await samples("github:tidalcycles/dirt-samples")"#,
             r#"await samples({ bd: ["bd.wav"] }, "https://example.test/audio/")"#,
             r#"$: s("bd").serial(38400, 0, 0, "/dev/tty.usbmodem 1")"#,
+            r#"$: s("bd").vst("Valhalla Supermassive", { preset: "Warm Pad" })"#,
+            r#"$: note("c3").vsti("Serum 2", { preset: "Bass One" })"#,
         ];
         for source in named {
             let output = transpile(
@@ -4173,7 +4381,11 @@ mod tests {
                         .output
                         .contains("m('github:tidalcycles/dirt-samples'")
                     && !output.output.contains("m('https://example.test/audio/'")
-                    && !output.output.contains("m('/dev/tty.usbmodem 1'"),
+                    && !output.output.contains("m('/dev/tty.usbmodem 1'")
+                    && !output.output.contains("m('Valhalla Supermassive'")
+                    && !output.output.contains("m('Warm Pad'")
+                    && !output.output.contains("m('Serum 2'")
+                    && !output.output.contains("m('Bass One'"),
                 "a name was parsed as a rhythm: {}",
                 output.output
             );
@@ -4191,6 +4403,42 @@ mod tests {
         );
         assert!(output.output.contains("m('c4 e4'"), "{}", output.output);
         assert!(output.output.contains("m('0.5 1'"), "{}", output.output);
+        // A plugin value is a pattern as before. The preset alone is a name.
+        let output = transpile(
+            r#"$: s("bd").vst("Gain", { mix: "0.2 0.8", preset: "A B" })"#,
+            &TranspileOptions {
+                add_return: false,
+                ..TranspileOptions::default()
+            },
+        );
+        assert!(output.output.contains("m('0.2 0.8'"), "{}", output.output);
+        assert!(!output.output.contains("m('A B'"), "{}", output.output);
+    }
+
+    #[test]
+    fn plugin_option_keys_remain_strings_while_values_keep_mini_notation() {
+        for source in [
+            r#"$: s("sawtooth").vst("Effect", { "mix": 0.15, "drive": "0.2 0.8", "preset": "A B" })"#,
+            r#"$: note("c3").vsti("Instrument", { "mix": 0.15, "drive": "0.2 0.8", "preset": "A B" })"#,
+        ] {
+            let output = transpile(
+                source,
+                &TranspileOptions {
+                    add_return: false,
+                    ..TranspileOptions::default()
+                },
+            );
+            assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+            for key in ["mix", "drive", "preset"] {
+                assert!(
+                    !output.output.contains(&format!("m('{key}'")),
+                    "a plugin option key was parsed as a rhythm: {}",
+                    output.output
+                );
+            }
+            assert!(output.output.contains("m('0.2 0.8'"), "{}", output.output);
+            assert!(!output.output.contains("m('A B'"), "{}", output.output);
+        }
     }
 
     #[test]
@@ -5068,6 +5316,14 @@ mod tests {
         assert_eq!(wrapped.output, "(async ()=>{return note(m('c3', 5));})()");
     }
 
+    fn lane(label: &str, body: &str, line: usize) -> LaneStatement {
+        LaneStatement {
+            label: label.into(),
+            body: body.into(),
+            line,
+        }
+    }
+
     /// A registered language becomes a call; a tag nothing registered is
     /// left alone.
     ///
@@ -5086,8 +5342,64 @@ mod tests {
         };
         assert_eq!(
             transpile("$: note(\"c3\")", &simple).output,
-            "note(m('c3', 8)).p('$');"
+            "note(m('c3', 8)).p('$', 0);"
         );
+        // Each labeled statement takes its lane number.
+        let score = "setcpm(30)\n$: note(60)\nlead: note(62)";
+        let numbered = |source: &str, lane_numbers: &[u64]| {
+            let options = TranspileOptions {
+                lane_numbers: lane_numbers.to_vec(),
+                ..simple.clone()
+            };
+            let result = transpile(source, &options);
+            (result.output, result.lanes_by_place)
+        };
+        let lanes = |first: u64, second: u64| {
+            format!("setcpm(30);\nnote(60).p('$', {first});\nnote(62).p('lead', {second});")
+        };
+        assert_eq!(numbered(score, &[7, 3]), (lanes(7, 3), false));
+        // A list with a different count gives the places, and the output
+        // says so.
+        for wrong in [&[][..], &[7], &[7, 3, 5]] {
+            assert_eq!(numbered(score, wrong), (lanes(0, 1), true), "{wrong:?}");
+        }
+        // With no labeled statement, the rewrite writes no place.
+        let bare = "setcpm(30)\n/* lead */ note(60)\n  .s('saw') // dry\n";
+        for numbers in [&[][..], &[7]] {
+            assert!(!numbered(bare, numbers).1, "{numbers:?}");
+        }
+        // `lane_statements` reads the score as written. A score with no label
+        // is one lane, with the body its last statement has under a label.
+        assert_eq!(
+            lane_statements(score),
+            Some(vec![lane("$", "note(60)", 2), lane("lead", "note(62)", 3)])
+        );
+        let body = "note(60)\n  .s('saw')";
+        assert_eq!(lane_statements(bare), Some(vec![lane("", body, 2)]));
+        assert_eq!(
+            lane_statements(&bare.replace("/*", "score: /*")),
+            Some(vec![lane("score", body, 2)])
+        );
+        // `lane_statements` and the rewrite find the same labeled statements
+        // around a regex literal and a KabelSalat graph.
+        for source in [
+            "kick: s(\"bd\").when(x => /\"/.test(x), y => y)\n$: s(\"hh\")",
+            "$: K(\n  sine(220)\n    .out()\n)\nlead: note(62)",
+        ] {
+            assert_eq!(
+                lane_statements(source).expect("scan").len(),
+                2,
+                "{source:?}"
+            );
+            assert!(!numbered(source, &[7, 3]).1, "{source:?}");
+        }
+        // A score with no code is one empty lane.
+        for source in ["", "// $: s(\"bd\")"] {
+            assert_eq!(lane_statements(source), Some(vec![lane("", "", 1)]));
+        }
+        // A text past the nesting limit has no scan.
+        let deep = format!("$: {}", "(".repeat(MAX_SOURCE_NESTING + 1));
+        assert_eq!(lane_statements(&deep), None);
         assert_eq!(transpile("mondo`a b`", &simple).output, "mondo('a b', 6);");
         // A space or line break between tag and template keeps the tag whole.
         for source in ["mondo `a b`", "mondo\n`a b`"] {
@@ -5227,16 +5539,16 @@ mod tests {
             (
                 "$: s(\"white!8\").decay(.08).\ngain(.4)",
                 1,
-                ".decay(0.08).gain(0.4).p('$')",
+                ".decay(0.08).gain(0.4).p('$', 0)",
             ),
             (
                 "$: s(\"white!8\").decay(.08).\n  gain(.4)\n$: s(\"bd\")",
                 2,
-                ".decay(0.08).gain(0.4).p('$');",
+                ".decay(0.08).gain(0.4).p('$', 0);",
             ),
-            ("$: stack(s(\"bd\"),\n  s(\"hh\"))", 1, ")).p('$')"),
-            ("$: s(\"bd\").gain(1 +\n  .2)", 1, "0.2).p('$')"),
-            ("$: x =>\n  s(\"bd\")", 1, ".p('$')"),
+            ("$: stack(s(\"bd\"),\n  s(\"hh\"))", 1, ")).p('$', 0)"),
+            ("$: s(\"bd\").gain(1 +\n  .2)", 1, "0.2).p('$', 0)"),
+            ("$: x =>\n  s(\"bd\")", 1, ".p('$', 0)"),
             // A dot inside a trailing comment is prose: the lane ends there
             // and `foo()` is its own statement.
             ("$: s(\"bd\") // then.\nfoo()", 1, "foo()"),
@@ -5248,7 +5560,7 @@ mod tests {
                 result.diagnostics
             );
             assert_eq!(
-                result.output.matches(".p('$')").count(),
+                result.output.matches(".p('$'").count(),
                 lanes,
                 "{source:?} -> {}",
                 result.output
@@ -5263,7 +5575,27 @@ mod tests {
                 "{source:?} registered a lane ending in a dot: {}",
                 result.output
             );
+            // `lane_statements` finds the same lanes, with either line end.
+            let read = lane_statements(source).expect("scan");
+            assert_eq!(read.len(), lanes, "{source:?}");
+            assert_eq!(
+                lane_statements(&source.replace('\n', "\r\n")),
+                Some(read),
+                "{source:?}"
+            );
         }
+        // The second lane has the next place. A body has one kind of line
+        // end, no whitespace at a line end and no comment at its end.
+        let two = "$: s(\"white!8\").decay(.08).  \r\n  gain(.4) // air\r\n$: s(\"bd\")";
+        let output = transpile(two, &options).output;
+        assert!(output.ends_with(".p('$', 1);"), "{output}");
+        assert_eq!(
+            lane_statements(two),
+            Some(vec![
+                lane("$", "s(\"white!8\").decay(.08).\n  gain(.4)", 1),
+                lane("$", "s(\"bd\")", 3),
+            ])
+        );
     }
 
     /// The parser reads the rewritten text, where every mini-notation
@@ -5307,7 +5639,7 @@ mod tests {
         assert_eq!(align_column("abc", "abc", 1), 1);
         assert_eq!(align_column("s(\"bd\").x", "s(m('bd', 2)).x", 14), 8);
         assert_eq!(
-            align_column("$: s(\"bd\")", " s(m('bd', 5)).p('$')", 21),
+            align_column("$: s(\"bd\")", " s(m('bd', 5)).p('$', 0)", 24),
             10
         );
     }
@@ -5380,8 +5712,16 @@ mod tests {
                 result.diagnostics
             );
             assert_eq!(
-                result.output, "s(m('bd', 5)).p('$');\nfoo();",
+                result.output, "s(m('bd', 5)).p('$', 0);\nfoo();",
                 "line terminator {separator:?} joined the next statement to the label"
+            );
+            // `lane_statements` ends the lane there too. In a body, each line
+            // terminator is the same line end.
+            let chain = format!("$: s(\"bd\"){separator}  .fast(2){separator}foo()");
+            assert_eq!(
+                lane_statements(&chain),
+                Some(vec![lane("$", "s(\"bd\")\n  .fast(2)", 1)]),
+                "line terminator {separator:?}"
             );
         }
     }
@@ -5396,20 +5736,34 @@ mod tests {
         };
         assert_eq!(
             transpile("kick : s(\"bd\")", &options).output,
-            "s(m('bd', 9)).p('kick');"
+            "s(m('bd', 9)).p('kick', 0);"
         );
         assert_eq!(
             transpile("kick : s(\"bd\")", &TranspileOptions::default()).output,
-            "return s(m('bd', 9)).p('kick');"
+            "return s(m('bd', 9)).p('kick', 0);"
         );
         assert_eq!(
             transpile("kick\n: s(\"bd\")", &options).output,
-            "s(m('bd', 9)).p('kick');"
+            "s(m('bd', 9)).p('kick', 0);"
         );
         assert_eq!(
             transpile("kick /* lane */ : s(\"bd\")", &options).output,
-            "/* lane */ s(m('bd', 20)).p('kick');"
+            "/* lane */ s(m('bd', 20)).p('kick', 0);"
         );
+        // `lane_statements` gives the label and the body with no trivia around
+        // them.
+        for source in [
+            "kick : s(\"bd\")",
+            "kick\n: s(\"bd\")",
+            "kick /* lane */ : s(\"bd\")",
+            "kick: /* lane */ s(\"bd\") // dry",
+        ] {
+            assert_eq!(
+                lane_statements(source),
+                Some(vec![lane("kick", "s(\"bd\")", 1)]),
+                "{source:?}"
+            );
+        }
         // The gap keeps its lines, so a parse error still lands on its own text.
         let source = "kick\n: s(\"bd\") foo(";
         let result = transpile(source, &options);
@@ -6640,7 +6994,7 @@ p._scope({ text: "/* not a comment */" });"#;
         let options = TranspileOptions::default();
         let outside = transpile(source, &options);
         assert!(outside.diagnostics.is_empty(), "{:?}", outside.diagnostics);
-        for rewrite in ["await samples(", "m('bd*2 sd'", ".p('kick')"] {
+        for rewrite in ["await samples(", "m('bd*2 sd'", ".p('kick', 0)"] {
             assert!(
                 outside.output.contains(rewrite),
                 "{rewrite} is missing from {}",
@@ -6648,6 +7002,10 @@ p._scope({ text: "/* not a comment */" });"#;
             );
         }
         assert_eq!(on_caller_stack(|| transpile(source, &options)), outside);
+        assert_eq!(
+            on_caller_stack(|| lane_statements(source)),
+            lane_statements(source)
+        );
     }
 
     #[test]

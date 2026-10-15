@@ -49,7 +49,9 @@ pub(super) struct SaveResult {
     pub path: PathBuf,
     pub editor_revision: Revision,
     pub source_revision: String,
-    pub result: Result<(), String>,
+    /// Ok(true) when the file was written, Ok(false) when the disk already
+    /// held these bytes and the write was skipped.
+    pub result: Result<bool, String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,7 +115,7 @@ impl SaveWorker {
 
     fn spawn_with_operation<F>(operation: F) -> io::Result<Self>
     where
-        F: FnMut(&Path, &str) -> Result<(), String> + Send + 'static,
+        F: FnMut(&Path, &str) -> Result<bool, String> + Send + 'static,
     {
         let shared = Arc::new(Shared {
             state: Mutex::new(SaveState::default()),
@@ -194,7 +196,7 @@ impl Drop for SaveWorker {
 
 fn run_worker<F>(shared: &Shared, mut operation: F)
 where
-    F: FnMut(&Path, &str) -> Result<(), String>,
+    F: FnMut(&Path, &str) -> Result<bool, String>,
 {
     loop {
         let request = {
@@ -237,7 +239,15 @@ where
 /// small files - the set's project file and the global prebake - which are
 /// written straight from the interface thread because they are tiny and are
 /// only written on an explicit gesture.
-pub(super) fn atomic_write(path: &Path, source: &str) -> io::Result<()> {
+///
+/// Returns false rather than writing when the file already holds these
+/// bytes: a set taken off Open recent only to hear what was in it keeps its
+/// files - and the changed dates the open list orders by - as they were.
+/// True when it wrote.
+pub(super) fn atomic_write(path: &Path, source: &str) -> io::Result<bool> {
+    if std::fs::read(path).is_ok_and(|kept| kept == source.as_bytes()) {
+        return Ok(false);
+    }
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -258,7 +268,7 @@ pub(super) fn atomic_write(path: &Path, source: &str) -> io::Result<()> {
     if let Ok(directory) = std::fs::File::open(parent) {
         let _ = directory.sync_all();
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -286,9 +296,27 @@ mod tests {
         let path = directory.path().join("score.strudel");
         std::fs::write(&path, "old score").unwrap();
 
-        atomic_write(&path, "new score").unwrap();
+        assert!(atomic_write(&path, "new score").unwrap(), "it wrote");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new score");
 
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "new score");
+        // The same bytes again is not a write: the file keeps the changed
+        // date the first one gave it.
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3_600);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(past))
+            .unwrap();
+        assert!(
+            !atomic_write(&path, "new score").unwrap(),
+            "nothing to write"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            past,
+            "a skipped write leaves the changed date alone"
+        );
     }
 
     #[test]
@@ -308,7 +336,7 @@ mod tests {
                 started_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
             }
-            Ok(())
+            Ok(true)
         })
         .unwrap();
 
@@ -359,7 +387,7 @@ mod tests {
         assert_eq!(third.editor_revision, Revision(30));
         assert_eq!(third.source_revision, source_revision("three"));
         assert_eq!(third.path, PathBuf::from("a"));
-        assert_eq!(third.result, Ok(()));
+        assert_eq!(third.result, Ok(true));
     }
 
     #[test]
@@ -389,7 +417,7 @@ mod tests {
                 release_rx.recv().unwrap();
             }
             if source == "persisted" {
-                Ok(())
+                Ok(true)
             } else {
                 Err("newer write failed".into())
             }
@@ -406,7 +434,7 @@ mod tests {
         assert_eq!(completions.len(), 2);
         assert_eq!(completions[0].request_id, 10);
         assert_eq!(completions[0].source_revision, source_revision("persisted"));
-        assert_eq!(completions[0].result, Ok(()));
+        assert_eq!(completions[0].result, Ok(true));
         assert_eq!(completions[1].request_id, 11);
         assert_eq!(completions[1].source_revision, source_revision("failed"));
         assert_eq!(completions[1].result, Err("newer write failed".into()));

@@ -30,6 +30,10 @@ pub fn entry_body(entry: &Entry, width: usize) -> Vec<BodyLine> {
     if entry.deprecated {
         lines.push(line("deprecated".to_owned(), BodyKind::Deprecated));
     }
+    let experimental = entry.tags.iter().any(|tag| tag == "experimental");
+    if experimental {
+        lines.push(line("experimental".to_owned(), BodyKind::Origin));
+    }
     if !entry.origin.is_empty() {
         lines.push(line(
             format!("{} extension", display_origin(&entry.origin)),
@@ -43,7 +47,11 @@ pub fn entry_body(entry: &Entry, width: usize) -> Vec<BodyLine> {
         ));
     }
     lines.push(blank());
-    for paragraph in entry.description.split("\n\n") {
+    // The experimental line says what a first paragraph `*Experimental*` says.
+    let paragraphs = entry.description.split("\n\n");
+    let paragraphs =
+        paragraphs.filter(|paragraph| !(experimental && paragraph.trim() == "*Experimental*"));
+    for paragraph in paragraphs {
         for (text, code) in wrap_inline(&paragraph.replace('\n', " "), width) {
             lines.push(BodyLine {
                 text,

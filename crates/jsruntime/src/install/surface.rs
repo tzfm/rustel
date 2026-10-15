@@ -71,8 +71,8 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
     ReferenceEntry {
         name: "aliasBank",
         synonyms: &[],
-        summary: "Bank aliases are not supported in Rustel.",
-        description: "Accepted for compatibility; the bank and alias arguments are ignored.",
+        summary: "Custom bank aliases are not supported.",
+        description: "Accepted for compatibility; the arguments are ignored. The default aliases are already applied.",
         params: &[
             ReferenceParam {
                 name: "bank",
@@ -1885,7 +1885,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         examples: &[
             "// The same as note(\"{c eb g, c2 g2}%6\")\npolymeter(\"c eb g\", \"c2 g2\").note()",
         ],
-        tags: &["stepwise"],
+        tags: &["stepwise", "experimental"],
         no_autocomplete: false,
         deprecated: false,
         origin: "rustel",
@@ -2462,7 +2462,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         examples: &[
             "stepalt([\"bd cp\", \"mt\"], \"bd\").sound()\n// The same as \"bd cp bd mt bd\".sound()",
         ],
-        tags: &["stepwise"],
+        tags: &["stepwise", "experimental"],
         no_autocomplete: false,
         deprecated: false,
         origin: "rustel",
@@ -2567,7 +2567,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         examples: &[
             "\"[c g]\".tour(\"e f\", \"e f g\", \"g f e c\").note()\n.sound(\"folkharp\")\n.pace(8)",
         ],
-        tags: &["stepwise"],
+        tags: &["stepwise", "experimental"],
         no_autocomplete: false,
         deprecated: false,
         origin: "rustel",
@@ -2598,6 +2598,71 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
             "useRNG('legacy')\n// Repeats every 300 cycles\n$: n(irand(50)).seg(16).scale(\"C:minor\").ribbon(88, 32)\n$: n(irand(50)).seg(16).scale(\"C:minor\").ribbon(388, 32)",
         ],
         tags: &["generators", "math"],
+        no_autocomplete: false,
+        deprecated: false,
+        origin: "rustel",
+    },
+    ReferenceEntry {
+        name: "vst",
+        synonyms: &[],
+        summary: "Sends the note through a VST3 effect plugin.",
+        description: "Sends the note through a VST3 effect plugin in the pattern's chain. A second `.vst()` call adds an effect after the first, and one chain holds 4 effects at most. Separate patterns on the same orbit keep separate chains. A note with no `.vst()` stays dry. For a plugin that makes the sound, such as a synth, see `vsti`.\n\nThe first argument is the plugin name, as the vst tab of the reference panel lists the plugins. Upper case, spaces and punctuation in the name do not matter: `\"valhalla supermassive\"` finds `ValhallaSupermassive`.\n\nThe second argument sets parameters by name, each from 0 to 1. Each value is a pattern, so a slider or a mini-notation string gives one value to each note. A note carries 16 parameter values at most. `preset` names a `.vstpreset` file in `~/.rustel/vst/<plugin name>/`.\n\nThe plugin shows no window. A plugin not yet loaded takes a moment, and the first notes play dry.",
+        params: &[
+            ReferenceParam {
+                name: "name",
+                r#type: "string",
+                description: "Plugin name.",
+            },
+            ReferenceParam {
+                name: "config",
+                r#type: "Object",
+                description: "Parameter values by name, each from 0 to 1.",
+            },
+            ReferenceParam {
+                name: "config.preset",
+                r#type: "string",
+                description: "Name of a `.vstpreset` file of the plugin.",
+            },
+        ],
+        examples: &[
+            "s(\"bd*2 sd\").vst(\"valhalla supermassive\", { mix: 0.4 })",
+            "note(\"c2 eb2 g2\").s(\"sawtooth\")\n  .vst(\"ott\", { depth: slider(0.5, 0, 1) })",
+            "s(\"hh*8\").vst(\"valhalla supermassive\", { mix: \"0.2 0.8\", preset: \"Big Hall\" })",
+            "s(\"bd*2 sd\").vst(\"ott\", { depth: 0.3 }).vst(\"valhalla supermassive\")",
+        ],
+        tags: &["orbit", "audio", "experimental"],
+        no_autocomplete: false,
+        deprecated: false,
+        origin: "rustel",
+    },
+    ReferenceEntry {
+        name: "vsti",
+        synonyms: &[],
+        summary: "Plays the note on a VST3 instrument plugin.",
+        description: "Plays the note on a VST3 instrument plugin, such as a synth. The plugin gets the pitch, velocity and length of the note, and makes the sound with its own envelope: `attack`, `decay`, `sustain` and `release` do not reach the plugin. `gain` sets the instrument's audio level before effects. `postgain` sets the level after the complete effect chain. The sound of the engine for the note, `s` included, is silent. Each chain holds one instrument. Separate instrument chains share an orbit without sharing their sound or effects.\n\nWith `.vst()` on the same note, the instrument goes through the effect plugins: `.vsti(\"serum 2\").vst(\"ott\")`. `vsti(\"serum 2\")` starts a chain too, with one note for each cycle.\n\nThe arguments are the arguments of `vst`: the plugin name, then parameter values by name from 0 to 1, and `preset`.\n\nThe plugin shows no window. The notes are silent until the plugin is loaded.",
+        params: &[
+            ReferenceParam {
+                name: "name",
+                r#type: "string",
+                description: "Plugin name.",
+            },
+            ReferenceParam {
+                name: "config",
+                r#type: "Object",
+                description: "Parameter values by name, each from 0 to 1.",
+            },
+            ReferenceParam {
+                name: "config.preset",
+                r#type: "string",
+                description: "Name of a `.vstpreset` file of the plugin.",
+            },
+        ],
+        examples: &[
+            "note(\"c2 eb2 g2 bb2\").vsti(\"serum 2\")",
+            "vsti(\"serum 2\").seg(8).note(\"<c2 eb2>\")",
+            "note(\"<c3 eb3>*4\").vsti(\"serum 2\", { macro1: slider(0.2, 0, 1) })\n  .vst(\"ott\", { depth: 0.6 })",
+        ],
+        tags: &["orbit", "audio", "experimental"],
         no_autocomplete: false,
         deprecated: false,
         origin: "rustel",
@@ -2717,7 +2782,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         examples: &[
             "zip(\"e f\", \"e f g\", \"g [f e] a f4 c\").note()\n.sound(\"folkharp\")\n.pace(8)",
         ],
-        tags: &["stepwise"],
+        tags: &["stepwise", "experimental"],
         no_autocomplete: false,
         deprecated: false,
         origin: "rustel",

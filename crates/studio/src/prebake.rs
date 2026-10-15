@@ -190,6 +190,7 @@ pub fn save_global_to(path: Option<&Path>, text: &str) -> Result<(), String> {
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     }
     super::save::atomic_write(path, text)
+        .map(|_| ())
         .map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 

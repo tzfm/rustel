@@ -39,6 +39,7 @@
 //! | jumping to the first error | `error_navigation.rs` |
 //! | pasting into prompts | `prompt_paste.rs` |
 //! | the remote-control sheet and its footer indicator | `remote_panel.rs`, `remote_edit.rs` |
+//! | the two vst tabs, and the plugin rows of the memory breakdown | `vst.rs` |
 //!
 //! And the machinery every feature goes through:
 //!
@@ -91,7 +92,7 @@ use super::editor::{
 };
 use super::engine::{DiagnosticAlert, Launch, LiveMaterial, StudioDiagnostic};
 use super::engine::{StudioConfig, StudioDeviceInfo, StudioDiagnosticLevel, StudioSnapshot};
-use super::export::{ExportJob, ExportSettings, ExportSheet, SheetAction};
+use super::export::{ExportJob, ExportScore, ExportSettings, ExportSheet, SheetAction};
 use super::file_picker::{Candidate, FilePicker, PickerChoice};
 use super::help::{HelpContext, HelpState, HelpView};
 use super::jobs::{BackgroundJob, JobsPanel, JobsPanelView};
@@ -4889,6 +4890,7 @@ mod tests {
                 source_revision: "r".into(),
                 pending_cutover: true,
                 answered_repeat,
+                held: false,
             };
             let installed_lines = |app: &App| {
                 app.log
@@ -5226,6 +5228,7 @@ mod tests {
                 source_revision: "r".into(),
                 pending_cutover: true,
                 answered_repeat,
+                held: false,
             }
         }
 
@@ -5424,6 +5427,7 @@ mod tests {
                     source_revision: source_revision(SCORE),
                     pending_cutover: false,
                     answered_repeat: false,
+                    held: false,
                 }),
                 success => Err(crate::EngineFailure {
                     kind: if success.is_none() {
@@ -6072,6 +6076,7 @@ mod tests {
                         late_events: 2,
                         ring_refusals: 1,
                         callback_errors: 4,
+                        callback_xruns: 8,
                         callback_scope_misses: 5,
                         callback_allocations: 6,
                         callback_frees: 7,
@@ -6107,6 +6112,7 @@ mod tests {
             assert_eq!(runtime.confirmed_audio_generation, Some(7));
             assert_eq!(runtime.submitted_frames, Some(600_000));
             assert_eq!(runtime.callbacks, Some(4_000));
+            assert_eq!(runtime.callback_xruns, Some(8));
             assert_eq!(runtime.accepted_events, Some(9_000));
             assert_eq!(runtime.hydra_frames, Some(123));
             assert_eq!(runtime.process_resident_bytes, Some(700_000_000));
@@ -6116,6 +6122,7 @@ mod tests {
             assert_eq!(value["confirmed_audio_generation"], 7);
             assert!(value.get("audible_generation").is_none());
             assert_eq!(value["publication"], "running");
+            assert_eq!(value["callback_xruns"], 8);
             assert_eq!(value["pressure"]["device"]["generation"], 8);
 
             let value = serde_json::to_value(StudioRuntimeSnapshot {
@@ -11496,6 +11503,10 @@ mod tests {
 
         #[test]
         fn the_link_tab_joins_on_space_and_leaves_on_space_again() {
+            // The checkbox is what is tested here, not the wire: the
+            // worker behind it is real, so the session stays off it,
+            // else a plain test run asks the OS for its consent.
+            rustel_runtime::link::keep_the_session_off_the_wire();
             let directory = tempfile::tempdir().expect("temp dir");
             let (mut app, _scene) = plain_app(directory.path(), "$: s(\"bd\")\n");
             app.panel = Some(crate::devices::DevicePanel {
@@ -11593,6 +11604,7 @@ mod tests {
                 settled,
                 total,
                 loading: Some("mlkr-grsl".into()),
+                plugins: 0,
                 waiting,
             }
         }
@@ -11681,6 +11693,20 @@ mod tests {
                 Some("loading sounds · 3/12 · 25% · mlkr-grsl"),
                 "nothing is held"
             );
+
+            // A plugin wait has its own word, alone or beside the sounds.
+            for (plugins, words) in [(9, "plugins"), (2, "sounds and plugins")] {
+                let waiting = LoadingCue {
+                    plugins,
+                    ..cue(3, 12, true)
+                };
+                loading(&mut app, Some(waiting), LOADING_LABEL_AFTER);
+                let label = app.loading_line(Instant::now()).and_then(|line| line.label);
+                assert_eq!(
+                    label,
+                    Some(format!("waiting for {words} · 3/12 · 25% · mlkr-grsl"))
+                );
+            }
         }
 
         /// The line grows with the load along the header row, adds no row and
@@ -16787,6 +16813,117 @@ mod tests {
             assert_eq!(*app.scenes.limiter(), crate::scenes::SetLimiter::Defer);
         }
 
+        /// A set pulled off Open recent to hear what was in it is left as
+        /// it was: a play of a score the file already holds is not a save,
+        /// and putting a set down whose project file already says what it
+        /// says is not a write. Only the changed dates moving would tell
+        /// the player the set was touched, and the open list orders by
+        /// them.
+        #[test]
+        fn a_set_only_opened_and_played_is_left_as_it_was() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+
+            // A second score, so the set carries a project file a close
+            // could churn.
+            let second = directory.path().join("second.strudel");
+            std::fs::write(&second, "$: s(\"hh\")\n").expect("a second score");
+            app.scenes.open_file(&second).expect("open the score");
+            app.land_on_current_scene();
+            app.persist_manifest();
+            let settle_in_the_past = |path: &std::path::Path| {
+                let when = std::time::SystemTime::now() - Duration::from_secs(3_600);
+                std::fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .expect("open to set times")
+                    .set_times(std::fs::FileTimes::new().set_modified(when))
+                    .expect("set the changed time");
+                when
+            };
+            let manifest = app.scenes.manifest_path();
+            let score_changed = settle_in_the_past(&second);
+            let set_changed = settle_in_the_past(&manifest);
+
+            // Play it: update on a score with no edit behind it.
+            app.handle_editor_effect(EditorEffect::Evaluate {
+                revision: app.editor().revision(),
+                source: ropey::Rope::from_str(&app.editor().source()),
+            })
+            .expect("play");
+            app.wait_for_saves();
+
+            // Close it: another set takes the studio.
+            let elsewhere = directory.path().join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).expect("another folder");
+            std::fs::write(elsewhere.join("other.strudel"), "$: s(\"bd\")\n").expect("a score");
+            let set = SceneSet::open(&elsewhere, "// starter").expect("set");
+            app.switch_set(set, "opened set");
+
+            let changed = |path: &std::path::Path| {
+                std::fs::metadata(path)
+                    .expect("the file")
+                    .modified()
+                    .expect("its changed time")
+            };
+            assert_eq!(
+                changed(&second),
+                score_changed,
+                "playing a score the file already holds rewrote it"
+            );
+            assert_eq!(
+                changed(&manifest),
+                set_changed,
+                "closing the set rewrote a project file that had nothing to say"
+            );
+        }
+
+        /// A save that finds the file already holding the score stays quiet -
+        /// unless the status still says the last save failed. The file came
+        /// to hold the buffer after that failure, so the failure line must
+        /// not outlive it.
+        #[test]
+        fn a_skip_replaces_a_stale_save_failure_line() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            let scene_id = app.scenes.current().id;
+            let path = app.scenes.current().path.clone();
+
+            // A real write, so the completion can be matched to a pending
+            // save and reaches the branches under test.
+            let revision = app.scenes.current().editor.revision();
+            let source = Arc::<str>::from(app.scenes.current().editor.source());
+            app.write_scene(scene_id, revision, source);
+            let request_id = app
+                .scenes
+                .current()
+                .latest_save
+                .as_ref()
+                .expect("the write registered a pending save")
+                .request_id;
+
+            // The save before this one failed, and its line still stands.
+            app.status = "save failed - the editor buffer is unchanged".into();
+
+            app.handle_save_result(SaveResult {
+                request_id,
+                path,
+                editor_revision: app.scenes.current().editor.revision(),
+                source_revision: "current".to_owned(),
+                result: Ok(false),
+            });
+
+            assert_ne!(
+                app.status, "save failed - the editor buffer is unchanged",
+                "the skip must not leave a failure that no longer stands"
+            );
+            assert!(
+                app.status.contains("already holds this score"),
+                "the line says where the score is: {}",
+                app.status
+            );
+        }
+
         #[test]
         fn a_save_that_lands_on_a_path_the_scene_no_longer_owns_is_not_taken_as_saved() {
             // The race: a write is in flight, the scene is renamed, and the
@@ -16821,7 +16958,7 @@ mod tests {
                 path: stale.clone(),
                 editor_revision: app.scenes.current().editor.revision(),
                 source_revision: "stale".to_owned(),
-                result: Ok(()),
+                result: Ok(true),
             });
 
             let scene = app
@@ -26893,6 +27030,9 @@ mod tests {
             assert_eq!(settings, crate::settings::UiSettings::default());
 
             sheet.key(KeyCode::Tab, &mut settings, &features);
+            #[cfg(feature = "vst")]
+            assert_eq!(sheet.page(), SettingsPage::Vst, "Tab still pages");
+            #[cfg(not(feature = "vst"))]
             assert_eq!(sheet.page(), SettingsPage::Reference, "Tab still pages");
             sheet.show_page(SettingsPage::Sources);
             assert_eq!(
@@ -27469,6 +27609,7 @@ mod tests {
                         source_revision: "old".into(),
                         pending_cutover: false,
                         answered_repeat: request_id == 2,
+                        held: false,
                     }),
                 });
                 if request_id == 1 {
@@ -34475,7 +34616,7 @@ mod tests {
                     path: path.clone(),
                     editor_revision: app.editor().revision(),
                     source_revision: source_revision(&app.editor().source()),
-                    result: Ok(()),
+                    result: Ok(true),
                 });
                 let expected = if full {
                     format!("saved {}", path.display())
@@ -35225,6 +35366,10 @@ mod tests {
             // App enumerates the runner's audio or MIDI hardware.
             app.devices
                 .pin(crate::devices::DeviceInventory::no_hardware());
+            // Nor its plugins: with no standard plugin folder, a vst tab
+            // lists and loads no plugin of the machine.
+            #[cfg(feature = "vst")]
+            rustel_runtime::vst::pin_standard_folders(Vec::new());
             // A folder of its own, as the real one has: the config folder is
             // never the set's folder, and a prebake.strudel among the scores
             // would be read as one.
@@ -38907,6 +39052,8 @@ mod tests {
 mod theme_sheets;
 mod transport;
 mod viz_panel;
+#[cfg(feature = "vst")]
+mod vst;
 
 use bank_context::bank_machines_ranked;
 use completion::{Landing, ReferenceAnchor};
@@ -39135,7 +39282,7 @@ pub fn run(options: StudioOptions) -> Result<(), RuntimeError> {
                         .unwrap_or_else(|| std::path::Path::new(".")),
                     log.exists().then_some(log.as_path()),
                     file.as_deref(),
-                    &mut std::io::stdout(),
+                    &mut rustel_runtime::stdio::out().lock(),
                     &mut std::io::stdin().lock(),
                 );
                 if answer == crash::AfterCrash::Quit {
@@ -39354,6 +39501,10 @@ fn run_once(options: StudioOptions) -> Result<Session, RuntimeError> {
         app.remote = Some(Box::new(remote));
     }
     let mut terminal = TerminalSession::enter()?;
+    // A plugin prints when it wants. The interface has its own copy of the
+    // terminal stream, and the standard output of the process goes to the
+    // null device.
+    rustel_runtime::stdio::keep_clear();
     // Normal sessions move stderr into the Studio log. The hidden measurement
     // stream keeps stderr separate so its controller can consume the protocol.
     if !app.performance.enabled() && app.log.capture_stderr() {
@@ -39499,6 +39650,22 @@ struct App {
     #[cfg(feature = "hydra")]
     generator_session: super::ideas::Generator,
     catalogue_refreshed_at: Instant,
+    /// When the vst tab of the reference column last read the plugin list.
+    #[cfg(feature = "vst")]
+    plugins_polled_at: Instant,
+    /// The plugin host read its folders at the last turn.
+    #[cfg(feature = "vst")]
+    plugins_scanning: bool,
+    /// The plugins in their load at the last turn: see `rustel_runtime::vst::loads`.
+    #[cfg(feature = "vst")]
+    plugin_loads: Vec<String>,
+    /// The bundles the plugin scan tested and the bundles of the scan in
+    /// all at the last turn, while the scan runs.
+    #[cfg(feature = "vst")]
+    plugin_scan: Option<(usize, usize)>,
+    /// The plugin rows of the memory breakdown, as last measured.
+    #[cfg(feature = "vst")]
+    plugin_memory: Vec<super::memory::PluginMemory>,
     linter: Linter,
     /// The newest finding per scene, in the coordinates of the revision
     /// it was checked at.
@@ -39943,6 +40110,7 @@ struct App {
     tabs_closed: u64,
     live_material_sent: Option<Vec<(SceneId, LiveTextMark, bool)>>,
     tabs_closed_sent: u64,
+    plugins_shown_sent: Vec<String>,
     setups_select_variants_sent: bool,
     sent_setup_selected_variants: bool,
     /// The mixer widget's faders and which strip the keys drive.
@@ -40215,6 +40383,16 @@ impl App {
             #[cfg(feature = "hydra")]
             generator_session: super::ideas::Generator::default(),
             catalogue_refreshed_at: now,
+            #[cfg(feature = "vst")]
+            plugins_polled_at: now,
+            #[cfg(feature = "vst")]
+            plugins_scanning: false,
+            #[cfg(feature = "vst")]
+            plugin_loads: Vec::new(),
+            #[cfg(feature = "vst")]
+            plugin_scan: None,
+            #[cfg(feature = "vst")]
+            plugin_memory: Vec::new(),
             linter: Linter::spawn().map_err(RuntimeError::Io)?,
             lint: HashMap::new(),
             // Check what was opened before anything is typed.
@@ -40415,6 +40593,7 @@ impl App {
             tabs_closed: 0,
             live_material_sent: None,
             tabs_closed_sent: 0,
+            plugins_shown_sent: Vec::new(),
             setups_select_variants_sent: false,
             sent_setup_selected_variants: false,
             mixer,
@@ -40504,6 +40683,8 @@ impl App {
         app.forget_sources_in_gone_sets();
         app.adopt_global_sources();
         app.refresh_catalogue();
+        #[cfg(feature = "vst")]
+        app.adopt_vst_folders();
         // Laid out the way the set was left: the same scores in the same
         // panes, with the caret in the pane that had it.
         app.restore_panes();
@@ -40832,8 +41013,13 @@ impl App {
                 Some((*id, LiveTextMark::of(scene), *pinned))
             })
             .collect();
+        #[cfg(feature = "vst")]
+        let plugins = self.plugins_shown();
+        #[cfg(not(feature = "vst"))]
+        let plugins = Vec::new();
         if (self.live_material_sent.as_ref() == Some(&key)
-            && self.tabs_closed_sent == self.tabs_closed)
+            && self.tabs_closed_sent == self.tabs_closed
+            && self.plugins_shown_sent == plugins)
             || now.duration_since(self.last_edit_at) < LINT_DEBOUNCE
         {
             return;
@@ -40865,6 +41051,7 @@ impl App {
                 .collect(),
             tabs_closed: self.tabs_closed,
             setups_select_variants,
+            plugins: plugins.clone(),
         };
         if !self.worker.try_set_live_material(material.clone()) {
             // The queue is full: the next turn asks again.
@@ -40891,6 +41078,7 @@ impl App {
         load_variants_ahead(&ahead, setups_select_variants, &library);
         self.live_material_sent = Some(key);
         self.tabs_closed_sent = self.tabs_closed;
+        self.plugins_shown_sent = plugins;
         self.setups_select_variants_sent = setups_select_variants;
     }
 

@@ -274,6 +274,12 @@ jobs:
           mkdir -p "$TMPDIR" "$RUSTEL_SAMPLE_CACHE"
           bash .github/scripts/cargo-ci.sh test --workspace --all-targets --all-features --exclude rustel-studio-e2e -- --test-threads=1
 
+      # The Link wire test above is ignored: its shared port is bound on
+      # every interface, which the macOS firewall asks a desktop for, once
+      # per rebuilt binary. A runner has no dialog, so it runs here.
+      - name: Run the Link wire test
+        run: bash .github/scripts/cargo-ci.sh test -p rustel-runtime --all-features --test link -- --ignored --test-threads=1
+
   # Miri interprets the tests of the hand-written unsafe code and stops on
   # undefined behavior. The script holds the pinned nightly and the test list.
   miri:

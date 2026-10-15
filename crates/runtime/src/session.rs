@@ -1,8 +1,9 @@
 //! Headless Session: evaluate → query → schedule generations.
 //!
 //! Score evaluation and replacement live in `session/evaluation.rs`; finite
-//! playback and offline rendering live in `session/playback.rs`. This module
-//! owns the shared state and live scheduling.
+//! playback and offline rendering live in `session/playback.rs`. The wait of
+//! a live edit for its plugin copies lives in `session/plugin_wait.rs`. This
+//! module owns the shared state and live scheduling.
 
 mod evaluation;
 mod playback;
@@ -17,6 +18,10 @@ pub use recovery::SessionPanicPoint;
 pub(crate) mod confirmation;
 #[cfg(feature = "device-audio")]
 mod handover;
+#[cfg(all(feature = "vst", feature = "device-audio"))]
+mod plugin_wait;
+#[cfg(all(feature = "vst", feature = "device-audio"))]
+pub use plugin_wait::PLUGIN_WAIT;
 
 #[cfg(all(test, feature = "device-audio"))]
 mod voice_refusal_tests {
@@ -765,6 +770,8 @@ mod voice_refusal_tests {
     /// One mistake repeated through a window is one refusal record on the
     /// command line's direct log, not one per onset. (The diagnostics queue
     /// collapses a run by itself, so only the direct log can show this.)
+    /// A plugin problem is one line for each evaluation, in the queue and on
+    /// the direct log.
     #[test]
     fn a_repeated_refusal_is_one_direct_record_a_window() {
         let mut session = Session::with_config(SessionConfig {
@@ -793,6 +800,78 @@ mod voice_refusal_tests {
             .filter(|kind| kind == "voice-refused")
             .count();
         assert_eq!(refusals, 1, "one record for one repeated refusal");
+
+        // Across windows the refusal is said once per score text, like a
+        // plugin line: the set plays on, and a refusal that stays true is
+        // not news each window. A reinstall says it again.
+        session.set_direct_diagnostic_logging(false);
+        let refusal_count = |session: &mut Session, now: f64| -> usize {
+            session
+                .schedule_audio_live_at(now, RATE, Duration::ZERO, LiveQueryBudgetMode::Steady)
+                .unwrap_or_else(|_| panic!("the sine plays, the unknown sound is skipped"));
+            session
+                .take_diagnostics()
+                .into_iter()
+                .filter(|diagnostic| diagnostic.kind == "voice-refused")
+                .count()
+        };
+        session
+            .set_pattern(ordered_pair(
+                voice("sine", 1.0),
+                sound_controls("nosuchsound", Vec::new()),
+                false,
+            ))
+            .unwrap();
+        assert_eq!(refusal_count(&mut session, 0.0), 1);
+        assert_eq!(refusal_count(&mut session, 0.5), 0);
+        session
+            .set_pattern(ordered_pair(
+                voice("sine", 1.0),
+                sound_controls("nosuchsound", Vec::new()),
+                false,
+            ))
+            .unwrap();
+        assert_eq!(refusal_count(&mut session, 0.0), 1);
+
+        // Each note of each window gives the plugin notice again.
+        session.set_direct_diagnostic_logging(false);
+        let effect = Value::object(vec![("name".into(), Value::Str("delay".into()))]);
+        let with_plugin = || {
+            let effects = Value::List(vec![effect.clone()]);
+            sound_controls("sine", vec![("vst".into(), effects)])
+        };
+        let plugin_lines = |session: &mut Session, now: f64| -> Vec<String> {
+            session
+                .schedule_audio_live_at(now, RATE, Duration::ZERO, LiveQueryBudgetMode::Steady)
+                .unwrap_or_else(|_| panic!("a note with no plugin plays"));
+            let diagnostics = session.take_diagnostics().into_iter();
+            let lines = diagnostics.filter(|diagnostic| diagnostic.kind == PLUGIN_DIAGNOSTIC);
+            lines.map(|diagnostic| diagnostic.message).collect()
+        };
+        session.set_pattern(with_plugin()).unwrap();
+        assert_eq!(
+            plugin_lines(&mut session, 0.0),
+            ["vst skipped: this host has no plugins"]
+        );
+        assert!(plugin_lines(&mut session, 0.5).is_empty());
+        session.set_pattern(with_plugin()).unwrap();
+        assert_eq!(plugin_lines(&mut session, 0.0).len(), 1);
+
+        // A text evaluation has its own clear of the set.
+        let text = r#"note("c3").s("sine").vst("delay").fast(8)"#;
+        for _ in 0..2 {
+            session.evaluate(text).unwrap();
+            assert_eq!(session.last_path, EvaluateSource::JavaScript);
+            assert_eq!(plugin_lines(&mut session, 0.0).len(), 1);
+        }
+
+        // The direct log gets one record for each evaluation too.
+        session.set_direct_diagnostic_logging(true);
+        session.set_pattern(with_plugin()).unwrap();
+        assert!(plugin_lines(&mut session, 0.0).is_empty());
+        assert!(plugin_lines(&mut session, 0.5).is_empty());
+        let records = direct_diagnostics_for_test::take().into_iter();
+        assert_eq!(records.filter(|kind| kind == PLUGIN_DIAGNOSTIC).count(), 1);
     }
 
     #[test]
@@ -2065,6 +2144,10 @@ static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 /// Below this floor the exact file identity remains Pending and retryable.
 const MIN_LIVE_PREBAKE_CPU_BUDGET: Duration = Duration::from_millis(25);
 const MAX_PENDING_SESSION_DIAGNOSTICS: usize = 64;
+/// The time between 2 looks at the plugin copies a start or an edit waits
+/// for. Each look asks the plugin host for each copy.
+#[cfg(feature = "vst")]
+const PLUGIN_LOOK_EVERY: Duration = Duration::from_millis(20);
 #[cfg(feature = "midi")]
 const MAX_MIDI_INTENTS_PER_PASS: usize = 256;
 #[cfg(feature = "midi")]
@@ -2134,9 +2217,15 @@ pub const SAMPLE_LOADING_DIAGNOSTIC: &str = "sample-loading";
 /// substituted and the rest still plays. The message is one sentence for
 /// people; direct logging prints the notice's JSON record instead.
 pub const VOICE_NOTICE_DIAGNOSTIC: &str = "voice-notice";
+/// The kind of a plugin line: a note plays with no plugin or with one value
+/// less, or the plugin thread has a problem. The set plays on. A text goes
+/// out one time for each evaluation.
+pub const PLUGIN_DIAGNOSTIC: &str = "plugin";
 /// The kind a still-loading refusal carries when its notes wait rather than
 /// being skipped: a rewind's first window held whole until its samples are
-/// in, or a sample just ahead that an unpublished update waits for.
+/// in, or a sample just ahead that an unpublished update waits for. An edit
+/// that waits for its plugin copies gives one line of this kind too: see
+/// `Session::reload_live`.
 pub const SAMPLE_AWAITED_DIAGNOSTIC: &str = "sample-awaited";
 /// What a watched score evaluation gets when the horizon is already spent.
 ///
@@ -2162,6 +2251,20 @@ pub(crate) enum LivePrebakeAttempt {
 pub(crate) enum LiveScoreAttempt {
     Applied(u64),
     Deferred,
+    /// The edit waits for its plugin copies: see [`Session::reload_live`].
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    Waiting,
+}
+
+/// What a live reload did: see [`Session::reload_live`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(all(feature = "vst", feature = "device-audio"))]
+pub enum LiveReload {
+    /// The score is in play, with this generation.
+    Installed(u64),
+    /// A plugin copy of the edit is not ready. The score in play plays on,
+    /// and the session holds the text of the edit.
+    Waiting,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2660,6 +2763,33 @@ pub struct Session {
     scheduler: Scheduler,
     config: SessionConfig,
     last_source: Option<Arc<str>>,
+    /// The score of this session plays through the plugins of a live
+    /// output: see [`Self::attach_plugins`].
+    #[cfg(feature = "vst")]
+    plugins_live: AtomicBool,
+    /// The sample rate of that output, in Hz. Each plugin call of this
+    /// session asks for a copy at this rate.
+    #[cfg(feature = "vst")]
+    plugin_rate: std::sync::atomic::AtomicU32,
+    /// The plugin chains of the scores of this session. The names source
+    /// of the live output reads the same chains.
+    #[cfg(feature = "vst")]
+    chains: Arc<std::sync::Mutex<crate::vst::Chains>>,
+    /// The lanes of the scores of this session, each with the number its
+    /// plugin notes carry.
+    #[cfg(feature = "vst")]
+    lanes: crate::vst::LaneTable,
+    /// The last look of [`Self::plugins_pending`]: its time, the generation
+    /// of the score, and the count.
+    #[cfg(feature = "vst")]
+    plugin_look: std::cell::Cell<Option<(Instant, u64, usize)>>,
+    /// The edit that waits for its plugin copies, while the score in play
+    /// plays on: see [`Self::reload_live`].
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    plugin_hold: Option<plugin_wait::PluginHold>,
+    /// An edit waits for its plugin copies: see [`Self::set_plugin_wait`].
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    plugin_wait: bool,
     /// Files the most recent `preload(...)` asked for, until a caller waits.
     preload_requested: usize,
     /// Whether a setup this session ran picks sample variants: it writes an
@@ -2675,13 +2805,17 @@ pub struct Session {
     /// The input-channel warnings already said for this score and this
     /// input: a silent voice on `in:1` is news once, not once a window.
     input_warnings_reported: std::collections::BTreeSet<String>,
-    /// The "sample X is still loading" voice refusals already said for this
-    /// score, by kind: the loading episodes that re-query a held replacement
-    /// re-convert the same onsets every window, and without this the log
-    /// fills with the same warning per retry. Every install clears it - a
-    /// new score's loading refusal is news again. Awaited and skipped are
-    /// kept apart, so notes skipped after a wait are still said.
-    loading_refusals_reported: std::collections::BTreeSet<(&'static str, String)>,
+    /// The voice refusals already said for this score, by kind. One install
+    /// converts the same onsets over and over - a live set asks its score
+    /// every window, and a held replacement re-converts its first window on
+    /// every retry - so without this the log fills with the same warning and
+    /// a count that climbs while nothing changes. Every install clears it -
+    /// a new score's refusal is news again. Awaited and skipped are kept
+    /// apart, so notes skipped after a wait are still said.
+    refusals_reported: std::collections::BTreeSet<(&'static str, String)>,
+    /// The plugin lines already said for this score. A note gives its line
+    /// again in each window. Every install clears the set.
+    plugin_lines_reported: std::collections::BTreeSet<String>,
     /// Seconds rendered past the scheduled length, for the tail: the
     /// scheduler stops at the length, the reverbs and delays ring out into
     /// the tail, and a silence stop ends it when they have.
@@ -2942,12 +3076,27 @@ impl Session {
             scheduler,
             config,
             last_source: None,
+            #[cfg(feature = "vst")]
+            plugins_live: AtomicBool::new(false),
+            #[cfg(feature = "vst")]
+            plugin_rate: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "vst")]
+            chains: Arc::new(std::sync::Mutex::new(crate::vst::Chains::new())),
+            #[cfg(feature = "vst")]
+            lanes: crate::vst::LaneTable::default(),
+            #[cfg(feature = "vst")]
+            plugin_look: std::cell::Cell::new(None),
+            #[cfg(all(feature = "vst", feature = "device-audio"))]
+            plugin_hold: None,
+            #[cfg(all(feature = "vst", feature = "device-audio"))]
+            plugin_wait: true,
             preload_requested: 0,
             prebake_selects_variants: false,
             stop_when_silent: None,
             export_limiter: None,
             input_warnings_reported: std::collections::BTreeSet::new(),
-            loading_refusals_reported: std::collections::BTreeSet::new(),
+            refusals_reported: std::collections::BTreeSet::new(),
+            plugin_lines_reported: std::collections::BTreeSet::new(),
             render_tail_secs: 0.0,
             last_gap_log: None,
             #[cfg(feature = "device-audio")]
@@ -3169,6 +3318,67 @@ impl Session {
     /// from a score evaluation rather than a directly installed Rust pattern.
     pub fn active_source(&self) -> Option<&str> {
         self.last_source.as_deref()
+    }
+
+    /// Gives a live output the plugins of the process. From this call, the
+    /// score of this session is the score of that output: an edit keeps the
+    /// plugin copies of each chain it leaves as it was, and ends the copies
+    /// of a chain that left. The plugins run at the sample rate of the
+    /// output. The call is no score change: each commit tells the chains of
+    /// this session its score. A session with no such output prepares no
+    /// plugin copy, and its score changes do not reach the plugin host.
+    /// Each session has chains of its own, and each render to a file has
+    /// too.
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    pub fn attach_plugins(&self, device: &rustel_audio::LiveScalarDevice) {
+        self.plugin_rate
+            .store(device.sample_rate(), std::sync::atomic::Ordering::Relaxed);
+        self.plugins_live
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::vst::attach(device, &self.chains);
+    }
+
+    /// Gives the plugins the sample rate of the live output after a reopen
+    /// of the output. A reopen is no new attach: see [`Self::attach_plugins`].
+    #[cfg(feature = "vst")]
+    pub fn set_plugin_rate(&self, sample_rate: u32) {
+        self.plugin_rate
+            .store(sample_rate, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// True when the score of this session plays through the plugins of a
+    /// live output: see [`Self::attach_plugins`].
+    #[cfg(feature = "vst")]
+    pub fn plugins_live(&self) -> bool {
+        self.plugins_live.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Converts a note of this session for a live output: see
+    /// [`crate::render::live_audio_event`]. The note takes the number of
+    /// its plugin chain from the chains of this session.
+    fn live_audio_event(
+        &self,
+        onset: &OnsetEventJson,
+        sample_rate: u32,
+        cps: f64,
+        samples: &dyn rustel_voice::SampleLookup,
+    ) -> Result<rustel_audio::AudioEvent, rustel_voice::VoiceError> {
+        crate::render::live_audio_event(onset, sample_rate, cps, samples, |value| {
+            #[cfg(feature = "vst")]
+            if let ValueJson::Raw(value) = value {
+                return crate::vst::live_chain(&self.chains, value);
+            }
+            #[cfg(not(feature = "vst"))]
+            let _ = value;
+            None
+        })
+    }
+
+    /// Plugin calls named in a candidate source. Evaluated haps supply the
+    /// chain identity used to prepare each plugin copy.
+    #[cfg(feature = "vst")]
+    pub fn plugin_calls_for_source(&self, source: &str) -> Vec<crate::lint::NamedPlugin> {
+        crate::lint::live_plugins(source)
     }
 
     pub fn generation(&self) -> u64 {
@@ -3414,6 +3624,11 @@ impl Session {
             self.js.adopt_runtime_settings(&settings);
             self.core_settings_initialized = true;
         }
+        // A direct pattern has no text to read the plugin chains from.
+        #[cfg(feature = "vst")]
+        if result.is_ok() {
+            crate::vst::score_changed(&self.chains, None);
+        }
         result
     }
 
@@ -3428,7 +3643,8 @@ impl Session {
     ) -> Result<(), RuntimeError> {
         // A new score: its missing channels are its own news.
         self.input_warnings_reported.clear();
-        self.loading_refusals_reported.clear();
+        self.refusals_reported.clear();
+        self.plugin_lines_reported.clear();
         self.ensure_bindings()?;
         let builder = self.js.builder();
         self.js
@@ -3646,7 +3862,8 @@ impl Session {
     /// unless the host turned it on, as the `rustel` command line does. With
     /// it off, diagnostics are collected for [`Self::take_diagnostics`],
     /// which a host drains from its presentation loop; they include `.log()`
-    /// lines and the voice resolver's notices ([`VOICE_NOTICE_DIAGNOSTIC`]).
+    /// lines, the voice resolver's notices ([`VOICE_NOTICE_DIAGNOSTIC`]) and
+    /// the plugin lines ([`PLUGIN_DIAGNOSTIC`]).
     /// It also decides whether [`Self::render`] and [`Self::render_session`]
     /// print progress.
     pub fn set_direct_diagnostic_logging(&mut self, enabled: bool) {
@@ -3913,15 +4130,42 @@ impl Session {
 
     /// Queue the notices one [`rustel_voice::with_diagnostic_policy`] scope
     /// collected, as [`VOICE_NOTICE_DIAGNOSTIC`]s. A notice already pending
-    /// is not queued again, so one raised every window holds one place.
+    /// is not queued again, so one raised every window holds one place. A
+    /// plugin notice is a plugin line: see [`Self::report_plugin_line`].
     fn report_voice_notices(&mut self, notices: Vec<rustel_voice::VoiceNotice>) {
         for notice in notices {
+            if notice.record.get("vst_skipped").is_some() {
+                self.report_plugin_line(notice.message, notice.record);
+                continue;
+            }
             let pending = self.pending_diagnostics.iter().any(|diagnostic| {
                 diagnostic.kind == VOICE_NOTICE_DIAGNOSTIC && diagnostic.message == notice.message
             });
             if !pending {
                 self.report_diagnostic(VOICE_NOTICE_DIAGNOSTIC, notice.message, notice.record);
             }
+        }
+        // A problem of the plugin thread has no note to report through, so
+        // its line joins here. Only the session of the live output takes the
+        // lines of the host. A session with no live output leaves them.
+        #[cfg(feature = "vst")]
+        if self.plugins_live() {
+            for message in crate::vst::take_errors() {
+                let record = serde_json::json!({ "vst_skipped": { "message": &message } });
+                self.report_plugin_line(message, record);
+            }
+        }
+    }
+
+    /// Queue one plugin line as a [`PLUGIN_DIAGNOSTIC`]. A note gives its
+    /// line again in each window, so a text goes out one time for each
+    /// evaluation. A score with a new text for each note fills the set, and
+    /// its later texts do not go out.
+    fn report_plugin_line(&mut self, message: String, record: serde_json::Value) {
+        if self.plugin_lines_reported.len() < MAX_PENDING_SESSION_DIAGNOSTICS
+            && self.plugin_lines_reported.insert(message.clone())
+        {
+            self.report_diagnostic(PLUGIN_DIAGNOSTIC, message, record);
         }
     }
 
@@ -4008,18 +4252,37 @@ impl Session {
     /// with the variants its onsets pick there: what the score is about to
     /// play, names it builds in JavaScript among them. Empty when the query
     /// did not finish.
+    ///
+    /// The plugins of the window load too, for the score of a live output.
+    /// This part needs no sample library.
     pub fn kick_sample_loads_within(
         &mut self,
         from_cycle: f64,
         cycles: f64,
         ceiling: Duration,
     ) -> Vec<(String, crate::sounds::Variants)> {
-        let Some(library) = self.samples.clone() else {
+        let library = self.samples.clone();
+        // A session with no sample library still has the plugins of its
+        // live output.
+        #[cfg(feature = "vst")]
+        let plugins = self.plugins_live();
+        #[cfg(not(feature = "vst"))]
+        let plugins = false;
+        if library.is_none() && !plugins {
+            return Vec::new();
+        }
+        let haps = self.window_haps(from_cycle, cycles, ceiling);
+        // A plugin loads as a sample does: before the first note asks.
+        #[cfg(feature = "vst")]
+        if plugins {
+            self.ensure_plugins(&haps);
+        }
+        let Some(library) = library else {
             return Vec::new();
         };
         let mut resolved: std::collections::BTreeMap<String, std::collections::BTreeSet<i64>> =
             std::collections::BTreeMap::new();
-        for sound in self.window_sounds(from_cycle, cycles, ceiling) {
+        for sound in Self::sounds_in(&haps) {
             // `.bank("tr909")` makes the sound `tr909_bd`. Warming only `bd`
             // fetches a different bank's files, and the lane's first hit is
             // refused. Warm the banked spelling too, as the voice looks it up.
@@ -4054,16 +4317,64 @@ impl Session {
         cycles: f64,
         ceiling: Duration,
     ) -> Vec<WindowSound> {
+        Self::sounds_in(&self.window_haps(from_cycle, cycles, ceiling))
+    }
+
+    /// The plugin copies the notes of the score need from `from_cycle` for
+    /// `cycles` that are not ready, at the rate of the output. A copy the
+    /// output holds on its slot is ready. A start that waits for its sounds
+    /// waits while the count is above 0, and the caller decides how long.
+    /// The call makes the host build each copy it counts, and waits for
+    /// nothing. A call less than [`PLUGIN_LOOK_EVERY`] after the look of the
+    /// same score gives the count of that look. A session with no live
+    /// output waits for no copy: the count is 0, with no call to the
+    /// plugin host.
+    #[cfg(feature = "vst")]
+    pub fn plugins_pending(&self, from_cycle: f64, cycles: f64, ceiling: Duration) -> usize {
+        if !self.plugins_live() {
+            return 0;
+        }
+        let now = Instant::now();
+        let generation = self.generation();
+        if let Some((looked, of, pending)) = self.plugin_look.get()
+            && of == generation
+            && now.duration_since(looked) < PLUGIN_LOOK_EVERY
+        {
+            return pending;
+        }
+        // The notes of a look do not play now, so their console lines go.
+        let haps = self
+            .js
+            .with_logs_dropped(|| self.window_haps(from_cycle, cycles, ceiling));
+        let pending = self.ensure_plugins(&haps);
+        self.plugin_look.set(Some((now, generation, pending)));
+        pending
+    }
+
+    /// Makes the plugin host build each plugin copy that the haps of the
+    /// score in play need, at the rate of the output: see
+    /// [`crate::vst::ensure`]. Gives the count of the copies not ready.
+    #[cfg(feature = "vst")]
+    fn ensure_plugins(&self, haps: &[crate::HapJson]) -> usize {
+        let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
+        let wants = crate::vst::wants(haps, |value| crate::vst::live_chain(&self.chains, value));
+        crate::vst::ensure(&wants, rate).len()
+    }
+
+    /// The haps the active score has from `from_cycle` for `cycles`. Empty
+    /// when the query does not finish within `ceiling`.
+    fn window_haps(&self, from_cycle: f64, cycles: f64, ceiling: Duration) -> Vec<crate::HapJson> {
         let begin = Fraction::from_f64(from_cycle.max(0.0)).unwrap_or(Fraction::ZERO);
         let span = Fraction::from_f64(cycles.max(1.0)).unwrap_or(Fraction::int(2));
         let ceiling = Instant::now() + ceiling;
-        let Ok(report) =
-            rustel_core::with_query_deadline(ceiling, || self.query_report(begin, begin.add(span)))
-        else {
-            return Vec::new();
-        };
+        rustel_core::with_query_deadline(ceiling, || self.query_report(begin, begin.add(span)))
+            .map(|report| report.haps)
+            .unwrap_or_default()
+    }
+
+    fn sounds_in(haps: &[crate::HapJson]) -> Vec<WindowSound> {
         let mut sounds = Vec::new();
-        for hap in &report.haps {
+        for hap in haps {
             let crate::ValueJson::Raw(serde_json::Value::Object(object)) = &hap.value else {
                 continue;
             };
@@ -4166,7 +4477,7 @@ impl Session {
                     ui_visuals: hap.ui_visuals_context(),
                     log_line: None,
                 };
-                match crate::render::live_audio_event(&onset, sample_rate, cps, lookup) {
+                match self.live_audio_event(&onset, sample_rate, cps, lookup) {
                     Ok(_) => rendered = true,
                     Err(error @ rustel_voice::VoiceError::SampleLoading(_)) => {
                         loading = Some(error.to_string());
@@ -4229,6 +4540,14 @@ impl Session {
     /// Drop a from-zero request the reload it was set for never consumed.
     pub fn clear_next_from_zero(&mut self) {
         self.next_from_zero = false;
+    }
+
+    /// Take back a from-zero request the reload it was set for did not
+    /// consume: true when the request was set. An edit that waits for its
+    /// plugin copies installs nothing, so its caller keeps the request for
+    /// the next try of the edit.
+    pub fn take_next_from_zero(&mut self) -> bool {
+        std::mem::take(&mut self.next_from_zero)
     }
 
     /// The live-reload re-query cursor margin: how far past `now` the audio
@@ -5064,7 +5383,7 @@ impl Session {
                 onsets
                     .iter()
                     .filter_map(|onset| {
-                        match crate::render::live_audio_event(onset, sample_rate, cps, lookup) {
+                        match self.live_audio_event(onset, sample_rate, cps, lookup) {
                             Ok(event) => {
                                 if let Some(warning) = self.input_channel_warning(&event)
                                     && !input_warnings.contains(&warning)
@@ -5085,12 +5404,19 @@ impl Session {
                     .collect()
             });
         self.report_voice_notices(notices);
+        // Said once per score text, like a plugin line: the set plays on,
+        // and a refusal that stays true is not news each window.
         for message in refusals {
-            self.report_diagnostic(
-                "voice-refused",
-                message.clone(),
-                serde_json::json!({ "voice_refused": { "message": message } }),
-            );
+            if self
+                .refusals_reported
+                .insert(("voice-refused", message.clone()))
+            {
+                self.report_diagnostic(
+                    "voice-refused",
+                    message.clone(),
+                    serde_json::json!({ "voice_refused": { "message": message } }),
+                );
+            }
         }
         for message in input_warnings {
             if self.input_warnings_reported.insert(message.clone()) {
@@ -5478,6 +5804,13 @@ impl Session {
     ) -> Result<LiveAudioBatch, LiveAudioScheduleError> {
         // The producer publishes a takeover at this same rate.
         self.live_sample_rate = (sample_rate > 0).then_some(sample_rate);
+        // The plugins of the output run at this rate too. A reopen of the
+        // output gives a new rate with no new attach.
+        #[cfg(feature = "vst")]
+        if sample_rate > 0 {
+            self.plugin_rate
+                .store(sample_rate, std::sync::atomic::Ordering::Relaxed);
+        }
         self.with_panic_recovery(now, |session| {
             Ok(session.schedule_audio_live_with_cover_at_guarded(
                 now,
@@ -5816,7 +6149,7 @@ impl Session {
                 onsets
                     .iter()
                     .filter_map(|onset| {
-                        match crate::render::live_audio_event(onset, sample_rate, cps, lookup) {
+                        match self.live_audio_event(onset, sample_rate, cps, lookup) {
                             Ok(event) => {
                                 if let Some(warning) = self.input_channel_warning(&event)
                                     && !input_warnings.contains(&warning)
@@ -5966,14 +6299,10 @@ impl Session {
             .unwrap_or(u64::MAX)
             .saturating_sub(record.converted_audio_events);
         let refused = refusals.last().map(|(_, message)| message.clone());
-        // A replacement still waiting to publish re-converts the same first
-        // window every retry (a rewind's held window is reopened and asked
-        // again), so its refusals are said ONCE per install - loading or
-        // not - or a held rewind logs the same refusal many times a second.
-        let held_replacement = matches!(mode, LiveQueryBudgetMode::ReplacementPrefill);
         // A rewind whose whole first window waits for its samples is
         // reopened and heard whole once they are in, so its loading
         // refusals are notes awaited, not skipped.
+        let held_replacement = matches!(mode, LiveQueryBudgetMode::ReplacementPrefill);
         let window_awaited = held_replacement
             && self.requery_takeover_cut != TakeoverCut::None
             && !onsets.is_empty()
@@ -5986,16 +6315,15 @@ impl Session {
                 (true, false) => SAMPLE_LOADING_DIAGNOSTIC,
                 (false, _) => "voice-refused",
             };
-            // Once playing, loading refusals are still said once, which is
-            // how the studio gathers the sounds a load skipped into one
-            // line after it and the command line says it is waiting; any
-            // other refusal reports every window: a repeated genuine
-            // refusal of a sounding score IS news.
-            if !(held_replacement || loading)
-                || self
-                    .loading_refusals_reported
-                    .insert((kind, message.clone()))
-            {
+            // Every refusal is said once per score text, like a plugin
+            // line: a held replacement re-converts its first window on
+            // every retry, a live set asks its score every window, and a
+            // refusal that stays true is not news each time. The studio
+            // still gathers the sounds a load skipped into one line, the
+            // command line still says it is waiting, and a refusal first
+            // scheduled in a later section lands when its onsets first
+            // come up.
+            if self.refusals_reported.insert((kind, message.clone())) {
                 if loading {
                     self.report_diagnostic(
                         kind,
@@ -6087,7 +6415,7 @@ impl Session {
                         // as awaited, since the update waits for it rather
                         // than skipping its notes.
                         if self
-                            .loading_refusals_reported
+                            .refusals_reported
                             .insert((SAMPLE_AWAITED_DIAGNOSTIC, loading.clone()))
                         {
                             self.report_diagnostic(
@@ -6339,6 +6667,38 @@ mod playback_reanchor_tests {
 
 #[cfg(test)]
 mod tests {
+    /// The first plugin note of the first cycle.
+    #[cfg(feature = "vst")]
+    pub(super) fn plugin_note(session: &Session) -> serde_json::Value {
+        let report = session
+            .query_report(Fraction::ZERO, Fraction::ONE)
+            .expect("query");
+        let values = report.haps.iter();
+        let mut values = values.map(|hap| serde_json::to_value(&hap.value).expect("value"));
+        let note = values.find(|value| value.get("vst").or(value.get("vsti")).is_some());
+        note.expect("plugin note")
+    }
+
+    #[cfg(feature = "vst")]
+    pub(super) fn plugin_chain(session: &Session) -> u64 {
+        crate::vst::live_chain(&session.chains, &plugin_note(session)).expect("plugin chain")
+    }
+
+    /// The fixture plugin in a new folder, as the only plugin folder of the
+    /// process: no test reads the plugins or the presets of the machine. A
+    /// new folder is a new plugin for the plugin host, so its first copy is
+    /// not ready at once. One test at a time has the folder.
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    pub(super) fn fixture_plugins() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
+        static FOLDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let one = FOLDER.lock().unwrap_or_else(|poison| poison.into_inner());
+        let folder = tempfile::tempdir().expect("plugin folder");
+        rustel_vst3_fixture::install(folder.path());
+        crate::vst::pin_standard_folders(vec![folder.path().to_path_buf()]);
+        crate::vst::host().set_preset_folder(folder.path().join("presets"));
+        (one, folder)
+    }
+
     /// `setGainCurve` shapes every gain, the default 0.8 included, as
     /// superdough does.
     #[test]
@@ -8179,6 +8539,8 @@ mod tests {
 
     use super::test_support::session_with_sample_origin;
     use super::*;
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    use crate::test_support::past_the_cover;
     use rustel_core::Value;
 
     mod hap_budget {
@@ -18304,7 +18666,18 @@ mod tests {
     #[test]
     fn captured_direct_pattern_clears_a_later_textual_rollback_target() {
         let mut session = Session::new().expect("session");
+        #[cfg(not(feature = "vst"))]
         session.evaluate_mini("bd").expect("source A");
+        #[cfg(feature = "vst")]
+        {
+            let source = r#"s("sine").vst("Delay").orbit(1)"#;
+            session.evaluate(source).expect("source A");
+            let chain = plugin_chain(&session);
+            session
+                .reload_at(&source.replace("orbit(1)", "orbit(2)"), false, 0.1)
+                .expect("move plugin");
+            assert_eq!(plugin_chain(&session), chain);
+        }
         // Inject replay policy, not consumer-copy evidence.
         session
             .mark_audible_generation(session.generation())
@@ -18427,6 +18800,82 @@ mod tests {
                 .show(),
             "s:bd"
         );
+
+        #[cfg(feature = "vst")]
+        {
+            let mut session = Session::new().expect("session");
+            let source = r#"$: s("sine").vst("Delay").orbit(1)"#;
+            session.evaluate(source).expect("audible plugin source");
+            session
+                .mark_audible_generation(session.generation())
+                .expect("retain playing source");
+            let chain = plugin_chain(&session);
+            let moved = source.replace("orbit(1)", "orbit(2)");
+            assert_eq!(session.plugin_calls_for_source(&moved)[0].orbit, Some(2));
+            session.reload_at(&moved, false, 0.1).expect("move to two");
+            assert_eq!(plugin_chain(&session), chain);
+            // A cancelled text with a different lane. Then an edit of the
+            // lane and a new lane above in one evaluation: the lane keeps
+            // its number, and so its chain.
+            let moved = format!("$: s(\"hh\")\n{}", source.replace("orbit(1)", "orbit(3)"));
+            let other = r#"$: note("a1 e2").lpf(400)"#;
+            for cancelled in [other, moved.as_str()] {
+                assert!(matches!(
+                    session.evaluate_cancellable(cancelled, &AtomicBool::new(true)),
+                    Err(RuntimeError::Cancelled)
+                ));
+                assert_eq!(plugin_chain(&session), chain);
+            }
+            session
+                .reload_at(&moved, false, 0.2)
+                .expect("move to three");
+            assert_eq!(plugin_note(&session)["__rustel_lane"], "#0");
+            assert_eq!(plugin_chain(&session), chain);
+            // A score with no plugin lane is not audible too. The rollback
+            // gives the plugin lane the number it had.
+            session
+                .reload_at(other, false, 0.25)
+                .expect("no plugin lane");
+            assert_eq!(
+                session
+                    .rollback_to_previous_source(0.3)
+                    .expect("rollback orbit"),
+                RollbackAttempt::Applied
+            );
+            assert_eq!(session.active_source(), Some(source));
+            assert_eq!(plugin_note(&session)["__rustel_lane"], "#0");
+            assert_eq!(plugin_chain(&session), chain);
+
+            // A live output, and a plugin with no copy ready. An edit waits,
+            // and a rollback in the same state plays at once. The commit of
+            // the rollback reads a clock past the cover, so it comes last.
+            let _plugins = fixture_plugins();
+            let relaxed = std::sync::atomic::Ordering::Relaxed;
+            session.plugins_live.store(true, relaxed);
+            session.plugin_rate.store(48_000, relaxed);
+            let edit = format!("{source}\n$: note(\"c3\").s(\"sine\").vst(\"rustel fixture\")");
+            let reserve = Duration::from_millis(1);
+            let stopped = AtomicBool::new(false);
+            session.schedule_through(0.3, 0.3).expect("cover");
+            let clock = past_the_cover(0.35);
+            let attempt =
+                session.evaluate_live_score_cancellable(&edit, false, reserve, &stopped, clock);
+            assert_eq!(attempt.expect("edit"), LiveScoreAttempt::Waiting);
+            assert_eq!(session.active_source(), Some(source));
+            session.cancel_plugin_hold();
+            session.reload_at(&edit, false, 0.4).expect("plugin edit");
+            session
+                .mark_audible_generation(session.generation())
+                .expect("retain the plugin edit");
+            session
+                .reload_at(other, false, 0.45)
+                .expect("no plugin lane");
+            session.schedule_through(0.45, 0.45).expect("cover");
+            let rollback = session.rollback_to_previous_source_with_clock(past_the_cover(0.5));
+            assert_eq!(rollback.expect("rollback"), RollbackAttempt::Applied);
+            assert_eq!(session.active_source(), Some(edit.as_str()));
+            assert!(!session.holds_edit(&edit));
+        }
     }
 
     #[cfg(feature = "device-audio")]

@@ -200,7 +200,9 @@ impl App {
                 self.silence_preview();
                 // Update is the save: the file is what you hear. The write
                 // and the evaluate leave together; a rejected score is still
-                // the score on disk, exactly as a watched set behaves.
+                // the score on disk, exactly as a watched set behaves. A
+                // file that already holds the text is left alone, so playing
+                // a set you only opened does not touch it.
                 self.playing_pane = Some(self.focused);
                 let scene = self.scenes.current().id;
                 // A replay tab's text is one block. Updates save normal

@@ -184,6 +184,8 @@ enum EngineCommand {
     AuditionRun(Vec<f32>, String, f32, f64),
     /// Silence the sounding preview, leaving the score alone.
     StopAudition,
+    /// The keyboard sound and volume. `prepare` is true while Piano mode is
+    /// open, and opens the keyboard output. False closes Piano mode.
     ConfigurePiano {
         sound: super::PianoSound,
         volume: u16,
@@ -1164,7 +1166,8 @@ fn try_send_snapshot(
     }
 }
 
-/// An evaluate the engine is holding until its cycle line.
+/// An evaluate the engine is holding until its cycle line, or until its
+/// sounds and its plugin copies are ready.
 struct ArmedRequest {
     request_id: u64,
     editor_revision: u64,
@@ -1474,6 +1477,15 @@ fn process_command(
                     playback_stopped: false,
                 })
             };
+            // An edit that waits for its plugin copies keeps the last score
+            // playing, and is answered when it lands.
+            if result.as_ref().is_ok_and(|install| install.held) {
+                *armed = Some(ArmedRequest {
+                    request_id,
+                    editor_revision,
+                });
+                return false;
+            }
             push_control(
                 pending,
                 StudioControlEvent::Evaluation(EvaluationOutcome {
@@ -1633,7 +1645,9 @@ fn process_command(
             prepare,
         } => {
             engine.set_piano_settings(sound, volume);
-            if prepare && let Err(error) = engine.prepare_piano() {
+            if !prepare {
+                engine.close_piano_mode();
+            } else if let Err(error) = engine.prepare_piano() {
                 push_control(
                     pending,
                     StudioControlEvent::Diagnostic(StudioDiagnostic::message(

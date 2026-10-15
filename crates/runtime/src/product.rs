@@ -45,8 +45,7 @@ macro_rules! define_product {
             "Windows; only shell quoting and file paths differ between them."
         );
         pub const RENDER_LONG_ABOUT: &str = concat!(
-            "Bounce a score to a file, offline: no audio device is opened, and the same ",
-            "score gives the same bytes every run.\n\n    ",
+            "Bounce a score to a file, offline: no audio device is opened.\n\n    ",
             $command_name,
             " export song.strudel                  # song.wav beside the score, 8 cycles\n    ",
             $command_name,

@@ -70,6 +70,8 @@ pub mod settings;
 /// Reading sound names out of score TEXT, so warming covers what a query
 /// cannot see: lanes commented out for later, and muted `_$:` lanes.
 pub mod sounds;
+/// The standard output of the process, kept clear of plugin text.
+pub mod stdio;
 /// Showing untrusted text on a terminal as visible characters only.
 pub mod terminal_text;
 #[cfg(any(test, feature = "test-support"))]
@@ -80,6 +82,8 @@ pub mod ui_analysis;
 /// Bounded, versioned live-editor event protocol.
 pub mod ui_events;
 pub mod updates;
+#[cfg(feature = "vst")]
+pub mod vst;
 mod watch;
 
 pub use capabilities::{
@@ -152,13 +156,15 @@ pub use samples::{
 };
 pub use score_import::{ScoreImportAccess, import_origin};
 pub use session::{
-    EvaluateSource, PREVIEW_ONSET_ID_FLAG, RuntimeError, SAMPLE_AWAITED_DIAGNOSTIC,
-    SAMPLE_LOADING_DIAGNOSTIC, Session, SessionConfig, SessionDiagnostic, VOICE_NOTICE_DIAGNOSTIC,
-    WindowSound,
+    EvaluateSource, PLUGIN_DIAGNOSTIC, PREVIEW_ONSET_ID_FLAG, RuntimeError,
+    SAMPLE_AWAITED_DIAGNOSTIC, SAMPLE_LOADING_DIAGNOSTIC, Session, SessionConfig,
+    SessionDiagnostic, VOICE_NOTICE_DIAGNOSTIC, WindowSound,
 };
 
 #[cfg(any(test, feature = "test-support"))]
 pub use session::SessionPanicPoint;
+#[cfg(all(feature = "vst", feature = "device-audio"))]
+pub use session::{LiveReload, PLUGIN_WAIT};
 pub use session::{catch_score_panic, panic_is_contained};
 pub use watch::{
     FileWatch, MAX_WATCH_SOURCE_BYTES, ReloadEvent, ReloadStatus, WatchLanguage, WatchPoll,

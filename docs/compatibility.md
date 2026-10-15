@@ -23,7 +23,7 @@ These names remain available, but the named feature is inactive.
 
 | Names | Native behavior |
 | --- | --- |
-| `aliasBank` | Does not register bank aliases. |
+| `aliasBank` | Does not register bank aliases of your own. The default aliases are applied anyway. |
 | `registerSynthSounds` | Does not register additional synths. |
 | `loadSoundfont` | Returns an empty object without loading a soundfont. |
 | `.webaudio()`, `.csound()`, `.tone()`, `.webdirt()`, `.speak()`, `.wave()`, `.soundfont()`, `.dough()`, `.fscope()` | Return the pattern unchanged. They do not select an output, produce speech, load a font, or open a frequency scope. |

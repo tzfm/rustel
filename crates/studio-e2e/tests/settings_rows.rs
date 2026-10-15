@@ -93,12 +93,10 @@ fn open_advanced(studio: &mut Hermetic) {
     studio.settle();
 }
 
-/// Open the sheet on the About page - the eighth of eight tabs.
+/// Open the sheet on the About page, the last tab.
 fn open_about(studio: &mut Hermetic) {
     open_sheet(studio);
-    for _ in 0..7 {
-        studio.press(KeyCode::Tab, KeyModifiers::NONE);
-    }
+    studio.press(KeyCode::BackTab, KeyModifiers::SHIFT);
     studio.settle();
 }
 
@@ -791,8 +789,9 @@ fn settings_and_advanced_keep_their_place_until_studio_restarts() {
 }
 
 /// A score that imports a script from an origin nobody trusted is refused,
-/// and the footer names the Trust page. The page offers the origin, Enter
-/// trusts it, and the next studio still trusts it.
+/// and the footer names the Trust page. The page offers the origin as a
+/// switch: Enter trusts it, Space turns the trust off where the row stands,
+/// and the next studio still trusts it.
 #[test]
 fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
     let mut studio = hermetic();
@@ -805,19 +804,27 @@ fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
     );
 
     open_sheet(&mut studio);
-    for _ in 0..6 {
-        studio.press(KeyCode::Tab, KeyModifiers::NONE);
+    for _ in 0..2 {
+        studio.press(KeyCode::BackTab, KeyModifiers::SHIFT);
     }
     studio.settle();
     let refused = row_with(&mut studio, "https://scripts.invalid");
     assert!(
-        refused.contains("▸") && refused.contains("refused"),
+        refused.contains("▸") && refused.contains("off"),
         "{refused}"
     );
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();
-    assert!(row_with(&mut studio, "https://scripts.invalid").contains("trusted"));
+    assert!(row_with(&mut studio, "https://scripts.invalid").contains("  on"));
     assert_eq!(studio.errors(), None, "the refusal left with the trust");
+    // Space takes the trust back, and the row stays to give it again.
+    studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
+    studio.settle();
+    let off = row_with(&mut studio, "https://scripts.invalid");
+    assert!(off.contains("  off"), "{off}");
+    studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
+    studio.settle();
+    assert!(row_with(&mut studio, "https://scripts.invalid").contains("  on"));
 
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     studio.settle();
@@ -827,21 +834,21 @@ fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
     studio.quit();
     let mut studio = reopen_over(studio);
     open_sheet(&mut studio);
-    for _ in 0..6 {
-        studio.press(KeyCode::Tab, KeyModifiers::NONE);
+    for _ in 0..2 {
+        studio.press(KeyCode::BackTab, KeyModifiers::SHIFT);
     }
     studio.settle();
-    assert!(row_with(&mut studio, "https://scripts.invalid").contains("trusted"));
+    assert!(row_with(&mut studio, "https://scripts.invalid").contains("  on"));
     // `d` takes the origin off the page.
     studio.press(KeyCode::Char('d'), KeyModifiers::NONE);
     studio.settle();
     assert!(studio.rows().join("\n").contains("none yet"));
 }
 
-/// Tab walks the strip's eight pages in order and wraps - each page
+/// Tab walks the strip's pages in order and wraps - each page
 /// recognised by a row only it draws.
 #[test]
-fn tab_cycles_the_eight_pages_and_wraps() {
+fn tab_cycles_the_pages_and_wraps() {
     let mut studio = hermetic();
     open_sheet(&mut studio);
 
@@ -850,6 +857,7 @@ fn tab_cycles_the_eight_pages_and_wraps() {
         "not assigned",         // mapping: the slot boxes
         "automatic",            // keybinds: the terminal-profile row
         "fetch imports",        // sources
+        "add folder",           // vst
         "OSC / SuperDirt",      // reference
         "none yet",             // trust
         "Terminal: rustel-e2e", // about

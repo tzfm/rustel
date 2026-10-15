@@ -10,6 +10,7 @@ Use `rustel --help` for command options and `rustel doc NAME` for pattern help.
 | Use your own samples | [Local samples](local-samples.md) |
 | Record or replay a set | [Sessions](sessions.md) |
 | Connect devices | [Hardware](hardware.md) |
+| Use VST3 effects and instruments | [Plugins](plugins.md) |
 | Add visuals | [Hydra](hydra.md) |
 | Check unsupported features | [Compatibility](compatibility.md) |
 | Find extensions and engine details | [Overview](overview.md) |
