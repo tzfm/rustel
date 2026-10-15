@@ -146,6 +146,8 @@ impl Studio {
             // No audio input in the harness: `s("in")` opens nothing and the
             // device panel shows no live input unless a test says otherwise.
             input: None,
+            // The harness never joins the network's session.
+            link: false,
             cancellation: None,
             recording: options.recording,
             build_features: &[],

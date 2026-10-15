@@ -259,6 +259,14 @@ impl App {
             self.panel = Some(panel);
         } else if panel.kind == DeviceKind::Midi {
             self.click_midi_row(&mut panel, geometry, x, y);
+        } else if panel.kind == DeviceKind::Link {
+            if let Some(index) = geometry.entry_at(x, y) {
+                panel.selected = index;
+                panel.first = geometry.first;
+                panel.hold_scroll = true;
+                self.panel = Some(panel);
+                self.set_link(!self.link_enabled);
+            }
         } else if let Some(index) = geometry.entry_at(x, y)
             && index < self.devices.inventory().entries(panel.kind).len()
         {
@@ -468,6 +476,16 @@ impl App {
             if !keep_open {
                 self.settle_focus();
             }
+            self.dirty_frame = true;
+            return Ok(true);
+        }
+        // The Link tab is one checkbox: Space or Enter joins the session
+        // or leaves it, and the list stays up to watch the others arrive.
+        if panel.kind == DeviceKind::Link
+            && (code == KeyCode::Char(' ') || (code == KeyCode::Enter && !primary))
+        {
+            self.set_link(!self.link_enabled);
+            self.panel = Some(panel);
             self.dirty_frame = true;
             return Ok(true);
         }
@@ -729,8 +747,9 @@ impl App {
             }
             // A MIDI row is acted on by `handle_midi_tab_key`, which knows
             // whether it is a port or a clock row; there is no plain entry to
-            // copy here.
-            DeviceKind::Midi => {}
+            // copy here. The Link row is acted on the same way, by its own
+            // key and click paths.
+            DeviceKind::Midi | DeviceKind::Link => {}
             DeviceKind::Gamepad => {
                 let snippet = kind.snippet(&entry.name);
                 match self.clipboard.set_text(snippet.clone()) {

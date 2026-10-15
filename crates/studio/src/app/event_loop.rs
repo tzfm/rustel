@@ -127,6 +127,7 @@ impl App {
         self.flush_pending_slider();
         self.tick_replays();
         self.drain_engine();
+        self.pump_link();
         self.drain_save();
         self.drain_pads();
         if self.pads.poll_visual_change(ACTIVITY_LIGHT_MILLIS) {

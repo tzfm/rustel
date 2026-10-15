@@ -186,9 +186,11 @@ objc2-game-controller = { version = "0.3", optional = true, default-features = f
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-# Validate an opened sample handle's final path before serving from it.
+# Validate an opened sample handle's final path before serving from it,
+# and hold the shared Link port beside any other participant.
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
+  "Win32_Networking_WinSock",
   "Win32_Storage_FileSystem",
   "Win32_System_ProcessStatus",
   "Win32_System_Threading",
