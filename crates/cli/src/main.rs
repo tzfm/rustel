@@ -1239,7 +1239,7 @@ enum Command {
         #[arg(long = "score-events", requires = "watch")]
         score_events: bool,
     },
-    /// Bounce a score to a file, offline - the same bytes every run.
+    /// Bounce a score to a file, offline.
     #[command(visible_alias = "export", long_about = product::RENDER_LONG_ABOUT)]
     Render {
         #[command(flatten)]
