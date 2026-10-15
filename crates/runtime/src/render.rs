@@ -1539,7 +1539,7 @@ mod tests {
             &rustel_voice::BundledOnly,
         )
         .expect_err("unknown sample name must not be mapped to an oscillator");
-        assert!(error.contains("unknown sound"), "{error}");
+        assert!(error.contains("sd is not loaded"), "{error}");
     }
 
     #[test]
@@ -1645,7 +1645,7 @@ mod tests {
             &rustel_voice::BundledOnly,
         )
         .expect_err("sample bank lookup is case-sensitive on strudel.cc");
-        assert!(error.contains("unknown sound"), "{error}");
+        assert!(error.contains("bd is not loaded"), "{error}");
     }
 
     #[test]

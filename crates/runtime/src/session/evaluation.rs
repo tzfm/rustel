@@ -978,7 +978,7 @@ impl Session {
         // and its plugin lines afresh. Both JavaScript and mini installs pass
         // through this point.
         self.input_warnings_reported.clear();
-        self.loading_refusals_reported.clear();
+        self.refusals_reported.clear();
         self.plugin_lines_reported.clear();
         // Live reloads preserve musical phase at the edit instant.
         // `replace_pattern` alone re-anchors at (now, queried_to), skipping the

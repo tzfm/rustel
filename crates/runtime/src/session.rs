@@ -801,6 +801,38 @@ mod voice_refusal_tests {
             .count();
         assert_eq!(refusals, 1, "one record for one repeated refusal");
 
+        // Across windows the refusal is said once per score text, like a
+        // plugin line: the set plays on, and a refusal that stays true is
+        // not news each window. A reinstall says it again.
+        session.set_direct_diagnostic_logging(false);
+        let refusal_count = |session: &mut Session, now: f64| -> usize {
+            session
+                .schedule_audio_live_at(now, RATE, Duration::ZERO, LiveQueryBudgetMode::Steady)
+                .unwrap_or_else(|_| panic!("the sine plays, the unknown sound is skipped"));
+            session
+                .take_diagnostics()
+                .into_iter()
+                .filter(|diagnostic| diagnostic.kind == "voice-refused")
+                .count()
+        };
+        session
+            .set_pattern(ordered_pair(
+                voice("sine", 1.0),
+                sound_controls("nosuchsound", Vec::new()),
+                false,
+            ))
+            .unwrap();
+        assert_eq!(refusal_count(&mut session, 0.0), 1);
+        assert_eq!(refusal_count(&mut session, 0.5), 0);
+        session
+            .set_pattern(ordered_pair(
+                voice("sine", 1.0),
+                sound_controls("nosuchsound", Vec::new()),
+                false,
+            ))
+            .unwrap();
+        assert_eq!(refusal_count(&mut session, 0.0), 1);
+
         // Each note of each window gives the plugin notice again.
         session.set_direct_diagnostic_logging(false);
         let effect = Value::object(vec![("name".into(), Value::Str("delay".into()))]);
@@ -2773,13 +2805,14 @@ pub struct Session {
     /// The input-channel warnings already said for this score and this
     /// input: a silent voice on `in:1` is news once, not once a window.
     input_warnings_reported: std::collections::BTreeSet<String>,
-    /// The "sample X is still loading" voice refusals already said for this
-    /// score, by kind: the loading episodes that re-query a held replacement
-    /// re-convert the same onsets every window, and without this the log
-    /// fills with the same warning per retry. Every install clears it - a
-    /// new score's loading refusal is news again. Awaited and skipped are
-    /// kept apart, so notes skipped after a wait are still said.
-    loading_refusals_reported: std::collections::BTreeSet<(&'static str, String)>,
+    /// The voice refusals already said for this score, by kind. One install
+    /// converts the same onsets over and over - a live set asks its score
+    /// every window, and a held replacement re-converts its first window on
+    /// every retry - so without this the log fills with the same warning and
+    /// a count that climbs while nothing changes. Every install clears it -
+    /// a new score's refusal is news again. Awaited and skipped are kept
+    /// apart, so notes skipped after a wait are still said.
+    refusals_reported: std::collections::BTreeSet<(&'static str, String)>,
     /// The plugin lines already said for this score. A note gives its line
     /// again in each window. Every install clears the set.
     plugin_lines_reported: std::collections::BTreeSet<String>,
@@ -3062,7 +3095,7 @@ impl Session {
             stop_when_silent: None,
             export_limiter: None,
             input_warnings_reported: std::collections::BTreeSet::new(),
-            loading_refusals_reported: std::collections::BTreeSet::new(),
+            refusals_reported: std::collections::BTreeSet::new(),
             plugin_lines_reported: std::collections::BTreeSet::new(),
             render_tail_secs: 0.0,
             last_gap_log: None,
@@ -3610,7 +3643,7 @@ impl Session {
     ) -> Result<(), RuntimeError> {
         // A new score: its missing channels are its own news.
         self.input_warnings_reported.clear();
-        self.loading_refusals_reported.clear();
+        self.refusals_reported.clear();
         self.plugin_lines_reported.clear();
         self.ensure_bindings()?;
         let builder = self.js.builder();
@@ -5371,12 +5404,19 @@ impl Session {
                     .collect()
             });
         self.report_voice_notices(notices);
+        // Said once per score text, like a plugin line: the set plays on,
+        // and a refusal that stays true is not news each window.
         for message in refusals {
-            self.report_diagnostic(
-                "voice-refused",
-                message.clone(),
-                serde_json::json!({ "voice_refused": { "message": message } }),
-            );
+            if self
+                .refusals_reported
+                .insert(("voice-refused", message.clone()))
+            {
+                self.report_diagnostic(
+                    "voice-refused",
+                    message.clone(),
+                    serde_json::json!({ "voice_refused": { "message": message } }),
+                );
+            }
         }
         for message in input_warnings {
             if self.input_warnings_reported.insert(message.clone()) {
@@ -6259,14 +6299,10 @@ impl Session {
             .unwrap_or(u64::MAX)
             .saturating_sub(record.converted_audio_events);
         let refused = refusals.last().map(|(_, message)| message.clone());
-        // A replacement still waiting to publish re-converts the same first
-        // window every retry (a rewind's held window is reopened and asked
-        // again), so its refusals are said ONCE per install - loading or
-        // not - or a held rewind logs the same refusal many times a second.
-        let held_replacement = matches!(mode, LiveQueryBudgetMode::ReplacementPrefill);
         // A rewind whose whole first window waits for its samples is
         // reopened and heard whole once they are in, so its loading
         // refusals are notes awaited, not skipped.
+        let held_replacement = matches!(mode, LiveQueryBudgetMode::ReplacementPrefill);
         let window_awaited = held_replacement
             && self.requery_takeover_cut != TakeoverCut::None
             && !onsets.is_empty()
@@ -6279,16 +6315,15 @@ impl Session {
                 (true, false) => SAMPLE_LOADING_DIAGNOSTIC,
                 (false, _) => "voice-refused",
             };
-            // Once playing, loading refusals are still said once, which is
-            // how the studio gathers the sounds a load skipped into one
-            // line after it and the command line says it is waiting; any
-            // other refusal reports every window: a repeated genuine
-            // refusal of a sounding score IS news.
-            if !(held_replacement || loading)
-                || self
-                    .loading_refusals_reported
-                    .insert((kind, message.clone()))
-            {
+            // Every refusal is said once per score text, like a plugin
+            // line: a held replacement re-converts its first window on
+            // every retry, a live set asks its score every window, and a
+            // refusal that stays true is not news each time. The studio
+            // still gathers the sounds a load skipped into one line, the
+            // command line still says it is waiting, and a refusal first
+            // scheduled in a later section lands when its onsets first
+            // come up.
+            if self.refusals_reported.insert((kind, message.clone())) {
                 if loading {
                     self.report_diagnostic(
                         kind,
@@ -6380,7 +6415,7 @@ impl Session {
                         // as awaited, since the update waits for it rather
                         // than skipping its notes.
                         if self
-                            .loading_refusals_reported
+                            .refusals_reported
                             .insert((SAMPLE_AWAITED_DIAGNOSTIC, loading.clone()))
                         {
                             self.report_diagnostic(

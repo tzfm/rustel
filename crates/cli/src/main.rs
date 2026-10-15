@@ -318,8 +318,10 @@ fn human_live_event(event: &serde_json::Value, verbosity: u8) -> Option<String> 
         }
         // A sound that could not be fetched is skipped and the set plays
         // on: a warning, not an error, so a 404 on one soundfont does not
-        // read as the run having died. A score that failed to compile is
-        // still an error, recoverable or not: the musician has to act.
+        // read as the run having died. A refused voice is the same news:
+        // that layer stays silent and the rest plays. A score that failed
+        // to compile is still an error, recoverable or not: the musician
+        // has to act.
         // A serial baud that could not change mid-set is reported once and
         // the writes go out at the open baud: news, not a failure. So are
         // serial writes refused, dropped late or rejected: the set plays on.
@@ -327,7 +329,12 @@ fn human_live_event(event: &serde_json::Value, verbosity: u8) -> Option<String> 
         // with one value less.
         if matches!(
             string(error, "kind"),
-            Some("serial-baud" | "serial-trouble" | rustel_runtime::PLUGIN_DIAGNOSTIC)
+            Some(
+                "voice-refused"
+                    | "serial-baud"
+                    | "serial-trouble"
+                    | rustel_runtime::PLUGIN_DIAGNOSTIC
+            )
         ) {
             return Some(format!("warning: {message}"));
         }
@@ -4918,9 +4925,9 @@ mod tests {
     }
 
     /// A sound that is still decoding is waiting, not failing. It must not
-    /// print as "Error:".
+    /// print as "Error:". A refused voice is a warning: the set plays on.
     #[test]
-    fn a_loading_sound_reads_as_waiting_and_a_refused_one_still_reads_as_an_error() {
+    fn a_loading_sound_reads_as_waiting_and_a_refused_one_reads_as_a_warning() {
         let line = |kind: &str, message: &str| {
             super::human_live_event(
                 &serde_json::json!({
@@ -4946,8 +4953,12 @@ mod tests {
             Some("waiting: sample \"hh:0\" is still loading")
         );
         assert_eq!(
-            line("voice-refused", "unknown sound \"nosuch\"").as_deref(),
-            Some("Error: unknown sound \"nosuch\"")
+            line(
+                "voice-refused",
+                "nosuch is not loaded - that layer stays silent, the rest plays"
+            )
+            .as_deref(),
+            Some("warning: nosuch is not loaded - that layer stays silent, the rest plays")
         );
         assert_eq!(
             line("sample-failed", "bd.wav: 404").as_deref(),

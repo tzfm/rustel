@@ -129,8 +129,7 @@ mod classification_tests {
                 &Lookup::Unknown
             ),
             VoiceError::UnknownSound(
-                "unknown sound \"BossDR110_ht\": no sample bank or synth of that name is loaded"
-                    .into()
+                "BossDR110_ht is not loaded - that layer stays silent, the rest plays".into(),
             )
         );
         // An oscillator under a bank with no sample of that name still plays.
@@ -190,7 +189,7 @@ mod classification_tests {
             let unknown = if name.starts_with("wt_") {
                 format!("unknown wavetable \"{name}\"")
             } else {
-                format!("unknown sound {name:?}: no sample bank or synth of that name is loaded")
+                format!("{name} is not loaded - that layer stays silent, the rest plays")
             };
             assert_eq!(
                 refusal(&value, &Lookup::Unknown),
@@ -3687,16 +3686,17 @@ fn oscillator_waveform(
         // partials the additive path overrides the waveform.
         "user" => Ok(rustel_audio::Waveform::Triangle),
         // Every source has been tried by now: a sample bank, a synth, an
-        // oscillator. The message says that, not what the oscillator table
-        // holds, and it names the sound that was looked for. Under `.bank`
-        // that is `{bank}_{s}`, which shows the bank that has no such sound.
+        // oscillator. The message names the sound that was looked for and
+        // says what happens to the music, not what the oscillator table
+        // holds. Under `.bank` the name is `{bank}_{s}`, which shows the
+        // bank that has no such sound.
         _ => {
             let sound = value
                 .as_str()
                 .and_then(|plain| bank_prefixed(object, plain).ok().flatten())
                 .unwrap_or(name);
             Err(VoiceError::UnknownSound(format!(
-                "unknown sound {sound:?}: no sample bank or synth of that name is loaded"
+                "{sound} is not loaded - that layer stays silent, the rest plays"
             )))
         }
     }
