@@ -2,8 +2,10 @@
 //! thread that renders it.
 //!
 //! An export is always one score - the scene in the focused pane, as
-//! written - because a bounce of "the set" would mean nothing. It is the
-//! same offline render `rustel export` performs, in a session of its own on
+//! written - because a bounce of "the set" would mean nothing. The two
+//! prebakes run before it, as they do before a score in play, so a name a
+//! set has taught the engine is there for the bounce too. It is the same
+//! offline render `rustel export` performs, in a session of its own on
 //! a thread of its own, so the engine playing the room is never touched.
 
 use std::path::{Path, PathBuf};
@@ -20,6 +22,7 @@ use ratatui::widgets::Widget;
 use unicode_width::UnicodeWidthStr;
 
 use super::devices::draw_border;
+use super::prebake::{self, PrebakeScope};
 use super::theme::Theme;
 use rustel_runtime::{MP3_EXPORT, RenderFormat, Session, SessionConfig};
 
@@ -531,6 +534,14 @@ pub(super) fn session_config(
         .with_score_import_access(super::engine::import_access(default, import_origins))
 }
 
+/// What one bounce plays: the score's source, the flag that says how to
+/// read it, and the two setup sources that run before it.
+pub struct ExportScore {
+    pub source: String,
+    pub mini: bool,
+    pub prebakes: [String; 2],
+}
+
 /// The render, on its own thread.
 pub struct ExportJob {
     pub scene_name: String,
@@ -545,13 +556,15 @@ pub struct ExportJob {
 }
 
 impl ExportJob {
-    /// Render `source` with `settings` into `target`. `config` is the
+    /// Render `score` with `settings` into `target`. `config` is the
     /// studio's current session configuration, including the current host
     /// polyphony default. The source may override it with setMaxPolyphony.
+    /// The score's `prebakes` are the two setup sources in
+    /// [`PrebakeScope::ALL`] order - the global one first, then the set's -
+    /// run before the score, as the engine runs them before a score in play.
     pub fn start(
         scene_name: String,
-        source: String,
-        mini: bool,
+        score: ExportScore,
         settings: ExportSettings,
         config: SessionConfig,
         target: PathBuf,
@@ -579,8 +592,7 @@ impl ExportJob {
             .stack_size(rustel_runtime::QUERY_WORKER_STACK_BYTES)
             .spawn(move || {
                 let _ = sender.send(render(
-                    &source,
-                    mini,
+                    &score,
                     settings,
                     config,
                     &path,
@@ -644,8 +656,7 @@ impl ExportJob {
 }
 
 fn render(
-    source: &str,
-    mini: bool,
+    score: &ExportScore,
     settings: ExportSettings,
     config: SessionConfig,
     target: &Path,
@@ -661,13 +672,25 @@ fn render(
     // The render does not care what the CLI would print; a library that
     // cannot be reached bounces the synths and says so in the log.
     let _ = session.enable_default_samples();
-    if mini {
-        session.evaluate_mini(source)
+    // What play runs, the bounce runs: the two setups first, so a score can
+    // call by name what its set taught the heap. A setup the engine refuses
+    // stops the bounce naming itself, not the score line that misses it.
+    // Only a setup emptied down to nothing is nothing to run.
+    for (scope, setup) in PrebakeScope::ALL.iter().zip(&score.prebakes) {
+        if prebake::is_blank(setup) {
+            continue;
+        }
+        session
+            .evaluate_prebake(setup)
+            .map_err(|error| format!("prebake ({}): {error}", scope.label()))?;
+    }
+    if score.mini {
+        session.evaluate_mini(&score.source)
     } else {
-        session.evaluate(source)
+        session.evaluate(&score.source)
     }
     .map_err(|error| error.to_string())?;
-    let sounds = rustel_runtime::sounds::in_score(source);
+    let sounds = rustel_runtime::sounds::in_score(&score.source);
     session.prefetch_sounds(&sounds);
     let _ = session.wait_for_sample_loads(SAMPLE_WAIT);
     let duration = match settings.length {
@@ -999,6 +1022,20 @@ mod tests {
     use super::*;
     use crossterm::event::KeyCode;
 
+    /// Two setups with nothing in them, for a bounce with no setup to run.
+    fn no_prebakes() -> [String; 2] {
+        [String::new(), String::new()]
+    }
+
+    /// A score as written, with no setup and no mini dialect.
+    fn plain_score(source: &str) -> ExportScore {
+        ExportScore {
+            source: source.into(),
+            mini: false,
+            prebakes: no_prebakes(),
+        }
+    }
+
     #[test]
     fn the_sheet_moves_between_fields_and_takes_digits_and_arrows() {
         let mut sheet = ExportSheet::open(
@@ -1107,8 +1144,7 @@ mod tests {
             };
             let error = ExportJob::start(
                 "drums".into(),
-                "s('sine')".into(),
-                false,
+                plain_score("s('sine')"),
                 settings,
                 SessionConfig::default(),
                 PathBuf::from("/tmp/unused-export.wav"),
@@ -1334,8 +1370,7 @@ mod tests {
             let target = dir.path().join(filename);
             let job = ExportJob::start(
                 "loud".into(),
-                "s('sine').gain(8)".into(),
-                false,
+                plain_score("s('sine').gain(8)"),
                 settings,
                 SessionConfig::default(),
                 target.clone(),
@@ -1413,6 +1448,56 @@ mod tests {
         }
     }
 
+    /// What play runs, the bounce runs: a name a setup defined is there
+    /// for the export, and a setup the engine refuses stops the bounce
+    /// naming itself, not the score line that misses the name.
+    #[test]
+    fn the_bounce_runs_the_prebakes_before_the_score() {
+        let dir =
+            std::env::temp_dir().join(format!("rustel-export-prebake-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bounce = |prebakes: [String; 2], filename: &str| {
+            let target = dir.join(filename);
+            let job = ExportJob::start(
+                "song".into(),
+                ExportScore {
+                    source: "$: s('sine').gain(half())".into(),
+                    mini: false,
+                    prebakes,
+                },
+                ExportSettings {
+                    length: Length::Cycles(0.5),
+                    mp3: false,
+                    ..ExportSettings::default()
+                },
+                SessionConfig::default(),
+                target.clone(),
+            )
+            .expect("job");
+            (await_outcome(&job, Duration::from_secs(120)), target)
+        };
+        let (result, target) = bounce(
+            [String::from("globalThis.half = () => 0.5"), String::new()],
+            "with-setup.wav",
+        );
+        result.expect("the setup's name reaches the score");
+        let pcm = rustel_runtime::test_support::read_pcm16_stereo_wav(&target).expect("WAV");
+        assert!(
+            pcm.iter().any(|sample| sample.abs() > 0.1),
+            "the bounce has sound"
+        );
+        let (error, _) = bounce(
+            [String::new(), String::from("throw new Error('no setup')")],
+            "refused.wav",
+        );
+        let error = error.expect_err("a refused setup stops the bounce");
+        assert!(
+            error.starts_with("prebake (local): "),
+            "the refusal names the setup, not the score: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_job_renders_one_score_to_a_file() {
         let dir = std::env::temp_dir().join(format!("rustel-export-{}", std::process::id()));
@@ -1420,8 +1505,7 @@ mod tests {
         let target = dir.join("bounce.wav");
         let job = ExportJob::start(
             "melody".into(),
-            "note(\"c3 e3 g3\").s(\"sine\")".into(),
-            false,
+            plain_score("note(\"c3 e3 g3\").s(\"sine\")"),
             ExportSettings {
                 length: Length::Cycles(2.0),
                 mp3: false,
@@ -1458,8 +1542,7 @@ mod tests {
         let target = dir.path().join("threw.wav");
         let job = ExportJob::start(
             "threw".into(),
-            r#"note("c4 e4").fmap(x => { throw new Error("boom-in-query") })"#.into(),
-            false,
+            plain_score(r#"note("c4 e4").fmap(x => { throw new Error("boom-in-query") })"#),
             ExportSettings {
                 length: Length::Cycles(0.5),
                 mp3: false,
@@ -1494,8 +1577,7 @@ mod tests {
             };
             let job = ExportJob::start(
                 "polyphony".into(),
-                format!("{setter} stack(note('c3'), note('e3'), note('g3'), note('c4')).s('sine').gain(0.05).attack(0).decay(0).sustain(1)"),
-                false,
+                plain_score(&format!("{setter} stack(note('c3'), note('e3'), note('g3'), note('c4')).s('sine').gain(0.05).attack(0).decay(0).sustain(1)")),
                 ExportSettings { length: Length::Cycles(0.025), mp3: false, ..ExportSettings::default() },
                 session_config(&SessionConfig::default(), voices, inherited, &[]),
                 target.clone(),
@@ -1555,8 +1637,7 @@ mod tests {
         let target = dir.join("bounce.wav");
         let mut job = ExportJob::start(
             "melody".into(),
-            "note(\"c3 e3 g3\").s(\"sine\")".into(),
-            false,
+            plain_score("note(\"c3 e3 g3\").s(\"sine\")"),
             ExportSettings {
                 length: Length::Cycles(60.0),
                 mp3: false,

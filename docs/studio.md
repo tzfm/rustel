@@ -645,7 +645,9 @@ at the same time.
 ## Export
 
 Press Ctrl+Shift+X to render the focused score offline. Export uses the text
-currently in the editor, including unsaved changes. Live playback continues.
+currently in the editor, including unsaved changes. The global and local
+prebakes run first, as they do before a score in play, so a name a setup
+defines is there for the bounce. Live playback continues.
 Use Tab and arrows to choose the length, WAV or MP3 format, and output path.
 
 Choose a fixed number of cycles or **until silence**. Until-silence export stops
