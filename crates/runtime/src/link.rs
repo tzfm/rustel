@@ -609,7 +609,7 @@ impl Actor {
         self.measure = Some(Measure {
             peer,
             session_id,
-            endpoint: same_machine_endpoint(endpoint, &self.interfaces),
+            endpoint: same_machine_endpoint(endpoint, &machine_interfaces()),
             samples: Vec::new(),
             retries: 0,
             next_ping: now,
@@ -710,10 +710,33 @@ fn local_address() -> Option<[u8; 4]> {
     }
 }
 
+/// Test hook: set once by a test before its first `Link::start`, and
+/// every session of the process speaks only on loopback, joining no
+/// interface the OS may ask permission for.
+#[cfg(feature = "test-support")]
+static LOOPBACK_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keep every session of this process on loopback. A test installs this
+/// once, before its first `Link::start`.
+#[cfg(feature = "test-support")]
+pub fn speak_only_on_loopback() {
+    LOOPBACK_ONLY.store(true, Ordering::Relaxed);
+}
+
 /// Every interface the session lives on. Loopback is always there: two
 /// participants on one machine find each other on it, with or without a
 /// network.
 fn session_interfaces() -> Vec<Ipv4Addr> {
+    #[cfg(feature = "test-support")]
+    if LOOPBACK_ONLY.load(Ordering::Relaxed) {
+        return vec![Ipv4Addr::LOCALHOST];
+    }
+    machine_interfaces()
+}
+
+/// The addresses this machine holds, whatever the session speaks on: a
+/// peer whose endpoint sits on one of them is a peer on this machine.
+fn machine_interfaces() -> Vec<Ipv4Addr> {
     let mut interfaces = vec![Ipv4Addr::LOCALHOST];
     if let Some(address) = local_address().map(Ipv4Addr::from)
         && !interfaces.contains(&address)
@@ -955,45 +978,5 @@ mod tests {
             second.unwrap_err()
         );
         drop(first);
-    }
-
-    /// Two participants on this machine, each with a grid of their own,
-    /// end up standing in one session on one grid. Skipped where the
-    /// announcements never come back through the looped group; the
-    /// arithmetic is covered elsewhere, this is the wire.
-    #[test]
-    fn two_participants_meet_on_one_grid() {
-        let Ok(first) = Link::start(120.0, 0.0) else {
-            eprintln!("no Link socket here; skipping");
-            return;
-        };
-        let Ok(second) = Link::start(90.0, 7.0) else {
-            eprintln!("only one Link socket here; skipping");
-            return;
-        };
-        let discovery_deadline = Instant::now() + Duration::from_secs(6);
-        loop {
-            if first.status().peers >= 1 && second.status().peers >= 1 {
-                break;
-            }
-            if Instant::now() > discovery_deadline {
-                eprintln!("no discovery here; skipping");
-                return;
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-        // Both measure, one session yields, and from then on both run
-        // the same tempo and the same phase, whatever each started with.
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let (a, b) = (first.status(), second.status());
-            let same_tempo = (a.bpm - b.bpm).abs() < 0.5;
-            let same_phase = (a.cycle - b.cycle).abs() < 0.01;
-            if same_tempo && same_phase {
-                break;
-            }
-            assert!(Instant::now() < deadline, "no shared grid within 20 s");
-            thread::sleep(Duration::from_millis(100));
-        }
     }
 }

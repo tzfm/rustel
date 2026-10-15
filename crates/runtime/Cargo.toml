@@ -74,6 +74,13 @@ path = "tests/semantic/scheduling.rs"
 name = "watch"
 path = "tests/semantic/watch.rs"
 
+# The Link wire on loopback, so a plain test run joins no network the
+# OS may ask permission for. Gated on `test-support`, inert in a
+# reduced-feature run.
+[[test]]
+name = "link"
+path = "tests/semantic/link.rs"
+
 # The visuals recording is present in the complete default product. Keeping
 # this target valid without `hydra` also protects explicit minimal builds.
 [[test]]
