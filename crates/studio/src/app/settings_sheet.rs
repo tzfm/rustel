@@ -943,6 +943,18 @@ impl App {
                     sheet.selected = self.prefs.import_origins.len().saturating_sub(1);
                 }
             }
+            SettingsAction::ToggleImport(at) => {
+                let refused = at >= self.prefs.import_origins.len();
+                self.toggle_import(at);
+                // Either way the row moved: a trust taken back lands at the
+                // end of the refused ones, a trust given at the end of the
+                // trusted ones.
+                sheet.selected = if refused {
+                    self.prefs.import_origins.len().saturating_sub(1)
+                } else {
+                    (self.prefs.import_origins.len() + self.blocked_imports.len()).saturating_sub(1)
+                };
+            }
             SettingsAction::ForgetImport(at) => {
                 self.forget_import(at);
                 let rows = self.prefs.import_origins.len() + self.blocked_imports.len();

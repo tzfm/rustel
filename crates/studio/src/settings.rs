@@ -2623,6 +2623,9 @@ pub enum SettingsAction {
     ClearKeybind(BindAction),
     /// Enter on a trust row: trust the origin, if it is a refused one.
     TrustImport(usize),
+    /// Space on a trust row: trust a refused origin, or turn a trusted one
+    /// off where it stands, so it can be turned back on later.
+    ToggleImport(usize),
     /// Delete, Backspace or `d` on a trust row: take the origin off the page.
     ForgetImport(usize),
     /// Ask before replacing all overrides with this terminal's defaults.
@@ -2660,9 +2663,9 @@ impl SettingsSheet {
         matches!(self.page, SettingsPage::Trust)
     }
 
-    /// The arrows walk the origins and wrap. Enter trusts, and Delete,
-    /// Backspace or `d` takes an origin off the page. Esc and Tab stay the
-    /// sheet's.
+    /// The arrows walk the origins and wrap. Enter trusts, Space flips a
+    /// row's trust where it stands, and Delete, Backspace or `d` takes an
+    /// origin off the page. Esc and Tab stay the sheet's.
     fn trust_key(&mut self, code: crossterm::event::KeyCode) -> SettingsAction {
         use crossterm::event::KeyCode;
         let len = self.trust_count;
@@ -2680,6 +2683,7 @@ impl SettingsSheet {
                 SettingsAction::Nothing
             }
             KeyCode::Enter => SettingsAction::TrustImport(at),
+            KeyCode::Char(' ') => SettingsAction::ToggleImport(at),
             KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('d' | 'D') => {
                 SettingsAction::ForgetImport(at)
             }
@@ -3629,6 +3633,19 @@ impl SettingsSheet {
     pub fn geometry_for(self, available: Rect) -> Option<(Rect, Rect)> {
         let (panel, rows) = SettingsSheetView::geometry(available)?;
         if self.shows_sources() {
+            return Some((
+                panel,
+                Rect {
+                    height: rows.height.saturating_sub(1),
+                    ..rows
+                },
+            ));
+        }
+        // The trust page's hint wraps to a second line on a wide terminal,
+        // and a cut hint loses either its keys or its warning of what a
+        // trusted script does. The list is short; one row of it pays for
+        // the whole hint.
+        if self.shows_trust() {
             return Some((
                 panel,
                 Rect {
@@ -7667,6 +7684,10 @@ mod tests {
         let mut trust_key = |code| sheet.key(code, &mut settings, &TerminalFeatures::default());
         assert_eq!(trust_key(KeyCode::Up), SettingsAction::Nothing);
         assert_eq!(trust_key(KeyCode::Enter), SettingsAction::TrustImport(1));
+        assert_eq!(
+            trust_key(KeyCode::Char(' ')),
+            SettingsAction::ToggleImport(1)
+        );
         assert_eq!(trust_key(KeyCode::Down), SettingsAction::Nothing);
         assert_eq!(
             trust_key(KeyCode::Char('d')),
@@ -7731,6 +7752,94 @@ mod tests {
             &TerminalFeatures::default(),
         );
         assert_eq!(sheet.page, SettingsPage::Settings);
+    }
+
+    /// The trust page's hint leads with its keys and keeps its whole
+    /// text. The keys closed the hint before, so a terminal narrow
+    /// enough to wrap it cut them off the page, and a player who cannot
+    /// see "Enter trusts" cannot work the page.
+    #[test]
+    fn the_trust_page_hint_leads_with_its_keys_and_stays_whole() {
+        let sheet = SettingsSheet {
+            page: SettingsPage::Trust,
+            ..Default::default()
+        };
+        for (width, height) in [(120, 35), (80, 24), (60, 14)] {
+            let area = Rect::new(0, 0, width, height);
+            // One row of the list pays for the hint's second line.
+            let (panel, rows) = sheet.geometry_for(area).unwrap();
+            let (_, plain) = SettingsSheetView::geometry(area).unwrap();
+            assert_eq!(rows.height + 1, plain.height);
+
+            let settings = UiSettings::default();
+            let mut buffer = Buffer::empty(area);
+            SettingsSheetView {
+                sheet: SettingsSheet {
+                    trust_count: 1,
+                    ..sheet
+                },
+                settings: &settings,
+                features: &TerminalFeatures::default(),
+                tier: Tier::Cells,
+                registry: rustel_runtime::capability_registry(),
+                build_features: &[],
+                device: None,
+                pressure: None,
+                max_polyphony_override: None,
+                prebakes: [PrebakeRow::default(); 2],
+                sets_folder: String::new(),
+                recordings_folder: String::new(),
+                set_limiter: None,
+                capabilities: KeyboardCapabilities::legacy(),
+                sample_cache: String::new(),
+                precache: None,
+                sources: Vec::new(),
+                mappings: Default::default(),
+                bindings: Vec::new(),
+                trust: vec![TrustRow {
+                    origin: "https://example.com".to_owned(),
+                    allowed: false,
+                }],
+                #[cfg(feature = "vst")]
+                vst: VstPage::default(),
+                #[cfg(feature = "hydra")]
+                hydra_webcam: None,
+                theme: &Theme::built_in_default(),
+            }
+            .render(area, &mut buffer);
+            let lines: Vec<String> = (panel.y..panel.bottom())
+                .map(|y| {
+                    (panel.x..panel.right())
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect();
+            // One line of running text, so a wrap cannot split the phrases.
+            let flat = lines
+                .iter()
+                .map(|line| line.trim().trim_matches('│'))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+            let keys = flat
+                .find("Enter trusts")
+                .unwrap_or_else(|| panic!("the keys are on the page at {width}x{height}"));
+            let explain = flat
+                .find("a score loads a script")
+                .expect("the hint explains what it is for");
+            assert!(
+                keys < explain,
+                "the keys come before the explanation: {flat}"
+            );
+            assert!(
+                flat.contains("Tab pages") && flat.contains("code before the score"),
+                "the whole hint fits at {width}x{height}: {flat}"
+            );
+            assert!(
+                flat.contains("https://example.com off"),
+                "the row reads as a switch: {flat}"
+            );
+        }
     }
 
     /// Non-settings tabs start fresh instead of inheriting a row index

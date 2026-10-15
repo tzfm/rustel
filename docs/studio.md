@@ -166,8 +166,9 @@ setup code before the text with the import.
 Studio loads a script only from an origin you trust. The first update of such
 a score stops with `https://glossing.dev is not trusted`. Press Ctrl+O, go to
 the Trust page, and press Enter on the origin. Then update the score again.
-Studio keeps the origin in `studio.json`. Press `d` on an origin to remove the
-origin.
+Each origin reads `on` or `off`: Space flips a row in place, so you can take
+a trust back without the origin leaving the page. Studio keeps the trusted
+origins in `studio.json`. Press `d` on an origin to remove the origin.
 
 The first update after you trust an origin fetches the script. The update
 waits for the fetch, 8 seconds at most. Studio fetches each script one time

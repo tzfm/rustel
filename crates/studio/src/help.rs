@@ -113,7 +113,7 @@ impl HelpContext {
                 "Fetch imports, cache all remote packs, refresh their lists, and clear the cache; then your folders and the studio's packs. r aliases a bank on a user import; c caches a remote pack."
             }
             Self::SettingsTrust => {
-                "The origins a score imports scripts from with await import('https://...'). An origin the engine refused is listed until the studio closes."
+                "The origins a score imports scripts from with await import('https://...'). Each row reads on or off, and an origin the studio has seen stays listed until it closes."
             }
             #[cfg(feature = "vst")]
             Self::SettingsVst => {
@@ -302,7 +302,10 @@ impl HelpContext {
                 ),
             ],
             Self::SettingsTrust => [
-                ("Enter", "trust the refused origin under the cursor"),
+                (
+                    "Enter · Space",
+                    "trust a refused origin · turn its trust on or off",
+                ),
                 (
                     "d · Delete",
                     "remove a trusted origin, or dismiss a refused one",

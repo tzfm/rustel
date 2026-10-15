@@ -1,8 +1,10 @@
 //! The Trust page: the origins a score imports scripts from.
 //!
 //! The engine refuses `await import('https://...')` from an origin that is
-//! not trusted. The studio keeps each refused origin until it closes, and
-//! the page offers it, so the player trusts an origin with one key.
+//! not trusted. The page reads as a switch: Enter trusts a refused origin,
+//! and Space flips a row where it stands, so a trust can be taken back
+//! without the origin leaving the page. A refused or turned-off origin
+//! stays listed until the studio closes; a trust is kept in the settings.
 
 use super::super::settings::TrustRow;
 use super::super::worker::EngineFailure;
@@ -57,7 +59,7 @@ impl App {
             return;
         };
         if row.allowed {
-            self.status = format!("{} is trusted · d removes it", row.origin);
+            self.status = format!("{} is trusted · Space turns it off", row.origin);
             return;
         }
         self.blocked_imports
@@ -77,6 +79,32 @@ impl App {
             }
         }
         self.status = format!("{} trusted · update the score to load it", row.origin);
+    }
+
+    /// Space on a row of the Trust page: trust a refused origin, or take
+    /// the trust back where the row stands. The origin stays on the page,
+    /// so the trust can come back with one more Space.
+    pub(super) fn toggle_import(&mut self, at: usize) {
+        let Some(row) = self.trust_rows().into_iter().nth(at) else {
+            return;
+        };
+        if !row.allowed {
+            self.trust_import(at);
+            return;
+        }
+        self.prefs
+            .import_origins
+            .retain(|origin| *origin != row.origin);
+        self.import_origins_changed();
+        // The row stays: it moves to the refused ones, which the studio
+        // keeps until it closes, so a trust taken back can be given again.
+        self.blocked_imports
+            .retain(|blocked| *blocked != row.origin);
+        if self.blocked_imports.len() >= MAX_BLOCKED_IMPORTS {
+            self.blocked_imports.remove(0);
+        }
+        self.blocked_imports.push(row.origin.clone());
+        self.status = format!("{} off · its scripts no longer load", row.origin);
     }
 
     /// Delete on a row of the Trust page.

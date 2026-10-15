@@ -725,7 +725,7 @@ pub(super) fn render_trust(
         } else {
             " "
         };
-        let state = if row.allowed { "trusted" } else { "refused" };
+        let state = if row.allowed { "on" } else { "off" };
         let style = if selected {
             Style::default()
                 .fg(theme.accent)
@@ -743,13 +743,16 @@ pub(super) fn render_trust(
             style,
         );
     }
+    // The keys lead, as on every other page: the footer often has room
+    // for one line, and a player who cannot see "Enter trusts" cannot
+    // work the page.
     let keys = match view.trust.get(view.sheet.selected) {
-        Some(row) if row.allowed => "d removes · Tab pages",
-        Some(_) => "Enter trusts · d dismisses · Tab pages",
+        Some(row) if row.allowed => "Space off · d removes · Tab pages",
+        Some(_) => "Enter trusts · Space on/off · d dismisses · Tab pages",
         None => "Tab pages",
     };
     let text = format!(
-        "A score loads a script with await import('https://...') only from a trusted origin. The script runs as setup code before the score. {keys}"
+        "{keys} · a score loads a script with await import('https://...') only from a trusted origin. The script runs as setup code before the score."
     );
     let lines = wrap_words(&text, width);
     let height = usize::from(
