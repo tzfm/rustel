@@ -117,8 +117,9 @@ struct SliderForm {
     fields: [String; 4],
     /// Where the caret is in the field under the keys, in bytes.
     cursor: usize,
-    /// The whole field is selected: the next character replaces it, the
-    /// way a freshly focused number input behaves.
+    /// The whole field is selected: the next typed character replaces it,
+    /// the way a freshly focused number input behaves. Erase keys edit
+    /// from the caret instead; the selection is never drawn.
     selected: bool,
     field: usize,
     /// What the last attempt to write it said, if it could not be written.
@@ -158,12 +159,11 @@ impl SliderForm {
     }
 
     fn erase(&mut self, backwards: bool) {
-        if self.selected {
-            self.text_mut().clear();
-            self.cursor = 0;
-            self.selected = false;
-            return;
-        }
+        // The form draws its caret, never its selection, so an erase key
+        // edits from the caret one character at a time. The selection goes
+        // with the erase: a field someone has trimmed is no longer the
+        // fresh default a typed character replaces.
+        self.selected = false;
         if backwards && self.cursor > 0 {
             self.cursor -= 1;
             let cursor = self.cursor;

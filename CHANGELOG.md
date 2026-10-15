@@ -7,6 +7,7 @@
 - Studio and the CLI report device underruns apart from DSP deadline misses. A recoverable underrun keeps playback running.
 - A digit in a name has the colour of the name in the Studio editor. The `1` in `filter1on` had the number colour.
 - Stop fades an orbit routed to another output pair with the main pair. Before, the orbit kept its level through the stop fade, and the stopped output played the last block of the orbit in a loop.
+- Backspace in the quick action's slider form deletes one character from the caret, not the whole field. Each field opens selected so a typed number replaces the default, and the selection is not drawn, so an erase key read as the whole default number going at once.
 - `K(...)` binds the same note frequency on every platform. The frequency came from the host `pow`, whose last bits differ on Windows, so a score using `sFreq` produced a different event hash there and failed the corpus. The bound frequency is trimmed, as tonal frequencies already are, and the two affected golden rows are recaptured.
 - KabelSalat guide tests read examples with Unix or Windows line endings.
 - Methods defined through aliases such as `const rg = register` pass score checks and remain available in later updates.
