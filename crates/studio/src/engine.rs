@@ -18,6 +18,7 @@ use rustel_audio::{
 };
 use rustel_scheduler::Transport;
 
+mod link;
 mod loading;
 mod recovery;
 mod shield_hold;
@@ -1022,6 +1023,8 @@ pub struct ClockStatus {
     pub external_bpm: Option<f64>,
     /// Following the clock in and within a few milliseconds of it.
     pub locked: bool,
+    /// The Link session, when the studio stands in one.
+    pub link: Option<rustel_runtime::link::LinkStatus>,
 }
 
 /// A launch that is armed, as the interface sees it.
@@ -1378,6 +1381,9 @@ pub struct StudioEngine {
     clock_followed_at: Instant,
     clock_locked: bool,
     clock_external_cps: Option<f64>,
+    link: Option<rustel_runtime::link::Link>,
+    link_followed_at: Instant,
+    link_playing_sent: Option<bool>,
     /// Each pad's buttons as last read, for telling a press or a release
     /// from a value that was already there. Seeded at rest: a pad found
     /// already held down the first time it is read still counts as freshly
@@ -1779,6 +1785,9 @@ impl StudioEngine {
             clock_followed_at: Instant::now(),
             clock_locked: false,
             clock_external_cps: None,
+            link: None,
+            link_followed_at: Instant::now(),
+            link_playing_sent: None,
             #[cfg(feature = "gamepad")]
             gamepad_buttons_seen: [[0.0; rustel_core::gamepad::BUTTONS];
                 rustel_core::gamepad::MAX_PADS],
@@ -3497,6 +3506,7 @@ impl StudioEngine {
                 in_port: self.clock_in.as_ref().map(|input| input.port().to_owned()),
                 external_bpm: self.clock_external_cps.map(midi_clock::bpm),
                 locked: self.clock_locked,
+                link: self.link.as_ref().map(|link| link.status()),
             },
             orbits: self.orbit_levels(),
             output_pairs: self
@@ -3621,8 +3631,8 @@ impl StudioEngine {
         Ok(())
     }
 
-    /// Join, lead or leave the Link session.
-    /// Lead or follow the Link session this tick.
+    /// The MIDI clock out this tick: transport news, then the ticks due
+    /// ahead on the scheduler's grid.
     fn advance_clock_out(&mut self) {
         let Some(out) = self.clock_out.as_mut() else {
             return;
@@ -4692,6 +4702,11 @@ impl StudioEngine {
         let result = self.evaluate_guarded_inner(source, mini, cancelled);
         self.sync_recovered_session();
         self.sync_polyphony();
+        if result.is_ok() {
+            // A fresh evaluation may have settled a tempo of its own;
+            // the session hears it once, and only if it moved.
+            self.publish_link_tempo();
+        }
         if result.is_err() {
             self.session.clear_next_from_zero();
         }
@@ -5356,6 +5371,7 @@ impl StudioEngine {
         // on playback, so this turn also opens a keyboard that a score asks
         // for and closes one that it stops asking for.
         self.open_score_midi_inputs();
+        self.pump_link();
         emit_pending_diagnostics(&mut self.pending_diagnostics, &mut emit);
     }
 
@@ -5427,6 +5443,7 @@ impl StudioEngine {
         if !initial_start {
             self.advance_clock_out();
             self.follow_clock_in();
+            self.pump_link();
         }
         if self.session.transport().is_stopped() {
             // Stop must reach a followed MIDI device on this turn too.
@@ -8645,6 +8662,64 @@ pub(super) mod tests {
             input.turn(deadline, InputStatus::Closed);
             assert_eq!(input.opens.len(), 2);
             assert_eq!(input.engine.input_attempts, 1);
+        }
+    }
+    mod link {
+        use super::*;
+
+        /// Joining founds the session where the score stands, a tempo the
+        /// session already runs is not published again, and one a fresh
+        /// evaluation settled on is.
+        #[test]
+        fn joining_founds_the_session_on_the_scores_tempo_and_publishes_only_a_change() {
+            let mut engine = StudioEngine::new(StudioConfig {
+                output: Some("silent".into()),
+                ..StudioConfig::default()
+            })
+            .expect("studio");
+            assert!(engine.link.is_none(), "out of the session at start");
+
+            engine.set_link(true).expect("join");
+            let status = || engine.link.as_ref().expect("joined").status();
+            let founded = midi_clock::bpm(engine.session.cps());
+            assert!(
+                (status().bpm - founded).abs() <= 0.05,
+                "founded where the score stands: {}",
+                status().bpm
+            );
+
+            // The tempo the session runs is ours already: publishing must
+            // not move it, and must not say anything that would.
+            engine.publish_link_tempo();
+            assert!(
+                (status().bpm - founded).abs() <= 0.05,
+                "an agreeing tempo is not sent: {}",
+                status().bpm
+            );
+
+            // A fresh evaluation settles on a different tempo, and the
+            // session is brought to it.
+            engine
+                .session
+                .reload_at("setcpm(150/4); $: s(\"bd\")", false, 0.0)
+                .expect("tempo change");
+            let moved = midi_clock::bpm(engine.session.cps());
+            assert!(moved > founded + 1.0, "the score really moved: {moved}");
+            engine.publish_link_tempo();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while (status().bpm - moved).abs() > 0.05 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                (status().bpm - moved).abs() <= 0.05,
+                "the session follows the new tempo: {}",
+                status().bpm
+            );
+
+            // Leaving gives the session up, and joining an open session
+            // again changes nothing.
+            engine.set_link(false).expect("leave");
+            assert!(engine.link.is_none(), "the session is given up");
         }
     }
     mod loading_pressure {

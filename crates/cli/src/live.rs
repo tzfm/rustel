@@ -27,6 +27,7 @@ pub(super) fn run_musician(
         midi_virtual,
         midi_clock_out,
         midi_clock_in,
+        link,
         audio_input,
         buffer_frames,
         // Read in `run`, which stores the one global switch `json_asked()`
@@ -179,6 +180,7 @@ pub(super) fn run_musician(
         midi_virtual,
         midi_clock_out,
         midi_clock_in,
+        link,
         audio_input,
         buffer_frames,
         ui_events,
@@ -1356,6 +1358,7 @@ pub(super) fn play_live(
     #[cfg_attr(not(feature = "midi"), allow(unused_variables))] midi_virtual: Vec<String>,
     #[cfg_attr(not(feature = "midi"), allow(unused_variables))] midi_clock_out: Option<String>,
     #[cfg_attr(not(feature = "midi"), allow(unused_variables))] midi_clock_in: Option<String>,
+    link: bool,
     audio_input: Option<String>,
     buffer_frames: Option<u32>,
     ui_events: bool,
@@ -1824,6 +1827,43 @@ pub(super) fn play_live(
         },
         None => None,
     };
+    // The Link session, asked for with --link. Founded standing where the
+    // score stands, so nothing moves until the network says otherwise.
+    let link_session = if link {
+        match rustel_runtime::link::Link::start(
+            rustel_runtime::midi_clock::bpm(session.cps()),
+            session.cycle_at_time(device.clock_seconds()),
+        ) {
+            Ok(opened) => {
+                output.event(
+                    LiveDetail::Essential,
+                    serde_json::json!({
+                        "link": { "status": "joined", "bpm": opened.status().bpm }
+                    }),
+                );
+                Some(opened)
+            }
+            Err(message) => {
+                output.event(
+                    LiveDetail::Essential,
+                    serde_json::json!({
+                        "live_error": {
+                            "kind": "link",
+                            "message": message.to_string(),
+                            "recoverable": true,
+                            "stream_id": device.stream_id(),
+                        }
+                    }),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut link_followed_at = Instant::now() - rustel_runtime::midi_clock::FOLLOW_INTERVAL;
+    let mut link_playing_sent = None;
+    let mut link_seen_playing = None;
     #[cfg(feature = "midi")]
     let mut clock_followed_at = Instant::now();
     #[cfg(feature = "midi")]
@@ -2366,6 +2406,59 @@ pub(super) fn play_live(
                 session.cps(),
                 Instant::now(),
             );
+        }
+        // The Link session: bend onto its grid, keep it told what this
+        // run does, and stop with it when it stops.
+        if let Some(link) = link_session.as_ref() {
+            let status = link.status();
+            let estimate = rustel_runtime::midi_clock::ClockEstimate {
+                cps: status.bpm / 240.0,
+                cycle: status.cycle,
+                running: true,
+                positioned: true,
+            };
+            let now_instant = Instant::now();
+            if !session.transport().is_stopped()
+                && now_instant.duration_since(link_followed_at)
+                    >= rustel_runtime::midi_clock::FOLLOW_INTERVAL
+            {
+                link_followed_at = now_instant;
+                let now = device.clock_seconds();
+                let (steer, _) = rustel_runtime::midi_clock::steer(
+                    estimate,
+                    session.cycle_at_time(now),
+                    session.cps(),
+                );
+                if let rustel_runtime::midi_clock::Steer::To { cps, cycle } = steer {
+                    session.retime(now, cps, cycle);
+                    if let Ok(Some((before, after))) = session.requery_active_at(now) {
+                        producer.arm_control_requery(before, after);
+                    }
+                }
+            }
+            let playing = !session.transport().is_stopped();
+            if link_playing_sent != Some(playing) {
+                link_playing_sent = Some(playing);
+                link.set_playing(playing);
+                output.event(
+                    LiveDetail::Essential,
+                    serde_json::json!({
+                        "link": { "status": if playing { "playing" } else { "stopped" } }
+                    }),
+                );
+            }
+            // A stop elsewhere reads as the session going quiet after it
+            // was heard playing. The turns before our own start echoes
+            // back must not read as that.
+            let seen_playing = link_seen_playing.replace(status.playing);
+            if seen_playing == Some(true)
+                && !status.playing
+                && link_playing_sent == Some(true)
+                && playing
+            {
+                // A stop elsewhere in the session is a stop here too.
+                session.transport().stop();
+            }
         }
         #[cfg(any(feature = "midi", feature = "osc", feature = "serial"))]
         let intents = take_tick_intents(session, step_result.is_err());
@@ -3054,6 +3147,11 @@ pub(super) fn play_live(
         }
         std::thread::sleep(POLL);
     };
+    // Tell the Link session this run stopped, whatever ended it: a stop
+    // that leaves with the process would keep sounding elsewhere.
+    if let Some(link) = link_session.as_ref() {
+        link.set_playing(false);
+    }
     let stop_acknowledged = device.stop_and_wait(Duration::from_secs(1));
     #[cfg(feature = "midi")]
     {
@@ -3243,6 +3341,7 @@ pub(super) fn play_live(
     _midi_virtual: Vec<String>,
     _midi_clock_out: Option<String>,
     _midi_clock_in: Option<String>,
+    _link: bool,
     _audio_input: Option<String>,
     _buffer_frames: Option<u32>,
     _ui_events: bool,

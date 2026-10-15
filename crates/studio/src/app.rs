@@ -163,6 +163,7 @@ mod import_trust;
 mod jobs_panel;
 mod key_bindings;
 mod keyboard;
+mod link;
 mod list_keys;
 mod loading_line;
 mod log_panel;
@@ -11472,6 +11473,116 @@ mod tests {
             assert_eq!(
                 app.sample_memory_owed, None,
                 "taken on a later turn once there is room"
+            );
+        }
+    }
+    mod link {
+        //! Tests for `app/link.rs`: the checkbox that joins the Link
+        //! session, and the transport that follows what it plays.
+
+        use super::super::*;
+        use super::support::*;
+        use crate::devices::DeviceKind;
+        use rustel_runtime::link::LinkStatus;
+
+        /// A snapshot whose session stands where the test wants it.
+        fn session(playing: bool) -> StudioSnapshot {
+            StudioSnapshot {
+                clock: crate::engine::ClockStatus {
+                    link: Some(LinkStatus {
+                        peers: 1,
+                        bpm: 120.0,
+                        playing,
+                        cycle: 4.0,
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn the_link_tab_joins_on_space_and_leaves_on_space_again() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "$: s(\"bd\")\n");
+            app.panel = Some(crate::devices::DevicePanel {
+                kind: DeviceKind::Link,
+                ..crate::devices::DevicePanel::default()
+            });
+
+            app.handle_panel_key(KeyCode::Char(' '), false)
+                .expect("handled");
+            assert!(app.link_enabled, "joined");
+            assert!(app.panel.is_some(), "the list stays up to watch it");
+            assert!(app.status.contains("joined"), "{}", app.status);
+
+            app.handle_panel_key(KeyCode::Char(' '), false)
+                .expect("handled");
+            assert!(!app.link_enabled, "left");
+            assert!(app.status.contains("left"), "{}", app.status);
+        }
+
+        #[test]
+        fn a_session_that_starts_playing_starts_this_studio_too() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "$: s(\"bd\")\n");
+            // The session stands idle first, so the start is a change.
+            app.snapshot = Some(session(false));
+            app.pump_link();
+
+            app.snapshot = Some(session(true));
+            app.pump_link();
+            let last = app.log.lines().back().expect("something was done");
+            assert!(
+                last.text.contains("update -"),
+                "the score plays: {}",
+                last.text
+            );
+
+            // The same state again is our own echo, or a steady session:
+            // nothing is sent a second time.
+            let sent = last.text.to_owned();
+            app.pump_link();
+            let still = app.log.lines().back().expect("something was done");
+            assert_eq!(still.text, sent, "one start, one update");
+        }
+
+        #[test]
+        fn a_session_that_stops_playing_stops_this_studio_too() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "$: s(\"bd\")\n");
+            // A studio already playing, as one standing in a session is.
+            let mut steady = session(true);
+            steady.playing = true;
+            app.snapshot = Some(steady);
+            app.pump_link();
+
+            // The engine has not answered the stop yet, so the studio still
+            // reads as playing when the session's stop arrives.
+            let mut stopped = session(false);
+            stopped.playing = true;
+            app.snapshot = Some(stopped);
+            app.pump_link();
+            let last = app.log.lines().back().expect("something was done");
+            assert!(
+                last.text.contains("stop -"),
+                "the set goes quiet: {}",
+                last.text
+            );
+        }
+
+        #[test]
+        fn with_no_session_to_stand_in_nothing_is_sent() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "$: s(\"bd\")\n");
+            app.snapshot = Some(StudioSnapshot::default());
+            app.pump_link();
+            assert!(
+                app.log
+                    .lines()
+                    .back()
+                    .is_none_or(|line| !line.text.contains("update -")),
+                "no session, no start"
             );
         }
     }
@@ -39055,6 +39166,9 @@ pub struct StudioOptions {
     /// substring of one. `None` opens no input, so `s("in")` is silence until
     /// the device panel picks one.
     pub input: Option<String>,
+    /// Join the Link session at start. Not kept between runs: joining is
+    /// a thing done on purpose, each time.
+    pub link: bool,
     /// Optional process-level cancellation observed by the UI loop. CLI
     /// frontends use this to turn SIGINT/SIGTERM into graceful restoration.
     pub cancellation: Option<Arc<AtomicBool>>,
@@ -39107,6 +39221,7 @@ impl StudioOptions {
             output: None,
             output_buffer_frames: None,
             input: None,
+            link: false,
             cancellation: None,
             recording: None,
             build_features: &[],
@@ -39349,6 +39464,11 @@ fn run_once(options: StudioOptions) -> Result<Session, RuntimeError> {
     )
     .map_err(|failure| RuntimeError::Message(failure.message))?;
     let mut app = App::new(options, theme, scenes, worker)?;
+    // The Link session is asked for before the first turn, so the grid
+    // is there to be followed from the first evaluation.
+    if app.options.link {
+        app.set_link(true);
+    }
     // The panels come back the way they were left.
     app.restore_panels_from_prefs();
     // Said after the panels are back rather than before: opening one puts
@@ -39877,6 +39997,12 @@ struct App {
     pending_slider: Option<(String, f64, bool)>,
     next_request_id: u64,
     snapshot: Option<StudioSnapshot>,
+    /// Whether the Link session was asked for. Kept nowhere: each run
+    /// starts out of the session.
+    link_enabled: bool,
+    /// What the Link session's transport last said, once a stand was
+    /// taken on it. `None` when no session is joined.
+    link_seen_playing: Option<bool>,
     audio_advisory: audio_advisory::AudioAdvisory,
     /// The output the last play went through, or the one picked in the
     /// device panel since. A stopped studio has no stream open, and this is
@@ -40405,6 +40531,8 @@ impl App {
             pending_slider: None,
             next_request_id: 1,
             snapshot: None,
+            link_enabled: false,
+            link_seen_playing: None,
             audio_advisory: audio_advisory::AudioAdvisory::default(),
             resting_output: None,
             input_lit_at: None,

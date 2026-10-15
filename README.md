@@ -40,7 +40,7 @@ devices, add live visuals, and export audio. No browser is required.
 | **Studio** | A terminal editor with live update, visuals, a mixer, and a key reference. A bad update leaves the last good score playing. |
 | **Your editor** | Run `rustel play song.strudel --watch` and edit in any editor. Audio keeps running across saves. |
 | **Session tapes** | Studio logs each installed update with its time. See [sessions](docs/sessions.md). |
-| **Hardware** | Speakers, audio input, MIDI, OSC, and serial. MIDI clock can follow or lead. See [hardware](docs/hardware.md). |
+| **Hardware** | Speakers, audio input, MIDI, OSC, and serial. MIDI clock can follow or lead. Link shares tempo and transport on the network. See [hardware](docs/hardware.md). |
 | **Plugins** | VST3 effects and instruments from a score: `.vsti("serum 2").vst("ott")`. See [plugins](docs/plugins.md). |
 | **Visuals** | Scope, piano roll, spectrum, and [Hydra](docs/hydra.md) in the terminal. |
 | **Offline render** | Export to WAV or MP3 with repeatable output. |

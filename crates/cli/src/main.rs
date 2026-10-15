@@ -696,6 +696,14 @@ struct MusicianArgs {
     /// an incoming Start is followed, not obeyed.
     #[arg(long, value_name = "PORT")]
     midi_clock_in: Option<String>,
+    /// Join the Link session on the local network.
+    ///
+    /// Tempo and phase follow the session's grid, and play and stop travel
+    /// both ways with whatever else speaks the protocol. Nothing starts
+    /// playback by itself: a session that is playing is followed, not
+    /// obeyed. Not kept between runs, in the studio as here.
+    #[arg(long, help_heading = "Playing")]
+    link: bool,
     /// The audio input to open for `s("in")`: a device name, or a distinctive
     /// substring of one. `rustel devices` lists the inputs with their channel
     /// counts, which is how far `in:N` goes.
@@ -1130,6 +1138,11 @@ enum Command {
         /// far `in:N` goes.
         #[arg(long, value_name = "NAME")]
         input: Option<String>,
+        /// Join the Link session on the local network at start. The device
+        /// panel's link tab (^P, link) is the same switch, and neither is
+        /// kept between runs.
+        #[arg(long)]
+        link: bool,
         #[command(flatten)]
         sample_access: SampleAccessArgs,
         /// How much of the set to record. Studio sets are recorded by default
@@ -2030,6 +2043,7 @@ fn run_command(
             file,
             cps,
             mini,
+            link,
             theme,
             list_themes,
             probe_terminal,
@@ -2106,6 +2120,7 @@ fn run_command(
                 output,
                 output_buffer_frames: buffer_frames,
                 input,
+                link,
                 cancellation: Some(cancellation),
                 recording,
                 build_features: BUILD_FEATURES,
@@ -2493,6 +2508,7 @@ fn run_command(
                     Vec::new(),
                     None,
                     None,
+                    false,
                     None,
                     None,
                     false,

@@ -34,6 +34,12 @@ Use `--buffer-frames 128` to request an audio buffer of 32-16384 frames.
 Increase it if sound crackles. Studio calls this setting `audio out latency`.
 The device can use a different size. See [Hardware](hardware.md).
 
+Use `--link` to join the Link session on the local network, sharing tempo
+and the play and stop states with the other participants. Joining starts no
+playback by itself: a session that plays starts this one too. The flag is
+not kept between runs. Studio has the same switch on the `link` tab of its
+Devices panel.
+
 ## Export
 
 ```sh
@@ -118,6 +124,7 @@ rustel midi-monitor
 rustel gamepad-monitor
 rustel play song.strudel --midi-clock-out IAC
 rustel play song.strudel --audio-input Scarlett
+rustel play song.strudel --link
 ```
 
 See [Hardware](hardware.md) for MIDI, OSC, serial, gamepads, and audio input.

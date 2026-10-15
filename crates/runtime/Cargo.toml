@@ -193,10 +193,11 @@ libc = "0.2"
 # Descriptor 1 of the C runtime, for the standard output kept clear of plugin
 # text.
 libc = "0.2"
-# Validate an opened sample handle's final path before serving from it. The
-# console writes of the kept standard output.
+# Validate an opened sample handle's final path before serving from it,
+# and hold the shared Link port beside any other participant.
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
+  "Win32_Networking_WinSock",
   "Win32_Storage_FileSystem",
   "Win32_System_Console",
   "Win32_System_ProcessStatus",

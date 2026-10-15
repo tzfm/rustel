@@ -116,6 +116,30 @@ $: midicmd("clock*96, <start stop>/2").midi('IAC')
 
 At four beats per cycle, `clock*96` sends 24 pulses per beat.
 
+## Link
+
+```sh
+rustel play song.strudel --link
+rustel studio song.strudel --link
+```
+
+Ableton Link shares tempo and the play and stop states over the local
+network, between participants such as DAWs and rustel itself. Rustel finds
+the other participants on its own; no address is given. Participants on
+this machine count too: they are found over loopback, with no network.
+
+A session that is playing starts rustel, and a session that stops stops it.
+When rustel starts or stops, the session is told the same. A tempo from a
+fresh evaluation is given to the session, and a tempo change made elsewhere
+is followed. The Link session and the MIDI clock in do not run at the same
+time: join the session, and the clock in is released.
+
+macOS asks once, the first time, to let rustel take incoming network
+connections. Answer yes: that is what lets the other participants reach it.
+
+The session is off at each start. In Studio, the `link` tab of the Devices
+panel holds the checkbox.
+
 ## Gamepad
 
 ```javascript

@@ -252,6 +252,8 @@ enum EngineCommand {
     ClockOut(Option<String>),
     /// Follow MIDI clock from this port, or none.
     ClockIn(Option<String>),
+    /// Join or leave the Link session.
+    Link(bool),
     /// Which MIDI ports this machine may open, either way.
     MidiEnablement(super::devices::MidiEnablement),
     #[cfg(test)]
@@ -861,6 +863,11 @@ impl StudioWorker {
     pub fn try_clock_in(&self, port: Option<String>) -> bool {
         !self.shutdown_requested.load(Ordering::Acquire)
             && self.commands.try_send(EngineCommand::ClockIn(port)).is_ok()
+    }
+
+    pub fn try_link(&self, on: bool) -> bool {
+        !self.shutdown_requested.load(Ordering::Acquire)
+            && self.commands.try_send(EngineCommand::Link(on)).is_ok()
     }
 
     /// Say which MIDI ports may be opened. False when the command queue is
@@ -1807,6 +1814,18 @@ fn process_command(
                     StudioControlEvent::Diagnostic(StudioDiagnostic::message(
                         "clock",
                         format!("clock in: {error}"),
+                    )),
+                );
+            }
+            false
+        }
+        EngineCommand::Link(on) => {
+            if let Err(error) = engine.set_link(on) {
+                push_control(
+                    pending,
+                    StudioControlEvent::Diagnostic(StudioDiagnostic::message(
+                        "clock",
+                        format!("link: {error}"),
                     )),
                 );
             }
@@ -2945,6 +2964,7 @@ mod tests {
                 in_port: None,
                 external_bpm: None,
                 locked: false,
+                link: None,
             },
             pressure: None,
             audition_loading: None,

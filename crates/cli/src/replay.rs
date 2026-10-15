@@ -334,6 +334,7 @@ pub(super) fn run_replay(
             midi_virtual: Vec::new(),
             midi_clock_out: None,
             midi_clock_in: None,
+            link: false,
             // A replay plays a tape back; it does not listen to anything.
             audio_input: None,
             // A replay carries no device override; the tape sounds the same
