@@ -609,7 +609,7 @@ impl Actor {
         self.measure = Some(Measure {
             peer,
             session_id,
-            endpoint,
+            endpoint: same_machine_endpoint(endpoint, &self.interfaces),
             samples: Vec::new(),
             retries: 0,
             next_ping: now,
@@ -721,6 +721,19 @@ fn session_interfaces() -> Vec<Ipv4Addr> {
         interfaces.push(address);
     }
     interfaces
+}
+
+/// Where a peer on this machine answers its pings. An endpoint on one of
+/// our own interfaces is this machine's address, and loopback reaches it
+/// with no network: the OS may refuse that network, and same-machine
+/// participants merge all the same.
+fn same_machine_endpoint(endpoint: SocketAddr, interfaces: &[Ipv4Addr]) -> SocketAddr {
+    match endpoint {
+        SocketAddr::V4(address) if interfaces.contains(address.ip()) => {
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, address.port()).into()
+        }
+        other => other,
+    }
 }
 
 /// Bind the shared port, allowing the other participants on this machine
@@ -913,6 +926,19 @@ mod tests {
     #[test]
     fn the_session_speaks_on_loopback_whatever_the_network() {
         assert!(session_interfaces().contains(&Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn a_peer_on_this_machine_is_measured_over_loopback() {
+        let lan = Ipv4Addr::new(192, 168, 1, 5);
+        let interfaces = vec![Ipv4Addr::LOCALHOST, lan];
+        let same = same_machine_endpoint(SocketAddrV4::new(lan, 41000).into(), &interfaces);
+        assert_eq!(same, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41000).into());
+        let away = Ipv4Addr::new(192, 168, 1, 9);
+        assert_eq!(
+            same_machine_endpoint(SocketAddrV4::new(away, 41000).into(), &interfaces),
+            SocketAddrV4::new(away, 41000).into()
+        );
     }
 
     /// Two participants on this machine, both with the port they share:
