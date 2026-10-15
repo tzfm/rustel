@@ -1057,6 +1057,7 @@ impl StudioPrefs {
         // preference would go, including the webcam consent this file exists
         // to remember.
         super::save::atomic_write(path, &(text + "\n"))
+            .map(|_| ())
             .map_err(|error| format!("cannot write {}: {error}", path.display()))
     }
 }

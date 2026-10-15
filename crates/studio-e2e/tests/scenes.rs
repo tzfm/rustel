@@ -172,11 +172,10 @@ fn ctrl_r_renames_and_esc_cancels() {
         !set.join("first.strudel").exists(),
         "the old file does not linger"
     );
-    assert!(
-        studio.status().contains("intro.strudel"),
-        "the save lands at the renamed path: {}",
-        studio.status()
-    );
+    // The queued save finds the moved file already holding the score, so
+    // it writes nothing and claims no save: the rename line stands, and a
+    // "saved" notice would be a claim for bytes that were only moved.
+    assert_eq!(studio.status(), "renamed \"first\" to \"intro\"");
 }
 
 /// Ctrl+W closes a clean scene - saying its file is still on disk - and

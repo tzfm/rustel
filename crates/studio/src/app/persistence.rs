@@ -259,7 +259,7 @@ impl App {
         }
         let still_pending = scene.latest_save.is_some();
         match result {
-            Ok(()) => {
+            Ok(wrote) => {
                 // A rename can race an in-flight write: the worker persisted
                 // to a path this scene no longer owns. Do not clear dirty or
                 // claim the current file is saved - finish_rename queues a
@@ -282,7 +282,7 @@ impl App {
                         "saved editor revision {}; a newer save is still pending…",
                         editor_revision.0
                     );
-                } else {
+                } else if wrote {
                     self.set_notice(format!(
                         "saved {}",
                         status_file_path(&path, self.ui_settings.show_full_paths)

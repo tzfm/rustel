@@ -16698,6 +16698,71 @@ mod tests {
             assert_eq!(*app.scenes.limiter(), crate::scenes::SetLimiter::Defer);
         }
 
+        /// A set pulled off Open recent to hear what was in it is left as
+        /// it was: a play of a score the file already holds is not a save,
+        /// and putting a set down whose project file already says what it
+        /// says is not a write. Only the changed dates moving would tell
+        /// the player the set was touched, and the open list orders by
+        /// them.
+        #[test]
+        fn a_set_only_opened_and_played_is_left_as_it_was() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+
+            // A second score, so the set carries a project file a close
+            // could churn.
+            let second = directory.path().join("second.strudel");
+            std::fs::write(&second, "$: s(\"hh\")\n").expect("a second score");
+            app.scenes.open_file(&second).expect("open the score");
+            app.land_on_current_scene();
+            app.persist_manifest();
+            let settle_in_the_past = |path: &std::path::Path| {
+                let when = std::time::SystemTime::now() - Duration::from_secs(3_600);
+                std::fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .expect("open to set times")
+                    .set_times(std::fs::FileTimes::new().set_modified(when))
+                    .expect("set the changed time");
+                when
+            };
+            let manifest = app.scenes.manifest_path();
+            let score_changed = settle_in_the_past(&second);
+            let set_changed = settle_in_the_past(&manifest);
+
+            // Play it: update on a score with no edit behind it.
+            app.handle_editor_effect(EditorEffect::Evaluate {
+                revision: app.editor().revision(),
+                source: ropey::Rope::from_str(&app.editor().source()),
+            })
+            .expect("play");
+            app.wait_for_saves();
+
+            // Close it: another set takes the studio.
+            let elsewhere = directory.path().join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).expect("another folder");
+            std::fs::write(elsewhere.join("other.strudel"), "$: s(\"bd\")\n").expect("a score");
+            let set = SceneSet::open(&elsewhere, "// starter").expect("set");
+            app.switch_set(set, "opened set");
+
+            let changed = |path: &std::path::Path| {
+                std::fs::metadata(path)
+                    .expect("the file")
+                    .modified()
+                    .expect("its changed time")
+            };
+            assert_eq!(
+                changed(&second),
+                score_changed,
+                "playing a score the file already holds rewrote it"
+            );
+            assert_eq!(
+                changed(&manifest),
+                set_changed,
+                "closing the set rewrote a project file that had nothing to say"
+            );
+        }
+
         #[test]
         fn a_save_that_lands_on_a_path_the_scene_no_longer_owns_is_not_taken_as_saved() {
             // The race: a write is in flight, the scene is renamed, and the
@@ -16732,7 +16797,7 @@ mod tests {
                 path: stale.clone(),
                 editor_revision: app.scenes.current().editor.revision(),
                 source_revision: "stale".to_owned(),
-                result: Ok(()),
+                result: Ok(true),
             });
 
             let scene = app
@@ -34390,7 +34455,7 @@ mod tests {
                     path: path.clone(),
                     editor_revision: app.editor().revision(),
                     source_revision: source_revision(&app.editor().source()),
-                    result: Ok(()),
+                    result: Ok(true),
                 });
                 let expected = if full {
                     format!("saved {}", path.display())

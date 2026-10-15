@@ -17,7 +17,9 @@ parent folder must exist.
 
 Type or paste a score, then press **Ctrl+S** or **F5**. Press **Ctrl+G** or **F8**
 to stop. Editing does not change the playing score until you update it. If an
-update fails, the last good score keeps playing.
+update fails, the last good score keeps playing. An update that changes nothing
+leaves the file, and its changed date, alone, so a set you only opened and played
+stays as it was.
 
 Use one editor for each score file. Studio does not detect external file
 changes or merge them with unsaved edits.
