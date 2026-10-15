@@ -281,8 +281,10 @@ impl GoState {
         match self {
             Self::Unchecked => theme.muted,
             Self::Ready => theme.ok,
-            Self::Loading { .. } => theme.warn,
-            Self::Failed { .. } | Self::Problems { .. } => theme.error,
+            // A failed sound leaves the set playing without it: warning
+            // weight, not the red of a refused update.
+            Self::Loading { .. } | Self::Failed { .. } => theme.warn,
+            Self::Problems { .. } => theme.error,
         }
     }
 }
@@ -8744,7 +8746,7 @@ mod tests {
             (
                 GoState::Failed { failed: 1 },
                 "⚠ 1 sound failed",
-                theme.error,
+                theme.warn,
             ),
         ] {
             chrome.go = go;
