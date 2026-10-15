@@ -66,11 +66,27 @@ pub(super) fn run_vst(
         outln!("{}", style::bold(on, "VST3 plugins"));
         for plugin in &plugins {
             let bundle = plugin.bundle.display().to_string();
-            outln!(
-                "  {}  {}",
-                style::cyan(on, &plugin.name),
-                style::dim(on, &bundle)
-            );
+            match &plugin.status {
+                // A bundle with a fault at its scan stays off. The reason
+                // tells why the row has no parameters, cut to one line:
+                // the full text is the error of `rustel vst <name>`.
+                Status::Failed(reason) => {
+                    let mut short: String = reason.chars().take(120).collect();
+                    if short.len() < reason.len() {
+                        short.push('…');
+                    }
+                    outln!(
+                        "  {}  {}",
+                        style::dim(on, &plugin.name),
+                        style::dim(on, &format!("{bundle}  off: {short}"))
+                    );
+                }
+                _ => outln!(
+                    "  {}  {}",
+                    style::cyan(on, &plugin.name),
+                    style::dim(on, &bundle)
+                ),
+            }
         }
         if plugins.is_empty() {
             outln!("  {}", style::dim(on, "no plugin in these folders:"));
@@ -150,19 +166,26 @@ pub(super) fn run_vst(
         style::dim(on, &format!("{vendor}  {categories}"))
     );
     // A plugin with many parameters shows its top level and the names of
-    // its groups. A filter shows the parameters with the word in their
-    // group, name or key.
+    // its groups. A top level of more parameters than the count is cut at
+    // the count, with a line that tells where the rest is. A filter shows
+    // the parameters with the word in their group, name or key.
     let wanted = filter.map(vst::canonical);
-    let shown: Vec<&vst::ParamInfo> = plugin
-        .params()
-        .iter()
-        .filter(|param| match &wanted {
-            Some(word) => [&param.group, &param.name, &param.key]
-                .iter()
-                .any(|text| vst::canonical(text).contains(word.as_str())),
-            None => plugin.params().len() <= MANY_PARAMS || param.group.is_empty(),
-        })
-        .collect();
+    let params = plugin.params();
+    let shown: Vec<&vst::ParamInfo> = match &wanted {
+        Some(word) => params
+            .iter()
+            .filter(|param| {
+                [&param.group, &param.name, &param.key]
+                    .iter()
+                    .any(|text| vst::canonical(text).contains(word.as_str()))
+            })
+            .collect(),
+        None => params
+            .iter()
+            .filter(|param| params.len() <= MANY_PARAMS || param.group.is_empty())
+            .take(MANY_PARAMS)
+            .collect(),
+    };
     let width = shown
         .iter()
         .map(|param| param.key.chars().count())
@@ -178,24 +201,34 @@ pub(super) fn run_vst(
             width = width + style::cyan(on, "").len(),
         );
     }
-    if shown.len() < plugin.params().len() && wanted.is_none() {
+    if shown.len() < params.len() && wanted.is_none() {
+        let top = params.iter().filter(|param| param.group.is_empty()).count();
+        if top > shown.len() {
+            let more = top - shown.len();
+            let said = format!("{more} more parameters with no group");
+            outln!("  {}", style::dim(on, &said));
+        }
         let mut groups: Vec<(&str, usize)> = Vec::new();
-        for param in plugin
-            .params()
-            .iter()
-            .filter(|param| !param.group.is_empty())
-        {
+        for param in params.iter().filter(|param| !param.group.is_empty()) {
             match groups.iter_mut().find(|(name, _)| *name == param.group) {
                 Some((_, count)) => *count += 1,
                 None => groups.push((&param.group, 1)),
             }
         }
-        outln!("{}", style::bold(on, "groups:"));
-        for (name, count) in groups {
-            outln!("  {name}  {}", style::dim(on, &count.to_string()));
+        if groups.is_empty() {
+            let hint = format!(
+                "a word in a name shows them: rustel vst \"{}\" <word>",
+                plugin.name()
+            );
+            outln!("{}", style::dim(on, &hint));
+        } else {
+            outln!("{}", style::bold(on, "groups:"));
+            for (name, count) in groups {
+                outln!("  {name}  {}", style::dim(on, &count.to_string()));
+            }
+            let hint = format!("one group: rustel vst \"{}\" <group>", plugin.name());
+            outln!("{}", style::dim(on, &hint));
         }
-        let hint = format!("one group: rustel vst \"{}\" <group>", plugin.name());
-        outln!("{}", style::dim(on, &hint));
     }
     if !presets.is_empty() {
         outln!("{} {}", style::bold(on, "presets:"), presets.join(", "));

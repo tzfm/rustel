@@ -50,8 +50,9 @@ Studio adds folders in Settings, vst tab. These folders count in Studio only.
 
 Studio at its start, and `rustel vst`, scan each new or changed plugin bundle
 one time, in a process of its own. A bundle with a fault at the scan stays
-off, and rustel goes on. Studio scans in the background, so you play and edit
-during the scan.
+off, and rustel goes on. The fault stays in the cache with the stamp of the
+bundle, so an unchanged bundle gets no new test. A rescan tries it again.
+Studio scans in the background, so you play and edit during the scan.
 
 The file `~/.rustel/vst/scan.json` keeps the result. `rustel vst --rescan`,
 or the rescan row in Settings, scans each bundle again. `rustel play` and
@@ -232,6 +233,9 @@ rustel starts. yabridge 5.1.1 needs Wine Staging 9.21 or earlier.
 
 - A plugin shows no window. Activate a plugin with a licence window in a
   different host first.
+- An offline render gives the same bytes each run for most plugins. A plugin
+  with randomness of its own gives different bytes each run. Rustel keeps the
+  samples of the plugin as they come.
 - Rustel does not compensate plugin latency. A look-ahead effect plays late by
   its look-ahead.
 - A side-chain input of a plugin gets silence.

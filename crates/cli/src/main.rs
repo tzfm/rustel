@@ -934,9 +934,10 @@ enum Command {
     ///
     /// The first run reads each plugin bundle in a process of its own and
     /// keeps the plugin names in a scan cache. A bundle with the same files
-    /// gets no new read. A name loads that one plugin. A part of a name is
-    /// enough when one plugin only has that part. Plugin folders: the
-    /// standard VST3 folders of the system, or the folders in
+    /// gets no new read. A bundle with a fault at the read stays off until
+    /// its files change or `--rescan`. A name loads that one plugin. A part
+    /// of a name is enough when one plugin only has that part. Plugin
+    /// folders: the standard VST3 folders of the system, or the folders in
     /// `RUSTEL_VST3_PATH` when set.
     Vst {
         /// Plugin to load.

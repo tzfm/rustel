@@ -529,7 +529,9 @@ fn an_instrument_plays_the_note_it_gets() {
 /// to the host as its worker program, so the bundle loads in a process of
 /// its own, as in the product. The host adds the bundle path as the last
 /// argument. With the argument `fault=<value>`, the process stops as the
-/// fixture variable of that value asks.
+/// fixture variable of that value asks. With the argument `mark=<path>`,
+/// the process writes one line to the file before its load, so a test
+/// counts the runs of the worker.
 #[test]
 fn plugin_worker() {
     let args: Vec<String> = std::env::args().collect();
@@ -537,6 +539,15 @@ fn plugin_worker() {
     let Some(bundle) = args.last().filter(|arg| arg.ends_with(".vst3")) else {
         return;
     };
+    if let Some(mark) = args.iter().find_map(|arg| arg.strip_prefix("mark=")) {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(mark)
+            .expect("mark file");
+        writeln!(file, "{bundle}").expect("mark line");
+    }
     if let Some(fault) = args.iter().find_map(|arg| arg.strip_prefix("fault=")) {
         // SAFETY: this process is the scan process, and no other thread of
         // it reads a variable now.
@@ -831,6 +842,70 @@ fn the_scan_names_the_plugins_and_keeps_a_fault_out_of_the_host() {
             .collect::<Vec<_>>()
     );
     assert!(matches!(rig.host.resolve(NAME, true), Resolved::Ready(..)));
+}
+
+/// A bundle that faults its scan keeps the fault in the cache file, with
+/// the stamp of its files. A host that starts again reads the fault and
+/// runs no new test of the bundle. A rescan empties the cache, so the
+/// bundle gets its new test.
+#[test]
+fn a_scan_fault_stays_in_the_cache_until_a_rescan() {
+    let root = std::env::temp_dir().join(format!("rustel-vst3-stay-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("plugins")).expect("plugin folder");
+    rustel_vst3_fixture::install(&root.join("plugins"));
+    let folders = [root.join("plugins")];
+    let mark = root.join("mark");
+    let runs = || {
+        std::fs::read_to_string(&mark)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let with_mark = |fault: Option<&str>| {
+        let mut program = worker_program(fault);
+        program.args.push(format!("mark={}", mark.display()).into());
+        program
+    };
+    let start = || {
+        let host = Host::new();
+        host.set_preset_folder(root.join("presets"));
+        host.set_worker(Some(with_mark(Some("load"))));
+        host.scan(&folders);
+        host.scan_plugins();
+        host.wait_idle();
+        host
+    };
+
+    let host = start();
+    until(|| host.scan_progress().is_none().then_some(()));
+    assert_eq!(runs(), 1);
+    let plugins = host.plugins();
+    let Status::Failed(reason) = &plugins[0].status else {
+        panic!("the bundle did not fail: {:?}", plugins[0].status);
+    };
+    assert!(reason.contains("the plugin process ended"), "{reason}");
+
+    // A host that starts again reads the fault of the cache file and runs
+    // no new test of the bundle with the same files.
+    let host = start();
+    until(|| host.scan_progress().is_none().then_some(()));
+    assert_eq!(runs(), 1);
+    let plugins = host.plugins();
+    assert!(
+        matches!(plugins[0].status, Status::Failed(_)),
+        "{plugins:?}"
+    );
+
+    // A rescan with no fault gives the bundle its plugins again.
+    host.set_worker(Some(with_mark(None)));
+    host.rescan(&folders);
+    host.wait_idle();
+    until(|| host.scan_progress().is_none().then_some(()));
+    assert_eq!(runs(), 2);
+    let names: Vec<String> = host.plugins().into_iter().map(|row| row.name).collect();
+    assert_eq!(names, [NAME, TONE_NAME]);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A bundle with no plugin a score names and no running copy unloads. A

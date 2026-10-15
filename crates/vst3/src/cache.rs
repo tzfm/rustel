@@ -1,11 +1,12 @@
 //! The scan cache: what the load test found in each bundle.
 //!
 //! The load test starts a process and loads the plugin there, so a test
-//! takes about as long as a load. The host keeps the plugins of each bundle
-//! that loads in one file: a bundle with the same files as at its test is
-//! not tested again, and its plugins have their names before the first
-//! load. A bundle that does not load is not in the file, so the next start
-//! tests the bundle again.
+//! takes about as long as a load. The host keeps the answer for each bundle
+//! in one file: a bundle with the same files as at its test is not tested
+//! again, and its plugins have their names before the first load. The
+//! answer is the plugins of a bundle that loads, or the fault of a bundle
+//! that does not, so the next start tests no unchanged bundle a second
+//! time.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -89,6 +90,11 @@ pub(crate) fn stamp(bundle: &Path) -> Stamp {
 struct Tested {
     stamp: Stamp,
     plugins: Vec<Scanned>,
+    /// The reason the bundle did not load at its test. A file of an older
+    /// version has no such field, and a reader of an older version drops
+    /// the field of a new file, so the form of the file stays.
+    #[serde(default)]
+    fault: Option<String>,
 }
 
 /// The plugins of the bundles that load, by the path of the bundle.
@@ -129,10 +135,20 @@ impl Cache {
         }
     }
 
-    /// The plugins of a bundle, if the bundle has the stamp of its test.
+    /// The plugins of a bundle, if the bundle has the stamp of its test and
+    /// the test found plugins.
     pub(crate) fn plugins(&self, bundle: &Path, stamp: Stamp) -> Option<&[Scanned]> {
         let tested = self.bundles.get(bundle.to_str()?)?;
-        (tested.stamp == stamp).then_some(tested.plugins.as_slice())
+        (tested.stamp == stamp && tested.fault.is_none()).then_some(tested.plugins.as_slice())
+    }
+
+    /// The reason a bundle did not load at its test, if the bundle has the
+    /// stamp of that test.
+    pub(crate) fn fault(&self, bundle: &Path, stamp: Stamp) -> Option<&str> {
+        let tested = self.bundles.get(bundle.to_str()?)?;
+        (tested.stamp == stamp)
+            .then_some(tested.fault.as_deref())
+            .flatten()
     }
 
     /// Stores the plugins of a bundle. False when the cache has the same
@@ -147,8 +163,41 @@ impl Cache {
             return false;
         }
         let plugins = plugins.to_vec();
-        self.bundles
-            .insert(path.to_owned(), Tested { stamp, plugins });
+        self.bundles.insert(
+            path.to_owned(),
+            Tested {
+                stamp,
+                plugins,
+                fault: None,
+            },
+        );
+        true
+    }
+
+    /// Stores the fault of a bundle that did not load at its test. False
+    /// when the cache has an answer for the bundle at this stamp already: a
+    /// fault that comes and goes does not remove the plugins of a bundle,
+    /// and the same fault needs no new line. A path that is not text has no
+    /// place in the file, as in [`Cache::store`].
+    pub(crate) fn store_fault(&mut self, bundle: &Path, stamp: Stamp, reason: &str) -> bool {
+        let Some(path) = bundle.to_str() else {
+            return false;
+        };
+        if self
+            .bundles
+            .get(path)
+            .is_some_and(|tested| tested.stamp == stamp)
+        {
+            return false;
+        }
+        self.bundles.insert(
+            path.to_owned(),
+            Tested {
+                stamp,
+                plugins: Vec::new(),
+                fault: Some(reason.to_owned()),
+            },
+        );
         true
     }
 }
@@ -186,6 +235,46 @@ mod tests {
         assert_eq!(cache.plugins(&bundle, second), None);
         std::fs::write(&file, "not a cache").unwrap();
         assert_eq!(Cache::read(&file).plugins(&bundle, first), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_fault_stays_for_a_bundle_with_the_same_files() {
+        let root = std::env::temp_dir().join(format!("rustel-vst3-fault-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let bundle = root.join("Bad.vst3");
+        std::fs::write(&bundle, [0u8; 16]).unwrap();
+        let first = stamp(&bundle);
+
+        let file = root.join("vst").join(FILE_NAME);
+        let mut cache = Cache::read(&file);
+        assert!(cache.store_fault(&bundle, first, "no audio plugin"));
+        assert!(!cache.store_fault(&bundle, first, "no audio plugin"));
+        assert_eq!(cache.plugins(&bundle, first), None);
+        cache.write(&file);
+        let mut cache = Cache::read(&file);
+        assert_eq!(cache.fault(&bundle, first), Some("no audio plugin"));
+        assert_eq!(cache.plugins(&bundle, first), None);
+
+        // Plugins that load after all win over the fault of the same files,
+        // and the fault then does not remove them again.
+        let plugins = vec![Scanned {
+            name: "Bad".into(),
+            vendor: "Maker".into(),
+            categories: "Fx".into(),
+        }];
+        assert!(cache.store(&bundle, first, &plugins));
+        assert_eq!(cache.plugins(&bundle, first), Some(plugins.as_slice()));
+        assert_eq!(cache.fault(&bundle, first), None);
+        assert!(!cache.store_fault(&bundle, first, "no audio plugin"));
+        assert_eq!(cache.plugins(&bundle, first), Some(plugins.as_slice()));
+
+        // A bundle with a changed file is a bundle with no answer.
+        std::fs::write(&bundle, [0u8; 17]).unwrap();
+        let second = stamp(&bundle);
+        assert_ne!(first, second);
+        assert_eq!(cache.fault(&bundle, second), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -3,7 +3,7 @@
 ## Unreleased
 
 - Scores use `.vst()` for VST3 effects and `.vsti()` for VST3 instruments, with parameters and presets. Plugin support is experimental. `rustel vst` lists your plugins. Studio lists the plugins in the reference panel and completes plugin names, parameters and presets. See [Plugins](https://github.com/tzfm/rustel/blob/main/docs/plugins.md).
-- The audio of a VST3 plugin runs in the rustel process, as in most DAWs. Studio and `rustel vst` scan each plugin bundle in a process of its own, so a plugin fault at the scan ends no host. An edit keeps the plugin copies of each call it does not change, and a plugin with no sound sleeps until its next note.
+- The audio of a VST3 plugin runs in the rustel process, as in most DAWs. Studio and `rustel vst` scan each plugin bundle in a process of its own, so a plugin fault at the scan ends no host. A bundle that fails its scan stays off until its files change or a rescan. An edit keeps the plugin copies of each call it does not change, and a plugin with no sound sleeps until its next note. `rustel vst <name>` shows at most 40 parameters with no group, with a hint for the rest.
 - Studio and the CLI report device underruns apart from DSP deadline misses. A recoverable underrun keeps playback running.
 - A digit in a name has the colour of the name in the Studio editor. The `1` in `filter1on` had the number colour.
 - Stop fades an orbit routed to another output pair with the main pair. Before, the orbit kept its level through the stop fade, and the stopped output played the last block of the orbit in a loop.

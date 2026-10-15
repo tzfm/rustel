@@ -650,7 +650,8 @@ impl Host {
 
     /// Reads the folders again, on the plugin thread: a folder on a slow
     /// disk does not hold the caller. New bundles join the list. A plugin
-    /// that failed gets a new try. Plugin numbers stay as they are.
+    /// that failed gets a new try when its files changed, or when
+    /// [`Host::rescan`] empties the cache. Plugin numbers stay as they are.
     /// [`Host::wait_idle`] returns after the read.
     pub fn scan(&self, folders: &[PathBuf]) {
         let folders = folders.to_vec();
@@ -734,6 +735,15 @@ impl Host {
             if let Some(plugins) = state.cache.plugins(bundle, stamp).map(<[Scanned]>::to_vec) {
                 state.scanned.insert(bundle.clone(), stamp);
                 state.name_rows(bundle, &plugins);
+            } else if let Some(fault) = state.cache.fault(bundle, stamp).map(str::to_owned) {
+                // The bundle has the fault of its last test, with the same
+                // files: it stays off, and no new test runs.
+                state.scanned.insert(bundle.clone(), stamp);
+                for entry in &mut state.entries {
+                    if entry.bundle == *bundle && matches!(entry.stage, Stage::Found) {
+                        entry.stage = Stage::Failed(fault.clone());
+                    }
+                }
             }
         }
         state
@@ -843,14 +853,15 @@ impl Host {
                 // start.
                 Err(_) if self.shared.closed.load(Ordering::Relaxed) => false,
                 // The list shows the reason. No score asked for the plugin,
-                // so the user gets no notice.
+                // so the user gets no notice. The fault goes in the cache,
+                // so the next start runs no new test of these files.
                 Err(reason) => {
                     for entry in &mut state.entries {
                         if entry.bundle == bundle && matches!(entry.stage, Stage::Found) {
                             entry.stage = Stage::Failed(reason.clone());
                         }
                     }
-                    false
+                    state.cache.store_fault(&bundle, stamp, &reason)
                 }
             };
             drop(state);

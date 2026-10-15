@@ -113,9 +113,19 @@ fn install_plugin<'js>(
         .and_then(|name| name.to_string().ok())
         .filter(|name| !name.trim().is_empty());
     let Some(name) = name else {
+        // Text in double quotes in a variable turns into a pattern before
+        // this code runs, so the message tells the two forms that work.
+        let forms = if !args.0.is_empty() {
+            format!(
+                " Write the name in quotes in the call, as .{call}(\"ott\"), \
+                 or in single quotes in a variable: 'ott', not \"ott\"."
+            )
+        } else {
+            String::new()
+        };
         return Err(rquickjs::Exception::throw_type(
             &ctx,
-            &format!("{call} expects the name of a plugin as its first argument"),
+            &format!("{call} expects the name of a plugin as its first argument.{forms}"),
         ));
     };
     let binding = with_bridge_frame(BridgeFrame::next_plugin_binding)
@@ -280,6 +290,28 @@ mod tests {
         ] {
             assert_eq!(lane_tags(lanes, &[]), tags, "{lanes}");
         }
+    }
+
+    #[test]
+    fn a_plugin_name_in_a_variable_of_double_quotes_names_the_fix() {
+        let runtime = runtime();
+        // Text in double quotes in a variable turns into a pattern, so the
+        // call says the two forms that work.
+        let error = runtime
+            .evaluate_score(
+                r#"const fx = "ott"; s("bd").vst(fx)"#,
+                &TranspileOptions::default(),
+            )
+            .expect_err("a pattern is no plugin name");
+        assert!(error.contains(".vst(\"ott\")"), "{error}");
+        assert!(error.contains("'ott', not \"ott\""), "{error}");
+        // Single quotes keep the text, so the same call works.
+        runtime
+            .evaluate_score(
+                r#"const fx = 'ott'; s("bd").vst(fx)"#,
+                &TranspileOptions::default(),
+            )
+            .expect("single quotes keep the text");
     }
 
     #[test]
