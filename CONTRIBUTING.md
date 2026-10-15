@@ -32,6 +32,17 @@ A PR that changes the studio must keep this suite passing. CI runs it only in
 the heavy tier (see "How CI runs, and why"). Run it locally, or ask a
 maintainer to dispatch Heavy CI for the PR's current commit.
 
+One test in the workspace run reports as ignored: the Link wire test, which
+binds the shared multicast port on every interface. The macOS firewall asks a
+desktop for its consent to that, again for every rebuilt binary, so the test
+stays out of plain runs. CI runs it with `--ignored`. To run it yourself:
+
+```sh
+cargo test -p rustel-runtime --all-features --test link -- --ignored
+```
+
+Answer the firewall once for that binary.
+
 The `--release` command above it evaluates, queries, and renders all committed
 corpus scores. It takes about fifteen seconds with a warm sample cache. The
 first run downloads the sample banks used by the scores and takes longer.

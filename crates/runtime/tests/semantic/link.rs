@@ -1,6 +1,12 @@
 //! The Link wire itself: two participants on one machine, kept on
-//! loopback so the test joins no network the OS may ask permission
-//! for. The arithmetic of the merge is covered by the unit tests.
+//! loopback so the test joins no real network. The arithmetic of the
+//! merge is covered by the unit tests.
+//!
+//! Ignored in a plain run: the shared port is bound on every interface,
+//! which the macOS firewall asks its consent to, and a rebuilt test
+//! binary is asked again each time. CI runs it with `--ignored`, where
+//! no dialog can appear. Run it yourself the same way and answer the
+//! firewall once.
 
 #![cfg(feature = "test-support")]
 
@@ -13,6 +19,7 @@ use rustel_runtime::link::{Link, speak_only_on_loopback};
 /// up standing in one session on one grid. Skipped where the
 /// announcements never come back through the looped group.
 #[test]
+#[ignore = "binds the multicast port the macOS firewall asks consent for"]
 fn two_participants_meet_on_one_grid() {
     speak_only_on_loopback();
     let Ok(first) = Link::start(120.0, 0.0) else {

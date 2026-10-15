@@ -790,6 +790,8 @@ fn bind_socket() -> io::Result<UdpSocket> {
     let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
     address.sin_family = libc::AF_INET as libc::sa_family_t;
     address.sin_port = wire::PORT.to_be();
+    // The wildcard address, not loopback: macOS delivers the group only
+    // to a socket bound to every interface.
     address.sin_addr.s_addr = libc::INADDR_ANY;
     let bound = unsafe {
         libc::bind(
