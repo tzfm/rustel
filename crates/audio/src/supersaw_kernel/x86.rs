@@ -18,7 +18,7 @@ use std::arch::x86_64::{
 };
 
 use super::StaticSupersawKernel;
-use crate::scalar::saw_blep;
+use crate::scalar::{saw_blep, saw_step};
 
 const LANES_PER_VECTOR: usize = 8;
 
@@ -145,7 +145,7 @@ unsafe fn avx2_render_static_lanes(
         .iter_mut()
         .zip(&detune_ratios[lane..count])
     {
-        let dt = (frequency_hz * ratio / sample_rate).rem_euclid(1.0);
+        let dt = saw_step(frequency_hz * ratio / sample_rate);
         let value = saw_blep(*phase, dt);
         left += value * gain_l;
         right += value * gain_r;
@@ -170,7 +170,7 @@ fn scalar_render_static_lanes(
     let mut left = 0.0f32;
     let mut right = 0.0f32;
     for (phase, ratio) in phases[..count].iter_mut().zip(&detune_ratios[..count]) {
-        let dt = (frequency_hz * ratio / sample_rate).rem_euclid(1.0);
+        let dt = saw_step(frequency_hz * ratio / sample_rate);
         let value = saw_blep(*phase, dt);
         left += value * gain_l;
         right += value * gain_r;
