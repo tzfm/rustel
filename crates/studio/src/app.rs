@@ -32842,6 +32842,32 @@ mod tests {
             assert!(rows[0].contains("edit this fader"), "{rows:?}");
         }
 
+        /// Backspace on a fresh field takes one character off its end, the
+        /// way the caret the form draws says it will. The selection a fresh
+        /// field opens with exists so a typed character replaces the guess;
+        /// one erase key must not erase the whole default.
+        #[test]
+        fn backspace_trims_a_fresh_field_instead_of_erasing_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _) = plain_app(directory.path(), "$: s(\"bd\").lpf(800)\n");
+            open_action_on(&mut app, "800");
+            precision_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            precision_key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            let (_, rows) = app.smart_action_view().expect("the form stays open");
+            assert_eq!(rows[0], "\u{25b8} value 80", "{rows:?}");
+            // The trim took the selection with it: a typed digit joins the
+            // number it trimmed.
+            precision_key(&mut app, KeyCode::Char('5'), KeyModifiers::NONE);
+            let (_, rows) = app.smart_action_view().expect("the form stays open");
+            assert_eq!(rows[0], "\u{25b8} value 805", "{rows:?}");
+            // A field Tab lands on is trimmed the same, not emptied.
+            precision_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            precision_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            precision_key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            let (_, rows) = app.smart_action_view().expect("the form stays open");
+            assert_eq!(rows[2], "\u{25b8} max   200", "{rows:?}");
+        }
+
         #[test]
         fn a_written_fader_marks_the_scene_unsaved() {
             let directory = tempfile::tempdir().expect("temp dir");
