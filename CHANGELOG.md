@@ -2,15 +2,17 @@
 
 ## Unreleased
 
+## v0.1.3
+
 - Scores use `.vst()` for VST3 effects and `.vsti()` for VST3 instruments, with parameters and presets. Plugin support is experimental. `rustel vst` lists your plugins. Studio lists the plugins in the reference panel and completes plugin names, parameters and presets. See [Plugins](https://github.com/tzfm/rustel/blob/main/docs/plugins.md).
 - The audio of a VST3 plugin runs in the rustel process, as in most DAWs. Studio and `rustel vst` scan each plugin bundle in a process of its own, so a plugin fault at the scan ends no host. A bundle that fails its scan stays off until its files change or a rescan. An edit keeps the plugin copies of each call it does not change, and a plugin with no sound sleeps until its next note. `rustel vst <name>` shows at most 40 parameters with no group, with a hint for the rest.
 - Studio and the CLI report device underruns apart from DSP deadline misses. A recoverable underrun keeps playback running.
 - Studio's export runs the global and local prebakes before the score, as the engine does before play. Before, an export of a score that called a name its setup defined stopped with `ReferenceError`, while the score played.
 - A set opened to hear it and closed with no change keeps its files and their changed dates. Update rewrote a score the file already held, and opening and closing rewrote the set's project file, so a set you only played rose to the top of the open list. A write that would put the same bytes on disk is skipped. A folder of scores with no project file gains one the first time it is opened, so it exists to be opened by name.
 - A digit in a name has the colour of the name in the Studio editor. The `1` in `filter1on` had the number colour.
-- Stop fades an orbit routed to another output pair with the main pair. Before, the orbit kept its level through the stop fade, and the stopped output played the last block of the orbit in a loop.
-- Ableton Link joins rustel to the tempo and transport of other participants on the local network. `rustel play --link` and `rustel studio --link` join, and in Studio the `link` tab of the Devices panel holds the checkbox, off at each start. A session that starts playing starts rustel, one that stops stops it, and rustel tells the session its own starts, stops and tempo changes. Participants on the same machine are found over loopback, with no network. Enabling Link releases the MIDI clock in. See [hardware](docs/hardware.md#link).
+- Ableton Link joins rustel to the tempo and transport of other participants on the local network. `rustel play --link` and `rustel studio --link` join, and in Studio the `link` tab of the Devices panel holds the checkbox, off at each start. A session that starts playing starts rustel, one that stops stops it, and rustel tells the session its own starts, stops and tempo changes. Participants on the same machine are found over loopback, with no network. Enabling Link releases the MIDI clock in. See [hardware](https://github.com/tzfm/rustel/blob/main/docs/hardware.md#link).
 - Backspace in the quick action's slider form deletes one character from the caret, not the whole field. Each field opens selected so a typed number replaces the default, and the selection is not drawn, so an erase key read as the whole default number going at once.
+- The header's transport word keeps to `PLAYING`, `STOPPING` and `STOPPED`, drawn in an eight-column field. The readiness chip, the tempo line and the take clock after it stay put while the word changes. An evaluation no longer replaces the word with `EVALUATING`. The logo dot breathes amber while a job runs.
 - `K(...)` binds the same note frequency on every platform. The frequency came from the host `pow`, whose last bits differ on Windows, so a score using `sFreq` produced a different event hash there and failed the corpus. The bound frequency is trimmed, as tonal frequencies already are, and the two affected golden rows are recaptured.
 - KabelSalat guide tests read examples with Unix or Windows line endings.
 - Methods defined through aliases such as `const rg = register` pass score checks and remain available in later updates.
@@ -23,8 +25,17 @@
 - The check reads a bank name without regard to case, as playback does. `.bank("TR909")` was flagged `unknown bank` while it played the machine `tr909` names.
 - A sound only some machines of a `.bank()` hold is a note, not a problem. `s("sh*16").bank("tr909,dmx,linn")` was refused as `unknown sound "sh"` while the dmx and linn layers played. The note says which machines go without and which carry the voice, and a sound no machine holds stays a refusal.
 - A refused voice is said once per score text and its line names the music. `unknown sound "tr909_sh": no sample bank or synth of that name is loaded` was logged on every scheduling window, its count climbing while the set played on. The line now reads `tr909_sh is not loaded - that layer stays silent, the rest plays`, the command line prints it as a warning, and a changed score says it again.
+- The installer puts `rustelup.ps1` in `~/.rustel/lib` and leaves only `rustelup.cmd` in `bin`. PowerShell runs a `.ps1` found on `PATH` before a `.cmd` of the same name, and the default execution policy blocks the script. `rustelup` now reaches the shim and runs with the default policy. Run the install command again to move an installed updater.
 - Studio no longer pauses animated themes during the first sample-library refresh.
+- `rustelup` runs from PowerShell 7. The shim starts Windows PowerShell through cmd.exe, where `Get-FileHash` is not available, so the updater computes the SHA256 hash itself.
 - Studio applies a paused edit by itself while the set plays. Settings ▸ Live coding turns auto evaluate on, off by default, and sets the typing pause: how long a rest before the edit applies, 250 ms to 2 s with a 500 ms default. Only a clean edit applies, a refused one keeps the last good score playing, and an applied edit never flashes the pane. The launch setting names the line an applied edit waits for, as for an update.
+
+### Sound changes
+
+- Stop fades an orbit routed to another output pair with the main pair. Before, the orbit kept its level through the stop fade, and the stopped output played the last block of the orbit in a loop.
+- Studio master volume changes ramp over 10 ms, removing the crackle when dragging the fader. The same ramp reaches routed outputs.
+- Limiter threshold, mode and makeup changes fade smoothly during playback. Mode changes keep audio flowing while the new mode fills its lookahead buffer.
+- On macOS, Studio keeps its output stream open across Stop and reuses it on the next start, avoiding the click from closing and reopening it even from silence. The stream closes when you quit, change the output device or buffer size, or the stream fails.
 
 ## v0.1.2
 
@@ -59,9 +70,6 @@
 
 ### Sound changes
 
-- Studio master volume changes ramp over 10 ms, removing the crackle when dragging the fader. The same ramp reaches routed outputs.
-- Limiter threshold, mode and makeup changes fade smoothly during playback. Mode changes keep audio flowing while the new mode fills its lookahead buffer.
-- On macOS, Studio keeps its output stream open across Stop and reuses it on the next start, avoiding the click from closing and reopening it even from silence. The stream closes when you quit, change the output device or buffer size, or the stream fails.
 - The stop fade runs for the full 10 ms. The fade ended after 128 frames, about 3 ms at 48 kHz, and left a click.
 - `.pg(x)` multiplies the postgain of each note by `x`. `.accent(x)` multiplies `velocity` and `lpenv` the same way. Before, both silenced the pattern with no error, because the multiplier held no events.
 - `s("one")` plays a constant signal, the source of a bus modulator: `s("one").gain("0 1").bus(1).dry(0)` moves the control another pattern reads with `bmod({ b: 1 })`. Before, the sound was unknown and the modulator voice was refused. A sample named `one` still plays as a sample.
