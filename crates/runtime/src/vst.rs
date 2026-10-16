@@ -1135,7 +1135,7 @@ fn end_chains(chains: Vec<u64>) {
 /// that chain.
 // Only the names source of a live output asks: see `attach`.
 #[cfg_attr(not(feature = "device-audio"), allow(dead_code))]
-fn named_chains(chains: &Mutex<Chains>) -> Vec<u64> {
+pub(crate) fn named_chains(chains: &Mutex<Chains>) -> Vec<u64> {
     let (named, left) = {
         let mut chains = locked(chains);
         let left = chains.settle(Instant::now());

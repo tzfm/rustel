@@ -1391,6 +1391,54 @@ fn disambiguate_device_names(list: &mut [AudioDeviceInfo]) {
     }
 }
 
+fn prepare_finite_inserts(
+    backend: &mut ScalarBackend,
+    events: &[OnsetEvent],
+    sample_rate: u32,
+    provider: Option<&crate::InsertProvider>,
+) -> Result<(), DevicePlaybackError> {
+    for event in events {
+        let chain = event.controls.insert_chain();
+        let slots =
+            event
+                .controls
+                .instrument
+                .iter()
+                .map(|controls| (crate::instrument_slot(chain), controls))
+                .chain(event.controls.effects.iter().enumerate().filter_map(
+                    |(stage, controls)| {
+                        controls
+                            .as_ref()
+                            .map(|controls| (crate::effect_slot(chain, stage), controls))
+                    },
+                ));
+        for (slot, controls) in slots {
+            if let Some(key) = backend.orbit_insert_key(slot) {
+                if key == controls.key {
+                    continue;
+                }
+                return Err(DevicePlaybackError::ResourceLimit(
+                    "finite playback needs one instrument or effect revision per chain slot".into(),
+                ));
+            }
+            let insert = provider
+                .and_then(|build| build(controls.key, sample_rate, slot))
+                .filter(|insert| insert.key() == controls.key)
+                .ok_or_else(|| {
+                    DevicePlaybackError::ResourceLimit(
+                        "cannot prepare a finite playback instrument or effect".into(),
+                    )
+                })?;
+            if backend.install_insert(slot, insert).is_some() {
+                return Err(DevicePlaybackError::ResourceLimit(
+                    "finite playback exceeds the instrument and effect chain limit".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl ScalarDevice {
     pub fn open_default() -> Result<Self, DevicePlaybackError> {
         Self::open_output(None)
@@ -1525,6 +1573,29 @@ impl ScalarDevice {
         dispatch: DspDispatch,
         max_polyphony: usize,
     ) -> Result<(), DevicePlaybackError> {
+        self.play_with_samples_dispatch_polyphony_and_inserts(
+            events,
+            duration_secs,
+            stopped,
+            samples,
+            dispatch,
+            max_polyphony,
+            None,
+        )
+    }
+
+    /// Finite playback with instruments and effects prepared before streaming.
+    #[allow(clippy::too_many_arguments)]
+    pub fn play_with_samples_dispatch_polyphony_and_inserts(
+        &self,
+        events: &[OnsetEvent],
+        duration_secs: f64,
+        stopped: &AtomicBool,
+        samples: Vec<(crate::sample::SampleId, Box<crate::sample::DecodedSample>)>,
+        dispatch: DspDispatch,
+        max_polyphony: usize,
+        provider: Option<Arc<crate::InsertProvider>>,
+    ) -> Result<(), DevicePlaybackError> {
         let total_frames = checked_frames(duration_secs, self.sample_rate())?;
         if total_frames == 0 {
             return Ok(());
@@ -1541,6 +1612,12 @@ impl ScalarDevice {
         for (id, decoded) in samples {
             let _ = backend.install_sample(id, decoded);
         }
+        prepare_finite_inserts(
+            &mut backend,
+            events,
+            self.sample_rate(),
+            provider.as_deref(),
+        )?;
         // The event list is complete up front: synthesise every needed orbit
         // reverb HERE, off the callback, so activation never generates.
         let mut stage_reverbs: Vec<crate::reverb::ReverbParams> = Vec::new();
@@ -1911,6 +1988,65 @@ where
 mod tests {
     use super::super::tests::*;
     use super::*;
+
+    #[test]
+    fn finite_inserts_prepare_each_slot_once_and_refuse_unavailable_revisions() {
+        struct Insert(crate::InsertKey);
+        impl crate::OrbitInsert for Insert {
+            fn key(&self) -> crate::InsertKey {
+                self.0
+            }
+            fn set_param(&mut self, _: crate::InsertParam, _: u32) {}
+            fn process(&mut self, _: &mut [f32], _: &mut [f32]) {}
+        }
+
+        let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = built.clone();
+        let provider = move |key, rate, _| -> Option<Box<dyn crate::OrbitInsert>> {
+            assert_eq!(rate, 48_000);
+            count.fetch_add(1, Ordering::Relaxed);
+            Some(Box::new(Insert(key)))
+        };
+        let key = crate::InsertKey {
+            plugin: 3,
+            preset: 1,
+        };
+        let mut event = OnsetEvent::new(0, 440.0, 1.0, 0.1);
+        event.controls.instrument = Some(crate::InsertControls::new(key).with_score(7));
+        event.controls.effects[0] = Some(crate::InsertControls::new(key));
+        let mut backend = ScalarBackend::new();
+        backend.init(48_000).unwrap();
+        assert!(matches!(
+            prepare_finite_inserts(&mut backend, &[event.clone()], 48_000, None),
+            Err(DevicePlaybackError::ResourceLimit(_))
+        ));
+        prepare_finite_inserts(
+            &mut backend,
+            &[event.clone(), event.clone()],
+            48_000,
+            Some(&provider),
+        )
+        .unwrap();
+        assert_eq!(built.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            backend.orbit_insert_key(crate::instrument_slot(event.controls.insert_chain())),
+            Some(key)
+        );
+        assert_eq!(
+            backend.orbit_insert_key(crate::effect_slot(event.controls.insert_chain(), 0)),
+            Some(key)
+        );
+        event.controls.instrument = Some(crate::InsertControls::new(crate::InsertKey {
+            preset: 2,
+            ..key
+        }));
+        assert!(matches!(
+            prepare_finite_inserts(&mut backend, &[event], 48_000, Some(&provider)),
+            Err(DevicePlaybackError::ResourceLimit(_))
+        ));
+        assert_eq!(built.load(Ordering::Relaxed), 2);
+    }
+
     mod host_cache {
         use super::*;
         use std::rc::Rc;

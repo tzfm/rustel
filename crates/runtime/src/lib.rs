@@ -8,6 +8,8 @@
 mod atomic_file;
 mod capabilities;
 mod capability_report;
+mod csound;
+pub use csound::CsoundSnapshot;
 /// Shared configuration, session, and sample-cache directory rules.
 pub mod config_dir;
 #[cfg(feature = "device-audio")]

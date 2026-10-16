@@ -89,6 +89,7 @@ impl LiveShared {
             line_arm: Arc::new(AtomicU64::new(0)),
             cut_sounding: Arc::new(AtomicBool::new(false)),
             frames: Arc::new(AtomicU64::new(0)),
+            completed_intake_frame: Arc::new(AtomicU64::new(0)),
             rendering_until_frame: Arc::new(AtomicU64::new(0)),
             playback_origin_nanos: Arc::new(AtomicU64::new(UNSET_STREAM_INSTANT_NANOS)),
             buffer_playback_nanos: Arc::new(AtomicU64::new(0)),
@@ -226,6 +227,11 @@ impl LiveShared {
             old_sample_rate,
             new_sample_rate,
         );
+        let completed_intake_frame = rebase_frame_rate(
+            self.completed_intake_frame.load(Ordering::Acquire),
+            old_sample_rate,
+            new_sample_rate,
+        );
         let takeover_frame = rebase_frame_rate(
             self.takeover_frame.load(Ordering::Acquire),
             old_sample_rate,
@@ -245,6 +251,8 @@ impl LiveShared {
                 .store((line << 2) | (line_arm & 0b11), Ordering::Release);
         }
         self.frames.store(frames, Ordering::Release);
+        self.completed_intake_frame
+            .store(completed_intake_frame, Ordering::Release);
         // The old callback has joined: there is no remaining in-flight
         // reservation to carry into the new frame domain.
         self.rendering_until_frame.store(frames, Ordering::Release);
@@ -991,6 +999,13 @@ impl LiveScalarDevice {
     /// Zero before the first callback is deliberately conservative.
     pub fn clock_frames(&self) -> u64 {
         self.shared.clock_frames()
+    }
+
+    /// End of the latest completed DSP chunk that admitted scheduled events.
+    /// Holds during Stop and its release ramp, even as the output clock runs.
+    /// This tracks event intake, not host copies or audible playback.
+    pub fn completed_intake_frames(&self) -> u64 {
+        self.shared.completed_intake_frame.load(Ordering::Acquire)
     }
 
     /// Render frontier including the DSP chunk currently being written.

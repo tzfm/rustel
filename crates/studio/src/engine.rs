@@ -548,6 +548,8 @@ pub fn try_send_update(
 /// zero, no device. Tests build one and set only the fields they are about.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StudioSnapshot {
+    /// Accepted orchestra sources and URL cache for an isolated export.
+    pub csound: rustel_runtime::CsoundSnapshot,
     pub playing: bool,
     /// A Stop has been requested and the last voices are ringing out; the
     /// device is still open and `playing` remains true until they have.
@@ -1947,6 +1949,7 @@ impl StudioEngine {
             device_time
         };
         StudioSnapshot {
+            csound: self.session.csound_snapshot(),
             playing: self.live.is_some(),
             stopping: self.is_stopping(),
             session_generation: self.session.generation(),
@@ -2086,6 +2089,10 @@ impl StudioEngine {
             return Ok(StudioTick::Idle);
         }
         if let Some(live) = self.live.as_mut() {
+            live.producer.reap_completed_output(
+                live.device.completed_intake_frames(),
+                live.device.sample_rate(),
+            );
             let refusals = live.device.report().asset_queues.fx_reverb_refusals;
             if let Some(diagnostic) =
                 fx_reverb_refusal_diagnostic(refusals, &mut live.last_fx_reverb_refusals)

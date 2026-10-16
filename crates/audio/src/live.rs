@@ -644,6 +644,11 @@ impl LiveScalarBackend {
             .is_some_and(|rendered| rendered >= self.stop_ramp_frames())
     }
 
+    #[cfg(feature = "device-audio")]
+    pub(crate) fn intake_is_running(&self) -> bool {
+        self.stop_fade_pos.is_none()
+    }
+
     /// Consume one stereo block at an absolute sample-clock position.
     ///
     /// Besides the event `ring`, it reads the producer's side of the

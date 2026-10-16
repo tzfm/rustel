@@ -1397,6 +1397,12 @@ struct SampleAccessArgs {
     /// no script loads.
     #[arg(long = "allow-import-origin", value_name = "ORIGIN")]
     import_origins: Vec<String>,
+    /// Permit native Csound orchestra code, including file and process access.
+    #[arg(long = "allow-csound")]
+    csound: bool,
+    /// Permit loadOrc() to read orchestra files beneath this directory.
+    #[arg(long = "allow-local-orchestras", value_name = "DIR")]
+    local_orchestras: Option<PathBuf>,
     /// Permit score-chosen OSC destinations other than loopback.
     /// Repeatable. The value must be an IP literal; names are not resolved
     /// on the music thread.
@@ -1424,10 +1430,19 @@ fn with_sample_access(
             .map_err(RuntimeError::Message)?;
     }
     config.score_sample_access = access;
+    if args.csound {
+        config.score_import_access.permit_csound();
+    }
     for origin in &args.import_origins {
         config
             .score_import_access
             .permit_origin(origin)
+            .map_err(RuntimeError::Message)?;
+    }
+    if let Some(root) = &args.local_orchestras {
+        config
+            .score_import_access
+            .permit_local_root(root)
             .map_err(RuntimeError::Message)?;
     }
     #[cfg(feature = "osc")]
@@ -6386,7 +6401,7 @@ mod tests {
             live_output_options(&session, None),
         )
         .expect("silent output");
-        session.attach_plugins(&device);
+        session.attach_instruments(&device);
         let mut producer = build_live_producer(
             &score,
             WatchLanguage::JavaScript,

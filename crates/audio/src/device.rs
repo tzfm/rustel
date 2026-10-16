@@ -397,6 +397,9 @@ struct LiveShared {
     /// would click - so auditioning asks for it explicitly.
     cut_sounding: Arc<AtomicBool>,
     frames: Arc<AtomicU64>,
+    /// End of the latest DSP chunk that admitted scheduled events.
+    /// Holds its position while Stop or its release ramp suspends intake.
+    completed_intake_frame: Arc<AtomicU64>,
     /// End of the current 128-frame DSP chunk, announced before rendering.
     /// Unlike `frames`, this includes in-flight work, not certified host
     /// copies. A completed host callback leaves both frontiers equal.

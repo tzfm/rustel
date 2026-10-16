@@ -147,6 +147,21 @@ rustel vst --rescan
 run tests each plugin and keeps the result in a scan cache, and `--rescan`
 tests each plugin again. See [Plugins](plugins.md#the-plugin-scan).
 
+## Csound
+
+Install double-precision Csound 6.18, then enable native orchestras for a
+trusted score:
+
+```sh
+rustel play song.strudel --allow-csound
+rustel studio --allow-csound
+```
+
+`--allow-local-orchestras DIR` also permits `loadOrc('local:voice.orc')`
+inside that folder. It does not grant native execution on its own.
+Remote orchestras use `--allow-import-origin` to trust their HTTPS origin.
+See [Csound](csound.md) for instruments, examples and exports.
+
 ## Samples
 
 ```sh

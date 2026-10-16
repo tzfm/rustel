@@ -535,6 +535,11 @@ fn write_live_output_inner<T>(
             stop_state != OUTPUT_RUNNING,
             Some(&shared.samples),
         );
+        if backend.intake_is_running() {
+            shared
+                .completed_intake_frame
+                .store(end_frame, Ordering::Release);
+        }
         report.accepted += immediate.accepted;
         report.refused += immediate.refused;
         // Visuals follow the score independently of listening volume and
@@ -1623,7 +1628,7 @@ mod tests {
                 stretch: Some(2.0),
                 ..Default::default()
             };
-            assert!(shared.ring.push(AudioEvent {
+            let event = AudioEvent {
                 onset_id: 1,
                 generation: 1,
                 target_frame: 0,
@@ -1637,7 +1642,8 @@ mod tests {
                 synth: None,
                 wavetable: None,
                 cut: None,
-            }));
+            };
+            assert!(shared.ring.push(event.clone()));
             let mut backend = LiveScalarBackend::new(48_000, 4).expect("live scalar");
             let mut meters = test_meter();
             let mut output = [0.0f32; 128 * 2];
@@ -1646,6 +1652,7 @@ mod tests {
             });
             let pressure = backend.pressure_observation();
             assert_eq!(pressure.active_voices, 1);
+            assert_eq!(shared.completed_intake_frame.load(Ordering::Acquire), 128);
             assert_eq!(
                 pressure.active_pool_leases[crate::pressure::RealtimePool::Stretch.index()],
                 1
@@ -1654,12 +1661,20 @@ mod tests {
             assert!(tripwire::allocator_is_armed());
             let before = tripwire::Violations::capture();
             shared.request_stop();
+            shared.stop.resume();
+            assert!(shared.ring.push(AudioEvent {
+                onset_id: 2,
+                target_frame: 128,
+                ..event
+            }));
             // The 10 ms ramp spans four 128-frame callbacks. The last one
             // resets the voices and returns the lease.
             for _ in 0..4 {
                 tripwire::audio_scope(|| {
                     write_live_output(&mut backend, &mut meters, &mut output, 2, &shared)
                 });
+                assert_eq!(shared.completed_intake_frame.load(Ordering::Acquire), 128);
+                assert_eq!(shared.ring.len(), 1);
             }
             let violations = tripwire::Violations::capture().since(before);
             assert!(
@@ -1673,6 +1688,14 @@ mod tests {
                 pressure.active_pool_leases[crate::pressure::RealtimePool::Stretch.index()],
                 0
             );
+            assert_eq!(shared.clock_frames(), 640);
+            tripwire::audio_scope(|| {
+                write_live_output(&mut backend, &mut meters, &mut output, 2, &shared)
+            });
+            assert_eq!(shared.completed_intake_frame.load(Ordering::Acquire), 768);
+            assert_eq!(shared.ring.len(), 0);
+            assert_eq!(backend.pressure_observation().active_voices, 1);
+            assert!(tripwire::Violations::capture().since(before).clean());
         }
 
         #[test]

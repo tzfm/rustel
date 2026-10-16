@@ -2950,6 +2950,7 @@ mod tests {
             audible_generation: None,
             confirmed_audio_generation: None,
             source_revision: None,
+            csound: Default::default(),
             cps: 0.5,
             device_time: 0.0,
             cycle: 0.0,

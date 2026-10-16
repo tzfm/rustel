@@ -210,6 +210,27 @@ general device API is installed in QuickJS. MIDI and serial failures are
 reported and dropped without ending the set. One-shot query, validation, and
 offline render routes do not open these external outputs.
 
+## Csound orchestras
+
+Native Csound execution is off by default. `--allow-csound` enables it for
+the session, including orchestra compilation and exports. An orchestra runs
+through the native library in the host process. Its opcodes can read files,
+write files, load native libraries and start processes with the rights of the user.
+QuickJS limits do not contain those operations. Enable it only for scores
+and orchestras you trust.
+
+`loadOrc` fetches HTTPS text only from a granted import origin. Redirects
+stay on that origin and use the same network address checks as script
+imports. `--allow-local-orchestras DIR` confines the host's orchestra text
+loader to that canonical folder. These grants control loading, not what a
+compiled orchestra can do. Inline `loadCSound` code also requires
+`--allow-csound`.
+
+The host loads double-precision Csound 6.18 from system library locations,
+or from `RUSTEL_CSOUND_LIBRARY` set by the host environment. A score cannot
+change that library path. Native synthesis runs on a worker thread in the
+same process. A native fault can end the host.
+
 ## Plugins
 
 The `vst` Cargo feature is a host-level capability. The default build and the

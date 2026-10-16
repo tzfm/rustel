@@ -9,8 +9,10 @@
 //! plausible-sounding approximations.
 
 mod bus_names;
+mod csound;
 
 pub use bus_names::BusNames;
+pub use csound::CsoundRequest;
 
 #[cfg(test)]
 mod classification_tests {
@@ -2043,6 +2045,11 @@ pub trait SampleLookup {
     ) -> Result<Option<rustel_audio::InsertControls>, String> {
         Err("this host has no plugins".into())
     }
+
+    /// Prepares a Csound score event outside the audio callback.
+    fn csound(&self, _request: &CsoundRequest<'_>) -> Result<rustel_audio::InsertControls, String> {
+        Err("this host has no Csound support".into())
+    }
 }
 
 /// What a note asks of a plugin, in the names the score wrote.
@@ -2296,6 +2303,7 @@ fn resolve_voice_at(
         }));
     }
     let mut plays_plugin = false;
+    let mut plays_csound = false;
     let (frequency, gain, controls, sample, wavetable, synth) = match value {
         serde_json::Value::Number(midi) => (
             midi_to_hz(
@@ -2319,15 +2327,21 @@ fn resolve_voice_at(
         serde_json::Value::Object(object) => {
             let slotted = with_bus_slots(object, samples)?;
             let object = slotted.as_ref().unwrap_or(object);
-            let gain = optional_f64(object.get("gain"), "gain")?.unwrap_or(0.8);
-            let velocity = optional_f64(object.get("velocity"), "velocity")?.unwrap_or(1.0);
+            plays_csound = object.contains_key("csound") || object.contains_key("csoundm");
+            let (gain, velocity) = if plays_csound {
+                (1.0, 1.0)
+            } else {
+                (
+                    optional_f64(object.get("gain"), "gain")?.unwrap_or(0.8),
+                    optional_f64(object.get("velocity"), "velocity")?.unwrap_or(1.0),
+                )
+            };
             let postgain = optional_f64(object.get("postgain"), "postgain")?.unwrap_or(1.0);
             let pan = optional_f64(object.get("pan"), "pan")?
                 .map(|pan| checked_f32(pan.clamp(0.0, 1.0), "pan"))
                 .transpose()?;
-            // With `.vsti()` the plugin makes the sound: the note needs no
-            // sample, wavetable or synth of the engine.
-            plays_plugin = object.contains_key("vsti");
+            // An external instrument needs no native sound source.
+            plays_plugin = plays_csound || object.contains_key("vsti");
             let wavetable = if plays_plugin {
                 None
             } else {
@@ -2360,7 +2374,9 @@ fn resolve_voice_at(
             };
             // Resolved BEFORE the modulators: an `fmh` modulator rides an
             // operator frequency, which is a multiple of this.
-            let frequency = if sample.is_some() {
+            let frequency = if plays_csound {
+                csound::frequency(object)?
+            } else if sample.is_some() {
                 0.0
             } else {
                 match optional_f64(object.get("freq"), "freq")? {
@@ -2413,7 +2429,7 @@ fn resolve_voice_at(
             // explicit `freq` is transposed too, and a sample keeps the 0.0
             // that marks it as pitched by playback rate.
             let frequency = match optional_f64(object.get("octave"), "octave")? {
-                Some(octave) if frequency != 0.0 => {
+                Some(octave) if frequency != 0.0 && !plays_csound => {
                     checked_frequency(frequency * 2f64.powf(octave))?
                 }
                 _ => frequency,
@@ -2534,10 +2550,14 @@ fn resolve_voice_at(
                 orbit: orbit as u8,
                 insert_chain: None,
                 effects: effect_controls(object, samples).map(|effect| effect.map(clocked)),
-                instrument: object
-                    .get("vsti")
-                    .and_then(|plugin| plugin_controls(plugin, "vsti", samples))
-                    .map(clocked),
+                instrument: if plays_csound {
+                    None
+                } else {
+                    object
+                        .get("vsti")
+                        .and_then(|plugin| plugin_controls(plugin, "vsti", samples))
+                        .map(clocked)
+                },
                 lfos,
                 envs,
                 phaser: phaser_controls(object, target_time)?,
@@ -2596,7 +2616,9 @@ fn resolve_voice_at(
 
     // An instrument plugin makes the sound of the note. The plugin gets the
     // pitch, velocity and length. The engine applies gain to its output.
-    let (gain, controls) = if plays_plugin {
+    let (gain, controls) = if plays_csound {
+        (1.0, controls)
+    } else if plays_plugin {
         let mut controls = controls;
         controls.instrument = controls.instrument.map(|instrument| {
             instrument.with_note(rustel_audio::InsertNote {
@@ -2634,7 +2656,7 @@ fn resolve_voice_at(
         )
         .into());
     }
-    if sample.is_none() && frequency >= f64::from(sample_rate) / 2.0 {
+    if !plays_csound && sample.is_none() && frequency >= f64::from(sample_rate) / 2.0 {
         return Err(format!(
             "onset {onset_id} frequency {frequency}Hz reaches or exceeds the {sample_rate}Hz Nyquist limit"
         ).into());
@@ -2644,6 +2666,7 @@ fn resolve_voice_at(
     // trails a render-quantum one by, so the shifted voice lands where the
     // reference's does. Separate `.FX()` stretch stages keep their delay.
     // A compensated onset before the render begins starts at time zero.
+    let source_time = target_time;
     let target_time = if value.get("stretch").is_some_and(|value| !value.is_null()) {
         let lag_secs =
             f64::from(rustel_audio::stretch::QUANTUM_LAG_FRAMES) / f64::from(sample_rate);
@@ -2665,6 +2688,19 @@ fn resolve_voice_at(
     if !onset_frame.is_finite() || onset_frame < 0.0 || onset_frame > u64::MAX as f64 {
         return Err(
             format!("onset {onset_id} has an unrepresentable target time {target_time}").into(),
+        );
+    }
+    let mut controls = controls;
+    if plays_csound {
+        controls.instrument = Some(
+            samples
+                .csound(&CsoundRequest {
+                    value: value.as_object().expect("checked control map"),
+                    frequency,
+                    duration_secs,
+                    target_time: source_time,
+                })?
+                .with_clock(musical_time * cps * 4.0, (cps * 240.0) as f32),
         );
     }
     let event = rustel_audio::OnsetEvent::new(

@@ -70,6 +70,7 @@ pub(super) struct RecoveryPrebake {
 struct RecoveryCheckpoint {
     source: Option<(Arc<str>, bool)>,
     prebakes: Arc<Vec<RecoveryPrebake>>,
+    csound: crate::CsoundSnapshot,
     settings: RuntimeSettings,
     cps: f64,
     cycle: f64,
@@ -197,10 +198,17 @@ impl Session {
             .audible_source
             .as_ref()
             .map_or(settings, |source| source.settings.clone());
+        let csound = self.csound_snapshot();
+        #[cfg(feature = "device-audio")]
+        let csound = self
+            .audible_source
+            .as_ref()
+            .map_or(csound, |source| source.csound.clone());
         RecoveryCheckpoint {
             source,
             settings,
             prebakes: self.recovery_prebakes.clone(),
+            csound,
             cps,
             cycle,
             query_hap_budget: self.scheduler.query_hap_budget(),
@@ -242,6 +250,7 @@ impl Session {
             .set_query_hap_budget(checkpoint.query_hap_budget);
         fresh.scheduler.set_trace_enabled(checkpoint.trace_enabled);
         fresh.samples = self.samples.clone();
+        fresh.csound = self.csound.clone();
         fresh.direct_diagnostic_logging = self.direct_diagnostic_logging;
         fresh.audio_input_channels = self.audio_input_channels;
         fresh.schedule_lead = self.schedule_lead;
@@ -318,6 +327,8 @@ impl Session {
                     replayed_voicings = Some(self.js.snapshot_published_runtime_settings());
                 }
             }
+            // Setup may replay older orchestra definitions.
+            self.restore_csound_snapshot(&checkpoint.csound)?;
             // Match the old lease identity, never a private token from another realm.
             if let Some(replayed) = replayed_voicings
                 && replayed.host_voicing_identity().is_some()
@@ -352,6 +363,7 @@ impl Session {
                     source: source.clone(),
                     mini: *mini,
                     settings: self.js.snapshot_published_runtime_settings(),
+                    csound: self.csound_snapshot(),
                     cps: checkpoint.cps,
                     cycle_zero_time: now - checkpoint.cycle / checkpoint.cps,
                 });
@@ -369,6 +381,7 @@ impl Session {
         let mut fallback = checkpoint;
         if fallback.source.take().is_none() {
             fallback.prebakes = Arc::default();
+            fallback.csound = crate::CsoundSnapshot::default();
         }
         self.rebuild_after_panic(now, fallback)?;
         Ok(false)
@@ -1008,6 +1021,33 @@ mod tests {
         session.reload_at(GOOD, false, 0.5).expect("next edit");
     }
 
+    #[test]
+    fn recovery_discards_an_orchestra_after_its_permission_is_revoked() {
+        let mut config = SessionConfig::default();
+        config.score_import_access.permit_csound();
+        let mut session = Session::with_config(config).expect("session");
+        if let Err(error) = session.evaluate_prebake("loadCSound`instr recoveryVoice\nendin`") {
+            if std::env::var_os("RUSTEL_CSOUND_LIBRARY").is_none()
+                && error.to_string().contains("Csound 6 is not available")
+            {
+                return;
+            }
+            panic!("load orchestra: {error}");
+        }
+        session
+            .evaluate("note('c4').csound('recoveryVoice')")
+            .expect("source uses orchestra");
+        session.set_score_import_access(crate::ScoreImportAccess::default());
+        let error = session
+            .with_panic_recovery::<()>(0.5, |_| panic!("host query panic"))
+            .expect_err("host panic is caught");
+        assert!(error.to_string().contains("fresh Session ready"), "{error}");
+        assert_eq!(session.active_source(), None);
+        assert!(session.recovery_prebakes.is_empty());
+        assert_eq!(session.csound_snapshot(), crate::CsoundSnapshot::default());
+        session.reload_at(GOOD, false, 0.5).expect("next edit");
+    }
+
     use super::*;
     use crate::session::tests::*;
     #[cfg(all(feature = "vst", feature = "device-audio"))]
@@ -1266,6 +1306,45 @@ mod tests {
                 .show(),
             "s:bd"
         );
+
+        match rustel_csound::Program::compile(&[]) {
+            Ok(_) => {
+                let mut config = SessionConfig::default();
+                config.score_import_access.permit_csound();
+                let mut session = Session::with_config(config).expect("native session");
+                session
+                    .evaluate_prebake(
+                        "loadCSound`instr probe\naOut init .025\nouts aOut,aOut\nendin`",
+                    )
+                    .expect("audible definition");
+                session
+                    .evaluate("note('c4').csound('probe')")
+                    .expect("audible reference");
+                session
+                    .mark_audible_generation(session.generation())
+                    .expect("retain audible orchestra");
+                let audible = session.csound_snapshot();
+                session
+                    .reload_at(
+                        "loadCSound`instr probe\naOut init .1\nouts aOut,aOut\nendin`\nsilence",
+                        false,
+                        0.1,
+                    )
+                    .expect("unconfirmed orchestra");
+                assert_ne!(session.csound_snapshot(), audible);
+                assert_eq!(
+                    session
+                        .rollback_to_previous_source(0.2)
+                        .expect("restore audible orchestra"),
+                    RollbackAttempt::Applied
+                );
+                assert_eq!(session.csound_snapshot(), audible);
+            }
+            Err(error)
+                if std::env::var_os("RUSTEL_CSOUND_LIBRARY").is_none()
+                    && error.contains("Csound 6 is not available") => {}
+            Err(error) => panic!("configured native Csound failed: {error}"),
+        }
 
         #[cfg(feature = "vst")]
         {
