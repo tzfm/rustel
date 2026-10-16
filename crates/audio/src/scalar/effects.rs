@@ -251,10 +251,10 @@ pub(super) fn apply_fx_stage(
     }
 
     if let Some(distort) = stage.distort {
-        let shape = distort.shape();
-        left = distort.apply(left, shape);
+        let curve = distort.curve(distort.shape());
+        left = curve.apply(left);
         if stereo {
-            right = distort.apply(right, shape);
+            right = curve.apply(right);
         }
     }
     // Everything above is per-channel and a mono source has no right chain, so
@@ -371,6 +371,19 @@ pub(super) fn apply_fx_stage(
     (left, right)
 }
 
+/// `2^(crush - 1)`, the quantiser's step count. A whole-number crush is an
+/// exact power of two, built without the library call.
+#[inline]
+fn crush_levels(crush: f64) -> f64 {
+    let exponent = crush - 1.0;
+    let whole = exponent as u64;
+    if whole <= 1023 && whole as f64 == exponent {
+        f64::from_bits((whole + 1023) << 52)
+    } else {
+        exponent.exp2()
+    }
+}
+
 /// Post-filter, pre-distort stages in the FX chain order:
 /// vowel -> coarse -> crush -> shape. A modulator add only lands when the
 /// matching control is set: an LFO on `crush` with no `crush` in the pattern
@@ -405,7 +418,7 @@ pub(super) fn voice_fx_pre_distort(
     }
     if let Some(crush) = controls.crush {
         let crush = f64::from(crush + fx_mod.crush).max(1.0);
-        let x = (crush - 1.0).exp2();
+        let x = crush_levels(crush);
         // Round half-up (floor(x + 0.5)), which differs from f64::round on
         // negative halves.
         sample = ((f64::from(sample) * x + 0.5).floor() / x) as f32;
@@ -1140,5 +1153,14 @@ mod tests {
         let edge = notch_coefs(0.0, 1.0, sr);
         assert_eq!(edge.b0, 1.0);
         assert_eq!(edge.a1, 0.0);
+    }
+
+    #[test]
+    fn crush_levels_match_exp2_bit_for_bit() {
+        let whole = (1..=1025).map(f64::from);
+        for crush in whole.chain([1.5, 4.25, 12.75, 2000.0, f64::INFINITY]) {
+            let want = (crush - 1.0).exp2();
+            assert_eq!(crush_levels(crush).to_bits(), want.to_bits(), "{crush}");
+        }
     }
 }

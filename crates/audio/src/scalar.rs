@@ -48,7 +48,6 @@ use voice::note_end_alive;
 use voice::nudged_start;
 use voice::oscillator_sample;
 use voice::retire_voice_resources;
-pub(crate) use voice::saw_blep;
 use voice::sbd_graph_lead_frames;
 use voice::sbd_noise_gain;
 use voice::sbd_saturation;
@@ -56,6 +55,7 @@ use voice::sbd_saturation_curve;
 use voice::seeded_phase;
 use voice::supersaw_detune_ratio;
 use voice::supersaw_spread_geometry;
+pub(crate) use voice::{saw_blep, saw_step};
 
 use crate::biquad::FilterChain;
 use crate::periodic_wave::{PeriodicWaveTables, TableSelection, prepared_tables};
@@ -256,8 +256,8 @@ struct Voice {
     /// to half a sample per onset, which `crush` then magnifies into whole
     /// quantisation steps.
     onset_lead: f32,
-    /// Precomputed `expm1(distort)` for the per-sample transfer.
-    distort_shape: f32,
+    /// The distortion curve at the unmodulated shape, prepared at onset.
+    distort_curve: Option<crate::distortion::DistortCurve>,
     /// Wet send into the orbit delay (0 = no send).
     delay_wet: f32,
     /// Wet send into the orbit reverb (0 = no send).

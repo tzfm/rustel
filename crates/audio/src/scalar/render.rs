@@ -1184,7 +1184,7 @@ impl AudioBackend for ScalarBackend {
                     preview_epoch: e.controls.preview_epoch,
                     piano: e.controls.piano,
                     onset_lead: e.onset_lead,
-                    distort_shape: e.controls.distort.map(|d| d.shape()).unwrap_or(0.0),
+                    distort_curve: e.controls.distort.map(|d| d.curve(d.shape())),
                     delay_wet,
                     reverb_wet,
                     through_insert,
@@ -1800,7 +1800,7 @@ impl AudioBackend for ScalarBackend {
                             .map_or_else(FxParamHold::default, ModAdds::fx_hold);
                     }
                     let mod_adds = mod_adds.as_ref().unwrap_or(&zero_mod_adds);
-                    let fm_offset_hz = match v.controls.fm {
+                    let fm_offset_hz = match &v.controls.fm {
                         None => 0.0f32,
                         Some(fm) => {
                             let state =
@@ -2198,7 +2198,7 @@ impl AudioBackend for ScalarBackend {
                                     let voice_freq = freq * ratio;
                                     // Euclidean remainder, not `fract` - dt
                                     // must stay non-negative.
-                                    let dt = (voice_freq / sr as f32).rem_euclid(1.0);
+                                    let dt = saw_step(voice_freq / sr as f32);
                                     let value = saw_blep(*phase, dt);
                                     left += value * gain_l;
                                     right += value * gain_r;
@@ -2677,12 +2677,11 @@ impl AudioBackend for ScalarBackend {
                         }
                         if let Some(distort) = v.controls.distort {
                             // a-rate: DistortProcessor reads per sample.
-                            let shape = if mod_adds.distort == 0.0 {
-                                v.distort_shape
-                            } else {
-                                distort.shape_with(mod_adds.distort)
+                            let curve = match v.distort_curve {
+                                Some(curve) if mod_adds.distort == 0.0 => curve,
+                                _ => distort.curve(distort.shape_with(mod_adds.distort)),
                             };
-                            let (l, r) = (distort.apply(left, shape), distort.apply(right, shape));
+                            let (l, r) = (curve.apply(left), curve.apply(right));
                             let vol = mod_adds.distort_vol;
                             let (l, r) = if vol == 0.0 {
                                 (l, r)
@@ -2811,12 +2810,11 @@ impl AudioBackend for ScalarBackend {
                         // and before the panner, one sample at a time with
                         // no oversampling.
                         if let Some(distort) = v.controls.distort {
-                            let shape = if mod_adds.distort == 0.0 {
-                                v.distort_shape
-                            } else {
-                                distort.shape_with(mod_adds.distort)
+                            let curve = match v.distort_curve {
+                                Some(curve) if mod_adds.distort == 0.0 => curve,
+                                _ => distort.curve(distort.shape_with(mod_adds.distort)),
                             };
-                            sample = distort.apply(sample, shape);
+                            sample = curve.apply(sample);
                             if mod_adds.distort_vol != 0.0 {
                                 sample *= distort.postgain_scale(mod_adds.distort_vol);
                             }

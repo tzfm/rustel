@@ -173,6 +173,7 @@ mod panes;
 mod persistence;
 mod piano_mode;
 mod pointer_shape;
+mod power_advisory;
 mod prebakes;
 mod previews;
 mod prompt_paste;
@@ -1158,6 +1159,7 @@ struct App {
     /// taken on it. `None` when no session is joined.
     link_seen_playing: Option<bool>,
     audio_advisory: audio_advisory::AudioAdvisory,
+    power_advisory: power_advisory::PowerAdvisory,
     /// The output the last play went through, or the one picked in the
     /// device panel since. A stopped studio has no stream open, and this is
     /// what the footer names then: the device the next evaluation opens.
@@ -1688,6 +1690,7 @@ impl App {
             link_enabled: false,
             link_seen_playing: None,
             audio_advisory: audio_advisory::AudioAdvisory::default(),
+            power_advisory: power_advisory::PowerAdvisory::default(),
             resting_output: None,
             input_lit_at: None,
             status: clipboard_status.into(),

@@ -270,9 +270,14 @@ impl AudioAdvisory {
 }
 
 impl App {
+    /// The power hint names the likely cause, so it wins over the latency hint.
     pub(super) fn audio_warning(&self) -> Option<&'static str> {
         (!self.stop_requested)
-            .then(|| self.audio_advisory.message())
+            .then(|| {
+                self.power_advisory
+                    .message()
+                    .or_else(|| self.audio_advisory.message())
+            })
             .flatten()
     }
 

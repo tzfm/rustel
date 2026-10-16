@@ -25,8 +25,13 @@ rustfft = "6"
 cpal = { version = "=0.18.2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-# MMCSS "Pro Audio" registration for the output callback's thread.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+# MMCSS "Pro Audio" registration for the output callback's thread, and the
+# effective power mode.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Power",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
