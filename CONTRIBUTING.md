@@ -124,6 +124,8 @@ module - the layout the Rust book teaches:
   suite into named child modules inside the same inline block.
 - A crate's own `tests/` folder is for integration tests. Those compile as a
   separate crate and see only the public API.
+- Split large integration suites into topic files under `tests/<name>/`.
+  Keep shared fixtures and process-wide locks in the suite's parent module.
 - Do not extract unit tests into separate files (`#[path]` modules or
   `src/tests/` trees), and do not expose internals just to move a test into
   the integration suite.
@@ -259,7 +261,7 @@ source-location span count, duration and frame count exactly.
 
 The workflows use GitHub-hosted Linux, macOS and Windows runners. `.github/workflows/ci.yml` runs ordinary checks on every pull request and push to `main`. It checks formatting, Clippy, supported feature sets and the serial workspace tests, and runs the tests of the hand-written `unsafe` code under Miri. `.github/workflows/heavy.yml` runs the release-mode corpus in portable and automatic acceleration modes and the Studio end-to-end suite. Heavy CI runs on pushes to `main`, twice weekly for cache warming, and when a maintainer dispatches it for an exact pull request commit.
 
-A pull request with only Markdown changes skips the build and test jobs. Four Markdown files are test inputs, so a change to `SECURITY.md`, `docs/cli.md`, `docs/hardware.md` or `docs/studio.md` runs the full checks. The `main` ruleset requires one check, `CI result`. This job passes when the build and test jobs pass or are skipped.
+A pull request with only Markdown changes skips the build and test jobs, except changes to `SECURITY.md`, `docs/cli.md`, `docs/hardware.md` or `docs/studio.md`, which run the full checks. The `main` ruleset requires one check, `CI result`. This job passes when the build and test jobs pass or are skipped.
 
 The CI workflows declare read-only repository tokens. Checkouts do not persist credentials, and the jobs do not receive repository secrets. No CI workflow uses a self-hosted runner.
 

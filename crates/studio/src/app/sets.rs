@@ -1498,3 +1498,1444 @@ pub(super) enum SetPrompt {
     #[cfg(feature = "vst")]
     AddVstFolder,
 }
+
+#[cfg(test)]
+mod tests {
+    mod sets {
+        //! Tests for `app/sets.rs`.
+
+        use crate::app::sets::*;
+        use crate::app::tests::support::*;
+
+        #[test]
+        fn paths_under_the_platform_home_are_shown_with_a_tilde() {
+            let home = PathBuf::from(rustel_runtime::config_dir::home().expect("a test home"));
+            assert_eq!(shorten_home(&home), "~");
+            assert_eq!(
+                shorten_home(&home.join(".rustel").join("recordings")),
+                format!(
+                    "~{}.rustel{}recordings",
+                    std::path::MAIN_SEPARATOR,
+                    std::path::MAIN_SEPARATOR
+                )
+            );
+        }
+
+        /// ^W closes a tab and no more: the file stays in the folder, the set
+        /// panel (^B) lists it beside the open scores with their strip
+        /// numbers, and Enter on it opens it again, after the current scene.
+        #[test]
+        fn a_closed_tab_stays_in_the_set_panel_and_opens_again() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.new_scene(false);
+            assert_eq!(app.scenes.score_count(), 2);
+            assert_eq!(app.scenes.current().name(), "scene 1");
+            press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+            assert_eq!(app.scenes.score_count(), 1, "closed");
+            assert!(
+                directory.path().join("scene 1.strudel").exists(),
+                "the file stays"
+            );
+            assert!(app.status.contains("closed"), "{}", app.status);
+
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Set));
+            assert_eq!(app.prefs.set_panel, Some(true), "remembered open");
+            let panel = app.set_panel.as_ref().expect("the panel is open");
+            assert_eq!(
+                panel
+                    .files
+                    .iter()
+                    .map(|file| (file.name.as_str(), file.strip))
+                    .collect::<Vec<_>>(),
+                [("first", Some(1)), ("scene 1", None)]
+            );
+            assert_eq!(panel.selected, 0, "opened on the scene on screen");
+            assert_eq!(panel.lines.len(), 3, "two scores and the sessions fold");
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.scenes.score_count(), 2, "open again");
+            assert_eq!(app.scenes.current().name(), "scene 1", "and selected");
+            assert_eq!(app.panes[app.focused].scene, app.scenes.current().id);
+            assert_eq!(
+                app.focus,
+                Focus::Editor,
+                "Enter hands the keyboard to the score"
+            );
+            let panel = app.set_panel.as_ref().expect("the panel stays open");
+            assert!(panel.files.iter().all(|file| file.open.is_some()));
+            assert_eq!(panel.selected, 1, "the selection followed the scene");
+            // The set file remembers the open tabs.
+            let manifest = crate::scenes::SetManifest::load(directory.path()).expect("set file");
+            assert_eq!(
+                manifest
+                    .scenes
+                    .iter()
+                    .map(|entry| entry.file.as_str())
+                    .collect::<Vec<_>>(),
+                ["first.strudel", "scene 1.strudel"]
+            );
+            // ^B hides the panel and shows it again; Enter on an open score
+            // selects it rather than opening it twice.
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            assert!(app.set_panel.is_none(), "^B again hides the panel");
+            assert_eq!(app.prefs.set_panel, Some(false));
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Home, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.scenes.score_count(), 2);
+            assert_eq!(app.scenes.current().name(), "first");
+            assert_eq!(
+                app.panes[app.focused].scene,
+                app.scenes.current().id,
+                "the pane shows it, as a click on its tab would"
+            );
+            assert_eq!(app.focus, Focus::Editor);
+        }
+
+        /// Delete in the panel asks and Enter answers: an open score off the
+        /// strip and the disk, a closed one off the disk, and the last score
+        /// never. Esc keeps what was asked about, and Scene > Delete scene
+        /// asks the same question.
+        #[test]
+        fn the_set_panel_deletes_after_asking() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            std::fs::write(directory.path().join("spare.strudel"), "// spare\n").expect("spare");
+            let mut app = app_over(directory.path());
+            app.new_scene(false);
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            let panel = app.set_panel.as_ref().expect("open");
+            assert_eq!(
+                panel
+                    .files
+                    .iter()
+                    .map(|file| file.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["first", "scene 1", "spare"]
+            );
+            assert_eq!(panel.selected_file().expect("a score").name, "scene 1");
+            press(&mut app, KeyCode::Delete, KeyModifiers::NONE);
+            assert!(
+                directory.path().join("scene 1.strudel").exists(),
+                "Delete only asks"
+            );
+            assert_eq!(app.set_panel.as_ref().expect("open").deleting, Some(1));
+            assert!(app.status.starts_with("delete scene 1"), "{}", app.status);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert_eq!(
+                app.set_panel.as_ref().expect("open").deleting,
+                None,
+                "Esc keeps it"
+            );
+            assert_eq!(
+                app.focus,
+                Focus::Panel(PanelKind::Set),
+                "and stays in the panel"
+            );
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            assert_eq!(
+                app.set_panel.as_ref().expect("open").deleting,
+                None,
+                "any other key withdraws the question"
+            );
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Delete, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(!directory.path().join("scene 1.strudel").exists());
+            assert_eq!(app.scenes.score_count(), 2);
+            assert_eq!(app.set_panel.as_ref().expect("open").files.len(), 2);
+
+            // A closed score is deleted as a file.
+            press(&mut app, KeyCode::End, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            assert_eq!(
+                app.set_panel
+                    .as_ref()
+                    .and_then(SetPanel::selected_file)
+                    .expect("a score")
+                    .name,
+                "spare"
+            );
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.scenes.current().name(), "spare");
+            press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+            assert_eq!(app.scenes.score_count(), 1);
+            assert!(directory.path().join("spare.strudel").exists());
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Delete, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(!directory.path().join("spare.strudel").exists());
+
+            // The last score stays.
+            press(&mut app, KeyCode::Home, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Delete, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(directory.path().join("first.strudel").exists());
+            assert!(
+                app.set_panel
+                    .as_ref()
+                    .and_then(|panel| panel.error.as_deref())
+                    .is_some_and(|error| error.contains("last scene")),
+                "{:?}",
+                app.set_panel.as_ref().and_then(|panel| panel.error.clone())
+            );
+
+            // The Scene menu's row arms the panel the same way.
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            app.dispatch_menu_action(crate::menu::MenuAction::DeleteScene)
+                .expect("menu");
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Set));
+            assert!(app.set_panel.as_ref().expect("open").deleting.is_some());
+        }
+
+        /// File > Open set… offers the sets folder's sets, Tab browses from
+        /// there, and `.` in the browser chooses the folder it is in; a set
+        /// file named by mistake is refused with its folder suggested.
+        #[test]
+        fn open_set_browses_folders_and_a_folder_entry_chooses_the_set() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let sets = directory.path().join("sets");
+            let other = sets.join("other");
+            std::fs::create_dir_all(&other).expect("other");
+            std::fs::write(other.join("a.strudel"), "$: s(\"oh\")\n").expect("a");
+            std::fs::write(other.join("b.strudel"), "$: s(\"cp\")\n").expect("b");
+            std::fs::create_dir_all(sets.join("empty")).expect("empty");
+            let home = directory.path().join("home");
+            std::fs::create_dir_all(&home).expect("home");
+            let mut app = app_over(&home);
+            app.prefs.sets_directory = Some(sets.display().to_string());
+
+            app.open_set_prompt(SetPrompt::OpenSet);
+            let (prompt, picker) = app.set_prompt.as_ref().expect("the prompt is up");
+            assert_eq!(*prompt, SetPrompt::OpenSet);
+            assert_eq!(
+                picker
+                    .candidates
+                    .iter()
+                    .map(|candidate| (candidate.label.as_str(), candidate.detail.as_str()))
+                    .collect::<Vec<_>>(),
+                [("other", "2 scores")],
+                "folders with scores, not empty ones"
+            );
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            let browser = app
+                .set_prompt
+                .as_ref()
+                .and_then(|(_, picker)| picker.browser.as_ref())
+                .expect("browsing");
+            assert_eq!(browser.dir, sets);
+            assert_eq!(
+                browser
+                    .entries
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["..", ".", "empty", "other"]
+            );
+            press(&mut app, KeyCode::End, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let browser = app
+                .set_prompt
+                .as_ref()
+                .and_then(|(_, picker)| picker.browser.as_ref())
+                .expect("browsing");
+            assert_eq!(browser.dir, other, "Enter went into the folder");
+            assert_eq!(
+                browser.entries[browser.selected].name, ".",
+                "the folder itself is on offer"
+            );
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.set_prompt.is_none());
+            assert_eq!(app.scenes.directory(), other);
+            assert_eq!(app.scenes.score_count(), 2);
+            assert_eq!(app.focus, Focus::Editor);
+            assert_eq!(app.prefs.last_set.as_deref(), other.to_str());
+            assert_eq!(app.prefs.recent_sets[0], other.display().to_string());
+            assert!(app.status.starts_with("opened set"), "{}", app.status);
+
+            // A set file is not a set.
+            app.open_set_prompt(SetPrompt::OpenSet);
+            for character in other.join("rustel-set.json").display().to_string().chars() {
+                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(
+                app.set_prompt
+                    .as_ref()
+                    .and_then(|(_, picker)| picker.error.as_deref())
+                    .is_some_and(|error| error.contains("set file")),
+                "{:?}",
+                app.set_prompt
+                    .as_ref()
+                    .and_then(|(_, picker)| picker.error.clone())
+            );
+        }
+
+        /// The set list starts with the set changed last, whatever its name.
+        /// The newest file in a set gives the set its time. Sets with the
+        /// same time stay in name order.
+        #[test]
+        fn the_set_list_leads_with_the_set_changed_last() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let sets = directory.path().join("sets");
+            let home = directory.path().join("home");
+            std::fs::create_dir_all(&home).expect("home");
+            let mut app = app_over(&home);
+            app.prefs.sets_directory = Some(sets.display().to_string());
+            // The score times are ahead of the clock, so each one is newer
+            // than the folder's own time.
+            let ahead = std::time::SystemTime::now() + std::time::Duration::from_secs(3_600);
+            for (name, seconds) in [("alpha", 10), ("beta", 30), ("delta", 20), ("gamma", 20)] {
+                let path = sets.join(name);
+                std::fs::create_dir_all(&path).expect("set folder");
+                let score = path.join("a.strudel");
+                std::fs::write(&score, "$: s(\"oh\")\n").expect("score");
+                std::fs::File::options()
+                    .write(true)
+                    .open(&score)
+                    .and_then(|file| {
+                        file.set_modified(ahead + std::time::Duration::from_secs(seconds))
+                    })
+                    .expect("score time");
+            }
+            app.open_set_prompt(SetPrompt::OpenSet);
+            let picker = &app.set_prompt.as_ref().expect("prompt").1;
+            assert_eq!(
+                picker
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.label.as_str())
+                    .collect::<Vec<_>>(),
+                ["beta", "delta", "gamma", "alpha"]
+            );
+        }
+
+        #[test]
+        fn double_clicking_a_set_picker_row_opens_the_clicked_set() {
+            for prompt in [SetPrompt::OpenRecent, SetPrompt::OpenSet] {
+                let directory = tempfile::tempdir().expect("temp dir");
+                let sets = directory.path().join("sets");
+                let home = directory.path().join("home");
+                std::fs::create_dir_all(&home).expect("home");
+                let mut app = app_over(&home);
+                app.frame = Rect::new(0, 0, 120, 40);
+                app.prefs.sets_directory = Some(sets.display().to_string());
+                app.prefs.recent_sets.clear();
+                for name in ["first", "second"] {
+                    let path = sets.join(name);
+                    std::fs::create_dir_all(&path).expect("set folder");
+                    std::fs::write(path.join("a.strudel"), "$: s(\"oh\")\n").expect("score");
+                    app.prefs.remember_set(&path);
+                }
+                app.open_set_prompt(prompt);
+                let picker = &app.set_prompt.as_ref().expect("prompt").1;
+                let (_, list) = picker.geometry(app.frame).expect("list");
+                let chosen = picker.candidates[1].path.clone();
+                let click = MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: list.x + 3,
+                    row: list.y,
+                    modifiers: KeyModifiers::NONE,
+                };
+                app.handle_mouse(click).expect("first row click");
+                let click = MouseEvent {
+                    row: list.y + 1,
+                    ..click
+                };
+                app.handle_mouse(click).expect("second row click");
+                assert_eq!(app.scenes.directory(), home, "different rows only select");
+                assert_eq!(app.set_prompt.as_ref().expect("still open").1.selected, 1);
+
+                // Moving away and back by keyboard breaks the pending click pair.
+                press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+                app.handle_mouse(click).expect("first click after keys");
+                app.handle_mouse(MouseEvent {
+                    kind: MouseEventKind::Up(MouseButton::Left),
+                    ..click
+                })
+                .expect("release");
+                assert_eq!(app.scenes.directory(), home, "one click only selects");
+                assert!(app.set_prompt.is_some());
+
+                app.handle_mouse(click).expect("double click");
+                assert!(app.set_prompt.is_none(), "opening closes the picker");
+                assert_eq!(app.scenes.directory(), chosen);
+                assert_eq!(app.scenes.current().name(), "a");
+                assert_eq!(app.focus, Focus::Editor);
+                assert_eq!(app.prefs.last_set.as_deref(), chosen.to_str());
+                assert!(app.status.starts_with("opened set"), "{}", app.status);
+            }
+        }
+
+        /// File > New set makes a folder named after the day under the sets
+        /// folder with a starter scene, and takes it up; Rename set… moves
+        /// the folder; Open recent… offers what was open before.
+        #[test]
+        fn sets_come_and_go_from_the_file_menu() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let sets = directory.path().join("sets");
+            let home = directory.path().join("home");
+            std::fs::create_dir_all(&home).expect("home");
+            let mut app = app_over(&home);
+            app.prefs.sets_directory = Some(sets.display().to_string());
+            assert_eq!(
+                app.prefs.last_set.as_deref(),
+                home.to_str(),
+                "the set opened is remembered"
+            );
+            // The preferences are one file for the whole test process: only
+            // this set on the list, so the order below is this test's own.
+            app.prefs.recent_sets.clear();
+            app.prefs.remember_set(&home);
+
+            app.dispatch_menu_action(crate::menu::MenuAction::NewSet)
+                .expect("menu");
+            let day = today();
+            assert_eq!(app.scenes.directory(), sets.join(&day));
+            assert_eq!(app.scenes.name(), day);
+            assert_eq!(app.scenes.score_count(), 1);
+            assert!(sets.join(&day).join("scene 1.strudel").exists());
+            assert!(
+                sets.join(&day).join("rustel-set.json").exists(),
+                "made by the studio, it has its set file at once"
+            );
+            assert_eq!(app.prefs.last_set.as_deref(), sets.join(&day).to_str());
+            assert_eq!(
+                app.prefs.recent_sets,
+                [
+                    sets.join(&day).display().to_string(),
+                    home.display().to_string()
+                ]
+            );
+            assert!(app.status.starts_with("new set"), "{}", app.status);
+
+            app.dispatch_menu_action(crate::menu::MenuAction::NewSet)
+                .expect("menu");
+            assert_eq!(
+                app.scenes.name(),
+                format!("{day} b"),
+                "the day already has one"
+            );
+
+            app.dispatch_menu_action(crate::menu::MenuAction::RenameSet)
+                .expect("menu");
+            let (prompt, picker) = app.set_prompt.as_ref().expect("prompt");
+            assert_eq!(*prompt, SetPrompt::RenameSet);
+            assert_eq!(picker.path, format!("{day} b"), "the name is there to edit");
+            for _ in 0..picker.path.chars().count() {
+                press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            }
+            for character in "opening night".chars() {
+                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.set_prompt.is_none());
+            assert_eq!(app.scenes.directory(), sets.join("opening night"));
+            assert!(sets.join("opening night").join("scene 1.strudel").exists());
+            assert!(!sets.join(format!("{day} b")).exists());
+            assert_eq!(
+                app.scenes.current().path,
+                sets.join("opening night").join("scene 1.strudel")
+            );
+            assert_eq!(
+                app.prefs.last_set.as_deref(),
+                sets.join("opening night").to_str()
+            );
+            assert!(
+                !app.prefs
+                    .recent_sets
+                    .iter()
+                    .any(|recent| recent.ends_with(&format!("{day} b")))
+            );
+
+            // A name in use is refused, in the prompt.
+            app.dispatch_menu_action(crate::menu::MenuAction::RenameSet)
+                .expect("menu");
+            for _ in 0.."opening night".len() {
+                press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            }
+            for character in day.chars() {
+                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(
+                app.set_prompt
+                    .as_ref()
+                    .and_then(|(_, picker)| picker.error.as_deref())
+                    .is_some_and(|error| error.contains("already in use"))
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.set_prompt.is_none());
+
+            // Open recent lists the others, newest first.
+            app.dispatch_menu_action(crate::menu::MenuAction::OpenRecent)
+                .expect("menu");
+            let (prompt, picker) = app.set_prompt.as_ref().expect("prompt");
+            assert_eq!(*prompt, SetPrompt::OpenRecent);
+            assert_eq!(
+                picker
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.label.as_str())
+                    .collect::<Vec<_>>(),
+                [day.as_str(), "home"]
+            );
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.scenes.directory(), sets.join(&day));
+            assert_eq!(app.focus, Focus::Editor);
+        }
+
+        #[test]
+        fn set_panel_resize_keeps_selection_and_remembers_the_preferred_width() {
+            use crate::set_panel;
+
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 140, 40);
+            app.open_set_panel(true);
+            let selected = app.set_panel.as_ref().unwrap().selected;
+            let source = app.editor().source();
+            assert_eq!(app.set_panel.as_ref().unwrap().width, 40);
+            press(&mut app, KeyCode::Char('+'), KeyModifiers::SHIFT);
+            assert_eq!(app.set_panel.as_ref().unwrap().width, 44);
+            press(&mut app, KeyCode::Char('-'), KeyModifiers::NONE);
+            assert_eq!(app.set_panel.as_ref().unwrap().width, 40);
+            for _ in 0..30 {
+                press(&mut app, KeyCode::Char('-'), KeyModifiers::NONE);
+            }
+            assert_eq!(
+                app.set_panel.as_ref().unwrap().width,
+                set_panel::SIDEBAR_MIN_WIDTH
+            );
+            for _ in 0..30 {
+                press(&mut app, KeyCode::Char('='), KeyModifiers::NONE);
+            }
+            assert_eq!(
+                app.set_panel.as_ref().unwrap().width,
+                set_panel::SIDEBAR_MAX_WIDTH
+            );
+            assert_eq!(app.set_panel.as_ref().unwrap().selected, selected);
+            assert_eq!(app.editor().source(), source);
+            app.flush_prefs();
+            assert_eq!(
+                StudioPrefs::load().set_panel_width,
+                Some(set_panel::SIDEBAR_MAX_WIDTH)
+            );
+
+            let narrow = view::regions_with_footer(
+                Rect::new(0, 0, 70, 40),
+                view::ChromeLayout::shown(false),
+                1,
+                false,
+                true,
+                app.set_sidebar(),
+                app.dock_requests(),
+                None,
+                None,
+                None,
+                0,
+                false,
+            );
+            assert_eq!(narrow.sidebar.width, 30);
+            assert_eq!(
+                app.set_panel.as_ref().unwrap().width,
+                set_panel::SIDEBAR_MAX_WIDTH
+            );
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            assert!(app.set_panel.is_none());
+            app.open_set_panel(true);
+            assert_eq!(
+                app.set_panel.as_ref().unwrap().width,
+                set_panel::SIDEBAR_MAX_WIDTH
+            );
+        }
+
+        /// The set panel keeps its place when Esc gives the keyboard back,
+        /// including as a sheet on a narrow terminal. A double click opens a row.
+        #[test]
+        fn the_set_panel_docks_when_wide_and_esc_keeps_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.new_scene(false);
+            press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            app.frame = Rect::new(0, 0, 120, 40);
+            app.regions = view::regions(
+                app.frame,
+                false,
+                1,
+                false,
+                true,
+                Some(app.set_panel_side()),
+                None,
+            );
+            assert!(!app.regions.sidebar.is_empty());
+            assert_eq!(
+                app.regions.sidebar_side,
+                view::Side::Right,
+                "the right, by default"
+            );
+            assert_eq!(app.regions.sidebar.right(), app.frame.right());
+            assert!(app.set_panel.as_ref().is_some_and(|panel| panel.on_right));
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(
+                app.set_panel.is_some(),
+                "docked, Esc only hands the keyboard back"
+            );
+            assert_eq!(app.focus, Focus::Editor);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.set_panel.is_some(), "Esc from the score leaves it too");
+
+            let list = app
+                .set_panel
+                .as_ref()
+                .and_then(|panel| panel.list_area(app.regions.sidebar, app.frame))
+                .expect("a list");
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: list.x + 3,
+                row: list.y + 1,
+                modifiers: KeyModifiers::NONE,
+            };
+            app.handle_mouse(click).expect("click");
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Set));
+            assert_eq!(app.scenes.score_count(), 1, "one click only chooses");
+            app.handle_mouse(click).expect("click");
+            assert_eq!(app.scenes.score_count(), 2, "the second opens the score");
+            assert_eq!(app.scenes.current().name(), "scene 1");
+
+            // With room for both, the reference column sits inside the set
+            // panel. Narrower layouts temporarily hide the set for reference.
+            app.frame = Rect::new(0, 0, 180, 40);
+            app.regions = view::regions(
+                app.frame,
+                false,
+                1,
+                true,
+                true,
+                Some(app.set_panel_side()),
+                None,
+            );
+            assert_eq!(app.regions.reference.right(), app.regions.sidebar.x);
+            let list = app
+                .set_panel
+                .as_ref()
+                .and_then(|panel| panel.list_area(app.regions.sidebar, app.frame))
+                .expect("a list");
+            assert_eq!(
+                list.x,
+                app.regions.sidebar.x + 2,
+                "past the rule on the left"
+            );
+            app.ui_settings.set_panel_right = false;
+            app.apply_ui_settings();
+            assert!(app.set_panel.as_ref().is_some_and(|panel| !panel.on_right));
+            app.regions = view::regions(
+                app.frame,
+                false,
+                1,
+                true,
+                true,
+                Some(app.set_panel_side()),
+                None,
+            );
+            assert_eq!(app.regions.sidebar_side, view::Side::Left);
+            assert_eq!(app.regions.sidebar.x, 0);
+            assert!(app.regions.reference.x > app.regions.sidebar.right());
+
+            // In a narrow terminal the panel is a sheet, and Esc keeps it open
+            // there too.
+            app.frame = Rect::new(0, 0, 60, 24);
+            app.regions = view::regions(
+                app.frame,
+                false,
+                1,
+                false,
+                true,
+                Some(app.set_panel_side()),
+                None,
+            );
+            assert!(app.regions.sidebar.is_empty());
+            app.focus_panel(PanelKind::Set);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.set_panel.is_some());
+            assert_eq!(app.focus, Focus::Editor);
+            // And ^B, the one thing that does hide it.
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            assert!(app.set_panel.is_none());
+            assert_eq!(app.prefs.set_panel, Some(false));
+            assert_eq!(app.focus, Focus::Editor);
+        }
+
+        /// A bare launch opens the set open last time, or makes a dated one in
+        /// the sets folder when there is none; a path named wins.
+        #[test]
+        fn a_bare_launch_opens_the_last_set_or_makes_one() {
+            crate::config::isolate_for_tests();
+            let directory = tempfile::tempdir().expect("temp dir");
+            let sets = directory.path().join("sets");
+            let mut prefs = StudioPrefs {
+                sets_directory: Some(sets.display().to_string()),
+                ..StudioPrefs::default()
+            };
+            let made = open_startup_set(None, &prefs, "// starter").expect("a new set");
+            assert_eq!(made.directory(), sets.join(today()));
+            assert_eq!(made.current().editor.source(), "// starter");
+            let named = directory.path().join("named");
+            std::fs::create_dir_all(&named).expect("named");
+            std::fs::write(named.join("x.strudel"), "// x").expect("x");
+            prefs.remember_set(&named);
+            let last = open_startup_set(None, &prefs, "// starter").expect("the last set");
+            assert_eq!(last.directory(), named);
+            // Gone from the disk, the last set is no set: a new one instead.
+            prefs.remember_set(&directory.path().join("gone"));
+            let fresh = open_startup_set(None, &prefs, "// starter").expect("a new set");
+            assert_eq!(fresh.directory(), sets.join(format!("{} b", today())));
+            let chosen =
+                open_startup_set(Some(&named), &prefs, "// starter").expect("the path named");
+            assert_eq!(chosen.directory(), named);
+        }
+
+        /// Delete on a tape asks and Enter deletes; Space opens and shuts the
+        /// fold the tapes sit under.
+        #[test]
+        fn the_set_panel_deletes_a_tape_after_asking() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let tapes = directory.path().join("sessions");
+            std::fs::create_dir_all(&tapes).expect("sessions");
+            let old = write_tape(&tapes, "2026-09-01T10-00-00", &[(0.0, "$: s(\"bd\")")]);
+            let new = write_tape(&tapes, "2026-09-02T10-00-00", &[(0.0, "$: s(\"sd\")")]);
+            let mut app = app_over(directory.path());
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::End, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+            assert!(app.set_panel.as_ref().expect("open").sessions_open);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            assert_eq!(
+                app.set_panel
+                    .as_ref()
+                    .and_then(SetPanel::selected_tape)
+                    .expect("a tape")
+                    .path,
+                old,
+                "newest first"
+            );
+            // Alt+R renames the selected tape. Ctrl+R keeps the global scene command.
+            press(&mut app, KeyCode::Char('r'), KeyModifiers::ALT);
+            assert!(matches!(
+                app.set_prompt,
+                Some((SetPrompt::RenameSession, _))
+            ));
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.set_prompt.is_none());
+            press(&mut app, KeyCode::Delete, KeyModifiers::NONE);
+            assert!(old.exists(), "Delete only asks");
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(!old.exists());
+            assert!(new.exists());
+            assert_eq!(app.set_panel.as_ref().expect("open").tapes.len(), 1);
+            // The cursor stays in the list: the tape that took its place, not
+            // the top of the panel.
+            assert!(
+                matches!(
+                    app.set_panel.as_ref().expect("open").selected_line(),
+                    Some(SetLine::Tape(0))
+                ),
+                "left the tapes: {:?}",
+                app.set_panel.as_ref().expect("open").selected_line()
+            );
+            assert!(
+                app.set_panel
+                    .as_ref()
+                    .and_then(SetPanel::selected_tape)
+                    .is_some_and(|tape| tape.path == new)
+            );
+            press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+            assert!(!app.set_panel.as_ref().expect("open").sessions_open);
+            // Esc hands the keyboard back and leaves the panel - in the
+            // sheet form as in the docked one. Only ^B hides it.
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.set_panel.is_some());
+            assert_eq!(app.focus, Focus::Editor);
+        }
+
+        /// In zen the set panel is a popup, so Esc closes it. Outside zen Esc
+        /// only returns focus to the score.
+        #[test]
+        fn esc_closes_the_set_panel_in_zen_instead_of_merely_unfocusing_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            press(&mut app, KeyCode::F(11), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            assert!(app.set_panel.is_some());
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Set));
+
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(
+                app.set_panel.is_none(),
+                "Esc did not close the set panel in zen"
+            );
+            assert_eq!(app.focus, Focus::Editor);
+        }
+
+        /// ^B is the plain switch and must still close the popup in zen, not
+        /// just the docked panel: a player who missed Esc reaches for the
+        /// same key that opened it, exactly as they would outside zen.
+        #[test]
+        fn ctrl_b_still_toggles_the_set_panel_closed_in_zen() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            press(&mut app, KeyCode::F(11), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            assert!(app.set_panel.is_some());
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Set));
+
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            assert!(
+                app.set_panel.is_none(),
+                "^B did not close the set panel in zen"
+            );
+            assert_eq!(app.focus, Focus::Editor);
+        }
+
+        /// Outside zen the set panel is the set, not a dialog, and Esc only
+        /// gives the keyboard back - ^B is still the only thing that hides
+        /// it. Zen's popup must not have changed that.
+        #[test]
+        fn esc_still_only_unfocuses_the_set_panel_outside_zen() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            assert!(app.set_panel.is_some());
+
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(
+                app.set_panel.is_some(),
+                "Esc closed the set panel outside zen"
+            );
+            assert_eq!(app.focus, Focus::Editor);
+        }
+
+        #[test]
+        fn settings_pickers_return_to_the_same_page_and_row() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+
+            let mut sources = SettingsSheet::default();
+            sources.show_page(crate::settings::SettingsPage::Sources);
+            sources.selected = 3;
+            app.settings_sheet = Some(sources);
+            app.open_set_prompt(SetPrompt::EditSampleSource(0));
+            assert_eq!(
+                app.settings_sheet.unwrap().page(),
+                crate::settings::SettingsPage::Sources
+            );
+            assert_eq!(app.settings_sheet.unwrap().selected, 3);
+            assert!(app.handle_set_prompt_key(KeyCode::Esc, false, false));
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Settings));
+            assert_eq!(
+                app.settings_sheet.unwrap().page(),
+                crate::settings::SettingsPage::Sources
+            );
+            assert_eq!(app.settings_sheet.unwrap().selected, 3);
+
+            let mut settings = SettingsSheet::default();
+            settings.show_page(crate::settings::SettingsPage::Settings);
+            settings.selected = 4;
+            app.settings_sheet = Some(settings);
+            app.open_set_prompt(SetPrompt::SetsFolder);
+            assert_eq!(
+                app.set_prompt.as_ref().unwrap().1.path,
+                shorten_home(&app.sets_root()),
+                "the current folder is ready to keep or replace"
+            );
+            let chosen = directory.path().join("sets");
+            app.choose_sets_folder(&chosen);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Settings));
+            assert_eq!(
+                app.settings_sheet.unwrap().page(),
+                crate::settings::SettingsPage::Settings
+            );
+            assert_eq!(app.settings_sheet.unwrap().selected, 4);
+
+            let mut settings = SettingsSheet::default();
+            settings.show_page(crate::settings::SettingsPage::Settings);
+            settings.selected = 5;
+            app.settings_sheet = Some(settings);
+            app.open_set_prompt(SetPrompt::RecordingsFolder);
+            assert_eq!(
+                app.set_prompt.as_ref().unwrap().1.path,
+                shorten_home(&app.recordings_directory()),
+                "the current folder is ready to keep or replace"
+            );
+            let recordings = directory.path().join("my recordings");
+            app.choose_recordings_folder(&recordings);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Settings));
+            assert_eq!(app.settings_sheet.unwrap().selected, 5);
+            assert_eq!(
+                app.prefs.recordings_directory.as_deref(),
+                recordings.to_str()
+            );
+            assert_eq!(app.recordings_directory(), recordings);
+            assert_ne!(app.recordings_directory(), app.sessions_directory());
+        }
+
+        /// The recordings picker refuses a set's own output folder: takes there
+        /// would never become samples. The picker stays up and says why.
+        #[test]
+        fn the_recordings_picker_refuses_a_sets_output_folder() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let before = app.prefs.recordings_directory.clone();
+            for folder in [
+                app.scenes.sessions_directory(),
+                directory
+                    .path()
+                    .join(rustel_runtime::product::EXPORT_DIRECTORY_NAME)
+                    .join("mixes"),
+            ] {
+                app.open_set_prompt(SetPrompt::RecordingsFolder);
+                app.choose_recordings_folder(&folder);
+                let error = app
+                    .set_prompt
+                    .as_ref()
+                    .and_then(|(_, picker)| picker.error.clone())
+                    .unwrap_or_else(|| panic!("{} was taken", folder.display()));
+                assert!(error.contains("a set's own"), "{error}");
+                assert_eq!(app.prefs.recordings_directory, before);
+                assert!(!folder.exists(), "nothing was made for a refused folder");
+                app.close_set_prompt();
+            }
+        }
+
+        /// Scene > Delete scene refreshes the panel onto the current scene and
+        /// then arms the selected line. An unsaved starter, as
+        /// `rustel studio newidea.strudel` opens, is in no listing, so the panel
+        /// falls back to its first row. The command must not arm that row.
+        #[test]
+        fn deleting_an_unwritten_scene_arms_nothing_and_says_so() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let stranger = directory.path().join("first.strudel");
+            let unwritten = directory.path().join("newidea.strudel");
+            let set = SceneSet::open(&unwritten, "// starter").expect("set");
+            app.switch_set(set, "opened set");
+            assert_eq!(app.scenes.current().path, unwritten);
+
+            app.arm_delete_scene();
+            assert!(
+                app.set_panel
+                    .as_ref()
+                    .is_some_and(|panel| panel.deleting.is_none()),
+                "nothing is armed: {}",
+                app.status
+            );
+            assert!(
+                app.status.contains("nothing to delete"),
+                "and it says why: {}",
+                app.status
+            );
+            app.confirm_delete_set_line();
+            assert!(
+                stranger.exists(),
+                "the score nobody asked about is still there"
+            );
+        }
+
+        /// The same menu on a scene the folder does hold still arms that one.
+        #[test]
+        fn deleting_a_written_scene_arms_that_scene() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            std::fs::write(directory.path().join("second.strudel"), "$: s(\"hh\")\n")
+                .expect("second scene");
+            let set = SceneSet::open(&directory.path().join("second.strudel"), "// starter")
+                .expect("set");
+            app.switch_set(set, "opened set");
+
+            app.arm_delete_scene();
+            assert!(
+                app.set_panel
+                    .as_ref()
+                    .is_some_and(|panel| panel.deleting == Some(panel.selected)),
+                "the scene is armed: {}",
+                app.status
+            );
+            assert!(app.status.contains("second"), "{}", app.status);
+        }
+
+        /// The bank a set's folder brought, as the browser would show it.
+        fn set_bank_location(app: &App, name: &str) -> Option<String> {
+            app.worker
+                .library()
+                .expect("the studio has a sample library")
+                .catalogue()
+                .into_iter()
+                .find(|entry| entry.name == name)
+                .and_then(|entry| entry.location)
+        }
+
+        /// Opening a set takes up the audio beside its scores, and leaving it
+        /// puts that audio down again. Nothing here adopts by hand: a launch
+        /// that reaches a constructed `App` is already looking at its own
+        /// folder.
+        #[test]
+        fn a_set_brings_the_samples_in_its_own_folder() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            std::fs::create_dir_all(directory.path().join("kicks")).expect("bank folder");
+            std::fs::write(directory.path().join("kicks").join("1.wav"), b"").expect("sample");
+            let mut app = app_over(directory.path());
+            let library = app
+                .worker
+                .library()
+                .expect("the studio has a sample library");
+            assert!(
+                library.knows("kicks"),
+                "the set's folder is a sample source"
+            );
+
+            let elsewhere = tempfile::tempdir().expect("second set");
+            std::fs::write(elsewhere.path().join("first.strudel"), "$: s(\"bd\")\n")
+                .expect("scene");
+            let set = SceneSet::open(elsewhere.path(), "// starter").expect("set");
+            app.switch_set(set, "opened set");
+            assert!(
+                !library.knows("kicks"),
+                "and the set that closed took it with it"
+            );
+        }
+
+        /// An update re-reads the open set's folder before the check judges the
+        /// score's sound names, so audio added since the last read plays from it.
+        #[test]
+        fn update_picks_up_audio_added_to_the_open_set() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            std::fs::create_dir(directory.path().join("kicks")).expect("bank folder");
+            std::fs::write(directory.path().join("kicks/1.wav"), b"").expect("first variant");
+            let mut app = app_over(directory.path());
+            // A library with no manifests on their way, so the check judges names.
+            app.worker
+                .set_library(Arc::new(rustel_runtime::samples::SampleLibrary::empty()));
+            app.adopt_set_samples();
+            let library = app.worker.library().expect("sample library");
+            app.reference_panel =
+                Some(ReferencePanel::samples(&app.reference, library.catalogue()));
+
+            std::fs::write(directory.path().join("kicks/2.wav"), b"").expect("second variant");
+            std::fs::create_dir(directory.path().join("fresh")).expect("new bank folder");
+            std::fs::write(directory.path().join("fresh/1.wav"), b"").expect("new bank");
+            assert!(
+                !library.knows("fresh"),
+                "the set has not been rescanned yet"
+            );
+            let source = "$: s(\"fresh\")";
+            app.scenes.current_mut().editor = Editor::new(source).expect("score");
+            let request_id = app.next_request_id;
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+            assert!(library.knows("fresh"), "the new sound is playable");
+            assert_eq!(app.next_request_id, request_id + 1, "the score passed lint");
+            assert!(
+                app.pending_evaluation.is_some() || !app.inflight.is_empty(),
+                "the update was sent to the engine"
+            );
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !app.worker.poll_catalogue() {
+                assert!(Instant::now() < deadline, "the catalogue was not rebuilt");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            app.install_catalogue();
+            let panel = app.reference_panel.as_ref().expect("samples browser");
+            assert!(panel.sounds.iter().any(|sound| sound.name == "fresh"));
+            assert_eq!(
+                panel
+                    .sounds
+                    .iter()
+                    .find(|sound| sound.name == "kicks")
+                    .map(|sound| sound.variants),
+                Some(2)
+            );
+        }
+
+        /// Renaming a set moves its folder. The banks from that folder must name
+        /// the new path, or the browser lists a sound that the loader cannot
+        /// open.
+        #[test]
+        fn a_renamed_set_keeps_the_samples_in_its_folder_playable() {
+            let parent = tempfile::tempdir().expect("temp parent");
+            let directory = parent.path().join("monday");
+            std::fs::create_dir_all(directory.join("kicks")).expect("bank folder");
+            std::fs::write(directory.join("kicks").join("1.wav"), b"").expect("sample");
+            let mut app = app_over(&directory);
+            assert!(
+                set_bank_location(&app, "kicks").is_some(),
+                "the set's folder is a sample source before the rename"
+            );
+
+            app.rename_set("tuesday");
+            assert_eq!(app.scenes.name(), "tuesday", "the set took the new name");
+            let location = set_bank_location(&app, "kicks").expect("still a bank");
+            let path = location
+                .strip_prefix("file://")
+                .unwrap_or_else(|| panic!("a file URL, not {location}"));
+            assert!(
+                std::path::Path::new(path).exists(),
+                "the bank names a file that is there: {location}"
+            );
+        }
+
+        /// A sample source inside a set's folder follows the set when it is
+        /// renamed, in the preferences and in the library - also when the set
+        /// was opened by a relative path, as `rustel studio monday/` opens it,
+        /// while the source is absolute.
+        #[test]
+        fn a_renamed_set_carries_the_sample_sources_inside_it() {
+            let here = std::env::current_dir().expect("working directory");
+            let parent = tempfile::tempdir_in(&here).expect("temp parent");
+            let relative = parent
+                .path()
+                .strip_prefix(&here)
+                .expect("made in the working directory")
+                .join("monday");
+            let kit = parent.path().join("monday").join("kit");
+            std::fs::create_dir_all(&kit).expect("kit folder");
+            std::fs::write(kit.join("kick.wav"), b"").expect("sample");
+            let mut app = app_over(&relative);
+            let spec = kit.display().to_string();
+            assert_eq!(app.add_sample_sources(std::slice::from_ref(&spec)), 1);
+            app.settle_sample_sources();
+
+            app.rename_set("tuesday");
+
+            assert_eq!(app.scenes.name(), "tuesday", "the set took the new name");
+            let moved = parent
+                .path()
+                .join("tuesday")
+                .join("kit")
+                .display()
+                .to_string();
+            assert_eq!(app.prefs.sample_sources.len(), 1);
+            assert_eq!(app.prefs.sample_sources[0].spec, moved);
+            app.settle_sample_sources();
+            let state = app
+                .source_reports
+                .iter()
+                .find(|report| report.spec == moved)
+                .map(|report| report.state.clone());
+            assert_eq!(
+                state,
+                Some(rustel_runtime::samples::GlobalSourceState::Ready { banks: 1 })
+            );
+        }
+
+        #[test]
+        fn sample_file_rename_keeps_selection_focus_and_the_bank_address() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            let takes = directory.path().join("takes");
+            std::fs::create_dir_all(&takes).unwrap();
+            std::fs::write(takes.join("a.wav"), b"first").unwrap();
+            std::fs::write(takes.join("b.wav"), b"second").unwrap();
+            app.add_sample_sources(&[takes.display().to_string()]);
+            app.settle_sample_sources();
+            let library = app.worker.library().unwrap();
+            app.open_set_panel(false);
+            app.reference_panel =
+                Some(ReferencePanel::samples(&app.reference, library.catalogue()));
+            app.focus_panel(PanelKind::Reference);
+            let panel = app.reference_panel.as_mut().unwrap();
+            for (section, _) in panel.visible_categories() {
+                panel.open_categories.insert(section);
+            }
+            panel.sound_selected = panel
+                .sound_rows()
+                .iter()
+                .position(
+                    |row| matches!(row, SoundRow::Bank(i) if panel.sounds[*i].name == "takes"),
+                )
+                .unwrap();
+            assert!(panel.expand());
+            panel.move_by(1);
+            let selected = panel.sound_selected;
+            // Cancelling must neither rename the file nor move selection.
+            app.handle_reference_key(KeyCode::Char('r'), false, true)
+                .unwrap();
+            assert!(matches!(app.set_prompt, Some((SetPrompt::RenameSample, _))));
+            app.handle_set_prompt_key(KeyCode::Esc, false, false);
+            assert!(takes.join("a.wav").exists());
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Reference));
+            // A conflict keeps the prompt open, so it can be corrected in place.
+            app.handle_reference_key(KeyCode::Char('r'), false, true)
+                .unwrap();
+            app.set_prompt.as_mut().unwrap().1.offer("b");
+            app.handle_set_prompt_key(KeyCode::Enter, false, false);
+            assert!(app.set_prompt.as_ref().unwrap().1.error.is_some());
+            app.set_prompt.as_mut().unwrap().1.offer("vox1");
+            app.handle_set_prompt_key(KeyCode::Enter, false, false);
+            assert!(app.set_prompt.is_none());
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Reference));
+            assert_eq!(std::fs::read(takes.join("vox1.wav")).unwrap(), b"first");
+            assert!(!takes.join("a.wav").exists());
+            let panel = app.reference_panel.as_ref().unwrap();
+            assert_eq!(panel.sound_selected, selected);
+            assert!(panel.expanded.is_some());
+            assert_eq!(panel.selected_bank().unwrap().0, "takes");
+            assert!(app.status.contains("takes:0 (vox1)"));
+            app.settle_sample_sources();
+            assert_eq!(
+                library.file_location("takes", Some(0)),
+                library.file_location("vox1", None)
+            );
+            assert!(
+                app.prefs.sample_renames.is_empty(),
+                "file rename must not alias the bank"
+            );
+        }
+
+        #[test]
+        fn prompts_restore_the_initiating_panel_with_the_set_browser_open() {
+            use rustel_runtime::samples::{SoundCategory, SoundEntry, SoundOrigin};
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.open_set_panel(false);
+            app.reference_panel = Some(ReferencePanel::samples(
+                &app.reference,
+                vec![SoundEntry {
+                    name: "takes".into(),
+                    variants: 2,
+                    variant_names: Vec::new(),
+                    origin: SoundOrigin::Global,
+                    category: SoundCategory::Drums,
+                    location: None,
+                    import: None,
+                }],
+            ));
+            let panel = app.reference_panel.as_mut().unwrap();
+            for (section, _) in panel.visible_categories() {
+                panel.open_categories.insert(section);
+            }
+            let selected = panel
+                .sound_rows()
+                .iter()
+                .position(|row| matches!(row, SoundRow::Bank(_)))
+                .unwrap();
+            panel.sound_selected = selected;
+            for key in [KeyCode::Esc, KeyCode::Enter] {
+                app.focus_panel(PanelKind::Reference);
+                app.handle_reference_key(KeyCode::Char('r'), false, true)
+                    .unwrap();
+                assert!(app.set_prompt.is_some());
+                app.handle_set_prompt_key(key, false, false);
+                assert!(app.set_prompt.is_none());
+                assert_eq!(app.focus, Focus::Panel(PanelKind::Reference));
+                assert_eq!(
+                    app.reference_panel.as_ref().unwrap().sound_selected,
+                    selected
+                );
+            }
+            for origin in [
+                Focus::Editor,
+                Focus::Panel(PanelKind::Reference),
+                Focus::Panel(PanelKind::Set),
+            ] {
+                app.focus = origin;
+                app.open_set_prompt(SetPrompt::OpenSet);
+                app.handle_set_prompt_key(KeyCode::Esc, false, false);
+                assert_eq!(app.focus, origin);
+            }
+            let mut sheet = SettingsSheet::default();
+            sheet.show_page(crate::settings::SettingsPage::Sources);
+            app.settings_sheet = Some(sheet);
+            app.focus_panel(PanelKind::Settings);
+            app.open_set_prompt(SetPrompt::PickBankToRename);
+            app.renaming_bank = Some("takes".into());
+            app.open_set_prompt(SetPrompt::RenameBank);
+            app.handle_set_prompt_key(KeyCode::Esc, false, false);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Settings));
+            assert!(app.set_panel.is_some());
+        }
+
+        #[test]
+        fn set_pages_use_the_visible_list_in_docked_and_sheet_layouts() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.open_set_panel(true);
+            app.frame = Rect::new(0, 0, 110, 45);
+            let source = app.editor().source().to_owned();
+            for sidebar in [Rect::new(0, 2, 25, 31), Rect::default()] {
+                app.regions.sidebar = sidebar;
+                let panel = app.set_panel.as_mut().unwrap();
+                panel.lines = (0..80).map(SetLine::File).collect();
+                panel.selected = 0;
+                let rows = panel.list_area(sidebar, app.frame).unwrap().height as usize;
+                assert!(app.handle_set_key(KeyCode::PageDown, false, false));
+                assert_eq!(app.set_panel.as_ref().unwrap().selected, rows);
+                assert!(app.handle_set_key(KeyCode::PageUp, false, false));
+                assert_eq!(app.set_panel.as_ref().unwrap().selected, 0);
+                app.handle_set_key(KeyCode::PageUp, false, false);
+                assert_eq!(app.set_panel.as_ref().unwrap().selected, 0);
+                app.set_panel.as_mut().unwrap().selected = 79;
+                app.handle_set_key(KeyCode::PageDown, false, false);
+                assert_eq!(app.set_panel.as_ref().unwrap().selected, 79);
+                assert_eq!(app.editor().source(), source);
+                assert_eq!(app.focus, Focus::Panel(PanelKind::Set));
+            }
+        }
+
+        #[test]
+        fn device_page_keys_keep_the_selection_visible_without_choosing_a_device() {
+            use crate::devices::{DeviceEntry, DeviceInventory};
+
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 110, 45);
+            app.devices.install_for_tests(DeviceInventory {
+                audio_outputs: (0..35)
+                    .map(|index| DeviceEntry {
+                        name: format!("output {index}"),
+                        id: index.to_string(),
+                        detail: String::new(),
+                        is_default: false,
+                    })
+                    .collect(),
+                ..DeviceInventory::default()
+            });
+            app.panel = Some(DevicePanel::default());
+            app.focus = Focus::Panel(PanelKind::Devices);
+            let status = app.status.clone();
+            let source = app.editor().source().to_owned();
+            for (key, selected) in [
+                (KeyCode::PageDown, 12),
+                (KeyCode::PageDown, 24),
+                (KeyCode::PageDown, 34),
+                (KeyCode::PageDown, 34),
+                (KeyCode::PageUp, 22),
+                (KeyCode::PageUp, 10),
+                (KeyCode::PageUp, 0),
+                (KeyCode::PageUp, 0),
+            ] {
+                assert!(app.handle_panel_key(key, false).unwrap());
+                let panel = app.panel.unwrap();
+                let geometry = DevicePanelView::geometry(app.frame, panel, 35).unwrap();
+                assert_eq!(panel.selected, selected);
+                assert!(selected >= geometry.first);
+                assert!(selected < geometry.first + usize::from(geometry.list.height));
+                assert_eq!(app.focus, Focus::Panel(PanelKind::Devices));
+                assert_eq!(app.status, status);
+                assert_eq!(app.editor().source(), source);
+            }
+        }
+
+        #[test]
+        fn session_fold_arrow_keys_expand_and_collapse_without_toggling_back() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            let sessions = app.sessions_directory();
+            std::fs::create_dir_all(&sessions).unwrap();
+            write_tape(&sessions, "2026-09-20T12-00-00", &[(0.0, "s('sine')")]);
+            app.open_set_panel(true);
+            let panel = app.set_panel.as_mut().unwrap();
+            let fold = panel
+                .lines
+                .iter()
+                .position(|row| *row == SetLine::Sessions)
+                .unwrap();
+            panel.selected = fold;
+            for _ in 0..2 {
+                app.handle_terminal_event(Event::Key(KeyEvent::new(
+                    KeyCode::Right,
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
+                assert!(app.set_panel.as_ref().unwrap().sessions_open);
+                assert_eq!(app.set_panel.as_ref().unwrap().selected, fold);
+            }
+            app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
+                .unwrap();
+            assert!(matches!(
+                app.set_panel.as_ref().unwrap().selected_line(),
+                Some(SetLine::Tape(_))
+            ));
+            for _ in 0..2 {
+                app.handle_terminal_event(Event::Key(KeyEvent::new(
+                    KeyCode::Left,
+                    KeyModifiers::NONE,
+                )))
+                .unwrap();
+                assert!(!app.set_panel.as_ref().unwrap().sessions_open);
+                assert_eq!(app.set_panel.as_ref().unwrap().selected, fold);
+            }
+            app.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+            assert!(
+                app.set_panel.as_ref().unwrap().sessions_open,
+                "Enter remains supported"
+            );
+        }
+
+        #[test]
+        fn every_set_selection_has_a_reveal_target() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.open_set_panel(false);
+            let score = app.scenes.current().path.clone();
+            assert_eq!(app.set_reveal_target(), RevealTarget::File(score));
+            let panel = app.set_panel.as_mut().unwrap();
+            panel.selected = panel
+                .lines
+                .iter()
+                .position(|line| *line == SetLine::Sessions)
+                .unwrap();
+            assert_eq!(
+                app.set_reveal_target(),
+                RevealTarget::Folder(directory.path().to_path_buf())
+            );
+            let sessions = app.sessions_directory();
+            std::fs::create_dir_all(&sessions).unwrap();
+            assert_eq!(
+                app.set_reveal_target(),
+                RevealTarget::Folder(sessions.clone())
+            );
+            let tape = write_tape(&sessions, "2026-09-24T12-00-00", &[(0.0, "s(\"bd\")")]);
+            app.refresh_set_panel(Some(tape.clone()));
+            assert_eq!(app.set_reveal_target(), RevealTarget::File(tape));
+        }
+
+        #[test]
+        fn a_set_hidden_for_reference_does_not_capture_input() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.open_set_panel(true);
+            app.toggle_reference_browse();
+            app.focus_panel(PanelKind::Set);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+            terminal
+                .draw(|frame| app.paint_into(frame, Instant::now()).unwrap())
+                .unwrap();
+            assert!(app.regions.sidebar_hidden);
+            assert_eq!(app.focus, Focus::Editor);
+            for (x, y) in [(50, 10), (90, 20)] {
+                assert!(!app.click_set_panel(x, y));
+                assert!(!app.scroll_set_panel(x, y, 1.0));
+            }
+            app.rotate_panel_focus();
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Reference));
+            app.rotate_panel_focus();
+            assert_eq!(app.focus, Focus::Editor);
+            assert!(app.set_panel.is_some(), "the requested panel stays open");
+        }
+    }
+}

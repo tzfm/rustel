@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Split large source files by concern and consolidate repeated tests. Studio tests now check the callback allocator at runtime.
+
 ## v0.1.3
 
 - Scores use `.vst()` for VST3 effects and `.vsti()` for VST3 instruments, with parameters and presets. Plugin support is experimental. `rustel vst` lists your plugins. Studio lists the plugins in the reference panel and completes plugin names, parameters and presets. See [Plugins](https://github.com/tzfm/rustel/blob/main/docs/plugins.md).

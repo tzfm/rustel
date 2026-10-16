@@ -47,60 +47,6 @@ fn update_plays_the_score_and_says_so() {
     );
 }
 
-/// F5 is the portable spelling of the same command.
-///
-/// The footer chip it lights is `Update`, the same one Ctrl+S lights - but a
-/// lit chip is a cell attribute, and the harness reads text, so this holds the
-/// command's effect rather than its highlight.
-#[test]
-fn f5_is_the_portable_update() {
-    let mut studio = hermetic();
-
-    studio.press(KeyCode::F(5), KeyModifiers::NONE);
-    studio.settle();
-
-    assert!(studio.is_playing(), "F5 updates and plays");
-}
-
-/// Ctrl+G cuts the transport. The engine answers asynchronously, so the
-/// test observes the two states a musician can see: something in flight
-/// (stopping or already stopped) once the key has been handled.
-#[test]
-fn stop_cuts_the_transport() {
-    let mut studio = hermetic();
-
-    studio.chord("ctrl+s");
-    studio.settle();
-    assert!(
-        studio.is_playing(),
-        "setup: the score plays before the stop"
-    );
-
-    studio.chord("ctrl+g");
-    studio.settle();
-
-    assert!(
-        studio.is_stopping() || !studio.is_playing(),
-        "the first stop begins a graceful tail or finishes it"
-    );
-}
-
-/// F8 is the portable stop.
-#[test]
-fn f8_is_the_portable_stop() {
-    let mut studio = hermetic();
-
-    studio.chord("ctrl+s");
-    studio.settle();
-    studio.press(KeyCode::F(8), KeyModifiers::NONE);
-    studio.settle();
-
-    assert!(
-        studio.is_stopping() || !studio.is_playing(),
-        "F8 begins a graceful tail or finishes the stop"
-    );
-}
-
 /// The transport outranks an open panel: with the settings sheet up and the
 /// keyboard inside it, Ctrl+S still updates. This is the contract the
 /// comment above `transport_key` states; here it is held with a real sheet.

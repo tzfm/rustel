@@ -483,3 +483,228 @@ impl App {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod scene_strip {
+        //! Tests for `app/scene_strip.rs`.
+
+        use crate::app::*;
+
+        /// A rename moves the scene file and saves its new path in the manifest.
+        #[test]
+        fn renaming_a_new_scene_keeps_its_file_and_manifest_in_step() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.new_scene(false);
+            let old_path = directory.path().join("scene 1.strudel");
+            let new_path = directory.path().join("buffy-tmp.strudel");
+            assert!(old_path.exists(), "new scenes are written at once");
+
+            app.begin_rename();
+            crate::app::tests::support::type_text(&mut app, "buffy-tmp");
+            crate::app::tests::support::press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(matches!(app.strip_mode, SceneStripMode::Idle));
+            assert_eq!(app.scenes.current().path, new_path);
+            assert!(new_path.exists(), "rename moved the empty file");
+            assert!(!old_path.exists(), "the old path was left behind");
+
+            let manifest = crate::scenes::SetManifest::load(directory.path()).expect("set file");
+            assert_eq!(manifest.current.as_deref(), Some("buffy-tmp.strudel"));
+            assert_eq!(manifest.scenes[1].file, "buffy-tmp.strudel");
+
+            app.dispatch_editor(Command::InsertText("// saved after rename\n".into()))
+                .expect("edit renamed scene");
+            app.dispatch_editor(Command::Evaluate)
+                .expect("update renamed scene");
+            app.wait_for_saves();
+            assert_eq!(
+                std::fs::read_to_string(&new_path).unwrap(),
+                "// saved after rename\n"
+            );
+            assert!(
+                !old_path.exists(),
+                "an update did not recreate the old file"
+            );
+
+            assert!(app.select_scene(0));
+            assert!(app.select_scene(1));
+            assert_eq!(app.scenes.current().name(), "buffy-tmp");
+            let reopened =
+                crate::scenes::SceneSet::open(directory.path(), "starter").expect("reopen");
+            assert_eq!(reopened.current().path, new_path);
+            assert_eq!(
+                reopened.current().editor.source(),
+                "// saved after rename\n"
+            );
+        }
+
+        /// A failed rename restores the actual name and keeps edits in rename mode.
+        #[test]
+        fn a_failed_rename_shows_the_name_the_scene_still_has() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.new_scene(false);
+            let old_path = app.scenes.current().path.clone();
+            std::fs::write(directory.path().join("taken.strudel"), "// another file")
+                .expect("occupied target");
+
+            app.begin_rename();
+            crate::app::tests::support::type_text(&mut app, "taken");
+            crate::app::tests::support::press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+            let error = app.errors.visible().expect("the refusal is reported");
+            assert!(error.contains(r#"could not rename "scene 1""#), "{error}");
+            assert!(
+                matches!(&app.strip_mode, SceneStripMode::Renaming(draft) if draft == "scene 1")
+            );
+            assert_eq!(app.scenes.current().path, old_path);
+            assert_eq!(app.scenes.current().name(), "scene 1");
+            let manifest = crate::scenes::SetManifest::load(directory.path()).expect("set file");
+            assert_eq!(manifest.current.as_deref(), Some("scene 1.strudel"));
+
+            let score = app.editor().source();
+            crate::app::tests::support::type_text(&mut app, "other");
+            assert_eq!(app.editor().source(), score, "the score was edited");
+            assert!(matches!(&app.strip_mode, SceneStripMode::Renaming(draft) if draft == "other"));
+            crate::app::tests::support::press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            app.wait_for_saves();
+            assert!(matches!(app.strip_mode, SceneStripMode::Idle));
+            assert_eq!(app.scenes.current().name(), "other");
+            assert_eq!(app.editor().source(), score);
+            assert!(directory.path().join("other.strudel").exists());
+            assert!(!old_path.exists());
+        }
+
+        /// A copy of a scene numbered at the top of the range takes the last number
+        /// instead of overflowing past it.
+        #[test]
+        fn duplicating_the_highest_numbered_scene_does_not_overflow() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let name = format!("x {}", usize::MAX - 1);
+            app.finish_rename(&name);
+            app.new_scene(true);
+            assert_eq!(app.scenes.current().name(), format!("x {}", usize::MAX));
+        }
+
+        /// An unrelated orphan must not make the first copy generic, and a
+        /// same-name orphan must be kept when later copies continue the sequence.
+        #[test]
+        fn duplicate_uses_the_source_name_without_replacing_an_orphan() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.finish_rename("encore");
+            let source = app.editor().source();
+            let unrelated_orphan = directory.path().join("scene 2.strudel");
+            std::fs::write(&unrelated_orphan, "// unrelated orphan\n").expect("orphan file");
+
+            app.new_scene(true);
+            assert_eq!(app.scenes.current().name(), "encore 2");
+            assert_eq!(app.editor().source(), source);
+            assert_eq!(
+                std::fs::read_to_string(directory.path().join("encore 2.strudel")).unwrap(),
+                source
+            );
+            assert_eq!(
+                std::fs::read_to_string(&unrelated_orphan).unwrap(),
+                "// unrelated orphan\n"
+            );
+
+            app.new_scene(true);
+            assert_eq!(app.scenes.current().name(), "encore 3");
+            assert_eq!(app.editor().source(), source);
+            let orphan = directory.path().join("encore 4.strudel");
+            std::fs::write(&orphan, "// same-name orphan\n").expect("orphan file");
+            app.new_scene(true);
+            assert_eq!(app.scenes.current().name(), "encore 5");
+            assert_eq!(
+                std::fs::read_to_string(&orphan).unwrap(),
+                "// same-name orphan\n"
+            );
+            let manifest = crate::scenes::SetManifest::load(directory.path()).expect("set file");
+            assert_eq!(manifest.current.as_deref(), Some("encore 5.strudel"));
+            let reopened =
+                crate::scenes::SceneSet::open(directory.path(), "encore").expect("reopen");
+            assert_eq!(reopened.current().name(), "encore 5");
+
+            app.new_scene(false);
+            assert_eq!(app.scenes.current().name(), "scene 1");
+            assert!(app.editor().source().is_empty());
+        }
+
+        /// A full set is a thing to do something about, not a fault. It took
+        /// the red ribbon, which is sticky, so it stayed on screen long after
+        /// scenes had been closed and the set had room again.
+        #[test]
+        fn a_full_set_says_so_without_leaving_a_mark() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            while app.scenes.len() < crate::scenes::MAX_SCENES {
+                app.new_scene(false);
+                assert!(app.errors.visible().is_none(), "{:?}", app.errors.visible());
+            }
+
+            app.new_scene(false);
+            assert_eq!(app.scenes.len(), crate::scenes::MAX_SCENES);
+            assert!(
+                app.status.contains("close one first"),
+                "the status says what to do: {}",
+                app.status
+            );
+            assert!(
+                app.errors.visible().is_none(),
+                "and nothing sticks: {:?}",
+                app.errors.visible()
+            );
+        }
+
+        /// No click plays a scene: no modifier, no second click, no right
+        /// button. The OS or the terminal can claim Ctrl+click, the right click
+        /// and Shift+click before the studio sees them. A pad, the Scene menu or
+        /// an update plays a scene.
+        #[test]
+        fn no_click_on_a_scene_chip_plays_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            app.regions.scenes = Rect::new(0, 1, 120, 1);
+            app.new_scene(false);
+            let second = app.scenes.current().id;
+            app.scenes.select(0);
+            app.panes[0].scene = app.scenes.current().id;
+
+            let chips = app.scene_chips();
+            let hits = view::scene_strip_hits(app.regions.scenes, &chips);
+            let target = hits.get(1).copied().expect("a chip for the second scene");
+            let press = |kind, modifiers| MouseEvent {
+                kind,
+                column: target.x,
+                row: target.y,
+                modifiers,
+            };
+
+            for (kind, modifiers) in [
+                (MouseEventKind::Down(MouseButton::Left), KeyModifiers::NONE),
+                (
+                    MouseEventKind::Down(MouseButton::Left),
+                    KeyModifiers::CONTROL,
+                ),
+                (MouseEventKind::Down(MouseButton::Left), KeyModifiers::SHIFT),
+                // Twice over, which is a double click at this distance and
+                // inside the window a double click is counted in.
+                (MouseEventKind::Down(MouseButton::Left), KeyModifiers::NONE),
+                (MouseEventKind::Down(MouseButton::Right), KeyModifiers::NONE),
+            ] {
+                app.handle_mouse(press(kind, modifiers)).expect("click");
+                assert!(
+                    app.pending_evaluation.is_none() && app.inflight.is_empty(),
+                    "{kind:?} with {modifiers:?} played a scene"
+                );
+            }
+
+            // What a click does do: it chooses the scene it landed on.
+            assert_eq!(app.scenes.current().id, second);
+        }
+    }
+}

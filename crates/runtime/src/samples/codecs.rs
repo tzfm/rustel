@@ -683,3 +683,645 @@ pub(super) mod panic_hook {
         assert!(!PANIC_NEXT_DECODE.replace(false), "test decoder failure");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::samples::*;
+    #[cfg(test)]
+    mod vorbis_guard_tests {
+        //! The Vorbis setup-header guard, [`guard_vorbis_setup`]: its codebook
+        //! arithmetic checked directly on the buffer symphonia's demuxer hands the
+        //! codec, and the production decode paths driven end to end with hand-built
+        //! and real Ogg files.
+
+        use super::*;
+
+        /// A least-significant-bit-first bit writer, the packing direction of
+        /// Vorbis header fields (spec section 3.1), for building header packets
+        /// bit by bit in the fixtures below.
+        struct TestBits {
+            bytes: Vec<u8>,
+            bit: u32,
+        }
+
+        impl TestBits {
+            fn new() -> Self {
+                TestBits {
+                    bytes: Vec::new(),
+                    bit: 0,
+                }
+            }
+
+            fn push(&mut self, value: u32, bits: u32) {
+                for index in 0..bits {
+                    if self.bit == 0 {
+                        self.bytes.push(0);
+                    }
+                    if (value >> index) & 1 == 1 {
+                        *self.bytes.last_mut().expect("a byte to set") |= 1 << self.bit;
+                    }
+                    self.bit = (self.bit + 1) % 8;
+                }
+            }
+
+            fn into_bytes(self) -> Vec<u8> {
+                self.bytes
+            }
+        }
+
+        /// The Ogg CRC-32 (polynomial 0x04c11db7, init 0, no reflection, no
+        /// final xor) of a page whose checksum field is zeroed, written back into
+        /// it. symphonia's page reader refuses a page whose CRC does not match,
+        /// so a fixture meant to reach the decoder has to carry a real one.
+        fn ogg_crc_page(page: &mut [u8]) {
+            page[22..26].copy_from_slice(&[0u8; 4]);
+            let mut crc = 0u32;
+            for &byte in page.iter() {
+                crc ^= u32::from(byte) << 24;
+                for _ in 0..8 {
+                    crc = if crc & 0x8000_0000 != 0 {
+                        (crc << 1) ^ 0x04c1_1db7
+                    } else {
+                        crc << 1
+                    };
+                }
+            }
+            page[22..26].copy_from_slice(&crc.to_le_bytes());
+        }
+
+        /// The Ogg lacing values for one packet that terminates on its page:
+        /// runs of 255 for each full segment, then a final value under 255 (a
+        /// trailing 0 when the length is an exact multiple of 255).
+        fn lacing_for(len: usize) -> Vec<u8> {
+            let mut segments = vec![255u8; len / 255];
+            segments.push((len % 255) as u8);
+            segments
+        }
+
+        /// Build one Ogg page from an explicit segment table and payload, with a
+        /// correct CRC. This is the low-level builder the fixtures below layer on:
+        /// a segment table lets a page end mid-packet (a trailing 255) so a packet
+        /// can be split across pages the way a real muxer splits a large one.
+        fn ogg_page_raw(
+            payload: &[u8],
+            segments: &[u8],
+            header_type: u8,
+            sequence: u32,
+            serial: u32,
+            absgp: u64,
+        ) -> Vec<u8> {
+            assert!(segments.len() <= 255, "a page holds at most 255 segments");
+            let mut page = Vec::with_capacity(27 + segments.len() + payload.len());
+            page.extend_from_slice(b"OggS");
+            page.push(0);
+            page.push(header_type);
+            page.extend_from_slice(&absgp.to_le_bytes());
+            page.extend_from_slice(&serial.to_le_bytes());
+            page.extend_from_slice(&sequence.to_le_bytes());
+            page.extend_from_slice(&0u32.to_le_bytes());
+            page.push(segments.len() as u8);
+            page.extend_from_slice(segments);
+            page.extend_from_slice(payload);
+            ogg_crc_page(&mut page);
+            page
+        }
+
+        /// One Ogg page carrying whole packets, each terminated with its own
+        /// lacing - the ordinary case where no packet spans a page boundary.
+        fn ogg_page_packets(
+            packets: &[&[u8]],
+            header_type: u8,
+            sequence: u32,
+            serial: u32,
+            absgp: u64,
+        ) -> Vec<u8> {
+            let mut segments = Vec::new();
+            let mut payload = Vec::new();
+            for packet in packets {
+                segments.extend(lacing_for(packet.len()));
+                payload.extend_from_slice(packet);
+            }
+            ogg_page_raw(&payload, &segments, header_type, sequence, serial, absgp)
+        }
+
+        /// Split one packet across two pages: the first page ends on a 255 lacing
+        /// (the packet continues), the second is flagged a continuation (0x01)
+        /// and carries the rest. This is the layout a real muxer produces when a
+        /// setup header does not fit on one page, and the case the guard used to
+        /// mis-handle by splicing the second page's header into the packet.
+        fn split_packet_pages(packet: &[u8], first_sequence: u32, serial: u32) -> Vec<u8> {
+            assert!(
+                packet.len() > 255,
+                "a split needs a packet over one segment"
+            );
+            let mut pages = ogg_page_raw(&packet[..255], &[255], 0x00, first_sequence, serial, 0);
+            let rest = &packet[255..];
+            pages.extend(ogg_page_raw(
+                rest,
+                &lacing_for(rest.len()),
+                0x01,
+                first_sequence + 1,
+                serial,
+                0,
+            ));
+            pages
+        }
+
+        /// A well-formed 30-byte Vorbis identification header: mono 44.1 kHz.
+        fn vorbis_id_packet() -> Vec<u8> {
+            let mut id = vec![0x01];
+            id.extend_from_slice(b"vorbis");
+            id.extend_from_slice(&0u32.to_le_bytes());
+            id.push(1);
+            id.extend_from_slice(&44_100u32.to_le_bytes());
+            id.extend_from_slice(&0u32.to_le_bytes());
+            id.extend_from_slice(&0u32.to_le_bytes());
+            id.extend_from_slice(&0u32.to_le_bytes());
+            id.push((11 << 4) | 11);
+            id.push(1);
+            assert_eq!(id.len(), 30, "the mapper requires exactly 30 bytes");
+            id
+        }
+
+        /// An empty but well-formed Vorbis comment header.
+        fn vorbis_comment_packet() -> Vec<u8> {
+            let mut comment = vec![0x03];
+            comment.extend_from_slice(b"vorbis");
+            comment.extend_from_slice(&0u32.to_le_bytes());
+            comment.extend_from_slice(&0u32.to_le_bytes());
+            comment.push(1);
+            comment
+        }
+
+        /// Wrap a setup header in the pages of one logical stream, closed by an
+        /// end-of-stream page carrying one audio packet. The closing page matters
+        /// for a hostile fixture reaching the decoder: a stream that ends right
+        /// after its setup header is refused by the demuxer's probe before the
+        /// codec parses it, so the attack carries one audio packet to get the
+        /// probe one packet further. `split` puts the setup across two pages,
+        /// the layout a real muxer uses for a header too big for one page.
+        fn vorbis_header_ogg_inner(setup: &[u8], split: bool) -> Vec<u8> {
+            let serial = 0x564F_u32;
+            let mut ogg = ogg_page_packets(&[&vorbis_id_packet()], 0x02, 0, serial, 0);
+            ogg.extend(ogg_page_packets(
+                &[&vorbis_comment_packet()],
+                0x00,
+                1,
+                serial,
+                0,
+            ));
+            if split {
+                ogg.extend(split_packet_pages(setup, 2, serial));
+                ogg.extend(ogg_page_packets(&[&[0x00]], 0x04, 4, serial, 0));
+            } else {
+                ogg.extend(ogg_page_packets(&[setup], 0x00, 2, serial, 0));
+                ogg.extend(ogg_page_packets(&[&[0x00]], 0x04, 3, serial, 0));
+            }
+            ogg
+        }
+
+        fn vorbis_header_ogg(setup: &[u8]) -> Vec<u8> {
+            vorbis_header_ogg_inner(setup, false)
+        }
+
+        /// The buffer symphonia's Ogg Vorbis mapper hands the codec: the 30-byte
+        /// identification header, then the setup packet whole. This is exactly
+        /// what [`guard_vorbis_setup`] receives, so the direct-guard tests below
+        /// can feed a setup packet without paginating anything.
+        fn extra_data(setup: &[u8]) -> Vec<u8> {
+            let mut buf = vorbis_id_packet();
+            buf.extend_from_slice(setup);
+            buf
+        }
+
+        /// A setup header packet (`0x05 'vorbis'` then the raw codebook bits).
+        fn setup_packet(bits: TestBits) -> Vec<u8> {
+            let mut setup = vec![0x05];
+            setup.extend_from_slice(b"vorbis");
+            setup.extend_from_slice(&bits.into_bytes());
+            setup
+        }
+
+        /// One codebook whose ordered codeword lengths cover every entry in a
+        /// single run - the cheapest way to write a book with a huge entry count,
+        /// and what a size-lie fixture uses. `lookup` is the VQ lookup type; when
+        /// it is 1 or 2 the table header follows but no multiplicands, so the book
+        /// is only ever valid to *allocate* toward.
+        fn oversized_codebook(bits: &mut TestBits, dimensions: u32, entries: u32, lookup: u32) {
+            bits.push(0x564342, 24); // codebook sync "BCV"
+            bits.push(dimensions, 16);
+            bits.push(entries, 24);
+            bits.push(1, 1); // codeword lengths are ordered
+            bits.push(0, 5); // initial length minus one
+            let run_bits = 32 - entries.leading_zeros();
+            bits.push(entries, run_bits); // one run covers every entry
+            bits.push(lookup, 4);
+            if lookup != 0 {
+                bits.push(0, 32); // minimum value
+                bits.push(0, 32); // delta value
+                bits.push(0, 4); // value bits minus one
+                bits.push(0, 1); // sequence_p
+            }
+        }
+
+        /// A minimal second codebook to follow the book under test: one dimension,
+        /// two entries of length 1, no lookup. If the walk over the book before it
+        /// skipped a single bit too many or too few, this book's sync word would not
+        /// be where the guard looks for it.
+        fn small_codebook(bits: &mut TestBits) {
+            bits.push(0x564342, 24); // codebook sync "BCV"
+            bits.push(1, 16); // dimensions
+            bits.push(2, 24); // entries
+            bits.push(0, 1); // unordered
+            bits.push(0, 1); // not sparse
+            bits.push(0, 5); // length 1
+            bits.push(0, 5); // length 1
+            bits.push(0, 4); // lookup type 0
+        }
+
+        /// Regression: 2^23 entries * 2^15 dimensions wraps u32 in symphonia 0.5.5,
+        /// and the decoder then aborts on a huge allocation. The guard refuses the
+        /// u64 product. The test calls it directly: the test profile panics first.
+        #[test]
+        fn the_wrapping_size_lie_is_refused_by_the_setup_guard() {
+            let mut bits = TestBits::new();
+            bits.push(0, 8); // one codebook
+            oversized_codebook(&mut bits, 32_768, 8_388_608, 2); // 2^15 x 2^23
+            let error = guard_vorbis_setup(&extra_data(&setup_packet(bits)))
+                .expect_err("the wrapping size lie must be refused");
+            assert!(error.contains("cap"), "names the value cap: {error}");
+        }
+
+        /// A type-2 lookup that promises entries × dimensions multiplicands the
+        /// packet does not carry. The decoder reads exactly that many before it
+        /// can build the book, so a header promising more table than the packet
+        /// holds is a stream no decoder finishes, only allocates toward.
+        #[test]
+        fn a_type2_multiplicand_promise_the_packet_cannot_back_is_refused() {
+            let mut bits = TestBits::new();
+            bits.push(0, 8); // one codebook
+            bits.push(0x564342, 24); // codebook sync "BCV"
+            bits.push(2, 16); // dimensions
+            bits.push(4, 24); // entries: eight multiplicands promised
+            bits.push(0, 1); // codeword lengths unordered
+            bits.push(0, 1); // ...and not sparse
+            for _ in 0..4 {
+                bits.push(0, 5); // one codeword length per entry
+            }
+            bits.push(2, 4); // lookup type 2
+            bits.push(0, 32); // minimum value
+            bits.push(0, 32); // delta value
+            bits.push(0, 4); // one bit per multiplicand
+            bits.push(0, 1); // sequence_p
+            // The packet ends here: not one promised multiplicand is carried.
+            let error = guard_vorbis_setup(&extra_data(&setup_packet(bits)))
+                .expect_err("a table its packet cannot back must be refused");
+            assert!(
+                error.contains("multiplicand"),
+                "names the missing multiplicands: {error}"
+            );
+        }
+
+        /// The value cap also covers lookup type 1. The packet carries only
+        /// `floor(entries^(1/dims))` multiplicands, but the decoder allocates the
+        /// full 2^26-value table.
+        #[test]
+        fn a_type1_lookup_table_over_the_cap_is_refused() {
+            let mut bits = TestBits::new();
+            bits.push(0, 8); // one codebook
+            oversized_codebook(&mut bits, 8, 8_388_608, 1); // 8 x 2^23 = 2^26 table
+            let error = guard_vorbis_setup(&extra_data(&setup_packet(bits)))
+                .expect_err("a type-1 table over the cap must be refused");
+            assert!(error.contains("cap"), "names the value cap: {error}");
+        }
+
+        /// An honest type-1 book whose `floor(entries^(1/dims))` multiplicands are
+        /// all present passes: the guard walks the type-1 path, computes the count
+        /// by integer root, and lets a real book through.
+        #[test]
+        fn a_type1_lookup_codebook_with_its_multiplicands_passes() {
+            let mut bits = TestBits::new();
+            bits.push(0, 8); // one codebook
+            bits.push(0x564342, 24); // codebook sync "BCV"
+            bits.push(3, 16); // dimensions
+            bits.push(8, 24); // entries: floor(8^(1/3)) = 2 multiplicands
+            bits.push(0, 1); // unordered
+            bits.push(0, 1); // not sparse
+            for _ in 0..8 {
+                bits.push(0, 5); // one codeword length per entry
+            }
+            bits.push(1, 4); // lookup type 1
+            bits.push(0, 32); // minimum value
+            bits.push(0, 32); // delta value
+            bits.push(0, 4); // one bit per multiplicand
+            bits.push(0, 1); // sequence_p
+            bits.push(0, 1); // the two promised multiplicands...
+            bits.push(1, 1);
+            guard_vorbis_setup(&extra_data(&setup_packet(bits)))
+                .expect("an honest type-1 book is not the guard's business");
+        }
+
+        /// Books with zero dimensions and 2^24-1 entries each. Their lookup tables
+        /// are empty, but symphonia builds entry-sized state for such a book. The
+        /// guard charges the entry count against the header budget and refuses the
+        /// fifth book. The test checks the guard's charge, not symphonia's.
+        #[test]
+        fn a_dimension_zero_codebook_flood_is_refused() {
+            let mut bits = TestBits::new();
+            bits.push(4, 8); // five codebooks
+            for _ in 0..5 {
+                oversized_codebook(&mut bits, 0, 16_777_215, 0); // dims 0, entries 2^24-1
+            }
+            let error = guard_vorbis_setup(&extra_data(&setup_packet(bits)))
+                .expect_err("a dimension-zero flood must be refused");
+            assert!(error.contains("budget"), "names the stream budget: {error}");
+        }
+
+        /// A small, honestly-declared type-2 book passes. The guard refuses
+        /// impossible tables, not real ones: a two-dimension, four-entry book
+        /// whose eight one-bit multiplicands are all present is what a real
+        /// encoder writes, and the same walk must let it through.
+        #[test]
+        fn an_honest_codebook_passes_the_setup_guard() {
+            let mut bits = TestBits::new();
+            bits.push(0, 8); // one codebook
+            bits.push(0x564342, 24); // codebook sync "BCV"
+            bits.push(2, 16); // dimensions
+            bits.push(4, 24); // entries
+            bits.push(0, 1); // unordered
+            bits.push(0, 1); // not sparse
+            for _ in 0..4 {
+                bits.push(0, 5); // one codeword length per entry
+            }
+            bits.push(2, 4); // lookup type 2: eight multiplicands
+            bits.push(0, 32); // minimum value
+            bits.push(0, 32); // delta value
+            bits.push(0, 4); // one bit per multiplicand
+            bits.push(0, 1); // sequence_p
+            for value in 0..8 {
+                bits.push(u32::from(value % 2 == 0), 1); // the eight promised values
+            }
+            guard_vorbis_setup(&extra_data(&setup_packet(bits)))
+                .expect("an honest codebook is not the guard's business");
+        }
+
+        /// A sparsely packed codeword list passes. Most real books mark unused
+        /// entries with a single 0 bit, so the guard must walk the sparse branch
+        /// (one flag bit per entry, five length bits only when used) to land the
+        /// next field on its true boundary.
+        #[test]
+        fn a_sparse_codeword_list_is_walked() {
+            let mut bits = TestBits::new();
+            bits.push(0, 8); // one codebook
+            bits.push(0x564342, 24); // codebook sync "BCV"
+            bits.push(1, 16); // dimensions
+            bits.push(4, 24); // entries
+            bits.push(0, 1); // unordered
+            bits.push(1, 1); // sparse
+            for entry in 0..4 {
+                let used = entry % 2 == 0;
+                bits.push(u32::from(used), 1); // used flag
+                if used {
+                    bits.push(0, 5); // length only for used entries
+                }
+            }
+            bits.push(0, 4); // lookup type 0: no table
+            guard_vorbis_setup(&extra_data(&setup_packet(bits)))
+                .expect("a sparse book is not the guard's business");
+        }
+
+        /// A complete type-2 book followed by a second book. The guard must skip
+        /// exactly entries * dimensions (4 * 2) three-bit multiplicands to find
+        /// the sync word of the next book.
+        #[test]
+        fn a_type2_book_is_stepped_over_to_the_next_codebook() {
+            let mut bits = TestBits::new();
+            bits.push(1, 8); // two codebooks
+            bits.push(0x564342, 24); // codebook sync "BCV"
+            bits.push(2, 16); // dimensions
+            bits.push(4, 24); // entries
+            bits.push(0, 1); // unordered
+            bits.push(0, 1); // not sparse
+            for _ in 0..4 {
+                bits.push(1, 5); // four codewords of length 2: a complete code
+            }
+            bits.push(2, 4); // lookup type 2
+            bits.push(0, 32); // minimum value
+            bits.push(0, 32); // delta value
+            bits.push(2, 4); // three bits per multiplicand
+            bits.push(0, 1); // sequence_p
+            for value in 0..8 {
+                bits.push(value, 3); // all eight multiplicands
+            }
+            small_codebook(&mut bits);
+            guard_vorbis_setup(&extra_data(&setup_packet(bits)))
+                .expect("a type-2 book and the book after it are not the guard's business");
+        }
+
+        /// A length-ordered book with several runs, followed by a second book.
+        /// Each run count uses `ilog(entries left)` bits (3, 2, 2 here), so the
+        /// guard must size each run by the entries that remain.
+        #[test]
+        fn a_multi_run_ordered_book_is_stepped_over_to_the_next_codebook() {
+            let mut bits = TestBits::new();
+            bits.push(1, 8); // two codebooks
+            bits.push(0x564342, 24); // codebook sync "BCV"
+            bits.push(1, 16); // dimensions
+            bits.push(4, 24); // entries
+            bits.push(1, 1); // codeword lengths are ordered
+            bits.push(0, 5); // lengths start at 1
+            bits.push(1, 3); // one entry of length 1, in ilog(4) = 3 bits
+            bits.push(1, 2); // one of length 2, in ilog(3) = 2 bits
+            bits.push(2, 2); // two of length 3, in ilog(2) = 2 bits: 1, 2, 3, 3 is complete
+            bits.push(0, 4); // lookup type 0
+            small_codebook(&mut bits);
+            guard_vorbis_setup(&extra_data(&setup_packet(bits)))
+                .expect("an ordered book and the book after it are not the guard's business");
+        }
+
+        /// A type-1 book that symphonia would take to the table allocation: 2^22
+        /// entries and 8 dimensions give a 2^25-value (128 MiB) f32 table, with
+        /// all six multiplicands present. The guard refuses it first. The sizes
+        /// keep symphonia's f32 `lookup1_values` exact, so the probe passes it on.
+        #[test]
+        fn a_type1_table_symphonia_would_allocate_is_refused_before_the_decoder() {
+            let mut bits = TestBits::new();
+            bits.push(0, 8); // one codebook
+            oversized_codebook(&mut bits, 8, 4_194_304, 1); // 8 x 2^22 = a 2^25-value table
+            for value in 0..6 {
+                bits.push(value % 2, 1); // the six one-bit multiplicands, all present
+            }
+            let ogg = vorbis_header_ogg(&setup_packet(bits));
+            let error = decode_guarded("https://example.test/table.ogg", &ogg, Some(48_000))
+                .expect_err("a table symphonia would allocate must be refused first");
+            assert!(error.contains("cap"), "names the value cap: {error}");
+        }
+
+        /// The type-1 multiplicand count, `floor(entries^(1/dims))`, computed by
+        /// integer binary search. Exact-power and off-by-one edges are where an
+        /// f32 root would drift, and dimension/entry zero are the saturating
+        /// corners symphonia's release build hits.
+        #[test]
+        fn vorbis_lookup1_values_matches_the_spec() {
+            assert_eq!(vorbis_lookup1_values(8, 3), 2); // 2^3 = 8
+            assert_eq!(vorbis_lookup1_values(7, 3), 1); // 2^3 > 7
+            assert_eq!(vorbis_lookup1_values(27, 3), 3); // 3^3 = 27
+            assert_eq!(vorbis_lookup1_values(26, 3), 2); // 3^3 > 26
+            assert_eq!(vorbis_lookup1_values(1, 1), 1);
+            assert_eq!(vorbis_lookup1_values(16_777_215, 1), 16_777_215); // v^1 <= entries
+            assert_eq!(vorbis_lookup1_values(0, 4), 0);
+            assert_eq!(vorbis_lookup1_values(100, 0), u64::MAX); // saturating corner
+        }
+
+        /// The rename bypass, closed: a hostile Vorbis stream served under any
+        /// extension reaches the same decoder, so the guard runs at the decoder
+        /// boundary, not by file name. A book declaring a 2^26-value table (which
+        /// fits u32, so symphonia's probe demuxes it without panicking) is refused
+        /// whether the URL says `.ogg` or `.mp3`, and whether it arrives as a
+        /// bank sample or a soundfont zone (which decodes through `decode_mp3`).
+        /// symphonia would stop this particular book itself, short of the table,
+        /// for want of its multiplicands, so this test pins *where* the guard runs;
+        /// the type-1 test below pins what it prevents.
+        #[test]
+        fn a_hostile_vorbis_setup_is_refused_at_every_entry_point() {
+            let mut bits = TestBits::new();
+            bits.push(0, 8); // one codebook
+            oversized_codebook(&mut bits, 8, 8_388_608, 2); // 2^26-value table, fits u32
+            let ogg = vorbis_header_ogg(&setup_packet(bits));
+
+            for url in [
+                "https://example.test/attack.ogg",
+                "https://example.test/attack.mp3",
+            ] {
+                let error = decode_guarded(url, &ogg, Some(48_000))
+                    .expect_err("the hostile setup must be refused");
+                assert!(error.contains("cap"), "{url} names the value cap: {error}");
+                // A refusal does not depend on gapless trimming, so it is reported
+                // once rather than again from a pointless non-gapless retry.
+                assert!(
+                    !error.contains("without gapless trimming"),
+                    "{url} reports the refusal once: {error}"
+                );
+            }
+            // The soundfont zone path decodes every non-RIFF zone through
+            // `decode_mp3`; the guard fires there too.
+            let error = decode_mp3(&ogg).expect_err("the zone path must refuse it");
+            assert!(
+                error.contains("cap"),
+                "the zone path names the cap: {error}"
+            );
+        }
+
+        /// A setup header split across two pages, hostile. symphonia's demuxer
+        /// reassembles the packet from both pages before the codec sees it, so the
+        /// guard inspects the whole header: a valid padding book fills the first
+        /// page and the oversized book begins only on the continuation page. The
+        /// old page-splicing pre-scan spliced the second page's 27-byte header into
+        /// the packet and lost the walk; guarding the demuxed header cannot.
+        #[test]
+        fn a_hostile_setup_split_across_two_pages_is_refused() {
+            let mut bits = TestBits::new();
+            bits.push(1, 8); // two codebooks
+            // A valid padding book: 512 entries of length 9 are a complete code
+            // (512 x 2^-9 = 1), and their 320 bytes of dense lengths push the second
+            // book past the first page's 255 bytes onto the continuation page.
+            bits.push(0x564342, 24);
+            bits.push(1, 16); // dimensions
+            bits.push(512, 24); // entries
+            bits.push(0, 1); // unordered
+            bits.push(0, 1); // not sparse
+            for _ in 0..512 {
+                bits.push(8, 5); // length 9
+            }
+            bits.push(0, 4); // lookup type 0
+            // The oversized book, now past the page boundary.
+            oversized_codebook(&mut bits, 8, 8_388_608, 2);
+
+            let setup = setup_packet(bits);
+            assert!(setup.len() > 300, "the setup must span two pages");
+            let ogg = vorbis_header_ogg_inner(&setup, true);
+            let error = decode_guarded("https://example.test/split.ogg", &ogg, Some(48_000))
+                .expect_err("the split hostile setup must be refused");
+            assert!(error.contains("cap"), "names the value cap: {error}");
+        }
+
+        /// The committed real file: 30 ms of a 330 Hz tone, 8 kHz mono, encoded
+        /// off-line by libvorbis into 2.7 KB.
+        const TINY_VORBIS: &[u8] = include_bytes!("testdata/tiny_vorbis.ogg");
+
+        /// A decode that ran but produced silence passes every other check and is
+        /// wrong only at the speaker, so a real file is held to audible output at
+        /// its own rate (decoded with no context rate, so nothing resamples it).
+        fn assert_audible(decoded: &DecodedSample) {
+            assert!(decoded.frames() > 0, "decoded to no frames");
+            assert_eq!(decoded.sample_rate(), 8_000, "the fixture's own rate");
+            let peak = decoded
+                .pcm()
+                .iter()
+                .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+            assert!(peak > 0.05, "decoded to near silence: peak {peak}");
+        }
+
+        /// A real libvorbis file decodes to audible audio through the production
+        /// entry point: the guard walks its 19 codebooks and refuses none. It has
+        /// no length-ordered books and no type-2 lookups; other tests cover those.
+        #[test]
+        fn a_real_vorbis_file_decodes_through_the_guarded_path() {
+            let decoded = decode_guarded("kick.ogg", TINY_VORBIS, None)
+                .expect("a real vorbis file must decode");
+            assert_audible(&decoded);
+        }
+
+        /// The same file with its setup header split across two pages still
+        /// decodes: the guard reads the reassembled header, not the raw page bytes.
+        #[test]
+        fn a_real_vorbis_setup_spanning_pages_still_decodes() {
+            let repaginated = repaginate_setup_across_pages(TINY_VORBIS);
+            let decoded = decode_guarded("kick.ogg", &repaginated, None)
+                .expect("a real file with a page-spanning setup must decode");
+            assert_audible(&decoded);
+        }
+
+        /// Reassemble the packets of a single-stream Ogg file in order, returning
+        /// the serial, the final page's granule, and the packet payloads.
+        fn ogg_packets(ogg: &[u8]) -> (u32, u64, Vec<Vec<u8>>) {
+            let mut packets = Vec::new();
+            let mut current = Vec::new();
+            let (mut serial, mut final_gp) = (0u32, 0u64);
+            let mut cursor = 0usize;
+            while cursor + 27 <= ogg.len() && &ogg[cursor..cursor + 4] == b"OggS" {
+                serial = u32::from_le_bytes(ogg[cursor + 14..cursor + 18].try_into().unwrap());
+                let absgp = u64::from_le_bytes(ogg[cursor + 6..cursor + 14].try_into().unwrap());
+                if absgp != u64::MAX {
+                    final_gp = final_gp.max(absgp);
+                }
+                let segments = usize::from(ogg[cursor + 26]);
+                let table = &ogg[cursor + 27..cursor + 27 + segments];
+                let mut offset = cursor + 27 + segments;
+                for &lacing in table {
+                    current.extend_from_slice(&ogg[offset..offset + usize::from(lacing)]);
+                    offset += usize::from(lacing);
+                    if lacing < 255 {
+                        packets.push(std::mem::take(&mut current));
+                    }
+                }
+                cursor = offset;
+            }
+            (serial, final_gp, packets)
+        }
+
+        /// Re-lay a single-stream Ogg file so the setup packet spans two pages,
+        /// keeping the identification, comment, and audio packets intact.
+        fn repaginate_setup_across_pages(ogg: &[u8]) -> Vec<u8> {
+            let (serial, final_gp, packets) = ogg_packets(ogg);
+            assert!(packets.len() >= 4, "need ident, comment, setup, and audio");
+            let mut out = ogg_page_packets(&[&packets[0]], 0x02, 0, serial, 0); // ident (BOS)
+            out.extend(ogg_page_packets(&[&packets[1]], 0x00, 1, serial, 0)); // comment
+            out.extend(split_packet_pages(&packets[2], 2, serial)); // setup (seq 2, 3)
+            let audio: Vec<&[u8]> = packets[3..].iter().map(Vec::as_slice).collect();
+            out.extend(ogg_page_packets(&audio, 0x04, 4, serial, final_gp)); // audio (EOS)
+            out
+        }
+    }
+}

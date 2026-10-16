@@ -984,21 +984,6 @@ mod tests {
         assert!(resolve_serial_selector("/dev/ttyUSB0", &[]).is_err());
     }
 
-    #[test]
-    fn security_docs_describe_live_midi_and_serial_output() {
-        let security = include_str!("../../../SECURITY.md");
-        let devices = security
-            .split_once("## MIDI and serial devices")
-            .expect("device security section")
-            .1
-            .split("\n## ")
-            .next()
-            .expect("device security text");
-        assert!(devices.contains("CLI live playback and Studio open and write"));
-        assert!(devices.contains("MIDI or serial ports a score names"));
-        assert!(!devices.contains("drains them as unsupported"));
-    }
-
     fn onset(value: serde_json::Value) -> OnsetEventJson {
         OnsetEventJson {
             onset_id: 1,

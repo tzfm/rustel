@@ -1362,3 +1362,1756 @@ mod scoped_completion_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod completion {
+        //! Tests for `app/completion.rs`.
+
+        use crate::app::string_roles::StringRole;
+        use crate::app::tests::support::*;
+        use crate::app::*;
+        use crate::editor::{MemoryClipboard, Selection};
+
+        /// A snippet is a whole statement. Mid-expression it ranks below a
+        /// function whose name matches; on a blank line it ranks above.
+        #[test]
+        fn snippets_sink_when_the_caret_is_not_on_a_blank_line() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "$: s(\"bd\").lpf(800)\n\n");
+            let reference = &app.reference;
+            let snippet_at = |results: &[usize]| {
+                results.iter().position(|index| {
+                    reference
+                        .entry(*index)
+                        .is_some_and(|entry| entry.tags.iter().any(|tag| tag == "snippet"))
+                })
+            };
+            let named_at = |results: &[usize], name: &str| {
+                results.iter().position(|index| {
+                    reference
+                        .entry(*index)
+                        .is_some_and(|entry| entry.name == name)
+                })
+            };
+
+            let on_line = reference.search_with("midike", true);
+            let on_blank = reference.search_with("midike", false);
+            assert!(
+                !on_line.is_empty() && !on_blank.is_empty(),
+                "the query finds things"
+            );
+
+            let keys_on_line =
+                named_at(&on_line, "midikeys").expect("midikeys is found either way");
+            let snippet_on_line =
+                snippet_at(&on_line).expect("snippets are still offered, not hidden");
+            assert!(
+                keys_on_line < snippet_on_line,
+                "mid-expression, the function a name matches comes before a snippet \
+         that cannot go there: {keys_on_line} vs {snippet_on_line}"
+            );
+
+            let snippet_on_blank = snippet_at(&on_blank).expect("a snippet");
+            let keys_on_blank = named_at(&on_blank, "midikeys").expect("midikeys");
+            assert!(
+                snippet_on_blank < keys_on_blank,
+                "on a blank line a snippet is what was wanted: {snippet_on_blank} vs {keys_on_blank}"
+            );
+            // Nothing is dropped either way - the order changed, not the answer.
+            assert_eq!(on_line.len(), on_blank.len());
+
+            // And the app reads the caret's own line to decide which it is.
+            let source = app.editor().source();
+            let mid = source.find("800").expect("a number mid-line");
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(mid)))
+                .expect("caret mid-line");
+            assert!(!app.caret_on_blank_line());
+            let blank = source.rfind("\n\n").expect("the blank line") + 1;
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(blank)))
+                .expect("caret on the blank line");
+            assert!(app.caret_on_blank_line());
+        }
+
+        /// Ctrl+D inside a sound, chord or scale string opens that call's own
+        /// list. It does not refuse.
+        #[test]
+        fn ctrl_d_inside_a_list_string_opens_that_list_on_the_word() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            for (score, needle, what) in [
+                ("$: s(\"siren\")\n", "siren", "sounds"),
+                ("$: n(\"0\").chord(\"Cmaj7\")\n", "Cmaj7", "chords"),
+                ("$: n(\"0\").scale(\"C:minor\")\n", "C:minor", "scales"),
+            ] {
+                let mut app = app_over(directory.path());
+                // `app_over` writes its own scene; this is the one under test.
+                app.scenes.current_mut().editor =
+                    crate::editor::Editor::new(score).expect("editor");
+                // Put the caret in the middle of the quoted name.
+                let column = score.find(needle).expect("needle") + needle.len() / 2;
+                for _ in 0..column {
+                    press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+                }
+                press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+                let panel = app
+                    .reference_panel
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{what}: Ctrl+D refused instead of answering"));
+                assert!(
+                    !panel.results.is_empty(),
+                    "{what}: opened on nothing - {}",
+                    app.status
+                );
+                assert!(
+                    !app.status.contains("no reference"),
+                    "{what}: still refusing - {}",
+                    app.status
+                );
+            }
+        }
+
+        #[test]
+        fn ctrl_d_shows_function_arguments_until_a_string_is_opened() {
+            use crate::reference::{ReferenceMode, Tab};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            for (marked, name) in [
+                ("$: s(|)", "s"),
+                ("$: chord(|)", "chord"),
+                ("$: n(0).scale(|)", "scale"),
+                #[cfg(feature = "extensions")]
+                ("$: n(0).inspire(|)", "inspire"),
+                ("$: s(\"bd\").warpmode(|)", "warpmode"),
+                #[cfg(feature = "extensions")]
+                ("$: n(0).inspire(\"C:major:pentatonic\", |)", "inspire"),
+                #[cfg(feature = "extensions")]
+                ("$: n(0).inspire(\"C:major:pentatonic\", 4, |)", "inspire"),
+            ] {
+                let caret = marked.find('|').expect("caret marker");
+                let source = marked.replace('|', "");
+                let mut app = app_over(directory.path());
+                app.scenes.current_mut().editor = Editor::new(&source).expect("editor");
+                app.editor_mut()
+                    .set_selection(Selection::caret(ByteOffset(caret)))
+                    .expect("caret");
+
+                press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+                let panel = app.reference_panel.as_ref().expect("reference opened");
+                assert_eq!(panel.tab, Tab::Reference, "{marked}");
+                let ReferenceMode::Entry { index, .. } = panel.mode else {
+                    panic!("{marked}: expected the function's argument documentation")
+                };
+                assert_eq!(app.reference.entry(index).unwrap().name, name, "{marked}");
+                assert!(panel.vocabulary.is_none(), "{marked}");
+                assert!(
+                    app.reference_anchor.is_none(),
+                    "{marked}: docs must not insert"
+                );
+                assert_eq!(app.editor().source(), source, "{marked}");
+                assert_eq!(app.editor().primary_selection().head, ByteOffset(caret));
+            }
+        }
+
+        #[test]
+        fn ctrl_d_after_an_opening_quote_offers_the_first_arguments_values() {
+            use crate::reference::Tab;
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            for (marked, tab) in [
+                ("$: s(\"|\")", Tab::Samples),
+                ("$: chord(\"|\")", Tab::Chords),
+                ("$: n(0).scale(\"|\")", Tab::Scales),
+                #[cfg(feature = "extensions")]
+                ("$: n(0).inspire(\"|\")", Tab::Scales),
+                #[cfg(feature = "extensions")]
+                ("$: n(0).inspire('|')", Tab::Scales),
+                #[cfg(feature = "extensions")]
+                ("$: n(0).inspire(\"|", Tab::Scales),
+            ] {
+                let caret = marked.find('|').expect("caret marker");
+                let source = marked.replace('|', "");
+                let mut app = app_over(directory.path());
+                app.scenes.current_mut().editor = Editor::new(&source).expect("editor");
+                app.editor_mut()
+                    .set_selection(Selection::caret(ByteOffset(caret)))
+                    .expect("caret");
+
+                press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+                let panel = app.reference_panel.as_ref().expect("value picker opened");
+                assert_eq!(panel.tab, tab, "{marked}");
+                assert!(
+                    app.reference_anchor.is_some(),
+                    "{marked}: values can be inserted"
+                );
+                assert_eq!(app.editor().source(), source, "{marked}");
+            }
+        }
+
+        #[test]
+        fn ctrl_d_in_later_string_arguments_does_not_reuse_the_first_arguments_values() {
+            use crate::reference::{ReferenceMode, Tab};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            for (marked, name) in [
+                #[cfg(feature = "extensions")]
+                (r#"$: n(0).inspire("C:major:pentatonic", "|")"#, "inspire"),
+                #[cfg(feature = "extensions")]
+                (r#"$: n(0).inspire("C:major, D:minor", "|")"#, "inspire"),
+                #[cfg(feature = "extensions")]
+                (
+                    r#"$: n(0).inspire(pick(["C:major", "D:minor"]), "|")"#,
+                    "inspire",
+                ),
+                #[cfg(feature = "extensions")]
+                (
+                    r#"$: n(0).inspire({ scales: ["C:major", "D:minor"] }, "|")"#,
+                    "inspire",
+                ),
+                #[cfg(feature = "extensions")]
+                (r#"$: n(0).inspire(/[,)]/.source, "|")"#, "inspire"),
+                #[cfg(feature = "extensions")]
+                ("$: n(0).inspire(\"C:major\", /* , ( */\n \"|\")", "inspire"),
+                (r#"$: s("bd").warpmode("binary", "|")"#, "warpmode"),
+                (r#"register("my|function", value => value)"#, "register"),
+            ] {
+                let caret = marked.find('|').expect("caret marker");
+                let source = marked.replace('|', "");
+                let mut app = app_over(directory.path());
+                app.scenes.current_mut().editor = Editor::new(&source).expect("editor");
+                app.editor_mut()
+                    .set_selection(Selection::caret(ByteOffset(caret)))
+                    .expect("caret");
+
+                press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+                let panel = app.reference_panel.as_ref().expect("reference opened");
+                assert_eq!(panel.tab, Tab::Reference, "{marked}");
+                let ReferenceMode::Entry { index, .. } = panel.mode else {
+                    panic!("{marked}: expected the function's argument documentation")
+                };
+                assert_eq!(app.reference.entry(index).unwrap().name, name, "{marked}");
+                assert!(panel.vocabulary.is_none(), "{marked}");
+                assert!(app.reference_anchor.is_none(), "{marked}");
+                assert_eq!(app.editor().source(), source, "{marked}");
+            }
+        }
+
+        #[test]
+        fn ctrl_d_inside_a_finite_choice_lists_explains_and_replaces_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let score = "$: s(\"basique\").warpmode(\"binary\")\n";
+            app.scenes.current_mut().editor = crate::editor::Editor::new(score).expect("editor");
+            let at = score.find("binary").expect("choice") + "bin".len();
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(at)))
+                .expect("caret");
+
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            let panel = app.reference_panel.as_ref().expect("Ctrl+D answered");
+            let vocabulary = panel.vocabulary.as_ref().expect("a choice list");
+            assert_eq!(vocabulary.subject, "warpmode");
+            assert_eq!(panel.query, "", "Ctrl+D shows every documented choice");
+            assert_eq!(panel.results.len(), vocabulary.names.len());
+            let spin = vocabulary
+                .names
+                .iter()
+                .position(|name| name == "spin")
+                .expect("spin is offered");
+            assert!(
+                vocabulary.details[spin].contains("Ripples phase"),
+                "the picker explains the choice: {:?}",
+                vocabulary.details
+            );
+            assert_eq!(
+                app.status,
+                "the documented choices - current selected; Enter replaces the word"
+            );
+            assert_eq!(
+                panel
+                    .selected_result()
+                    .and_then(|index| vocabulary.names.get(index))
+                    .map(String::as_str),
+                Some("binary"),
+                "the value already in the score is selected"
+            );
+
+            // Move to the next documented choice and prove Enter replaces only the
+            // choice under the caret, through the ordinary anchored edit path.
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            let selected = app
+                .reference_panel
+                .as_ref()
+                .and_then(|panel| panel.selected_result())
+                .and_then(|index| {
+                    app.reference_panel
+                        .as_ref()?
+                        .vocabulary
+                        .as_ref()?
+                        .names
+                        .get(index)
+                })
+                .cloned()
+                .expect("selected choice");
+            assert_ne!(selected, "s", "Down must select a replacement");
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_ne!(app.editor().source(), score, "Enter must edit the score");
+            assert!(
+                app.editor()
+                    .source()
+                    .contains(&format!("warpmode(\"{selected}\")")),
+                "Enter replaced the choice: {}",
+                app.editor().source()
+            );
+        }
+
+        #[test]
+        fn ctrl_d_exposes_every_direct_finite_choice_with_the_current_value_selected() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            for set in rustel_core::reference::REFERENCE_CHOICE_SETS
+                .iter()
+                .filter(|set| set.completes_string)
+            {
+                let current = set.choices[set.choices.len() / 2].value;
+                let score = match set.entry {
+                    "setDefaultJoin" | "useRNG" => {
+                        format!(r#"{}("{current}")\n"#, set.entry)
+                    }
+                    "lfo" => format!(r#"$: s("sine").lfo({{ shape: "{current}" }})\n"#),
+                    _ => format!(r#"$: s("sine").{}("{current}")\n"#, set.entry),
+                };
+                let mut app = app_over(directory.path());
+                app.scenes.current_mut().editor =
+                    crate::editor::Editor::new(&score).expect("editor");
+                let at = score.find(current).expect("current choice") + current.len() / 2;
+                app.editor_mut()
+                    .set_selection(Selection::caret(ByteOffset(at)))
+                    .expect("caret");
+
+                press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+                let panel = app.reference_panel.as_ref().unwrap_or_else(|| {
+                    panic!("{}.{}: Ctrl+D did not open", set.entry, set.parameter)
+                });
+                let vocabulary = panel.vocabulary.as_ref().unwrap_or_else(|| {
+                    panic!(
+                        "{}.{}: Ctrl+D did not open choices",
+                        set.entry, set.parameter
+                    )
+                });
+                let expected = set
+                    .choices
+                    .iter()
+                    .map(|choice| choice.value.to_owned())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    vocabulary.names, expected,
+                    "{}.{}: incomplete or reordered choices",
+                    set.entry, set.parameter
+                );
+                assert_eq!(
+                    panel.query, "",
+                    "{}.{}: the current choice became a search filter",
+                    set.entry, set.parameter
+                );
+                assert_eq!(
+                    panel
+                        .selected_result()
+                        .and_then(|index| vocabulary.names.get(index))
+                        .map(String::as_str),
+                    Some(current),
+                    "{}.{}: the current choice was not selected",
+                    set.entry,
+                    set.parameter
+                );
+                assert!(
+                    vocabulary
+                        .details
+                        .iter()
+                        .all(|detail| !detail.trim().is_empty()),
+                    "{}.{}: a choice has no explanation",
+                    set.entry,
+                    set.parameter
+                );
+            }
+        }
+
+        /// Ctrl+D inside a scale the score names opens the scales list on that
+        /// scale: every scale stays listed, its group is open, and Enter writes
+        /// the selected scale in place of the old name.
+        #[test]
+        fn ctrl_d_inside_a_written_scale_lands_on_that_scale() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let score = "$: n(\"0\").scale(\"Gb1:minor\")\n";
+            app.scenes.current_mut().editor = crate::editor::Editor::new(score).expect("editor");
+            // The caret stands on the `i` in `minor`, mid-word.
+            let at = score.find("Gb1:minor").expect("the scale") + "Gb1:mi".len();
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(at)))
+                .expect("caret");
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            let panel = app.reference_panel.as_ref().expect("Ctrl+D answered");
+            assert_eq!(panel.tab, crate::reference::Tab::Scales);
+            assert_eq!(
+                panel.scale_query, "",
+                "a known scale leaves the full catalogue visible"
+            );
+            assert_eq!(
+                panel.open_scale.as_deref(),
+                Some("minor"),
+                "the named scale's group is open"
+            );
+            assert_eq!(
+                panel.selected_scale().as_deref(),
+                Some("Gb:minor"),
+                "the scale the score names is the row under the cursor"
+            );
+            assert_eq!(
+                panel.scale_names().len(),
+                crate::reference::scale_vocabulary().len(),
+                "every scale stays listed around the open one"
+            );
+
+            // Enter on the selected scale writes it in place of the old name.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(
+                app.editor().source().contains("scale(\"Gb:minor\")"),
+                "Enter replaced the old scale: {}",
+                app.editor().source()
+            );
+        }
+
+        #[test]
+        fn no_call_is_found_in_empty_text_or_a_lone_bracket() {
+            use crate::app::{ByteOffset, completion::word_before};
+            for (source, offset) in [("", 0), ("osc()\n\n", 6), ("(", 1)] {
+                let document = crate::editor::Document::new(source, 1 << 16).expect("document");
+                assert_eq!(
+                    word_before(&document, ByteOffset(offset)),
+                    None,
+                    "{source:?}"
+                );
+            }
+        }
+
+        /// Ctrl+D asks about the call the caret is in, and no other.
+        #[test]
+        fn the_caret_finds_the_name_of_the_call_it_is_inside() {
+            use crate::app::{ByteOffset, completion::word_before};
+            let source = "await initHydra()\nosc(10, 0.1).luma(0.4).repeatX(4)\n";
+            let document = crate::editor::Document::new(source, 1 << 16).expect("document");
+            let after =
+                |needle: &str| ByteOffset(source.find(needle).expect(needle) + needle.len());
+            let name = |at| word_before(&document, at).map(|(word, _)| word);
+
+            // Inside the name, and just after it.
+            assert_eq!(name(after("lum")).as_deref(), Some("luma"));
+            assert_eq!(name(after(".luma")).as_deref(), Some("luma"));
+            // But not at its start: sitting before `luma` you are about to write
+            // something, and the name to your right is not what you are on.
+            assert_eq!(name(after("0.1).")), None);
+            // Inside its brackets, over an argument: still the call, not the
+            // number, because `4` is not something to look up.
+            assert_eq!(name(after(".luma(")).as_deref(), Some("luma"));
+            assert_eq!(name(after(".luma(0.4")).as_deref(), Some("luma"));
+
+            // Past the closing bracket the call is finished, and answering about
+            // `luma` there answers about something already left behind.
+            assert_eq!(name(after(".luma(0.4)")), None);
+            assert_eq!(name(after("osc(10, 0.1)")), None);
+            assert_eq!(name(after(".repeatX(4)")), None);
+        }
+
+        /// Ctrl+Space with the caret inside `setcpm(` documents setcpm - the
+        /// argument being typed is the question being asked.
+        #[test]
+        fn the_reference_opens_on_the_call_the_caret_stands_inside() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("setcpm(".into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            // Caret sits right after the bracket: no word under it, but the
+            // enclosing call is setcpm.
+            let (word, _) = app.enclosing_call_at_caret().expect("an enclosing call");
+            assert_eq!(word, "setcpm");
+            assert!(
+                app.reference.lookup("setcpm").is_some(),
+                "the reference knows setcpm"
+            );
+            app.toggle_reference_browse();
+            let panel = app.reference_panel.as_ref().expect("reference open");
+            assert!(
+                matches!(panel.mode, crate::reference::ReferenceMode::Entry { .. }),
+                "the entry page opens directly, parameters and all"
+            );
+
+            // Deeper in, mid-argument on a number, the call still answers.
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("140/".into()),
+                    HistoryMoment(1),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("type an argument");
+            let (word, _) = app.enclosing_call_at_caret().expect("still inside");
+            assert_eq!(word, "setcpm");
+        }
+
+        /// `enclosing_call_at_caret` ignores brackets in strings, comments and
+        /// regexes, and permits whitespace between the name and its `(`.
+        #[test]
+        fn the_enclosing_call_is_read_past_strings_and_comments() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            for (source, expected) in [
+                ("$: stack(\")\", ", Some("stack")),
+                ("$: f(x /* ) */, ", Some("f")),
+                ("$: s(\"bd(3,8", Some("s")),
+                ("$: note(\"c\").when(/(/, x => x.fast(", Some("fast")),
+                ("$: note(\"c\").when(/(/, ", Some("when")),
+                ("// setcpm(", None),
+                ("$: setcpm (", Some("setcpm")),
+            ] {
+                app.scenes.current_mut().editor =
+                    crate::editor::Editor::new(source).expect("editor");
+                app.editor_mut()
+                    .set_selection(Selection::caret(ByteOffset(source.len())))
+                    .expect("caret");
+                let call = app.enclosing_call_at_caret().map(|(word, range)| {
+                    assert_eq!(source[range.start.0..range.end.0], word, "{source}");
+                    word
+                });
+                assert_eq!(call.as_deref(), expected, "{source}");
+            }
+        }
+
+        /// Ctrl+Space with a word under the fingers completes THAT word, even
+        /// inside a call: after `sometimesBy(0.6, x=>x.pl` the question is
+        /// `pl…`, not sometimesBy's own page.
+        #[test]
+        fn a_word_being_typed_beats_the_enclosing_call() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("sometimesBy(0.6, x=>x.pl".into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            app.toggle_reference_browse();
+            let panel = app.reference_panel.as_ref().expect("reference open");
+            assert!(
+                matches!(panel.mode, crate::reference::ReferenceMode::Browse),
+                "a partial word opens the searched list, not the call's page"
+            );
+            assert_eq!(panel.query, "pl");
+        }
+
+        /// Ctrl+Space inside `s("…")` opens the samples browser on the word;
+        /// inside `scale("…")` it offers scale names. Functions are never the
+        /// answer inside a string.
+        /// Open on one name, caret on another: the chord asks about the new
+        /// one instead of closing. Pressed again on the same name, it closes.
+        #[test]
+        fn the_chord_retargets_to_the_word_under_the_caret() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("$: note(\"c4\").pianoroll".into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            app.toggle_reference_browse();
+            let showing = |app: &App| {
+                app.reference_panel
+                    .as_ref()
+                    .and_then(|panel| panel.showing(&app.reference))
+            };
+            assert_eq!(showing(&app).as_deref(), Some("pianoroll"));
+
+            // The caret moves onto another name: one press asks about it.
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("\n$: note(\"c4\").lpenv(4)".into()),
+                    HistoryMoment(1),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("more");
+            let source = app.editor().source();
+            let at = source.rfind("lpenv").expect("lpenv");
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(at + 2)))
+                .expect("caret in sine");
+            app.focus = Focus::Editor;
+            app.toggle_reference_browse();
+            assert!(app.reference_panel.is_some(), "the panel stays open");
+            assert_eq!(
+                showing(&app).as_deref(),
+                Some("lpenv"),
+                "the chord asks about the word under the caret"
+            );
+
+            // Pressed again on the same word, it closes.
+            app.toggle_reference_browse();
+            assert!(app.reference_panel.is_none(), "the same word puts it away");
+        }
+
+        /// While an anchored completion list is open, the Left and Right arrows
+        /// do not move the caret. The chosen name lands inside the quotes where
+        /// the list opened.
+        #[test]
+        fn the_arrows_do_not_walk_the_caret_out_of_an_open_completion() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("$: s(\"oh\").dec(0.4).bank(\"".into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            let opened_at =
+                app.editor().source().find("bank(\"").expect("the call") + "bank(\"".len();
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(opened_at)))
+                .expect("caret");
+
+            app.toggle_reference_browse();
+            assert!(app.reference_panel.is_some(), "the list is up");
+            assert!(
+                app.reference_anchor.is_some(),
+                "and it is anchored: this is a completion, not the reference being read"
+            );
+
+            for code in [KeyCode::Left, KeyCode::Left, KeyCode::Right] {
+                press(&mut app, code, KeyModifiers::NONE);
+                assert_eq!(
+                    app.editor().primary_selection().head.0,
+                    opened_at,
+                    "{code:?} moved the caret out of the string being completed"
+                );
+                assert!(app.reference_panel.is_some(), "{code:?} closed the list");
+            }
+
+            // And the name lands where the list was opened: inside the quotes.
+            app.insert_reference_name("tr909".into()).expect("it lands");
+            assert!(
+                app.editor().source().contains("bank(\"tr909"),
+                "{}",
+                app.editor().source()
+            );
+        }
+
+        /// The name lands where the list opened, not at the caret, even when
+        /// the anchor is an empty string such as `bank("|`.
+        #[test]
+        fn a_completion_lands_where_it_was_opened_even_if_the_caret_moved() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("$: s(\"oh\").dec(0.4).bank(\"".into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            let opened_at =
+                app.editor().source().find("bank(\"").expect("the call") + "bank(\"".len();
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(opened_at)))
+                .expect("caret");
+            app.toggle_reference_browse();
+            assert!(app.reference_anchor.is_some(), "anchored on the empty spot");
+
+            // The caret goes somewhere else entirely - a click in the score
+            // while the list is still up.
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(2)))
+                .expect("caret elsewhere");
+
+            app.insert_reference_name("tr909".into()).expect("it lands");
+            assert!(
+                app.editor().source().contains("bank(\"tr909"),
+                "the name belongs where the list was opened, not at the caret: {}",
+                app.editor().source()
+            );
+        }
+
+        /// The reference being READ beside a score is not anchored, and there
+        /// the arrows still belong to the editor: a musician reads a page with
+        /// one hand and moves the caret with the other. Only a completion, which
+        /// has a place in the text to protect, keeps them.
+        #[test]
+        fn an_unanchored_reference_still_lets_the_arrows_move_the_caret() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("$: s(\"oh\").dec(0.4).bank(\"".into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            let opened_at =
+                app.editor().source().find("bank(\"").expect("the call") + "bank(\"".len();
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(opened_at)))
+                .expect("caret");
+            app.toggle_reference_browse();
+            // Reading, not completing: nothing in the score is waiting for a name.
+            app.reference_anchor = None;
+
+            press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+            assert_eq!(
+                app.editor().primary_selection().head.0,
+                opened_at - 1,
+                "an unanchored column lets the arrow through to the caret"
+            );
+        }
+
+        /// The token a chosen name replaces is the one the caret stands in,
+        /// colon and all - one sound out of a mini-notation string of them.
+        #[test]
+        fn the_completion_replaces_the_whole_sound_under_the_caret() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("$: s(\"bd:1 sd:3 hh:4\")".into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            let source = app.editor().source();
+            let token = |caret: usize, app: &mut App| {
+                app.editor_mut()
+                    .set_selection(Selection::caret(ByteOffset(caret)))
+                    .expect("caret");
+                let (callee, prefix, range) = app
+                    .string_completion_at_caret()
+                    .expect("the caret stands in a string");
+                (
+                    callee,
+                    prefix,
+                    app.editor().source()[range.start.0..range.end.0].to_owned(),
+                )
+            };
+            // Anywhere inside `sd:3` - before the colon, on it, after it -
+            // asks about that sound and replaces the whole of it.
+            let at = source.find("sd:3").expect("sd");
+            for caret in [at, at + 1, at + 2, at + 3, at + 4] {
+                let (callee, prefix, covered) = token(caret, &mut app);
+                assert_eq!(callee, "s");
+                assert_eq!(covered, "sd:3", "caret at {caret}");
+                assert!(
+                    "sd".starts_with(prefix.as_str()),
+                    "the search is the bank, not the index: {prefix:?}"
+                );
+            }
+            // And the replacement lands: `bd:1 piano:1 hh:4`.
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(at + 3)))
+                .expect("caret");
+            app.toggle_reference_browse();
+            app.insert_reference_name("piano:1".into())
+                .expect("the name lands");
+            assert!(
+                app.editor().source().contains("s(\"bd:1 piano:1 hh:4\")"),
+                "{}",
+                app.editor().source()
+            );
+        }
+
+        /// A chord writes its quality in marks a word does not use - `G^9`,
+        /// `A-7`, `C+` - and the whole of it is the token a chosen chord
+        /// replaces: standing anywhere in `G^9`, taking `Db-7` must leave
+        /// `Db-7`, not `G^Db-7`.
+        #[test]
+        fn the_completion_replaces_the_whole_chord_under_the_caret() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("$: chord(\"G^9 Bb^9\").anchor(\"c4\").voicing()".into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            let source = app.editor().source();
+            let at = source.find("G^9").expect("the chord");
+            // Anywhere in it - before the `G`, on the `^`, after the `9` - the
+            // question is that chord, and the whole of it is what answers.
+            for caret in at..=at + "G^9".len() {
+                app.editor_mut()
+                    .set_selection(Selection::caret(ByteOffset(caret)))
+                    .expect("caret");
+                let (callee, _, range) = app
+                    .string_completion_at_caret()
+                    .expect("the caret stands in a string");
+                assert_eq!(callee, "chord");
+                assert_eq!(
+                    &app.editor().source()[range.start.0..range.end.0],
+                    "G^9",
+                    "caret at {caret}"
+                );
+            }
+            // And the replacement lands whole: `Db-7 Bb^9`, never `G^Db-7`.
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(at + 3)))
+                .expect("caret");
+            app.toggle_reference_browse();
+            app.insert_reference_name("Db-7".into())
+                .expect("the name lands");
+            assert!(
+                app.editor().source().contains("chord(\"Db-7 Bb^9\")"),
+                "{}",
+                app.editor().source()
+            );
+
+            // The chord already under the caret is not inserted twice: taking
+            // the name that is already there leaves the score as it reads.
+            let at = app.editor().source().find("Db-7").expect("the chord");
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(at + 4)))
+                .expect("caret");
+            app.focus = Focus::Editor;
+            app.toggle_reference_browse();
+            app.insert_reference_name("Db-7".into())
+                .expect("the name lands");
+            assert!(
+                app.editor().source().contains("chord(\"Db-7 Bb^9\")"),
+                "{}",
+                app.editor().source()
+            );
+        }
+
+        /// A decimal point is not a link, and a name the caret is parked
+        /// inside is a name to ask about rather than a place to write one.
+        #[test]
+        fn only_the_head_of_a_link_takes_a_call() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let mut moment = 0u64;
+            let mut chain_at = |app: &mut App, source: &str, find: &str| {
+                app.editor_mut()
+                    .dispatch(
+                        Command::SelectAll,
+                        HistoryMoment(moment),
+                        &mut MemoryClipboard::default(),
+                    )
+                    .expect("all");
+                moment += 1;
+                app.editor_mut()
+                    .dispatch(
+                        Command::PasteText(source.into()),
+                        HistoryMoment(moment),
+                        &mut MemoryClipboard::default(),
+                    )
+                    .expect("seed");
+                moment += 1;
+                let at = app.editor().source().find(find).expect("target");
+                app.editor_mut()
+                    .set_selection(Selection::caret(ByteOffset(at)))
+                    .expect("caret");
+                app.chain_position_at_caret()
+            };
+            // The head of a link, however the chain is laid out - and the end
+            // of one link is the head of the next.
+            assert!(chain_at(&mut app, "$: s(\"bd\").lpf(400)", "lpf(400)").is_some());
+            let end = ByteOffset(app.editor().source().trim_end().len());
+            app.editor_mut()
+                .set_selection(Selection::caret(end))
+                .expect("caret");
+            assert!(
+                app.chain_position_at_caret().is_some(),
+                "a chain resting at `)` takes the call after it"
+            );
+            assert!(chain_at(&mut app, "$: note(\"c a f\")\n  .s(\"x\")", "s(\"x\")").is_some());
+            assert!(chain_at(&mut app, "$: \"0 1\".n().s(\"x\")", "n()").is_some());
+            // A decimal point is not a link.
+            assert!(chain_at(&mut app, "$: s(\"bd\").gain(0.5)", "5)").is_none());
+            // A name the caret stands inside is the question, not a place to
+            // write a new one.
+            assert!(chain_at(&mut app, "$: note(\"c4\").lpenv(4)", "env(4)").is_none());
+            // And inside a string the names on offer are not functions.
+            assert!(chain_at(&mut app, "$: s(\"bd.x\")", "x\")").is_none());
+        }
+
+        /// `chord(` with nothing typed asks for a chord as surely as
+        /// `chord("` does, and the name goes in quoted. A call whose argument
+        /// is not a list we keep falls through to its own reference entry.
+        #[test]
+        fn a_call_that_takes_a_list_offers_it_before_a_quote_is_typed() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("$: note(\"c a f e\").chord()".into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            // The caret between the chord call's brackets, where an argument
+            // would go.
+            let open = app.editor().source().find(".chord(").expect("the call") + ".chord(".len();
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(open)))
+                .expect("caret");
+            app.toggle_reference_browse();
+            {
+                let panel = app.reference_panel.as_ref().expect("panel open");
+                assert_eq!(panel.tab, crate::reference::Tab::Chords);
+            }
+            // Taking one writes the string, quotes and all.
+            app.insert_reference_name("C^7".into()).expect("insert");
+            assert!(
+                app.editor().source().contains(".chord(\"C^7\")"),
+                "{}",
+                app.editor().source()
+            );
+
+            // A call the studio keeps no list for still opens its own entry.
+            app.reference_panel = None;
+            app.focus = Focus::Editor;
+            let end = ByteOffset(app.editor().source().len());
+            app.editor_mut()
+                .set_selection(Selection::caret(end))
+                .expect("caret");
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("\n$: s(\"bd\").lpf()".into()),
+                    HistoryMoment(1),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("a numeric call");
+            let open = app.editor().source().find(".lpf(").expect("the call") + ".lpf(".len();
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(open)))
+                .expect("caret");
+            app.toggle_reference_browse();
+            let panel = app.reference_panel.as_ref().expect("panel open");
+            assert_eq!(panel.tab, crate::reference::Tab::Reference);
+            assert!(
+                matches!(panel.mode, crate::reference::ReferenceMode::Entry { .. }),
+                "a number has no list, so the call's own entry answers"
+            );
+        }
+
+        /// A MIDI port name has to be typed exactly, cannot be guessed, and
+        /// fails silently when it is wrong. It is also the one list nothing
+        /// compiled in can know, so it is read off the dock's own probe.
+        #[test]
+        fn the_midi_ports_complete_from_what_is_plugged_in() {
+            use crate::devices::{DeviceEntry, DeviceInventory};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let port = |name: &str| DeviceEntry {
+                name: name.to_owned(),
+                id: String::new(),
+                detail: String::new(),
+                is_default: false,
+            };
+            app.devices.install_for_tests(DeviceInventory {
+                midi_outputs: vec![port("IAC Driver Bus 1"), port("Scarlett 2i2")],
+                midi_inputs: vec![port("LPK25")],
+                ..DeviceInventory::default()
+            });
+
+            assert_eq!(app.string_role("midi"), Some(StringRole::MidiOut));
+            assert_eq!(app.string_role("midin"), Some(StringRole::MidiIn));
+            assert_eq!(app.string_role("midikeys"), Some(StringRole::MidiIn));
+
+            // The outputs and the inputs are different lists, and neither is
+            // a guess: they are what the probe last saw.
+            assert_eq!(
+                app.midi_port_names(MidiDirection::Out),
+                vec!["IAC Driver Bus 1".to_owned(), "Scarlett 2i2".to_owned()]
+            );
+            assert_eq!(
+                app.midi_port_names(MidiDirection::In),
+                vec!["LPK25".to_owned()]
+            );
+
+            // And unplugging is reflected, because the list is read at the
+            // moment the completion opens rather than captured at launch.
+            app.devices.install_for_tests(DeviceInventory::default());
+            assert!(app.midi_port_names(MidiDirection::Out).is_empty());
+        }
+
+        /// A MIDI port name can contain spaces. A chosen port replaces the
+        /// whole quoted name from any caret position, and the closing single
+        /// quote stays outside the replaced range.
+        #[test]
+        fn a_chosen_midi_port_replaces_the_whole_name_and_keeps_its_quotes() {
+            use crate::devices::{DeviceEntry, DeviceInventory};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.devices.install_for_tests(DeviceInventory {
+                midi_inputs: vec![DeviceEntry {
+                    name: "Bass Station II".to_owned(),
+                    id: String::new(),
+                    detail: String::new(),
+                    is_default: false,
+                }],
+                ..DeviceInventory::default()
+            });
+            let source = "$: midikeys('MY MIDI DEVICE')
+";
+            for caret in [13, 16, 21, 26, 27] {
+                app.editor_mut()
+                    .dispatch(
+                        Command::SelectAll,
+                        HistoryMoment(0),
+                        &mut MemoryClipboard::default(),
+                    )
+                    .expect("select");
+                app.editor_mut()
+                    .dispatch(
+                        Command::PasteText(source.into()),
+                        HistoryMoment(0),
+                        &mut MemoryClipboard::default(),
+                    )
+                    .expect("seed");
+                app.editor_mut()
+                    .set_selection(Selection::caret(ByteOffset(caret)))
+                    .expect("caret in the name");
+                let (callee, query, range) = app
+                    .string_completion_at_caret()
+                    .unwrap_or_else(|| panic!("a completion at {caret}"));
+                assert_eq!(callee, "midikeys");
+                assert_eq!(
+                    query, "MY MIDI DEVICE",
+                    "the whole name is the question, not the word at {caret}"
+                );
+                assert_eq!(
+                    &source[range.start.0..range.end.0],
+                    "MY MIDI DEVICE",
+                    "the whole name is what a choice replaces, from caret {caret}"
+                );
+                assert_eq!(
+                    source.as_bytes()[range.end.0],
+                    b'\'',
+                    "and the closing quote is outside it"
+                );
+            }
+        }
+
+        /// A `.bank(...)` string names the machine, not a sound:
+        /// `s("cymbal").bank("Metal")` plays `Metal_cymbal`. The list offers
+        /// the library's machines, filtered by the typed text and widened by
+        /// Backspace, and Enter writes the chosen one.
+        #[test]
+        fn a_bank_string_completes_the_machines_not_the_sounds() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            // Drain the worker's background default-library load first, so the
+            // library under test is the last word on the machines offered.
+            settle(&mut app);
+            let library = std::sync::Arc::new(rustel_runtime::samples::SampleLibrary::empty());
+            library
+                .register_trusted_custom(
+                    r#"{"Metal_cymbal":["http://127.0.0.1:9/a.wav"],"RolandTR909_bd":["http://127.0.0.1:9/b.wav"],"RolandTR909_sd":["http://127.0.0.1:9/c.wav"],"RolandTR909_cymbal":["http://127.0.0.1:9/d.wav"],"AkaiXR10_ht":["http://127.0.0.1:9/e.wav"]}"#,
+                    None,
+                )
+                .expect("banks");
+            app.worker.set_library(std::sync::Arc::clone(&library));
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("$: s(\"cymbal\").bank(\"Met".into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            let (callee, prefix, _) = app
+                .string_completion_at_caret()
+                .expect("the caret stands in a string");
+            assert_eq!((callee.as_str(), prefix.as_str()), ("bank", "Met"));
+            assert_eq!(app.string_role(&callee), Some(StringRole::Bank));
+            app.toggle_reference_browse();
+            {
+                let panel = app.reference_panel.as_ref().expect("panel open");
+                assert!(panel.bank_vocabulary(), "a machine list, not the sounds");
+                let names = panel.vocabulary.as_ref().expect("vocabulary").names.clone();
+                assert_eq!(
+                    names,
+                    vec![
+                        "Metal".to_owned(),
+                        "RolandTR909".to_owned(),
+                        "AkaiXR10".to_owned()
+                    ],
+                    "every machine, the two that can play `cymbal` leading"
+                );
+                // Typed narrow: `Met` answers Metal and says so.
+                let results = panel.results.clone();
+                assert_eq!(results, vec![0], "only Metal survives the filter");
+                assert_eq!(panel.query, "Met");
+            }
+            let action = app
+                .reference_panel
+                .as_mut()
+                .expect("panel open")
+                .confirm(&app.reference);
+            assert_eq!(
+                action,
+                crate::reference::PanelAction::Insert("Metal".to_owned()),
+                "Enter puts the machine in place"
+            );
+
+            // An empty bank string initially offers only compatible machines.
+            app.reference_panel = None;
+            app.focus = Focus::Editor;
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("\n$: s(\"cymbal\").bank(\"".into()),
+                    HistoryMoment(1),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("an empty quote");
+            app.toggle_reference_browse();
+            {
+                let panel = app.reference_panel.as_ref().expect("panel open");
+                assert!(panel.bank_vocabulary());
+                assert_eq!(panel.query, "");
+                assert_eq!(panel.results.len(), 2, "only machines with cymbal");
+            }
+
+            // The plain `s("…")` is untouched: the sounds, searched by the
+            // word, however a bank line sits beside it.
+            app.reference_panel = None;
+            app.focus = Focus::Editor;
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("\n$: s(\"cym".into()),
+                    HistoryMoment(2),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("a sound string");
+            app.toggle_reference_browse();
+            {
+                let panel = app.reference_panel.as_ref().expect("panel open");
+                assert!(!panel.bank_vocabulary(), "still the samples browser");
+                assert_eq!(panel.tab, crate::reference::Tab::Samples);
+                assert_eq!(panel.sound_query, "cym");
+            }
+
+            // A machine search that matches nothing says so in the words of
+            // the question: the typed text was a sound's name, and no machine
+            // holds one.
+            app.reference_panel = None;
+            app.focus = Focus::Editor;
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("\n$: s(\"cymbal\").bank(\"kjkjkjsdf".into()),
+                    HistoryMoment(3),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("a bank miss");
+            app.toggle_reference_browse();
+            {
+                let panel = app.reference_panel.as_ref().expect("panel open");
+                assert!(panel.bank_vocabulary());
+                assert!(panel.results.is_empty(), "nothing matches the gibberish");
+                let missed = panel.banks_miss_line().expect("the miss is said");
+                assert_eq!(
+                    missed, "no compatible banks named \"kjkjkjsdf\"",
+                    "said in the words of the question, not counted"
+                );
+            }
+
+            // Machines that can play the line's sound pattern lead the list.
+            // BossDR110 has no `ht`, so it does not lead for a line that asks
+            // `ht`. The other machines stay available through Backspace on the
+            // empty search.
+            app.reference_panel = None;
+            app.focus = Focus::Editor;
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("\n$: s(\"ht\").bank(\"".into()),
+                    HistoryMoment(4),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("a sound-shaped question");
+            app.toggle_reference_browse();
+            {
+                let panel = app.reference_panel.as_ref().expect("panel open");
+                assert!(panel.bank_vocabulary());
+                let names = panel.vocabulary.as_ref().expect("vocabulary").names.clone();
+                assert_eq!(
+                    names,
+                    vec![
+                        "AkaiXR10".to_owned(),
+                        "Metal".to_owned(),
+                        "RolandTR909".to_owned()
+                    ],
+                    "the machine that can play `ht` leads, the rest follow: {names:?}"
+                );
+                assert_eq!(
+                    panel.results.first().copied(),
+                    Some(0),
+                    "and the empty query lands on the compatible machine"
+                );
+                assert_eq!(panel.results.len(), 1);
+            }
+        }
+
+        /// Ctrl+D inside a bank with underscores opens the bank list under
+        /// Samples and keeps the whole machine name.  The active sound gives
+        /// the boundary; splitting on the first underscore would offer `wt`.
+        #[test]
+        fn ctrl_d_opens_the_full_underscore_bank_in_samples() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            settle(&mut app);
+            let library = std::sync::Arc::new(rustel_runtime::samples::SampleLibrary::empty());
+            library
+                .register_trusted_custom(
+                    r#"{"wt_digital_basique":["http://127.0.0.1:9/a.wav"]}"#,
+                    None,
+                )
+                .expect("bank");
+            app.worker.set_library(library);
+            let score = "$: s(\"basique\").bank(\"wt_digital\")\n";
+            app.scenes.current_mut().editor = crate::editor::Editor::new(score).expect("editor");
+            let at = score.find("wt_digital").expect("bank name") + "wt_di".len();
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(at)))
+                .expect("caret");
+
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+            let panel = app.reference_panel.as_ref().expect("bank list");
+            assert_eq!(panel.tab, crate::reference::Tab::Samples);
+            assert!(panel.bank_vocabulary());
+            assert_eq!(
+                panel
+                    .vocabulary
+                    .as_ref()
+                    .map(|vocabulary| &vocabulary.names),
+                Some(&vec!["wt_digital".to_owned()])
+            );
+            assert_eq!(panel.results, vec![0]);
+            assert_eq!(app.status, "the sample banks - Enter replaces the word");
+
+            // Explicit browsing still broadens an initially empty compatibility
+            // list without shortening the bank's name. Ctrl+D's empty-search
+            // Backspace instead returns to the function's arguments.
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            let score = score.replace("basique", "basique:3");
+            app.scenes.current_mut().editor = crate::editor::Editor::new(&score).expect("editor");
+            let at = score.find("wt_digital").expect("bank name") + 3;
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(at)))
+                .expect("caret");
+            app.toggle_reference_browse();
+            press(&mut app, KeyCode::Backspace, KeyModifiers::CONTROL);
+            let panel = app.reference_panel.as_ref().expect("bank list");
+            assert!(panel.results.is_empty());
+            assert_eq!(
+                panel.banks_miss_line().as_deref(),
+                Some("no compatible banks")
+            );
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            let panel = app.reference_panel.as_ref().expect("bank list");
+            assert_eq!(
+                panel.vocabulary.as_ref().expect("vocabulary").names,
+                ["wt_digital"]
+            );
+            assert_eq!(panel.results, [0]);
+        }
+
+        /// A mini-notation sound still filters the bank list: `hh:3*16` picks
+        /// a variant and repeats it, and the list shows the machines that
+        /// hold `hh`. The `:3` and the `*16` are structure, not sounds named
+        /// `3` and `16`.
+        ///
+        /// Backspace edits the search first; another Backspace from the empty
+        /// search explicitly includes incompatible machines.
+        #[test]
+        fn a_mini_notated_sound_filters_its_banks_and_backspace_reaches_the_rest() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            // Drain the worker's background default-library load first, so the
+            // library under test is the last word on the machines offered.
+            settle(&mut app);
+            let library = std::sync::Arc::new(rustel_runtime::samples::SampleLibrary::empty());
+            library
+                .register_trusted_custom(
+                    r#"{"RolandTR909_hh":["http://127.0.0.1:9/a.wav","http://127.0.0.1:9/b.wav","http://127.0.0.1:9/c.wav","http://127.0.0.1:9/d.wav"],"AkaiLinn_hh":["http://127.0.0.1:9/c.wav"],"BossDR110_bd":["http://127.0.0.1:9/d.wav"]}"#,
+                    None,
+                )
+                .expect("banks");
+            app.worker.set_library(std::sync::Arc::clone(&library));
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("$: s(\"hh:3*16\").velocity(tri.fast(4)).bank(\"".into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            // Explicit browsing keeps Backspace available to widen bank compatibility.
+            app.toggle_reference_browse();
+            {
+                let panel = app.reference_panel.as_ref().expect("panel open");
+                assert!(panel.bank_vocabulary(), "a machine list, not the sounds");
+                let names = panel.vocabulary.as_ref().expect("vocabulary").names.clone();
+                assert_eq!(
+                    names,
+                    vec![
+                        "RolandTR909".to_owned(),
+                        "AkaiLinn".to_owned(),
+                        "BossDR110".to_owned()
+                    ],
+                    "only RolandTR909 has hh:3; the others remain available on request"
+                );
+                assert_eq!(panel.results.len(), 1, "only the bank with hh:3 is shown");
+            }
+            // Typing narrows to the matching machine…
+            let panel = app.reference_panel.as_mut().expect("panel open");
+            assert!(panel.type_char(&app.reference, 'R'));
+            assert_eq!(panel.results.len(), 1, "only RolandTR909 answers `R`");
+            // Removing the search preserves the compatibility filter.
+            assert!(panel.backspace(&app.reference));
+            assert_eq!(panel.query, "");
+            assert_eq!(panel.results.len(), 1);
+            // A second Backspace asks for every bank, including missing variants.
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            let panel = app.reference_panel.as_ref().expect("panel open");
+            assert_eq!(
+                panel.results.len(),
+                3,
+                "backspacing goes back to all of them, BossDR110 among them"
+            );
+        }
+
+        #[test]
+        fn bank_compatibility_survives_refresh_and_reopens_after_browsing_all() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            settle(&mut app);
+            let library = std::sync::Arc::new(rustel_runtime::samples::SampleLibrary::empty());
+            library.register_trusted_custom(
+                r#"{"Ready_bd":["http://127.0.0.1:9/0.wav","http://127.0.0.1:9/1.wav","http://127.0.0.1:9/2.wav","http://127.0.0.1:9/3.wav"],"Ready_sd":["http://127.0.0.1:9/0.wav"],"Short_bd":["http://127.0.0.1:9/0.wav"],"Short_sd":["http://127.0.0.1:9/0.wav"],"Hat_hh":["http://127.0.0.1:9/0.wav"]}"#,
+                None,
+            ).expect("banks");
+            app.worker.set_library(library);
+            let score = "$: sound('BD:3 sd').dec(.1).bank(\"Short\").fast(2)\n$: s(\"hh\")\n";
+            app.scenes.current_mut().editor = crate::editor::Editor::new(score).expect("editor");
+            let at = score.find("Short").expect("bank") + 2;
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(at)))
+                .expect("caret");
+            app.toggle_reference_browse();
+            press(&mut app, KeyCode::Backspace, KeyModifiers::CONTROL);
+            let visible = |app: &App| {
+                let panel = app.reference_panel.as_ref().expect("bank list");
+                let names = &panel.vocabulary.as_ref().expect("vocabulary").names;
+                panel
+                    .results
+                    .iter()
+                    .map(|index| names[*index].clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                visible(&app),
+                ["Ready"],
+                "the explicit variant and every sound must exist"
+            );
+
+            // A refresh must use the opening context, even if the editor caret moves.
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(score.len())))
+                .expect("caret");
+            app.install_catalogue();
+            assert_eq!(visible(&app), ["Ready"]);
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            assert_eq!(visible(&app), ["Ready", "Hat", "Short"]);
+            app.install_catalogue();
+            assert_eq!(
+                visible(&app),
+                ["Ready", "Hat", "Short"],
+                "refresh preserves the opt-out"
+            );
+
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(at)))
+                .expect("caret");
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert_eq!(
+                visible(&app),
+                ["Ready"],
+                "reopening restores the useful default"
+            );
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.editor().source(), score.replace("Short", "Ready"));
+        }
+
+        /// A native synth plays by its own name whatever the bank, and the lint
+        /// lets it pass under any, so `sbd` beside `hh` asks the bank for `hh`
+        /// alone. Counted as a sound no bank holds, it emptied the list.
+        #[test]
+        fn native_synths_beside_samples_leave_the_banks_that_hold_the_samples() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            settle(&mut app);
+            let library = std::sync::Arc::new(rustel_runtime::samples::SampleLibrary::empty());
+            library
+                .register_trusted_custom(
+                    r#"{"RolandTR909_hh":["http://127.0.0.1:9/a.wav"],"AkaiLinn_hh":["http://127.0.0.1:9/b.wav"],"BossDR110_bd":["http://127.0.0.1:9/c.wav"]}"#,
+                    None,
+                )
+                .expect("banks");
+            app.worker.set_library(library);
+            for (score, expected) in [
+                (
+                    "$: s(\"sbd hh*2\").bank(\"",
+                    &["AkaiLinn", "RolandTR909"][..],
+                ),
+                // Nothing but synths asks nothing of the bank: every one is offered.
+                (
+                    "$: s(\"sine white\").bank(\"",
+                    &["AkaiLinn", "BossDR110", "RolandTR909"][..],
+                ),
+            ] {
+                app.reference_panel = None;
+                app.focus = Focus::Editor;
+                app.scenes.current_mut().editor =
+                    crate::editor::Editor::new(score).expect("editor");
+                app.editor_mut()
+                    .set_selection(Selection::caret(ByteOffset(score.len())))
+                    .expect("caret");
+                app.toggle_reference_at_caret();
+                let panel = app.reference_panel.as_ref().expect("bank list");
+                let names = &panel.vocabulary.as_ref().expect("vocabulary").names;
+                let mut visible = panel
+                    .results
+                    .iter()
+                    .map(|index| names[*index].as_str())
+                    .collect::<Vec<_>>();
+                visible.sort_unstable();
+                assert_eq!(visible, expected, "{score}");
+            }
+        }
+
+        /// On a banked chain, the bank's sounds rank first and are inserted without
+        /// its prefix. An unknown bank connects nothing, and a patterned bank
+        /// connects each machine it names.
+        #[test]
+        fn a_sound_string_in_a_banked_chain_ranks_the_bank_and_inserts_bare() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            // The worker loads its default library in the background; drain
+            // that arrival first, so the library under test is the last word.
+            settle(&mut app);
+            let library = std::sync::Arc::new(rustel_runtime::samples::SampleLibrary::empty());
+            library
+                .register_trusted_custom(
+                    r#"{"Metal_cymbal":["http://127.0.0.1:9/a.wav"],"Tin_cymbal":["http://127.0.0.1:9/b.wav"],"Metal_bd":["http://127.0.0.1:9/c.wav"]}"#,
+                    None,
+                )
+                .expect("banks");
+            app.worker.set_library(std::sync::Arc::clone(&library));
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("$: s(\"cym\").bank(\"Metal\")".into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            // Walk the caret back into the sound string - the question is the
+            // sound, with the bank call beside it.
+            for _ in 0..16 {
+                app.editor_mut()
+                    .dispatch(
+                        Command::Move {
+                            motion: crate::editor::Motion::Left,
+                            extend: false,
+                        },
+                        HistoryMoment(0),
+                        &mut MemoryClipboard::default(),
+                    )
+                    .expect("a move");
+            }
+            let (callee, prefix, _) = app
+                .string_completion_at_caret()
+                .expect("the caret stands in the sound string");
+            assert_eq!((callee.as_str(), prefix.as_str()), ("s", "cym"));
+            app.toggle_reference_browse();
+            {
+                let panel = app.reference_panel.as_ref().expect("panel open");
+                assert_eq!(panel.tab, crate::reference::Tab::Samples);
+                assert_eq!(
+                    panel.sound_prefix,
+                    vec!["Metal".to_owned()],
+                    "the chain's bank is read off the text"
+                );
+                // `cym` matches Metal's and Tin's cymbals; the connected
+                // machine's own leads.
+                let first = panel
+                    .sound_results
+                    .first()
+                    .and_then(|&index| panel.sounds.get(index))
+                    .map(|entry| entry.name.clone())
+                    .expect("a match");
+                assert_eq!(first, "Metal_cymbal", "the bank's own sound leads");
+                assert_eq!(panel.sound_results.len(), 2, "nothing else is hidden");
+                // Enter on the leading row offers the bare spelling.
+                let row = panel.sound_selected;
+                let offered = panel
+                    .sound_of(panel.sound_rows()[row], true)
+                    .expect("the row names a sound");
+                assert_eq!(offered, "cymbal:0", "bare - the bank supplies the prefix");
+            }
+            // Taking it: the score reads `$: s("cymbal:0").bank("Metal")` -
+            // a pattern that keeps playing under another machine by editing
+            // the one call.
+            let chosen = match app
+                .reference_panel
+                .as_mut()
+                .expect("panel open")
+                .confirm(&app.reference)
+            {
+                crate::reference::PanelAction::Insert(chosen) => chosen,
+                other => panic!("Enter offers the sound, not {other:?}"),
+            };
+            assert_eq!(chosen, "cymbal", "bare, patternizable under the bank");
+
+            // An unknown bank connects nothing: no priority, no stripping -
+            // the full name is the only spelling that would play.
+            app.reference_panel = None;
+            app.focus = Focus::Editor;
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("\n$: s(\"cym\").bank(\"nope\"".into()),
+                    HistoryMoment(1),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("an unknown bank");
+            app.toggle_reference_browse();
+            {
+                let panel = app.reference_panel.as_ref().expect("panel open");
+                assert!(panel.sound_prefix.is_empty(), "nope connects nothing");
+                let first = panel
+                    .sound_results
+                    .first()
+                    .and_then(|&index| panel.sounds.get(index))
+                    .map(|entry| entry.name.clone())
+                    .expect("a match");
+                assert!(!first.starts_with("Metal_"), "no machine is privileged");
+            }
+
+            // A patterned bank connects each machine it names.
+            app.reference_panel = None;
+            app.focus = Focus::Editor;
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("\n$: s(\"cym\").bank(\"Metal Tin\")".into()),
+                    HistoryMoment(2),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("a two-machine bank");
+            for _ in 0..23 {
+                app.editor_mut()
+                    .dispatch(
+                        Command::Move {
+                            motion: crate::editor::Motion::Left,
+                            extend: false,
+                        },
+                        HistoryMoment(0),
+                        &mut MemoryClipboard::default(),
+                    )
+                    .expect("a move");
+            }
+            app.toggle_reference_browse();
+            {
+                let panel = app.reference_panel.as_mut().expect("panel open");
+                assert_eq!(
+                    panel.sound_prefix,
+                    vec!["Metal".to_owned(), "Tin".to_owned()],
+                    "the whole pattern is the connection"
+                );
+                let chosen = match panel.confirm(&app.reference) {
+                    crate::reference::PanelAction::Insert(chosen) => chosen,
+                    other => panic!("Enter offers the sound, not {other:?}"),
+                };
+                assert_eq!(
+                    chosen, "cymbal",
+                    "bare under either machine - the bank call prefixes"
+                );
+            }
+        }
+
+        /// A score writes `s('bd')` as readily as `s("bd")`, and the chord
+        /// answers the same question in both - the synths included.
+        #[test]
+        fn a_single_quoted_sound_is_completed_like_a_double_quoted_one() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("$: note(\"c4\").s('supe".into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            let (callee, prefix, _) = app
+                .string_completion_at_caret()
+                .expect("the caret stands in a string");
+            assert_eq!((callee.as_str(), prefix.as_str()), ("s", "supe"));
+            app.toggle_reference_browse();
+            {
+                let panel = app.reference_panel.as_ref().expect("panel open");
+                assert_eq!(panel.tab, crate::reference::Tab::Samples);
+                assert_eq!(panel.sound_query, "supe");
+                assert!(
+                    panel
+                        .sounds
+                        .iter()
+                        .any(|entry| entry.name == "supersaw" || entry.name == "sawtooth"),
+                    "the synths are in the list the chord opens"
+                );
+            }
+
+            // The quote alone, nothing typed yet: still the sounds, not the
+            // entry for `s` - the question is which sound, and the answer is
+            // the whole browser.
+            app.reference_panel = None;
+            app.focus = Focus::Editor;
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("rsaw')\n$: s('".into()),
+                    HistoryMoment(1),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("an empty quote");
+            let (callee, prefix, _) = app
+                .string_completion_at_caret()
+                .expect("the caret stands in an empty string");
+            assert_eq!((callee.as_str(), prefix.as_str()), ("s", ""));
+            app.toggle_reference_browse();
+            let panel = app.reference_panel.as_ref().expect("panel open");
+            assert_eq!(panel.tab, crate::reference::Tab::Samples);
+            assert!(panel.sound_query.is_empty());
+        }
+
+        /// Inside `.color("…")` the question is a colour, not a function: the
+        /// chord offers the names a score can use, and Enter replaces the word.
+        #[test]
+        fn inside_a_colour_the_chord_offers_colours() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("$: note(\"c4\").color(\"cy".into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            app.toggle_reference_browse();
+            let panel = app.reference_panel.as_ref().expect("panel open");
+            let vocabulary = panel.vocabulary.as_ref().expect("a word list");
+            assert_eq!(vocabulary.subject, "colours");
+            assert!(vocabulary.swatches, "a colour list is drawn in its colours");
+            let offered: Vec<&str> = panel
+                .results
+                .iter()
+                .filter_map(|&index| vocabulary.names.get(index))
+                .map(String::as_str)
+                .collect();
+            assert_eq!(offered.first().copied(), Some("cyan"), "{offered:?}");
+        }
+
+        #[test]
+        fn inside_a_string_the_chord_offers_the_names_valid_there() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("s(\"Aka".into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            app.toggle_reference_browse();
+            {
+                let panel = app.reference_panel.as_ref().expect("panel open");
+                assert_eq!(panel.tab, crate::reference::Tab::Samples);
+                assert_eq!(panel.sound_query, "Aka");
+            }
+            // Inside a string the chord always re-targets rather than closing;
+            // Esc is the way out.
+            app.reference_panel = None;
+            app.focus = Focus::Editor;
+
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("i\").scale(\"C:maj".into()),
+                    HistoryMoment(1),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("more");
+            app.toggle_reference_browse();
+            let panel = app.reference_panel.as_ref().expect("panel open");
+            assert_eq!(panel.tab, crate::reference::Tab::Scales);
+            // `C:maj` is one token: the tab searches it whole and offers the
+            // majors, and taking one replaces the tonic with it.
+            let names: Vec<String> = panel.scale_names();
+            assert!(
+                names.first().is_some_and(|name| name.starts_with("major")),
+                "{names:?}"
+            );
+            let anchor = app.reference_anchor.as_ref().expect("anchored");
+            assert_eq!(
+                anchor.word, "C:maj",
+                "a scale is one word, tonic and all, and the whole of it is replaced"
+            );
+        }
+    }
+
+    mod completion_unicode {
+        //! Completion keeps character boundaries in object keys.
+
+        use crate::app::tests::support::*;
+        use crate::app::*;
+        use crate::editor::Selection;
+
+        #[test]
+        fn a_non_ascii_object_key_before_a_string_is_not_a_panic() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            for key in ["pré", "🎵"] {
+                let (mut app, _scene) =
+                    plain_app(directory.path(), &format!("$: lfo({{ {key}: \"si"));
+                // Inside the open quote, after the `si` - not `source().len()`,
+                // which the trailing newline puts on the next line.
+                let caret = app.editor().source().find("si").expect("the string") + "si".len();
+                app.editor_mut()
+                    .set_selection(Selection::caret(ByteOffset(caret)))
+                    .expect("caret");
+                assert_eq!(
+                    app.object_key_before_string_at_caret(),
+                    None,
+                    "`{key}` ends in a non-word char, so no key follows it"
+                );
+                let (callee, prefix, _) = app
+                    .string_completion_at_caret()
+                    .expect("the caret stands in a string");
+                assert_eq!(callee, "lfo", "the completion falls back to the callee");
+                assert_eq!(prefix, "si", "the token under the caret survives");
+            }
+        }
+    }
+}

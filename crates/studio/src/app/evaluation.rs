@@ -1189,3 +1189,892 @@ pub(super) fn virtual_rows_for(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    mod auto_evaluate {
+        //! Tests for the auto evaluate path in `app/evaluation.rs`.
+
+        use crate::app::tests::support::*;
+        use crate::app::*;
+
+        /// A studio playing one scene, with auto evaluate on or off. The
+        /// scene keeps the score `app_over` opened, "$: s(\"bd\")".
+        fn playing_app(directory: &std::path::Path, auto: bool) -> (App, SceneId) {
+            let mut app = app_over(directory);
+            app.ui_settings.auto_evaluate = auto;
+            app.snapshot = Some(sounding(true, false));
+            let scene = app.scenes.current().id;
+            (app, scene)
+        }
+
+        /// The evaluations one auto apply queued, pending or in flight.
+        fn queued_by(app: &App, scene: SceneId) -> Vec<PendingEvaluation> {
+            app.pending_evaluation
+                .iter()
+                .chain(app.inflight.values())
+                .filter(|pending| pending.scene == scene)
+                .cloned()
+                .collect()
+        }
+
+        fn clear_queued(app: &mut App) {
+            app.pending_evaluation = None;
+            app.inflight.clear();
+        }
+
+        /// Off is the default for a reason: nothing applies itself, and the
+        /// press stays the only way an edit becomes sound.
+        #[test]
+        fn off_leaves_the_updates_to_the_press() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene) = playing_app(directory.path(), false);
+            app.auto_evaluate();
+            assert!(
+                queued_by(&app, scene).is_empty(),
+                "no evaluation left without a press"
+            );
+        }
+
+        /// A stopped set is not started by typing. Update is how playback
+        /// starts, and the studio does not make that decision alone.
+        #[test]
+        fn a_paused_edit_does_not_start_a_stopped_set() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene) = plain_app(directory.path(), "$: s(\"bd\")\n");
+            app.ui_settings.auto_evaluate = true;
+            app.snapshot = None;
+            app.auto_evaluate();
+            assert!(
+                queued_by(&app, scene).is_empty(),
+                "a stopped set stays put until update starts it"
+            );
+        }
+
+        /// The apply itself: queued while the set plays, and no flash, because
+        /// a flash confirms a press and nobody pressed anything. The launch
+        /// row is off by default, so the edit lands at once.
+        #[test]
+        fn a_paused_edit_applies_itself_without_a_flash() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene) = playing_app(directory.path(), true);
+            app.auto_evaluate();
+            let queued = queued_by(&app, scene);
+            assert_eq!(queued.len(), 1, "the paused edit was queued");
+            assert_eq!(&*queued[0].source, "$: s(\"bd\")\n");
+            assert_eq!(queued[0].launch, Launch::Now);
+            assert!(
+                app.evaluation_feedback.is_none(),
+                "an auto apply begins no flash"
+            );
+            clear_queued(&mut app);
+        }
+
+        /// The launch row owns the line an applied edit lands on, the same
+        /// line an update waits for: off plays it at once, beat and cycle
+        /// hold it for the line the row names.
+        #[test]
+        fn the_launch_row_names_the_line_its_edits_land_on() {
+            for (quantise, launch) in [
+                (settings::Quantise::Off, Launch::Now),
+                (
+                    settings::Quantise::Beat,
+                    Launch::Quantised { unit_cycles: 0.25 },
+                ),
+                (
+                    settings::Quantise::Cycle,
+                    Launch::Quantised { unit_cycles: 1.0 },
+                ),
+            ] {
+                let directory = tempfile::tempdir().expect("temp dir");
+                let (mut app, scene) = playing_app(directory.path(), true);
+                app.ui_settings.quantise = quantise;
+                app.auto_evaluate();
+                let queued = queued_by(&app, scene);
+                assert_eq!(queued.len(), 1, "{quantise:?} queued its edit");
+                assert_eq!(
+                    queued[0].launch, launch,
+                    "{quantise:?} lands where the launch row says"
+                );
+                clear_queued(&mut app);
+            }
+        }
+
+        /// Text the checker refuses is not applied: the last good score keeps
+        /// playing, and the footer says why, as a refused update does.
+        #[test]
+        fn refused_text_keeps_the_last_good_score() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene) = playing_app(directory.path(), true);
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("$: s(\"bd\"".into()),
+                    HistoryMoment(1),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("break the score");
+            app.auto_evaluate();
+            assert!(
+                queued_by(&app, scene).is_empty(),
+                "an unclean score is not sent to the engine"
+            );
+            assert!(
+                app.status.contains("refused"),
+                "the refusal is said: {}",
+                app.status
+            );
+        }
+
+        /// The typing pause gates the apply: a pump inside the pause holds it,
+        /// and the pump after it applies. The flag is spent either way, so a
+        /// pause that elapsed while the set was stopped never fires when
+        /// playback later starts.
+        #[test]
+        fn the_typing_pause_gates_the_apply() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene) = playing_app(directory.path(), true);
+            app.dispatch_editor(Command::PasteText("$: s(\"hh\")\n".into()))
+                .expect("edit the score");
+            assert!(app.auto_evaluate_due, "the edit armed the apply");
+            app.pump_turn();
+            assert!(
+                queued_by(&app, scene).is_empty(),
+                "inside the pause nothing applies"
+            );
+            assert!(
+                app.auto_evaluate_due,
+                "the apply waits inside the pause, it is not lost"
+            );
+            let elapsed =
+                app.ui_settings.typing_pause.duration() + std::time::Duration::from_millis(50);
+            app.last_edit_at = std::time::Instant::now()
+                .checked_sub(elapsed)
+                .expect("backdate the edit");
+            // An idle worker still says stopped every 100 ms, and the drain
+            // at a pump's head is read before the apply at its end: a word
+            // landed between the two spends the pause on a set that reads
+            // stopped. Put the playing picture back, owe the pause again,
+            // and pump at once - nothing new arrives between two pumps run
+            // back to back, so the next one runs clean through.
+            let mut applied = false;
+            for _ in 0..50 {
+                app.snapshot = Some(sounding(true, false));
+                app.pump_turn();
+                if !app.auto_evaluate_due && !queued_by(&app, scene).is_empty() {
+                    applied = true;
+                    break;
+                }
+                app.auto_evaluate_due = true;
+            }
+            assert!(applied, "past the pause the edit applies");
+            clear_queued(&mut app);
+
+            // A pause that elapsed while stopped buys nothing later.
+            app.auto_evaluate_due = true;
+            app.snapshot = None;
+            app.last_edit_at = std::time::Instant::now()
+                .checked_sub(elapsed)
+                .expect("backdate the edit");
+            app.pump_turn();
+            assert!(
+                !app.auto_evaluate_due,
+                "the elapsed pause is spent stopped, not saved up"
+            );
+        }
+    }
+
+    mod evaluation {
+        //! Tests for `app/evaluation.rs`.
+
+        use crate::app::evaluation::*;
+        use crate::app::tests::support::*;
+        use crate::editor::{MemoryClipboard, Selection};
+
+        #[test]
+        fn only_the_underscored_painters_take_rows_the_plain_ones_are_the_stage() {
+            let layout =
+                rustel_runtime::ui_events::visual_layout("$: note(60)._pianoroll().scope()", 4)
+                    .unwrap()
+                    .ui_layout;
+            let rows = virtual_rows_for(&layout, Some, |_| true).unwrap();
+            assert_eq!(
+                rows.len(),
+                1,
+                "the plain scope() paints on the stage, not in rows"
+            );
+            assert_eq!(rows[0].height, 8);
+            let layout =
+                rustel_runtime::ui_events::visual_layout("$: note(60)._pianoroll()._scope()", 4)
+                    .unwrap()
+                    .ui_layout;
+            let rows = virtual_rows_for(&layout, Some, |_| true).unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[1].height, 6);
+        }
+
+        #[test]
+        fn a_deleted_or_commented_call_releases_its_rows_and_undo_restores_them() {
+            let source = "$: s(\"bd\")._pianoroll()\n$: s(\"hh\")._scope()\n";
+            let mut editor = Editor::new(source).unwrap();
+            let revision = editor.revision();
+            let layout = rustel_runtime::ui_events::visual_layout(source, 1)
+                .unwrap()
+                .ui_layout;
+            let alive = |editor: &Editor| {
+                layout
+                    .visuals
+                    .iter()
+                    .filter(|visual| visual_is_alive(editor, revision, Some(source), visual))
+                    .map(|visual| visual.kind.clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(alive(&editor), ["pianoroll", "scope"]);
+
+            // Delete `._pianoroll()` from the first line.
+            let call = source.find("._pianoroll()").unwrap();
+            editor
+                .set_selection(Selection::range(
+                    ByteOffset(call),
+                    ByteOffset(call + "._pianoroll()".len()),
+                ))
+                .unwrap();
+            editor
+                .dispatch(
+                    Command::DeleteForward,
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .unwrap();
+            assert_eq!(alive(&editor), ["scope"]);
+
+            // Comment the second line out.
+            let second = editor.source().find("$: s(\"hh\")").unwrap();
+            editor
+                .set_selection(Selection::caret(ByteOffset(second)))
+                .unwrap();
+            editor
+                .dispatch(
+                    Command::ToggleComment,
+                    HistoryMoment(1_000),
+                    &mut MemoryClipboard::default(),
+                )
+                .unwrap();
+            assert!(alive(&editor).is_empty());
+
+            editor.undo().unwrap();
+            editor.undo().unwrap();
+            assert_eq!(alive(&editor), ["pianoroll", "scope"]);
+        }
+
+        #[test]
+        fn revision_cache_evicts_by_age_not_hash_sort_order() {
+            let mut cache = RevisionCache::default();
+            for index in 0..MAX_EVALUATION_REVISIONS {
+                cache.remember(
+                    format!("z{index:02}"),
+                    Revision(index as u64),
+                    Arc::from(""),
+                    SceneId(1),
+                    None,
+                );
+            }
+            cache.remember(
+                "a-newest".into(),
+                Revision(99),
+                Arc::from("newest"),
+                SceneId(2),
+                None,
+            );
+
+            let newest = cache.get("a-newest").unwrap();
+            assert_eq!(newest.revision, Some(Revision(99)));
+            assert_eq!(newest.scene, SceneId(2));
+            assert!(cache.get("z00").is_none());
+            assert_eq!(cache.order.len(), MAX_EVALUATION_REVISIONS);
+        }
+
+        /// The footer shows only the innermost clause and the tail of a nested
+        /// engine refusal. The log keeps the whole message.
+        #[test]
+        fn a_refused_update_says_on_the_footer_only_what_a_player_can_act_on() {
+            let engine = "the new score could not be played (scalar audio refused every onset of the \
+             replacement's first window (unison 100 exceeds the native supersaw's 32-voice \
+             ceiling)); the last audible score keeps playing";
+            assert_eq!(
+                player_facing_error(engine),
+                "unison 100 exceeds the native supersaw's 32-voice ceiling - the last audible score \
+             keeps playing"
+            );
+
+            // The orbit spelling of the same fault.
+            let orbit = "the new score could not be played (scalar audio refused every onset of the \
+             replacement's first window (orbit 19999999 is outside the supported 0..16 range)); \
+             putting the last audible score back";
+            assert_eq!(
+                player_facing_error(orbit),
+                "orbit 19999999 is outside the supported 0..16 range - putting the last audible \
+             score back"
+            );
+
+            // One level of nesting: the bracket is itself the reason.
+            assert_eq!(
+                player_facing_error("the new score could not be played (the engine went away)"),
+                "the engine went away"
+            );
+
+            // Everything else is left exactly as it is - a syntax error with
+            // brackets of its own must not be taken apart.
+            for other in [
+                "line 2: unexpected token )",
+                "sound \"abcde\" is not in the library",
+                "",
+                "the new score could not be played",
+            ] {
+                assert_eq!(player_facing_error(other), other);
+            }
+
+            let callback = "javascript: replacement query failed; last-good score kept (pattern \
+            callback 14 failed: TypeError: not a function - line 28, column 90)";
+            assert_eq!(
+                player_facing_error(callback),
+                "not a function - line 28, column 90"
+            );
+        }
+
+        /// A repeat launch press answered with the launch already playing is
+        /// not a second install: one "installed" line in the log, a status that
+        /// says the score is already playing, and the visuals left as they are.
+        #[test]
+        fn an_answered_repeat_press_is_not_announced_as_a_second_install() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let scene = app.scenes.current().id;
+            for request_id in [1, 2] {
+                app.inflight.insert(
+                    request_id,
+                    PendingEvaluation {
+                        request_id,
+                        scene,
+                        editor_revision: app.scenes.current().editor.revision(),
+                        source: Arc::from("$: s(\"bd\")"),
+                        launch: Launch::Quantised { unit_cycles: 1.0 },
+                        rewind: true,
+                        record: true,
+                    },
+                );
+            }
+            let install = |answered_repeat| crate::StudioInstall {
+                generation: 7,
+                source_revision: "r".into(),
+                pending_cutover: true,
+                answered_repeat,
+                held: false,
+            };
+            let installed_lines = |app: &App| {
+                app.log
+                    .lines()
+                    .iter()
+                    .filter(|line| line.text.contains("generation 7 installed"))
+                    .count()
+            };
+
+            app.handle_evaluation(EvaluationOutcome {
+                request_id: 1,
+                editor_revision: 0,
+                result: Ok(install(false)),
+            });
+            assert_eq!(installed_lines(&app), 1);
+            assert!(app.visual.running());
+            app.visual.stop();
+
+            app.handle_evaluation(EvaluationOutcome {
+                request_id: 2,
+                editor_revision: 0,
+                result: Ok(install(true)),
+            });
+            assert_eq!(installed_lines(&app), 1, "no second install line");
+            assert_eq!(app.status, "already playing from the top");
+            assert!(
+                !app.visual.running(),
+                "the answer does not restart the visuals"
+            );
+            assert!(!app.is_evaluating(), "both requests were answered");
+        }
+
+        /// A live replacement can report several layers of engine routing around
+        /// one JavaScript mistake. The footer names the mistake and its location;
+        /// Studio Log retains the complete diagnostic for debugging.
+        #[test]
+        fn a_callback_failure_keeps_engine_routing_out_of_the_footer() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let message = "javascript: replacement query failed; last-good score kept (pattern \
+            callback 14 failed: TypeError: not a function - line 28, column 90)";
+
+            app.handle_evaluation(EvaluationOutcome {
+                request_id: 17,
+                editor_revision: 0,
+                result: Err(crate::EngineFailure {
+                    kind: "evaluation".into(),
+                    message: message.into(),
+                    recoverable: true,
+                    playback_stopped: false,
+                }),
+            });
+
+            assert_eq!(
+                app.errors.visible(),
+                Some("not a function - line 28, column 90")
+            );
+            assert_eq!(
+                app.log.lines().back().map(|line| line.text.as_str()),
+                Some(
+                    "evaluation: javascript: replacement query failed; last-good score kept (pattern \
+                 callback 14 failed: TypeError: not a function - line 28, column 90)"
+                )
+            );
+        }
+
+        /// A refusal arrives late for an origin on the saved list. The Trust
+        /// page keeps one row for this origin.
+        #[test]
+        fn a_stale_import_refusal_adds_no_second_row_for_a_saved_origin() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let origin = "https://scripts.invalid";
+            app.prefs.import_origins.push(origin.to_owned());
+
+            app.handle_evaluation(EvaluationOutcome {
+                request_id: 17,
+                editor_revision: 0,
+                result: Err(crate::EngineFailure {
+                    kind: "untrusted-import".into(),
+                    message: format!("{origin} is not trusted for import()"),
+                    recoverable: true,
+                    playback_stopped: false,
+                }),
+            });
+            assert!(app.blocked_imports.is_empty());
+
+            // Enter on a refused row of the same origin adds nothing.
+            app.blocked_imports.push(origin.to_owned());
+            app.trust_import(1);
+            assert_eq!(app.prefs.import_origins, [origin]);
+            assert!(app.blocked_imports.is_empty());
+        }
+
+        #[test]
+        fn an_engine_failure_alert_clears_when_playback_resumes() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let unseen_before = app.log.unseen();
+            let failure = "audio output failed while playing live";
+
+            app.handle_control(StudioControlEvent::EngineFailure(crate::EngineFailure {
+                kind: "audio".into(),
+                message: failure.into(),
+                recoverable: true,
+                playback_stopped: true,
+            }));
+            assert!(app.errors.get(ErrorOwner::Engine).is_some());
+            assert_eq!(app.log.unseen(), unseen_before + 1);
+
+            app.handle_control(StudioControlEvent::Snapshot(Box::new(sounding(
+                false, false,
+            ))));
+            assert!(app.errors.get(ErrorOwner::Engine).is_some());
+            assert_eq!(app.log.unseen(), unseen_before + 1);
+
+            app.handle_control(StudioControlEvent::Snapshot(Box::new(sounding(
+                true, false,
+            ))));
+            assert!(app.errors.get(ErrorOwner::Engine).is_none());
+            assert_eq!(app.log.unseen(), unseen_before, "the header alert clears");
+            assert!(
+                app.log
+                    .lines()
+                    .iter()
+                    .any(|line| line.text.contains(failure) && line.resolved),
+                "the failure remains in the log as resolved history"
+            );
+
+            app.handle_control(StudioControlEvent::EngineFailure(crate::EngineFailure {
+                kind: "audio".into(),
+                message: failure.into(),
+                recoverable: true,
+                playback_stopped: true,
+            }));
+            assert!(app.errors.get(ErrorOwner::Engine).is_some());
+            assert_eq!(app.log.unseen(), unseen_before + 1);
+            app.log.push(LogLevel::Warn, "other", "unrelated warning");
+            app.handle_control(StudioControlEvent::Snapshot(Box::new(sounding(
+                true, false,
+            ))));
+            assert_eq!(
+                app.log.unseen(),
+                unseen_before + 1,
+                "an unrelated warning keeps its header alert"
+            );
+        }
+
+        #[test]
+        fn unowned_engine_failures_do_not_borrow_an_editors_position() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.audible_scene = Some(app.scenes.current().id);
+            app.visual_revision = None;
+            app.handle_control(StudioControlEvent::Diagnostic(
+                crate::engine::StudioDiagnostic {
+                    kind: "evaluation".into(),
+                    message: "callback failed - line 2".into(),
+                    recoverable: true,
+                    level: StudioDiagnosticLevel::Error,
+                    alert: None,
+                },
+            ));
+            assert_eq!(app.update_failure, None);
+            assert!(app.errors.get(ErrorOwner::Evaluation).is_some());
+
+            app.visual_revision = Some(app.editor().revision());
+            app.handle_evaluation(EvaluationOutcome {
+                request_id: u64::MAX,
+                editor_revision: app.editor().revision().0,
+                result: Err(crate::EngineFailure {
+                    kind: "evaluation".into(),
+                    message: "refused replacement - line 3".into(),
+                    recoverable: true,
+                    playback_stopped: false,
+                }),
+            });
+            assert_eq!(
+                app.update_failure, None,
+                "an unknown request does not own the audible score's source position"
+            );
+            assert!(app.errors.get(ErrorOwner::Evaluation).is_some());
+        }
+
+        /// A score waits behind a setup it may depend on.
+        #[test]
+        fn a_score_never_overtakes_a_queued_setup() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.prebake_inflight = Some(PrebakeRequest {
+                request_id: 1,
+                scope: PrebakeScope::Global,
+                source: Arc::from("globalThis.g = 1"),
+                reinstall_after: false,
+            });
+            app.prebake_queue.push_back(PrebakeRequest {
+                request_id: 2,
+                scope: PrebakeScope::Local,
+                source: Arc::from("globalThis.l = 1"),
+                reinstall_after: true,
+            });
+
+            app.queue_evaluation(app.editor().revision(), Arc::from("$: s(\"bd\")"));
+            assert!(
+                app.pending_evaluation.is_some() && app.inflight.is_empty(),
+                "a score was sent ahead of a setup"
+            );
+        }
+
+        /// A `.log()` line is a note that sounded: the log panel takes it at
+        /// Info - where the quiet floor keeps it - and the footer's status is
+        /// left alone, one hap per line.
+        #[test]
+        fn a_log_line_lands_in_the_panel_without_touching_the_status() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            app.status = "ready".to_owned();
+            for message in [
+                "[hap] 0/1 → 1/4: note:c s:sine",
+                "[hap] 1/4 → 1/2: note:c s:sine",
+            ] {
+                app.handle_control(StudioControlEvent::Diagnostic(
+                    crate::engine::StudioDiagnostic {
+                        kind: "log".into(),
+                        message: message.into(),
+                        recoverable: true,
+                        level: StudioDiagnosticLevel::Info,
+                        alert: None,
+                    },
+                ));
+            }
+            let logged = app
+                .log
+                .lines()
+                .iter()
+                .filter(|line| line.kind.as_str() == "log")
+                .collect::<Vec<_>>();
+            assert_eq!(logged.len(), 2, "both lines are in the panel");
+            assert!(
+                logged
+                    .iter()
+                    .all(|line| line.level == LogLevel::Info && line.text.contains("[hap] "))
+            );
+            assert_eq!(app.status, "ready", "the status line keeps its own words");
+        }
+
+        #[test]
+        fn a_recoverable_runtime_refusal_is_still_a_red_footer_error() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            app.handle_control(StudioControlEvent::Diagnostic(
+                crate::engine::StudioDiagnostic {
+                    kind: "resource-limit".into(),
+                    message: "query deadline exceeded".into(),
+                    recoverable: true,
+                    level: StudioDiagnosticLevel::Error,
+                    alert: None,
+                },
+            ));
+
+            assert_eq!(app.errors.visible(), Some("query deadline exceeded"));
+            assert_eq!(
+                app.log.lines().back().map(|line| line.level),
+                Some(LogLevel::Error)
+            );
+        }
+
+        /// The stream facts ("coreaudio · … · 128 frames · 2.7 ms") are queued
+        /// beside an install and used to arrive as a warning, which took the
+        /// status line: two studio-e2e suites saw "silent · silent · 48000 Hz
+        /// · 256 frames · 5.3 ms" where "playing from the top" belonged. A
+        /// note is for the log alone.
+        #[test]
+        fn a_note_diagnostic_is_logged_and_leaves_the_status_line_alone() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            app.status = "playing from the top".into();
+            app.handle_control(StudioControlEvent::Diagnostic(
+                crate::engine::StudioDiagnostic {
+                    kind: "audio".into(),
+                    message: "silent · silent · 48000 Hz · 256 frames · 5.3 ms".into(),
+                    recoverable: true,
+                    level: StudioDiagnosticLevel::Note,
+                    alert: None,
+                },
+            ));
+
+            assert_eq!(app.status, "playing from the top");
+            assert_eq!(app.errors.visible(), None);
+            let last = app.log.lines().back().expect("the note is logged");
+            assert_eq!(last.level, LogLevel::Info);
+            assert!(
+                last.text.contains("256 frames"),
+                "the log keeps the facts: {}",
+                last.text
+            );
+        }
+
+        fn pending_alert_update(app: &mut App, request_id: u64) -> (SceneId, Revision) {
+            let scene = app.scenes.current();
+            let owner = (scene.id, scene.editor.revision());
+            app.inflight.insert(
+                request_id,
+                PendingEvaluation {
+                    request_id,
+                    scene: owner.0,
+                    editor_revision: owner.1,
+                    source: Arc::from(scene.editor.source()),
+                    launch: Launch::Now,
+                    rewind: false,
+                    record: false,
+                },
+            );
+            owner
+        }
+
+        fn refuse_alert_update(app: &mut App, request_id: u64) -> (SceneId, Revision) {
+            let owner = pending_alert_update(app, request_id);
+            app.handle_evaluation(EvaluationOutcome {
+                request_id,
+                editor_revision: owner.1.0,
+                result: Err(crate::EngineFailure {
+                    kind: "evaluation".into(),
+                    message: format!("refused request {request_id}"),
+                    recoverable: true,
+                    playback_stopped: false,
+                }),
+            });
+            owner
+        }
+
+        fn alert_install(answered_repeat: bool) -> crate::StudioInstall {
+            crate::StudioInstall {
+                generation: 7,
+                source_revision: "r".into(),
+                pending_cutover: true,
+                answered_repeat,
+                held: false,
+            }
+        }
+
+        #[test]
+        fn clean_lint_resolves_its_scene_even_when_another_scene_owns_the_footer() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let unseen_before = app.log.unseen();
+            let first = refuse_alert_update(&mut app, 1);
+            app.new_scene(false);
+            let second = refuse_alert_update(&mut app, 2);
+            assert_ne!(first.0, second.0);
+            assert_eq!(app.log.unseen(), unseen_before + 2);
+
+            assert!(app.select_scene(0));
+            type_text(&mut app, " ");
+            app.absorb_lint(crate::lint::LintResult {
+                scene: first.0,
+                revision: app.editor().revision(),
+                input_channels: app.lint_input_channels(),
+                diagnostics: Vec::new(),
+            });
+            assert_eq!(app.log.unseen(), unseen_before + 1);
+            assert_eq!(app.update_failure, Some(second));
+            assert_eq!(
+                app.errors.get(ErrorOwner::Evaluation),
+                Some("refused request 2")
+            );
+            assert!(
+                app.log
+                    .lines()
+                    .iter()
+                    .any(|line| line.text.contains("request 1") && line.resolved)
+            );
+            assert!(
+                app.log
+                    .lines()
+                    .iter()
+                    .any(|line| line.text.contains("request 2") && !line.resolved)
+            );
+        }
+
+        #[test]
+        fn an_install_clears_another_scenes_footer_and_preserves_unrelated_alerts() {
+            for answered_repeat in [false, true] {
+                let directory = tempfile::tempdir().expect("temp dir");
+                let mut app = app_over(directory.path());
+                app.log.push(LogLevel::Warn, "device", "unrelated warning");
+                let unseen_before = app.log.unseen();
+                let first = refuse_alert_update(&mut app, 1);
+                pending_alert_update(&mut app, 3);
+                app.new_scene(false);
+                refuse_alert_update(&mut app, 2);
+                assert_eq!(app.log.unseen(), unseen_before + 2);
+
+                app.handle_evaluation(EvaluationOutcome {
+                    request_id: 3,
+                    editor_revision: first.1.0,
+                    result: Ok(alert_install(answered_repeat)),
+                });
+                assert_eq!(app.log.unseen(), unseen_before + 1);
+                // The footer follows the latest install. The other scene's
+                // log alert stays open.
+                assert_eq!(app.update_failure, None);
+                assert_eq!(app.errors.get(ErrorOwner::Evaluation), None);
+                assert!(
+                    app.log
+                        .lines()
+                        .iter()
+                        .any(|line| line.text.contains("request 1") && line.resolved)
+                );
+                assert!(
+                    app.log
+                        .lines()
+                        .iter()
+                        .any(|line| line.text.contains("request 2") && !line.resolved)
+                );
+                assert!(
+                    app.log
+                        .lines()
+                        .iter()
+                        .any(|line| line.kind == "device" && !line.resolved)
+                );
+            }
+        }
+
+        #[test]
+        fn cancelled_unowned_and_older_updates_do_not_resolve_newer_alerts() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let unseen_before = app.log.unseen();
+            let old = pending_alert_update(&mut app, 1);
+            type_text(&mut app, " ");
+            let refused = refuse_alert_update(&mut app, 2);
+            assert!(refused.1 > old.1);
+            pending_alert_update(&mut app, 3);
+
+            app.handle_evaluation(EvaluationOutcome {
+                request_id: 3,
+                editor_revision: refused.1.0,
+                result: Err(crate::EngineFailure {
+                    kind: "cancelled".into(),
+                    message: "cancelled".into(),
+                    recoverable: true,
+                    playback_stopped: false,
+                }),
+            });
+            app.handle_evaluation(EvaluationOutcome {
+                request_id: u64::MAX,
+                editor_revision: refused.1.0,
+                result: Ok(alert_install(false)),
+            });
+            app.handle_evaluation(EvaluationOutcome {
+                request_id: 1,
+                editor_revision: old.1.0,
+                result: Ok(alert_install(false)),
+            });
+            assert_eq!(app.log.unseen(), unseen_before + 1);
+            assert_eq!(app.update_failure, Some(refused));
+            assert!(
+                app.log
+                    .lines()
+                    .iter()
+                    .any(|line| line.text.contains("request 2") && !line.resolved)
+            );
+        }
+
+        #[test]
+        fn an_install_clears_an_unowned_runtime_footer_without_retiring_its_alert() {
+            for answered_repeat in [false, true] {
+                let directory = tempfile::tempdir().expect("temp dir");
+                let mut app = app_over(directory.path());
+                let unseen_before = app.log.unseen();
+                let refused = refuse_alert_update(&mut app, 1);
+                app.handle_control(StudioControlEvent::Diagnostic(crate::StudioDiagnostic {
+                    kind: "audio".into(),
+                    message: "reverb capacity reached".into(),
+                    recoverable: true,
+                    level: StudioDiagnosticLevel::Error,
+                    alert: None,
+                }));
+                assert_eq!(app.log.unseen(), unseen_before + 2);
+
+                type_text(&mut app, " ");
+                app.absorb_lint(crate::lint::LintResult {
+                    scene: refused.0,
+                    revision: app.editor().revision(),
+                    input_channels: app.lint_input_channels(),
+                    diagnostics: Vec::new(),
+                });
+                assert_eq!(app.log.unseen(), unseen_before + 1);
+                assert_eq!(
+                    app.errors.get(ErrorOwner::Evaluation),
+                    Some("reverb capacity reached")
+                );
+
+                let accepted = pending_alert_update(&mut app, 2);
+                app.handle_evaluation(EvaluationOutcome {
+                    request_id: 2,
+                    editor_revision: accepted.1.0,
+                    result: Ok(alert_install(answered_repeat)),
+                });
+                assert!(app.errors.get(ErrorOwner::Evaluation).is_none());
+                assert_eq!(app.log.unseen(), unseen_before + 1);
+                assert!(app.log.lines().iter().any(|line| {
+                    line.kind == "audio" && line.text == "reverb capacity reached" && !line.resolved
+                }));
+            }
+        }
+    }
+}

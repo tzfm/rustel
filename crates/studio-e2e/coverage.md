@@ -1,24 +1,22 @@
 # Studio surface coverage
 
-One test file per surface. A PR that adds a studio surface adds a row; a PR
-that leaves a surface uncovered says so in *not yet covered*. A PR must
-never grow that list.
+Each row lists a suite and the behavior it checks. Update this table when
+adding or removing a suite. Record known gaps below. A listed suite does
+not prove that every case for its surface is covered.
 
-This table is the answer to "what is tested and what is not": one row per
-suite file, every row's premise in plain sentences. `coverage_guard.rs`
-holds the table and the suite together - a file without a row, or a row
-without a file, is a red test. For the flat inventory of every test name,
-run `cargo test -p rustel-studio-e2e -- --list`.
+Run `cargo test -p rustel-studio-e2e -- --list` for the test inventory.
+The shared studio fixture checks that the callback allocator is active
+before it opens the studio.
 
 | file | surface | key cases | status |
 | --- | --- | --- | --- |
 | `all_once.rs` | score evaluation | `all()` runs once per evaluation and playback starts without a repeated transform | covered |
-| `transport.rs` | evaluate/stop | `Ctrl+S`, `F5`, `Ctrl+G`, `F8`; transport outranks an open panel; a stop while stopping cuts the tail; header state text; `Ctrl+S` on the playing text pasted over itself installs nothing, says it is unchanged, and its fader still moves on Alt+Up | covered |
+| `transport.rs` | evaluate/stop | `Ctrl+S` and `Ctrl+G` (`F5` and `F8` in `keymap.rs`); transport outranks an open panel; a stop while stopping cuts the tail; header state text; `Ctrl+S` on the playing text pasted over itself installs nothing, says it is unchanged, and its fader still moves on Alt+Up | covered |
 | `editor.rs` | editing | typing, selection, undo/redo, comment toggle, word motions, bracket match, paste, tab/outdent, the 480-key raw-paste batch, a broken edit marked and cleared, the syntax check's three modes (on update quiet while typing and marking a refused update, off marking nothing while the footer still says why, full again) | covered |
 | `layout.rs` | layout | split open/close/focus, zen, resize down to 80×24 and back, minimap presence and scrollbar fallback, reference column widths | covered |
 | `golden_surfaces.rs` | whole-screen goldens | the mixer desk, reference browser, and menu bar as complete frames; the settings sheet and log panel contain host-dependent paths and are checked semantically elsewhere | covered |
 | `pointer.rs` | the pointer | scene chips by mouse: a click selects and plays nothing - no modifier, no right button either, ^S is how the focused one plays; the header's `✓ ready` chip opens the log; the footer's ♪ chip opens the picker, Esc gives the keys back; a menu row works end to end (File ▸ Quit quits outright) and a click outside a dropdown dismisses it without reaching the score; the master fader drags both ways and reads its decibels, the wheel steps it half a decibel (aimed off the bar itself - the handle is a translucent cap, no glyph to hunt); a live slider's pill drags to its ends and rewrites the literal, a click arms ←/→, the wheel steps a notch; over the samples pulse row the wheel is the preview volume | covered |
-| `keymap.rs` | capability matrix | every chord in `docs/studio.md` resolves under `legacy()` and `enhanced()`, and nothing else claims those keys; the doc table and the keymap cannot drift; a moved slider is named for the call it sits in (`gain = …`); ^J is the documented quick action - menu, choose, apply without evaluating - and an unclaimed chord (Ctrl+I, pressed where the enhanced set reports it) claims nothing: not the score, the menu, a panel or the status line; the suite presses ^Q (`quit_arming.rs`, `piano_mode.rs`) and ^H (`record_sample.rs`) in their own files | covered |
+| `keymap.rs` | capability matrix | the listed shortcuts work under `legacy()` and `enhanced()` where supported; a moved slider is named for the call it sits in (`gain = …`); ^J is the documented quick action - menu, choose, apply without evaluating - and an unclaimed chord (Ctrl+I, pressed where the enhanced set reports it) claims nothing: not the score, the menu, a panel or the status line; the suite presses ^Q (`quit_arming.rs`, `piano_mode.rs`) and ^H (`record_sample.rs`) in their own files | covered |
 | `menu_bar.rs` | menu bar | F1 opens the bar and F1 closes it; a title mnemonic drops that menu; Right walks all seven and wraps; Esc closes the bar and returns the keys; Scene ▸ New scene does what ^N does, once; Edit rows act on the score; Options ▸ Devices opens the panel; Help ▸ Keyboard reference opens help; Transport ▸ Update evaluates; a greyed row is inert; zen has no bar so F1 goes on meaning help; View ▸ Set panel opens the tapes fold and a toggle runs and closes the bar; File ▸ Quit quits outright, no arming, where ^Q asks twice | covered |
 | `panels_reference.rs` | Reference tab | `Ctrl+D` on a documented word opens its entry; an unknown word browses and Enter replaces it; search, Esc ladder (entry → list → close); Tab walks the tabs; letters fall through to the score in entry mode; no terminal width leaves a tab undrawn or unreachable; at 26 columns the strip slides to seat the tab being shown and `+N` counts what went behind the edge; Settings ▸ Reference turning OSC off takes `squiz` out of the browser and the suggestions while `tag:osc` and Ctrl+D still reach it | covered |
 | `panels_samples.rs` | Samples tab | the library's catalogue reaches the tab (a real local WAV bank, no network); live search with the count line and the score tag; Enter copies in the browser and inserts from a string; Space previews a bank's first variant and Space again stops; Esc silences a live preview first; `Alt+A` auto-play vs plain letters staying in the search box; `Alt++`/`Alt+-` set the preview's own volume, +3 dB a step, past unity onto the detent, floor at mute; `Alt+D` arms an imported file's deletion, Esc keeps it, Enter deletes it and its bank leaves the browser | covered |
@@ -51,9 +49,7 @@ run `cargo test -p rustel-studio-e2e -- --list`.
 | `errors.rs` | failure surfaces | a broken score keeps the last good one playing, the error line names it, a refused empty call is readable, six error owners each get a slot | covered |
 | `pty_smoke.rs` | the real binary | feature `pty`: `rustel studio` starts under a pseudo-terminal with a score passed as the CLI documents it, paints its header and the opened set, normalizes mixed CRLF/bare-CR/LF in a bracketed paste saved to disk, accepts SGR mouse clicks and double clicks to place the caret and select a word after set-panel and terminal focus changes, survives a resize, and exits cleanly on `Ctrl+Q` | covered |
 | `pty_alt_chords.rs` | the real binary's Alt chords and editor gestures | feature `pty`: the Keybinds page lists the fixed Alt+O row past the learnable table and Enter on it arms no learn; Alt+O delivered as `ESC o` over ConPTY on the samples tab reveals a local sample's file under the headless pin; Alt+A as `ESC a` flips auto-play; SGR press/drag/release replaces only selected source, a drag crossing the split stays in its originating editor, wheel reports scroll the pane under the pointer without taking keyboard focus, and F10 moves edits between both panes, all checked against saved score bytes | covered |
-| `coverage_guard.rs` | the table itself | every suite file under `tests/` has a row above and every row names a suite file that exists - this table and the suite cannot drift apart without a red test | covered |
 | `smart_action.rs` | ^J quick action | ^J on a number raises the menu with the gesture's choices; the form adds and edits a fader in place, and the menu removes it, without evaluating or starting playback; a caret that is not on a number is refused by the menu, not the score; Esc hands the keys back with the score untouched; Edit ▸ Quick action greys where the caret has nothing for it - muted ink, its mnemonic skipped - and lights up live on a number | covered |
-| `docs_claims.rs` | the docs' promises | `docs/studio.md`, `docs/hardware.md` and `docs/cli.md` never offer an `audio in latency` row (the input lag is always automatic), and they name the output's row `audio out latency`, as the settings sheet does, never `output latency`. The documents are compiled in, so no studio opens and nothing is recorded for the demo video | covered |
 | `help_contexts.rs` | contextual keyboard help | Help ▸ Keyboard reference (F1 `h` `k` - F1 alone opens the menu bar) opens the overlay on the page for whatever has the keys - the editor; each settings page (Settings, Sources, About); the panels (the log sheet, devices, set, reference, mixer, theme picker); the export sheet; the theme editor's form; the visuals dock; a scene being renamed and a scene learning its pad; an armed slider; and a replay's timeline - and Esc closes it and hands the keys back to exactly the panel or timeline that held them | covered |
 | `record_sample.rs` | ^H sample recording | a running take refuses a sample and the refusal names the chord that finishes the take; with no input to record from (the harness opens no default input, so no runner's microphone is ever touched) ^H is refused in the error line, the status stops claiming a sample, the header shows no sample clock, a second ^H is a fresh start rather than the finish of a phantom take, and no WAV is left in the recordings folder. A started sample (the clock, the saved WAV, the silent-input discard) needs a live input, outside the suite's no-hardware boundary | covered |
 | `timeline_replay.rs` | timeline paging | PgDn and PgUp move a tape's selection by exactly the blocks the timeline shows across (read from the laid-out strip, so it holds at any width) rather than one block, PgDn stops at the end, Home and End are its two ends, no page starts playback, and Enter plays from the chosen block while the timeline keeps the keyboard - every block's code names its index, and the blocks are an hour apart so the run cannot move on while the test looks | covered |
@@ -64,8 +60,8 @@ run `cargo test -p rustel-studio-e2e -- --list`.
 
 ## Not yet covered
 
-None. Every surface the studio ships has a suite row above; a PR that
-adds a surface adds its row here in the same change.
+The suite uses simulated devices. It does not verify real audio hardware
+or every terminal emulator.
 
 ## Demo video
 
@@ -73,4 +69,4 @@ The suite records every frame it paints (and a snapshot after each
 input) when `RUSTEL_E2E_RECORD_DIR` is set, and `src/bin/e2e-demo.rs`
 turns those recordings into `demo/e2e-demo.mp4` - one segment per test
 above, with a banner naming the test that is running. See the README for
-the two commands. Every row in the table above appears in the video.
+the two commands. Only tests that paint recorded frames appear in the video.

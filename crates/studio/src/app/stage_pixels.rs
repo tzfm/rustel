@@ -265,3 +265,385 @@ impl App {
         pictures
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod stage_pixels {
+        //! Tests for stage pixels.
+
+        use crate::app::stage_pixels::*;
+        use crate::editor::{GridRect, VirtualRowSpec};
+        use crate::graphics::Tier;
+        use crate::graphics::{self, PixelImage};
+        use ratatui::style::Color;
+        use ratatui::style::Style;
+        use rustel_runtime::ui_analysis::{
+            UI_SCOPE_SAMPLES, UI_SPECTRUM_BINS, UiAudioAnalysisFrame, UiAudioAnalysisSet,
+        };
+        use rustel_runtime::ui_events::UiAudioMetadata;
+        use std::collections::HashSet;
+
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn late_shelf_pixels_follow_reference_stacking_and_leave_other_images_intact() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.frame = Rect::new(0, 0, 140, 40);
+            app.regions = view::regions(app.frame, false, 1, true, true, None, None);
+            app.reference_panel = Some(crate::reference::ReferencePanel::browse(&app.reference));
+            app.settings_sheet = Some(crate::settings::SettingsSheet::default());
+            let (sheet, _) = crate::settings::SettingsSheetView::geometry(app.frame).unwrap();
+            let area =
+                crate::reference::preview_area(crate::reference::inner_area(app.regions.reference));
+            assert!(
+                !area.intersection(sheet).is_empty(),
+                "the preview overlaps Settings"
+            );
+            let image = PixelImage {
+                area,
+                width: u32::from(area.width) * 2,
+                height: u32::from(area.height) * 3,
+                rgba: [80, 90, 100, 255]
+                    .repeat(usize::from(area.width) * usize::from(area.height) * 6),
+                depth: 0,
+                cells: Some((area.width, area.height)),
+            };
+            let (_, remaining) = graphics::capture_images(|| {
+                let prior = PixelImage {
+                    depth: -1,
+                    ..image.clone()
+                };
+                graphics::push_image(prior.clone());
+                app.raise(PanelKind::Reference);
+                app.raise(PanelKind::Settings);
+                let covered = app.shelf_exclusions(false);
+                assert!(covered.contains(&sheet));
+                let masked = mask_shelf(image.clone(), &covered);
+                if let Some(masked) = masked {
+                    assert_eq!(masked.cells, image.cells);
+                    assert_eq!(masked.depth, 0);
+                    assert_eq!(masked.area, area);
+                    for (index, pixel) in masked.rgba.as_chunks::<4>().0.iter().enumerate() {
+                        let x = area.x + ((index % image.width as usize) / 2) as u16;
+                        let y = area.y + ((index / image.width as usize) / 3) as u16;
+                        let hidden = covered.iter().any(|rect| rect.contains((x, y).into()));
+                        assert_eq!(pixel[3], if hidden { 0 } else { 255 });
+                    }
+                } else {
+                    assert_eq!(
+                        area.intersection(sheet),
+                        area,
+                        "only a wholly covered preview disappears"
+                    );
+                }
+                app.raise(PanelKind::Reference);
+                let covered = app.shelf_exclusions(false);
+                assert!(
+                    !covered.contains(&sheet),
+                    "a lower Settings sheet cannot cut out the raised shelf"
+                );
+                assert_eq!(mask_shelf(image.clone(), &covered), Some(image.clone()));
+                app.set_prompt = Some((SetPrompt::OpenSet, FilePicker::text("open", "accept")));
+                let prompt = app
+                    .set_prompt
+                    .as_ref()
+                    .unwrap()
+                    .1
+                    .geometry(app.frame)
+                    .unwrap()
+                    .0;
+                assert!(
+                    app.shelf_exclusions(false).contains(&prompt),
+                    "file prompts stay above a raised reference"
+                );
+                app.menu = Some(crate::menu::MenuState::dropped_on(&app.menus(), 0));
+                let menus = crate::menu::dropdown_rects(
+                    &app.menus(),
+                    app.menu.as_ref().unwrap(),
+                    app.menu_row(),
+                    app.frame,
+                );
+                assert!(!menus.is_empty());
+                assert!(
+                    menus
+                        .iter()
+                        .all(|rect| app.shelf_exclusions(false).contains(rect))
+                );
+                assert_eq!(
+                    graphics::take_images(),
+                    vec![prior],
+                    "masking the late shelf never damages existing layers"
+                );
+            });
+            assert!(remaining.is_empty());
+        }
+
+        #[test]
+        fn stage_pixels_follow_opacity_and_exclusions_without_masking_other_layers() {
+            let area = Rect::new(3, 4, 8, 1);
+            let ground = Color::Rgb(10, 20, 30);
+            let mut frame = Buffer::empty(area);
+            frame.set_style(area, Style::default().bg(ground));
+            frame.set_string(4, 4, "x", Style::default().fg(Color::White));
+            frame[(5, 4)].set_bg(Color::Blue);
+            let covered = [Rect::new(7, 4, 1, 1), Rect::new(8, 4, 1, 1)];
+            let untouched = HashSet::from([(6, 4), (9, 4)]);
+            let stage = PixelImage::inline(area, 16, 3, [90, 80, 70, 255].repeat(16 * 3));
+            let other = PixelImage::inline(area, 16, 3, [1, 2, 3, 255].repeat(16 * 3));
+            let (_, queued) = graphics::capture_images(|| {
+                graphics::push_image(other.clone());
+                let prepared = prepare(
+                    vec![stage.clone()],
+                    &frame,
+                    ground,
+                    &covered,
+                    &untouched,
+                    0.25,
+                );
+                assert_eq!(prepared.len(), 1);
+                let image = &prepared[0];
+                assert_eq!(image.depth, -1, "stage stays behind glyphs");
+                assert_eq!(image.area, area);
+                assert_eq!((image.width, image.height), (16, 3));
+                for (index, pixel) in image.rgba.as_chunks::<4>().0.iter().enumerate() {
+                    let column = (index % 16) / 2;
+                    assert_eq!(&pixel[..3], &[90, 80, 70]);
+                    assert_eq!(
+                        pixel[3],
+                        if [0, 1, 7].contains(&column) { 64 } else { 0 },
+                        "own-background chips, highlights, selections and explicit rectangles stay clear"
+                    );
+                }
+                assert_eq!(
+                    graphics::take_images(),
+                    vec![other.clone()],
+                    "masking is local to the stage"
+                );
+                let backdrop = PixelImage {
+                    depth: -1,
+                    ..other.clone()
+                };
+                graphics::push_image(backdrop);
+                for image in prepared {
+                    graphics::push_image(image);
+                }
+            });
+            assert_eq!(queued.len(), 2);
+            assert_eq!(queued[0].rgba, other.rgba, "backdrop is queued first");
+            assert_eq!(
+                queued[1].rgba[3], 64,
+                "stage is placed above it at equal negative depth"
+            );
+            assert!(prepare(vec![stage], &frame, ground, &[], &HashSet::new(), 0.0).is_empty());
+        }
+
+        struct Restore {
+            tier: Tier,
+            cells: Option<(u16, u16)>,
+            settings: UiSettings,
+            images: Vec<PixelImage>,
+        }
+
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = graphics::take_images();
+                graphics::set_tier(self.tier);
+                graphics::set_cell_pixels(self.cells);
+                self.settings.apply();
+                for image in self.images.drain(..) {
+                    graphics::push_image(image);
+                }
+            }
+        }
+
+        #[test]
+        fn global_scope_survives_frame_reset_and_excludes_inline_rows_and_sheets() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let _restore = Restore {
+                tier: graphics::tier(),
+                cells: graphics::cell_pixels(),
+                settings: app.ui_settings.clone(),
+                images: graphics::take_images(),
+            };
+            app.ui_settings.animation = true;
+            app.ui_settings.apply();
+            graphics::set_tier(Tier::Pixels);
+            graphics::set_cell_pixels(Some((2, 3)));
+            app.frame = Rect::new(0, 0, 120, 40);
+            app.regions = view::regions(app.frame, false, 1, false, false, None, None);
+            app.audible_scene = Some(app.scenes.current().id);
+            let layout = visual_layout("s(\"bd\").scope()._scope()", 1).unwrap();
+            let audio = UiAudioAnalysisFrame {
+                scope: [0.5; UI_SCOPE_SAMPLES],
+                spectrum: [-120.0; UI_SPECTRUM_BINS],
+            };
+            let taps = layout
+                .ui_layout
+                .visuals
+                .iter()
+                .filter_map(|visual| visual.slot)
+                .map(|slot| (slot, audio.clone()))
+                .collect();
+            app.visual.install_layout(layout);
+            app.visual.start();
+            assert!(app.visual.install_audio(
+                UiAudioMetadata {
+                    sequence: 1,
+                    generation: 1,
+                    device_time: 0.5,
+                    stream_id: 1,
+                    epoch: 1,
+                    end_frame: 24_000,
+                    sample_rate: 48_000
+                },
+                UiAudioAnalysisSet {
+                    master: audio,
+                    visuals: taps,
+                    sides: Vec::new(),
+                }
+            ));
+            let (buffers, images) = graphics::capture_images(|| app.stage_pictures());
+            assert_eq!(
+                buffers.len(),
+                1,
+                "only the global scope belongs to the stage"
+            );
+            assert_eq!(
+                images.len(),
+                1,
+                "the actual scope renderer produced a pixel image"
+            );
+            let area = app.regions.panes[0].editor;
+            assert_eq!(images[0].area, area);
+            assert!(
+                images[0]
+                    .rgba
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[3] > 0)
+            );
+            assert!(
+                graphics::take_images().is_empty(),
+                "the frame reset cannot discard captured stage images"
+            );
+            let mut frame = Buffer::empty(app.frame);
+            frame.set_style(app.frame, Style::default().bg(app.theme.background));
+            let prepared = prepare(
+                images,
+                &frame,
+                app.theme.background,
+                &[],
+                &HashSet::new(),
+                0.5,
+            );
+            assert_eq!(prepared.len(), 1);
+            assert!(
+                prepared[0]
+                    .rgba
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[3] == 128)
+            );
+
+            let revision = app.editor().revision();
+            app.editor_mut()
+                .set_virtual_rows(
+                    revision,
+                    vec![VirtualRowSpec::new(
+                        Arc::<str>::from("inline"),
+                        ByteOffset(0),
+                        2,
+                    )],
+                )
+                .unwrap();
+            app.editor_mut()
+                .set_view_size(usize::from(area.width), usize::from(area.height));
+            let map = app
+                .editor_mut()
+                .screen_map(GridRect::new(area.x, area.y, area.width, area.height))
+                .unwrap();
+            app.panel = Some(DevicePanel::default());
+            app.set_prompt = Some((SetPrompt::OpenSet, FilePicker::text("test", "accept")));
+            app.viz_docks[0] = Some(VizPanel {
+                adding: Some(0),
+                prompt: Some(FilePicker::text("art", "accept")),
+                ..VizPanel::default()
+            });
+            let covered = app.stage_exclusions(std::slice::from_ref(&map));
+            for row in map.rows() {
+                if let crate::editor::ScreenRow::Virtual(row) = row {
+                    assert!(covered.contains(&Rect::new(area.x, row.screen_y, area.width, 1)));
+                }
+            }
+            let device = app.panel.unwrap();
+            let count = app.panel_row_count(device.kind).max(1);
+            assert!(
+                covered.contains(
+                    &DevicePanelView::geometry(app.frame, device, count)
+                        .unwrap()
+                        .area
+                )
+            );
+            assert!(
+                covered.contains(
+                    &app.set_prompt
+                        .as_ref()
+                        .unwrap()
+                        .1
+                        .geometry(app.frame)
+                        .unwrap()
+                        .0
+                )
+            );
+            assert!(
+                covered.contains(
+                    &app.viz_docks[0]
+                        .as_ref()
+                        .unwrap()
+                        .prompt
+                        .as_ref()
+                        .unwrap()
+                        .geometry(app.frame)
+                        .unwrap()
+                        .0
+                )
+            );
+            assert!(covered.contains(&VizPanel::add_sheet_geometry(app.frame).unwrap().0));
+        }
+
+        /// A stage painter with nothing to draw yet leaves its picture blank: no
+        /// word about waiting is written behind the score.
+        #[test]
+        fn a_stage_painter_with_nothing_to_draw_writes_nothing() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let _restore = Restore {
+                tier: graphics::tier(),
+                cells: graphics::cell_pixels(),
+                settings: app.ui_settings.clone(),
+                images: graphics::take_images(),
+            };
+            app.ui_settings.animation = true;
+            app.ui_settings.apply();
+            app.frame = Rect::new(0, 0, 120, 40);
+            app.regions = view::regions(app.frame, false, 1, false, false, None, None);
+            app.audible_scene = Some(app.scenes.current().id);
+            app.visual
+                .install_layout(visual_layout("s(\"bd\").scope().pianoroll()", 1).unwrap());
+            let pictures = app.stage_pictures();
+            assert_eq!(pictures.len(), 2, "both painters are on the stage");
+            for (_, picture) in pictures {
+                let written: String = picture
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .filter(|symbol| *symbol != " ")
+                    .collect();
+                assert!(written.is_empty(), "the stage stays blank: {written:?}");
+            }
+        }
+    }
+}

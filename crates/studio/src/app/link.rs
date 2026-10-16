@@ -51,3 +51,121 @@ impl App {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod link {
+        //! Tests for `app/link.rs`: the checkbox that joins the Link
+        //! session, and the transport that follows what it plays.
+
+        use crate::app::tests::support::*;
+        use crate::app::*;
+        use crate::devices::DeviceKind;
+        use rustel_runtime::link::LinkStatus;
+
+        /// A snapshot whose session stands where the test wants it.
+        fn session(playing: bool) -> StudioSnapshot {
+            StudioSnapshot {
+                clock: crate::engine::ClockStatus {
+                    link: Some(LinkStatus {
+                        peers: 1,
+                        bpm: 120.0,
+                        playing,
+                        cycle: 4.0,
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn the_link_tab_joins_on_space_and_leaves_on_space_again() {
+            // The checkbox is what is tested here, not the wire: the
+            // worker behind it is real, so the session stays off it,
+            // else a plain test run asks the OS for its consent.
+            rustel_runtime::link::keep_the_session_off_the_wire();
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "$: s(\"bd\")\n");
+            app.panel = Some(crate::devices::DevicePanel {
+                kind: DeviceKind::Link,
+                ..crate::devices::DevicePanel::default()
+            });
+
+            app.handle_panel_key(KeyCode::Char(' '), false)
+                .expect("handled");
+            assert!(app.link_enabled, "joined");
+            assert!(app.panel.is_some(), "the list stays up to watch it");
+            assert!(app.status.contains("joined"), "{}", app.status);
+
+            app.handle_panel_key(KeyCode::Char(' '), false)
+                .expect("handled");
+            assert!(!app.link_enabled, "left");
+            assert!(app.status.contains("left"), "{}", app.status);
+        }
+
+        #[test]
+        fn a_session_that_starts_playing_starts_this_studio_too() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "$: s(\"bd\")\n");
+            // The session stands idle first, so the start is a change.
+            app.snapshot = Some(session(false));
+            app.pump_link();
+
+            app.snapshot = Some(session(true));
+            app.pump_link();
+            let last = app.log.lines().back().expect("something was done");
+            assert!(
+                last.text.contains("update -"),
+                "the score plays: {}",
+                last.text
+            );
+
+            // The same state again is our own echo, or a steady session:
+            // nothing is sent a second time.
+            let sent = last.text.to_owned();
+            app.pump_link();
+            let still = app.log.lines().back().expect("something was done");
+            assert_eq!(still.text, sent, "one start, one update");
+        }
+
+        #[test]
+        fn a_session_that_stops_playing_stops_this_studio_too() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "$: s(\"bd\")\n");
+            // A studio already playing, as one standing in a session is.
+            let mut steady = session(true);
+            steady.playing = true;
+            app.snapshot = Some(steady);
+            app.pump_link();
+
+            // The engine has not answered the stop yet, so the studio still
+            // reads as playing when the session's stop arrives.
+            let mut stopped = session(false);
+            stopped.playing = true;
+            app.snapshot = Some(stopped);
+            app.pump_link();
+            let last = app.log.lines().back().expect("something was done");
+            assert!(
+                last.text.contains("stop -"),
+                "the set goes quiet: {}",
+                last.text
+            );
+        }
+
+        #[test]
+        fn with_no_session_to_stand_in_nothing_is_sent() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "$: s(\"bd\")\n");
+            app.snapshot = Some(StudioSnapshot::default());
+            app.pump_link();
+            assert!(
+                app.log
+                    .lines()
+                    .back()
+                    .is_none_or(|line| !line.text.contains("update -")),
+                "no session, no start"
+            );
+        }
+    }
+}

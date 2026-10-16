@@ -741,3 +741,626 @@ pub(super) fn format_take_length(seconds: f64) -> String {
         format!("{}:{:02}", total / 60, total % 60)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod recording {
+        //! Tests for `app/recording.rs`.
+
+        use crate::app::recording::*;
+        use crate::app::tests::support::*;
+        use crate::engine::{RecordingInfo, StudioStop};
+        use crate::wav::{RawSignalSummary, TakeStatus};
+
+        /// A take and a sample are one recorder to the player: pressing one
+        /// while the other runs says, in the footer, which to finish first -
+        /// and starts nothing.
+        #[test]
+        fn a_take_and_a_sample_refuse_each_other_in_the_footer() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+
+            app.active_recording_id = Some(7);
+            app.toggle_sample();
+            assert!(app.sample_take.is_none(), "no sample started under a take");
+            assert!(app.pending_sample.is_none());
+            let shown = app.errors.visible().expect("a footer error").to_owned();
+            assert!(
+                shown.starts_with("a take is recording - finish it (^\u{21e7}R)"),
+                "{shown}"
+            );
+
+            app.active_recording_id = None;
+            app.sample_take = Some(SampleTake {
+                started: Instant::now(),
+                path: directory.path().join("sample.wav"),
+                shown_second: 0,
+            });
+            app.toggle_take();
+            assert!(
+                app.pending_recording.is_none(),
+                "no take started under a sample"
+            );
+            let shown = app.errors.visible().expect("a footer error").to_owned();
+            assert!(
+                shown.starts_with("a sample is recording - finish it (^H)"),
+                "{shown}"
+            );
+        }
+
+        /// The chord the table shows for recording a sample is the chord that
+        /// records one. It had no handler of its own, so the key the menu
+        /// promised did nothing in any terminal.
+        #[test]
+        fn the_record_sample_chord_starts_a_sample() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let chord = app
+                .keybinds
+                .binding(BindAction::RecordSample)
+                .expect("record a sample has a chord");
+            let mut modifiers = KeyModifiers::NONE;
+            if chord.control {
+                modifiers |= KeyModifiers::CONTROL;
+            }
+            if chord.shift {
+                modifiers |= KeyModifiers::SHIFT;
+            }
+            press(&mut app, chord.code, modifiers);
+            assert!(
+                app.pending_sample.is_some(),
+                "the press reached the recorder: {}",
+                app.status
+            );
+            assert!(
+                app.sample_take.is_some(),
+                "a sample is on its way: {}",
+                app.status
+            );
+            assert_eq!(app.status, "● recording a sample…");
+
+            // The fixture opens no default input, so the engine's answer is the
+            // refusal a machine with no input gives - and it leaves nothing open.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.pending_sample.is_some() && Instant::now() < deadline {
+                while let Ok(event) = app.worker.try_recv_control() {
+                    app.handle_control(event);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(app.pending_sample.is_none(), "the engine answered");
+            assert!(app.sample_take.is_none(), "a refused start leaves no take");
+            assert_eq!(app.status, "no sample is recording");
+            assert_eq!(
+                app.errors.visible(),
+                Some(
+                    "could not record a sample: no audio input to record from: \
+             this studio opens no default input"
+                )
+            );
+        }
+
+        /// A sample whose writer failed on the way out says so twice over: the
+        /// error line has the reason, and the status stops saying "finishing the
+        /// sample…", which beside that error would read as a finish still under
+        /// way.
+        #[test]
+        fn a_sample_that_fails_to_save_stops_saying_it_is_finishing() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let path = directory.path().join("sample.wav");
+            app.sample_take = Some(SampleTake {
+                started: Instant::now(),
+                path: path.clone(),
+                shown_second: 0,
+            });
+            app.toggle_sample();
+            let request_id = app.pending_sample.expect("the finish went to the engine");
+            assert_eq!(app.status, "finishing the sample…");
+
+            let mut failed = status(&path);
+            failed.error = Some("No space left on device (os error 28)".into());
+            app.handle_control(StudioControlEvent::SampleRecording(
+                SampleRecordingOutcome {
+                    request_id,
+                    result: Ok(SampleReply::Finished(failed)),
+                },
+            ));
+            assert_eq!(app.pending_sample, None);
+            assert!(app.sample_take.is_none());
+            assert_eq!(app.status, "sample not saved");
+            assert_eq!(
+                app.errors.visible(),
+                Some("sample not saved: No space left on device (os error 28)")
+            );
+        }
+
+        /// A finished sample names the bank the player types - `recordings:2` -
+        /// first in the footer, before the long filename that would otherwise
+        /// push it off a narrow row. That name is what ^J pastes.
+        #[test]
+        fn a_saved_sample_names_its_bank_first_in_the_footer() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.ui_settings.trim_recordings = false;
+            let recordings = directory.path().join("recordings");
+            std::fs::create_dir_all(&recordings).expect("recordings folder");
+            app.prefs.recordings_directory = Some(recordings.display().to_string());
+            for name in ["sample-a.wav", "sample-b.wav"] {
+                std::fs::write(recordings.join(name), b"").expect("existing take");
+            }
+            let path = recordings.join("sample-c.wav");
+            std::fs::write(&path, b"").expect("the new sample");
+            app.sample_take = Some(SampleTake {
+                started: Instant::now(),
+                path: path.clone(),
+                shown_second: 0,
+            });
+            app.toggle_sample();
+            let request_id = app.pending_sample.expect("the finish went to the engine");
+
+            app.handle_control(StudioControlEvent::SampleRecording(
+                SampleRecordingOutcome {
+                    request_id,
+                    result: Ok(SampleReply::Finished(status(&path))),
+                },
+            ));
+
+            assert_eq!(
+                app.last_recorded_sample.as_deref(),
+                Some("recordings:2"),
+                "the latest sample is the one ^J pastes"
+            );
+            assert!(
+                app.status.starts_with("sample saved - recordings:2"),
+                "the footer leads with the name to type: {}",
+                app.status
+            );
+            assert!(
+                app.status.contains("sample-c.wav"),
+                "the file is still named, after the bank: {}",
+                app.status
+            );
+            assert_eq!(
+                app.last_file_status.as_ref(),
+                Some(&app.status),
+                "the status line's path is still a link to the file"
+            );
+        }
+
+        /// The sample saved names the variant that plays it: a folder bank
+        /// lists its audio files in name order, and nothing else counts.
+        #[test]
+        fn a_saved_sample_is_named_by_the_variant_that_plays_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            for name in [
+                "session-2026-09-22T01-00-00.wav",
+                "sample-2026-09-22T02-00-00.wav",
+                "notes.txt",
+                "sample-2026-09-22T01-30-00.wav",
+            ] {
+                std::fs::write(directory.path().join(name), b"").expect("file");
+            }
+            std::fs::create_dir(directory.path().join("sample-a-folder")).expect("folder");
+            assert_eq!(
+                variant_index(
+                    directory.path(),
+                    &directory.path().join("sample-2026-09-22T02-00-00.wav")
+                ),
+                Some(1)
+            );
+            assert_eq!(
+                variant_index(
+                    directory.path(),
+                    &directory.path().join("sample-2026-09-22T03-00-00.wav")
+                ),
+                Some(2),
+                "a recording not written yet already has its place"
+            );
+            assert_eq!(
+                recording_sound(&directory.path().join("sample-2026-09-22T01-30-00.wav")),
+                format!(
+                    "{}:0",
+                    directory.path().file_name().unwrap().to_string_lossy()
+                )
+            );
+        }
+
+        #[test]
+        fn a_take_that_ends_on_its_own_is_said_in_two_words() {
+            assert_eq!(
+                short_disk_reason("No space left on device (os error 28)"),
+                "disk full"
+            );
+            assert_eq!(
+                short_disk_reason("Permission denied (os error 13)"),
+                "no permission"
+            );
+            assert_eq!(
+                short_disk_reason("Read-only file system (os error 30)"),
+                "read-only disk"
+            );
+            assert_eq!(
+                short_disk_reason("Input/output error (os error 5)"),
+                "disk error"
+            );
+            assert_eq!(format_take_length(754.0), "12:34");
+        }
+
+        fn status(path: &std::path::Path) -> TakeStatus {
+            TakeStatus {
+                path: path.to_path_buf(),
+                sample_rate: 48_000,
+                frames: 48_000,
+                bytes: 288_044,
+                error: None,
+                final_signal: Some(RawSignalSummary {
+                    sample_count: 96_000,
+                    nonfinite_count: 0,
+                    finite_peak: 0.5,
+                }),
+            }
+        }
+
+        fn finished(request_id: u64, capture_id: u64, status: TakeStatus) -> StudioControlEvent {
+            StudioControlEvent::Recording(RecordingOutcome {
+                request_id: Some(request_id),
+                result: Ok(RecordingReply::Finished { capture_id, status }),
+            })
+        }
+
+        fn recording(path: &std::path::Path, error: Option<String>) -> StudioSnapshot {
+            StudioSnapshot {
+                recording: Some(RecordingInfo {
+                    path: path.to_path_buf(),
+                    seconds: 1.0,
+                    bytes: 288_044,
+                    dropped_seconds: 0.0,
+                    error,
+                }),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn joined_take_is_retained_after_stop_and_only_then_reported_saved() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            // Trimming has its own asynchronous test below; this test isolates
+            // the recorder's join and final-reply ordering.
+            app.ui_settings.trim_recordings = false;
+            let status = status(&directory.path().join("take.wav"));
+            app.active_recording_id = Some(1);
+            app.toggle_take();
+            let request_id = app.pending_recording.expect("stop enqueued");
+            assert_eq!(app.status, "closing take…");
+            assert_eq!(app.last_file, None);
+            assert!(app.last_finished_take.is_none());
+            app.handle_control(StudioControlEvent::Stopped(Box::new(StudioStop::idle())));
+            let outcome = finished(request_id, 1, status.clone());
+            app.handle_control(outcome.clone());
+            assert_eq!(app.pending_recording, None);
+            assert_eq!(app.last_file.as_ref(), Some(&status.path));
+            // The status names the bank the player must type, not the file:
+            // that is the whole point of registering a take immediately.
+            assert!(
+                app.status.starts_with("take saved - take.wav · s(\""),
+                "{}",
+                app.status
+            );
+            // Registering the take must not land on Settings ▸ Samples the way
+            // a dropped folder does: a sheet over the score is the last thing
+            // anyone wants the moment they stop recording.
+            assert!(
+                app.settings_sheet.is_none(),
+                "stopping a take opened the settings sheet"
+            );
+            app.handle_control(StudioControlEvent::Snapshot(Box::default()));
+            app.handle_control(outcome);
+            assert!(matches!(&app.last_finished_take.as_ref().unwrap().result,
+                Ok(RecordingReply::Finished { capture_id: 1, status: received }) if received == &status));
+            assert_eq!(
+                app.log
+                    .lines()
+                    .iter()
+                    .filter(|line| line.kind == "take" && line.text.starts_with("saved "))
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
+        fn a_silent_take_is_removed_and_not_registered() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            let path = directory.path().join("silent.wav");
+            std::fs::write(&path, b"placeholder").unwrap();
+            let mut silent = status(&path);
+            silent.final_signal.as_mut().unwrap().finite_peak = 0.0;
+            app.active_recording_id = Some(1);
+            app.pending_recording = Some(2);
+
+            app.handle_control(finished(2, 1, silent));
+
+            assert!(!path.exists(), "silent capture was left on disk");
+            assert_eq!(
+                app.last_file, None,
+                "silent capture was advertised as saved"
+            );
+            assert_eq!(app.status, "take not saved - silence");
+            assert!(
+                app.log
+                    .lines()
+                    .iter()
+                    .any(|line| line.kind == "take" && line.text.starts_with("discarded silence"))
+            );
+        }
+
+        #[test]
+        fn older_final_reply_cannot_close_a_newer_take_even_at_the_same_path() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            let status = status(&directory.path().join("take.wav"));
+            let snapshot = recording(&status.path, None);
+            app.snapshot = Some(snapshot.clone());
+            app.active_recording_id = Some(3);
+            app.pending_recording = Some(4);
+            let older = finished(2, 1, status.clone());
+            app.handle_control(older.clone());
+            assert_eq!(app.snapshot, Some(snapshot));
+            assert_eq!(app.active_recording_id, Some(3));
+            assert_eq!(app.pending_recording, Some(4));
+            assert_eq!(app.last_file, None);
+            assert_eq!(app.last_finished_take.as_ref().unwrap().request_id, Some(2));
+            app.handle_control(finished(4, 3, status));
+            app.handle_control(older);
+            assert_eq!(app.last_finished_take.as_ref().unwrap().request_id, Some(4));
+            assert_eq!(app.active_recording_id, None);
+        }
+
+        #[test]
+        fn final_error_details_are_preserved_without_a_saved_notice() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            let mut status = status(&directory.path().join("take.wav"));
+            app.active_recording_id = Some(1);
+            app.pending_recording = Some(2);
+            app.reported_take_error = Some("write failed".into());
+            status.error = Some("write failed; writer thread panicked".into());
+            status.final_signal = None;
+            app.handle_control(finished(2, 1, status.clone()));
+            assert_eq!(app.last_file, None);
+            assert_eq!(
+                app.status,
+                "take ended: write failed; writer thread panicked"
+            );
+            assert!(matches!(&app.last_finished_take.as_ref().unwrap().result,
+                Ok(RecordingReply::Finished { status: received, .. }) if received == &status));
+            // An I/O error can also accompany a complete received-input summary.
+            status.final_signal = Some(RawSignalSummary {
+                sample_count: 2,
+                nonfinite_count: 1,
+                finite_peak: 0.5,
+            });
+            app.reported_take_error = None;
+            app.active_recording_id = Some(3);
+            app.pending_recording = Some(4);
+            app.handle_control(finished(4, 3, status.clone()));
+            assert!(matches!(&app.last_finished_take.as_ref().unwrap().result,
+                Ok(RecordingReply::Finished { status: received, .. }) if received == &status));
+            assert_eq!(
+                app.log
+                    .lines()
+                    .iter()
+                    .filter(|line| line.kind == "take")
+                    .map(|line| line.repeats)
+                    .sum::<u32>(),
+                2,
+                "both takes' errors are reported, the second as a repeat of the first"
+            );
+        }
+
+        #[test]
+        fn automatic_final_is_not_an_answer_to_an_absent_or_pending_request() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            let status = status(&directory.path().join("take.wav"));
+            let previous_status = app.status.clone();
+            app.handle_control(StudioControlEvent::Recording(RecordingOutcome {
+                request_id: None,
+                result: Ok(RecordingReply::Finished {
+                    capture_id: 1,
+                    status: status.clone(),
+                }),
+            }));
+            assert_eq!(app.last_file, None);
+            assert_eq!(app.status, previous_status);
+            assert!(app.last_finished_take.is_some());
+
+            app.active_recording_id = Some(3);
+            app.pending_recording = Some(4);
+            app.handle_control(StudioControlEvent::Snapshot(Box::default()));
+            assert_eq!(app.active_recording_id, Some(3));
+            let final_reply = RecordingOutcome {
+                request_id: None,
+                result: Ok(RecordingReply::Finished {
+                    capture_id: 3,
+                    status: status.clone(),
+                }),
+            };
+            app.handle_recording(final_reply.clone());
+            app.handle_recording(final_reply);
+            assert_eq!(app.pending_recording, Some(4));
+            assert_eq!(app.active_recording_id, None);
+            assert_eq!(app.last_file, Some(status.path));
+            assert_eq!(
+                app.log
+                    .lines()
+                    .iter()
+                    .filter(|line| line.kind == "take" && line.text.starts_with("saved "))
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
+        fn start_reply_discards_the_previous_snapshot_before_watching_errors() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.snapshot = Some(recording(
+                &directory.path().join("take.wav"),
+                Some("old error".into()),
+            ));
+            app.pending_recording = Some(3);
+            app.watch_take();
+            assert_eq!(app.reported_take_error, None);
+            assert_eq!(app.pending_recording, Some(3));
+            app.handle_control(StudioControlEvent::Recording(RecordingOutcome {
+                request_id: Some(3),
+                result: Ok(RecordingReply::Started { capture_id: 3 }),
+            }));
+            app.watch_take();
+            assert_eq!(app.active_recording_id, Some(3));
+            assert_eq!(app.pending_recording, None);
+            assert_eq!(app.reported_take_error, None);
+            assert!(app.snapshot.as_ref().unwrap().recording.is_none());
+            // A snapshot can arrive while the closed writer is still finishing.
+            app.handle_control(StudioControlEvent::Snapshot(Box::default()));
+            assert_eq!(app.active_recording_id, Some(3));
+            assert!(app.last_finished_take.is_none());
+            app.handle_control(StudioControlEvent::Recording(RecordingOutcome {
+                request_id: None,
+                result: Ok(RecordingReply::Finished {
+                    capture_id: 3,
+                    status: status(&directory.path().join("take.wav")),
+                }),
+            }));
+            assert_eq!(app.active_recording_id, None);
+            app.pending_recording = Some(4);
+            app.handle_control(StudioControlEvent::Recording(RecordingOutcome {
+                request_id: Some(4),
+                result: Ok(RecordingReply::Started { capture_id: 4 }),
+            }));
+            assert_eq!(app.active_recording_id, Some(4));
+            assert_eq!(app.pending_recording, None);
+        }
+
+        /// A finished take registers as a source at once, and the status names
+        /// the bank that plays it with `s("<stem>")`. `trim_recordings` (on by
+        /// default) trims the file first; off leaves the file as recorded.
+        #[test]
+        fn a_finished_take_registers_and_the_status_names_its_bank() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+
+            let takes = directory.path().join("takes");
+            std::fs::create_dir_all(&takes).unwrap();
+            app.prefs.recordings_directory = Some(takes.display().to_string());
+            let make_take = |name: &str| {
+                let path = takes.join(name);
+                let mut writer =
+                    crate::wav::TakeWriter::start(path.clone(), 48_000).expect("writer");
+                assert_eq!(writer.push_padded(Vec::new(), 2_000), Ok(true));
+                let loud: Vec<f32> = std::iter::repeat_n([0.6_f32, -0.6_f32], 1_000)
+                    .flatten()
+                    .collect();
+                assert!(writer.push(loud));
+                assert_eq!(writer.push_padded(Vec::new(), 2_000), Ok(true));
+                let take_status = writer.finish();
+                assert_eq!(take_status.error, None);
+                path
+            };
+
+            // Trimmed by default.
+            let path = make_take("one.wav");
+            let before = std::fs::read(&path).unwrap();
+            app.active_recording_id = Some(1);
+            app.pending_recording = Some(2);
+            app.handle_control(finished(2, 1, status(&path)));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !app.trim_jobs.is_empty() && Instant::now() < deadline {
+                std::thread::yield_now();
+                app.poll_trim_jobs();
+            }
+            assert!(app.trim_jobs.is_empty(), "trim worker did not answer");
+            assert!(app.status.contains("s(\"takes:0\")"), "{}", app.status);
+            assert!(app.status.contains("trimmed"), "{}", app.status);
+            let after = std::fs::read(&path).unwrap();
+            assert!(
+                after.len() < before.len(),
+                "the padded silence either side was cut"
+            );
+            app.settle_sample_sources();
+            assert!(
+                app.worker
+                    .library()
+                    .is_some_and(|library| library.knows("one")),
+                "the take is playable at once, not on the next periodic scan"
+            );
+
+            // Off: the file the recorder wrote is left exactly as it was.
+            app.ui_settings.trim_recordings = false;
+            let path2 = make_take("two.wav");
+            let before2 = std::fs::read(&path2).unwrap();
+            app.active_recording_id = Some(3);
+            app.pending_recording = Some(4);
+            app.handle_control(finished(4, 3, status(&path2)));
+            assert!(app.status.contains("s(\"takes:1\")"), "{}", app.status);
+            assert!(!app.status.contains("trimmed"), "{}", app.status);
+            let after2 = std::fs::read(&path2).unwrap();
+            assert_eq!(
+                before2, after2,
+                "trim_recordings off leaves the file untouched"
+            );
+        }
+
+        /// A take that lands in a set's own `sessions/` folder is kept but never
+        /// registered as a sample source, and the footer offers no `s("…")` that
+        /// would not play it.
+        #[test]
+        fn a_take_saved_in_a_sets_sessions_folder_is_not_a_sample_source() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.ui_settings.trim_recordings = false;
+            let sessions = app.scenes.sessions_directory();
+            std::fs::create_dir_all(&sessions).unwrap();
+            app.prefs.recordings_directory = Some(sessions.display().to_string());
+            let path = sessions.join("take.wav");
+            std::fs::write(&path, b"placeholder").unwrap();
+            app.active_recording_id = Some(1);
+            app.pending_recording = Some(2);
+
+            app.handle_control(finished(2, 1, status(&path)));
+
+            assert!(path.exists(), "the take is kept");
+            assert_eq!(app.last_file.as_ref(), Some(&path));
+            assert_eq!(app.status, "take saved - take.wav");
+            assert!(
+                app.prefs.sample_sources.is_empty(),
+                "{:?}",
+                app.prefs.sample_sources
+            );
+            assert!(
+                app.log.lines().iter().any(
+                    |line| line.kind == "take" && line.text.contains("not imported as samples")
+                ),
+                "the log says why the take is not a sound"
+            );
+        }
+
+        #[test]
+        fn takes_default_to_recordings_while_session_tapes_stay_with_the_set() {
+            let directory = tempfile::tempdir().unwrap();
+            let app = app_over(directory.path());
+
+            assert_eq!(
+                app.recordings_directory()
+                    .file_name()
+                    .and_then(|name| name.to_str()),
+                Some("recordings")
+            );
+            assert_ne!(app.recordings_directory(), app.sessions_directory());
+            assert_eq!(app.sessions_directory(), app.scenes.sessions_directory());
+        }
+    }
+}

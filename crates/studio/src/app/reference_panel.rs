@@ -1742,3 +1742,1158 @@ impl App {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod catalogue {
+        //! Tests for catalogue.
+
+        use crate::app::*;
+        use crate::editor::MemoryClipboard;
+        use rustel_runtime::samples::SampleLibrary;
+        use std::sync::{Arc, mpsc};
+
+        fn library() -> Arc<SampleLibrary> {
+            let library = Arc::new(SampleLibrary::empty());
+            library
+                .register_trusted_custom(r#"{"cached_bd":["http://127.0.0.1:9/bd.wav"]}"#, None)
+                .unwrap();
+            library
+        }
+
+        fn contains(app: &App, name: &str) -> bool {
+            app.reference_panel
+                .as_ref()
+                .unwrap()
+                .sounds
+                .iter()
+                .any(|sound| sound.name == name)
+        }
+
+        #[test]
+        fn catalogue_is_ready_on_every_open_even_while_library_is_locked() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let library = library();
+            app.worker.set_library(Arc::clone(&library));
+            let (locked, entered) = mpsc::sync_channel(1);
+            let (release, gate) = mpsc::sync_channel(1);
+            let holder = std::thread::spawn(move || {
+                library.with_catalogue_lock_for_tests(|| {
+                    locked.send(()).unwrap();
+                    gate.recv_timeout(Duration::from_secs(5)).is_ok()
+                })
+            });
+            entered.recv_timeout(Duration::from_secs(2)).unwrap();
+            app.refresh_catalogue();
+            let start = Instant::now();
+            for _ in 0..10 {
+                app.reference_panel = None;
+                app.focus = Focus::Editor;
+                app.toggle_reference_browse();
+                assert!(contains(&app, "cached_bd"), "Ctrl+Space first frame");
+                app.reference_panel = None;
+                app.focus = Focus::Editor;
+                app.toggle_reference_at_caret();
+                assert!(contains(&app, "cached_bd"), "Ctrl+D first frame");
+                app.reference_panel.as_mut().unwrap().tab = Tab::Reference;
+                app.handle_reference_key(KeyCode::Tab, false, false)
+                    .unwrap();
+                assert_eq!(app.reference_panel.as_ref().unwrap().tab, Tab::Samples);
+                assert!(
+                    contains(&app, "cached_bd"),
+                    "tab switching needs no refresh"
+                );
+            }
+            eprintln!(
+                "20 catalogue panel opens while library is locked: {:?}",
+                start.elapsed()
+            );
+            let _ = release.send(());
+            assert!(
+                holder.join().unwrap(),
+                "opening the panel waited for the library lock to time out"
+            );
+        }
+
+        #[test]
+        fn catalogue_arrivals_are_installed_before_switching_to_samples() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let library = library();
+            app.worker.set_library(Arc::clone(&library));
+            app.toggle_reference_browse();
+            app.reference_panel.as_mut().unwrap().tab = Tab::Reference;
+            library
+                .register_trusted_custom(r#"{"arrived_sn":["http://127.0.0.1:9/sn.wav"]}"#, None)
+                .unwrap();
+            app.refresh_catalogue();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !contains(&app, "arrived_sn") && Instant::now() < deadline {
+                app.pump_turn();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                contains(&app, "arrived_sn"),
+                "hidden Samples list was not kept ready"
+            );
+            assert_eq!(app.reference_panel.as_ref().unwrap().tab, Tab::Reference);
+            app.handle_reference_key(KeyCode::Tab, false, false)
+                .unwrap();
+            assert_eq!(app.reference_panel.as_ref().unwrap().tab, Tab::Samples);
+            assert!(contains(&app, "arrived_sn"));
+        }
+
+        #[test]
+        fn requesting_a_catalogue_refresh_does_not_undo_a_visible_rename() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.worker.set_library(library());
+            app.toggle_reference_browse();
+            app.reference_panel
+                .as_mut()
+                .unwrap()
+                .prepare_sound_rename("cached_bd", "vox1");
+            app.refresh_catalogue();
+            assert!(contains(&app, "vox1"));
+            assert!(!contains(&app, "cached_bd"));
+        }
+
+        #[test]
+        fn large_cached_catalogue_renders_its_first_frame_with_complete_grouping() {
+            use crate::reference::{ReferenceView, SoundRow};
+            use ratatui::{buffer::Buffer, widgets::Widget};
+            use rustel_runtime::samples::{SoundCategory, SoundEntry, SoundOrigin};
+            let reference = Reference::load_all();
+            let sounds = (0..10_000)
+                .map(|i| SoundEntry {
+                    name: format!("machine{:04}_sound{:02}", i / 10, i % 10),
+                    variants: 16,
+                    variant_names: Vec::new(),
+                    origin: SoundOrigin::Default,
+                    category: SoundCategory::Drums,
+                    location: Some(format!("https://example.invalid/samples/{i}.wav")),
+                    import: None,
+                })
+                .collect::<Vec<_>>();
+            let theme = Theme::built_in_default();
+            let area = ratatui::layout::Rect::new(0, 0, 90, 32);
+            let mut buffer = Buffer::empty(area);
+            let start = Instant::now();
+            let mut panel = ReferencePanel::samples(&reference, sounds);
+            panel.open_categories.extend(panel.section_categories());
+            let opened = start.elapsed();
+            ReferenceView {
+                keybinds: &crate::keybinds::Keybinds::default(),
+                focused: true,
+                pulse: None,
+                sounding_note: None,
+                loading: None,
+                caching: 0,
+                importing: 0,
+                library_loading: false,
+                #[cfg(feature = "hydra")]
+                playing: None,
+                #[cfg(feature = "hydra")]
+                preview_note: None,
+                #[cfg(feature = "hydra")]
+                preview_progress: None,
+                #[cfg(feature = "hydra")]
+                preview_row: None,
+                picture: false,
+                refused: None,
+                reference: &reference,
+                panel: &panel,
+                theme: &theme,
+            }
+            .render(area, &mut buffer);
+            eprintln!(
+                "10,000-bank cached catalogue: open {:?}, first render {:?}, total {:?}",
+                opened,
+                start.elapsed() - opened,
+                start.elapsed()
+            );
+            assert_eq!(panel.sound_rows().len(), 1_000);
+            assert!(
+                panel
+                    .sound_rows()
+                    .iter()
+                    .all(|row| matches!(row, SoundRow::Family(_)))
+            );
+            let drawn = buffer
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(
+                drawn.contains("machine0000"),
+                "first frame contains the catalogue"
+            );
+            assert!(
+                drawn.contains("10000 of 10000 sounds"),
+                "all banks are present"
+            );
+        }
+
+        /// A `.bank(…)` completion whose library arrives under the open panel
+        /// refills its machines - the list never stays short of what would
+        /// play, and what the reader has typed keeps filtering.
+        #[test]
+        fn a_bank_list_refills_when_the_library_arrives_late() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            // The library the panel opens under has not met a bank yet.
+            app.worker.set_library(std::sync::Arc::new(
+                rustel_runtime::samples::SampleLibrary::empty(),
+            ));
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("$: s(\"cymbal\").bank(\"".into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            app.toggle_reference_browse();
+            {
+                let panel = app.reference_panel.as_ref().expect("panel open");
+                assert!(panel.bank_vocabulary());
+                assert!(panel.results.is_empty(), "no library yet, no machines");
+            }
+            let library = std::sync::Arc::new(rustel_runtime::samples::SampleLibrary::empty());
+            library
+                .register_trusted_custom(r#"{"Metal_cymbal":["http://127.0.0.1:9/a.wav"]}"#, None)
+                .expect("bank");
+            app.worker.set_library(std::sync::Arc::clone(&library));
+            // set_library publishes the test snapshot synchronously.
+            app.install_catalogue();
+            let panel = app.reference_panel.as_ref().expect("panel open");
+            assert_eq!(
+                panel.vocabulary.as_ref().expect("vocabulary").names,
+                vec!["Metal".to_owned()],
+                "the machine the library brought"
+            );
+            assert_eq!(panel.results.len(), 1);
+        }
+    }
+
+    mod reference_insertion {
+        //! Tests for reference insertion.
+
+        use crate::app::*;
+        use crate::editor::MemoryClipboard;
+        use crate::editor::Selection;
+        use crate::reference::{PanelIntent, ReferenceMode};
+
+        fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+            app.handle_terminal_event(Event::Key(KeyEvent::new(code, modifiers)))
+                .unwrap();
+        }
+
+        fn seed(app: &mut App, source: &str) {
+            let caret = source.find('|').unwrap();
+            let source = source.replace('|', "");
+            app.editor_mut()
+                .dispatch(
+                    Command::SelectAll,
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .unwrap();
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText(source),
+                    HistoryMoment(1),
+                    &mut MemoryClipboard::default(),
+                )
+                .unwrap();
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(caret)))
+                .unwrap();
+            app.focus = Focus::Editor;
+        }
+
+        fn marked(app: &App) -> String {
+            let text = app.editor().source();
+            let caret = app.editor().primary_selection().head.0;
+            format!("{}|{}", &text[..caret], &text[caret..])
+        }
+
+        fn choose(app: &mut App, name: &str) {
+            press(app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            app.set_reference_panel(Some(ReferencePanel::browse_for(&app.reference, name)));
+            press(app, KeyCode::Enter, KeyModifiers::NONE);
+        }
+
+        fn assert_parameters(app: &App, name: &str) {
+            let panel = app
+                .reference_panel
+                .as_ref()
+                .expect("parameters stay visible");
+            assert_eq!(panel.tab, Tab::Reference);
+            let ReferenceMode::Entry { index, .. } = panel.mode else {
+                panic!("not the parameter page")
+            };
+            assert_eq!(app.reference.entry(index).unwrap().name, name);
+            assert_eq!(
+                app.focus,
+                Focus::Editor,
+                "arguments go straight into the score"
+            );
+            assert!(app.reference_anchor.is_none());
+        }
+
+        #[test]
+        fn ctrl_d_inserts_a_closed_call_and_keeps_its_parameters_while_typing() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            seed(&mut app, "$: |");
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            for letter in "lpf".chars() {
+                press(&mut app, KeyCode::Char(letter), KeyModifiers::NONE);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(marked(&app), "$: lpf(|)");
+            assert_parameters(&app, "lpf");
+            for letter in "800".chars() {
+                press(&mut app, KeyCode::Char(letter), KeyModifiers::NONE);
+            }
+            assert_eq!(marked(&app), "$: lpf(800|)");
+            assert_parameters(&app, "lpf");
+        }
+
+        #[test]
+        fn chained_calls_existing_arguments_and_zero_argument_functions_keep_their_shape() {
+            for (before, name, after) in [
+                ("$: s(\"bd\").|", "gain", "$: s(\"bd\").gain(|)"),
+                ("$: s(\"bd\")|", "gain", "$: s(\"bd\").gain(|)"),
+                (
+                    "$: s(\"bd\").gaiin|(0.5)",
+                    "gain",
+                    "$: s(\"bd\").gain(|0.5)",
+                ),
+                ("$: s(\"bd\").gain|(0.5)", "gain", "$: s(\"bd\").gain(|0.5)"),
+                (
+                    "$: s(\"bd\").gaiin| (0.5)",
+                    "gain",
+                    "$: s(\"bd\").gain (|0.5)",
+                ),
+                ("$: s(\"bd\").|", "rev", "$: s(\"bd\").rev(|)"),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut app = crate::app::tests::support::app_over(directory.path());
+                seed(&mut app, before);
+                choose(&mut app, name);
+                assert_eq!(marked(&app), after);
+                assert_parameters(&app, name);
+            }
+        }
+
+        #[test]
+        fn a_quote_then_ctrl_d_offers_samples_and_inserts_the_choice_as_a_value() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            seed(&mut app, "$: |");
+            choose(&mut app, "s");
+            assert_eq!(marked(&app), "$: s(|)");
+            assert_parameters(&app, "s");
+            press(&mut app, KeyCode::Char('"'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            let panel = app.reference_panel.as_ref().unwrap();
+            assert_eq!(panel.tab, Tab::Samples);
+            assert_eq!(panel.intent, PanelIntent::Insert);
+            // A synth whose name also has a reference page must remain a quoted value.
+            app.confirm_reference_name("sine".into()).unwrap();
+            assert_eq!(marked(&app), "$: s(\"sine|)");
+            press(&mut app, KeyCode::Char('"'), KeyModifiers::NONE);
+            assert_eq!(marked(&app), "$: s(\"sine\"|)");
+            assert!(app.reference_panel.is_none());
+            assert_eq!(app.focus, Focus::Editor);
+            rustel_runtime::Session::new()
+                .unwrap()
+                .evaluate(&app.editor().source())
+                .unwrap();
+        }
+
+        #[test]
+        fn a_quote_then_ctrl_d_offers_documented_parameter_choices() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            seed(&mut app, "$: s(\"bd\").|");
+            choose(&mut app, "warpmode");
+            assert_parameters(&app, "warpmode");
+            press(&mut app, KeyCode::Char('"'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert!(app.reference_panel.as_ref().unwrap().vocabulary.is_some());
+            app.confirm_reference_name("asym".into()).unwrap();
+            assert_eq!(marked(&app), "$: s(\"bd\").warpmode(\"asym|)");
+            press(&mut app, KeyCode::Char('"'), KeyModifiers::NONE);
+            assert_eq!(marked(&app), "$: s(\"bd\").warpmode(\"asym\"|)");
+            assert!(app.reference_panel.is_none());
+        }
+
+        #[test]
+        fn signals_stay_values_and_insertion_returns_to_editor_with_the_set_panel_open() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            seed(&mut app, "$: |");
+            choose(&mut app, "sine");
+            assert_eq!(marked(&app), "$: sine|");
+            app.toggle_set_panel();
+            seed(&mut app, "$: s(\"bd\").|");
+            choose(&mut app, "gain");
+            assert_parameters(&app, "gain");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.reference_panel.is_none());
+            assert_eq!(marked(&app), "$: s(\"bd\").gain(|)");
+        }
+
+        /// A global that is a value, as a fresh runtime reports it, inserts bare:
+        /// `nothing()` and `sliderValues()` would throw `not a function`.
+        #[test]
+        fn values_the_runtime_reports_insert_bare() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            seed(&mut app, "$: |");
+            choose(&mut app, "nothing");
+            assert_eq!(marked(&app), "$: nothing|");
+            seed(&mut app, "$: |");
+            choose(&mut app, "sliderValues");
+            assert_eq!(marked(&app), "$: sliderValues|");
+        }
+
+        /// ^F on a half-typed word, then a snippet: the word was reaching for
+        /// it, so it goes and the snippet stands where it stood.
+        #[test]
+        fn a_snippet_replaces_the_word_the_reference_was_opened_on() {
+            use crate::reference::Tab;
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.scenes.current_mut().editor = Editor::new("$: s(\"bd\")\ngame").expect("editor");
+            press(&mut app, KeyCode::End, KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::End, KeyModifiers::NONE);
+            app.toggle_reference_browse();
+            assert_eq!(
+                app.reference_panel.as_ref().map(|panel| panel.tab),
+                Some(Tab::Reference)
+            );
+            assert!(
+                app.reference_anchor.is_some(),
+                "opened on the word, the panel remembers it"
+            );
+            {
+                let panel = app.reference_panel.as_mut().expect("panel");
+                panel.query.clear();
+                for character in "gamepad setup".chars() {
+                    panel.type_char(&app.reference, character);
+                }
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let source = app.scenes.current().editor.source();
+            assert!(
+                source.starts_with("$: s(\"bd\")\nconst gp = gamepad(0)"),
+                "the word went and the snippet took its line: {source}"
+            );
+            assert!(!source.contains("game\n"), "{source}");
+        }
+
+        /// Enter on a snippet row pastes its lines into the score, whole and
+        /// on lines of their own, and hands the keyboard back to the score.
+        #[test]
+        fn enter_on_a_snippet_pastes_it_into_the_score() {
+            use crate::reference::Tab;
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.scenes.current_mut().editor = Editor::new("$: s(\"bd\")").expect("editor");
+            // Caret at the end of the only line: the snippet goes under it.
+            press(&mut app, KeyCode::End, KeyModifiers::NONE);
+            app.toggle_reference_browse();
+            assert_eq!(
+                app.reference_panel.as_ref().map(|panel| panel.tab),
+                Some(Tab::Reference)
+            );
+            for character in "set tempo".chars() {
+                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.reference_panel.is_none(), "the panel closed");
+            assert_eq!(app.focus, Focus::Editor, "and the score has the keyboard");
+            let source = app.scenes.current().editor.source();
+            assert_eq!(
+                source, "$: s(\"bd\")\nsetcpm(120/4)",
+                "pasted whole, on a line of its own"
+            );
+        }
+
+        /// A function chosen at the head of a chain link goes in as a call with
+        /// the `.` the next link needs: at `.voicing().|s("z_tan")`, `glide`
+        /// leaves `.glide(|).s("z_tan")`.
+        #[test]
+        #[cfg(feature = "extensions")]
+        fn a_function_taken_for_a_chain_goes_in_as_a_call() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let seed = "$: chord(\"G^9 Bb^9\").anchor(\"c4\").voicing().s(\"z_tan\")";
+            let head = |app: &App| {
+                let source = app.editor().source();
+                let head = app.editor().primary_selection().head.0;
+                format!("{}|{}", &source[..head], &source[head..])
+            };
+            app.editor_mut()
+                .dispatch(
+                    Command::SelectAll,
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("all");
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText(seed.into()),
+                    HistoryMoment(1),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            // The caret at the head of the last link, where a new one goes.
+            let at = app
+                .editor()
+                .source()
+                .find("s(\"z_tan\")")
+                .expect("the link");
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(at)))
+                .expect("caret");
+            app.focus = Focus::Editor;
+            // Ctrl+Space, then the name typed into the panel's search box, then
+            // Enter: the whole gesture, as it is actually made.
+            press(&mut app, KeyCode::Char(' '), KeyModifiers::CONTROL);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Reference));
+            for letter in "glide".chars() {
+                press(&mut app, KeyCode::Char(letter), KeyModifiers::NONE);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(
+                head(&app),
+                "$: chord(\"G^9 Bb^9\").anchor(\"c4\").voicing().glide(|).s(\"z_tan\")"
+            );
+            assert_eq!(
+                app.reference_panel
+                    .as_ref()
+                    .and_then(|panel| panel.showing(&app.reference))
+                    .as_deref(),
+                Some("glide"),
+                "the inserted call's parameters remain visible"
+            );
+            assert_eq!(app.focus, Focus::Editor);
+
+            // The end of one link is the head of the next: a chain resting at
+            // `)` takes the call after it, `.` and all.
+            let end = ByteOffset(app.editor().source().trim_end().len());
+            app.editor_mut()
+                .set_selection(Selection::caret(end))
+                .expect("caret");
+            app.focus = Focus::Editor;
+            app.toggle_reference_browse();
+            app.insert_reference_name("room".into()).expect("insert");
+            assert_eq!(
+                head(&app),
+                "$: chord(\"G^9 Bb^9\").anchor(\"c4\").voicing().glide().s(\"z_tan\").room(|)"
+            );
+
+            // With the name half typed in front of an existing link, what is
+            // taken replaces only what was typed: `glide` goes in ahead of `s`,
+            // it does not eat it.
+            app.editor_mut()
+                .dispatch(
+                    Command::SelectAll,
+                    HistoryMoment(2),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("all");
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("$: note(\"c4\").voicing().glis(\"z_tan\")".into()),
+                    HistoryMoment(3),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            let at = app
+                .editor()
+                .source()
+                .find("s(\"z_tan\")")
+                .expect("the link");
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(at)))
+                .expect("caret");
+            app.focus = Focus::Editor;
+            app.toggle_reference_browse();
+            app.insert_reference_name("glide".into()).expect("insert");
+            assert_eq!(
+                head(&app),
+                "$: note(\"c4\").voicing().glide(|).s(\"z_tan\")"
+            );
+
+            // A call that already has its brackets keeps them: its name is
+            // being put right, not a link going in.
+            app.editor_mut()
+                .dispatch(
+                    Command::SelectAll,
+                    HistoryMoment(4),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("all");
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("$: note(\"c4\").gaiin(0.5)".into()),
+                    HistoryMoment(5),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            let at = app.editor().source().find("(0.5)").expect("the brackets");
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(at)))
+                .expect("caret");
+            app.focus = Focus::Editor;
+            app.toggle_reference_browse();
+            app.insert_reference_name("gain".into()).expect("insert");
+            assert_eq!(head(&app), "$: note(\"c4\").gain(|0.5)");
+        }
+    }
+
+    mod reference_panel {
+        //! Tests for `app/reference_panel.rs`.
+
+        use crate::app::tests::support::*;
+        use crate::app::*;
+        use crate::editor::{MemoryClipboard, Selection};
+
+        #[test]
+        fn ctrl_d_explains_the_function_while_editing_its_arguments() {
+            let directory = tempfile::tempdir().unwrap();
+            for (marked, expected) in [
+                ("$: s(\"bd\").distort(\"0.1:0.3:|", "distort"),
+                ("$: distort(\"0.1:|0.3:fold\")", "distort"),
+                ("$: distort(\"gain|\")", "distort"),
+                ("$: distort(amount|)", "distort"),
+                ("$: distort(gain|)", "distort"),
+                ("$: distort(0.1, |)", "distort"),
+                ("$: distort(\n  amount + |\n)", "distort"),
+                ("$: distort([0.1, 0.3]|)", "distort"),
+                ("$: distort(sine(1)|)", "distort"),
+                ("$: distort(sine(freq|))", "sine"),
+                ("$: distort(si|ne(1))", "sine"),
+                ("$: distort(|sine(1))", "distort"),
+                ("$: distort(sine|(1))", "sine"),
+                ("$: lfo({ min: 0.1, max: amount| })", "lfo"),
+                ("$: lfo({ control: \"gain|\" })", "lfo"),
+                ("$: distort(amount /* gain|( */)", "distort"),
+                ("$: distort(/gain|(/)", "distort"),
+                ("$: distort(`0.1:\n0.3:|`)", "distort"),
+            ] {
+                let mut app = app_over(directory.path());
+                let caret = ByteOffset(marked.find('|').unwrap());
+                let source = marked.replace('|', "");
+                app.scenes.current_mut().editor = Editor::new(&source).unwrap();
+                app.editor_mut()
+                    .set_selection(Selection::caret(caret))
+                    .unwrap();
+
+                press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+                let panel = app.reference_panel.as_ref().expect(marked);
+                let crate::reference::ReferenceMode::Entry { index, .. } = panel.mode else {
+                    panic!("expected parameter help for {marked}");
+                };
+                assert_eq!(
+                    app.reference.entry(index).unwrap().name,
+                    expected,
+                    "{marked}"
+                );
+                assert_eq!(app.focus, Focus::Panel(PanelKind::Reference), "{marked}");
+                assert!(app.reference_anchor.is_none(), "{marked}");
+                assert_eq!(app.editor().source(), source, "{marked}");
+                assert_eq!(app.editor().primary_selection(), Selection::caret(caret));
+
+                press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+                assert!(app.reference_panel.is_none(), "{marked}");
+                assert_eq!(app.focus, Focus::Editor, "{marked}");
+                assert_eq!(app.editor().source(), source, "{marked}");
+                assert_eq!(app.editor().primary_selection(), Selection::caret(caret));
+            }
+        }
+
+        #[test]
+        fn ctrl_d_opens_a_visible_reference_overlay_in_zen() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            press(&mut app, KeyCode::F(11), KeyModifiers::NONE);
+
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+            assert!(
+                app.reference_panel.is_some(),
+                "Ctrl+D did not open reference"
+            );
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Reference));
+            let layout = view::regions(
+                app.frame,
+                app.ui_settings.zen,
+                app.panes.len(),
+                app.reference_panel.is_some(),
+                false,
+                None,
+                None,
+            );
+            assert!(
+                !layout.reference.is_empty(),
+                "reference is invisible in zen"
+            );
+            assert_eq!(layout.panes[0].editor, app.frame);
+            assert!(layout.reference_overlays);
+        }
+
+        #[test]
+        fn backspace_from_an_empty_contextual_picker_returns_to_function_arguments() {
+            use crate::reference::{ReferenceMode, Tab};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            for (marked, name) in [
+                (r#"$: s("|")"#, "s"),
+                (r#"$: chord("|")"#, "chord"),
+                (r#"$: n(0).scale("|")"#, "scale"),
+                #[cfg(feature = "extensions")]
+                (r#"$: n(0).inspire("|")"#, "inspire"),
+                (r#"$: s("bd").warpmode("|")"#, "warpmode"),
+                (r#"$: s("bd").bank("|")"#, "bank"),
+            ] {
+                let caret = marked.find('|').expect("caret marker");
+                let source = marked.replace('|', "");
+                let mut app = app_over(directory.path());
+                app.scenes.current_mut().editor = Editor::new(&source).expect("editor");
+                app.editor_mut()
+                    .set_selection(Selection::caret(ByteOffset(caret)))
+                    .expect("caret");
+                press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+                assert!(
+                    app.reference_anchor.is_some(),
+                    "{marked}: a contextual picker"
+                );
+
+                press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+
+                let panel = app
+                    .reference_panel
+                    .as_ref()
+                    .expect("arguments stay visible");
+                assert_eq!(panel.tab, Tab::Reference, "{marked}");
+                let ReferenceMode::Entry { index, .. } = panel.mode else {
+                    panic!("{marked}: expected the enclosing function's arguments")
+                };
+                assert_eq!(app.reference.entry(index).unwrap().name, name, "{marked}");
+                assert!(panel.vocabulary.is_none(), "{marked}");
+                assert!(
+                    app.reference_anchor.is_none(),
+                    "{marked}: discard the value anchor"
+                );
+                assert_eq!(
+                    app.editor().source(),
+                    source,
+                    "{marked}: Backspace must not edit"
+                );
+                assert_eq!(app.editor().primary_selection().head, ByteOffset(caret));
+            }
+        }
+
+        #[test]
+        fn backspace_edits_a_contextual_search_before_returning_to_function_arguments() {
+            use crate::reference::{ReferenceMode, Tab};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let source = "$: s(\"su\")";
+            let caret = source.find("su").expect("sound") + 2;
+            let mut app = app_over(directory.path());
+            app.scenes.current_mut().editor = Editor::new(source).expect("editor");
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(caret)))
+                .expect("caret");
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+            for query in ["s", ""] {
+                press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+                let panel = app.reference_panel.as_ref().expect("picker stays open");
+                assert_eq!(panel.tab, Tab::Samples);
+                assert_eq!(panel.sound_query, query);
+                assert!(app.reference_anchor.is_some());
+                assert_eq!(app.editor().source(), source);
+            }
+
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            let panel = app.reference_panel.as_ref().expect("function arguments");
+            assert_eq!(panel.tab, Tab::Reference);
+            let ReferenceMode::Entry { index, .. } = panel.mode else {
+                panic!("expected sound function arguments")
+            };
+            assert_eq!(app.reference.entry(index).unwrap().name, "s");
+            assert!(app.reference_anchor.is_none());
+            assert_eq!(app.editor().source(), source);
+            assert_eq!(app.editor().primary_selection().head, ByteOffset(caret));
+        }
+
+        /// The chord walks its three states: open+focus, refocus, close.
+        #[test]
+        fn the_chord_comes_back_before_it_closes() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.toggle_reference_browse();
+            assert!(app.reference_panel.is_some());
+            app.focus = Focus::Editor;
+            app.toggle_reference_browse();
+            assert!(
+                app.reference_panel.is_some(),
+                "first press comes back to it"
+            );
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Reference));
+            app.toggle_reference_browse();
+            assert!(app.reference_panel.is_none(), "second press puts it away");
+            assert_eq!(app.focus, Focus::Editor);
+        }
+
+        /// Every key for the reference opens and closes the panel. macOS takes
+        /// Ctrl+Space by default, and F2 arrives only on a Mac that sends real
+        /// function keys, so Ctrl+F is the key that always arrives there.
+        #[test]
+        fn every_spelling_reaches_the_reference_browser_when_ctrl_space_never_arrives() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            for (code, modifiers) in [
+                // The one with nothing in its way.
+                (KeyCode::Char('f'), KeyModifiers::CONTROL),
+                (KeyCode::F(2), KeyModifiers::NONE),
+                (KeyCode::Char(' '), KeyModifiers::CONTROL),
+                // What a legacy terminal sends for Ctrl+Space, where it arrives.
+                (KeyCode::Null, KeyModifiers::NONE),
+            ] {
+                let mut app = crate::app::tests::support::app_over(directory.path());
+                assert!(app.reference_panel.is_none(), "{code:?} starts closed");
+                press(&mut app, code, modifiers);
+                assert!(
+                    app.reference_panel.is_some(),
+                    "{code:?} with {modifiers:?} did not open the reference"
+                );
+                press(&mut app, code, modifiers);
+                assert!(
+                    app.reference_panel.is_none(),
+                    "{code:?} with {modifiers:?} did not close it again"
+                );
+            }
+        }
+
+        /// `c` copies the dragged fragment and leaves the panel standing; with
+        /// nothing dragged it keeps its old meaning, whole-chain and closing.
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn c_copies_the_dragged_selection_and_leaves_the_panel_open() {
+            use crate::reference::{PaneSelection, SelectionTarget, Tab};
+            use crate::textblock::{TextPoint, TextSelection};
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.toggle_reference_browse();
+            app.regions = view::regions(Rect::new(0, 0, 120, 40), false, 1, true, true, None, None);
+            {
+                let panel = app.reference_panel.as_mut().expect("panel");
+                panel.tab = Tab::Examples;
+                panel.snippet_open.insert((0, 0));
+                panel.snippet_selected = 2;
+                let inner = crate::reference::inner_area(app.regions.reference);
+                let rows = panel.snippet_layout(inner).code_rows();
+                let lines =
+                    panel.snippet_code_lines(usize::from(rows.height), usize::from(rows.width));
+                assert!(!lines.is_empty());
+                panel.selection = Some(PaneSelection {
+                    target: SelectionTarget::Snippet {
+                        row: panel.snippet_selected,
+
+                        width: rows.width,
+                    },
+                    selection: TextSelection {
+                        anchor: TextPoint { line: 0, column: 0 },
+                        head: TextPoint {
+                            line: 0,
+                            column: lines[0].chars().count(),
+                        },
+                    },
+                });
+            }
+            press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+            assert!(
+                app.reference_panel.is_some(),
+                "a fragment copy is not the end of reading"
+            );
+
+            // Released, `c` means the whole snippet again - and that leaves the
+            // shelf open too: one take is rarely the end of it.
+            app.reference_panel.as_mut().expect("panel").selection = None;
+            press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+            assert!(
+                app.reference_panel.is_some(),
+                "taking a whole snippet keeps the shelf open"
+            );
+        }
+
+        /// A drag begun on the hint row below the entry's text anchors at the
+        /// right end of the last line of text, as a drag from a pane's blank
+        /// half does in an editor.
+        #[test]
+        fn a_drag_begun_below_the_entry_selects_from_its_text_edge() {
+            use crate::reference::{ReferenceMode, Tab};
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("s(".into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            app.toggle_reference_browse();
+            let index = app.reference.lookup("s").expect("the s entry");
+            {
+                let panel = app.reference_panel.as_mut().expect("panel");
+                panel.tab = Tab::Reference;
+                panel.mode = ReferenceMode::Entry {
+                    index,
+                    scroll: 0,
+                    from_browse: false,
+                };
+            }
+            app.focus_panel(PanelKind::Reference);
+            app.frame = Rect::new(0, 0, 120, 40);
+            app.regions = view::regions(app.frame, false, 1, true, true, None, None);
+
+            let inner = crate::reference::inner_area(app.regions.reference);
+            let body = crate::reference::entry_body_area(inner);
+            let hint_row = body.bottom();
+            let entry = app.reference.entry(index).expect("entry");
+            let lines: Vec<String> = crate::reference::entry_body(entry, usize::from(inner.width))
+                .into_iter()
+                .map(|line| line.text)
+                .collect();
+            let first_line = 0;
+            let block = crate::textblock::TextBlock {
+                lines: &lines,
+                area: body,
+                first_line,
+            };
+            // What a press IN the text at the hint row would have read, before
+            // the block claimed the row beside it.
+            let expected = block
+                .point_at(inner.x + 2, body.y + 1, crate::textblock::Clamp::Inside)
+                .expect("text exists");
+            // A press on the hint row below the body starts a selection. Its
+            // anchor is the end of the last visible line.
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: inner.x + 2,
+                row: hint_row,
+                modifiers: KeyModifiers::NONE,
+            })
+            .expect("press below the body");
+            let panel = app.reference_panel.as_ref().expect("panel");
+            let held = panel.selection.as_ref().expect("the press began a drag");
+            let last_index = lines
+                .iter()
+                .rposition(|line| !line.is_empty())
+                .expect("the body has text");
+            let to = held.selection.ordered().1;
+            assert_eq!(
+                to,
+                crate::textblock::TextPoint {
+                    line: last_index,
+                    column: lines[last_index].chars().count(),
+                },
+                "the anchor is the text's right end: the last visible line set in ink"
+            );
+            // The head follows the drag into the text: the selection then reads
+            // as if it had started at the text's edge under the pointer.
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: inner.x + 2,
+                row: body.y + 1,
+                modifiers: KeyModifiers::NONE,
+            })
+            .expect("drag into the text");
+            let panel = app.reference_panel.as_ref().expect("panel");
+            let held = panel.selection.as_ref().expect("drag held");
+            let (from, _) = held.selection.ordered();
+            assert_eq!(from, expected, "the selection reads from the text");
+            assert!(
+                !held.selection.is_empty(),
+                "dragging up from the hint row takes text with it"
+            );
+        }
+
+        #[test]
+        fn reference_on_an_unfinished_alias_offers_functions_before_arguments() {
+            use crate::reference::ReferenceMode;
+
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            let source = "$: s(\"bd\").lp";
+            app.scenes.current_mut().editor = Editor::new(source).unwrap();
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(source.len())))
+                .unwrap();
+            app.focus = Focus::Editor;
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Reference));
+            let panel = app.reference_panel.as_mut().unwrap();
+            assert_eq!(panel.mode, ReferenceMode::Browse);
+            let names: Vec<_> = panel
+                .results
+                .iter()
+                .map(|&index| app.reference.entry(index).unwrap().name.as_str())
+                .collect();
+            assert!(names.contains(&"lpf"), "{names:?}");
+            panel.selected =
+                panel.row_of_result(names.iter().position(|&name| name == "lpenv").unwrap());
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.editor().source(), "$: s(\"bd\").lpenv()");
+            assert_eq!(
+                app.editor().primary_selection().head.0,
+                app.editor().source().len() - 1
+            );
+            assert_eq!(
+                app.reference_panel
+                    .as_ref()
+                    .unwrap()
+                    .showing(&app.reference)
+                    .as_deref(),
+                Some("lpenv")
+            );
+            assert_eq!(app.focus, Focus::Editor);
+
+            let source = "$: s(\"bd\").lp(300)";
+            app.set_reference_panel(None);
+            app.scenes.current_mut().editor = Editor::new(source).unwrap();
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(source.find("lp").unwrap() + 2)))
+                .unwrap();
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert_eq!(
+                app.reference_panel
+                    .as_ref()
+                    .unwrap()
+                    .showing(&app.reference)
+                    .as_deref(),
+                Some("lpf")
+            );
+            assert_eq!(app.editor().source(), source);
+        }
+
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn s_toggles_the_example_code_between_stack_and_voices() {
+            use crate::reference::{ReferencePanel, SnippetLine};
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            // The Tracks section's first shelf opens onto a genre kit, which is
+            // stored in the JSON catalogue.
+            let mut panel = ReferencePanel::snippets(&app.reference);
+            panel.section_open.clear();
+            panel.section_open.insert(1);
+            panel.snippet_open.clear();
+            panel.snippet_open.insert((1, 0));
+            let lines = panel.snippet_lines();
+            let row = lines
+                .iter()
+                .position(|line| matches!(line, SnippetLine::Snippet(1, 0, 0)))
+                .expect("the first track example");
+            panel.snippet_selected = row;
+            app.reference_panel = Some(panel);
+            app.focus_panel(PanelKind::Reference);
+
+            let shown = |app: &App| {
+                app.reference_panel
+                    .as_ref()
+                    .expect("panel")
+                    .selected_snippet_code()
+                    .expect("a kit")
+                    .into_owned()
+            };
+            // The default reading is one `$:` a voice…
+            let lanes = shown(&app);
+            assert!(!lanes.contains("stack("), "split into voices:\n{lanes}");
+            assert!(lanes.lines().count() >= 2, "{lanes}");
+            // …s folds to the stack…
+            app.handle_reference_key(KeyCode::Char('s'), false, false)
+                .expect("s");
+            let stack = shown(&app);
+            assert!(stack.contains("$: stack("), "folded:\n{stack}");
+            // …s again unfolds - the toggle is live, not one-way…
+            app.handle_reference_key(KeyCode::Char('s'), false, false)
+                .expect("s");
+            assert_eq!(shown(&app), lanes, "back to the voices");
+            // …and Enter copies whichever reading is on screen.
+            app.handle_reference_key(KeyCode::Enter, false, false)
+                .expect("Enter");
+            assert_eq!(
+                app.clipboard.get_text().ok().as_deref(),
+                Some(lanes.as_str())
+            );
+        }
+
+        /// The browser lists every import the score names, each with where it
+        /// stands; one nobody has asked the library for yet is on its way.
+        #[test]
+        fn the_browser_lists_the_scores_imports_as_they_stand() {
+            let library = rustel_runtime::samples::SampleLibrary::empty();
+            library.note_samples_source_state_for_tests(
+                "github:me/gone",
+                rustel_runtime::samples::SourceState::Failed("refused".into()),
+            );
+            let imports = browser_imports(
+                "samples('github:me/gone')\nsamples('github:me/new')\nsamples('github:me/new')",
+                &crate::catalogue::Snapshot {
+                    sounds: Vec::new(),
+                    sources: library.browser_source_states(),
+                },
+            );
+            assert_eq!(
+                imports,
+                [
+                    (
+                        "github:me/gone".to_owned(),
+                        rustel_runtime::samples::SourceState::Failed("refused".into())
+                    ),
+                    (
+                        "github:me/new".to_owned(),
+                        rustel_runtime::samples::SourceState::Loading
+                    ),
+                ]
+            );
+        }
+
+        /// Esc on the samples tab closes the browser outright.
+        #[test]
+        fn esc_closes_the_samples_browser() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let sounds = vec![rustel_runtime::samples::SoundEntry {
+                name: "bd".into(),
+                variants: 3,
+                variant_names: Vec::new(),
+                origin: rustel_runtime::samples::SoundOrigin::Default,
+                category: rustel_runtime::samples::SoundCategory::Drums,
+                location: None,
+                import: None,
+            }];
+            app.reference_panel = Some(ReferencePanel::samples(&app.reference, sounds));
+            app.focus = Focus::Panel(PanelKind::Reference);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+            // A preview still sounding does not cost a press of its own: Esc
+            // closes the browser and silences it in one go.
+            app.preview_armed = Some(("bd:0".into(), Instant::now()));
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.reference_panel.is_none(), "the browser is gone");
+            assert_eq!(app.preview_armed, None, "and the preview with it");
+        }
+    }
+}

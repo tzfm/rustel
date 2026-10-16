@@ -1,0 +1,200 @@
+use super::*;
+
+impl StudioEngine {
+    /// What the snippet shelf wants shown, if anything has changed.
+    ///
+    /// `Some(None)` means "give the screen back to the score"; `None` means
+    /// nothing has been asked for since the last turn.
+    #[cfg(feature = "hydra")]
+    pub fn set_hydra_preview(&mut self, code: Option<String>) {
+        self.hydra_preview = Some(code);
+    }
+
+    #[cfg(feature = "hydra")]
+    pub fn set_hydra_theme(&mut self, code: Option<String>, webcam: bool) {
+        self.hydra_theme = Some((code, webcam));
+    }
+
+    #[cfg(feature = "hydra")]
+    pub fn set_hydra_frame_size(&mut self, wanted: rustel_runtime::hydra::HydraFrameRequest) {
+        self.hydra_frame_size = Some(wanted);
+    }
+
+    /// Hand this turn's visuals to the window, and the window this turn's
+    /// signals and sound.
+    ///
+    /// Runs on the engine worker, where the Session lives, so an `H(...)`
+    /// pattern is sampled with exactly the settings and at exactly the cycle
+    /// the audio is using. Nothing here blocks: the window is on its own
+    /// thread behind a channel that drops rather than waits.
+    ///
+    /// Each distinct failure of the turn is queued with the engine's own
+    /// diagnostics, which wait for room in the channel. The returned notice
+    /// is informational, and a full channel may skip it.
+    #[cfg(feature = "hydra")]
+    pub fn drive_hydra(
+        &mut self,
+        hydra: &mut rustel_runtime::hydra::HydraBridge,
+        audio: Option<&rustel_runtime::ui_analysis::UiAudioAnalysisFrame>,
+    ) -> Option<StudioDiagnostic> {
+        let mut note = None;
+        let mut trouble = Vec::new();
+        let mut failure = |message: String| {
+            if !trouble.contains(&message) {
+                trouble.push(message);
+            }
+        };
+        if let Some(wanted) = self.hydra_frame_size.take() {
+            hydra.set_frames_wanted(wanted);
+        }
+        if let Some(preview) = self.hydra_preview.take()
+            && let Err(message) = hydra.preview(preview.as_deref())
+        {
+            failure(message);
+        }
+        if let Some((theme, webcam)) = self.hydra_theme.take()
+            && let Err(message) = hydra.theme_with_camera(theme.as_deref(), webcam)
+        {
+            failure(message);
+        }
+        if let Some(candidate) = self.session.take_pending_hydra() {
+            match rustel_runtime::hydra::HydraUpdate::from_candidate(&candidate) {
+                Ok(update) => {
+                    if let Err(message) = hydra.apply_with_sample_access(
+                        update,
+                        &self.session.config().score_sample_access,
+                    ) {
+                        failure(message);
+                    }
+                }
+                Err(message) => failure(message),
+            }
+        }
+        for event in hydra.take_events() {
+            match event {
+                rustel_hydra::HydraEvent::Failed { message, .. } => failure(message),
+                // Say once, in the log, which surface the visuals landed on.
+                // Without it there is no way to tell a sketch drawing behind
+                // the code from one drawing in a window somewhere else.
+                rustel_hydra::HydraEvent::Ready { renderer } => {
+                    note.get_or_insert_with(|| format!("visuals are drawing here ({renderer})"));
+                }
+                rustel_hydra::HydraEvent::Input {
+                    slot,
+                    message,
+                    failed,
+                } => {
+                    let message = format!("Hydra s{slot}: {message}");
+                    if failed {
+                        failure(message);
+                    } else {
+                        note.get_or_insert(message);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A stopped set wipes the picture, the way the strudel.cc editor does.
+        // The shelf's own picture is a second renderer with its own liveness,
+        // so browsing does not keep the score's visuals alive - and inserting
+        // a snippet leaves the screen still until you press play.
+        hydra.set_drawing(self.is_playing());
+        let now = Instant::now();
+        if let Err(message) = hydra.tick(
+            now,
+            self.session.cycle_at_time(self.device_time()),
+            self.session.cps(),
+        ) {
+            queue_diagnostic(
+                &mut self.pending_diagnostics,
+                StudioDiagnostic::message("hydra", message),
+            );
+        }
+        if let Some(frame) = audio.filter(|_| hydra.wants_audio()) {
+            let rms = (frame.scope.iter().map(|s| s * s).sum::<f32>()
+                / frame.scope.len().max(1) as f32)
+                .sqrt();
+            hydra.audio(&rustel_runtime::hydra::audio_frame(rms, &frame.spectrum));
+        }
+        for message in trouble {
+            queue_diagnostic(
+                &mut self.pending_diagnostics,
+                StudioDiagnostic::message("hydra", message),
+            );
+        }
+        note.map(|message| StudioDiagnostic::info("hydra", message))
+    }
+
+    /// Where the audible clock is now; zero when nothing is open, which is
+    /// the same answer the status bar gives, and the same one the snapshot
+    /// carries.
+    pub(super) fn device_time(&self) -> f64 {
+        self.live
+            .as_ref()
+            .map_or(0.0, |live| live.device.clock_seconds())
+    }
+}
+
+#[cfg(all(test, feature = "hydra"))]
+mod tests {
+    use super::*;
+    use crate::engine::tests::*;
+
+    /// Two chains that fail differently in one frame each reach the
+    /// diagnostics once, through the queue a full channel holds.
+    #[cfg(feature = "hydra")]
+    #[test]
+    fn chains_that_fail_in_one_frame_each_reach_the_diagnostics() {
+        if rustel_hydra::native::NativeRenderer::new(8, 8).is_err() {
+            eprintln!("skipped: no GPU and no software rasteriser");
+            return;
+        }
+        let mut engine = silent_engine_with_pattern(rustel_core::silence());
+        engine
+            .session
+            .evaluate("await initHydra()\nosc().foo().out(o0)\nosc().bar().out(o1)\n")
+            .expect("the score records both chains");
+        let mut hydra = rustel_runtime::hydra::HydraBridge::new();
+        let frames = hydra.frames();
+        let mut notices: Vec<StudioDiagnostic> =
+            engine.drive_hydra(&mut hydra, None).into_iter().collect();
+        // Both chains fail before their frame is read back, so the next turn
+        // drains both failures at once.
+        let until = Instant::now() + Duration::from_secs(20);
+        while frames.take().is_none() {
+            assert!(Instant::now() < until, "the sketch never drew a frame");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        notices.extend(engine.drive_hydra(&mut hydra, None));
+
+        emit_pending_diagnostics(&mut engine.pending_diagnostics, &mut |update| {
+            Err((UiEventSendStatus::DroppedFull, update))
+        });
+        let mut said = notices.clone();
+        emit_pending_diagnostics(&mut engine.pending_diagnostics, &mut |update| {
+            if let StudioUpdate::Diagnostic(diagnostic) = update {
+                said.push(diagnostic);
+            }
+            Ok(())
+        });
+        let failures: Vec<&str> = said
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.kind == "hydra" && diagnostic.level == StudioDiagnosticLevel::Warning
+            })
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        assert!(
+            failures.len() == 2
+                && failures.iter().any(|message| message.contains("foo"))
+                && failures.iter().any(|message| message.contains("bar")),
+            "each chain's failure must be said once: {said:?}"
+        );
+        assert!(
+            notices
+                .iter()
+                .all(|notice| notice.level != StudioDiagnosticLevel::Warning),
+            "a failure must not ride the notice a full channel skips: {notices:?}"
+        );
+    }
+}

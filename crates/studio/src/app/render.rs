@@ -2019,3 +2019,890 @@ fn bracket_spans(editor: &Editor) -> Option<Vec<(usize, usize, bool)>> {
     };
     super::super::editor::brackets::bracket_at(&text, start, caret).map(|found| found.ranges())
 }
+
+#[cfg(test)]
+mod tests {
+    mod layout_degenerate_sizes {
+        //! Every UI configuration must survive frames at degenerate terminal
+        //! sizes. The sweep covers panels, bands, splits and dialogs. Run:
+        //! `cargo test -p rustel-studio --features harness --lib
+        //! layouts_survive_degenerate_sizes -- --nocapture`.
+
+        use crate::app::tests::support;
+        use ratatui::{Terminal, backend::TestBackend};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        /// Key sequences, each ending in one stable configuration.
+        const CONFIGS: &[(&str, &[&str])] = &[
+            ("plain", &[]),
+            ("mixer", &["f4"]),
+            ("mixer focused twice", &["f4", "f4"]),
+            ("log docked", &["shift-f9"]),
+            ("log docked grown", &["shift-f9", "+", "+", "+"]),
+            ("reference", &["f2"]),
+            ("reference snippets", &["f2", "tab", "tab"]),
+            ("set panel", &["f7"]),
+            ("zen", &["f11"]),
+            ("split", &["ctrl-e"]),
+            ("split twice", &["ctrl-e", "ctrl-e"]),
+            ("split mixer zen", &["ctrl-e", "f4", "f11"]),
+            ("piano", &["f12"]),
+            ("piano zen", &["f12", "f11"]),
+            ("help", &["f1", "h"]),
+            ("menu bar", &["f1"]),
+            ("menu file", &["f1", "f"]),
+            ("menu scene", &["f1", "s"]),
+            ("menu options", &["f1", "o"]),
+            ("settings", &["ctrl-o"]),
+            ("settings keybinds", &["ctrl-o", "tab", "tab", "tab"]),
+            ("theme picker", &["ctrl-t"]),
+            ("export sheet", &["ctrl-shift-e"]),
+            ("devices", &["ctrl-p"]),
+            ("everything", &["ctrl-e", "f4", "shift-f9", "ctrl-t"]),
+            ("viz dock", &["shift-f1"]),
+            ("viz dock zen", &["shift-f1", "f11"]),
+            ("piano mixer", &["f12", "f4"]),
+            ("mixer arrows", &["f4", "up", "right", "down", "left"]),
+            ("mixer digits", &["f4", "5", "0", "+", "-"]),
+            ("split then viz", &["ctrl-e", "shift-f1"]),
+            ("log top focused", &["shift-f9", "e"]),
+        ];
+
+        const SIZES: &[(u16, u16)] = &[
+            (1, 1),
+            (2, 2),
+            (3, 3),
+            (20, 3),
+            (40, 6),
+            (80, 10),
+            (30, 24),
+            (10, 60),
+            (200, 2),
+        ];
+
+        #[test]
+        fn layouts_survive_degenerate_sizes() {
+            layouts_survive(false);
+        }
+
+        #[test]
+        fn layouts_survive_degenerate_sizes_over_a_pathological_document() {
+            layouts_survive(true);
+        }
+
+        fn layouts_survive(pathological: bool) {
+            let mut failures = Vec::new();
+            for (config, keys) in CONFIGS {
+                for &(width, height) in SIZES {
+                    let directory = tempfile::tempdir().unwrap();
+                    let mut app = support::app_over(directory.path());
+                    if pathological {
+                        // Grapheme torture: ZWJ families, deep combining stacks,
+                        // astral chars, bidi controls, and a pile of scenes.
+                        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+                        let source = format!(
+                            "$: note(\"{family}\")\n$: s(\"e\u{301}\u{301}\u{301}\")\n\
+                     $: s(\"\u{202E}dd\u{202C}\")\n$: note(\"\u{FEFF}\u{3164}\u{10FFFF}\")\n\
+                     $: s(\"{}\")\n",
+                            family.repeat(40),
+                        );
+                        let scene = app.scenes.current().id;
+                        app.editor_mut()
+                            .dispatch(
+                                crate::editor::Command::PasteText(source.clone()),
+                                crate::editor::HistoryMoment(0),
+                                &mut crate::editor::MemoryClipboard::default(),
+                            )
+                            .expect("paste pathological source");
+                        while app.scenes.len() < 16 {
+                            app.new_scene(false);
+                        }
+                        let index = app.scenes.index_of(scene).expect("original scene");
+                        assert!(app.select_scene(index));
+                        assert_eq!(app.scenes.current().id, scene);
+                        assert!(app.editor().source().contains(&source));
+                    }
+                    support::settle(&mut app);
+                    for key in *keys {
+                        let event = crossterm::event::Event::Key(parse_key_event(key));
+                        app.handle_terminal_event(event).expect("configure layout");
+                    }
+                    let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                        terminal
+                            .draw(|frame| {
+                                app.paint_into(frame, Instant::now()).expect("paint");
+                            })
+                            .unwrap();
+                    }));
+                    if drawn.is_err() {
+                        failures.push(format!("{config} at {width}x{height}"));
+                    }
+                }
+            }
+            assert!(failures.is_empty(), "{failures:#?}");
+        }
+
+        /// A remote-parseable key name into a crossterm key event.
+        fn parse_key_event(spec: &str) -> crossterm::event::KeyEvent {
+            use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+            let mut modifiers = KeyModifiers::NONE;
+            let mut name = spec;
+            for prefix in ["ctrl-", "shift-"] {
+                if let Some(rest) = name.strip_prefix(prefix) {
+                    modifiers |= if prefix == "ctrl-" {
+                        KeyModifiers::CONTROL
+                    } else {
+                        KeyModifiers::SHIFT
+                    };
+                    name = rest;
+                }
+            }
+            let code = match name {
+                "e" => KeyCode::Char('e'),
+                "h" => KeyCode::Char('h'),
+                "f" => KeyCode::Char('f'),
+                "s" => KeyCode::Char('s'),
+                "o" => KeyCode::Char('o'),
+                "t" => KeyCode::Char('t'),
+                "p" => KeyCode::Char('p'),
+                "+" => KeyCode::Char('+'),
+                "shift-f1" => {
+                    return KeyEvent::new(KeyCode::F(1), KeyModifiers::SHIFT);
+                }
+                "5" => KeyCode::Char('5'),
+                "0" => KeyCode::Char('0'),
+                "-" => KeyCode::Char('-'),
+                "up" => KeyCode::Up,
+                "down" => KeyCode::Down,
+                "left" => KeyCode::Left,
+                "right" => KeyCode::Right,
+                "f1" => KeyCode::F(1),
+                "f2" => KeyCode::F(2),
+                "f4" => KeyCode::F(4),
+                "f7" => KeyCode::F(7),
+                "f9" => KeyCode::F(9),
+                "f11" => KeyCode::F(11),
+                "f12" => KeyCode::F(12),
+                "tab" => KeyCode::Tab,
+                other => panic!("map {other}"),
+            };
+            KeyEvent::new(code, modifiers)
+        }
+
+        #[test]
+        fn layouts_survive_resize_storms() {
+            let storms: &[(&str, &[(u16, u16)])] = &[
+                (
+                    "shrink to 1x1 and back",
+                    &[(200, 50), (80, 24), (3, 2), (1, 1), (80, 24), (200, 50)],
+                ),
+                ("wide-flat", &[(200, 2), (1, 1), (200, 1), (80, 3)]),
+                ("tall-thin", &[(2, 60), (1, 1), (1, 200), (10, 60)]),
+                (
+                    "wobble",
+                    &[(80, 24), (79, 23), (81, 25), (78, 22), (80, 24)],
+                ),
+            ];
+            let mut failures = Vec::new();
+            for (config, keys) in CONFIGS {
+                for (storm, sizes) in storms {
+                    let directory = tempfile::tempdir().unwrap();
+                    let mut app = support::app_over(directory.path());
+                    support::settle(&mut app);
+                    for key in *keys {
+                        let event = crossterm::event::Event::Key(parse_key_event(key));
+                        app.handle_terminal_event(event).expect("configure layout");
+                    }
+                    let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut terminal =
+                            Terminal::new(TestBackend::new(sizes[0].0, sizes[0].1)).unwrap();
+                        for &(width, height) in sizes.iter() {
+                            let expected = ratatui::layout::Rect::new(0, 0, width, height);
+                            terminal.backend_mut().resize(width, height);
+                            terminal
+                                .draw(|frame| {
+                                    assert_eq!(frame.area(), expected);
+                                    app.paint_into(frame, Instant::now()).expect("paint");
+                                })
+                                .unwrap();
+                        }
+                    }));
+                    if drawn.is_err() {
+                        failures.push(format!("{config} / {storm}"));
+                    }
+                }
+            }
+            assert!(failures.is_empty(), "{failures:#?}");
+        }
+
+        #[test]
+        fn inline_visuals_survive_degenerate_sizes() {
+            let painters = [
+                "pianoroll",
+                "pitchwheel",
+                "punchcard",
+                "scope",
+                "spectrum",
+                "spiral",
+                "tscope",
+                "wordfall",
+            ];
+            let scores = [
+                "$: s(\"bd <hh oh>*2\")._PAINTER()\n",
+                // Extremes inside the painter's own axes.
+                "$: note(\"a\").late(10000000000)._PAINTER()\n",
+                "$: note(\"a\").fast(0.0000001).early(1000000)._PAINTER()\n",
+                "$: stack(note(\"c\"), note(\"e\"), note(\"g\"))._PAINTER()\n",
+            ];
+            let sizes = [(1, 1), (20, 3), (40, 6), (30, 24), (10, 60), (200, 2)];
+            let mut failures = Vec::new();
+            for painter in painters {
+                for template in &scores {
+                    let source = template.replace("_PAINTER()", &format!("_{painter}()"));
+                    for split in [false, true] {
+                        let directory = tempfile::tempdir().unwrap();
+                        let mut app = support::app_over(directory.path());
+                        if split {
+                            app.handle_terminal_event(crossterm::event::Event::Key(
+                                parse_key_event("ctrl-e"),
+                            ))
+                            .expect("split editor");
+                        }
+                        for command in [
+                            crate::editor::Command::SelectAll,
+                            crate::editor::Command::PasteText(source.clone()),
+                        ] {
+                            app.editor_mut()
+                                .dispatch(
+                                    command,
+                                    crate::editor::HistoryMoment(0),
+                                    &mut crate::editor::MemoryClipboard::default(),
+                                )
+                                .expect("replace score");
+                        }
+                        app.ui_settings.animation = true;
+                        install_inline_visual(&mut app, painter);
+                        for &(width, height) in &sizes {
+                            let drawn =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    let mut terminal =
+                                        Terminal::new(TestBackend::new(width, height)).unwrap();
+                                    terminal
+                                        .draw(|frame| {
+                                            assert_eq!(
+                                                frame.area(),
+                                                ratatui::layout::Rect::new(0, 0, width, height)
+                                            );
+                                            app.paint_into(frame, Instant::now()).expect("paint");
+                                        })
+                                        .unwrap();
+                                }));
+                            if drawn.is_err() {
+                                failures.push(format!(
+                                    "{painter} split={split} at {width}x{height}: {source:?}"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(failures.is_empty(), "{failures:#?}");
+        }
+
+        fn install_inline_visual(app: &mut crate::app::App, painter: &str) {
+            use rustel_fraction::Fraction;
+            use rustel_runtime::ui_analysis::{
+                UI_SCOPE_SAMPLES, UI_SPECTRUM_BINS, UiAudioAnalysisFrame, UiAudioAnalysisSet,
+            };
+            use rustel_runtime::ui_events::{UiAudioMetadata, UiEventBatch, visual_layout};
+
+            let source: Arc<str> = Arc::from(app.editor().source());
+            let mut session = rustel_runtime::Session::new().expect("visual session");
+            session.evaluate(&source).expect("evaluate visual score");
+            let generation = session.generation();
+            let layout = visual_layout(&source, generation).expect("visual layout");
+            let hash = layout.ui_layout.source_revision.clone();
+            let revision = app.editor().revision();
+            let scene = app.scenes.current().id;
+            app.evaluation_revisions.remember(
+                hash.clone(),
+                revision,
+                Arc::clone(&source),
+                scene,
+                None,
+            );
+            app.handle_control(crate::StudioControlEvent::Layout(layout));
+            app.snapshot = Some(support::sounding(true, false));
+            app.visual.start();
+
+            // Keep long events whose onset precedes the query window.
+            let traces: Vec<_> = session
+                .query(Fraction::ZERO, Fraction::ONE)
+                .expect("query visual score")
+                .iter()
+                .enumerate()
+                .map(|(index, hap)| {
+                    let whole = hap.whole.expect("visual event span");
+                    rustel_scheduler::ScheduleTraceEvent::from_hap(
+                        hap,
+                        generation,
+                        index as u64,
+                        session.time_at_cycle(whole.begin),
+                    )
+                    .expect("visual trace")
+                })
+                .collect();
+            assert!(!traces.is_empty(), "no visual events for {source:?}");
+            assert!(
+                app.visual.install_preview(
+                    UiEventBatch::from_traces(
+                        0.0,
+                        0.0,
+                        session.cps(),
+                        generation,
+                        hash,
+                        &traces,
+                        0
+                    )
+                    .expect("visual event batch"),
+                    0.0,
+                )
+            );
+            assert_eq!(app.visual.events().count(), traces.len());
+
+            // Audio painters use fixed analysis data; this test does not open a device.
+            let audio = UiAudioAnalysisFrame {
+                scope: [0.5; UI_SCOPE_SAMPLES],
+                spectrum: [-20.0; UI_SPECTRUM_BINS],
+            };
+            let taps = app
+                .visual
+                .layout()
+                .expect("installed layout")
+                .visuals
+                .iter()
+                .filter_map(|visual| visual.slot)
+                .map(|slot| (slot, audio.clone()))
+                .collect();
+            assert!(app.visual.install_audio(
+                UiAudioMetadata {
+                    sequence: 1,
+                    generation,
+                    device_time: 0.0,
+                    stream_id: 1,
+                    epoch: 1,
+                    end_frame: 0,
+                    sample_rate: 48_000,
+                },
+                UiAudioAnalysisSet {
+                    master: audio,
+                    visuals: taps,
+                    sides: Vec::new(),
+                },
+            ));
+            assert_eq!(app.evaluated_source.as_deref(), Some(source.as_ref()));
+            assert!(app.visual.layout().is_some_and(|layout| {
+                layout
+                    .visuals
+                    .iter()
+                    .any(|visual| visual.inline && visual.kind == painter)
+            }));
+            assert!(
+                !app.editor().virtual_rows().is_empty(),
+                "inline {painter} must have rows before drawing"
+            );
+        }
+
+        #[test]
+        fn degenerate_sizes_survive_a_huge_document() {
+            let mut source = String::new();
+            for line in 0..20_000 {
+                source.push_str(&format!("$: s(\"bd*{line}\") // \u{1F600}\u{0301}\n"));
+            }
+            let sizes = [(1, 1), (20, 3), (40, 6), (30, 24), (200, 2)];
+            let mut failures = Vec::new();
+            for &(width, height) in &sizes {
+                let directory = tempfile::tempdir().unwrap();
+                let mut app = support::app_over(directory.path());
+                app.editor_mut()
+                    .dispatch(
+                        crate::editor::Command::PasteText(source.clone()),
+                        crate::editor::HistoryMoment(0),
+                        &mut crate::editor::MemoryClipboard::default(),
+                    )
+                    .expect("paste");
+                let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    for key in ["ctrl-e", "f4", "shift-f9"] {
+                        app.handle_terminal_event(crossterm::event::Event::Key(parse_key_event(
+                            key,
+                        )))
+                        .expect("configure layout");
+                    }
+                    for _ in 0..3 {
+                        terminal
+                            .draw(|frame| {
+                                app.paint_into(frame, Instant::now()).expect("paint");
+                            })
+                            .unwrap();
+                    }
+                }));
+                if drawn.is_err() {
+                    failures.push(format!("{width}x{height}"));
+                }
+            }
+            assert!(failures.is_empty(), "{failures:#?}");
+        }
+    }
+
+    mod render {
+        //! Tests for `app/render.rs`.
+
+        use crate::app::render::*;
+
+        /// The pixel frame's size follows the measured frame time. It falls
+        /// while frames run long, rises while they run short, and stays between
+        /// its two limits.
+        #[test]
+        fn the_backdrop_follows_what_the_terminal_can_carry() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let ceiling = crate::graphics::PIXEL_CEILING;
+            assert_eq!(app.pixel_budget, ceiling, "as fine as it goes");
+            app.watch_pixel_frame(Duration::from_millis(15));
+            assert_eq!(
+                app.pixel_budget, ceiling,
+                "a frame inside the band moves nothing"
+            );
+            app.watch_pixel_frame(Duration::from_millis(40));
+            assert!(app.pixel_budget < ceiling, "a slow frame lowers it");
+            assert_eq!(
+                crate::graphics::pixel_budget(),
+                app.pixel_budget,
+                "and every canvas in the frame hears about it too"
+            );
+            assert!(
+                app.log
+                    .lines()
+                    .iter()
+                    .any(|line| line.kind == "rendering" && line.text.contains("smaller")),
+                "and the log says so once"
+            );
+            let said = app
+                .log
+                .lines()
+                .iter()
+                .filter(|line| line.kind == "rendering")
+                .count();
+            for _ in 0..40 {
+                app.watch_pixel_frame(Duration::from_millis(40));
+            }
+            assert!(
+                app.pixel_budget >= crate::graphics::PIXEL_FLOOR,
+                "and never below the floor"
+            );
+            assert_eq!(
+                app.log
+                    .lines()
+                    .iter()
+                    .filter(|line| line.kind == "rendering")
+                    .count(),
+                said,
+                "it is said once, not on every step"
+            );
+            for _ in 0..200 {
+                app.watch_pixel_frame(Duration::from_millis(1));
+            }
+            assert_eq!(
+                app.pixel_budget, ceiling,
+                "a terminal that keeps up gets the fine picture back"
+            );
+        }
+
+        /// Every docked panel, including the mixer desk, must be named to the
+        /// backdrop. On the pixel tier the backdrop is painted over a panel
+        /// that is not named.
+        #[test]
+        fn every_docked_panel_is_named_to_the_backdrop() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            assert!(
+                app.docked_chrome().iter().all(|rect| !rect.is_empty()),
+                "nothing empty is furniture"
+            );
+            let desk = Rect::new(0, 22, 120, 16);
+            app.regions.mixer = desk;
+            let dock = Rect::new(0, 0, 30, 22);
+            app.regions.viz[0] = dock;
+            let sidebar = Rect::new(90, 0, 30, 22);
+            app.regions.sidebar = sidebar;
+            let chrome = app.docked_chrome();
+            for (rect, what) in [
+                (desk, "the mixer desk"),
+                (dock, "a visuals dock"),
+                (sidebar, "the set panel"),
+            ] {
+                assert!(chrome.contains(&rect), "{what} is furniture: {chrome:?}");
+            }
+        }
+
+        /// A theme whose characters animate repaints the score on every frame,
+        /// playing or not. However many glyphs a frame rewrites, it shows the
+        /// terminal's cursor on one cell only: the caret.
+        #[test]
+        fn animated_characters_keep_the_cursor_on_the_caret() {
+            use crate::terminal::StudioBackend;
+            use crate::terminal::cursor_trace::{Capture, Cursor};
+            use ratatui::{Terminal, TerminalOptions, Viewport};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _) = crate::app::tests::support::plain_app(
+                directory.path(),
+                "$: s(\"bd sd\").fast(2)\n",
+            );
+            app.apply_theme_draft(&Theme::built_in("lavender").expect("a bundled theme"));
+            assert!(
+                app.theme.animates_native_visual(),
+                "the studio redraws it while idle"
+            );
+            let capture = Capture::default();
+            let mut terminal = Terminal::with_options(
+                StudioBackend::new(capture.clone()),
+                TerminalOptions {
+                    viewport: Viewport::Fixed(Rect::new(0, 0, 120, 30)),
+                },
+            )
+            .expect("terminal");
+            let started = Instant::now();
+            let mut cursor = Cursor::default();
+            let mut shown = Vec::new();
+            for frame in 0..8 {
+                terminal
+                    .draw(|out| {
+                        app.paint_into(out, started + Duration::from_millis(17 * frame))
+                            .expect("frame paints")
+                    })
+                    .expect("frame draws");
+                let sent = capture.take();
+                assert!(
+                    sent.windows(7).any(|bytes| bytes == b"\x1b[38;2;"),
+                    "frame {frame} rewrites glyphs"
+                );
+                shown.push(cursor.visible_cells(&sent));
+            }
+            assert!(
+                shown.iter().all(|cells| cells.len() == 1),
+                "the cells each frame shows the cursor on: {shown:?}"
+            );
+        }
+
+        #[test]
+        fn inline_sliders_stay_above_animated_cells_and_characters() {
+            use crate::graphics::{self, HeldRenderer, Tier};
+            use crate::theme::{
+                CellEffect, CharacterEffect, CharacterVisual, TachyonMode, ThemeVisual,
+            };
+            use ratatui::{Terminal, backend::TestBackend};
+
+            let _renderer = HeldRenderer::pixels((1, 1));
+            graphics::set_tier(Tier::Cells);
+            for mode in [Some(TachyonMode::Text), Some(TachyonMode::Image), None] {
+                let directory = tempfile::tempdir().unwrap();
+                let (mut app, scene, call) =
+                    crate::app::tests::support::slider_app(directory.path());
+                app.theme = Theme::built_in_default();
+                app.theme.visual = None;
+                app.theme.characters = None;
+                app.theme.slider_fill = None;
+                app.ui_settings.backdrop_opacity = 100;
+                app.ui_settings.editor_opacity = 0;
+                let started = Instant::now();
+                let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+                terminal
+                    .draw(|frame| app.paint_into(frame, started).unwrap())
+                    .unwrap();
+                let baseline = terminal.backend().buffer().clone();
+                let chip = app.live_chip_at(scene, call).unwrap();
+                let (left, width) = app.slider_pill_track(scene, &chip).unwrap();
+                let row = app.panes[0]
+                    .last_map
+                    .as_ref()
+                    .unwrap()
+                    .cell_for_offset(ByteOffset(call))
+                    .unwrap()
+                    .y;
+                let rail = Rect::new(left, row, width, 1);
+                assert!((left..rail.right()).all(|x| {
+                    matches!(baseline.cell((x, row)).unwrap().symbol(), "─" | "█")
+                }));
+
+                if let Some(mode) = mode {
+                    app.theme.visual = Some(ThemeVisual::TachyonFx {
+                        effect: if mode == TachyonMode::Text {
+                            CellEffect::Decrypt
+                        } else {
+                            CellEffect::ColorShift
+                        },
+                        mode,
+                        density: 100,
+                        speed: 100,
+                    });
+                } else {
+                    app.theme.characters = Some(CharacterVisual {
+                        effect: CharacterEffect::Rainbow,
+                        strength: 100,
+                        speed: 100,
+                    });
+                }
+                let mut surrounding_text_changed = false;
+                let mut rail_background_changed = false;
+                for step in 1..=3 {
+                    terminal
+                        .draw(|frame| {
+                            app.paint_into(frame, started + Duration::from_millis(step * 100))
+                                .unwrap()
+                        })
+                        .unwrap();
+                    let animated = terminal.backend().buffer();
+                    for x in left..rail.right() {
+                        let before = baseline.cell((x, row)).unwrap();
+                        let after = animated.cell((x, row)).unwrap();
+                        let mut glyph = after.clone();
+                        glyph.bg = before.bg;
+                        assert_eq!(
+                            &glyph, before,
+                            "{mode:?} changed the slider glyph at ({x}, {row}) on frame {step}"
+                        );
+                        rail_background_changed |= after.bg != before.bg;
+                    }
+                    surrounding_text_changed |= (rail.right()..app.regions.panes[0].editor.right())
+                        .any(|x| animated.cell((x, row)) != baseline.cell((x, row)));
+                }
+                assert!(
+                    surrounding_text_changed,
+                    "{mode:?} still animates the score"
+                );
+                if mode == Some(TachyonMode::Image) {
+                    assert!(rail_background_changed, "the rail's gaps stay transparent");
+                }
+            }
+        }
+
+        #[test]
+        fn inline_slider_gaps_follow_their_fill_in_pixel_backdrops() {
+            use crate::editor::Selection;
+            use crate::graphics::{self, HeldRenderer};
+            use crate::theme::{CellEffect, TachyonMode, ThemeVisual};
+            use ratatui::{Terminal, backend::TestBackend, style::Color};
+
+            let _renderer = HeldRenderer::pixels((1, 1));
+            for state in ["transparent", "filled", "armed", "selected"] {
+                let directory = tempfile::tempdir().unwrap();
+                let (mut app, scene, call) =
+                    crate::app::tests::support::slider_app(directory.path());
+                app.theme = Theme::built_in_default();
+                app.theme.slider_fill = (state == "filled").then_some(Color::Blue);
+                if state == "armed" {
+                    app.armed_slider = Some((scene, call));
+                } else if state == "selected" {
+                    app.editor_mut()
+                        .set_selection(Selection::range(ByteOffset(call + 1), ByteOffset(call + 2)))
+                        .unwrap();
+                }
+                app.theme.visual = Some(ThemeVisual::TachyonFx {
+                    effect: CellEffect::ColorShift,
+                    mode: TachyonMode::Image,
+                    density: 100,
+                    speed: 100,
+                });
+                app.ui_settings.backdrop_opacity = 100;
+                app.ui_settings.editor_opacity = 0;
+                let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+                let (_, images) = graphics::capture_images(|| {
+                    terminal
+                        .draw(|frame| app.paint_into(frame, Instant::now()).unwrap())
+                        .unwrap();
+                });
+                let chip = app.live_chip_at(scene, call).unwrap();
+                let (left, width) = app.slider_pill_track(scene, &chip).unwrap();
+                let row = app.panes[0]
+                    .last_map
+                    .as_ref()
+                    .unwrap()
+                    .cell_for_offset(ByteOffset(call))
+                    .unwrap()
+                    .y;
+                let backdrop = images.iter().find(|image| image.depth == -1).unwrap();
+                assert_eq!((backdrop.width, backdrop.height), (120, 30));
+                for x in left..left + width {
+                    let alpha = backdrop.rgba[(usize::from(row) * 120 + usize::from(x)) * 4 + 3];
+                    assert_eq!(
+                        alpha,
+                        if state == "transparent" { 255 } else { 0 },
+                        "{state} slider background at ({x}, {row})"
+                    );
+                    let cell = terminal.backend().buffer().cell((x, row)).unwrap();
+                    assert!(matches!(cell.symbol(), "─" | "█"));
+                    if state == "armed" || state == "selected" {
+                        assert_eq!(cell.bg, app.theme.selection);
+                    } else if state == "filled" {
+                        assert_eq!(cell.bg, Color::Blue);
+                    }
+                }
+                let beside =
+                    backdrop.rgba[(usize::from(row) * 120 + usize::from(left + width)) * 4 + 3];
+                assert_eq!(beside, 255, "the picture still reaches the adjacent value");
+            }
+        }
+
+        #[test]
+        fn menus_covering_inline_sliders_keep_their_backdrop_wash() {
+            use crate::graphics::{self, HeldRenderer};
+            use crate::menu::{MenuState, dropdown_rects};
+            use crate::theme::{CellEffect, TachyonMode, ThemeVisual};
+            use ratatui::{Terminal, backend::TestBackend, style::Color};
+
+            let _renderer = HeldRenderer::pixels((1, 1));
+            for fill in [None, Some(Color::Blue)] {
+                let directory = tempfile::tempdir().unwrap();
+                let (mut app, scene, call) = crate::app::tests::support::slider_app_with_source(
+                    directory.path(),
+                    "          $: s(\"bd\").gain(slider(0.5, 0, 1, 0.0001))\n",
+                );
+                app.theme = Theme::built_in_default();
+                app.theme.slider_fill = fill;
+                app.theme.visual = Some(ThemeVisual::TachyonFx {
+                    effect: CellEffect::ColorShift,
+                    mode: TachyonMode::Image,
+                    density: 100,
+                    speed: 100,
+                });
+                app.ui_settings.backdrop_opacity = 100;
+                app.ui_settings.editor_opacity = 0;
+                app.ui_settings.interface_opacity = 50;
+                app.menu = Some(MenuState::dropped_on(&app.menus(), 0));
+                let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+                let visual = app.theme.visual.take();
+                terminal
+                    .draw(|frame| app.paint_into(frame, Instant::now()).unwrap())
+                    .unwrap();
+                let baseline = terminal.backend().buffer().clone();
+                app.theme.visual = visual;
+                let (_, images) = graphics::capture_images(|| {
+                    terminal
+                        .draw(|frame| app.paint_into(frame, Instant::now()).unwrap())
+                        .unwrap();
+                });
+                let chip = app.live_chip_at(scene, call).unwrap();
+                let (left, width) = app.slider_pill_track(scene, &chip).unwrap();
+                let row = app.panes[0]
+                    .last_map
+                    .as_ref()
+                    .unwrap()
+                    .cell_for_offset(ByteOffset(call))
+                    .unwrap()
+                    .y;
+                let rail = Rect::new(left, row, width, 1);
+                let menu = dropdown_rects(
+                    &app.menus(),
+                    app.menu.as_ref().unwrap(),
+                    app.menu_row(),
+                    app.frame,
+                )[0];
+                let covered = rail.intersection(menu);
+                assert!(!covered.is_empty() && covered.width < rail.width);
+                let backdrop = images.iter().find(|image| image.depth == -1).unwrap();
+                assert_eq!((backdrop.width, backdrop.height), (120, 30));
+                for x in rail.x..rail.right() {
+                    if menu.contains((x, row).into()) {
+                        let before = baseline.cell((x, row)).unwrap();
+                        let mut after = terminal.backend().buffer().cell((x, row)).unwrap().clone();
+                        after.bg = before.bg;
+                        assert_eq!(&after, before, "the menu keeps its glyph at ({x}, {row})");
+                    }
+                    let alpha = backdrop.rgba[(usize::from(row) * 120 + usize::from(x)) * 4 + 3];
+                    assert_eq!(
+                        alpha,
+                        if fill.is_none() || menu.contains((x, row).into()) {
+                            255
+                        } else {
+                            0
+                        },
+                        "only an exposed filled rail cuts a backdrop hole at ({x}, {row})"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn tempo_calls_are_found_whole() {
+            let source = "setcpm(120/4)\n$: s(\"bd\").fast(2)\nsetcps(0.5)";
+            let spans = tempo_call_spans(source);
+            assert_eq!(spans.len(), 2);
+            assert_eq!(&source[spans[0].0..spans[0].1], "setcpm(120/4)");
+            assert_eq!(&source[spans[1].0..spans[1].1], "setcps(0.5)");
+            assert!(tempo_call_spans("s(\"bd\")").is_empty());
+        }
+
+        /// With the header hidden a launch still counts down, in the top-right
+        /// corner of the score: the menu bar and the scene tabs stay as drawn,
+        /// so no chip is hidden under the countdown and still clickable.
+        #[test]
+        fn a_hidden_header_counts_a_launch_down_over_the_score_not_the_tabs() {
+            use ratatui::{Terminal, backend::TestBackend};
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.ui_settings.show_header = false;
+            while app.scenes.len() < 12 {
+                app.new_scene(false);
+            }
+            app.snapshot = Some(crate::app::tests::support::sounding(true, false));
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let mut draw = |app: &mut App| {
+                terminal
+                    .draw(|frame| app.paint_into(frame, Instant::now()).unwrap())
+                    .unwrap();
+                terminal.backend().buffer().clone()
+            };
+            let quiet = draw(&mut app);
+            app.landing_name = Some("intro".into());
+            app.snapshot = Some(StudioSnapshot {
+                launch: Some(crate::engine::LaunchInfo {
+                    boundary_cycle: 8.0,
+                    cycles_left: 3.2,
+                    seconds_left: 6.4,
+                }),
+                ..crate::app::tests::support::sounding(true, false)
+            });
+            let counting = draw(&mut app);
+            let row = |buffer: &Buffer, y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            };
+            let regions = app.regions;
+            assert!(regions.header.is_empty());
+            assert_eq!(regions.menu.height, 1);
+            assert_eq!(regions.scenes.y, regions.menu.bottom());
+            assert_eq!(
+                row(&counting, regions.menu.y),
+                row(&quiet, regions.menu.y),
+                "the countdown painted over the menu bar"
+            );
+            assert_eq!(
+                row(&counting, regions.scenes.y),
+                row(&quiet, regions.scenes.y),
+                "the countdown painted over the scene tabs"
+            );
+            let score = regions.panes[0].editor;
+            assert_eq!(score.y, regions.scenes.bottom());
+            assert!(
+                row(&counting, score.y).contains("» intro in 3.2"),
+                "{}",
+                row(&counting, score.y)
+            );
+        }
+    }
+}

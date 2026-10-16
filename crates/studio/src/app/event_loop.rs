@@ -741,3 +741,496 @@ pub(super) fn loop_wait(pacing: Duration, pad_cap: Option<Duration>) -> Duration
         None => pacing,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod event_loop {
+        //! Tests for `app/event_loop.rs`.
+
+        use crate::app::event_loop::*;
+        use crate::app::tests::support::*;
+
+        const SIXTY: Duration = Duration::from_micros(16_667);
+
+        const THRIFTY: Duration = Duration::from_micros(125_000);
+
+        fn past(now: Instant) -> Instant {
+            now - SIXTY
+        }
+
+        fn future(now: Instant) -> Instant {
+            now + SIXTY
+        }
+
+        /// While animating, an animated dirty frame waits for the frame
+        /// interval, so the frame-rate setting bounds the repaint rate.
+        #[test]
+        fn an_animated_dirty_frame_waits_for_its_interval() {
+            let now = Instant::now();
+            assert!(
+                !frame_is_due(true, true, false, now, future(now)),
+                "mid-interval, the repaint is held"
+            );
+            assert!(
+                frame_is_due(true, true, false, now, past(now)),
+                "once due, it paints"
+            );
+            assert_eq!(
+                pacing_wait(true, true, false, now, future(now), THRIFTY),
+                SIXTY,
+                "and the loop sleeps to the frame"
+            );
+        }
+
+        /// Typing while the set plays paints at once. Pacing every repaint made
+        /// a typed character wait for the next frame: up to an eighth of a
+        /// second at the thriftiest rate, which reads as a sluggish editor.
+        #[test]
+        fn a_keystroke_while_playing_paints_at_once() {
+            let now = Instant::now();
+            assert!(frame_is_due(true, false, true, now, future(now)));
+            assert!(frame_is_due(true, true, true, now, now + THRIFTY));
+            assert_eq!(
+                pacing_wait(true, false, true, now, now + THRIFTY, THRIFTY),
+                Duration::ZERO
+            );
+        }
+
+        /// While animating, a due frame paints even when nothing set the dirty
+        /// flag. Otherwise playback with no dirty source freezes the screen.
+        #[test]
+        fn an_animated_due_frame_paints_without_a_dirty_flag() {
+            let now = Instant::now();
+            assert!(
+                frame_is_due(true, false, false, now, past(now)),
+                "the animation advances"
+            );
+            assert!(
+                !frame_is_due(true, false, false, now, future(now)),
+                "but not ahead of its interval"
+            );
+        }
+
+        /// Stopped, the interval has no claim: a keystroke repaints at once.
+        #[test]
+        fn a_stopped_dirty_frame_paints_at_once() {
+            let now = Instant::now();
+            assert!(frame_is_due(false, true, false, now, future(now)));
+            assert!(frame_is_due(false, true, true, now, future(now)));
+            assert!(!frame_is_due(false, false, false, now, future(now)));
+        }
+
+        /// While animating, the wait runs to the due frame and is at most one
+        /// interval. It is zero only when the frame is already due, so the loop
+        /// does not spin between the dirty flag and the due frame.
+        #[test]
+        fn an_animating_wait_runs_to_the_frame_not_hot() {
+            let now = Instant::now();
+            // Mid-interval: wait the remainder, never more than the interval.
+            assert_eq!(
+                pacing_wait(true, true, false, now, future(now), SIXTY),
+                SIXTY
+            );
+            // A next_frame far ahead (lagged draw) is clamped to one interval.
+            let far = now + THRIFTY * 4;
+            assert_eq!(pacing_wait(true, false, false, now, far, SIXTY), SIXTY);
+            // Due now: the wait is zero but bounded - the turn proceeds.
+            assert_eq!(
+                pacing_wait(true, false, false, now, past(now), SIXTY),
+                Duration::ZERO
+            );
+            // The thrift setting owns the pacing, not a fixed cadence: past
+            // the remainder it clamps to its own interval, not the default's.
+            assert_eq!(
+                pacing_wait(true, false, false, now, now + THRIFTY * 2, THRIFTY),
+                THRIFTY
+            );
+        }
+
+        /// A wake that lands late within the interval keeps the deadlines on the
+        /// original cadence, so lateness never accumulates across frames.
+        #[test]
+        fn repeated_late_wakes_keep_the_animation_cadence() {
+            let interval = Duration::from_micros(4_167);
+            let lateness = Duration::from_millis(1);
+            let started = Instant::now();
+            let mut deadline = started;
+            for frame in 1..=120 {
+                let woke = deadline + lateness;
+                assert!(frame_is_due(true, false, false, woke, deadline));
+                deadline = next_frame_deadline(deadline, woke, interval);
+                assert_eq!(deadline, started + interval * frame);
+                assert_eq!(
+                    pacing_wait(true, false, false, woke, deadline, interval),
+                    interval - lateness,
+                );
+            }
+        }
+
+        /// An input repaint before the due frame restarts the interval from the
+        /// keystroke, so typing cannot quicken the animation.
+        #[test]
+        fn an_early_input_repaint_starts_a_new_animation_interval() {
+            let started = Instant::now();
+            let old_deadline = started + SIXTY;
+            let key_at = started + SIXTY / 4;
+            assert!(frame_is_due(true, false, true, key_at, old_deadline));
+            let deadline = next_frame_deadline(old_deadline, key_at, SIXTY);
+            assert_eq!(deadline, key_at + SIXTY);
+            assert!(!frame_is_due(true, false, false, old_deadline, deadline));
+        }
+
+        /// A wake a whole interval or more late starts a fresh interval instead of
+        /// painting the missed frames back to back.
+        #[test]
+        fn a_missed_animation_interval_does_not_replay_old_frames() {
+            let old_deadline = Instant::now();
+            for delay in [SIXTY, SIXTY * 2, Duration::from_secs(30)] {
+                let woke = old_deadline + delay;
+                let deadline = next_frame_deadline(old_deadline, woke, SIXTY);
+                assert_eq!(deadline, woke + SIXTY);
+                assert!(!frame_is_due(true, true, false, woke, deadline));
+                assert_eq!(pacing_wait(true, true, false, woke, deadline, SIXTY), SIXTY);
+            }
+        }
+
+        /// The time spent drawing comes out of the frame's interval: after the draw
+        /// the loop waits only what is left of it, not a whole interval more.
+        #[test]
+        fn drawing_spends_the_remainder_of_the_anchored_interval() {
+            let interval = Duration::from_micros(4_167);
+            let lateness = Duration::from_millis(1);
+            let drawing = Duration::from_micros(750);
+            let old_deadline = Instant::now();
+            let woke = old_deadline + lateness;
+            let deadline = next_frame_deadline(old_deadline, woke, interval);
+            assert_eq!(
+                pacing_wait(true, false, false, woke + drawing, deadline, interval),
+                interval - lateness - drawing,
+            );
+        }
+
+        /// A press that can act caps the wait to what is left of the pad
+        /// deadline; with nothing bound the idle loop keeps its long sleep.
+        #[test]
+        fn the_pad_cap_bounds_the_wait_only_while_a_press_can_act() {
+            let cap = pad_wait_cap(Duration::from_millis(3));
+            assert_eq!(loop_wait(IDLE_POLL, Some(cap)), Duration::from_millis(12));
+            assert_eq!(loop_wait(IDLE_POLL, None), IDLE_POLL);
+            assert_eq!(loop_wait(Duration::ZERO, Some(cap)), Duration::ZERO);
+            assert_eq!(
+                loop_wait(Duration::from_millis(5), Some(cap)),
+                Duration::from_millis(5),
+                "a nearer frame still wins"
+            );
+        }
+
+        #[test]
+        fn a_visible_midi_feed_gets_the_low_latency_wait_while_stopped() {
+            let since = Duration::from_millis(3);
+            assert_eq!(
+                midi_wait_cap(1, false, true, since),
+                Some(Duration::from_millis(12))
+            );
+            assert_eq!(midi_wait_cap(1, false, false, since), None);
+            assert_eq!(midi_wait_cap(0, true, true, since), None);
+        }
+
+        /// The cap is a deadline from the last drain, not a fixed span: what
+        /// remains of 15 ms, and a millisecond once that is spent. A fixed
+        /// millisecond spun the loop a thousand turns a second wherever the
+        /// timer ran finer than Windows's default tick; a fixed 15 ms added a
+        /// whole tick of lag where it did not.
+        #[test]
+        fn the_pad_cap_counts_down_from_the_last_drain() {
+            let ms = Duration::from_millis;
+            assert_eq!(pad_wait_cap(Duration::ZERO), ms(15));
+            assert_eq!(
+                pad_wait_cap(Duration::from_micros(600)),
+                Duration::from_micros(14_400)
+            );
+            assert_eq!(pad_wait_cap(ms(4)), ms(11));
+            assert_eq!(pad_wait_cap(ms(14)), ms(1));
+            assert_eq!(
+                pad_wait_cap(Duration::from_micros(14_500)),
+                ms(1),
+                "floored"
+            );
+            assert_eq!(pad_wait_cap(ms(15)), ms(1));
+            assert_eq!(pad_wait_cap(ms(250)), ms(1), "a long turn does not spin");
+        }
+
+        /// Stopped, a dirty frame repaints at once and an idle loop keeps its
+        /// long poll; the wait never depends on next_frame's position.
+        #[test]
+        fn a_stopped_wait_is_keystroke_or_idle_poll() {
+            let now = Instant::now();
+            assert_eq!(
+                pacing_wait(false, true, false, now, future(now), SIXTY),
+                Duration::ZERO
+            );
+            assert_eq!(
+                pacing_wait(false, false, false, now, past(now), SIXTY),
+                IDLE_POLL
+            );
+        }
+
+        #[test]
+        fn benchmark_runtime_snapshot_pairs_generation_and_callback_evidence() {
+            let snapshot = StudioSnapshot {
+                playing: true,
+                session_generation: 8,
+                audible_generation: Some(8),
+                confirmed_audio_generation: Some(7),
+                source_revision: Some("a".repeat(64)),
+                cps: 3.75,
+                device_time: 12.5,
+                pressure: Some(rustel_runtime::EnginePressureSnapshot {
+                    device: rustel_audio::LiveDeviceReport {
+                        stream_id: 1,
+                        submitted_frames: 600_000,
+                        generation: 8,
+                        callbacks: 4_000,
+                        accepted_events: 9_000,
+                        stale_events_filtered: 3,
+                        late_events: 2,
+                        ring_refusals: 1,
+                        callback_errors: 4,
+                        callback_xruns: 8,
+                        callback_scope_misses: 5,
+                        callback_allocations: 6,
+                        callback_frees: 7,
+                        ..rustel_audio::LiveDeviceReport::default()
+                    },
+                    ..rustel_runtime::EnginePressureSnapshot::default()
+                }),
+                ..StudioSnapshot::default()
+            };
+            let runtime = studio_runtime_snapshot(
+                Publication::Running,
+                42,
+                StudioRuntimeSnapshotContext {
+                    snapshot: Some(&snapshot),
+                    evaluating: false,
+                    visible_error: None,
+                    process: ProcessStats {
+                        cpu_percent: Some(12.5),
+                        machine_cpu_percent: Some(40.0),
+                        resident_bytes: Some(700_000_000),
+                        footprint_bytes: None,
+                    },
+                    master_peak_db: -3.0,
+                    master_lufs: -18.0,
+                    hydra_frames: Some(123),
+                },
+            );
+
+            assert!(runtime.playing);
+            assert_eq!(runtime.frame_sequence, 42);
+            assert_eq!(runtime.session_generation, 8);
+            assert_eq!(runtime.published_generation, Some(8));
+            assert_eq!(runtime.confirmed_audio_generation, Some(7));
+            assert_eq!(runtime.submitted_frames, Some(600_000));
+            assert_eq!(runtime.callbacks, Some(4_000));
+            assert_eq!(runtime.callback_xruns, Some(8));
+            assert_eq!(runtime.accepted_events, Some(9_000));
+            assert_eq!(runtime.hydra_frames, Some(123));
+            assert_eq!(runtime.process_resident_bytes, Some(700_000_000));
+            let value = serde_json::to_value(&runtime).expect("runtime snapshot serializes");
+            assert_eq!(value["schema_version"], 2);
+            assert_eq!(value["published_generation"], 8);
+            assert_eq!(value["confirmed_audio_generation"], 7);
+            assert!(value.get("audible_generation").is_none());
+            assert_eq!(value["publication"], "running");
+            assert_eq!(value["callback_xruns"], 8);
+            assert_eq!(value["pressure"]["device"]["generation"], 8);
+
+            let value = serde_json::to_value(StudioRuntimeSnapshot {
+                published_generation: None,
+                confirmed_audio_generation: None,
+                ..runtime
+            })
+            .expect("unavailable generations serialize");
+            assert_eq!(
+                value.get("published_generation"),
+                Some(&serde_json::Value::Null)
+            );
+            assert_eq!(
+                value.get("confirmed_audio_generation"),
+                Some(&serde_json::Value::Null)
+            );
+        }
+
+        /// When the terminal goes away, the studio stops the sound first, then
+        /// quits and writes the scene, as an ordinary quit does.
+        #[test]
+        fn a_hung_up_studio_stops_the_sound_and_writes_the_scene() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let path = app.scenes.current().path.clone();
+            type_text(&mut app, "$: s(\"hh*8\")");
+            assert!(app.scenes.current().dirty, "typed and not yet written");
+
+            assert!(!app.pump_terminal_hangup(false), "a terminal that is there");
+            assert!(!app.quit, "changes nothing");
+
+            assert!(app.pump_terminal_hangup(true), "and one that has gone");
+            assert!(app.quit, "is a way out");
+            assert!(
+                app.worker.stop_requested(),
+                "silence first: the music must not play on into a closed window"
+            );
+            app.save_worker.shutdown();
+            let _ = app.drain_save_completions();
+            let after = std::fs::read_to_string(&path).expect("the scene's file");
+            assert!(
+                after.contains("hh*8"),
+                "and the typing is on disk: {after:?}"
+            );
+        }
+
+        /// A signal writes the pending changes to disk, as an ordinary quit
+        /// does.
+        #[test]
+        fn a_cancelled_studio_writes_the_scene_it_was_typing() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let path = app.scenes.current().path.clone();
+            type_text(&mut app, "$: s(\"bd*4\")");
+            assert!(app.scenes.current().dirty, "typed and not yet written");
+            let before = std::fs::read_to_string(&path).unwrap_or_default();
+            assert!(
+                !before.contains("bd*4"),
+                "the keystrokes have not reached the file yet"
+            );
+
+            // What the signal watcher does: raise the flag the loop reads.
+            let cancelled = std::sync::Arc::new(AtomicBool::new(true));
+            app.options.cancellation = Some(std::sync::Arc::clone(&cancelled));
+            app.pump_cancellation();
+
+            assert!(app.quit, "the studio is on its way out");
+            // Silence first: the transport is stopped before anything is
+            // written, so a window closed mid-set does not go on playing after
+            // it has gone from the screen.
+            assert!(
+                app.worker.stop_requested(),
+                "the sound was left running while the files were written"
+            );
+            assert!(
+                app.scenes.current().latest_save.is_some(),
+                "and the scene went to the save worker rather than with it"
+            );
+            app.save_worker.shutdown();
+            let _ = app.drain_save_completions();
+            let after = std::fs::read_to_string(&path).expect("the scene's file");
+            assert!(
+                after.contains("bd*4"),
+                "what was typed is on disk: {after:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "harness")]
+    mod pinned_device_feed {
+        //! The desk's device feed is part of the pinned frame. The harness
+        //! stands in for the host, so messages from a controller attached to
+        //! the test machine must not reach the desk. These tests inject
+        //! messages the way a driver would and assert that nothing leaks, so
+        //! the guard also holds on machines with no hardware.
+
+        use crate::app::tests::support::app_over;
+        use crate::app::tests::support::press;
+        use crate::app::*;
+        use crate::pads::PadListener;
+        use ratatui::{Terminal, backend::TestBackend};
+        use rustel_midi::input::MidiEvent;
+
+        /// Paint one frame at 140×40 and return the screen as rows, the harness's
+        /// own way in: the app's `paint_into` into a test backend.
+        fn screen_rows(app: &mut App) -> Vec<String> {
+            let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("test terminal");
+            let started = std::time::Instant::now();
+            terminal
+                .draw(|frame| app.paint_into(frame, started).expect("frame paints"))
+                .expect("test backend draw");
+            let buffer = terminal.backend().buffer().clone();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol().to_owned())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_owned()
+                })
+                .collect()
+        }
+
+        /// Messages stamped on the driver's thread, as a real controller leaves
+        /// them.
+        fn record_aftertouch(listener: &PadListener) {
+            listener.record_for_test(
+                "Maschine MK3 Virtual Input",
+                MidiEvent::ChannelAftertouch {
+                    channel: 1,
+                    pressure: 64,
+                },
+            );
+            listener.record_for_test(
+                "Maschine MK3 Virtual Input",
+                MidiEvent::NoteOn {
+                    channel: 1,
+                    note: 60,
+                    velocity: 100,
+                },
+            );
+        }
+
+        /// The rows of the desk's device area: from the desk's rule down, the
+        /// lines a controller's traffic would appear among.
+        fn desk_rows(app: &mut App) -> Vec<String> {
+            let rows = screen_rows(app);
+            let Some(rule) = rows.iter().position(|row| row.contains("── mixer ──")) else {
+                panic!("the desk's rule is on screen");
+            };
+            rows[rule..].to_vec()
+        }
+
+        /// Aftertouch and notes in the feed do not reach the pinned desk: the
+        /// device area shows the two pinned chips and nothing live.
+        #[test]
+        fn the_pinned_desk_shows_no_live_device_lines() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.pin_frame_inputs = true;
+            press(&mut app, KeyCode::F(4), KeyModifiers::NONE);
+            record_aftertouch(&app.pads);
+            let rows = desk_rows(&mut app);
+            assert!(
+                rows.iter().any(|row| row.contains("⌁ no midi")),
+                "the pinned feed opens with the no-midi chip: {rows:?}"
+            );
+            for row in &rows {
+                assert!(
+                    !row.contains("Maschine") && !row.contains("aftertouch"),
+                    "a live device line leaked into the pinned desk: {row:?}"
+                );
+            }
+        }
+
+        /// The product's own desk, unpinned, still tells the truth: the same
+        /// messages do reach it. The pin is the harness's, not a blindfold.
+        #[test]
+        fn the_unpinned_desk_still_shows_the_live_feed() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            press(&mut app, KeyCode::F(4), KeyModifiers::NONE);
+            record_aftertouch(&app.pads);
+            let rows = desk_rows(&mut app).join("\n");
+            assert!(
+                rows.contains("aftertouch"),
+                "the live desk reads the feed: {rows}"
+            );
+        }
+    }
+}

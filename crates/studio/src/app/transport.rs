@@ -394,3 +394,750 @@ impl App {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod transport {
+        //! Tests for `app/transport.rs`.
+
+        use crate::app::tests::support::*;
+        use crate::app::transport::*;
+
+        /// The one shortcut with nothing behind it asks before it goes.
+        #[test]
+        fn quit_asks_twice_and_anything_else_calls_it_off() {
+            let directory = tempfile::tempdir().expect("temp dir");
+
+            // One press arms and says so; it does not quit.
+            let mut app = app_over(directory.path());
+            press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+            assert!(!app.quit, "a single ^Q quit the studio");
+            assert!(app.quit_armed, "^Q did not arm the quit");
+            assert!(
+                app.status.contains("again to quit"),
+                "the status does not say how to confirm: {}",
+                app.status
+            );
+
+            // The second goes.
+            press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+            assert!(app.quit, "^Q twice did not quit");
+
+            // Any other key calls it off - including the transport, which is the
+            // most likely thing to be reaching for when the finger slipped.
+            for (code, modifiers) in [
+                (KeyCode::Char('s'), KeyModifiers::CONTROL),
+                (KeyCode::Esc, KeyModifiers::NONE),
+                (KeyCode::Char('x'), KeyModifiers::NONE),
+            ] {
+                let mut app = app_over(directory.path());
+                press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+                assert!(app.quit_armed);
+                press(&mut app, code, modifiers);
+                assert!(!app.quit_armed, "{code:?} left the quit armed");
+                assert!(!app.quit, "{code:?} let the studio quit");
+                // And a later ^Q has to start over.
+                press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+                assert!(
+                    !app.quit,
+                    "the disarmed press still counted toward quitting"
+                );
+                assert!(app.quit_armed);
+            }
+        }
+
+        #[test]
+        fn errors_clear_only_their_owner_and_newest_remaining_error_is_visible() {
+            let mut errors = AppErrors::default();
+            errors.set(ErrorOwner::Evaluation, "compile failed".into());
+            errors.set(ErrorOwner::Editor, "clipboard failed".into());
+            assert_eq!(errors.visible(), Some("clipboard failed"));
+
+            assert!(errors.clear(ErrorOwner::Editor));
+            assert_eq!(errors.visible(), Some("compile failed"));
+            assert!(!errors.clear(ErrorOwner::Save));
+            assert_eq!(errors.visible(), Some("compile failed"));
+
+            errors.set(ErrorOwner::Engine, "device failed".into());
+            errors.clear(ErrorOwner::Evaluation);
+            assert_eq!(errors.visible(), Some("device failed"));
+        }
+
+        #[test]
+        fn transient_errors_expire_even_when_hidden_and_new_errors_get_five_seconds() {
+            let now = Instant::now();
+            let mut errors = AppErrors::default();
+            errors.set_at(ErrorOwner::Editor, "clipboard failed".into(), now);
+            errors.set_at(ErrorOwner::Interface, "last scene".into(), now);
+            assert_eq!(errors.expire(now + Duration::from_secs(4)).count(), 0);
+            errors.set_at(
+                ErrorOwner::Interface,
+                "last scene again".into(),
+                now + Duration::from_secs(4),
+            );
+            assert_eq!(
+                errors
+                    .expire(now + Duration::from_secs(5))
+                    .collect::<Vec<_>>(),
+                [ErrorOwner::Editor]
+            );
+            assert!(errors.get(ErrorOwner::Editor).is_none());
+            assert_eq!(errors.visible(), Some("last scene again"));
+            assert_eq!(errors.expire(now + Duration::from_secs(8)).count(), 0);
+            assert_eq!(
+                errors
+                    .expire(now + Duration::from_secs(9))
+                    .collect::<Vec<_>>(),
+                [ErrorOwner::Interface]
+            );
+            assert!(errors.visible().is_none());
+        }
+
+        #[test]
+        fn theme_notices_expire_without_clearing_prompts_or_errors() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.keep_theme();
+            assert!(app.status.contains("remembered in"));
+            let old_deadline = Instant::now();
+            app.status_notice.as_mut().unwrap().1 = old_deadline;
+            app.keep_theme();
+            app.expire_notice(old_deadline);
+            assert!(
+                !app.status.is_empty(),
+                "repeating a notice renews its lifetime"
+            );
+
+            let deadline = app.status_notice.as_ref().unwrap().1;
+            app.request_quit();
+            let prompt = app.status.clone();
+            app.expire_notice(deadline);
+            assert_eq!(app.status, prompt, "the quit prompt still needs an answer");
+            assert!(app.status_notice.is_none());
+
+            app.keep_theme();
+            app.set_error(ErrorOwner::Save, "save failed".into());
+            let deadline = app.status_notice.as_ref().unwrap().1;
+            app.expire_notice(deadline);
+            assert!(app.status.is_empty(), "a hidden notice expires too");
+            assert_eq!(app.errors.visible(), Some("save failed"));
+        }
+
+        #[test]
+        fn transient_errors_do_not_dismiss_unresolved_score_save_or_engine_errors() {
+            for owner in [
+                ErrorOwner::Setup,
+                ErrorOwner::Evaluation,
+                ErrorOwner::Save,
+                ErrorOwner::Engine,
+            ] {
+                let now = Instant::now();
+                let mut errors = AppErrors::default();
+                errors.set_at(owner, "needs attention".into(), now);
+                errors.set_at(ErrorOwner::Interface, "last scene".into(), now);
+                assert_eq!(errors.visible(), Some("last scene"));
+                assert_eq!(errors.expire(now + Duration::from_secs(5)).count(), 1);
+                assert_eq!(errors.visible(), Some("needs attention"));
+                assert_eq!(errors.expire(now + Duration::from_secs(3600)).count(), 0);
+            }
+        }
+
+        #[test]
+        fn interface_error_clears_on_an_idle_turn_but_stays_in_the_log() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            assert_eq!(app.log.unseen(), 0);
+            app.set_error(ErrorOwner::Interface, "could not write scene".into());
+            assert_eq!(app.log.unseen(), 1);
+            let error = app
+                .errors
+                .get(ErrorOwner::Interface)
+                .expect("interface error")
+                .to_owned();
+            app.errors.entries[ErrorOwner::Interface.slot()]
+                .as_mut()
+                .unwrap()
+                .expires_at = Some(Instant::now());
+            app.dirty_frame = false;
+            app.pump_turn();
+            assert!(app.errors.get(ErrorOwner::Interface).is_none());
+            assert_eq!(app.log.unseen(), 0, "the header alert expires too");
+            assert!(
+                app.dirty_frame,
+                "expiry redraws the footer even without a keypress"
+            );
+            assert!(app.log.lines().iter().any(|line| line.text == error));
+        }
+
+        #[test]
+        fn transient_alerts_clear_only_their_owner_and_can_be_raised_again() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.set_error(ErrorOwner::Save, "save failed".into());
+            app.log.push(LogLevel::Warn, "device", "device warning");
+            app.set_error(ErrorOwner::Editor, "clipboard failed".into());
+            app.set_error(ErrorOwner::Interface, "last scene".into());
+            app.set_error(ErrorOwner::Interface, "last scene again".into());
+            assert_eq!(app.log.unseen(), 5);
+
+            app.errors.entries[ErrorOwner::Interface.slot()]
+                .as_mut()
+                .unwrap()
+                .expires_at = Some(Instant::now());
+            app.pump_turn();
+            assert_eq!(app.log.unseen(), 3, "both expired interface alerts retire");
+            assert_eq!(app.errors.visible(), Some("clipboard failed"));
+
+            app.clear_error(ErrorOwner::Editor);
+            assert_eq!(app.log.unseen(), 2, "unrelated warnings stay visible");
+            assert_eq!(app.errors.visible(), Some("save failed"));
+            app.set_error(ErrorOwner::Interface, "last scene again".into());
+            assert_eq!(app.log.unseen(), 3, "a repeated error alerts again");
+            app.clear_error(ErrorOwner::Interface);
+            assert_eq!(app.log.unseen(), 2);
+            assert!(app.log.lines().iter().any(|line| line.text == "last scene"));
+            assert!(
+                app.log.lines().iter().all(|line| !line.resolved),
+                "a passing message that timed out or gave way is not resolved"
+            );
+        }
+
+        #[test]
+        fn stopping_hides_score_marks_before_the_snapshot_catches_up() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.snapshot = Some(crate::engine::StudioSnapshot {
+                playing: true,
+                stopping: false,
+                ..Default::default()
+            });
+            assert!(app.sounding_marks_visible(), "playing events are marked");
+
+            app.handle_editor_effect(EditorEffect::Stop).expect("stop");
+            assert!(
+                app.snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.playing && !snapshot.stopping),
+                "the deliberately stale snapshot still says playing"
+            );
+            assert!(
+                !app.sounding_marks_visible(),
+                "the local stop request hides marks while tails ring"
+            );
+            assert!(
+                !app.visual.running(),
+                "the visual canvas freezes while tails ring"
+            );
+
+            app.stop_requested = false;
+            app.snapshot = Some(crate::engine::StudioSnapshot {
+                playing: true,
+                stopping: true,
+                ..Default::default()
+            });
+            assert!(
+                !app.sounding_marks_visible(),
+                "the acknowledged draining state also hides marks"
+            );
+            app.snapshot = Some(crate::engine::StudioSnapshot::default());
+            assert!(
+                !app.sounding_marks_visible(),
+                "a fully stopped score has no marks"
+            );
+        }
+
+        /// Every owner has a slot. The footer keeps one message per owner in a
+        /// fixed array, so an owner whose index falls outside it takes the whole
+        /// studio down the first time anything reports through it. A failed
+        /// widget install uses this path during every evaluation that moves an
+        /// inline visual.
+        #[test]
+        fn every_error_owner_can_be_set_read_and_cleared() {
+            let mut errors = AppErrors::default();
+            for owner in ErrorOwner::ALL {
+                errors.set(owner, format!("{owner:?} spoke"));
+                assert_eq!(
+                    errors.get(owner).unwrap_or_default(),
+                    format!("{owner:?} spoke"),
+                    "{owner:?} has no slot of its own"
+                );
+                assert!(errors.clear(owner), "{owner:?} did not clear");
+                assert!(errors.get(owner).is_none());
+            }
+            assert_eq!(
+                ErrorOwner::ALL.len(),
+                ERROR_OWNER_COUNT,
+                "the slots and the owners disagree"
+            );
+            for (index, owner) in ErrorOwner::ALL.into_iter().enumerate() {
+                assert_eq!(owner.slot(), index, "{owner:?} is not at its own index");
+            }
+        }
+
+        #[test]
+        fn pressing_update_on_the_score_already_sounding_installs_nothing() {
+            // Update is held down as often as it is pressed, and each repeat used
+            // to tear down a generation and build a byte-identical one. The
+            // cutovers stack faster than the music absorbs them, and it is
+            // audible.
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            let source = "$: s(\"bd*4\")";
+
+            let current = app.scenes.current().id;
+            app.installed_revision = Some(source_revision(source));
+            app.audible_scene = Some(current);
+            app.snapshot = Some(sounding(true, false));
+            assert!(
+                app.install_would_be_redundant(current, source),
+                "the sounding score is already this one"
+            );
+
+            // A single edited character is a different score.
+            assert!(!app.install_would_be_redundant(current, "$: s(\"bd*8\")"));
+        }
+
+        /// A duplicate is another scene with the same text: launching it is a
+        /// launch, not a repeat press, and the playing mark moves over to it.
+        #[test]
+        fn launching_a_duplicate_of_the_sounding_scene_installs_it() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            let source = "$: s(\"sine*4\")";
+            let first = app.scenes.current().id;
+            app.scenes.current_mut().editor = Editor::new(source).expect("editor");
+            app.installed_revision = Some(source_revision(source));
+            app.audible_scene = Some(first);
+            app.snapshot = Some(sounding(true, false));
+            assert!(app.install_would_be_redundant(first, source));
+
+            app.new_scene(true);
+            let copy = app.scenes.current().id;
+            assert_ne!(copy, first);
+            assert_eq!(app.scenes.current().editor.source(), source, "a copy");
+            assert!(
+                !app.install_would_be_redundant(copy, source),
+                "the same text from another scene is a launch"
+            );
+            // Sent, the copy is the one the engine will answer for.
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+            assert!(
+                app.pending_evaluation.is_some() || !app.inflight.is_empty(),
+                "the copy was evaluated rather than refused as unchanged"
+            );
+            assert!(!app.status.starts_with("unchanged"), "{}", app.status);
+        }
+
+        /// ^⇧S rewinds once; the scene's own ⟲ rewinds every time.
+        ///
+        /// The flag is the scene's rather than the gesture's, so a scene
+        /// without one is an ordinary update however it is played, and a
+        /// scene with one rewinds however it is played. A live edit that
+        /// jumped back to the downbeat on every save would be unusable, which
+        /// is why the ordinary kind is the default and stays it.
+        #[test]
+        fn a_rewinding_launch_starts_the_score_from_its_own_beginning() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            let playing = app.scenes.current().id;
+            app.scenes.current_mut().editor = Editor::new("$: s(\"sine*4\")").expect("editor");
+            app.audible_scene = Some(playing);
+            app.snapshot = Some(sounding(true, false));
+
+            // The queue is two-deep and the engine may already have taken it,
+            // so the newest request is looked for in both places.
+            let queued = |app: &mut App| {
+                let newest = app
+                    .inflight
+                    .keys()
+                    .copied()
+                    .max()
+                    .and_then(|id| app.inflight.remove(&id));
+                match (app.pending_evaluation.take(), newest) {
+                    (Some(pending), _) => pending.rewind,
+                    (None, Some(sent)) => sent.rewind,
+                    (None, None) => panic!("an evaluation was queued"),
+                }
+            };
+
+            // An ordinary update of the score already sounding joins the cycle
+            // it is already in.
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+            assert!(!queued(&mut app), "an edit stays in time");
+
+            // ^⇧S is that update with a rewind, whatever the setting says.
+            press(
+                &mut app,
+                KeyCode::Char('s'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            );
+            assert!(queued(&mut app), "^⇧S plays from the top");
+            assert!(
+                !app.next_rewind,
+                "and is spent on the score it was asked for"
+            );
+
+            // The menu row is the same gesture.
+            app.dispatch_menu_action(crate::menu::MenuAction::RewindUpdate)
+                .expect("update from the top");
+            assert!(queued(&mut app), "Transport ▸ Update from the top");
+
+            // A scene flagged to rewind does it on every ordinary update,
+            // with no second key and no setting: the flag is the scene's.
+            app.new_scene(false);
+            let moved_to = app.scenes.current().id;
+            assert_ne!(moved_to, playing);
+            app.scenes.current_mut().editor = Editor::new("$: s(\"sawtooth*8\")").expect("editor");
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+            assert!(
+                !queued(&mut app),
+                "an unflagged scene joins the cycle already running"
+            );
+            press(
+                &mut app,
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            );
+            assert!(app.scenes.current_rewinds(), "^⇧U flags the scene");
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+            assert!(queued(&mut app), "and now ^S alone rewinds it");
+            // It is the scene's and not the studio's: the one that was
+            // playing before still joins the running cycle.
+            let back = app
+                .scenes
+                .scenes()
+                .iter()
+                .position(|scene| scene.id == playing)
+                .expect("the scene that was playing");
+            app.scenes.select(back);
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+            assert!(!queued(&mut app), "the other scene is unchanged");
+        }
+
+        /// A pad launching a flagged scene rewinds it.
+        ///
+        /// This is the whole reason the flag lives on the scene: a performer
+        /// has one pad per scene, and mapping a second pad to "the rewinding
+        /// kind of play" would double the mapping for every scene that wants
+        /// it. The pad path selects the scene and evaluates, the same as ^S,
+        /// and reads the same flag.
+        #[test]
+        fn a_pad_launching_a_flagged_scene_rewinds_it() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            let playing = app.scenes.current().id;
+            app.scenes.current_mut().editor = Editor::new("$: s(\"sine*4\")").expect("editor");
+            app.audible_scene = Some(playing);
+            app.snapshot = Some(sounding(true, false));
+
+            // A second scene, with a pad on it.
+            app.new_scene(false);
+            app.scenes.current_mut().editor = Editor::new("$: s(\"sawtooth*8\")").expect("editor");
+            let pad = crate::pads::Pad {
+                note: 36,
+                channel: 10,
+            };
+            assert!(app.scenes.learn_pad(pad));
+            let flagged = app.scenes.current_index();
+
+            let rewound = |app: &mut App| {
+                let newest = app
+                    .inflight
+                    .keys()
+                    .copied()
+                    .max()
+                    .and_then(|id| app.inflight.remove(&id));
+                match (app.pending_evaluation.take(), newest) {
+                    (Some(pending), _) => pending.rewind,
+                    (None, Some(sent)) => sent.rewind,
+                    (None, None) => panic!("an evaluation was queued"),
+                }
+            };
+
+            // Unflagged, the pad plays it into the cycle already running.
+            app.launch_scene(flagged).expect("the pad launches it");
+            assert!(!rewound(&mut app), "an unflagged scene joins the cycle");
+
+            // Flagged, the same pad plays it from its own beginning - with no
+            // second mapping and nothing else pressed.
+            assert_eq!(app.scenes.toggle_rewind(), Some(true));
+            app.launch_scene(flagged)
+                .expect("the pad launches it again");
+            assert!(rewound(&mut app), "the scene's ⟲ is read by the pad path");
+        }
+
+        /// A rewind plays the same text again rather than refusing it.
+        ///
+        /// An ordinary update of the sounding score is refused as unchanged. A
+        /// rewind is that restart, so unchanged text is not a reason to drop
+        /// it.
+        #[test]
+        fn a_rewind_replays_text_an_ordinary_update_would_refuse() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            let source = "$: s(\"sine*4\")";
+            let playing = app.scenes.current().id;
+            app.scenes.current_mut().editor = Editor::new(source).expect("editor");
+            app.installed_revision = Some(source_revision(source));
+            app.audible_scene = Some(playing);
+            app.snapshot = Some(sounding(true, false));
+            assert!(app.install_would_be_redundant(playing, source));
+
+            // Unchanged text, ordinary update: refused, and nothing queued.
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+            assert!(app.status.starts_with("unchanged"), "{}", app.status);
+            assert!(app.pending_evaluation.is_none() && app.inflight.is_empty());
+
+            let rewound = |app: &mut App| {
+                let newest = app
+                    .inflight
+                    .keys()
+                    .copied()
+                    .max()
+                    .and_then(|id| app.inflight.remove(&id));
+                match (app.pending_evaluation.take(), newest) {
+                    (Some(pending), _) => Some(pending.rewind),
+                    (None, Some(sent)) => Some(sent.rewind),
+                    (None, None) => None,
+                }
+            };
+
+            // ^⇧S on the same text plays it again, from the top.
+            press(
+                &mut app,
+                KeyCode::Char('s'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            );
+            assert_eq!(
+                rewound(&mut app),
+                Some(true),
+                "a rewind update was refused as unchanged: {}",
+                app.status
+            );
+
+            // And so does a scene that wears ⟲, on an ordinary ^S.
+            assert_eq!(app.scenes.toggle_rewind(), Some(true));
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+            assert_eq!(
+                rewound(&mut app),
+                Some(true),
+                "a flagged scene was refused as unchanged: {}",
+                app.status
+            );
+        }
+
+        #[test]
+        fn update_still_starts_a_stopped_studio_on_unchanged_text() {
+            // Stopped, update is how you start; the text being unchanged is
+            // beside the point. Mid-stop, the next update is how you cut the
+            // tail short - neither may be swallowed.
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            let source = "$: s(\"bd*4\")";
+            let current = app.scenes.current().id;
+            app.installed_revision = Some(source_revision(source));
+            app.audible_scene = Some(current);
+
+            app.snapshot = None;
+            assert!(!app.install_would_be_redundant(current, source), "stopped");
+
+            app.snapshot = Some(sounding(false, false));
+            assert!(
+                !app.install_would_be_redundant(current, source),
+                "not playing"
+            );
+
+            app.snapshot = Some(sounding(true, true));
+            assert!(!app.install_would_be_redundant(current, source), "stopping");
+        }
+
+        #[test]
+        fn an_armed_launch_is_never_redundant() {
+            // Queueing an evaluation is what consumes the arming; returning early
+            // would leave it in place and hand a later ordinary update a
+            // quantised launch it never asked for.
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            let source = "$: s(\"bd*4\")";
+            let current = app.scenes.current().id;
+            app.installed_revision = Some(source_revision(source));
+            app.audible_scene = Some(current);
+            app.snapshot = Some(sounding(true, false));
+            assert!(
+                app.install_would_be_redundant(current, source),
+                "the baseline is redundant"
+            );
+
+            app.next_launch = Launch::Quantised { unit_cycles: 4.0 };
+            assert!(
+                !app.install_would_be_redundant(current, source),
+                "a pending launch"
+            );
+
+            // An armed scene is no exemption on its own: the text that is armed
+            // is answered before this predicate runs, and any other text is a
+            // new launch.
+            app.next_launch = Launch::Now;
+            app.armed_scene = Some(current);
+            assert!(
+                app.install_would_be_redundant(current, source),
+                "the sounding text"
+            );
+        }
+
+        /// The worker answers a superseded launch with a cancel for the old
+        /// request after the new one is armed; that answer must leave the new
+        /// arming - and its countdown - alone. Only the armed request's own
+        /// outcome ends it.
+        #[test]
+        fn a_superseded_outcome_leaves_the_new_arming_alone() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            let scene = app.scenes.current().id;
+            app.snapshot = Some(sounding(true, false));
+            app.armed_scene = Some(scene);
+            app.armed_request = Some(2);
+            app.armed_revision = Some("armed".into());
+            app.landing_name = Some("intro".into());
+            let cancelled = |request_id| EvaluationOutcome {
+                request_id,
+                editor_revision: 0,
+                result: Err(crate::EngineFailure {
+                    kind: "cancelled".into(),
+                    message: "launch was superseded".into(),
+                    recoverable: true,
+                    playback_stopped: false,
+                }),
+            };
+            app.handle_evaluation(cancelled(1));
+            assert_eq!(app.armed_scene, Some(scene), "the old request's answer");
+            assert_eq!(app.armed_request, Some(2));
+            app.handle_evaluation(cancelled(2));
+            assert_eq!(app.armed_scene, None, "its own answer ends it");
+            assert_eq!(app.armed_revision, None);
+        }
+
+        /// Stop forgets the arming, drops the request that carried it, and
+        /// does not leak a refused or stopped launch into the next update.
+        #[test]
+        fn stop_forgets_the_arming_and_the_launch_it_carried() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            let scene = app.scenes.current().id;
+            app.snapshot = Some(sounding(true, false));
+            app.armed_scene = Some(scene);
+            app.armed_request = Some(7);
+            app.armed_revision = Some("armed".into());
+            app.next_launch = Launch::Quantised { unit_cycles: 1.0 };
+            app.handle_editor_effect(EditorEffect::Stop).expect("stop");
+            assert_eq!(app.armed_scene, None);
+            assert_eq!(app.armed_request, None);
+            assert!(matches!(app.next_launch, Launch::Now), "no launch leaks");
+
+            app.armed_scene = Some(scene);
+            app.armed_request = Some(8);
+            app.inflight.insert(
+                8,
+                PendingEvaluation {
+                    record: true,
+                    request_id: 8,
+                    scene,
+                    editor_revision: Revision(0),
+                    source: Arc::from("$: s(\"bd\")"),
+                    launch: Launch::Quantised { unit_cycles: 1.0 },
+                    rewind: false,
+                },
+            );
+            app.inflight.insert(
+                9,
+                PendingEvaluation {
+                    record: true,
+                    request_id: 9,
+                    scene,
+                    editor_revision: Revision(0),
+                    source: Arc::from("$: s(\"hh\")"),
+                    launch: Launch::Now,
+                    rewind: false,
+                },
+            );
+            app.handle_control(StudioControlEvent::Stopped(Box::new(
+                crate::engine::StudioStop::idle(),
+            )));
+            assert_eq!(app.armed_scene, None);
+            assert!(
+                !app.inflight.contains_key(&8),
+                "the quantised request is dropped"
+            );
+            assert!(
+                app.inflight.contains_key(&9),
+                "a plain update still wants its outcome"
+            );
+            assert!(app.is_evaluating(), "and is still being waited for");
+            app.handle_evaluation(EvaluationOutcome {
+                request_id: 9,
+                editor_revision: 0,
+                result: Err(crate::EngineFailure {
+                    kind: "cancelled".into(),
+                    message: "evaluation was superseded by Stop".into(),
+                    recoverable: true,
+                    playback_stopped: false,
+                }),
+            });
+            assert!(!app.is_evaluating(), "nothing left to wait for");
+        }
+
+        /// The text that is already armed is not re-armed by pressing again:
+        /// inside the head-room a re-arm slips the launch a whole line later.
+        #[test]
+        fn pressing_update_on_the_armed_text_does_not_re_arm() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            let source = "$: s(\"sine*4\")";
+            app.snapshot = Some(sounding(true, false));
+            app.armed_scene = Some(app.scenes.current().id);
+            app.armed_request = Some(3);
+            app.armed_revision = Some(source_revision(source));
+            let before = app.next_request_id;
+            app.handle_editor_effect(EditorEffect::Evaluate {
+                revision: app.editor().revision(),
+                source: source.into(),
+            })
+            .expect("evaluate");
+            assert_eq!(app.next_request_id, before, "nothing was queued");
+            assert!(app.status.contains("already armed"), "{}", app.status);
+            assert_eq!(app.armed_request, Some(3), "still the same arming");
+        }
+
+        #[test]
+        fn stopping_forgets_what_was_sounding_before_the_snapshot_catches_up() {
+            // The worker stops on an atomic immediately; the snapshot saying so
+            // arrives up to 100ms later. Until then the predicate would still see
+            // playing=true, and a Stop followed at once by Update would be read as
+            // redundant instead of restarting.
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            let source = "$: s(\"bd*4\")";
+            let current = app.scenes.current().id;
+            app.installed_revision = Some(source_revision(source));
+            app.audible_scene = Some(current);
+            app.snapshot = Some(sounding(true, false));
+
+            app.handle_editor_effect(EditorEffect::Stop).expect("stop");
+            assert!(
+                app.installed_revision.is_none(),
+                "a stop must forget what was sounding at once"
+            );
+            // The snapshot still lags, and the update is no longer redundant.
+            assert!(!app.install_would_be_redundant(current, source));
+        }
+
+        #[test]
+        fn nothing_is_redundant_before_the_first_install() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            app.snapshot = Some(sounding(true, false));
+            let current = app.scenes.current().id;
+            assert!(!app.install_would_be_redundant(current, "$: s(\"bd*4\")"));
+        }
+    }
+}

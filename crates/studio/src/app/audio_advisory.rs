@@ -280,3 +280,431 @@ impl App {
         u16::from(self.errors.visible().is_some()) + u16::from(self.audio_warning().is_some())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod audio_advisory {
+        //! Tests for `app/audio_advisory.rs`.
+
+        use std::sync::{Arc, OnceLock};
+
+        use crate::app::audio_advisory::*;
+        use crate::app::*;
+        use rustel_audio::{LiveDeviceReport, RealtimeLoadSnapshot};
+        use rustel_runtime::{EnginePressureCause, EnginePressureSnapshot, ProducerLoadSnapshot};
+
+        /// The opened stream's facts: what was asked for, and what the host said
+        /// it granted.
+        fn device(requested: u32, reported: Option<u32>) -> StudioDeviceInfo {
+            static REGISTRY: OnceLock<Arc<rustel_runtime::CapabilityRegistry>> = OnceLock::new();
+            StudioDeviceInfo {
+                stream_id: 1,
+                registry: Arc::clone(
+                    REGISTRY
+                        .get_or_init(|| Arc::new(rustel_runtime::capability_registry().clone())),
+                ),
+                audio: rustel_runtime::AudioStreamFacts::new(
+                    rustel_runtime::AudioOutputFacts::new(
+                        rustel_runtime::AudioHost::cpal("pulseaudio"),
+                        "test output",
+                        48_000,
+                        2,
+                        Some(rustel_runtime::AudioSampleFormat::F32),
+                        requested,
+                        reported,
+                    ),
+                    None,
+                ),
+                allocator_tripwire_armed: true,
+            }
+        }
+
+        /// A playing stream whose buffer, and the callback that last published,
+        /// are both `frames`.
+        fn snapshot(tick: u64, misses: u64, frames: u32) -> StudioSnapshot {
+            StudioSnapshot {
+                playing: true,
+                device: Some(device(frames, Some(frames))),
+                pressure: Some(EnginePressureSnapshot {
+                    device: LiveDeviceReport {
+                        stream_id: 1,
+                        realtime_load: RealtimeLoadSnapshot {
+                            publication: tick + 1,
+                            sample_rate_hz: 48_000,
+                            last_callback_frames: frames,
+                            total_callbacks: 10_000 + tick * 16,
+                            callbacks_over_100_percent: misses,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    // The old classifier can linger; the advisory must use fresh
+                    // counters, not this label or its per-projection delta.
+                    cause: EnginePressureCause::DspOverload,
+                    callback_deadline_misses: 100,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
+        fn at(start: Instant, tick: u64) -> Instant {
+            start + Duration::from_millis(tick * 100)
+        }
+
+        fn producer_snapshot(
+            tick: u64,
+            gaps: u64,
+            refusals: u64,
+            late_events: u64,
+        ) -> StudioSnapshot {
+            let mut snapshot = snapshot(tick, 0, 32);
+            let pressure = snapshot.pressure.as_mut().unwrap();
+            pressure.device.late_events = late_events;
+            pressure.producer = ProducerLoadSnapshot {
+                publication: tick + 1,
+                turns: 10_000 + tick,
+                gap_resync_count: gaps,
+                atomic_refusals: refusals,
+                ..Default::default()
+            };
+            snapshot
+        }
+
+        fn struggling(start: Instant) -> (AudioAdvisory, StudioSnapshot) {
+            let mut advisory = AudioAdvisory::default();
+            let mut latest = snapshot(0, 500, 32);
+            for tick in 0..=50 {
+                latest = snapshot(tick, 500 + tick, 32);
+                advisory.observe(&latest, at(start, tick));
+                assert_eq!(advisory.message().is_some(), tick == 50, "tick {tick}");
+            }
+            (advisory, latest)
+        }
+
+        #[test]
+        fn historical_and_warmup_misses_never_become_a_warning() {
+            let start = Instant::now();
+            let mut advisory = AudioAdvisory::default();
+            for tick in 0..=80 {
+                advisory.observe(&snapshot(tick, 500 + tick.min(20), 32), at(start, tick));
+                assert!(advisory.message().is_none(), "tick {tick}");
+            }
+        }
+
+        #[test]
+        fn one_hiccup_across_a_window_boundary_stays_quiet() {
+            let start = Instant::now();
+            let mut advisory = AudioAdvisory::default();
+            let mut misses = 500;
+            for tick in 0..=90 {
+                if tick == 29 || tick == 30 {
+                    misses += 200;
+                }
+                advisory.observe(&snapshot(tick, misses, 32), at(start, tick));
+                assert!(advisory.message().is_none(), "tick {tick}");
+            }
+        }
+
+        #[test]
+        fn recurring_producer_skips_warn_across_quiet_seconds_without_callback_overload() {
+            let start = Instant::now();
+            for late_events in [false, true] {
+                let mut advisory = AudioAdvisory::default();
+                let mut skips = 100;
+                for tick in 0..=111 {
+                    if [21, 41, 61].contains(&tick) {
+                        skips += 1;
+                    }
+                    let snapshot = if late_events {
+                        producer_snapshot(tick, 0, 0, skips)
+                    } else {
+                        producer_snapshot(tick, skips, 0, 0)
+                    };
+                    advisory.observe(&snapshot, at(start, tick));
+                    assert_eq!(
+                        advisory.message().is_some(),
+                        (70..111).contains(&tick),
+                        "tick {tick}, late events {late_events}"
+                    );
+                }
+                assert!(advisory.message().is_none());
+            }
+        }
+
+        #[test]
+        fn one_producer_hiccup_and_historical_starvation_stay_quiet() {
+            let start = Instant::now();
+            let mut advisory = AudioAdvisory::default();
+            let mut skips = 100;
+            for tick in 0..=100 {
+                if tick <= 20 || tick == 29 || tick == 30 {
+                    skips += 1;
+                }
+                advisory.observe(&producer_snapshot(tick, skips, 0, skips), at(start, tick));
+                assert!(advisory.message().is_none(), "tick {tick}");
+            }
+        }
+
+        #[test]
+        fn refusals_warn_only_near_fresh_audio_starvation_and_clear_when_it_settles() {
+            let start = Instant::now();
+            for fresh_starvation in [false, true] {
+                let mut advisory = AudioAdvisory::default();
+                for tick in 0..=130 {
+                    let gaps = 100 + u64::from(fresh_starvation && tick >= 21);
+                    advisory.observe(&producer_snapshot(tick, gaps, tick, 0), at(start, tick));
+                    assert_eq!(
+                        advisory.message().is_some(),
+                        fresh_starvation && (50..120).contains(&tick),
+                        "tick {tick}, fresh starvation {fresh_starvation}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn reported_query_burst_warns_at_32_frames_then_clears_before_an_isolated_skip() {
+            let start = Instant::now();
+            let mut advisory = AudioAdvisory::default();
+            let mut gaps = 0;
+            let mut refusals = 0;
+            // Replay the reported deadline/refusal timing at 100ms UI intervals.
+            // The audio callbacks themselves never exceed their deadline here.
+            for tick in 0..=330 {
+                if [180, 183, 188, 197, 200, 207, 211, 270].contains(&tick) {
+                    refusals += 1;
+                }
+                if [189, 270].contains(&tick) {
+                    gaps += 1;
+                }
+                advisory.observe(&producer_snapshot(tick, gaps, refusals, 0), at(start, tick));
+                assert_eq!(
+                    advisory.message().is_some(),
+                    (210..261).contains(&tick),
+                    "tick {tick}: first burst should warn; later isolated skip should not"
+                );
+            }
+        }
+
+        #[test]
+        fn loading_and_invalid_scores_do_not_extend_a_starvation_hiccup() {
+            let start = Instant::now();
+            let mut advisory = AudioAdvisory::default();
+            for tick in 0..=100 {
+                let mut snapshot = producer_snapshot(tick, u64::from(tick >= 21), tick, 0);
+                let producer = &mut snapshot.pressure.as_mut().unwrap().producer;
+                producer.loading_refusals = tick;
+                producer.committed_refusals = tick;
+                producer.rejected_scores = tick;
+                advisory.observe(&snapshot, at(start, tick));
+                assert!(advisory.message().is_none(), "tick {tick}");
+            }
+        }
+
+        /// An unavailable producer read is a dropped sample and keeps the earlier
+        /// baseline. A skip during the failed reads still counts when they return:
+        /// here it is the third affected window of five. An empty read taken as a
+        /// baseline loses that skip and leaves only two.
+        #[test]
+        fn a_skip_during_unavailable_producer_reads_counts_when_they_return() {
+            let start = Instant::now();
+            let mut advisory = AudioAdvisory::default();
+            let mut gaps = 100;
+            for tick in 0..=110 {
+                if [25, 35, 55].contains(&tick) {
+                    gaps += 1;
+                }
+                let mut snapshot = producer_snapshot(tick, gaps, 0, 0);
+                if (30..40).contains(&tick) {
+                    snapshot.pressure.as_mut().unwrap().producer = ProducerLoadSnapshot::default();
+                }
+                advisory.observe(&snapshot, at(start, tick));
+                assert_eq!(
+                    advisory.message().is_some(),
+                    (60..105).contains(&tick),
+                    "tick {tick}"
+                );
+            }
+        }
+
+        /// A producer counter that goes backwards belongs to a new meter. Its
+        /// counts start a fresh baseline with its own warmup, so skips in the next
+        /// two seconds are startup, not sustained trouble. Without the warmup the
+        /// three skips below would fill three windows in a row.
+        #[test]
+        fn a_restarted_producer_counter_starts_a_fresh_warmup() {
+            let start = Instant::now();
+            let mut advisory = AudioAdvisory::default();
+            for tick in 0..=130 {
+                let gaps = match tick {
+                    ..60 => 100,
+                    60 => 1,
+                    61..71 => 2,
+                    71..81 => 3,
+                    _ => 4,
+                };
+                advisory.observe(&producer_snapshot(tick, gaps, 0, 0), at(start, tick));
+                assert!(advisory.message().is_none(), "tick {tick}");
+            }
+        }
+
+        #[test]
+        fn three_affected_windows_warn_then_five_quiet_seconds_clear() {
+            let start = Instant::now();
+            let (mut advisory, _) = struggling(start);
+            for tick in 51..=100 {
+                let changed = advisory.observe(&snapshot(tick, 550, 32), at(start, tick));
+                assert_eq!(advisory.message().is_some(), tick < 100, "tick {tick}");
+                assert_eq!(changed, tick == 100, "only the visible transition redraws");
+            }
+        }
+
+        #[test]
+        fn a_healthy_window_breaks_the_activation_streak() {
+            let start = Instant::now();
+            let mut advisory = AudioAdvisory::default();
+            let mut misses = 500;
+            for tick in 0..=80 {
+                if (21..30).contains(&tick) || (40..60).contains(&tick) {
+                    misses += 1;
+                }
+                advisory.observe(&snapshot(tick, misses, 32), at(start, tick));
+                assert!(advisory.message().is_none(), "tick {tick}");
+            }
+        }
+
+        #[test]
+        fn duplicates_and_a_long_telemetry_gap_cannot_fill_windows() {
+            let start = Instant::now();
+            let mut advisory = AudioAdvisory::default();
+            for tick in 0..=49 {
+                advisory.observe(&snapshot(tick, 500 + tick, 32), at(start, tick));
+            }
+            let delayed = snapshot(80, 2_000, 32);
+            advisory.observe(&delayed, at(start, 80));
+            assert!(
+                advisory.message().is_none(),
+                "one late delivery is not sustained load"
+            );
+            for tick in 81..=150 {
+                advisory.observe(&delayed, at(start, tick));
+                assert!(advisory.message().is_none(), "duplicate at tick {tick}");
+            }
+            let (mut advisory, latest) = struggling(start);
+            for tick in 51..=100 {
+                advisory.observe(&latest, at(start, tick));
+            }
+            assert!(
+                advisory.message().is_none(),
+                "duplicates cannot keep a warning alive"
+            );
+        }
+
+        #[test]
+        fn empty_telemetry_is_not_recovery_but_a_new_stream_resets_immediately() {
+            let start = Instant::now();
+            let (mut advisory, mut latest) = struggling(start);
+            latest.pressure.as_mut().unwrap().device.realtime_load =
+                RealtimeLoadSnapshot::default();
+            advisory.observe(&latest, at(start, 51));
+            assert!(advisory.message().is_some());
+            latest.pressure.as_mut().unwrap().device.stream_id += 1;
+            advisory.observe(&latest, at(start, 52));
+            assert!(advisory.message().is_none());
+        }
+
+        #[test]
+        fn stream_rate_and_counter_changes_start_fresh() {
+            let start = Instant::now();
+            for change in 0..5 {
+                let (mut advisory, mut latest) = struggling(start);
+                if change == 4 {
+                    // A recycle at a new latency keeps the stream id and, here, the
+                    // counters: the newly granted buffer alone starts afresh.
+                    latest.device = Some(device(64, Some(64)));
+                } else {
+                    let report = &mut latest.pressure.as_mut().unwrap().device;
+                    match change {
+                        0 => report.stream_id += 1,
+                        1 => report.realtime_load.sample_rate_hz = 44_100,
+                        2 => report.realtime_load.total_callbacks = 16,
+                        3 => report.realtime_load.callbacks_over_100_percent = 0,
+                        _ => unreachable!(),
+                    }
+                }
+                assert!(advisory.observe(&latest, at(start, 51)));
+                assert!(advisory.message().is_none(), "change {change}");
+            }
+        }
+
+        /// PulseAudio asked for 32 frames delivers 32 to 64 a callback, and more
+        /// when the client is late; the meter publishes whichever callback came
+        /// sixteenth. The same stream under the same sustained misses must warn on
+        /// the same schedule as a steady one, and keep warning while they last.
+        #[test]
+        fn varying_callback_sizes_on_one_small_stream_warn_and_stay() {
+            let start = Instant::now();
+            let mut advisory = AudioAdvisory::default();
+            for tick in 0..=100 {
+                let mut latest = snapshot(tick, 500 + tick, 32);
+                let callback = match tick % 7 {
+                    6 => 128,
+                    odd if odd % 2 == 1 => 64,
+                    _ => 32,
+                };
+                latest
+                    .pressure
+                    .as_mut()
+                    .unwrap()
+                    .device
+                    .realtime_load
+                    .last_callback_frames = callback;
+                advisory.observe(&latest, at(start, tick));
+                assert_eq!(
+                    advisory.message().is_some(),
+                    tick >= 50,
+                    "tick {tick}, {callback}-frame callback"
+                );
+            }
+        }
+
+        #[test]
+        fn normal_buffers_and_stopped_audio_never_keep_the_hint() {
+            let start = Instant::now();
+            for frames in [128, 256, 512] {
+                let mut advisory = AudioAdvisory::default();
+                for tick in 0..=100 {
+                    advisory.observe(&snapshot(tick, 500 + tick, frames), at(start, tick));
+                }
+                assert!(
+                    advisory.message().is_none(),
+                    "the stream's buffer is {frames} frames"
+                );
+            }
+            // What the host granted decides, not what was asked for. With nothing
+            // reported, the request is all there is to go by.
+            for (reported, warns) in [(Some(256), false), (None, true)] {
+                let mut advisory = AudioAdvisory::default();
+                for tick in 0..=50 {
+                    let mut latest = snapshot(tick, 500 + tick, 32);
+                    latest.device = Some(device(32, reported));
+                    advisory.observe(&latest, at(start, tick));
+                }
+                assert_eq!(advisory.message().is_some(), warns, "reported {reported:?}");
+            }
+            for state in 0..4 {
+                let (mut advisory, mut latest) = struggling(start);
+                match state {
+                    0 => latest.playing = false,
+                    1 => latest.stopping = true,
+                    2 => latest.device = Some(device(256, Some(256))),
+                    3 => latest.device = Some(device(32, Some(256))),
+                    _ => unreachable!(),
+                }
+                advisory.observe(&latest, at(start, 51));
+                assert!(advisory.message().is_none(), "state {state}");
+            }
+        }
+    }
+}

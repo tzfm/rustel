@@ -719,3 +719,717 @@ impl App {
         self.dirty_frame = true;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod sample_import {
+        //! Tests for `app/sample_import.rs`.
+
+        use crate::app::sample_import::*;
+        use crate::app::tests::support::select_bank_row;
+
+        /// A terminal has no drop event: a dropped file arrives as a paste of
+        /// its path. A paste is a drop only when every path in it exists.
+        #[test]
+        fn a_dropped_path_is_told_apart_from_a_paste() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let plain = directory.path().join("kick.wav");
+            std::fs::write(&plain, b"x").expect("fixture");
+            let spaced = directory.path().join("deep bass.wav");
+            std::fs::write(&spaced, b"x").expect("fixture");
+
+            assert_eq!(
+                dropped_paths(&plain.display().to_string()),
+                Some(vec![plain.clone()])
+            );
+            // Terminals hand a path with spaces over quoted, or escaped, and
+            // both spellings are the same file. The escaped spelling is what
+            // macOS Terminal sends, and every sample pack on a real machine is
+            // named with spaces in it.
+            assert_eq!(
+                dropped_paths(&format!("'{}'", spaced.display())),
+                Some(vec![spaced.clone()])
+            );
+            #[cfg(not(windows))]
+            assert_eq!(
+                dropped_paths(&spaced.display().to_string().replace(' ', "\\ ")),
+                Some(vec![spaced.clone()])
+            );
+            // On Windows a backslash is the path separator, not an escape. The
+            // escaping rule is a parameter, so both rules run on every platform.
+            // `written` names an existing file with a backslash in its text: one
+            // file name on Unix, a nested file on Windows.
+            let backslash = if cfg!(windows) {
+                let nested = directory.path().join("deep");
+                std::fs::create_dir(&nested).expect("fixture folder");
+                nested.join("bass.wav")
+            } else {
+                directory.path().join("deep\\bass.wav")
+            };
+            std::fs::write(&backslash, b"x").expect("fixture");
+            let written = backslash.display().to_string();
+            assert_eq!(
+                parse_dropped_paths(&written, false),
+                Some(vec![backslash.clone()]),
+                "a separator survives where nothing escapes"
+            );
+            assert_eq!(
+                parse_dropped_paths(&written, true),
+                None,
+                "and is eaten where everything does - which was the Windows bug"
+            );
+            // With escapes on, a trailing backslash is an unfinished escape, so
+            // the parse refuses the path.
+            assert_eq!(
+                parse_dropped_paths(&format!("{}\\", directory.path().display()), true),
+                None,
+                "a trailing separator read as an unfinished escape"
+            );
+            if cfg!(windows) {
+                let spelled = format!("{}\\", directory.path().display());
+                assert_eq!(
+                    dropped_paths(&spelled),
+                    Some(vec![directory.path().to_path_buf()]),
+                    "Explorer's trailing backslash is a folder drop on Windows"
+                );
+            }
+            // Several files at once, the way a multi-selection arrives.
+            assert_eq!(
+                dropped_paths(&format!("{} '{}'", plain.display(), spaced.display())),
+                Some(vec![plain.clone(), spaced.clone()])
+            );
+
+            // Ordinary text stays ordinary text, even when it is path-shaped.
+            assert_eq!(dropped_paths("s(\"bd sd\")"), None);
+            assert_eq!(dropped_paths("/no/such/file/anywhere.wav"), None);
+            assert_eq!(dropped_paths(""), None);
+            // A word that names something in the working directory is still a
+            // word: a terminal delivers a drop by its full path.
+            assert_eq!(dropped_paths("docs"), None, "relative, so not a drop");
+            assert_eq!(dropped_paths("."), None);
+            assert_eq!(dropped_paths("Cargo.toml"), None);
+            // One real path and one that is not is not a drop: half-importing a
+            // selection would be worse than declining it.
+            assert_eq!(
+                dropped_paths(&format!("{} /no/such/thing.wav", plain.display())),
+                None
+            );
+
+            // A pasted score is not split into a thousand words and asked about
+            // one syscall at a time.
+            let long = format!("{} ", plain.display()).repeat(200);
+            assert_eq!(dropped_paths(&long), None, "too long to be a drop");
+            let many = std::iter::repeat_n(plain.display().to_string(), 65)
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(dropped_paths(&many), None, "too many to be a drop");
+        }
+
+        /// What a drop does is decided by what was dropped: a folder and the
+        /// sounds inside it are one source, a score opens as a tab, and what
+        /// is neither is named in the status rather than swallowed.
+        #[test]
+        fn a_drop_is_dispatched_on_what_it_is() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let dropped = tempfile::tempdir().expect("dropped folder");
+            let wav = |name: &str| {
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(b"RIFF");
+                bytes.extend_from_slice(&40u32.to_le_bytes());
+                bytes.extend_from_slice(b"WAVEfmt ");
+                bytes.extend_from_slice(&16u32.to_le_bytes());
+                bytes.extend_from_slice(&1u16.to_le_bytes());
+                bytes.extend_from_slice(&1u16.to_le_bytes());
+                bytes.extend_from_slice(&48_000u32.to_le_bytes());
+                bytes.extend_from_slice(&96_000u32.to_le_bytes());
+                bytes.extend_from_slice(&2u16.to_le_bytes());
+                bytes.extend_from_slice(&16u16.to_le_bytes());
+                bytes.extend_from_slice(b"data");
+                bytes.extend_from_slice(&4u32.to_le_bytes());
+                bytes.extend_from_slice(&[0, 0, 0, 0]);
+                std::fs::write(dropped.path().join(name), bytes).expect("fixture");
+            };
+            wav("a.wav");
+            wav("b.wav");
+            let score = dropped.path().join("groove.strudel");
+            std::fs::write(&score, "$: s(\"bd\")").expect("fixture");
+            let notes = dropped.path().join("notes.txt");
+            std::fs::write(&notes, "hello").expect("fixture");
+            let scores_before = app.scenes.scores().count();
+
+            app.accept_drop(&[
+                dropped.path().to_path_buf(),
+                dropped.path().join("a.wav"),
+                dropped.path().join("b.wav"),
+                score.clone(),
+                notes,
+            ]);
+
+            // The folder and files inside it are one source. The direct files
+            // become variants of the folder bank rather than permanent rows of
+            // their own.
+            let specs: Vec<&str> = app
+                .prefs
+                .sample_sources
+                .iter()
+                .map(|source| source.spec.as_str())
+                .collect();
+            assert_eq!(specs.len(), 1, "{specs:?}");
+            assert!(specs.contains(&dropped.path().display().to_string().as_str()));
+            assert_eq!(
+                app.scenes.scores().count(),
+                scores_before + 1,
+                "the score opened as a tab"
+            );
+            assert!(
+                app.status.contains("notes.txt"),
+                "what was neither is named: {}",
+                app.status
+            );
+
+            // The same score dropped again is selected, not opened twice.
+            app.accept_drop(std::slice::from_ref(&score));
+            assert_eq!(app.scenes.scores().count(), scores_before + 1);
+        }
+
+        /// A dropped audio file chooses its containing folder. Its siblings are
+        /// variants of one folder-named bank, and the saved source is the folder.
+        #[test]
+        fn dropping_one_file_imports_its_containing_folder() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let dropped = tempfile::tempdir().expect("dropped folder");
+            let wav = |name: &str| {
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(b"RIFF");
+                bytes.extend_from_slice(&40u32.to_le_bytes());
+                bytes.extend_from_slice(b"WAVEfmt ");
+                bytes.extend_from_slice(&16u32.to_le_bytes());
+                bytes.extend_from_slice(&1u16.to_le_bytes());
+                bytes.extend_from_slice(&1u16.to_le_bytes());
+                bytes.extend_from_slice(&48_000u32.to_le_bytes());
+                bytes.extend_from_slice(&96_000u32.to_le_bytes());
+                bytes.extend_from_slice(&2u16.to_le_bytes());
+                bytes.extend_from_slice(&16u16.to_le_bytes());
+                bytes.extend_from_slice(b"data");
+                bytes.extend_from_slice(&4u32.to_le_bytes());
+                bytes.extend_from_slice(&[0, 0, 0, 0]);
+                let path = dropped.path().join(name);
+                std::fs::write(&path, bytes).expect("fixture");
+                path
+            };
+            let lone = wav("solo.wav");
+            wav("sibling.wav");
+
+            app.accept_drop(std::slice::from_ref(&lone));
+            assert_eq!(
+                app.prefs.sample_sources,
+                vec![crate::prefs::SampleSourcePref {
+                    spec: dropped.path().display().to_string(),
+                    enabled: true,
+                }],
+                "the dropped file selects its containing folder"
+            );
+
+            // A directory, dropped on its own, still brings the whole thing.
+            let directory2 = tempfile::tempdir().expect("temp dir");
+            let mut app2 = crate::app::tests::support::app_over(directory2.path());
+            app2.accept_drop(&[dropped.path().to_path_buf()]);
+            assert_eq!(
+                app2.prefs.sample_sources,
+                vec![crate::prefs::SampleSourcePref {
+                    spec: dropped.path().display().to_string(),
+                    enabled: true,
+                }],
+                "a dropped folder is still one source, itself"
+            );
+        }
+
+        /// Windows Explorer pastes a dropped folder with a trailing separator,
+        /// such as `C:\test\`. The drop imports the folder under the same spec
+        /// that the Settings page uses, so both agree on what is already
+        /// imported.
+        #[cfg(windows)]
+        #[test]
+        fn a_folder_dropped_with_a_trailing_separator_matches_a_settings_add() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let dropped = tempfile::tempdir().expect("dropped folder");
+            std::fs::write(dropped.path().join("snap.wav"), b"not really audio").expect("fixture");
+
+            let explorer_spelling = format!("{}\\", dropped.path().display());
+            let paths = dropped_paths(&explorer_spelling)
+                .expect("the Explorer spelling of a folder drop parses");
+            app.accept_drop(&paths);
+            assert_eq!(
+                app.prefs.sample_sources,
+                vec![crate::prefs::SampleSourcePref {
+                    spec: dropped.path().display().to_string(),
+                    enabled: true,
+                }],
+                "the spec is the folder, without the trailing separator"
+            );
+
+            // Adding the same folder again through the Settings spelling
+            // changes nothing: the two entries are one source.
+            app.add_sample_source(&dropped.path().display().to_string());
+            assert_eq!(app.prefs.sample_sources.len(), 1, "no duplicate row");
+        }
+
+        /// One dropped folder gets the same receipt as one typed: the browser
+        /// opens on what arrived and the status says what it brought.
+        #[test]
+        fn a_single_dropped_folder_is_announced() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let dropped = tempfile::tempdir().expect("dropped folder");
+            std::fs::write(dropped.path().join("snap.wav"), b"not really audio").expect("fixture");
+            app.accept_drop(&[dropped.path().to_path_buf()]);
+            assert!(
+                app.status.contains("imported") || app.status.contains("sound"),
+                "a receipt: {}",
+                app.status
+            );
+            assert!(
+                app.settings_sheet
+                    .is_some_and(|sheet| sheet.shows_sources()),
+                "Sources opens on the import"
+            );
+            assert!(app.reference_panel.is_none(), "the browser stays closed");
+        }
+
+        /// Renaming a bank again replaces the rename rather than stacking one
+        /// on another; renaming it back to its own name removes it; and a name
+        /// another sound already answers to is refused.
+        #[test]
+        fn renames_replace_and_refuse_collisions() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+
+            app.renaming_bank = Some("hats".into());
+            app.rename_bank("hats_open");
+            assert_eq!(
+                app.prefs.sample_renames.get("hats").map(String::as_str),
+                Some("hats_open")
+            );
+
+            app.renaming_bank = Some("hats".into());
+            app.rename_bank("hats_closed");
+            assert_eq!(
+                app.prefs.sample_renames.get("hats").map(String::as_str),
+                Some("hats_closed"),
+                "a second rename replaces the first"
+            );
+            assert_eq!(app.prefs.sample_renames.len(), 1);
+
+            // A name already taken by a rename of another bank is refused.
+            app.renaming_bank = Some("kick".into());
+            app.rename_bank("hats_closed");
+            assert!(
+                !app.prefs.sample_renames.contains_key("kick"),
+                "two banks under one name would be one row"
+            );
+            assert!(app.status.contains("already"), "{}", app.status);
+
+            // And a name a sound already answers to is refused too - here one
+            // an imported folder brought, since the test's library ships no
+            // pinned banks of its own.
+            let imported = tempfile::tempdir().expect("imported folder");
+            std::fs::write(imported.path().join("snap.wav"), b"x").expect("fixture");
+            app.add_sample_sources(&[imported.path().display().to_string()]);
+            // Walked off the studio's thread, so the name is known a moment
+            // later rather than on the call.
+            app.settle_sample_sources();
+            assert!(
+                app.worker
+                    .library()
+                    .is_some_and(|library| library.knows("snap")),
+                "the folder's sound is known"
+            );
+            app.renaming_bank = Some("kick".into());
+            app.rename_bank("snap");
+            assert!(!app.prefs.sample_renames.contains_key("kick"));
+            assert!(app.status.contains("already"), "{}", app.status);
+
+            // Back to its own name takes the overlay away.
+            app.renaming_bank = Some("hats".into());
+            app.rename_bank("hats");
+            assert!(app.prefs.sample_renames.is_empty());
+        }
+
+        #[test]
+        fn renaming_an_imported_bank_twice_keeps_the_browser_on_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let imported = directory.path().join("samples");
+            let bank = imported.join("hats");
+            std::fs::create_dir_all(&bank).expect("bank folder");
+            std::fs::write(bank.join("closed.wav"), b"fixture").expect("sample");
+            std::fs::write(bank.join("open.wav"), b"fixture").expect("sample");
+            let spec = imported.display().to_string();
+            app.add_sample_sources(std::slice::from_ref(&spec));
+            app.settle_sample_sources();
+
+            let sounds = app.worker.library().expect("library").catalogue();
+            app.reference_panel = Some(ReferencePanel::samples(&app.reference, sounds));
+            select_bank_row(app.reference_panel.as_mut().unwrap(), "hats");
+            assert!(app.reference_panel.as_mut().unwrap().expand());
+
+            for alias in ["vox1", "vox2"] {
+                app.renaming_bank = Some("hats".into());
+                app.renaming_bank_source = Some(spec.clone());
+                app.rename_bank(alias);
+                app.settle_sample_sources();
+                assert_eq!(
+                    app.reference_panel
+                        .as_ref()
+                        .and_then(ReferencePanel::selected_bank)
+                        .map(|(name, _)| name),
+                    Some(alias.to_owned()),
+                    "the selected bank follows each alias"
+                );
+                assert!(
+                    app.reference_panel.as_ref().unwrap().expanded.is_some(),
+                    "the bank stays expanded"
+                );
+            }
+        }
+
+        #[test]
+        fn dropping_an_imported_folder_again_refreshes_its_banks() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let imported = directory.path().join("samples");
+            let first = imported.join("bank1");
+            std::fs::create_dir_all(&first).expect("first bank");
+            std::fs::write(first.join("a.wav"), b"fixture").expect("first sample");
+            let spec = imported.display().to_string();
+
+            assert_eq!(app.add_sample_sources(std::slice::from_ref(&spec)), 1);
+            app.settle_sample_sources();
+            assert!(app.worker.library().unwrap().knows("bank1"));
+
+            let added = imported.join("bank1 - Copy");
+            std::fs::create_dir_all(&added).expect("new bank");
+            std::fs::write(added.join("a.wav"), b"fixture").expect("new sample");
+            app.status = "quiet".into();
+            assert_eq!(app.add_sample_sources(std::slice::from_ref(&spec)), 0);
+            app.settle_sample_sources();
+
+            assert_eq!(app.prefs.sample_sources.len(), 1, "the source stays unique");
+            assert!(app.worker.library().unwrap().knows("bank1 - Copy"));
+            assert!(
+                !app.status.contains("already imported"),
+                "the repeat is a refresh, not a duplicate warning: {}",
+                app.status
+            );
+        }
+
+        /// Alt+R on the samples browser opens the prompt that `r` opens on
+        /// Settings > Samples, for the bank under the cursor. A heading does
+        /// nothing, and a pinned bank has no such action. The chord uses the
+        /// full press routing, the path that a merged ConPTY `ESC r` arrives
+        /// on, so a degraded Alt cannot type the letter into the score.
+        #[test]
+        fn alt_r_from_the_browser_opens_the_rename_prompt_or_refuses() {
+            use rustel_runtime::samples::{SoundCategory, SoundEntry, SoundOrigin};
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let sounds = vec![
+                SoundEntry {
+                    name: "bd".into(),
+                    variants: 1,
+                    variant_names: Vec::new(),
+                    origin: SoundOrigin::Global,
+                    category: SoundCategory::Drums,
+                    location: None,
+                    import: None,
+                },
+                SoundEntry {
+                    name: "hh".into(),
+                    variants: 1,
+                    variant_names: Vec::new(),
+                    origin: SoundOrigin::Default,
+                    category: SoundCategory::Percussion,
+                    location: None,
+                    import: None,
+                },
+            ];
+            app.reference_panel = Some(ReferencePanel::samples(&app.reference, sounds));
+            app.focus = Focus::Panel(PanelKind::Reference);
+            // Two kinds of sound group into a heading each, folded at first.
+            assert_eq!(app.reference_panel.as_ref().unwrap().sound_selected, 0);
+
+            // On the heading: nothing happens.
+            crate::app::tests::support::press(&mut app, KeyCode::Char('r'), KeyModifiers::ALT);
+            assert_eq!(app.renaming_bank, None, "a heading is not a bank");
+            assert!(app.set_prompt.is_none());
+
+            // Open "drums" and land on `bd`, an imported bank.
+            if let Some(panel) = app.reference_panel.as_mut() {
+                panel
+                    .open_categories
+                    .insert(crate::reference::SoundSection::Kind(SoundCategory::Drums));
+                panel.sound_selected = 1;
+            }
+            crate::app::tests::support::press(&mut app, KeyCode::Char('r'), KeyModifiers::ALT);
+            assert_eq!(app.renaming_bank.as_deref(), Some("bd"));
+            let (prompt, picker) = app.set_prompt.as_ref().expect("the rename prompt opened");
+            assert_eq!(*prompt, SetPrompt::RenameBank);
+            assert_eq!(picker.path, "bd", "the bank under the cursor is offered");
+
+            // Back out, then try the pinned bank: the action is unavailable.
+            app.set_prompt = None;
+            app.renaming_bank = None;
+            if let Some(panel) = app.reference_panel.as_mut() {
+                panel
+                    .open_categories
+                    .insert(crate::reference::SoundSection::Kind(
+                        SoundCategory::Percussion,
+                    ));
+                let row = panel
+                    .sound_rows()
+                    .iter()
+                    .position(
+                        |row| matches!(row, SoundRow::Bank(index) if panel.sounds[*index].name == "hh"),
+                    )
+                    .expect("hh is listed");
+                panel.sound_selected = row;
+            }
+            crate::app::tests::support::press(&mut app, KeyCode::Char('r'), KeyModifiers::ALT);
+            assert_eq!(app.renaming_bank, None, "a pinned bank cannot be aliased");
+            assert!(app.set_prompt.is_none());
+        }
+
+        /// The first Alt+T on a local take arms the trim, and a second Alt+T on
+        /// the same row cuts the silence. A move off the row, even one that
+        /// cannot move the cursor, disarms it.
+        #[test]
+        fn alt_t_arms_then_trims_and_any_other_key_disarms_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+
+            let takes = directory.path().join("takes");
+            std::fs::create_dir_all(&takes).expect("takes dir");
+            let path = takes.join("solo.wav");
+            let mut writer = crate::wav::TakeWriter::start(path.clone(), 48_000).expect("writer");
+            assert_eq!(writer.push_padded(Vec::new(), 2_000), Ok(true));
+            let loud: Vec<f32> = std::iter::repeat_n([0.6_f32, -0.6_f32], 1_000)
+                .flatten()
+                .collect();
+            assert!(writer.push(loud));
+            assert_eq!(writer.push_padded(Vec::new(), 2_000), Ok(true));
+            let status = writer.finish();
+            assert_eq!(status.error, None);
+
+            app.add_sample_sources(&[takes.display().to_string()]);
+            app.settle_sample_sources();
+            assert!(
+                app.worker
+                    .library()
+                    .is_some_and(|library| library.knows("takes")),
+                "the fixture registered in its folder's bank"
+            );
+
+            let sounds = app.worker.library().expect("library").catalogue();
+            app.reference_panel = Some(ReferencePanel::samples(&app.reference, sounds));
+            app.focus = Focus::Panel(PanelKind::Reference);
+            select_bank_row(app.reference_panel.as_mut().unwrap(), "takes");
+            let row = app.reference_panel.as_ref().unwrap().sound_selected;
+
+            let before = std::fs::read(&path).expect("fixture bytes");
+
+            // Ctrl+Shift+T is deliberately not a second spelling. It must not
+            // arm a destructive action that Settings and the footer only call
+            // Alt+T.
+            app.handle_reference_key_with_modifiers(KeyCode::Char('t'), true, true, false)
+                .expect("ctrl+shift+t");
+            assert_eq!(
+                app.reference_panel.as_ref().unwrap().confirm_trim,
+                None,
+                "Ctrl+Shift+T must not arm trim"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before, "armed, not cut");
+
+            app.handle_reference_key(KeyCode::Char('t'), false, true)
+                .expect("alt+t");
+            assert!(
+                app.status
+                    .contains(crate::keybinds::shortcut_label("Alt+T again trims").as_ref()),
+                "{}",
+                app.status
+            );
+            assert_eq!(
+                app.reference_panel.as_ref().unwrap().confirm_trim,
+                Some(row)
+            );
+
+            // Any other key disarms it. The real catalogue can carry other
+            // rows, so put the cursor back on `takes` before the next press.
+            app.handle_reference_key(KeyCode::Down, false, false)
+                .expect("down");
+            assert_eq!(app.reference_panel.as_ref().unwrap().confirm_trim, None);
+            select_bank_row(app.reference_panel.as_mut().unwrap(), "takes");
+
+            // So this press is a FIRST press again, not the one that cuts.
+            app.handle_reference_key(KeyCode::Char('t'), false, true)
+                .expect("alt+t");
+            assert!(
+                app.status
+                    .contains(crate::keybinds::shortcut_label("Alt+T again trims").as_ref()),
+                "a moved-off arm starts over: {}",
+                app.status
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before, "still untouched");
+
+            // The second press in a row is the one that cuts.
+            app.handle_reference_key(KeyCode::Char('t'), false, true)
+                .expect("alt+t again");
+            assert!(app.status.contains("trimming"), "{}", app.status);
+            assert_eq!(app.reference_panel.as_ref().unwrap().confirm_trim, None);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !app.trim_jobs.is_empty() && Instant::now() < deadline {
+                std::thread::yield_now();
+                app.poll_trim_jobs();
+            }
+            assert!(app.trim_jobs.is_empty(), "trim worker did not answer");
+            assert!(app.status.contains("trimmed"), "{}", app.status);
+            let after = std::fs::read(&path).expect("trimmed bytes");
+            assert!(
+                after.len() < before.len(),
+                "the padded silence either side was cut"
+            );
+        }
+
+        /// A downloaded pack sample is shared and re-fetchable, not this
+        /// player's local file to edit: Alt+T refuses it outright, on both
+        /// presses, and the bytes on disk never move.
+        #[test]
+        fn alt_t_refuses_a_downloaded_pack_sample() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+
+            let cache = rustel_runtime::samples::sample_cache_dir().join("alt-t-refusal-fixture");
+            std::fs::create_dir_all(&cache).expect("cache subfolder");
+            let path = cache.join("kick.wav");
+            let mut writer = crate::wav::TakeWriter::start(path.clone(), 48_000).expect("writer");
+            let loud: Vec<f32> = std::iter::repeat_n([0.5_f32, -0.5_f32], 200)
+                .flatten()
+                .collect();
+            assert!(writer.push(loud));
+            let status = writer.finish();
+            assert_eq!(status.error, None);
+
+            app.add_sample_sources(&[cache.display().to_string()]);
+            app.settle_sample_sources();
+            assert!(
+                app.worker
+                    .library()
+                    .is_some_and(|library| library.knows("alt-t-refusal-fixture")),
+                "the fixture registered in its folder's bank"
+            );
+
+            let sounds = app.worker.library().expect("library").catalogue();
+            app.reference_panel = Some(ReferencePanel::samples(&app.reference, sounds));
+            app.focus = Focus::Panel(PanelKind::Reference);
+            select_bank_row(
+                app.reference_panel.as_mut().unwrap(),
+                "alt-t-refusal-fixture",
+            );
+
+            let before = std::fs::read(&path).expect("fixture bytes");
+            app.handle_reference_key(KeyCode::Char('t'), false, true)
+                .expect("alt+t");
+            assert!(
+                app.status.contains("downloaded pack sample"),
+                "{}",
+                app.status
+            );
+            assert_eq!(
+                app.reference_panel.as_ref().unwrap().confirm_trim,
+                None,
+                "a refusal never arms"
+            );
+            // A second press would be the one that cuts on an armed row; here
+            // nothing was ever armed to answer to.
+            app.handle_reference_key(KeyCode::Char('t'), false, true)
+                .expect("alt+t again");
+            assert!(
+                app.status.contains("downloaded pack sample"),
+                "{}",
+                app.status
+            );
+            let after = std::fs::read(&path).expect("fixture bytes");
+            assert_eq!(before, after, "a refused row is never rewritten");
+
+            let _ = std::fs::remove_dir_all(&cache);
+        }
+
+        /// A set's `sessions/` and `exports/` hold what the studio writes into
+        /// the set, so no door makes either a sample source: a drop, the import
+        /// prompt and the edit prompt each refuse, with a status line and an
+        /// info line in the log. That holds for another set's folders too, and
+        /// for a take dropped from inside one.
+        #[test]
+        fn a_sets_own_output_folders_are_never_imported() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let other_set = tempfile::tempdir().expect("another set");
+            std::fs::write(other_set.path().join("song.strudel"), "$: s(\"bd\")").expect("score");
+            let sessions = app.scenes.sessions_directory();
+            let exports = directory
+                .path()
+                .join(rustel_runtime::product::EXPORT_DIRECTORY_NAME);
+            let other_sessions = other_set
+                .path()
+                .join(rustel_runtime::product::SESSIONS_DIRECTORY_NAME);
+            for folder in [&sessions, &exports, &other_sessions] {
+                std::fs::create_dir_all(folder).expect("output folder");
+                std::fs::write(folder.join("take.wav"), b"fixture").expect("a take");
+            }
+            let refusals = |app: &App| {
+                app.log
+                    .lines()
+                    .iter()
+                    .filter(|line| {
+                        line.level == LogLevel::Info && line.text.contains("not imported")
+                    })
+                    .count()
+            };
+            let warnings = app.log.unseen();
+
+            app.accept_drop(std::slice::from_ref(&sessions));
+            assert!(app.prefs.sample_sources.is_empty(), "the drop was refused");
+            assert!(app.status.contains("not imported"), "{}", app.status);
+            assert_eq!(refusals(&app), 1);
+
+            app.accept_drop(&[exports.join("take.wav")]);
+            assert!(app.prefs.sample_sources.is_empty(), "a take's folder too");
+            assert_eq!(refusals(&app), 2);
+
+            app.add_sample_source(&other_sessions.display().to_string());
+            assert!(app.prefs.sample_sources.is_empty(), "the import prompt");
+            assert!(app.status.contains("not imported"), "{}", app.status);
+            assert_eq!(refusals(&app), 3);
+
+            let kit = directory.path().join("kit");
+            std::fs::create_dir_all(&kit).expect("kit");
+            std::fs::write(kit.join("kick.wav"), b"fixture").expect("sample");
+            let kit = kit.display().to_string();
+            app.add_sample_source(&kit);
+            app.open_set_prompt(SetPrompt::EditSampleSource(0));
+            if let Some((_, picker)) = app.set_prompt.as_mut() {
+                picker.offer(&sessions.display().to_string());
+            }
+            assert!(app.handle_set_prompt_key(KeyCode::Enter, false, false));
+            assert_eq!(
+                app.prefs.sample_sources[0].spec, kit,
+                "the edit prompt keeps the source it had"
+            );
+            assert!(app.status.contains("not imported"), "{}", app.status);
+            assert_eq!(refusals(&app), 4);
+            assert_eq!(app.log.unseen(), warnings, "a refusal is not a warning");
+        }
+    }
+}

@@ -339,3 +339,295 @@ impl App {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod hydra_backdrop {
+        //! Tests for `app/hydra_backdrop.rs`.
+
+        use crate::app::*;
+
+        /// The webcam switch in the settings sheet is the consent for a camera
+        /// theme: browsing to the theme opens the camera only with the switch
+        /// on. A theme-editor draft never opens the camera.
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn a_camera_theme_previews_under_the_webcam_switch_and_never_from_a_draft() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let camera_theme = Theme::built_in("webcam-clean").expect("webcam-clean");
+            assert!(
+                camera_theme.hydra_camera_enabled(),
+                "the fixture must ask for s0"
+            );
+
+            // What `sync_theme_sketch` last decided. The send is a `try_send`
+            // that can drop, so the helper calls it until one send lands.
+            let asked = |app: &mut App| -> bool {
+                app.theme_sketch_sent = None;
+                for _ in 0..400 {
+                    app.sync_theme_sketch();
+                    if let Some((_, webcam)) = app.theme_sketch_sent.as_ref() {
+                        return *webcam;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                panic!("the theme sketch was never accepted by the worker");
+            };
+
+            // Browsing to it with the switch on: the camera comes up, the way
+            // every other theme in the picker shows what it looks like.
+            app.theme = camera_theme.clone();
+            app.ui_settings.hydra_webcam = true;
+            app.theme_picker = Some(ThemePicker::open(&app.theme));
+            assert!(
+                asked(&mut app),
+                "a browsed camera theme must show its camera"
+            );
+
+            // The same row with the switch off opens nothing.
+            app.ui_settings.hydra_webcam = false;
+            assert!(
+                !asked(&mut app),
+                "the webcam switch is the consent and it is off"
+            );
+
+            // Kept by Enter, the switch is no longer what carries it.
+            app.ui_settings.hydra_webcam = true;
+            app.keep_theme();
+            assert!(app.theme_picker.is_none());
+            assert!(asked(&mut app), "a theme kept by Enter keeps its camera");
+
+            // A draft in the editor never acquires, switch or no switch.
+            app.open_theme_editor(&camera_theme, String::new(), true);
+            assert!(
+                !asked(&mut app),
+                "a theme being typed is not a theme being chosen"
+            );
+        }
+
+        /// A surface at opacity 100 hides the picture at any visuals opacity. A
+        /// lower surface opacity lets the picture through, never brighter than
+        /// visuals opacity asks. The defaults do not change the picture in the
+        /// code area.
+        #[test]
+        fn a_surfaces_opacity_caps_the_picture_behind_it() {
+            use crate::settings::{BACKDROP_OPACITY_DEFAULT, EDITOR_OPACITY_DEFAULT};
+            assert_eq!(backdrop_strength(100, 100), 0.0, "a solid surface hides it");
+            assert_eq!(backdrop_strength(55, 100), 0.0);
+            assert!(
+                (backdrop_strength(55, 0) - 0.55).abs() < 1e-6,
+                "never past the picture's own"
+            );
+            assert_eq!(backdrop_strength(0, 0), 0.0, "visuals opacity zero is off");
+            // Perceptual: half opaque reads as half the picture, which on a
+            // linear mix would have taken the slider most of the way up.
+            let half = backdrop_strength(100, 50);
+            assert!((0.2..0.25).contains(&half), "{half}");
+            let steps: Vec<f32> = (0..=10).map(|i| backdrop_strength(100, i * 10)).collect();
+            assert!(
+                steps.windows(2).all(|pair| pair[0] > pair[1]),
+                "every step of the slider changes something: {steps:?}"
+            );
+            assert!(
+                (backdrop_strength(BACKDROP_OPACITY_DEFAULT, EDITOR_OPACITY_DEFAULT) - 0.53).abs()
+                    < 0.02,
+                "the shipped look is unchanged"
+            );
+        }
+
+        /// `visuals opacity` applies to a theme's own Hydra opacity too: at
+        /// zero it turns off every kind of visual, a camera theme included.
+        #[test]
+        fn visuals_opacity_caps_a_themes_forged_hydra_strength() {
+            let theme_hydra = |forged: u8, visuals: u8, surface: u8| {
+                backdrop_strength(forged.min(visuals), surface)
+            };
+            assert_eq!(
+                theme_hydra(100, 0, 0),
+                0.0,
+                "zero turns a theme's picture off like any other"
+            );
+            assert!(
+                (theme_hydra(100, 10, 0) - 0.10).abs() < 1e-6,
+                "a theme cannot outshine what visuals opacity asks for"
+            );
+            assert!(
+                (theme_hydra(45, 100, 0) - 0.45).abs() < 1e-6,
+                "and a slider wide open leaves the forged look exactly as it was"
+            );
+            assert!(
+                theme_hydra(100, 100, 100) == 0.0,
+                "a solid surface still hides it"
+            );
+        }
+
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn a_music_example_clears_the_hydra_preview_before_the_renderer_stops() {
+            use crate::examples::{Kind, section_of};
+            use crate::reference::{ReferencePanel, SnippetLine};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let mut panel = ReferencePanel::browse(&app.reference);
+            panel.select_tab(Tab::Examples);
+            let hydra = section_of(Kind::Hydra).unwrap();
+            panel.section_open.insert(hydra);
+            panel.snippet_open.insert((hydra, 0));
+            panel.section_open.insert(0);
+            panel.snippet_open.insert((0, 0));
+            let lines = panel.snippet_lines();
+            panel.snippet_selected = lines
+                .iter()
+                .position(|line| *line == SnippetLine::Snippet(hydra, 0, 0))
+                .unwrap();
+            app.reference_panel = Some(panel);
+            app.sync_snippet_preview();
+            assert!(app.hydra_preview_sent.is_some());
+            app.hydra_shelf_last = Some(view::VisualBackdrop {
+                width: 1,
+                height: 1,
+                rgba: vec![255, 0, 0, 255],
+                strength: 1.0,
+                interface: 1.0,
+            });
+
+            let panel = app.reference_panel.as_mut().unwrap();
+            panel.snippet_selected = lines
+                .iter()
+                .position(|line| *line == SnippetLine::Snippet(0, 0, 0))
+                .unwrap();
+            let code = panel.selected_snippet_code().unwrap().into_owned();
+            app.preview_snippet_score(&code);
+            app.sync_snippet_preview();
+            assert!(
+                app.hydra_shelf_last.is_none(),
+                "no stale picture while the engine stops"
+            );
+            // The sound preview can fill the bounded command queue. Like the
+            // frame loop, retry the renderer stop after the worker makes room;
+            // hiding the old picture above must not wait for that acceptance.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.hydra_preview_sent.is_some() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+                app.sync_snippet_preview();
+            }
+            assert!(app.hydra_preview_sent.is_none(), "stop the Hydra renderer");
+            assert!(
+                app.snippet_preview.is_some(),
+                "keep the sound preview playing"
+            );
+            assert!(
+                app.reference_panel
+                    .as_ref()
+                    .unwrap()
+                    .section_open
+                    .contains(&hydra)
+            );
+        }
+
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn leaving_hydra_browsing_removes_only_the_temporary_background() {
+            use crate::examples::{Kind, section_of};
+            use crate::reference::{ReferencePanel, SnippetLine};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let picture = |red| view::VisualBackdrop {
+                width: 1,
+                height: 1,
+                rgba: vec![red, 0, 0, 255],
+                strength: 1.0,
+                interface: 1.0,
+            };
+            for close in [false, true] {
+                let mut panel = ReferencePanel::browse(&app.reference);
+                panel.select_tab(Tab::Examples);
+                let hydra = section_of(Kind::Hydra).unwrap();
+                panel.section_open.insert(hydra);
+                panel.snippet_open.insert((hydra, 0));
+                panel.snippet_selected = panel
+                    .snippet_lines()
+                    .iter()
+                    .position(|line| *line == SnippetLine::Snippet(hydra, 0, 0))
+                    .unwrap();
+                app.hydra_preview_sent = Some(panel.selected_snippet_code().unwrap().into_owned());
+                app.reference_panel = Some(panel);
+                app.focus_panel(PanelKind::Reference);
+                app.hydra_shelf_last = Some(picture(255));
+                app.hydra_last = Some(picture(128));
+                app.hydra_theme_last = Some(picture(64));
+                if close {
+                    crate::app::tests::support::press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+                    assert!(app.reference_panel.is_none());
+                } else {
+                    app.reference_panel
+                        .as_mut()
+                        .unwrap()
+                        .select_tab(Tab::Samples);
+                }
+                app.sync_snippet_preview();
+                assert!(app.hydra_shelf_last.is_none());
+                assert_eq!(app.hydra_last.as_ref().unwrap().rgba, [128, 0, 0, 255]);
+                assert_eq!(app.hydra_theme_last.as_ref().unwrap().rgba, [64, 0, 0, 255]);
+            }
+        }
+
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn hydra_preview_matches_the_shelf_box_in_both_renderers() {
+            use crate::graphics::{self, HeldRenderer, Tier};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let _held = HeldRenderer::pixels((10, 20));
+            app.frame = Rect::new(0, 0, 100, 40);
+            app.regions = view::regions(app.frame, false, 1, true, true, None, None);
+            let area =
+                crate::reference::preview_area(crate::reference::inner_area(app.regions.reference));
+            for tier in [Tier::Pixels, Tier::Cells] {
+                graphics::set_tier(tier);
+                app.hydra_frame_size_sent = None;
+                app.sync_hydra_frame_size();
+                let size = app.hydra_frame_size_sent.expect("renderer size sent");
+                let scale = if tier == Tier::Pixels {
+                    (10, 20)
+                } else {
+                    (1, 1)
+                };
+                assert_eq!(size.score, (100 * scale.0, 40 * scale.1));
+                assert_eq!(size.preview, (area.width * scale.0, area.height * scale.1),);
+            }
+        }
+
+        /// A theme's last sketch frame goes with the theme: a reset-colour theme
+        /// after `synthwave` is the terminal's own background, not a gradient
+        /// nobody is drawing any more.
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn changing_theme_drops_the_previous_sketch_frame() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.theme = Theme::built_in("synthwave").expect("synthwave");
+            app.sync_theme_sketch();
+            app.hydra_theme_last = Some(crate::view::VisualBackdrop {
+                width: 2,
+                height: 1,
+                rgba: vec![255, 0, 255, 255, 255, 0, 255, 255],
+                strength: 0.5,
+                interface: 0.2,
+            });
+            app.theme = Theme::built_in("rustel-light").expect("rustel-light");
+            app.theme.name = "custom-reset".into();
+            app.theme.background = ratatui::style::Color::Reset;
+            app.theme.surface = ratatui::style::Color::Reset;
+            app.sync_theme_sketch();
+            assert!(
+                app.hydra_theme_last.is_none(),
+                "the old sketch's frame is not painted under the new theme"
+            );
+        }
+    }
+}

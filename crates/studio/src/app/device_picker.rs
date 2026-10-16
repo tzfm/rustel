@@ -770,3 +770,255 @@ impl App {
         self.dirty_frame = true;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod device_picker {
+        //! Tests for `app/device_picker.rs`.
+
+        use crate::app::tests::support::*;
+        use crate::app::*;
+
+        /// A device picker opened from the footer's audio chip, at the bottom
+        /// left, sits over that chip. A second click on the chip closes it,
+        /// because the click-outside dismissal cannot reach a chip under the
+        /// popover.
+        #[test]
+        fn the_device_picker_opens_over_the_chip_that_asked_for_it() {
+            use crate::devices::DevicePanelView;
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "$: s(\"bd*4\")\n");
+            app.frame = Rect::new(0, 0, 160, 40);
+            app.regions = view::regions(app.frame, false, 1, false, false, None, None);
+            let chip = app.footer_hits().device_chip;
+            assert!(!chip.is_empty(), "the footer draws an output chip");
+
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                chip.x,
+                chip.y,
+            );
+            let panel = app.panel.expect("the picker opened");
+            let entries = app.devices.inventory().entries(panel.kind).len().max(1);
+            let geometry =
+                DevicePanelView::geometry(app.frame, panel, entries).expect("it is drawn");
+            assert!(
+                geometry.area.x <= chip.x && chip.x < geometry.area.right(),
+                "the picker at {:?} does not cover the chip at {}",
+                geometry.area,
+                chip.x
+            );
+            assert!(
+                geometry.area.x + 8 < app.frame.right(),
+                "and it is not in the far corner: {:?}",
+                geometry.area
+            );
+
+            // The chip still closes what it opened.
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                chip.x,
+                chip.y,
+            );
+            assert!(app.panel.is_none(), "the chip is still a toggle");
+
+            // Opened by the chord instead, it has no chip to sit under and keeps
+            // the corner it always had.
+            app.toggle_device_panel();
+            let panel = app.panel.expect("opened by the chord");
+            assert_eq!(panel.anchor_x, None);
+            let corner = DevicePanelView::geometry(app.frame, panel, entries).expect("drawn");
+            assert_eq!(corner.area.right(), app.frame.right() - 1);
+        }
+
+        /// Choosing a MIDI port copies its name and opens nothing, so the list
+        /// stays open; Enter chooses and closes. Audio in and out commit a device
+        /// and close either way. Space ticks the port under the cursor and the
+        /// preferences keep the tick. The clock rows offer only ticked ports, and
+        /// unticking the port a clock runs through releases that clock.
+        #[test]
+        fn ticking_a_midi_port_is_kept_and_the_clock_only_offers_ticked_ports() {
+            use crate::devices::{DeviceEntry, DeviceInventory, MidiEnablement};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "$: s(\"bd\")\n");
+            let port = |name: &str| DeviceEntry {
+                name: name.to_owned(),
+                id: String::new(),
+                detail: String::new(),
+                is_default: false,
+            };
+            let inventory = DeviceInventory {
+                midi_outputs: vec![port("Synth")],
+                ..DeviceInventory::default()
+            };
+            app.devices.install_for_tests(inventory.clone());
+            // Everything off, as a studio that has turned everything off would be.
+            app.midi_enabled = Some(MidiEnablement::from_prefs(Some(&[]), Some(&[]), &inventory));
+            app.panel = Some(crate::devices::DevicePanel {
+                kind: DeviceKind::Midi,
+                ..crate::devices::DevicePanel::default()
+            });
+            // Rows: 0 = Synth, 1 = clock in, 2 = clock out.
+            let press = |app: &mut App, selected: usize, code: KeyCode| {
+                let mut panel = app.panel.expect("open");
+                panel.selected = selected;
+                app.panel = Some(panel);
+                app.handle_panel_key(code, false).expect("handled");
+            };
+
+            // Nothing ticked: clock out has nothing to offer, and says why.
+            press(&mut app, 2, KeyCode::Right);
+            assert_eq!(app.ui_settings.clock_out, None);
+            assert!(app.status.contains("tick"), "{}", app.status);
+
+            // Tick Synth's out box, and it is kept.
+            press(&mut app, 0, KeyCode::Right);
+            press(&mut app, 0, KeyCode::Char(' '));
+            assert_eq!(app.prefs.midi_out_enabled, Some(vec!["Synth".to_owned()]));
+            assert!(app.status.contains("on"), "{}", app.status);
+
+            // Now clock out offers it.
+            press(&mut app, 2, KeyCode::Right);
+            assert_eq!(app.ui_settings.clock_out.as_deref(), Some("Synth"));
+
+            // Untick it: the port goes, and the clock running through it with it.
+            press(&mut app, 0, KeyCode::Char(' '));
+            assert_eq!(app.prefs.midi_out_enabled, Some(Vec::new()));
+            assert_eq!(app.ui_settings.clock_out, None, "the clock is released");
+            assert!(app.status.contains("clock"), "{}", app.status);
+        }
+
+        #[test]
+        fn copying_a_midi_port_leaves_the_list_up() {
+            use crate::devices::{DeviceEntry, DeviceInventory, DevicePanelView};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "$: s(\"bd\")\n");
+            app.frame = Rect::new(0, 0, 160, 40);
+            let port = |name: &str| DeviceEntry {
+                name: name.to_owned(),
+                id: String::new(),
+                detail: String::new(),
+                is_default: false,
+            };
+            app.devices.install_for_tests(DeviceInventory {
+                midi_outputs: vec![port("IAC Driver Bus 1"), port("Scarlett 2i2")],
+                ..DeviceInventory::default()
+            });
+            app.panel = Some(crate::devices::DevicePanel {
+                kind: DeviceKind::Midi,
+                ..crate::devices::DevicePanel::default()
+            });
+
+            // A click on a NAME copies it and leaves the list up for the next one.
+            let panel = app.panel.expect("open");
+            let rows = app.panel_row_count(panel.kind);
+            let geometry = DevicePanelView::geometry(app.frame, panel, rows).expect("drawn");
+            app.click_panel(geometry.list.x + 3, geometry.list.y + 1);
+            assert!(app.panel.is_some(), "a click leaves the list up");
+            assert!(app.status.contains("Scarlett"), "{}", app.status);
+
+            // Enter on a name copies and closes.
+            let mut panel = app.panel.expect("still open");
+            panel.selected = 0;
+            app.panel = Some(panel);
+            app.handle_panel_key(KeyCode::Enter, false)
+                .expect("handled");
+            assert!(app.panel.is_none(), "Enter copies and closes");
+            assert!(app.status.contains("IAC Driver Bus 1"), "{}", app.status);
+        }
+
+        /// A stopped studio has no stream open, and "no output" said so as if
+        /// something were wrong. It names the device the next evaluation opens:
+        /// the pick, else the host's default. Playing with nothing open is the
+        /// one case that really is no output.
+        #[test]
+        fn a_stopped_studio_names_the_output_it_will_open() {
+            use crate::devices::{DeviceEntry, DeviceInventory};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let row = |name: &str, is_default: bool| DeviceEntry {
+                name: name.to_owned(),
+                id: String::new(),
+                detail: String::new(),
+                is_default,
+            };
+            app.devices.install_for_tests(DeviceInventory {
+                audio_outputs: vec![row("Speakers (Realtek)", true), row("Scarlett 2i2", false)],
+                ..DeviceInventory::default()
+            });
+            assert_eq!(
+                app.resting_output_name(),
+                None,
+                "the test studio runs on `silent`, which is no output at all"
+            );
+            app.options.output = None;
+            assert_eq!(
+                app.resting_output_name().as_deref(),
+                Some("Speakers (Realtek)"),
+                "nothing chosen: the host's default"
+            );
+
+            app.activate_device(DeviceKind::AudioOutput, 1, true);
+            assert_eq!(
+                app.resting_output_name().as_deref(),
+                Some("Scarlett 2i2"),
+                "the pick, before anything has played through it"
+            );
+
+            app.snapshot = Some(StudioSnapshot {
+                playing: true,
+                ..StudioSnapshot::default()
+            });
+            assert_eq!(
+                app.resting_output_name(),
+                None,
+                "playing with no stream open really is no output"
+            );
+        }
+
+        /// The `none` row clears the input: the remembered choice and the input
+        /// named by `--input` on the command line.
+        #[test]
+        fn the_none_row_lets_the_audio_input_go_for_good() {
+            use crate::devices::{DeviceEntry, DeviceInventory};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let row = |name: &str| DeviceEntry {
+                name: name.to_owned(),
+                id: String::new(),
+                detail: String::new(),
+                is_default: false,
+            };
+            app.devices.install_for_tests(DeviceInventory {
+                audio_inputs: vec![row(NO_INPUT_NAME), row("Scarlett 2i2")],
+                ..DeviceInventory::default()
+            });
+
+            app.activate_device(DeviceKind::AudioInput, 1, true);
+            assert_eq!(app.prefs.audio_input.as_deref(), Some("Scarlett 2i2"));
+            assert!(app.input_chosen(), "a chosen input answers for itself");
+            assert!(app.panel.is_none(), "choosing closes the picker");
+
+            // What the command line named would otherwise outlive the choice.
+            app.options.input = Some("Mic".into());
+            app.activate_device(DeviceKind::AudioInput, 0, true);
+            assert_eq!(app.prefs.audio_input, None, "forgotten for the next start");
+            assert_eq!(app.options.input, None, "and the flag stops answering");
+            assert!(!app.input_chosen(), "nothing is chosen now");
+            assert!(app.status.contains("audio in off"), "{}", app.status);
+            assert!(app.panel.is_none());
+
+            // Pressing it again is not an error: it says the same thing.
+            app.activate_device(DeviceKind::AudioInput, 0, true);
+            assert!(!app.input_chosen());
+            assert!(app.status.contains("audio in off"), "{}", app.status);
+        }
+    }
+}

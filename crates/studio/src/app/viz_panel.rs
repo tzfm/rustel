@@ -861,3 +861,518 @@ impl App {
             .map(|widget| widget.kind)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod viz_panel {
+        //! Tests for `app/viz_panel.rs`.
+
+        use crate::app::tests::support::*;
+        use crate::app::*;
+        use crate::viz_panel::ART_MAX_BYTES;
+        use crate::viz_panel::{ArtAlignment, Edge};
+
+        /// Shift+F1 and Shift+F2 toggle the two visuals docks, as View > Visuals
+        /// 1 and 2 do, so the ticked row and the key agree. Ctrl+Shift+V does
+        /// nothing: Windows Terminal keeps it for paste.
+        #[test]
+        fn shift_function_keys_show_and_hide_the_visuals_docks() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            for (key, index) in [(KeyCode::F(1), 0usize), (KeyCode::F(2), 1usize)] {
+                let before = app.viz_docks[index].is_some();
+                press(&mut app, key, KeyModifiers::SHIFT);
+                assert_ne!(
+                    app.viz_docks[index].is_some(),
+                    before,
+                    "{key:?} is the switch for dock {index}"
+                );
+                press(&mut app, key, KeyModifiers::SHIFT);
+                assert_eq!(
+                    app.viz_docks[index].is_some(),
+                    before,
+                    "{key:?} again puts it back"
+                );
+            }
+
+            // The chord Windows Terminal eats, doing nothing rather than
+            // something surprising.
+            let before: Vec<bool> = app.viz_docks.iter().map(Option::is_some).collect();
+            press(
+                &mut app,
+                KeyCode::Char('V'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            );
+            let after: Vec<bool> = app.viz_docks.iter().map(Option::is_some).collect();
+            assert_eq!(after, before, "^⇧V is nobody's chord here");
+        }
+
+        /// View ▸ Visuals 1 opens the visuals panel with the set's name in art
+        /// when the set has no widgets yet, kept in the set file; ←/→ step the
+        /// art's style and Space its colour, a adds a widget, Delete asks and
+        /// Enter removes, Esc hands the keyboard back, and the preferences
+        /// remember the panel.
+        #[test]
+        fn the_visuals_panel_keeps_its_widgets_in_the_preferences() {
+            use crate::viz_panel::{ArtStyle, Colouring, WidgetKind};
+            // Start from no widgets and a shut panel, so what the test reads
+            // back is what the test put there. The file is this thread's alone.
+            crate::config::isolate_for_tests();
+            let mut prefs = StudioPrefs::load();
+            prefs.visuals[0].open = false;
+            prefs.visuals[0].widgets.clear();
+            prefs.save().expect("prefs");
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 140, 40);
+            assert!(app.prefs.visuals[0].widgets.is_empty());
+            app.toggle_viz_dock(0);
+            assert!(app.viz_docks[0].is_some(), "View ▸ Visuals 1 opens it");
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Viz));
+            assert!(app.prefs.visuals[0].open);
+            assert_eq!(
+                app.prefs.visuals[0]
+                    .widgets
+                    .iter()
+                    .map(|w| w.kind)
+                    .collect::<Vec<_>>(),
+                [WidgetKind::Art],
+                "an empty panel gets the art"
+            );
+            app.flush_prefs();
+            assert_eq!(
+                StudioPrefs::load().visuals[0].widgets.len(),
+                1,
+                "kept in the preferences at once"
+            );
+            app.regions = view::regions_with(
+                app.frame,
+                false,
+                1,
+                false,
+                true,
+                None,
+                app.dock_requests(),
+                None,
+                None,
+            );
+            assert_eq!(
+                app.viz_dock_edge(0),
+                crate::viz_panel::Edge::Right,
+                "the right, by default"
+            );
+            assert_eq!(app.regions.viz[0].right(), app.frame.right());
+
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+            assert_eq!(app.prefs.visuals[0].widgets[0].art_style(), ArtStyle::Glow);
+            press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+            assert_eq!(app.prefs.visuals[0].widgets[0].colour(), Colouring::Acid);
+            app.flush_prefs();
+            let remembered = StudioPrefs::load().visuals[0].widgets.clone();
+            assert_eq!(remembered[0].style.as_deref(), Some("glow"));
+            assert_eq!(remembered[0].colour, Some(Colouring::Acid));
+            let manifest = crate::scenes::SetManifest::load(directory.path());
+            assert!(
+                manifest.is_none_or(|manifest| manifest.widgets.is_empty()),
+                "the set file keeps no widgets"
+            );
+
+            // a, then a kind, then Enter: the widget joins under the chosen one.
+            press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+            assert_eq!(app.viz_docks[0].as_ref().expect("open").adding, Some(0));
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(
+                app.prefs.visuals[0]
+                    .widgets
+                    .iter()
+                    .map(|w| w.kind)
+                    .collect::<Vec<_>>(),
+                [WidgetKind::Art, WidgetKind::Spectrum]
+            );
+            assert_eq!(app.viz_docks[0].as_ref().expect("open").selected, 1);
+
+            // Delete removes the chosen widget, no question asked.
+            press(&mut app, KeyCode::Delete, KeyModifiers::NONE);
+            assert_eq!(app.prefs.visuals[0].widgets.len(), 1);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Viz));
+            assert_eq!(app.prefs.visuals[0].widgets[0].kind, WidgetKind::Art);
+
+            // Esc gives the keyboard back and leaves the panel; the menu row
+            // hides it, and so does ⇧F1 - the dock's own chord, a plain switch
+            // like the row beside it.
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert_eq!(app.focus, Focus::Editor);
+            assert!(app.viz_docks[0].is_some());
+            app.dispatch_menu_action(crate::menu::MenuAction::VizPanel)
+                .expect("menu");
+            assert!(app.viz_docks[0].is_none());
+            assert!(!app.prefs.visuals[0].open);
+            // Opened again, the widgets are as they were.
+            app.dispatch_menu_action(crate::menu::MenuAction::VizPanel)
+                .expect("menu");
+            assert_eq!(app.prefs.visuals[0].widgets.len(), 1);
+            assert_eq!(app.prefs.visuals[0].widgets[0].art_style(), ArtStyle::Glow);
+        }
+
+        /// A set file from before the preferences held the widgets hands them
+        /// over when the panel opens without any; a studio that has its own
+        /// keeps them.
+        #[test]
+        fn an_older_set_file_hands_its_widgets_to_the_preferences() {
+            use crate::viz_panel::{WidgetKind, WidgetSpec};
+            // This studio starts with no widgets and its panel shut, so nothing
+            // is carried over before the test looks.
+            crate::config::isolate_for_tests();
+            let mut prefs = StudioPrefs::load();
+            prefs.visuals[0].open = false;
+            prefs.visuals[0].widgets.clear();
+            prefs.save().expect("prefs");
+            let directory = tempfile::tempdir().expect("temp dir");
+            std::fs::write(
+                crate::scenes::SetManifest::path_in(directory.path()),
+                r#"{"scenes":[{"file":"first.strudel"}],"widgets":[{"kind":"scope","style":"glow"},{"kind":"vectorscope"}]}"#,
+            )
+            .expect("set file");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 140, 40);
+            app.open_viz_dock(0, false);
+            assert_eq!(
+                app.prefs.visuals[0]
+                    .widgets
+                    .iter()
+                    .map(|w| w.kind)
+                    .collect::<Vec<_>>(),
+                [WidgetKind::Scope, WidgetKind::Vector],
+                "carried over"
+            );
+            assert_eq!(
+                app.prefs.visuals[0].widgets[0].style.as_deref(),
+                Some("glow")
+            );
+            app.flush_prefs();
+            app.persist_manifest();
+            let text =
+                std::fs::read_to_string(crate::scenes::SetManifest::path_in(directory.path()))
+                    .expect("set file");
+            assert!(
+                !text.contains("widgets"),
+                "the set file lets them go: {text}"
+            );
+
+            let mut own = app_over(directory.path());
+            own.prefs.visuals[0].widgets = vec![WidgetSpec::default_art()];
+            own.open_viz_dock(0, false);
+            assert_eq!(
+                own.prefs.visuals[0].widgets.len(),
+                1,
+                "a studio with its own keeps them"
+            );
+            assert_eq!(own.prefs.visuals[0].widgets[0].kind, WidgetKind::Art);
+        }
+
+        /// A visuals dock takes a slice of the stage for good; zen's whole
+        /// point is a stage nothing is sliced from, so it is refused rather
+        /// than opened invisible with the keyboard stuck on it.
+        #[test]
+        fn visuals_docks_are_refused_in_zen() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            press(&mut app, KeyCode::F(11), KeyModifiers::NONE);
+            assert!(app.ui_settings.zen);
+
+            press(&mut app, KeyCode::F(1), KeyModifiers::SHIFT);
+            assert!(app.viz_docks[0].is_none(), "visuals 1 opened in zen");
+            assert!(app.status.contains("zen"), "{}", app.status);
+
+            press(&mut app, KeyCode::F(2), KeyModifiers::SHIFT);
+            assert!(app.viz_docks[1].is_none(), "visuals 2 opened in zen");
+
+            // The menu row is the same switch and must refuse just as flatly.
+            app.dispatch_menu_action(crate::menu::MenuAction::VizPanel)
+                .expect("menu");
+            assert!(app.viz_docks[0].is_none(), "the menu opened visuals in zen");
+        }
+
+        /// Shift with an arrow moves the chosen widget along the dock, and
+        /// the art's text given back as the set's name stays the set's name.
+        #[test]
+        fn widgets_reorder_and_the_art_keeps_the_sets_name() {
+            use crate::viz_panel::WidgetKind;
+            // Start from a known panel: this thread's preferences are its own.
+            crate::config::isolate_for_tests();
+            let mut prefs = StudioPrefs::load();
+            prefs.visuals[0].open = false;
+            prefs.visuals[0].widgets.clear();
+            prefs.save().expect("prefs");
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 140, 40);
+            app.open_viz_dock(0, true);
+            // A key only reaches a dock the layout found room for, and a test
+            // that never draws has no layout: stand in the column a frame this
+            // wide would have given it.
+            app.regions.viz[0] = Rect::new(104, 1, 36, 38);
+            press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let kinds = |app: &App| {
+                app.prefs.visuals[0]
+                    .widgets
+                    .iter()
+                    .map(|w| w.kind)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(kinds(&app), [WidgetKind::Art, WidgetKind::Scope]);
+            assert_eq!(app.viz_docks[0].as_ref().unwrap().selected, 1);
+            press(&mut app, KeyCode::Left, KeyModifiers::SHIFT);
+            assert_eq!(kinds(&app), [WidgetKind::Scope, WidgetKind::Art]);
+            assert_eq!(
+                app.viz_docks[0].as_ref().unwrap().selected,
+                0,
+                "the selection went with it"
+            );
+            press(&mut app, KeyCode::Left, KeyModifiers::SHIFT);
+            assert_eq!(
+                kinds(&app),
+                [WidgetKind::Scope, WidgetKind::Art],
+                "nowhere further"
+            );
+            // Enter on the art offers the set's name; Enter again keeps the
+            // art on the set's name, whatever set is open later.
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            assert_eq!(app.viz_docks[0].as_ref().unwrap().selected, 1);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.viz_docks[0].as_ref().unwrap().prompt.is_some());
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.prefs.visuals[0].widgets[1].text, None);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            for character in "HELLO".chars() {
+                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(
+                app.prefs.visuals[0].widgets[1].text.as_deref(),
+                Some("HELLO")
+            );
+        }
+
+        /// The clock the visuals animate on counts sound, not time: stopped,
+        /// it stays where it is, so the art's own animation holds rather than
+        /// running on over silence.
+        #[test]
+        fn the_visuals_clock_stops_with_the_music() {
+            use crate::viz_panel::Motion;
+            let directory = tempfile::tempdir().expect("temp dir");
+            let app = app_over(directory.path());
+            let start = Instant::now();
+
+            // From the app's first breath to here is a sliver of a second, so
+            // the first reading is the baseline rather than a flat zero.
+            let base = app.count_sound(start, Motion::Live);
+            let playing = app.count_sound(start + Duration::from_secs(2), Motion::Live);
+            assert!((playing - base - 2.0).abs() < 1e-3, "{playing} from {base}");
+
+            // Silent: the same reading, however long the silence lasts.
+            let held = app.count_sound(start + Duration::from_secs(30), Motion::Off);
+            assert!((held - playing).abs() < 1e-6, "{held} moved from {playing}");
+
+            // Playing again, it counts from where it left off.
+            let again = app.count_sound(start + Duration::from_secs(31), Motion::Live);
+            assert!(
+                (again - playing - 1.0).abs() < 1e-3,
+                "{again} from {playing}"
+            );
+        }
+
+        #[test]
+        fn mixer_hit_rows_follow_the_drawn_stack_below_expanded_art() {
+            use crate::viz_panel::{Motion, VizDockView};
+            use ratatui::{buffer::Buffer, widgets::Widget};
+
+            for edge in [Edge::Left, Edge::Right] {
+                let directory = tempfile::tempdir().expect("temp dir");
+                let mut app = app_over(directory.path());
+                app.prefs.audio_input = Some("Mic".into());
+                // Given a limiter, so the desk has the strip it leads with.
+                app.set_limiter_slot(true);
+                let mut art = WidgetSpec::default_art();
+                art.text = Some("one\ntwo".into());
+                app.prefs.visuals[0].widgets = vec![art, WidgetSpec::new(WidgetKind::Mixer)];
+                app.viz_docks[0] = Some(VizPanel {
+                    edge,
+                    selected: 1,
+                    ..VizPanel::default()
+                });
+                app.frame = Rect::new(0, 0, 120, 40);
+                app.regions.viz[0] = Rect::new(80, 0, 40, 40);
+                app.viz_focus = 0;
+                app.focus = Focus::Panel(PanelKind::Viz);
+                let area = app.regions.viz[0];
+                let parts = VizPanel::parts(area, edge).expect("dock parts");
+                let facts = app.mixer_facts().expect("mixer facts");
+                let mut buffer = Buffer::empty(app.frame);
+                VizDockView {
+                    panel: app.viz_docks[0].as_ref().unwrap(),
+                    index: 0,
+                    widgets: &app.prefs.visuals[0].widgets,
+                    set_name: &app.scenes.name(),
+                    state: &app.visual,
+                    theme: &app.theme,
+                    motion: Motion::Off,
+                    level: 0.0,
+                    seconds: 0.0,
+                    area,
+                    focused: true,
+                    mixer: Some(&facts),
+                }
+                .render(app.frame, &mut buffer);
+                // Found by the master's own drawn label - `ma` after the
+                // marker - rather than by counting rows, so this measures the
+                // picture against the hit test instead of against itself.
+                let master_y = (parts.body.y..parts.body.bottom())
+                    .find(|&y| {
+                        buffer.cell((parts.body.x + 1, y)).unwrap().symbol() == "m"
+                            && buffer.cell((parts.body.x + 2, y)).unwrap().symbol() == "a"
+                    })
+                    .expect("drawn master strip label");
+                let widget = app.viz_widget_rect(0, 1).expect("mixer hit rectangle");
+                // The limiter leads the desk and the master follows it, here as
+                // on the panel: the stack is the same order lying down.
+                assert_eq!(
+                    widget.y + 1,
+                    master_y,
+                    "{edge:?}: hit rows match the picture"
+                );
+                assert_eq!(widget.bottom(), parts.body.bottom());
+                let x = parts.body.x + 1;
+                assert_eq!(
+                    app.mixer_strip_at(0, x, widget.y),
+                    Some(MixerTarget::Limiter),
+                    "the first row is the limiter's"
+                );
+                assert_eq!(
+                    app.mixer_fader_at(0, x, widget.y),
+                    Some(MixerTarget::Limiter)
+                );
+                assert_eq!(
+                    app.mixer_strip_at(0, x, master_y),
+                    Some(MixerTarget::Master),
+                    "and the master is the row the label was drawn on"
+                );
+                assert!(app.click_viz_panel(x, master_y));
+                assert_eq!(
+                    app.mixer.selected,
+                    MixerTarget::Master,
+                    "a press chooses the row"
+                );
+                assert!(matches!(app.pointer, Some(Pointer::Panel)));
+            }
+        }
+
+        #[test]
+        fn j_aligns_only_selected_art_and_pasted_drawing_waits_for_enter() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.prefs.visuals[0].widgets = vec![
+                WidgetSpec::default_art(),
+                WidgetSpec::new(WidgetKind::Scope),
+            ];
+            app.viz_docks[0] = Some(VizPanel {
+                edge: Edge::Top,
+                ..VizPanel::default()
+            });
+            app.viz_focus = 0;
+            app.focus = Focus::Panel(PanelKind::Viz);
+            let source = app.editor().source();
+            assert!(
+                !app.handle_viz_key(KeyCode::Char('j'), true, false),
+                "primary shortcuts pass through"
+            );
+            assert!(app.handle_viz_key(KeyCode::Char('j'), false, false));
+            assert_eq!(app.prefs.visuals[0].widgets[0].alignment, ArtAlignment::End);
+            assert!(app.status.contains("right"));
+            app.viz_docks[0].as_mut().unwrap().edge = Edge::Left;
+            assert!(app.handle_viz_key(KeyCode::Char('J'), false, true));
+            assert_eq!(
+                app.prefs.visuals[0].widgets[0].alignment,
+                ArtAlignment::Start
+            );
+            assert!(app.status.contains("top"));
+            assert!(app.handle_viz_key(KeyCode::Tab, false, false));
+            let widgets = app.prefs.visuals[0].widgets.clone();
+            assert!(!app.handle_viz_key(KeyCode::Char('j'), false, false));
+            assert_eq!(
+                app.prefs.visuals[0].widgets, widgets,
+                "scope and other art stay unchanged"
+            );
+            assert!(app.handle_viz_key(KeyCode::BackTab, false, true));
+            assert!(app.handle_viz_key(KeyCode::Enter, false, false));
+            let drawing = "  /\\_/\\\n ( o.o )\n  > ^ <  \n";
+            assert!(app.paste_viz_prompt(drawing));
+            assert!(
+                app.viz_docks[0].as_ref().unwrap().prompt.is_some(),
+                "paste does not submit"
+            );
+            assert_eq!(
+                app.prefs.visuals[0].widgets[0].text, None,
+                "paste is still an unconfirmed edit"
+            );
+            assert_eq!(app.editor().source(), source, "no paste reaches the score");
+            assert!(app.handle_viz_key(KeyCode::Enter, false, false));
+            assert_eq!(
+                app.prefs.visuals[0].widgets[0].text.as_deref(),
+                Some(drawing)
+            );
+            assert_eq!(app.editor().source(), source);
+
+            assert!(app.handle_viz_key(KeyCode::Enter, false, false));
+            let offered = app.viz_docks[0]
+                .as_ref()
+                .unwrap()
+                .prompt
+                .as_ref()
+                .unwrap()
+                .path
+                .clone();
+            for too_large in [
+                "x\n".repeat(crate::viz_panel::ART_MAX_LINES + 1),
+                "x".repeat(ART_MAX_BYTES + 1),
+            ] {
+                assert!(
+                    app.paste_viz_prompt(&too_large),
+                    "refused paste still belongs to the prompt"
+                );
+                let picker = app.viz_docks[0].as_ref().unwrap().prompt.as_ref().unwrap();
+                assert_eq!(
+                    picker.path, offered,
+                    "refusal preserves the entire previous input"
+                );
+                assert!(
+                    picker
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("artwork limit"))
+                );
+                assert_eq!(app.editor().source(), source);
+            }
+            // Direct entry or older preferences cannot evade the commit check.
+            app.viz_docks[0]
+                .as_mut()
+                .unwrap()
+                .prompt
+                .as_mut()
+                .unwrap()
+                .path = "x\n".repeat(65_534);
+            assert!(app.handle_viz_key(KeyCode::Enter, false, false));
+            assert!(app.viz_docks[0].as_ref().unwrap().prompt.is_some());
+            assert_eq!(
+                app.prefs.visuals[0].widgets[0].text.as_deref(),
+                Some(drawing)
+            );
+            assert_eq!(app.editor().source(), source);
+        }
+    }
+}

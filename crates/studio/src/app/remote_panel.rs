@@ -688,4 +688,738 @@ mod tests {
             None
         );
     }
+
+    #[cfg(feature = "remote-control")]
+    mod remote_activity {
+        //! The remote activity light follows accepted commands and settles without animation.
+
+        use crate::app::tests::support::{app_over, press};
+        use crate::app::*;
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpStream;
+
+        #[test]
+        fn remote_commands_light_the_indicator_and_expire_with_one_repaint() {
+            let directory = tempfile::tempdir().expect("score directory");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 100, 30);
+            app.remote = Some(Box::new(
+                crate::remote::listen("127.0.0.1:0".parse().unwrap(), Some("gig1"))
+                    .expect("start listener"),
+            ));
+            let address = app.remote.as_ref().unwrap().address();
+            let mut client = TcpStream::connect(address).expect("connect client");
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("read timeout");
+            let mut reader = BufReader::new(client.try_clone().expect("clone client"));
+            let mut reply = String::new();
+            writeln!(client, "auth gig1").expect("authenticate");
+            reader.read_line(&mut reply).expect("auth reply");
+            assert_eq!(reply, "ok\n");
+            app.dirty_frame = false;
+            app.poll_remote().expect("poll authenticated connection");
+            assert!(app.remote.as_ref().unwrap().activity_until.is_none());
+            assert!(!app.dirty_frame, "an idle connection must not animate");
+
+            writeln!(client, "key x").expect("send key");
+            reply.clear();
+            reader.read_line(&mut reply).expect("key reply");
+            assert_eq!(reply, "ok\n");
+            app.poll_remote().expect("apply key");
+            let key_until = app
+                .remote
+                .as_ref()
+                .unwrap()
+                .activity_until
+                .expect("key lit indicator");
+            assert!(app.dirty_frame);
+
+            // A screen request also pulses, while preserving its usual frame pacing.
+            app.input_dirty = false;
+            app.dirty_frame = false;
+            writeln!(client, "screen").expect("request screen");
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while app.remote.as_ref().unwrap().pending_screens.is_empty() {
+                assert!(Instant::now() < deadline, "screen request was not queued");
+                app.poll_remote().expect("poll screen request");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let screen_until = app
+                .remote
+                .as_ref()
+                .unwrap()
+                .activity_until
+                .expect("screen lit indicator");
+            assert!(screen_until > key_until, "a burst should extend the pulse");
+            assert!(app.dirty_frame);
+            assert!(
+                !app.input_dirty,
+                "screen requests must not bypass frame pacing"
+            );
+
+            app.dirty_frame = false;
+            app.expire_remote_activity(screen_until - Duration::from_millis(1));
+            assert!(app.remote.as_ref().unwrap().activity_until.is_some());
+            assert!(!app.dirty_frame);
+            app.expire_remote_activity(screen_until);
+            assert!(app.remote.as_ref().unwrap().activity_until.is_none());
+            assert!(
+                app.dirty_frame,
+                "expiry needs a repaint to dim the indicator"
+            );
+            app.dirty_frame = false;
+            app.expire_remote_activity(screen_until + Duration::from_secs(1));
+            assert!(
+                !app.dirty_frame,
+                "an idle light must not request more frames"
+            );
+
+            // Disabling during a pulse drops it; enabling again starts unlit.
+            app.remote.as_mut().unwrap().activity_until = Some(screen_until);
+            app.options.remote_control = Some("127.0.0.1:0".parse().unwrap());
+            app.options.auth_token = Some("gig1".into());
+            app.dispatch_menu_action(crate::menu::MenuAction::RemoteControl)
+                .expect("open remote controls");
+            assert!(app.remote_panel_open);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.remote.is_none());
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.remote.as_ref().unwrap().activity_until.is_none());
+        }
+    }
+
+    #[cfg(feature = "remote-control")]
+    mod remote_control {
+        //! Integration of authenticated automation with the real editor and frame pacing.
+
+        use crate::app::tests::support::{app_over, press};
+        use crate::app::*;
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{TcpListener, TcpStream};
+
+        #[test]
+        fn included_remote_control_stays_dormant_without_runtime_opt_in() {
+            let directory = tempfile::tempdir().expect("score directory");
+            let mut app = app_over(directory.path());
+            assert!(app.options.remote_control.is_none());
+            assert!(app.remote.is_none());
+            app.input_dirty = false;
+            app.dirty_frame = false;
+            app.poll_remote().expect("inactive poll");
+            assert!(!app.input_dirty && !app.dirty_frame);
+        }
+
+        #[test]
+        fn options_remote_control_replaces_devices_and_returns_to_editor() {
+            use crate::menu::MenuAction;
+
+            let directory = tempfile::tempdir().expect("score directory");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 100, 30);
+            app.dispatch_menu_action(MenuAction::Devices)
+                .expect("open Devices");
+            assert!(app.panel.is_some());
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Devices));
+
+            press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('o'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+            assert!(app.remote_panel_open, "F1, O, R should open remote control");
+            assert!(app.panel.is_none(), "remote control should replace Devices");
+            assert!(app.menu.is_none());
+            assert_eq!(app.focus, Focus::Editor);
+
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(!app.remote_panel_open);
+            let before = app.editor().source();
+            press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+            assert_ne!(app.editor().source(), before, "editor lost keyboard focus");
+        }
+
+        #[test]
+        fn remote_panel_keys_cancel_armed_quit() {
+            let directory = tempfile::tempdir().expect("score directory");
+            for code in [KeyCode::Down, KeyCode::Esc] {
+                let mut app = app_over(directory.path());
+                app.frame = Rect::new(0, 0, 100, 30);
+                app.dispatch_menu_action(crate::menu::MenuAction::RemoteControl)
+                    .expect("open remote control");
+                assert!(app.remote_panel_open);
+
+                press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+                assert!(app.quit_armed && !app.quit);
+                press(&mut app, code, KeyModifiers::NONE);
+                assert!(!app.quit_armed, "{code:?} left quit armed behind the panel");
+                assert!(!app.quit);
+                assert_eq!(app.remote_panel_open, code != KeyCode::Esc);
+
+                press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+                assert!(app.quit_armed, "a later Ctrl+Q should arm a fresh quit");
+                assert!(!app.quit, "a later Ctrl+Q unexpectedly quit after {code:?}");
+            }
+        }
+
+        #[test]
+        fn options_menu_controls_remote_listener_without_a_pointer() {
+            use crate::menu::MenuAction;
+
+            let directory = tempfile::tempdir().expect("score directory");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 100, 30);
+            let remote_row = |app: &App| {
+                app.menus()
+                    .into_iter()
+                    .find(|menu| menu.title == "Options")
+                    .expect("Options menu")
+                    .items
+                    .into_iter()
+                    .find(|item| item.id() == Some(MenuAction::RemoteControl))
+            };
+            assert!(app.remote.is_none());
+            assert!(remote_row(&app).expect("remote control row").enabled);
+            press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('o'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+            assert!(
+                app.remote_panel_open,
+                "F1, O, R did not open remote details"
+            );
+            assert!(
+                app.menu.is_none(),
+                "the menu should close before the panel opens"
+            );
+            assert!(app.remote.is_none(), "opening the panel must not enable it");
+            assert!(!app.remote_token_revealed);
+
+            // Use an ephemeral port for the toggle, after proving the entry is
+            // reachable in an ordinary launch with no --remote-control flag.
+            app.options.remote_control = Some("127.0.0.1:0".parse().unwrap());
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let remote = app.remote.as_ref().expect("Enter enabled listener");
+            assert!(remote.address().ip().is_loopback());
+            let first_address = remote.address();
+            let first_token = remote.token().to_owned();
+            let first_token_file = remote
+                .token_path()
+                .expect("generated token file")
+                .to_owned();
+            assert!(first_token_file.exists());
+            assert!(app.remote_panel_open, "toggle should keep the panel open");
+
+            for _ in 0..3 {
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(
+                app.remote_token_revealed,
+                "choosing reveal with the keyboard did not show the token"
+            );
+
+            let mut client =
+                TcpStream::connect(first_address).expect("connect authenticated client");
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("read timeout");
+            let mut reader = BufReader::new(client.try_clone().expect("clone client"));
+            writeln!(client, "auth {first_token}").expect("authenticate");
+            let mut reply = String::new();
+            reader.read_line(&mut reply).expect("auth reply");
+            assert_eq!(reply, "ok\n");
+
+            for _ in 0..3 {
+                press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.remote.is_none(), "Enter disabled listener");
+            assert!(app.remote_panel_open, "toggle should keep the panel open");
+            assert!(
+                !app.remote_token_revealed,
+                "disabling should hide the token"
+            );
+            assert!(!first_token_file.exists(), "old token file was not removed");
+            reply.clear();
+            assert_eq!(reader.read_line(&mut reply).expect("client disconnect"), 0);
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let remote = app.remote.as_ref().expect("Enter re-enabled listener");
+            assert_ne!(
+                remote.token(),
+                first_token,
+                "re-enable must issue a fresh code"
+            );
+            let second_address = remote.address();
+            let second_token = remote.token().to_owned();
+            let second_token_file = remote.token_path().expect("new token file").to_owned();
+            assert!(second_token_file.exists());
+
+            // Both commands reach the same listener before the UI drains its queue.
+            // Once the first Enter disables it, the second must not re-enable it.
+            let mut queued_client =
+                TcpStream::connect(second_address).expect("connect queued client");
+            queued_client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("read timeout");
+            let mut queued_reader =
+                BufReader::new(queued_client.try_clone().expect("clone queued client"));
+            writeln!(queued_client, "auth {second_token}").expect("authenticate queued client");
+            reply.clear();
+            queued_reader.read_line(&mut reply).expect("auth reply");
+            assert_eq!(reply, "ok\n");
+            for _ in 0..2 {
+                writeln!(queued_client, "key enter").expect("queue Enter");
+                reply.clear();
+                queued_reader
+                    .read_line(&mut reply)
+                    .expect("queued key reply");
+                assert_eq!(reply, "ok\n");
+            }
+            app.poll_remote().expect("apply queued keys");
+            assert!(app.remote.is_none(), "queued Enter re-enabled the listener");
+            app.poll_remote().expect("inactive poll after disconnect");
+            assert!(app.remote.is_none());
+            assert!(!second_token_file.exists());
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(!app.remote_panel_open);
+            assert!(
+                !app.remote_token_revealed,
+                "closing must hide the token again"
+            );
+        }
+
+        #[test]
+        fn bind_failure_keeps_remote_panel_usable_and_explicit_token_stable() {
+            let directory = tempfile::tempdir().expect("score directory");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 100, 30);
+            let occupied = TcpListener::bind("127.0.0.1:0").expect("occupy port");
+            let address = occupied.local_addr().expect("occupied address");
+            app.options.remote_control = Some(address);
+            app.options.auth_token = Some("a-long-private-token".into());
+
+            press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('o'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+            assert!(app.remote_panel_open);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.remote.is_none(), "occupied port unexpectedly bound");
+            assert!(app.remote_panel_open, "bind failure closed the panel");
+            assert_eq!(app.remote_panel_selected, 0);
+
+            drop(occupied);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let remote = app.remote.as_ref().expect("retry enabled listener");
+            assert_eq!(remote.address(), address);
+            assert_eq!(remote.token(), "a-long-private-token");
+            assert!(remote.token_path().is_none(), "explicit code needs no file");
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.remote.is_none());
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(
+                app.remote.as_ref().expect("re-enabled").token(),
+                "a-long-private-token"
+            );
+        }
+
+        fn open_remote_sheet(app: &mut App) {
+            if app.remote_panel_open {
+                press(app, KeyCode::Esc, KeyModifiers::NONE);
+            }
+            app.frame = Rect::new(0, 0, 100, 30);
+            press(app, KeyCode::F(1), KeyModifiers::NONE);
+            press(app, KeyCode::Char('o'), KeyModifiers::NONE);
+            press(app, KeyCode::Char('r'), KeyModifiers::NONE);
+            assert!(app.remote_panel_open);
+        }
+
+        fn replace_remote_input(app: &mut App, text: &str) {
+            press(app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+            app.handle_terminal_event(Event::Paste(text.into()))
+                .expect("paste into remote field");
+        }
+
+        #[test]
+        fn remote_fields_accept_keyboard_edits_and_apply_them_on_enable() {
+            let directory = tempfile::tempdir().expect("score directory");
+            let mut app = app_over(directory.path());
+            let before = app.editor().source();
+            let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve port");
+            let address = reserved.local_addr().expect("reserved address");
+            open_remote_sheet(&mut app);
+
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+            for character in address.to_string().chars() {
+                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.options.remote_control, Some(address));
+
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let token = "live";
+            app.clipboard
+                .set_text(token.into())
+                .expect("seed clipboard");
+            press(&mut app, KeyCode::Char('v'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.options.auth_token.as_deref(), Some(token));
+            assert!(!app.remote_token_revealed, "saving should mask the token");
+            assert!(app.remote.is_none(), "editing must not start the listener");
+            assert_eq!(
+                app.editor().source(),
+                before,
+                "field edits reached the score"
+            );
+
+            for _ in 0..2 {
+                press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            }
+            drop(reserved);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let remote = app.remote.as_ref().expect("Enable uses edited fields");
+            assert_eq!(remote.address(), address);
+            assert_eq!(remote.token(), token);
+            assert!(remote.token_path().is_none());
+        }
+
+        #[test]
+        fn remote_field_validation_and_cancel_preserve_saved_configuration() {
+            let directory = tempfile::tempdir().expect("score directory");
+            let mut app = app_over(directory.path());
+            let original_address = "127.0.0.1:9247".parse().unwrap();
+            let original_token = "original-private-code";
+            app.options.remote_control = Some(original_address);
+            app.options.auth_token = Some(original_token.into());
+            let before = app.editor().source();
+            open_remote_sheet(&mut app);
+
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            replace_remote_input(&mut app, "127.0.0.1:0");
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.options.remote_control, Some(original_address));
+            assert!(app.remote_panel_open);
+
+            // A validation failure retains the draft so it can be corrected in place.
+            let updated_address = "127.0.0.1:9357".parse().unwrap();
+            replace_remote_input(&mut app, "127.0.0.1:9357");
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.options.remote_control, Some(updated_address));
+
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            replace_remote_input(&mut app, "abc");
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.options.auth_token.as_deref(), Some(original_token));
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.remote_panel_open, "Escape should first cancel the edit");
+            assert_eq!(app.options.auth_token.as_deref(), Some(original_token));
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            replace_remote_input(&mut app, "discard-this-private-code");
+            app.handle_terminal_event(Event::FocusLost)
+                .expect("focus lost");
+            assert!(!app.remote_panel_open);
+            assert!(!app.remote_token_revealed);
+            assert_eq!(app.options.auth_token.as_deref(), Some(original_token));
+            open_remote_sheet(&mut app);
+            assert_eq!(app.remote_panel_selected, 0);
+            assert_eq!(
+                app.editor().source(),
+                before,
+                "cancelled edits reached the score"
+            );
+        }
+
+        #[test]
+        fn clearing_the_remote_token_restores_generated_codes() {
+            let directory = tempfile::tempdir().expect("score directory");
+            let mut app = app_over(directory.path());
+            // Port zero is assigned directly only for the test's listener; the UI
+            // rejects it because a user must choose a stable destination port.
+            app.options.remote_control = Some("127.0.0.1:0".parse().unwrap());
+            app.options.auth_token = Some("replace-this-private-code".into());
+            open_remote_sheet(&mut app);
+            for _ in 0..2 {
+                press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.options.auth_token.is_none());
+            assert!(!app.remote_token_revealed);
+
+            for _ in 0..2 {
+                press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let remote = app.remote.as_ref().expect("generated-code listener");
+            assert!(remote.token_path().is_some());
+            assert_eq!(remote.token().len(), 14);
+        }
+
+        #[test]
+        fn running_remote_fields_require_disabling_before_edits() {
+            let directory = tempfile::tempdir().expect("score directory");
+            let mut app = app_over(directory.path());
+            app.options.remote_control = Some("127.0.0.1:0".parse().unwrap());
+            app.options.auth_token = Some("running-private-code".into());
+            open_remote_sheet(&mut app);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let address = app.remote.as_ref().expect("enabled listener").address();
+            let configured_address = app.options.remote_control;
+            let configured_token = app.options.auth_token.clone();
+
+            for (row, replacement) in [(1, "127.0.0.1:9357"), (2, "new-private-code-for-later")] {
+                open_remote_sheet(&mut app);
+                for _ in 0..row {
+                    press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+                }
+                press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+                replace_remote_input(&mut app, replacement);
+                press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+                assert!(
+                    !app.remote_panel_open,
+                    "active field unexpectedly began editing"
+                );
+                assert_eq!(app.options.remote_control, configured_address);
+                assert_eq!(app.options.auth_token, configured_token);
+                let remote = app.remote.as_ref().expect("listener should stay running");
+                assert_eq!(remote.address(), address);
+                assert_eq!(remote.token(), "running-private-code");
+            }
+        }
+
+        fn remote_sheet_buffer(app: &App) -> ratatui::buffer::Buffer {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+                .expect("test terminal");
+            terminal
+                .draw(|frame| app.paint_remote_panel(frame))
+                .expect("paint remote sheet");
+            terminal.backend().buffer().clone()
+        }
+
+        fn remote_sheet_text(app: &App) -> String {
+            remote_sheet_buffer(app)
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect()
+        }
+
+        #[test]
+        fn remote_token_drafts_are_masked_until_revealed_and_remasked_on_save() {
+            let directory = tempfile::tempdir().expect("score directory");
+            let mut app = app_over(directory.path());
+            let saved_token = "original-private-code";
+            let draft_token = "new-secret-for-sharing";
+            app.options.auth_token = Some(saved_token.into());
+            open_remote_sheet(&mut app);
+            for _ in 0..2 {
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(!remote_sheet_text(&app).contains(saved_token));
+            replace_remote_input(&mut app, draft_token);
+            assert!(!remote_sheet_text(&app).contains(draft_token));
+            let buffer = remote_sheet_buffer(&app);
+            let mask_start = buffer
+                .content
+                .iter()
+                .position(|cell| cell.symbol() == "•")
+                .expect("draft uses bullet masking");
+            let label_style = buffer.content[mask_start - 3].style();
+            for cell in &buffer.content[mask_start..mask_start + draft_token.len()] {
+                assert_eq!(cell.symbol(), "•");
+                assert_eq!(cell.style(), label_style, "mask keeps the row styling");
+            }
+
+            press(&mut app, KeyCode::Char('r'), KeyModifiers::ALT);
+            assert!(remote_sheet_text(&app).contains(draft_token));
+            // Plain letters remain token input, even when they are sheet shortcuts.
+            press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('c'), KeyModifiers::NONE);
+            let final_token = format!("{draft_token}rc");
+            assert!(remote_sheet_text(&app).contains(&final_token));
+            press(&mut app, KeyCode::Char('r'), KeyModifiers::ALT);
+            assert!(!remote_sheet_text(&app).contains(&final_token));
+
+            press(&mut app, KeyCode::Char('r'), KeyModifiers::ALT);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(
+                app.options.auth_token.as_deref(),
+                Some(final_token.as_str())
+            );
+            assert!(!app.remote_token_revealed);
+            assert!(!remote_sheet_text(&app).contains(&final_token));
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('r'), KeyModifiers::ALT);
+            assert!(remote_sheet_text(&app).contains(&final_token));
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.remote_panel_open);
+            assert!(!app.remote_token_revealed);
+            assert!(!remote_sheet_text(&app).contains(&final_token));
+        }
+
+        #[test]
+        fn remote_fields_reject_unsafe_or_oversized_pastes_without_partial_changes() {
+            let directory = tempfile::tempdir().expect("score directory");
+            let mut app = app_over(directory.path());
+            let address = "[::1]:9357";
+            let token = "original-private-code";
+            app.options.remote_control = Some(address.parse().unwrap());
+            app.options.auth_token = Some(token.into());
+            let before = app.editor().source();
+            open_remote_sheet(&mut app);
+
+            for (expected, limit) in [(address, 64), (token, 256)] {
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+                press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+                for invalid in [
+                    "valid-prefix-é".to_owned(),
+                    "valid-prefix-😀".to_owned(),
+                    "valid-prefix-\nsecond-line".to_owned(),
+                    "valid-prefix-\0suffix".to_owned(),
+                    "valid-prefix- suffix".to_owned(),
+                    "x".repeat(limit + 1),
+                ] {
+                    replace_remote_input(&mut app, &invalid);
+                    let edit = app.remote_edit.as_ref().expect("still editing");
+                    assert_eq!(edit.visible_text(512, true), expected);
+                    assert!(edit.error.is_some(), "invalid paste needs feedback");
+                    assert!(edit.selected, "rejected paste consumed the selection");
+                    // Rendering the rejected Unicode must also remain safe.
+                    let _ = remote_sheet_text(&app);
+                }
+                press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            }
+            assert_eq!(app.options.remote_control, Some(address.parse().unwrap()));
+            assert_eq!(app.options.auth_token.as_deref(), Some(token));
+
+            // Appending to a full token is rejected too, without a partial suffix.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let full_token = "x".repeat(256);
+            replace_remote_input(&mut app, &full_token);
+            press(&mut app, KeyCode::End, KeyModifiers::NONE);
+            app.handle_terminal_event(Event::Paste("yz".into()))
+                .expect("reject overflowing append");
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.options.auth_token.as_deref(), Some(full_token.as_str()));
+            assert_eq!(app.editor().source(), before);
+        }
+
+        #[test]
+        fn remote_token_cursor_edits_and_shift_tab_stay_in_the_sheet() {
+            let directory = tempfile::tempdir().expect("score directory");
+            let mut app = app_over(directory.path());
+            app.options.auth_token = Some("xabcdefghijklmnopz".into());
+            let before = app.editor().source();
+            open_remote_sheet(&mut app);
+            for _ in 0..2 {
+                press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            for code in [
+                KeyCode::Home,
+                KeyCode::Backspace, // no character before the start
+                KeyCode::Delete,    // remove the leading x
+                KeyCode::End,
+                KeyCode::Delete,    // no character after the end
+                KeyCode::Backspace, // remove the trailing z
+                KeyCode::Left,
+                KeyCode::Char('-'),
+                KeyCode::Right,
+                KeyCode::Backspace, // replace the p after the inserted separator
+                KeyCode::Char('q'),
+                KeyCode::Enter,
+            ] {
+                press(&mut app, code, KeyModifiers::NONE);
+            }
+            assert_eq!(app.options.auth_token.as_deref(), Some("abcdefghijklmno-q"));
+            assert_eq!(app.remote_panel_selected, 2);
+            press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT);
+            assert_eq!(app.remote_panel_selected, 1);
+            press(&mut app, KeyCode::BackTab, KeyModifiers::NONE);
+            assert_eq!(app.remote_panel_selected, 0);
+            assert_eq!(app.editor().source(), before);
+        }
+
+        #[test]
+        fn authenticated_keys_and_concurrent_snapshots_preserve_frame_pacing() {
+            let directory = tempfile::tempdir().expect("score directory");
+            let mut app = app_over(directory.path());
+            let remote =
+                crate::remote::listen("127.0.0.1:0".parse().unwrap(), None).expect("listener");
+            let token =
+                std::fs::read_to_string(remote.token_path().unwrap()).expect("launch token");
+            let mut client = TcpStream::connect(remote.address()).expect("connect");
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(client.try_clone().unwrap());
+            app.remote = Some(Box::new(remote));
+            writeln!(client, "auth {}", token.trim()).unwrap();
+            let mut reply = String::new();
+            reader.read_line(&mut reply).unwrap();
+            assert_eq!(reply, "ok\n");
+
+            let before = app.editor().source();
+            writeln!(client, "key x").unwrap();
+            reply.clear();
+            reader.read_line(&mut reply).unwrap();
+            assert_eq!(reply, "ok\n");
+            app.poll_remote().expect("apply acknowledged key");
+            assert_ne!(app.editor().source(), before);
+            assert!(app.input_dirty);
+
+            let mut other = TcpStream::connect(app.remote.as_ref().unwrap().address()).unwrap();
+            other
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut other_reader = BufReader::new(other.try_clone().unwrap());
+            writeln!(other, "auth {}", token.trim()).unwrap();
+            reply.clear();
+            other_reader.read_line(&mut reply).unwrap();
+            assert_eq!(reply, "ok\n");
+
+            // An abandoned request must not stop either client getting a frame.
+            let (stale, abandoned) = std::sync::mpsc::channel();
+            app.remote.as_mut().unwrap().queue_screen(stale);
+            drop(abandoned);
+            app.input_dirty = false;
+            app.dirty_frame = false;
+            writeln!(client, "screen").unwrap();
+            writeln!(other, "screen").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while app.remote.as_ref().unwrap().pending_screens.len() < 3 {
+                assert!(
+                    Instant::now() < deadline,
+                    "screen requests did not reach UI"
+                );
+                app.poll_remote().expect("snapshot poll");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(!app.input_dirty, "screen must not bypass animation pacing");
+            assert!(app.dirty_frame);
+
+            let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 5, 1));
+            buffer[(0, 0)].set_symbol("x");
+            app.reply_remote_screen(&buffer);
+            for reader in [&mut reader, &mut other_reader] {
+                reply.clear();
+                reader.read_line(&mut reply).unwrap();
+                let screen: serde_json::Value =
+                    serde_json::from_str(reply.strip_prefix("screen ").expect("snapshot reply"))
+                        .unwrap();
+                assert_eq!(screen["cols"], 5);
+                assert!(screen["text"].as_str().unwrap().starts_with('x'));
+            }
+            assert!(app.remote.as_ref().unwrap().pending_screens.is_empty());
+        }
+    }
 }

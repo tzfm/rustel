@@ -430,3 +430,262 @@ impl App {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod replay_edit {
+        //! Tests for replay edit.
+
+        use crate::app::replay_edit::*;
+        use rustel_runtime::session_log::{SessionRecorder, SessionScript};
+
+        fn replay_app(directory: &std::path::Path) -> (App, SceneId) {
+            let mut app = crate::app::tests::support::app_over(directory);
+            let path = directory.join("blocks.rustel-session");
+            let mut recorder =
+                SessionRecorder::create(path.clone(), SessionMode::Normal, None).unwrap();
+            for (at, source) in [(0.0, "s(\"bd\")"), (2.0, "s(\"sd\")"), (5.0, "s(\"hh\")")] {
+                recorder.record_save(at, SaveStatus::Installed, source, None);
+            }
+            recorder.record_save_via(9.0, SaveStatus::Installed, "silence", None, Some("stop"));
+            drop(recorder);
+            app.frame = Rect::new(0, 0, 140, 40);
+            app.open_replay_tab(&path);
+            app.focus_timeline();
+            let id = app.scenes.current().id;
+            (app, id)
+        }
+
+        fn press(app: &mut App, code: KeyCode) {
+            app.handle_terminal_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+                .unwrap();
+        }
+
+        #[test]
+        fn exact_duration_seconds_and_cycles_persist_without_rounding_other_blocks() {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, id) = replay_app(directory.path());
+            let source = app.editor().source();
+            press(&mut app, KeyCode::Char('t'));
+            assert!(app.replay_edit.is_some());
+            app.handle_terminal_event(Event::Paste("0.03125".into()))
+                .unwrap();
+            press(&mut app, KeyCode::Enter);
+            assert!(app.replay_edit.is_none());
+            let tab = ReplayTab::open(&app.replays[&id].path).unwrap();
+            assert_eq!(tab.duration_of(0), Some(0.03125));
+            assert_eq!(tab.duration_of(1), Some(3.0));
+            assert_eq!(tab.duration_of(2), Some(4.0));
+            assert_eq!(app.editor().source(), source);
+            app.handle_terminal_event(Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            )))
+            .unwrap();
+            assert_eq!(
+                app.editor().source(),
+                source,
+                "held confirmation cannot type a newline"
+            );
+            app.options.session.cps = 2.0;
+            app.load_replay_block(id, 2);
+            app.focus_timeline();
+            press(&mut app, KeyCode::Char('t'));
+            press(&mut app, KeyCode::Tab);
+            assert!(
+                app.replay_edit
+                    .as_ref()
+                    .unwrap()
+                    .duration
+                    .as_ref()
+                    .unwrap()
+                    .cycles
+            );
+            app.handle_terminal_event(Event::Paste("6".into())).unwrap();
+            press(&mut app, KeyCode::Enter);
+            let tab = ReplayTab::open(&app.replays[&id].path).unwrap();
+            assert_eq!(tab.duration_of(2), Some(3.0));
+        }
+
+        #[test]
+        fn delete_confirmation_owns_paste_and_can_remove_the_last_remaining_block() {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, id) = replay_app(directory.path());
+            app.load_replay_block(id, 1);
+            app.focus_timeline();
+            let source = app.editor().source();
+            press(&mut app, KeyCode::Delete);
+            assert!(
+                app.accepts_raw_paste(),
+                "legacy pasted Enter is collected before confirmation"
+            );
+            app.handle_terminal_event(Event::Paste("delete\nEnter\n".into()))
+                .unwrap();
+            assert_eq!(app.replays[&id].events.len(), 3);
+            assert!(app.replay_edit.is_some());
+            assert_eq!(app.editor().source(), source);
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.replays[&id].events.len(), 3);
+            for remaining in [2, 1, 0] {
+                app.focus_timeline();
+                press(&mut app, KeyCode::Delete);
+                press(&mut app, KeyCode::Enter);
+                assert!(app.replay_edit.is_none());
+                assert_eq!(app.replays[&id].events.len(), remaining);
+            }
+            assert!(app.editor().source().is_empty());
+            assert!(
+                ReplayTab::open(&app.replays[&id].path)
+                    .unwrap()
+                    .events
+                    .is_empty()
+            );
+            assert!(
+                SessionScript::load(&app.replays[&id].path).is_err(),
+                "CLI replay still needs a block"
+            );
+        }
+
+        #[test]
+        fn duration_prompt_rejects_invalid_paste_and_never_evaluates_enter() {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, id) = replay_app(directory.path());
+            press(&mut app, KeyCode::Char('t'));
+            assert!(app.accepts_raw_paste());
+            app.handle_terminal_event(Event::Paste("9\nthrow Error()".into()))
+                .unwrap();
+            assert_eq!(
+                app.replay_edit
+                    .as_ref()
+                    .unwrap()
+                    .duration
+                    .as_ref()
+                    .unwrap()
+                    .text,
+                "2"
+            );
+            app.handle_terminal_event(Event::Paste("-3".into()))
+                .unwrap();
+            press(&mut app, KeyCode::Enter);
+            assert!(app.replay_edit.as_ref().unwrap().error.is_some());
+            assert_eq!(app.replays[&id].duration_of(0), Some(2.0));
+            assert!(app.pending_evaluation.is_none() && app.inflight.is_empty());
+            assert!(app.replays[&id].run.is_none());
+        }
+
+        #[test]
+        fn failed_block_write_keeps_the_original_model_and_error_paths_private() {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, id) = replay_app(directory.path());
+            let blocked = directory.path().join("private-parent-file");
+            std::fs::write(&blocked, "not a directory").unwrap();
+            app.replays.get_mut(&id).unwrap().path = blocked.join("tape.rustel-session");
+            press(&mut app, KeyCode::Delete);
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.replays[&id].events.len(), 3);
+            let error = app.replay_edit.as_ref().unwrap().error.as_ref().unwrap();
+            assert!(!error.contains(&directory.path().display().to_string()));
+            assert!(
+                app.log
+                    .lines()
+                    .iter()
+                    .any(|line| line.text.contains("private-parent-file"))
+            );
+        }
+
+        #[test]
+        fn block_edit_stops_its_replay_run_and_only_the_audio_that_replay_owns() {
+            for audible in [true, false] {
+                let directory = tempfile::tempdir().unwrap();
+                let (mut app, id) = replay_app(directory.path());
+                let other = app.replay_view.as_ref().unwrap().current;
+                app.audible_scene = Some(if audible { id } else { other });
+                app.installed_revision = Some("sounding".into());
+                app.stop_requested = false;
+                app.replays.get_mut(&id).unwrap().start(0, Instant::now());
+                press(&mut app, KeyCode::Delete);
+                press(&mut app, KeyCode::Enter);
+                assert!(app.replays[&id].run.is_none());
+                assert_eq!(app.stop_requested, audible);
+                assert_eq!(app.installed_revision.is_none(), audible);
+            }
+        }
+
+        #[test]
+        fn live_and_debug_tapes_refuse_block_editing() {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, id) = replay_app(directory.path());
+            let original = app.replays[&id].path.clone();
+            app.replays.get_mut(&id).unwrap().keeps = "all-saves-and-diagnostics".into();
+            press(&mut app, KeyCode::Delete);
+            assert!(app.replay_edit.is_none());
+            // A refusal, in the footer's error colour, not a remark in the status
+            // line's: pressing Delete again has to look different from pressing it
+            // the first time.
+            let refusal = app.errors.visible().expect("a refusal is an error");
+            assert!(refusal.contains("debug"), "{refusal}");
+            app.replays.get_mut(&id).unwrap().keeps = "installed-saves".into();
+            let live = directory.path().join("live.rustel-session");
+            app.recorder =
+                Some(SessionRecorder::create(live.clone(), SessionMode::Normal, None).unwrap());
+            app.replays.get_mut(&id).unwrap().path = live;
+            press(&mut app, KeyCode::Char('t'));
+            assert!(app.replay_edit.is_none());
+            let refusal = app.errors.visible().expect("a refusal is an error");
+            assert!(refusal.contains("still recording"), "{refusal}");
+            assert_eq!(ReplayTab::open(&original).unwrap().events.len(), 3);
+        }
+
+        #[test]
+        fn final_duration_expiry_stops_only_its_audible_replay() {
+            for audible in [true, false] {
+                let directory = tempfile::tempdir().unwrap();
+                let (mut app, id) = replay_app(directory.path());
+                let other = app.replay_view.as_ref().unwrap().current;
+                app.audible_scene = Some(if audible { id } else { other });
+                app.installed_revision = Some("sounding".into());
+                app.stop_requested = false;
+                let tab = app.replays.get_mut(&id).unwrap();
+                tab.set_duration_exact(2, 0.01).unwrap();
+                tab.start(2, Instant::now() - Duration::from_secs(1));
+                app.tick_replays();
+                assert!(app.replays[&id].run.is_none());
+                assert_eq!(app.stop_requested, audible);
+                assert_eq!(app.installed_revision.is_none(), audible);
+                assert!(app.pending_evaluation.is_none() && app.inflight.is_empty());
+            }
+        }
+
+        #[test]
+        fn duration_field_shows_selection_and_keeps_the_editing_cursor_visible() {
+            use ratatui::{Terminal, backend::TestBackend};
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, _) = replay_app(directory.path());
+            app.open_replay_edit(true);
+            let mut state = app.replay_edit.take().unwrap();
+            let text = "123456789012345678901234567890123456789012345678901234567890";
+            let entry = state.duration.as_mut().unwrap();
+            entry.text = text.into();
+            entry.cursor = 48;
+            let mut terminal = Terminal::new(TestBackend::new(28, 9)).unwrap();
+            terminal
+                .draw(|frame| state.render(frame, &app.theme, true))
+                .unwrap();
+            let area = geometry(Rect::new(0, 0, 28, 9));
+            let width = area.width - 4;
+            let buffer = terminal.backend().buffer();
+            let cell = buffer.cell((area.x + 2, area.y + 2)).unwrap();
+            assert_eq!(cell.bg, app.theme.selection);
+            assert_eq!(cell.fg, app.theme.selection_text);
+            let visible = (area.x + 2..area.x + 2 + width)
+                .map(|x| buffer.cell((x, area.y + 2)).unwrap().symbol())
+                .collect::<String>();
+            let start = 48 - (usize::from(width) - 1);
+            assert_eq!(visible, text[start..start + usize::from(width)]);
+            let cursor = terminal.backend().cursor_position();
+            assert_eq!(cursor.x, area.x + 2 + width - 1);
+            assert_eq!(cursor.y, area.y + 2);
+        }
+    }
+}

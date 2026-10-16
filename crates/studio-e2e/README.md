@@ -61,9 +61,8 @@ can fail a test.
 
 ## Coverage
 
-`coverage.md` maps every studio surface to the test that covers it, with a
-*not yet covered* list a PR is expected to shrink, never grow. If your PR
-adds a studio surface, add a row; if it leaves one uncovered, say so there.
+`coverage.md` lists the tested studio surfaces and known gaps. Update it when
+adding or removing a suite. Record gaps so later changes can address them.
 
 ## Goldens
 
