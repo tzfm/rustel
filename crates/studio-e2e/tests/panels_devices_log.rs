@@ -253,6 +253,38 @@ fn a_warning_badges_and_the_log_clears_it() {
     );
 }
 
+/// A warning nothing can resolve - no condition the studio will report
+/// cleared - badges as news and then leaves the header on its own, without
+/// the log ever being opened. The line stays in the log as history.
+#[test]
+fn an_unresolved_warning_leaves_the_badge_on_its_own() {
+    let mut studio = hermetic();
+    let note = studio.set_directory().join("note.txt");
+    std::fs::write(&note, "not a sound").expect("note");
+
+    studio.paste(&note.display().to_string());
+    studio.settle();
+    assert!(
+        studio.rows().iter().any(|row| row.contains("⚠")),
+        "the refusal badges: nobody has looked yet:\n{}",
+        studio.rows().join("\n")
+    );
+
+    // Nobody opens the log. The keyless warning's stay passes and the
+    // badge lets it go.
+    studio.pump_until(
+        std::time::Duration::from_secs(15),
+        "the badge left the header on its own",
+        |studio| !studio.rows().iter().any(|row| row.contains("⚠")),
+    );
+
+    // What left the header is still in the log.
+    studio.chord("ctrl+shift+d");
+    assert_eq!(studio.focus(), Some(PanelKind::Log));
+    row_containing(&studio.rows(), "not audio, a folder of audio, or a score");
+    let _ = std::fs::remove_file(note);
+}
+
 /// The log walks: Up goes back into older lines, End returns to following
 /// the newest - the way a musician finds the line that explains things.
 #[test]

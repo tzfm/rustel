@@ -12,6 +12,7 @@
 - Rustel joins a Link session that is already running and takes its tempo. Before, the running session took the rustel tempo: an app playing at 128 BPM jumped to 90 BPM when `rustel play --link` started at 90 BPM.
 - Stop stops the set when auto evaluate is on. An edit that applied in the 100 ms after the press started the set again.
 - `rustel vst | head -1` and other pipes into a reader that stops early end quietly with exit code 0. Rustel printed a panic when the reader closed the pipe.
+- The header's warning count lets go of a warning that nothing resolves. A warning with a condition the studio can re-evaluate, such as a refused score or a failed import, leaves the count when its condition clears. A keyless warning, such as a voice refused once per score text, kept the count up until the log was opened. It now counts as news for ten seconds from its last word and then leaves the count on its own, and the line stays in the log. Opening the log still takes the whole count down at once.
 
 ## v0.1.3
 
