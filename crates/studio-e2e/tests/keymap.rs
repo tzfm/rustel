@@ -1,5 +1,4 @@
-//! Check documented shortcuts and platform labels under both keyboard
-//! capability sets. Assert each action's effect and read docs/studio.md directly.
+//! Check shortcut behavior and platform labels under both keyboard capability sets.
 
 // The engine's `silent` output refuses to open unless this process's
 // allocator is the audio-callback tripwire - the callback must be provably
@@ -12,14 +11,10 @@ static AUDIO_CALLBACK_ALLOCATOR: rustel_audio::tripwire::TripwireAlloc =
 use crossterm::event::{KeyCode, KeyModifiers};
 use rustel_studio::editor::KeyboardCapabilities;
 use rustel_studio_e2e::hermetic_with;
-use std::path::PathBuf;
 
 /// A documented chord and what the app should visibly do about it.
 struct Documented {
     chord: &'static str,
-    /// The docs table row this chord is promised under. Checked for
-    /// presence so a renamed or deleted row breaks this test loudly.
-    row: &'static str,
     /// Only meaningful under the enhanced capability set: a legacy terminal
     /// cannot report these apart from other keys.
     enhanced_only: bool,
@@ -143,56 +138,48 @@ fn caret_on_a_number(studio: &mut rustel_studio_e2e::Hermetic) {
 const DOCUMENTED: &[Documented] = &[
     Documented {
         chord: "f1",
-        row: "Menu bar",
         enhanced_only: false,
         setup: None,
         check: Check::Menu,
     },
     Documented {
         chord: "ctrl+s",
-        row: "Update (write the file and play it)",
         enhanced_only: false,
         setup: None,
         check: Check::Transport(|s| s.is_playing()),
     },
     Documented {
         chord: "ctrl+enter",
-        row: "Update (write the file and play it)",
         enhanced_only: true,
         setup: None,
         check: Check::Transport(|s| s.is_playing()),
     },
     Documented {
         chord: "ctrl+.",
-        row: "Stop",
         enhanced_only: true,
         setup: Some(play_first),
         check: Check::Transport(|s| s.is_stopping() || !s.is_playing()),
     },
     Documented {
         chord: "f5",
-        row: "Update (write the file and play it)",
         enhanced_only: false,
         setup: None,
         check: Check::Transport(|s| s.is_playing()),
     },
     Documented {
         chord: "ctrl+g",
-        row: "Stop",
         enhanced_only: false,
         setup: Some(play_first),
         check: Check::Transport(|s| s.is_stopping() || !s.is_playing()),
     },
     Documented {
         chord: "f8",
-        row: "Stop",
         enhanced_only: false,
         setup: Some(play_first),
         check: Check::Transport(|s| s.is_stopping() || !s.is_playing()),
     },
     Documented {
         chord: "ctrl+z",
-        row: "Undo / redo",
         enhanced_only: false,
         setup: Some(type_an_edit),
         check: Check::Edit {
@@ -201,7 +188,6 @@ const DOCUMENTED: &[Documented] = &[
     },
     Documented {
         chord: "ctrl+shift+z",
-        row: "Undo / redo",
         enhanced_only: false,
         setup: Some(undo_first),
         check: Check::Edit {
@@ -210,7 +196,6 @@ const DOCUMENTED: &[Documented] = &[
     },
     Documented {
         chord: "ctrl+y",
-        row: "Undo / redo",
         enhanced_only: false,
         setup: Some(undo_first),
         check: Check::Edit {
@@ -219,7 +204,6 @@ const DOCUMENTED: &[Documented] = &[
     },
     Documented {
         chord: "ctrl+/",
-        row: "Comment / uncomment",
         enhanced_only: false,
         setup: None,
         check: Check::Edit {
@@ -228,218 +212,167 @@ const DOCUMENTED: &[Documented] = &[
     },
     Documented {
         chord: "ctrl+p",
-        row: "Devices",
         enhanced_only: false,
         setup: None,
         check: Check::Panel,
     },
     Documented {
         chord: "ctrl+shift+up",
-        row: "Master volume",
         enhanced_only: true,
         setup: None,
         check: Check::Master,
     },
     Documented {
         chord: "ctrl+shift+down",
-        row: "Master volume",
         enhanced_only: true,
         setup: None,
         check: Check::Master,
     },
     Documented {
         chord: "alt+up",
-        row: "Slider under the caret",
         enhanced_only: false,
         setup: None,
         check: Check::Slider,
     },
     Documented {
         chord: "alt+down",
-        row: "Slider under the caret",
         enhanced_only: false,
         setup: None,
         check: Check::Slider,
     },
     Documented {
         chord: "ctrl+j",
-        row: "Quick action at the caret",
         enhanced_only: false,
         setup: Some(caret_on_a_number),
         check: Check::SmartAction,
     },
     Documented {
         chord: "f11",
-        row: "Zen mode",
         enhanced_only: false,
         setup: None,
         check: Check::Frame,
     },
     Documented {
         chord: "f6",
-        row: "Previous / next scene",
         enhanced_only: false,
         setup: Some(three_scenes),
         check: Check::SceneAt(1),
     },
     Documented {
         chord: "f7",
-        row: "Previous / next scene",
         enhanced_only: false,
         setup: Some(three_scenes),
         check: Check::SceneAt(0),
     },
     Documented {
         chord: "ctrl+n",
-        row: "New scene / duplicate",
         enhanced_only: false,
         setup: None,
         check: Check::Effect(|s| s.scene_names().len() == 2),
     },
     Documented {
         chord: "ctrl+shift+n",
-        row: "New scene / duplicate",
         enhanced_only: true,
         setup: None,
         check: Check::Effect(|s| s.scene_names().len() == 2),
     },
     Documented {
         chord: "ctrl+r",
-        row: "Rename / close scene",
         enhanced_only: false,
         setup: None,
         check: Check::Strip,
     },
     Documented {
         chord: "ctrl+shift+r",
-        row: "Record a take",
         enhanced_only: true,
         setup: None,
         check: Check::Says("recording"),
     },
     Documented {
         chord: "f9",
-        row: "Log",
         enhanced_only: false,
         setup: None,
         check: Check::Panel,
     },
     Documented {
         chord: "ctrl+shift+x",
-        row: "Export",
         enhanced_only: true,
         setup: None,
         check: Check::Panel,
     },
     Documented {
         chord: "ctrl+t",
-        row: "Theme",
         enhanced_only: false,
         setup: None,
         check: Check::Panel,
     },
     Documented {
         chord: "ctrl+b",
-        row: "Settings",
         enhanced_only: false,
         setup: None,
         check: Check::Panel,
     },
     Documented {
         chord: "ctrl+shift+p",
-        row: "Settings",
         enhanced_only: true,
         setup: None,
         check: Check::Panel,
     },
     Documented {
         chord: "ctrl+l",
-        row: "Learn a pad / forget it",
         enhanced_only: false,
         setup: None,
         check: Check::SaysAny(&["learning -", "no MIDI input"]),
     },
     Documented {
         chord: "ctrl+shift+l",
-        row: "Learn a pad / forget it",
         enhanced_only: true,
         setup: None,
         check: Check::Says("has no pad"),
     },
     Documented {
         chord: "ctrl+d",
-        row: "Docs for the function at the caret",
         enhanced_only: false,
         setup: None,
         check: Check::Panel,
     },
     Documented {
         chord: "ctrl+f",
-        row: "Values for the argument at the caret; the reference",
         enhanced_only: false,
         setup: None,
         check: Check::Panel,
     },
     Documented {
         chord: "ctrl+space",
-        row: "Values for the argument at the caret; the reference",
         enhanced_only: false,
         setup: None,
         check: Check::Panel,
     },
     Documented {
         chord: "ctrl+e",
-        row: "Split / close the split",
         enhanced_only: false,
         setup: None,
         check: Check::Frame,
     },
     Documented {
         chord: "ctrl+shift+e",
-        row: "Split / close the split",
         enhanced_only: true,
         setup: None,
         check: Check::PaneHop,
     },
     Documented {
         chord: "ctrl+[",
-        row: "Previous / next scene",
         enhanced_only: true,
         setup: Some(three_scenes),
         check: Check::SceneAt(1),
     },
     Documented {
         chord: "ctrl+]",
-        row: "Previous / next scene",
         enhanced_only: true,
         setup: Some(three_scenes),
         check: Check::SceneAt(0),
     },
 ];
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-}
-
-/// The docs table exists and is the one this test reads - if the file
-/// moves or the table is renamed, this test says so rather than silently
-/// passing over an empty parse. Every chord this file asserts is still
-/// promised under its row; a row removed from the docs must remove its
-/// entry here in the same PR.
-#[test]
-fn the_documented_shortcut_table_is_present() {
-    let docs = std::fs::read_to_string(repo_root().join("docs").join("studio.md"))
-        .expect("docs/studio.md is readable");
-    for Documented { chord, row, .. } in DOCUMENTED {
-        assert!(
-            docs.contains(row),
-            "the docs row {row:?} (promising `{chord}`) is gone or renamed; \
-             update the table and this list together"
-        );
-    }
-}
 
 /// Every documented chord does what the docs promise, under the capability
 /// sets that can deliver it. Each chord gets a fresh studio: several of
@@ -452,7 +385,6 @@ fn every_documented_chord_is_honoured() {
         enhanced_only,
         setup,
         check,
-        ..
     } in DOCUMENTED
     {
         for capabilities in capability_sets(*enhanced_only) {

@@ -242,3 +242,141 @@ impl App {
         self.dirty_frame = true;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod export_sheet {
+        //! Tests for `app/export_sheet.rs`.
+
+        use crate::app::tests::support::*;
+        use crate::app::*;
+
+        #[test]
+        fn a_click_on_the_export_sheet_chooses_what_it_lands_on() {
+            use crate::export::{ExportSheetView, Field, Length};
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            app.toggle_export_sheet();
+            let sheet = app.export_sheet.as_ref().expect("the sheet opens");
+            let layout = ExportSheetView::layout(sheet, app.frame).expect("room");
+            let click = |app: &mut App, column: u16, row: u16| {
+                for kind in [
+                    MouseEventKind::Down(MouseButton::Left),
+                    MouseEventKind::Up(MouseButton::Left),
+                ] {
+                    app.handle_mouse(MouseEvent {
+                        kind,
+                        column,
+                        row,
+                        modifiers: KeyModifiers::NONE,
+                    })
+                    .expect("mouse");
+                }
+            };
+            click(&mut app, layout.until_silence.x, layout.until_silence.y);
+            let sheet = app.export_sheet.as_ref().expect("still open");
+            assert!(matches!(sheet.settings.length, Length::UntilSilence { .. }));
+            assert_eq!(sheet.field, Field::Length);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Export));
+
+            let layout = ExportSheetView::layout(sheet, app.frame).expect("room");
+            // A build without the encoder draws no mp3 radio to click.
+            if rustel_runtime::MP3_EXPORT {
+                click(&mut app, layout.mp3.x, layout.mp3.y);
+                let sheet = app.export_sheet.as_ref().expect("still open");
+                assert!(sheet.settings.mp3);
+            }
+            click(&mut app, layout.limiter_on.x, layout.limiter_on.y);
+            let sheet = app.export_sheet.as_ref().expect("still open");
+            assert!(sheet.settings.limiter_enabled);
+            assert_eq!(sheet.field, Field::Limiter);
+            click(&mut app, layout.limiter_off.x, layout.limiter_off.y);
+            assert!(!app.export_sheet.as_ref().unwrap().settings.limiter_enabled);
+            click(&mut app, layout.target.x + 2, layout.target.y);
+            assert_eq!(
+                app.export_sheet.as_ref().expect("open").field,
+                Field::Target
+            );
+            // The border claims the sheet without changing anything.
+            click(&mut app, layout.panel.x, layout.panel.y);
+            assert_eq!(
+                app.export_sheet.as_ref().expect("open").field,
+                Field::Target
+            );
+        }
+
+        #[test]
+        fn each_export_opens_with_the_current_mixer_limiter() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let settings = rustel_audio::LimiterSettings {
+                threshold_db: -9.0,
+                character: rustel_audio::LimiterCharacter::Punchy,
+            };
+            app.ui_settings.master_limiter_on = true;
+            app.ui_settings.master_limiter_makeup = true;
+            for state in [
+                SetLimiter::Defer,
+                SetLimiter::Says {
+                    bypassed: false,
+                    settings,
+                },
+                SetLimiter::Says {
+                    bypassed: true,
+                    settings,
+                },
+                SetLimiter::None,
+            ] {
+                app.scenes.set_limiter(state.clone());
+                let expected = rustel_audio::RenderLimiter {
+                    settings: app.desk_limiter(),
+                    makeup: true,
+                };
+                let enabled = app.live_master_limiter().is_some();
+                app.toggle_export_sheet();
+                let sheet = app.export_sheet.as_mut().expect("open");
+                assert_eq!(sheet.settings.limiter_enabled, enabled, "{state:?}");
+                assert_eq!(sheet.settings.limiter, expected);
+                sheet.settings.limiter_enabled = !enabled;
+                app.export_settings = sheet.settings;
+                app.toggle_export_sheet();
+                assert_eq!(
+                    app.scenes.limiter(),
+                    &state,
+                    "export does not edit the mixer"
+                );
+                app.toggle_export_sheet();
+                assert_eq!(
+                    app.export_sheet.as_ref().unwrap().settings.limiter_enabled,
+                    enabled,
+                    "reopening follows the mixer, not the last bounce"
+                );
+                app.toggle_export_sheet();
+            }
+        }
+
+        #[test]
+        fn the_export_folder_is_remembered_for_the_next_sheet() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            let bounces = directory.path().join("bounces");
+            std::fs::create_dir_all(&bounces).expect("folder");
+            app.remember_export_directory(&bounces.join("take.wav"));
+            assert_eq!(
+                app.prefs.export_directory.as_deref(),
+                Some(bounces.to_string_lossy().as_ref())
+            );
+            app.toggle_export_sheet();
+            let target = app.export_sheet.as_ref().expect("open").target.clone();
+            assert!(target.starts_with(&bounces), "{}", target.display());
+            // A relative target teaches nothing.
+            app.remember_export_directory(std::path::Path::new("exports/take.wav"));
+            assert_eq!(
+                app.prefs.export_directory.as_deref(),
+                Some(bounces.to_string_lossy().as_ref())
+            );
+        }
+    }
+}

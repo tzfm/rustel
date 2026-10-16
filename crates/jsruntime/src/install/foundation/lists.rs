@@ -3,6 +3,7 @@ use rquickjs::{
     function::{Rest, This},
     object::Property,
 };
+use rustel_core::combinators::StackMode;
 
 pub(super) const CANONICAL_POLYMETER_PACE: &str = "canonicalPolymeterPace";
 pub(super) const CANONICAL_ZOOM: &str = "canonicalZoom";
@@ -19,6 +20,7 @@ enum CatKind {
 #[derive(Clone, Copy)]
 enum ListMethod {
     Stack,
+    StackWith(StackMode),
     Sequence,
     Seq,
     Cat,
@@ -117,6 +119,34 @@ fn stack<'js>(
     let normalized = normalize_cat(&ctx, args.0, 0, &list_budget(&ctx)?)?;
     let (patterns, sidecars) = wrapper_values(&ctx, &normalized)?;
     derive_wrapper(ctx, rustel_core::stack(patterns), &sidecars).map(rquickjs::Class::into_value)
+}
+
+fn stack_with<'js>(
+    mode: StackMode,
+    ctx: Ctx<'js>,
+    args: Rest<rquickjs::Value<'js>>,
+) -> rquickjs::Result<rquickjs::Value<'js>> {
+    let normalized = normalize_cat(&ctx, args.0, 0, &list_budget(&ctx)?)?;
+    if normalized.len() == 1 {
+        return Ok(normalized.into_iter().next().expect("one stack value"));
+    }
+    let (mut patterns, sidecars) = wrapper_values(&ctx, &normalized)?;
+    for (pattern, value) in patterns.iter_mut().zip(normalized) {
+        let wrapper = rquickjs::Class::<NativePatternWrapper>::from_value(&value)?;
+        *pattern = pattern_with_own_steps(&ctx, &wrapper)?;
+        if pattern.steps.is_none() {
+            return Err(throw_type_error(
+                &ctx,
+                "aligned stacks require a step count for each pattern",
+            ));
+        }
+    }
+    derive_wrapper(
+        ctx,
+        rustel_core::combinators::stack_with(&patterns, mode),
+        &sidecars,
+    )
+    .map(rquickjs::Class::into_value)
 }
 
 fn cat<'js>(
@@ -262,6 +292,7 @@ fn list_method<'js>(
     values.extend(args.0);
     match kind {
         ListMethod::Stack => stack(ctx, Rest(values)),
+        ListMethod::StackWith(mode) => stack_with(mode, ctx, Rest(values)),
         ListMethod::Sequence | ListMethod::Seq | ListMethod::FastCat => {
             cat(CatKind::Fast, ctx, Rest(values))
         }
@@ -351,6 +382,28 @@ pub(super) fn install<'js>(
     for alias in ["polyrhythm", "pr"] {
         globals
             .set(alias, stack_fn.clone())
+            .map_err(|error| error.to_string())?;
+    }
+
+    for (name, mode) in [
+        ("stackLeft", StackMode::Left),
+        ("stackRight", StackMode::Right),
+        ("stackCenter", StackMode::Center),
+        ("stackCentre", StackMode::Center),
+        ("stackRepeat", StackMode::Repeat),
+    ] {
+        let function = ordinary(
+            ctx,
+            name,
+            0,
+            Function::new(ctx.clone(), move |ctx, args| stack_with(mode, ctx, args))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        globals
+            .set(name, function)
+            .map_err(|error| error.to_string())?;
+        define_list_method(proto, name, ListMethod::StackWith(mode))
             .map_err(|error| error.to_string())?;
     }
 

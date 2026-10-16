@@ -3,6 +3,10 @@
 ## Unreleased
 
 - A VST3 bundle with several plugins keeps the plugins that start when one of them does not. The whole bundle failed, and all of its plugins stayed off until a rescan.
+- Split large source files by concern and consolidate repeated tests. Studio tests now check the callback allocator at runtime.
+- Euclidean rhythms accept negative steps and more pulses than steps. Negative steps switch between regular and legato notes. Extra pulses extend the rhythm across cycles. Legato rotation shifts the rhythm without shifting the source notes.
+- `stackLeft`, `stackRight`, `stackCenter` and `stackRepeat` combine patterns with different step counts. `degradeByWith` uses a signal to choose which events to keep. `open` and `close` provide fades over one cycle.
+- Custom `xen` scales accept ratio strings and patterns. `randL` uses the score's random seed. `getFreq` and `getFrequency` both accept notes and events.
 
 ## v0.1.3
 

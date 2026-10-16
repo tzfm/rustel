@@ -1065,3 +1065,73 @@ pub(super) fn parse_chord(chord: &str) -> (KeyCode, KeyModifiers) {
     }
     (code, modifiers)
 }
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "harness")]
+    mod harness {
+        //! Tests for harness.
+
+        use crate::app::harness::*;
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        #[test]
+        fn chords_parse_modifiers_and_keys() {
+            let (code, modifiers) = parse_chord("ctrl+shift+x");
+            assert_eq!(code, KeyCode::Char('x'));
+            assert!(modifiers.contains(KeyModifiers::CONTROL));
+            assert!(modifiers.contains(KeyModifiers::SHIFT));
+
+            let (code, modifiers) = parse_chord("ctrl+s");
+            assert_eq!(code, KeyCode::Char('s'));
+            assert_eq!(modifiers, KeyModifiers::CONTROL);
+
+            let (code, modifiers) = parse_chord("F5");
+            assert_eq!(code, KeyCode::F(5));
+            assert_eq!(modifiers, KeyModifiers::NONE);
+
+            let (code, modifiers) = parse_chord("enter");
+            assert_eq!(code, KeyCode::Enter);
+            assert_eq!(modifiers, KeyModifiers::NONE);
+
+            // A plus as the key itself - the docs' preview-volume chord.
+            let (code, modifiers) = parse_chord("alt++");
+            assert_eq!(code, KeyCode::Char('+'));
+            assert_eq!(modifiers, KeyModifiers::ALT);
+
+            let (code, modifiers) = parse_chord("alt+-");
+            assert_eq!(code, KeyCode::Char('-'));
+            assert_eq!(modifiers, KeyModifiers::ALT);
+        }
+
+        /// The two chords a terminal reports differently from how they read. Both
+        /// used to produce an event the product can never receive, so a test built
+        /// on either would have driven nothing and still passed.
+        #[test]
+        fn shift_tab_is_backtab_and_meta_is_not_super() {
+            let (code, modifiers) = parse_chord("shift+tab");
+            assert_eq!(code, KeyCode::BackTab);
+            assert_eq!(modifiers, KeyModifiers::NONE);
+            assert_eq!(parse_chord("backtab").0, KeyCode::BackTab);
+
+            // A plain Tab is still a Tab, and shift on a letter is still shift.
+            assert_eq!(parse_chord("tab").0, KeyCode::Tab);
+            let (code, modifiers) = parse_chord("ctrl+shift+t");
+            assert_eq!(code, KeyCode::Char('t'));
+            assert!(modifiers.contains(KeyModifiers::SHIFT));
+
+            let (_, meta) = parse_chord("meta+x");
+            assert!(meta.contains(KeyModifiers::META));
+            assert!(!meta.contains(KeyModifiers::SUPER));
+            let (_, command) = parse_chord("cmd+x");
+            assert!(command.contains(KeyModifiers::SUPER));
+            assert!(!command.contains(KeyModifiers::META));
+        }
+
+        #[test]
+        #[should_panic(expected = "unknown key")]
+        fn a_made_up_key_is_a_panic_not_a_silent_nothing() {
+            let _ = parse_chord("ctrl+makebelieve");
+        }
+    }
+}

@@ -481,3 +481,529 @@ impl App {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod pointer_shape {
+        //! Tests for `app/pointer_shape.rs`.
+
+        use crate::app::pointer_shape::*;
+        use crate::app::tests::support::*;
+        use crossterm::event::ModifierKeyCode;
+
+        // Affected Ghostty releases keep the OSC 22 request separately from the
+        // visible modifier override. Identical requests are ignored by setMouseShape.
+        struct GhosttyPointer {
+            requested: String,
+            visible: String,
+        }
+
+        impl GhosttyPointer {
+            fn text() -> Self {
+                Self {
+                    requested: SHAPE_TEXT.into(),
+                    visible: SHAPE_TEXT.into(),
+                }
+            }
+
+            fn receive(&mut self, bytes: &[u8]) {
+                let output = std::str::from_utf8(bytes).unwrap();
+                for command in output.split("\x1b\\").filter(|command| !command.is_empty()) {
+                    let shape = command.strip_prefix("\x1b]22;").expect("OSC 22");
+                    if self.requested != shape {
+                        self.requested = shape.into();
+                        self.visible = shape.into();
+                    }
+                }
+            }
+        }
+
+        fn app_at(directory: &std::path::Path, terminal: &str) -> (App, (u16, u16)) {
+            let mut app = app_over(directory);
+            app.features.name = terminal.into();
+            app.scenes.current_mut().editor = Editor::new("s(\"sine\")").unwrap();
+            app.frame = Rect::new(0, 0, 100, 30);
+            app.regions = view::regions(app.frame, false, 1, false, false, None, None);
+            let editor = app.regions.panes[0].editor;
+            let gutter = view::gutter_width(app.editor(), true);
+            let point = (editor.x + gutter + 2, editor.y);
+            let mut output = Vec::new();
+            app.write_pointer_shape(point.0, point.1, &mut output)
+                .unwrap();
+            let expected = format!("\x1b]22;{}\x1b\\", pointer_shape_name(terminal, SHAPE_TEXT));
+            assert_eq!(output, expected.as_bytes());
+            app.dirty_frame = false;
+            (app, point)
+        }
+
+        fn modifier(app: &mut App, code: ModifierKeyCode, kind: KeyEventKind) {
+            let modifiers = match code {
+                ModifierKeyCode::LeftShift | ModifierKeyCode::RightShift => KeyModifiers::SHIFT,
+                ModifierKeyCode::LeftControl | ModifierKeyCode::RightControl => {
+                    KeyModifiers::CONTROL
+                }
+                ModifierKeyCode::LeftAlt | ModifierKeyCode::RightAlt => KeyModifiers::ALT,
+                ModifierKeyCode::LeftSuper | ModifierKeyCode::RightSuper => KeyModifiers::SUPER,
+                _ => KeyModifiers::NONE,
+            };
+            app.handle_terminal_event(Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Modifier(code),
+                modifiers,
+                kind,
+            )))
+            .unwrap();
+        }
+
+        #[test]
+        fn ghostty_shift_release_restores_the_ibeam_without_mouse_motion() {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, point) = app_at(directory.path(), "Ghostty 1.2.3");
+            let before = app.editor().primary_selection();
+            let mut terminal = GhosttyPointer::text();
+            for _ in 0..3 {
+                modifier(&mut app, ModifierKeyCode::LeftShift, KeyEventKind::Press);
+                assert!(
+                    !app.pointer_shape_reset,
+                    "retain native selection while Shift is held"
+                );
+                terminal.visible = SHAPE_DEFAULT.into(); // Ghostty's release override.
+                terminal.receive(b"\x1b]22;text\x1b\\");
+                assert_eq!(
+                    terminal.visible, SHAPE_DEFAULT,
+                    "same-shape requests cannot repair it"
+                );
+                modifier(&mut app, ModifierKeyCode::LeftShift, KeyEventKind::Release);
+                assert!(
+                    app.dirty_frame,
+                    "a still pointer needs a frame after modifier release"
+                );
+                let mut output = Vec::new();
+                app.write_pointer_shape(point.0, point.1, &mut output)
+                    .unwrap();
+                assert_eq!(output, b"\x1b]22;default\x1b\\\x1b]22;text\x1b\\");
+                terminal.receive(&output);
+                assert_eq!(terminal.visible, SHAPE_TEXT);
+                assert_eq!(app.editor().primary_selection(), before);
+                assert_eq!(app.editor().source(), "s(\"sine\")");
+                assert_eq!(app.pointer_at, Some(point));
+                assert!(!app.pointer_shape_reset);
+                output.clear();
+                app.write_pointer_shape(point.0, point.1, &mut output)
+                    .unwrap();
+                assert!(
+                    output.is_empty(),
+                    "ordinary frames still deduplicate OSC output"
+                );
+                app.dirty_frame = false;
+            }
+        }
+
+        #[test]
+        fn ghostty_pointer_restore_survives_modifier_release_batched_with_typing() {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, point) = app_at(directory.path(), "Ghostty");
+            assert!(app.accepts_raw_paste());
+            let release = Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Modifier(ModifierKeyCode::LeftShift),
+                KeyModifiers::SHIFT,
+                KeyEventKind::Release,
+            ));
+            let queued = std::cell::RefCell::new(std::collections::VecDeque::from([
+                Event::Key(KeyEvent::new_with_kind(
+                    KeyCode::Char('A'),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Release,
+                )),
+                release.clone(),
+            ]));
+            let events = read_raw_paste_batch(
+                Event::Key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE)),
+                |_| Ok(!queued.borrow().is_empty()),
+                || Ok(queued.borrow_mut().pop_front().unwrap()),
+            )
+            .unwrap();
+            assert_eq!(events.len(), 2, "ordinary key-up stays inert");
+            assert_eq!(events.last(), Some(&release));
+            for event in events {
+                app.handle_terminal_event(event).unwrap();
+            }
+            assert!(app.editor().source().contains('A'));
+            assert!(app.pointer_shape_reset);
+            let mut output = Vec::new();
+            app.write_pointer_shape(point.0, point.1, &mut output)
+                .unwrap();
+            let mut terminal = GhosttyPointer::text();
+            terminal.visible = SHAPE_DEFAULT.into();
+            terminal.receive(&output);
+            assert_eq!(terminal.visible, SHAPE_TEXT);
+        }
+
+        #[test]
+        fn ghostty_modifier_release_preserves_captured_drag_shapes() {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, point) = app_at(directory.path(), "tmux via Ghostty 1.2.3");
+            app.pointer = Some(Pointer::Volume);
+            for code in [
+                ModifierKeyCode::RightShift,
+                ModifierKeyCode::LeftControl,
+                ModifierKeyCode::RightAlt,
+                ModifierKeyCode::LeftSuper,
+            ] {
+                modifier(&mut app, code, KeyEventKind::Release);
+                let mut output = Vec::new();
+                app.write_pointer_shape(point.0, point.1, &mut output)
+                    .unwrap();
+                assert_eq!(output, b"\x1b]22;default\x1b\\\x1b]22;grabbing\x1b\\");
+                assert!(matches!(app.pointer, Some(Pointer::Volume)));
+            }
+        }
+
+        #[test]
+        fn ghostty_pointer_waits_for_native_shift_selection_to_end() {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, point) = app_at(directory.path(), "Ghostty");
+            app.pointer = Some(Pointer::Volume);
+            app.write_pointer_shape(point.0, point.1, &mut Vec::new())
+                .unwrap();
+            modifier(&mut app, ModifierKeyCode::LeftShift, KeyEventKind::Press);
+            modifier(&mut app, ModifierKeyCode::RightShift, KeyEventKind::Press);
+            modifier(&mut app, ModifierKeyCode::LeftAlt, KeyEventKind::Release);
+            modifier(&mut app, ModifierKeyCode::LeftShift, KeyEventKind::Release);
+            let mut output = Vec::new();
+            app.write_pointer_shape(point.0, point.1, &mut output)
+                .unwrap();
+            assert!(output.is_empty(), "Right Shift still owns selection");
+            modifier(&mut app, ModifierKeyCode::RightShift, KeyEventKind::Release);
+            assert!(app.pointer_shape_reset);
+            // A new press can arrive in the same input batch before the next frame.
+            modifier(&mut app, ModifierKeyCode::LeftShift, KeyEventKind::Press);
+            app.write_pointer_shape(point.0, point.1, &mut output)
+                .unwrap();
+            assert!(output.is_empty(), "new Shift press defers queued recovery");
+            modifier(&mut app, ModifierKeyCode::LeftShift, KeyEventKind::Release);
+            app.write_pointer_shape(point.0, point.1, &mut output)
+                .unwrap();
+            assert_eq!(output, b"\x1b]22;default\x1b\\\x1b]22;grabbing\x1b\\");
+            // Alt-tab can lose a Shift release; focus return must not leave it held.
+            modifier(&mut app, ModifierKeyCode::LeftShift, KeyEventKind::Press);
+            app.handle_terminal_event(Event::FocusLost).unwrap();
+            app.handle_terminal_event(Event::FocusGained).unwrap();
+            output.clear();
+            app.write_pointer_shape(point.0, point.1, &mut output)
+                .unwrap();
+            assert!(!output.is_empty());
+        }
+
+        #[test]
+        fn ghostty_focus_return_repairs_default_and_text_shapes() {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, text) = app_at(directory.path(), "Ghostty");
+            let gutter = (app.regions.panes[0].editor.x, app.regions.panes[0].editor.y);
+            for (point, expected) in [
+                (gutter, "\x1b]22;text\x1b\\\x1b]22;default\x1b\\"),
+                (text, "\x1b]22;default\x1b\\\x1b]22;text\x1b\\"),
+            ] {
+                app.handle_terminal_event(Event::FocusGained).unwrap();
+                let mut output = Vec::new();
+                app.write_pointer_shape(point.0, point.1, &mut output)
+                    .unwrap();
+                assert_eq!(output, expected.as_bytes());
+            }
+        }
+
+        #[test]
+        fn pointer_refresh_is_specific_to_detected_ghostty_and_modifier_releases() {
+            let directory = tempfile::tempdir().unwrap();
+            for terminal in ["kitty", "iTerm2", "Windows Terminal", "unknown", "Ghostty"] {
+                let (mut app, point) = app_at(directory.path(), terminal);
+                modifier(&mut app, ModifierKeyCode::LeftShift, KeyEventKind::Press);
+                modifier(&mut app, ModifierKeyCode::LeftShift, KeyEventKind::Repeat);
+                let mut output = Vec::new();
+                app.write_pointer_shape(point.0, point.1, &mut output)
+                    .unwrap();
+                assert!(
+                    output.is_empty(),
+                    "{terminal}: no reset while a modifier is held"
+                );
+                modifier(&mut app, ModifierKeyCode::LeftShift, KeyEventKind::Release);
+                app.write_pointer_shape(point.0, point.1, &mut output)
+                    .unwrap();
+                assert_eq!(!output.is_empty(), terminal == "Ghostty", "{terminal}");
+            }
+        }
+
+        #[test]
+        fn ghostty_refresh_waits_for_a_known_pointer_and_survives_failed_writes() {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, point) = app_at(directory.path(), "Ghostty");
+            app.pointer_at = None;
+            app.dirty_frame = false;
+            modifier(&mut app, ModifierKeyCode::LeftShift, KeyEventKind::Release);
+            assert!(app.pointer_shape_reset);
+            assert!(!app.dirty_frame, "do not invent a mouse position");
+
+            struct FailedOutput;
+            impl std::io::Write for FailedOutput {
+                fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                    Err(std::io::Error::other("test output failed"))
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            assert!(
+                app.write_pointer_shape(point.0, point.1, &mut FailedOutput)
+                    .is_err()
+            );
+            assert!(
+                app.pointer_shape_reset,
+                "failed output still needs a restore"
+            );
+            let mut output = Vec::new();
+            app.write_pointer_shape(point.0, point.1, &mut output)
+                .unwrap();
+            assert_eq!(output, b"\x1b]22;default\x1b\\\x1b]22;text\x1b\\");
+            assert!(!app.pointer_shape_reset);
+        }
+
+        /// The mixer's score fader uses the same pointer shapes as the inline
+        /// pill: a hand over the rail, the closed hand for as long as a drag lasts.
+        #[test]
+        fn mixer_score_fader_pointer_matches_the_inline_slider() {
+            use crate::mixer_panel::{FaderDesk, MixerEdge, fader_desk, parts};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene, call) = slider_app(directory.path());
+            app.audible_scene = Some(scene);
+            let (pill_x, _, pill_y) = lay_out(&mut app, scene, call);
+            assert_eq!(
+                app.pointer_shape_at(pill_x, pill_y),
+                SHAPE_POINTER,
+                "the inline pill is a hand"
+            );
+            let editor = app.regions.panes[0].editor;
+            let gutter = view::gutter_width(&app.scenes.current().editor, true);
+            assert_eq!(
+                app.pointer_shape_at(editor.x + gutter + 2, pill_y),
+                SHAPE_TEXT,
+                "the score around the pill keeps the I-beam"
+            );
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                pill_x,
+                pill_y,
+            );
+            assert!(
+                matches!(app.pointer, Some(Pointer::Slider { .. })),
+                "the press keeps the pill: {:?}",
+                app.pointer
+            );
+            assert_eq!(app.held_pointer_shape(), Some(SHAPE_GRABBING));
+            mouse(
+                &mut app,
+                MouseEventKind::Up(MouseButton::Left),
+                pill_x,
+                pill_y,
+            );
+            assert!(app.pointer.is_none(), "the release lets the pill go");
+
+            precision_key(&mut app, KeyCode::F(4), KeyModifiers::NONE);
+            app.regions.mixer = Rect::new(0, 18, 120, 12);
+            let desk = parts(app.regions.mixer, MixerEdge::Bottom)
+                .expect("a band that tall is a desk")
+                .desk;
+            let widths = app.mixer_strip_widths();
+            let layout = fader_desk(desk, &widths, 1).expect("room for the score's one fader");
+            let cell = layout.cell(0).expect("the fader is drawn");
+            let rail = FaderDesk::rail(cell).expect("and so is its rail");
+            assert_eq!(
+                app.pointer_shape_at(rail.x, rail.y),
+                SHAPE_POINTER,
+                "the mixer's copy of the same slider is a hand too"
+            );
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                rail.x,
+                rail.y,
+            );
+            assert!(
+                matches!(app.pointer, Some(Pointer::MixerFader { .. })),
+                "the press keeps the mixer's fader: {:?}",
+                app.pointer
+            );
+            assert_eq!(
+                app.held_pointer_shape(),
+                Some(SHAPE_GRABBING),
+                "and the drag keeps the closed hand, as the pill does"
+            );
+            assert_eq!(
+                app.pointer_shape_at(editor.x + gutter + 2, pill_y),
+                SHAPE_TEXT,
+                "opening the mixer does not take the I-beam off the score"
+            );
+        }
+
+        /// iTerm2 speaks OSC 22 in X11 names and resets on anything else; the
+        /// CSS names kitty and Ghostty take would have done nothing there.
+        #[test]
+        fn iterm_gets_the_x11_pointer_names() {
+            assert_eq!(pointer_shape_name("iTerm.app 3.5.11", "pointer"), "hand2");
+            assert_eq!(pointer_shape_name("iTerm.app 3.5.11", "text"), "xterm");
+            assert_eq!(pointer_shape_name("iTerm.app 3.5.11", "default"), "arrow");
+            assert_eq!(pointer_shape_name("iTerm.app 3.5.11", "grabbing"), "fleur");
+            assert_eq!(
+                pointer_shape_name("iTerm.app 3.5.11", "ew-resize"),
+                "sb_h_double_arrow"
+            );
+            assert_eq!(pointer_shape_name("kitty", "grabbing"), "grabbing");
+            assert_eq!(pointer_shape_name("kitty", "pointer"), "pointer");
+            assert_eq!(pointer_shape_name("ghostty 1.1.0", "text"), "text");
+            assert_eq!(pointer_shape_name("Windows Terminal", "default"), "default");
+        }
+
+        /// The shape follows what is on top and what a press there would do:
+        /// the I-beam over the score but the arrow over its line numbers, the
+        /// arrow over the keyboard help and a sheet's frame, the hand over a
+        /// sheet's rows and the footer's error line, the closed hand for as
+        /// long as a drag lasts, and a fresh answer when the screen changes
+        /// under a still pointer.
+        #[test]
+        fn the_pointer_shape_says_what_a_press_would_do() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let source = (0..80)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            app.scenes.current_mut().editor = Editor::new(&source).expect("editor");
+            app.frame = Rect::new(0, 0, 100, 30);
+            // No minimap: the pane keeps a scrollbar instead.
+            app.regions = view::regions(app.frame, false, 1, false, false, None, None);
+            let editor = app.regions.panes[0].editor;
+            let gutter = view::gutter_width(&app.scenes.current().editor, true);
+            assert!(gutter > 1, "numbered, the gutter is more than the margin");
+            assert_eq!(
+                app.pointer_shape_at(editor.x, editor.y),
+                SHAPE_DEFAULT,
+                "the line numbers take no caret"
+            );
+            let text = (editor.x + gutter + 2, editor.y);
+            assert_eq!(app.pointer_shape_at(text.0, text.1), SHAPE_TEXT);
+            assert_eq!(
+                app.pointer_shape_at(app.regions.panes[0].scrollbar.x, editor.y + 2),
+                SHAPE_POINTER
+            );
+
+            // The footer's error line opens the log, so it is a hand.
+            app.set_error(ErrorOwner::Interface, "a test error".into());
+            let footer = app.regions.footer;
+            assert_eq!(app.pointer_shape_at(footer.x + 2, footer.y), SHAPE_POINTER);
+            app.clear_error(ErrorOwner::Interface);
+            assert_eq!(app.pointer_shape_at(footer.x + 2, footer.y), SHAPE_DEFAULT);
+
+            // A sheet opened from the keyboard changes the answer under a
+            // still pointer: its rows are hands, its frame the arrow.
+            press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+            let (sheet, rows) = crate::app::settings::SettingsSheetView::geometry(app.frame)
+                .expect("the sheet fits");
+            let control_y = (rows.y..rows.bottom())
+                .find(|y| {
+                    app.settings_sheet
+                        .unwrap()
+                        .row_at_for(app.frame, rows.x + 1, *y)
+                        .is_some()
+                })
+                .expect("visible control");
+            assert_eq!(app.pointer_shape_at(rows.x + 1, control_y), SHAPE_POINTER);
+            assert_eq!(app.pointer_shape_at(sheet.x, sheet.y), SHAPE_DEFAULT);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            // Over the score again - not the sheet's own row, which the strip's
+            // margin now reaches.
+            assert_eq!(app.pointer_shape_at(text.0, text.1), SHAPE_TEXT);
+
+            // The keyboard help covers everything.
+            press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            assert!(app.help.is_some(), "Help > Keyboard reference");
+            assert_eq!(app.pointer_shape_at(text.0, text.1), SHAPE_DEFAULT);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+            // A drag keeps the closed hand wherever the pointer goes.
+            let bar = app.regions.panes[0].scrollbar;
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: bar.x,
+                row: bar.y + 1,
+                modifiers: KeyModifiers::NONE,
+            })
+            .expect("press");
+            assert_eq!(app.pointer, Some(Pointer::Scrollbar));
+            app.follow_pointer_shape(text.0, text.1);
+            assert_eq!(app.pointer_shape_sent, Some(SHAPE_GRABBING));
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: text.0,
+                row: text.1,
+                modifiers: KeyModifiers::NONE,
+            })
+            .expect("release");
+            assert_eq!(
+                app.pointer_shape_sent,
+                Some(SHAPE_TEXT),
+                "let go over the text"
+            );
+        }
+
+        /// The OS pointer says what a click would do: a hand over a settings
+        /// row, an I-beam over the score, the arrow over plain chrome.
+        #[test]
+        fn the_pointer_shape_follows_what_is_under_it() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            app.regions = view::regions(app.frame, false, 1, false, true, None, None);
+            let editor = app.regions.panes[0].editor;
+            let gutter = view::gutter_width(&app.scenes.current().editor, true);
+            assert_eq!(
+                app.pointer_shape_at(editor.x + gutter + 2, editor.y + 1),
+                "text"
+            );
+            let minimap = app.regions.panes[0].minimap;
+            assert_eq!(app.pointer_shape_at(minimap.x, minimap.y + 1), "pointer");
+            let header = app.regions.header;
+            assert_eq!(
+                app.pointer_shape_at(header.x + header.width / 2, header.y),
+                "default"
+            );
+            app.settings_sheet = Some(SettingsSheet::default());
+            let settings_frame = app.settings_sheet_frame();
+            let (_area, rows) =
+                crate::settings::SettingsSheetView::geometry(settings_frame).expect("room");
+            let control_y = (rows.y..rows.bottom())
+                .find(|y| {
+                    app.settings_sheet
+                        .unwrap()
+                        .row_at_for(settings_frame, rows.x + 3, *y)
+                        .is_some()
+                })
+                .expect("visible control");
+            assert_eq!(app.pointer_shape_at(rows.x + 3, control_y), "pointer");
+            let blank_y = (rows.y..rows.bottom())
+                .find(|y| {
+                    app.settings_sheet
+                        .unwrap()
+                        .row_at_for(settings_frame, rows.x + 3, *y)
+                        .is_none()
+                })
+                .expect("a blank sheet row");
+            assert_eq!(
+                app.pointer_shape_at(rows.x + 3, blank_y),
+                "default",
+                "the sheet's blank rows are not buttons"
+            );
+        }
+    }
+}

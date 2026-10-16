@@ -94,6 +94,12 @@ the same feature at different boundaries and still provide distinct coverage.
 Test names should identify the behavior or regression; descriptive names are
 useful even when long.
 
+Combine repeated cases when they share the same setup and contract. Keep
+each input, expected result, and a useful failure message. Test observable
+results instead of source formatting, private function text, or document
+wording. Remove such checks when they enforce no supported contract. Check
+test setup at runtime when the suite depends on it.
+
 Do not add tests that merely repeat the implementation for a comment or file
 move. Verify those changes with existing tests and comparisons of moved code.
 Preserve golden expectations for retained tests; deleting a proven duplicate

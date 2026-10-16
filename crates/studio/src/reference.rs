@@ -1026,8 +1026,6 @@ mod tests {
             "isNoteWithOctave",
             "getAccidentalsOffset",
             "getPlayableNoteValue",
-            "getFreq",
-            "getFrequency",
             "getSoundIndex",
             "getEventOffsetMs",
             "getControlName",

@@ -577,3 +577,442 @@ impl App {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod menu_bar {
+        //! Tests for `app/menu_bar.rs`.
+
+        use crate::app::tests::support::*;
+        use crate::app::*;
+
+        #[test]
+        fn f1_help_preserves_the_focused_surface_and_swallows_covered_input() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.toggle_reference_browse();
+            let panel_before = app.reference_panel.clone();
+            let score_before = app.editor().source();
+
+            press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+            assert_eq!(app.help, Some(HelpState::default()));
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Reference));
+            press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+            app.handle_terminal_event(Event::Paste("hidden paste".into()))
+                .expect("paste swallowed");
+            app.handle_terminal_event(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .expect("click swallowed");
+            assert_eq!(app.editor().source(), score_before);
+            assert_eq!(app.reference_panel, panel_before);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Reference));
+
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.help.is_none());
+            assert_eq!(app.reference_panel, panel_before);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Reference));
+        }
+
+        /// A menu cannot go on holding the keyboard once its bar has no row.
+        ///
+        /// View ▸ Zen is a switch, so it does not close the menu, and zen then
+        /// takes the row away. The dropdown's rects are computed from that row,
+        /// so an unsettled menu would hit-test an invisible list lying over the
+        /// top of the editor: a click near the top would choose a View row that
+        /// was never drawn, and F11 would be swallowed rather than restoring the
+        /// stage.
+        #[test]
+        fn a_menu_does_not_outlive_the_bar_it_hangs_from() {
+            let directory = tempfile::tempdir().expect("temp dir");
+
+            // Zen from inside the menu.
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 100, 30);
+            press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('z'), KeyModifiers::NONE);
+            assert!(app.ui_settings.zen, "View ▸ Zen did not turn zen on");
+            assert!(app.menu_row().is_empty(), "zen still draws a menu row");
+            // The next event must find no menu holding the keyboard.
+            press(&mut app, KeyCode::F(11), KeyModifiers::NONE);
+            assert!(
+                !app.ui_settings.zen,
+                "F11 was swallowed by a menu with no bar"
+            );
+            // The chord a Mac terminal delivers when F11 never arrives.
+            press(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+            assert!(app.ui_settings.zen, "^K did not turn zen on");
+            assert!(app.status.starts_with("zen mode"), "{}", app.status);
+            press(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+            assert!(!app.ui_settings.zen, "^K did not restore the stage");
+
+            // And a resize below the bar's minimum height does the same.
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 100, 30);
+            press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+            assert!(app.menu.is_some());
+            app.frame = Rect::new(0, 0, 100, 4);
+            assert!(
+                app.menu_row().is_empty(),
+                "a four-row frame drew a menu row"
+            );
+            press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+            assert!(
+                app.menu.is_none(),
+                "the menu survived the bar it hangs from"
+            );
+        }
+
+        /// The menu bar, header and footer switches are the player's lasting
+        /// chrome: zen hides them for the session, and leaving zen restores
+        /// whatever they said, not the factory defaults.
+        #[test]
+        fn zen_does_not_rewrite_the_chrome_visibility_preferences() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 100, 30);
+            app.ui_settings.show_menu = false;
+            app.ui_settings.show_header = false;
+            app.ui_settings.show_footer = false;
+            assert!(app.menu_row().is_empty(), "the hidden bar still drew a row");
+
+            press(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+            assert!(app.ui_settings.zen);
+            assert!(!app.ui_settings.show_menu);
+            assert!(!app.ui_settings.show_header);
+            assert!(!app.ui_settings.show_footer);
+            press(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+            assert!(!app.ui_settings.zen);
+            assert!(!app.ui_settings.show_menu);
+            assert!(!app.ui_settings.show_header);
+            assert!(!app.ui_settings.show_footer);
+            assert!(
+                app.menu_row().is_empty(),
+                "leaving zen brought the bar back against the preference"
+            );
+
+            press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+            assert!(app.menu.is_none(), "F1 opened a bar that is hidden");
+            assert!(app.help.is_some(), "F1 did not go on meaning help");
+        }
+
+        /// The chrome switches lead the Options menu, ticked while their rows are
+        /// drawn; each one flips and remembers its own preference.
+        #[test]
+        fn options_menu_toggles_remember_the_chrome() {
+            use crate::menu::{MenuAction, MenuItemKind};
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 100, 30);
+            let options = |app: &App| {
+                app.menus()
+                    .into_iter()
+                    .find(|menu| menu.title == "Options")
+                    .expect("Options")
+                    .items
+            };
+            let labels: Vec<String> = options(&app).into_iter().map(|item| item.label).collect();
+            assert_eq!(
+                labels
+                    .iter()
+                    .take(3)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["Menu bar", "Header", "Footer"],
+                "the chrome switches lead the Options menu: {labels:?}"
+            );
+            let ticked = |app: &App, id| {
+                options(app)
+                    .into_iter()
+                    .find(|item| item.id() == Some(id))
+                    .map(|item| matches!(item.kind, MenuItemKind::Toggle { on: true, .. }))
+                    .unwrap_or_else(|| panic!("{id:?} is not on the Options menu"))
+            };
+            let switches = [
+                MenuAction::ShowMenu,
+                MenuAction::ShowHeader,
+                MenuAction::ShowFooter,
+            ];
+            for id in switches {
+                assert!(ticked(&app, id), "{id:?} starts ticked");
+                app.dispatch_menu_action(id).expect("switch");
+                assert!(!ticked(&app, id), "{id:?} did not turn off");
+            }
+            assert!(app.menu_row().is_empty());
+            let remembered = app.prefs.ui_settings();
+            assert!(!remembered.show_menu && !remembered.show_header && !remembered.show_footer);
+        }
+
+        /// With the bar hidden the Settings chord is the way back to the switch,
+        /// so the status names the chord the table holds, or the preferences file
+        /// when Settings has none.
+        #[test]
+        fn hiding_the_menu_bar_names_the_settings_chord_the_table_holds() {
+            use crate::keybinds::KeyCombo;
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 100, 30);
+            app.toggle_show_menu();
+            assert!(
+                app.status.contains("^O opens settings"),
+                "the shipped chord: {}",
+                app.status
+            );
+            app.toggle_show_menu();
+            assert_eq!(app.status, "menu bar shown");
+
+            // ^O learnt for zen leaves Settings with no chord.
+            app.keybinds
+                .learn(BindAction::Zen, Some(KeyCombo::parse("ctrl+o").unwrap()));
+            assert!(app.keybinds.binding(BindAction::Settings).is_none());
+            app.toggle_show_menu();
+            assert!(!app.status.contains("^O"), "{}", app.status);
+            assert!(app.status.contains("studio.json"), "{}", app.status);
+            app.toggle_show_menu();
+
+            app.keybinds.learn(
+                BindAction::Settings,
+                Some(KeyCombo::parse("ctrl+shift+f9").unwrap()),
+            );
+            app.toggle_show_menu();
+            let chord = app.keybinds.hint(BindAction::Settings);
+            assert!(!chord.is_empty());
+            assert!(
+                app.status.contains(&format!("{chord} opens settings")),
+                "the learnt chord: {}",
+                app.status
+            );
+        }
+
+        /// F1 focuses the bar with nothing dropped, so pressing it twice is
+        /// cheap, and the bar keeps the precedence help used to hold: ahead of a
+        /// rename, behind the transport.
+        #[test]
+        fn f1_opens_the_menu_bar_and_it_outranks_everything_but_the_transport() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 100, 30);
+            app.begin_rename();
+            let rename_before = app.strip_mode.clone();
+
+            press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+            let menu = app.menu.as_ref().expect("F1 did not open the bar");
+            assert!(!menu.is_dropped(), "F1 alone should drop nothing");
+            assert!(app.help.is_none(), "F1 opened help rather than the bar");
+
+            // The mnemonics are unmodified letters, and a rename swallows every
+            // unmodified letter - so the bar has to be asked first or choosing
+            // "New scene" types "n" into the scene name.
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+            assert_eq!(
+                app.strip_mode, rename_before,
+                "the rename ate the menu's mnemonic"
+            );
+            assert!(
+                app.menu
+                    .as_ref()
+                    .is_some_and(crate::menu::MenuState::is_dropped),
+                "s did not drop the Scene menu"
+            );
+
+            // The transport is claimed before anything on screen, menu included.
+            press(&mut app, KeyCode::F(8), KeyModifiers::NONE);
+            assert!(app.menu.is_some(), "stop dismissed the menu");
+
+            press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+            assert!(app.menu.is_none(), "F1 does not close the bar again");
+            assert_eq!(app.strip_mode, rename_before);
+        }
+
+        /// Where there is no bar to open, F1 goes on meaning help: a key that
+        /// does nothing at all is worse than one that does the old thing.
+        #[test]
+        fn f1_still_opens_help_where_there_is_no_room_for_a_bar() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+
+            // Too short for the row.
+            app.frame = Rect::new(0, 0, 100, 5);
+            press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+            assert!(app.menu.is_none(), "a five-row terminal grew a menu bar");
+            assert!(app.help.is_some(), "F1 did nothing at all");
+            press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+
+            // Zen is exactly the source: no chrome, so no bar.
+            app.frame = Rect::new(0, 0, 100, 30);
+            app.ui_settings.zen = true;
+            press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+            assert!(app.menu.is_none(), "zen grew a menu bar");
+            assert!(app.help.is_some(), "F1 did nothing at all in zen");
+        }
+
+        /// With a dropdown down, a letter that is not a mnemonic must never
+        /// reach the score underneath it.
+        #[test]
+        fn an_open_menu_swallows_letters_instead_of_typing_them() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 100, 30);
+            let source = app.editor().source();
+
+            press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+            // None of these is a Scene mnemonic, so all four must be eaten.
+            for letter in ['j', 'k', 'v', 'z'] {
+                press(&mut app, KeyCode::Char(letter), KeyModifiers::NONE);
+            }
+            assert_eq!(
+                app.editor().source(),
+                source,
+                "an open menu let letters through into the score"
+            );
+        }
+
+        #[test]
+        fn help_opens_ahead_of_rename_and_transport_stays_ahead_of_help() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.begin_rename();
+            let rename_before = app.strip_mode.clone();
+
+            press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+            assert!(app.help.is_some(), "rename did not swallow F1");
+            assert_eq!(app.help_context(), HelpContext::SceneRename);
+            press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+            assert_eq!(app.strip_mode, rename_before, "help swallowed rename input");
+
+            press(&mut app, KeyCode::F(8), KeyModifiers::NONE);
+            assert!(app.help.is_some(), "the transport does not dismiss help");
+            assert_eq!(app.strip_mode, rename_before, "stop did not reach rename");
+
+            press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+            assert!(app.help.is_none(), "F1 toggles help closed");
+            assert_eq!(app.strip_mode, rename_before);
+        }
+
+        #[test]
+        fn help_scrolls_with_keys_repeats_and_the_mouse_wheel() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 80, 18);
+            // On a frame this size F1 opens the menu bar, so help comes up the
+            // way the Help menu opens it. This test is about the scrolling.
+            app.toggle_help();
+
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            let after_down = app.help.expect("help").scroll;
+            assert_eq!(after_down, 1);
+            app.handle_terminal_event(Event::Key(KeyEvent::new_with_kind(
+                KeyCode::PageDown,
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            )))
+            .expect("repeat handled");
+            let after_repeat = app.help.expect("help").scroll;
+            assert!(after_repeat > after_down);
+            app.handle_terminal_event(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .expect("wheel handled");
+            assert!(app.help.expect("help").scroll >= after_repeat);
+            press(&mut app, KeyCode::Home, KeyModifiers::NONE);
+            assert_eq!(app.help.expect("help").scroll, 0);
+            press(&mut app, KeyCode::End, KeyModifiers::NONE);
+            assert!(app.help.expect("help").scroll > 0);
+        }
+
+        #[test]
+        fn theme_editor_help_tracks_nested_prompts_without_changing_them() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let theme = app.theme.clone();
+            app.open_theme_editor(&theme, "mine".into(), false);
+            assert_eq!(app.help_context(), HelpContext::ThemeEditorForm);
+
+            app.theme_editor.as_mut().expect("editor").saving =
+                Some(crate::theme_editor::SaveSheet {
+                    name: "half-typed".into(),
+                    keep: true,
+                    note: None,
+                    closing: false,
+                });
+            assert_eq!(app.help_context(), HelpContext::ThemeEditorSave);
+            press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('z'), KeyModifiers::NONE);
+            assert_eq!(
+                app.theme_editor
+                    .as_ref()
+                    .and_then(|editor| editor.saving.as_ref())
+                    .map(|saving| (saving.name.as_str(), saving.keep)),
+                Some(("half-typed", true))
+            );
+        }
+
+        #[test]
+        fn help_context_distinguishes_every_studio_surface() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            assert_eq!(app.help_context(), HelpContext::Editor);
+
+            for (panel, context) in [
+                (PanelKind::Theme, HelpContext::ThemePicker),
+                (PanelKind::Reference, HelpContext::Reference),
+                (PanelKind::Settings, HelpContext::Settings),
+                (PanelKind::Log, HelpContext::Log),
+                (PanelKind::Export, HelpContext::Export),
+                (PanelKind::Devices, HelpContext::Devices),
+                (PanelKind::Set, HelpContext::Set),
+                (PanelKind::Viz, HelpContext::Viz),
+            ] {
+                app.focus = Focus::Panel(panel);
+                assert_eq!(app.help_context(), context, "{panel:?}");
+            }
+
+            app.strip_mode = SceneStripMode::Learning;
+            assert_eq!(app.help_context(), HelpContext::SceneLearn);
+            app.strip_mode = SceneStripMode::Idle;
+            app.focus = Focus::Panel(PanelKind::Reference);
+            app.armed_slider = Some((app.scenes.current().id, 0));
+            assert_eq!(
+                app.help_context(),
+                HelpContext::Slider,
+                "an armed slider takes arrows before the focused surface"
+            );
+        }
+
+        /// A menu row opens a panel; it never closes one.
+        ///
+        /// Picking "Reference" from a menu while the reference is open is an
+        /// instruction to have the reference. Closing it reads as the menu
+        /// ignoring the click. The chord keeps its toggle, where pressing the same
+        /// keys again is how a thing is put away.
+        #[test]
+        fn a_menu_row_opens_a_panel_and_never_closes_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+
+            // Twice through the menu leaves it open both times.
+            for _ in 0..2 {
+                press(&mut app, KeyCode::F(1), KeyModifiers::NONE);
+                press(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+                press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+                assert!(
+                    app.reference_panel.is_some(),
+                    "a menu row closed the panel it names"
+                );
+            }
+
+            // The chord still toggles.
+            press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+            assert!(app.reference_panel.is_none(), "the chord stopped toggling");
+        }
+    }
+}

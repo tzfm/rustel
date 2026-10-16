@@ -322,4 +322,199 @@ mod tests {
             );
         }
     }
+
+    mod string_roles {
+        //! Tests for `app/string_roles.rs`.
+
+        use crate::app::string_roles::StringRole;
+        use crate::app::tests::support::*;
+        use crate::app::*;
+        use crate::editor::{MemoryClipboard, Selection};
+
+        #[test]
+        fn wtshape_uses_the_documented_waveform_names() {
+            let set = rustel_core::reference::reference_choices("wtshape", "shape")
+                .expect("wtshape choices");
+            assert_eq!(
+                set.choices
+                    .iter()
+                    .map(|choice| choice.value)
+                    .collect::<Vec<_>>(),
+                ["triangle", "sine", "ramp", "saw", "square"]
+            );
+        }
+
+        #[test]
+        fn an_object_choice_only_opens_for_its_own_key() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let score = r#"$: s("sine").lfo({ control: "gain" })
+"#;
+            app.scenes.current_mut().editor = crate::editor::Editor::new(score).expect("editor");
+            let at = score.find("gain").expect("control") + 2;
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(at)))
+                .expect("caret");
+
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert!(
+                app.reference_panel
+                    .as_ref()
+                    .is_none_or(|panel| panel.vocabulary.is_none()),
+                "an LFO control name must not open the shape choices"
+            );
+
+            let score = "$: s(\"sine\").lfo({\n  \"shape\":\n    \"square\"\n})\n";
+            app.scenes.current_mut().editor = crate::editor::Editor::new(score).expect("editor");
+            let at = score.find("square").expect("shape") + 3;
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(at)))
+                .expect("caret");
+            app.reference_panel = None;
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            let panel = app.reference_panel.as_ref().expect("shape choices");
+            let vocabulary = panel.vocabulary.as_ref().expect("shape vocabulary");
+            assert_eq!(
+                panel
+                    .selected_result()
+                    .and_then(|index| vocabulary.names.get(index))
+                    .map(String::as_str),
+                Some("square"),
+                "a multiline quoted object key still selects its current choice"
+            );
+        }
+
+        /// A function that says its first parameter is a scale gets the
+        /// scales for its first string, the way `.scale()` does: `inspire`
+        /// from the extensions names it so in the reference.
+        #[cfg(feature = "extensions")]
+        #[test]
+        fn a_function_whose_first_parameter_is_a_scale_offers_the_scales() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("$: s(\"piano\").inspire(\"c:mi".into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            assert_eq!(app.string_completion_panel_kind(), Some("the scales"));
+            app.toggle_reference_browse();
+            let panel = app.reference_panel.as_ref().expect("panel open");
+            assert_eq!(panel.tab, crate::reference::Tab::Scales);
+            assert_eq!(panel.scale_query, "c:mi");
+        }
+
+        /// A parameter that declares a vocabulary word as its type is offered
+        /// that vocabulary, however the parameter is spelled. `xen` asks for a
+        /// scale in a parameter called `scaleNameOrRatios`, which no reading of
+        /// the name could have found.
+        #[test]
+        fn a_declared_vocabulary_offers_its_list_whatever_the_parameter_is_called() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("$: n(\"0 2 4\").xen(\"31e".into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            let (callee, _, _) = app
+                .string_completion_at_caret()
+                .expect("the caret stands in a string");
+            assert_eq!(callee.as_str(), "xen");
+            // `xen` and `tune` resolve against the EDO, preset and tune.js
+            // dictionaries - never the tonaljs one `scale` offers, where
+            // `xen("c:major")` is an error. They declare `tuning`, and get the
+            // tunings rather than the scales.
+            assert_eq!(app.string_role(&callee), Some(StringRole::Tuning));
+            assert_eq!(app.string_role("tune"), Some(StringRole::Tuning));
+            // The name path still answers for the entries that rely on it.
+            assert_eq!(app.string_role("scale"), Some(StringRole::Scale));
+            // `inspire` is one of the extensions, and a lean build has no
+            // reference entry for it to read a vocabulary off.
+            #[cfg(feature = "extensions")]
+            assert_eq!(app.string_role("inspire"), Some(StringRole::Scale));
+            assert_eq!(app.string_role("chord"), Some(StringRole::Chord));
+            // `chord` is answered by the callee's name here, so this is a
+            // regression guard rather than proof of the type path. The chord
+            // word is declared on the control's own `symbols` parameter, which
+            // is what a future chord-taking function will match on without any
+            // change to this function.
+            //
+            // And a name with no vocabulary anywhere still answers nothing, so
+            // the reference cannot start offering scales to everything.
+            assert_eq!(app.string_role("room"), None);
+            // `edo` was invisible to all of this until it was given an entry:
+            // installed straight onto the globals, it had no reference at all.
+            // It resolves now, and declares the tuning vocabulary rather than
+            // borrowing the scales.
+            let edo = app
+                .reference
+                .resolve("edo")
+                .and_then(|found| app.reference.entry(found))
+                .expect("edo has a reference entry");
+            assert_eq!(
+                edo.params.first().map(|param| param.r#type.as_str()),
+                Some("edo")
+            );
+            assert_eq!(app.string_role("edo"), Some(StringRole::Edo));
+            // And it offers the divisions rather than the tuning names, every
+            // one of which `edo` refuses.
+            let names = crate::reference::edo_vocabulary();
+            assert!(names.contains(&"31edo".to_owned()), "{names:?}");
+            assert!(
+                names.iter().all(|name| rustel_core::xen::edo(name).is_ok()),
+                "every offered division must be one the engine accepts"
+            );
+        }
+
+        /// `register('myfunction', …)` names something of the score's own:
+        /// there is nothing to complete, and searching the function list for
+        /// a name that does not exist yet answers a question nobody asked.
+        #[test]
+        fn a_string_that_names_something_of_your_own_completes_nothing() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("register('myfunction".into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+            app.toggle_reference_browse();
+            assert!(
+                app.reference_panel.is_none(),
+                "no list is opened for a name the score invents"
+            );
+            assert!(app.status.contains("nothing to complete"), "{}", app.status);
+
+            // Ctrl+D still explains the enclosing function's arguments.
+            app.toggle_reference_at_caret();
+            let panel = app.reference_panel.as_ref().expect("register arguments");
+            assert_eq!(panel.tab, crate::reference::Tab::Reference);
+            let crate::reference::ReferenceMode::Entry { index, .. } = panel.mode else {
+                panic!("expected the enclosing function's arguments")
+            };
+            assert_eq!(app.reference.entry(index).unwrap().name, "register");
+            assert!(panel.vocabulary.is_none());
+            assert!(app.reference_anchor.is_none());
+
+            // A string that DOES have a list still says which one.
+            app.set_reference_panel(None);
+            app.focus = Focus::Editor;
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("', (x, p) => p.decay(x))\n$: s('bd".into()),
+                    HistoryMoment(1),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("a sound");
+            app.toggle_reference_at_caret();
+            assert!(app.status.contains("the sounds"), "{}", app.status);
+        }
+    }
 }

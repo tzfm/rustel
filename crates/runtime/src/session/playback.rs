@@ -963,3 +963,611 @@ impl Session {
         })
     }
 }
+
+impl Session {
+    /// Produce fixed-layout audio-ring events off the real-time thread.
+    ///
+    /// This works without `device-audio`: a host can send the returned events
+    /// through [`rustel_audio::Ring`] to its own audio callback. `now` is in
+    /// seconds on the session clock; `sample_rate` must match the host's DSP
+    /// rate so each event's absolute `target_frame` uses the same clock.
+    pub fn schedule_audio_at(
+        &mut self,
+        now: f64,
+        sample_rate: u32,
+    ) -> Result<Vec<rustel_audio::AudioEvent>, RuntimeError> {
+        self.schedule_audio_through(now, now + self.config.horizon, sample_rate)
+    }
+
+    /// Produce fixed-layout audio-ring events through `through`, entirely
+    /// off the real-time thread, without requiring an audio device backend.
+    ///
+    /// `now` and `through` are seconds on the session clock. The deadline is
+    /// limited to the configured lookahead horizon, as in
+    /// [`Self::schedule_through`]. Scheduling advances the shared cursor, so
+    /// callers should use one scheduling method per window.
+    pub fn schedule_audio_through(
+        &mut self,
+        now: f64,
+        through: f64,
+        sample_rate: u32,
+    ) -> Result<Vec<rustel_audio::AudioEvent>, RuntimeError> {
+        self.with_panic_recovery(now, |session| {
+            session.schedule_audio_through_guarded(now, through, sample_rate)
+        })
+    }
+
+    fn schedule_audio_through_guarded(
+        &mut self,
+        now: f64,
+        through: f64,
+        sample_rate: u32,
+    ) -> Result<Vec<rustel_audio::AudioEvent>, RuntimeError> {
+        // Per-voice refusals (unknown sound, unsupported control) skip THAT
+        // voice, exactly as a dropped event leaves the rest playing. One bad
+        // onset must never silence the whole batch. Each distinct refusal is
+        // logged once.
+        self.log_sample_failures();
+        let library = self.samples.clone();
+        let bundled = rustel_voice::BundledOnly;
+        let lookup: &dyn rustel_voice::SampleLookup = match &library {
+            Some(library) => library.as_ref(),
+            None => &bundled,
+        };
+        let mut refusals = Vec::new();
+        let cps = self.config.cps;
+        let onsets = self.schedule_through(now, through)?;
+        // Emit `.log()` text for scheduled onsets. Formatting happens during
+        // the pattern query, but emission waits until an onset is accepted
+        // so re-querying a span cannot print the same onset twice.
+        //
+        // `logger(...)` and `console.log(...)` are drained in the same pass.
+        // Those are written while a score EVALUATES rather than when a note
+        // sounds, so they come out at the first opportunity after.
+        let mut logged: Vec<String> = self.js.take_logs();
+        logged.extend(onsets.iter().filter_map(|onset| onset.log_line.clone()));
+        for line in logged {
+            self.report_diagnostic(
+                "log",
+                line.clone(),
+                serde_json::json!({ "log": { "message": line } }),
+            );
+        }
+
+        #[cfg(feature = "serial")]
+        {
+            self.collect_pending_serial(&onsets, now);
+        }
+        // Collected in the SAME pass: `schedule_through` advances the
+        // scheduler, so asking again for this window would return the next
+        // onsets, not these.
+        #[cfg(feature = "midi")]
+        {
+            self.collect_pending_midi(&onsets);
+        }
+        #[cfg(feature = "osc")]
+        self.collect_pending_osc(&onsets, now, cps);
+
+        let mut input_warnings: Vec<String> = Vec::new();
+        let (events, notices) =
+            rustel_voice::with_diagnostic_policy(self.direct_diagnostic_logging, || {
+                onsets
+                    .iter()
+                    .filter_map(|onset| {
+                        match self.live_audio_event(onset, sample_rate, cps, lookup) {
+                            Ok(event) => {
+                                if let Some(warning) = self.input_channel_warning(&event)
+                                    && !input_warnings.contains(&warning)
+                                {
+                                    input_warnings.push(warning);
+                                }
+                                Some(event)
+                            }
+                            Err(error) => {
+                                let message = error.to_string();
+                                if refusals.last() != Some(&message) {
+                                    refusals.push(message);
+                                }
+                                None
+                            }
+                        }
+                    })
+                    .collect()
+            });
+        self.report_voice_notices(notices);
+        // Said once per score text, like a plugin line: the set plays on,
+        // and a refusal that stays true is not news each window.
+        for message in refusals {
+            if self
+                .refusals_reported
+                .insert(("voice-refused", message.clone()))
+            {
+                self.report_diagnostic(
+                    "voice-refused",
+                    message.clone(),
+                    serde_json::json!({ "voice_refused": { "message": message } }),
+                );
+            }
+        }
+        for message in input_warnings {
+            if self.input_warnings_reported.insert(message.clone()) {
+                self.report_diagnostic(
+                    "audio-input",
+                    message.clone(),
+                    serde_json::json!({ "audio_input": { "message": message } }),
+                );
+            }
+        }
+        Ok(events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(test)]
+    mod offline_window_tests {
+        //! The offline window every bounce door uses (`play_window`): what it
+        //! reports about a pattern that threw, and which score owns the instant two
+        //! of a session bounce's windows share.
+
+        use super::*;
+        use crate::session::test_support::{quiet_session, warnings};
+
+        /// A throw raised only by the window's LAST tick has no next iteration to
+        /// take it, so only the take after the loop reports it. Without that take
+        /// the bounce is silent where the score threw and exits zero.
+        #[test]
+        fn a_throw_raised_only_by_the_last_offline_tick_is_still_reported() {
+            const WINDOW_SECS: f64 = 1.0;
+            // The furthest this window's ticks query: only the last query reaches it.
+            let mut probe = quiet_session(
+                "globalThis.__furthest = 0;
+         new Pattern(state => {
+           globalThis.__furthest = Math.max(globalThis.__furthest, Number(state.span.end));
+           return [];
+         })",
+            );
+            let report = probe.play(WINDOW_SECS).expect("probe window");
+            assert_eq!(report.query_threw, None);
+            let furthest = probe.js.get_number("__furthest").expect("probe ran");
+            assert!(furthest > 0.0, "the probe was never queried");
+
+            let mut session = quiet_session(&format!(
+                "new Pattern(state => {{
+           if (Number(state.span.end) >= {furthest}) throw new Error('last tick');
+           return [];
+         }})"
+            ));
+            let report = session.play(WINDOW_SECS).expect("window");
+            assert!(
+                report
+                    .query_threw
+                    .as_deref()
+                    .is_some_and(|message| message.contains("last tick")),
+                "the last tick's throw was lost: {:?}",
+                report.query_threw
+            );
+            let warnings = warnings(&mut session);
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(warnings[0].contains("last tick"), "{warnings:?}");
+        }
+
+        /// Bounces `saves` to `until` seconds at cps 0.5 anchored at zero, where
+        /// every score below holds one hap per cycle: on 0 s, 2 s and 4 s.
+        fn bounce(saves: &[(f64, &str)], until: f64) -> RenderReport {
+            let directory =
+                tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("render directory");
+            let mut session = Session::new().expect("session");
+            session.set_direct_diagnostic_logging(false);
+            let saves: Vec<(f64, String)> = saves
+                .iter()
+                .map(|(at, source)| (*at, (*source).to_owned()))
+                .collect();
+            let report = session
+                .render_session(
+                    &saves,
+                    0.0,
+                    Some(until),
+                    &directory.path().join("bounce.wav"),
+                    false,
+                )
+                .expect("session bounce");
+            assert!(report.query_threw.is_none(), "{report:?}");
+            report
+        }
+
+        const LOW: &str = r#"$: note("c3").s("sawtooth").gain(0.25)"#;
+        const HIGH: &str = r#"$: note("c5").s("sawtooth").gain(0.25)"#;
+        const BROKEN: &str = "note(";
+
+        /// An onset on the instant of a save that installs bounces once, whether the
+        /// save keeps or changes the score, and whichever order a failed save at the
+        /// same instant comes in.
+        #[test]
+        fn an_onset_on_an_installing_saves_instant_bounces_once() {
+            for (label, saves) in [
+                ("unchanged", vec![(0.0, LOW), (2.0, LOW)]),
+                ("changed", vec![(0.0, LOW), (2.0, HIGH)]),
+                (
+                    "failed then installed",
+                    vec![(0.0, LOW), (2.0, BROKEN), (2.0, HIGH)],
+                ),
+                (
+                    "installed then failed",
+                    vec![(0.0, LOW), (2.0, HIGH), (2.0, BROKEN)],
+                ),
+            ] {
+                let report = bounce(&saves, 4.0);
+                assert_eq!(report.onset_count, 3, "{label}: {report:?}");
+            }
+        }
+
+        /// A save that fails to evaluate leaves the outgoing score's onset on its
+        /// instant in the bounce.
+        #[test]
+        fn a_failed_save_keeps_the_outgoing_onset_on_its_instant() {
+            let report = bounce(&[(0.0, LOW), (2.0, BROKEN)], 4.0);
+            assert!(report.failed_save.is_some(), "{report:?}");
+            assert_eq!(report.onset_count, 3, "{report:?}");
+        }
+
+        /// A save on or past the set's end leaves the onset on the closing instant in
+        /// the bounce.
+        #[test]
+        fn a_save_on_or_past_the_end_keeps_the_closing_onset() {
+            for at in [4.0, 5.0] {
+                let report = bounce(&[(0.0, LOW), (at, HIGH)], 4.0);
+                assert_eq!(report.onset_count, 3, "save at {at}: {report:?}");
+            }
+        }
+
+        /// A filter predicate that throws fails open: the hap it tested keeps
+        /// playing, so the bounce has every hit. The failure is one diagnostic and
+        /// does not set `query_threw`, which fails the exit status of a bounce
+        /// that is silent where the score is not.
+        #[test]
+        fn an_offline_bounce_through_a_throwing_filter_is_complete_not_threw() {
+            let mut session = quiet_session(r#"$: s("bd*4").filterValues(x => log(x))"#);
+            let seconds = 2.0 / session.cps();
+            let report = session
+                .play_window(0.0, seconds, QUERY_JS_CPU_BUDGET, false)
+                .expect("offline window");
+            assert_eq!(
+                report.query_threw, None,
+                "a filter that failed open was reported as a silent bounce"
+            );
+            assert!(
+                report.onsets.len() >= 8,
+                "the throwing filter silenced the bounce: {} onsets",
+                report.onsets.len()
+            );
+            let warnings = warnings(&mut session);
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(warnings[0].contains("log is not defined"), "{warnings:?}");
+        }
+    }
+
+    #[cfg(test)]
+    mod playback_reanchor_tests {
+        use super::*;
+        use rustel_core::{Value, fastcat, pure};
+
+        fn native_session() -> Session {
+            let mut session = Session::with_config(SessionConfig {
+                cps: 1.0,
+                horizon: 0.25,
+                sample_rate: 48_000,
+                channels: 2,
+                ..Default::default()
+            })
+            .expect("session");
+            let notes = [60.0, 72.0].into_iter().map(|note| {
+                pure(Value::object(vec![
+                    ("s".into(), Value::Str("sine".into())),
+                    ("note".into(), Value::F64(note)),
+                    ("gain".into(), Value::F64(0.25)),
+                ]))
+            });
+            session
+                .set_pattern(fastcat(notes.collect()))
+                .expect("native pattern");
+            assert!(!session.active_needs_host());
+            session
+        }
+
+        #[test]
+        fn repeated_play_restarts_at_zero_without_reusing_onset_ids() {
+            let mut session = native_session();
+            let generation = session.generation();
+            let fresh = native_session().play(0.625).expect("fresh play");
+            let first = session.play(0.625).expect("first play");
+            assert!(
+                session.scheduler.scheduled_to_cycle().fract() > 0.0,
+                "the first pass must leave a fractional query cursor"
+            );
+            let repeated = session.play(0.625).expect("repeated play");
+            let semantics = |report: &PlayReport| {
+                report
+                    .onsets
+                    .iter()
+                    .map(|onset| {
+                        (
+                            onset.whole_begin.clone(),
+                            onset.target_time,
+                            onset.duration_secs,
+                            onset.value.clone(),
+                            onset.ui_visuals,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(fresh.onsets.len(), 2);
+            assert_eq!(fresh.onsets[0].target_time, 0.0);
+            assert_eq!(fresh.onsets[1].target_time, 0.5);
+            assert_eq!(semantics(&first), semantics(&fresh));
+            assert_eq!(semantics(&repeated), semantics(&fresh));
+            assert_eq!(first.generation, generation + 1);
+            assert_eq!(repeated.generation, first.generation + 1);
+            assert!(repeated.onsets[0].onset_id > first.onsets.last().unwrap().onset_id);
+            assert!(
+                repeated
+                    .onsets
+                    .iter()
+                    .all(|onset| onset.generation == repeated.generation)
+            );
+            assert_eq!(session.time_at_cycle(Fraction::ZERO), 0.0);
+        }
+
+        #[test]
+        fn repeated_pcm_render_restarts_after_an_intervening_play() {
+            let expected = native_session().render_pcm(0.125).expect("fresh PCM");
+            assert_eq!(expected.len(), 12_000);
+            assert!(expected.iter().all(|sample| sample.is_finite()));
+            assert!(expected.iter().any(|sample| sample.abs() > 1e-6));
+            let mut session = native_session();
+            let first = session.render_pcm(0.125).expect("first PCM");
+            session.play(0.625).expect("intervening play");
+            let repeated = session.render_pcm(0.125).expect("repeated PCM");
+            for actual in [&first, &repeated] {
+                assert_eq!(actual.len(), expected.len());
+                for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                    assert!(actual.is_finite());
+                    assert_eq!(actual.to_bits(), expected.to_bits(), "sample {index}");
+                }
+            }
+        }
+
+        #[test]
+        fn non_reanchored_play_window_preserves_the_installed_timeline() {
+            let mut session = native_session();
+            session.scheduler.rebase_anchor(10.0, 0.25);
+            let generation = session.generation();
+            let report = session
+                .play_window(10.0, 0.3, QUERY_JS_CPU_BUDGET, false)
+                .expect("continuous window");
+            assert_eq!(report.generation, generation);
+            assert_eq!(session.generation(), generation);
+            assert_eq!(session.time_at_cycle(Fraction::ZERO), 9.75);
+            assert_eq!(report.onsets.len(), 1);
+            let onset = &report.onsets[0];
+            assert_eq!(onset.whole_begin, Fraction::new(1, 2).show());
+            assert_eq!(onset.target_time, 10.25);
+            assert_eq!(onset.duration_secs, 0.5);
+            assert_eq!(
+                onset.value,
+                ValueJson::Raw(serde_json::json!({
+                    "s": "sine", "note": 72, "gain": 0.25,
+                }))
+            );
+        }
+    }
+
+    /// `setGainCurve` shapes every gain, the default 0.8 included, as
+    /// superdough does.
+    #[test]
+    fn the_gain_curve_shapes_what_plays() {
+        let peak_of = |score: &str| {
+            let mut session = Session::with_config(SessionConfig::default()).expect("session");
+            session.evaluate(score).expect("evaluate");
+            let pcm = session.render_pcm(1.0).expect("render");
+            pcm.iter().fold(0f32, |peak, sample| peak.max(sample.abs()))
+        };
+        let straight = peak_of("$: s(\"sine\").gain(.5)");
+        let squared = peak_of("setGainCurve(x => x * x)\n$: s(\"sine\").gain(.5)");
+        assert!(
+            (squared / straight - 0.5).abs() < 0.05,
+            "gain .5 through x² is half as loud: {straight} -> {squared}"
+        );
+        let default_straight = peak_of("$: s(\"sine\")");
+        let default_squared = peak_of("setGainCurve(x => x * x)\n$: s(\"sine\")");
+        assert!(
+            (default_squared / default_straight - 0.8).abs() < 0.05,
+            "the default 0.8 goes through the curve too: {default_straight} -> {default_squared}"
+        );
+        let identity = peak_of("setGainCurve(x => x)\n$: s(\"sine\").gain(.5)");
+        assert!(
+            (identity - straight).abs() < 1e-3,
+            "an identity curve changes nothing"
+        );
+    }
+
+    #[test]
+    fn play_restarts_the_transport_so_a_prior_stop_is_not_cancellation() {
+        // `play` calls `transport.start()` before scheduling, so a Stop
+        // issued beforehand is cleared. A run is cancelled only from the
+        // handle, concurrently, while it is in flight.
+        let mut session = Session::new().expect("session");
+        session.evaluate(r#"s("bd sd")"#).expect("evaluate");
+        session.transport().stop();
+        assert!(
+            !session.play(2.0).expect("play").onsets.is_empty(),
+            "`play` no longer restarts the transport; if that is deliberate, \
+             stop-before-play is now cancellation and this test should say so"
+        );
+    }
+
+    #[test]
+    fn play_carries_the_legato_alias_as_effective_hap_duration() {
+        let mut session = Session::new().expect("session");
+        session
+            .evaluate(r#"note("c4").legato(0.25)"#)
+            .expect("evaluate the public alias");
+        let report = session.play(0.1).expect("play");
+        let onset = report.onsets.first().expect("one scheduled onset");
+        let crate::ValueJson::Raw(serde_json::Value::Object(value)) = &onset.value else {
+            panic!("control pattern did not produce an object value");
+        };
+        assert_eq!(value.get("clip"), Some(&serde_json::json!(0.25)));
+        assert!(
+            (onset.duration_secs - 0.5).abs() < f64::EPSILON,
+            "legato writes clip=0.25, so one cycle at 0.5 cps must gate for 0.5s; got {}",
+            onset.duration_secs
+        );
+    }
+
+    #[test]
+    fn stopping_the_transport_mid_run_cancels_it() {
+        // A `play` that ignores Stop also returns, so termination proves
+        // nothing. Stop discards queued events, so a cancelled run yields
+        // fewer onsets. The full run takes seconds; the stop lands at 100 ms.
+        let mut session = Session::new().expect("session");
+        session.evaluate(r#"s("bd*8")"#).expect("evaluate");
+        let full = session.play(86_400.0).expect("play").onsets.len();
+        assert!(
+            full > 1000,
+            "the uncancelled run scheduled only {full} onsets"
+        );
+
+        let mut session = Session::new().expect("session");
+        session.evaluate(r#"s("bd*8")"#).expect("evaluate");
+        let handle = session.transport();
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            handle.stop();
+        });
+        let started = std::time::Instant::now();
+        let cancelled = session.play(86_400.0).expect("play").onsets.len();
+        let elapsed = started.elapsed();
+        stopper.join().expect("stopper thread");
+
+        assert!(
+            cancelled < full,
+            "a mid-run Stop changed nothing: {cancelled} onsets vs {full} \
+             uncancelled. Stop must discard queued events, not drain them."
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(60),
+            "the cancelled run took {elapsed:?}; Stop must end it promptly"
+        );
+    }
+
+    #[test]
+    fn stop_ends_the_computation_not_just_the_output() {
+        // Stop must end the work, not only the output. The scheduler
+        // suppresses events after Stop either way, so the test compares the
+        // loop's iteration count and elapsed time, not only the onset count.
+        let mut session = Session::new().expect("session");
+        session.evaluate(r#"s("bd*8")"#).expect("evaluate");
+        let started = std::time::Instant::now();
+        let full = session.play(86_400.0).expect("play").onsets.len();
+        let full_elapsed = started.elapsed();
+        let full_iterations = session.last_play_iterations;
+        assert!(
+            full > 1000,
+            "the uncancelled run scheduled only {full} onsets"
+        );
+        assert!(
+            full_iterations > 1_000_000,
+            "the uncancelled run only iterated {full_iterations} times, so the \
+             comparison below has no headroom"
+        );
+
+        let mut session = Session::new().expect("session");
+        session.evaluate(r#"s("bd*8")"#).expect("evaluate");
+        session.transport().stop();
+        // `play` restarts the transport, so stop from a handle DURING the run.
+        let handle = session.transport();
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            handle.stop();
+        });
+        let started = std::time::Instant::now();
+        let cancelled = session.play(86_400.0).expect("play").onsets.len();
+        let cancelled_elapsed = started.elapsed();
+        stopper.join().expect("stopper");
+
+        assert!(
+            cancelled < full,
+            "Stop delivered as many onsets as an uncancelled run: {cancelled} \
+             vs {full}"
+        );
+        // A loose bound: a run that keeps querying after Stop takes seconds
+        // and fails it.
+        assert!(
+            cancelled_elapsed * 10 < full_elapsed,
+            "a stopped run took {cancelled_elapsed:?} against {full_elapsed:?} \
+             uncancelled - Stop is not ending the work"
+        );
+        // The loop must stop iterating, not just stop producing. Timing alone
+        // is too sensitive to machine load, so the loop counts itself.
+        let cancelled_iterations = session.last_play_iterations;
+        assert!(
+            cancelled_iterations < full_iterations / 10,
+            "a stopped run performed {cancelled_iterations} of the \
+             {full_iterations} iterations an uncancelled run does: `play` is not \
+             breaking on `TickStatus::Stopped`, it is spinning through the rest \
+             of the window doing nothing"
+        );
+    }
+
+    #[test]
+    fn the_public_play_api_validates_its_own_duration() {
+        // `play` is public, so an embedder or a test can call it without the
+        // CLI's validation. `Session::play(f64::INFINITY)` must be refused.
+        let mut session = Session::new().expect("session");
+        session.evaluate(r#"s("bd")"#).expect("evaluate");
+        for bad in [f64::INFINITY, f64::NAN, -1.0, 1e300, 1e12] {
+            let result = session.play(bad);
+            assert!(
+                result.is_err(),
+                "Session::play({bad}) was accepted; the bound must live at the \
+                 library boundary, not only in the argument parser"
+            );
+        }
+        // ...and the ordinary case still works.
+        assert!(!session.play(2.0).expect("play").onsets.is_empty());
+    }
+
+    #[test]
+    fn max_polyphony_changes_the_voices_in_offline_pcm() {
+        fn render(voices: usize, script_override: bool) -> Vec<f32> {
+            let mut session = Session::with_config(SessionConfig {
+                max_polyphony: if script_override { 128 } else { voices },
+                ..Default::default()
+            })
+            .expect("session");
+            let setter = if script_override {
+                format!("setMaxPolyphony({voices});")
+            } else {
+                String::new()
+            };
+            session.evaluate(&format!("{setter} stack(note('c3'), note('e3'), note('g3'), note('c4')).s('sine').gain(0.05).attack(0).decay(0).sustain(1).release(0.1)")).expect("score");
+            session.render_pcm(0.05).expect("PCM")
+        }
+        let limited = render(1, false);
+        let all = render(4, false);
+        assert_eq!(
+            all,
+            render(4, true),
+            "score and host budgets reach the same backend"
+        );
+        assert!(
+            limited
+                .iter()
+                .zip(&all)
+                .any(|(a, b)| (a - b).abs() > 0.0001),
+            "limiting polyphony must change actual audio"
+        );
+    }
+}

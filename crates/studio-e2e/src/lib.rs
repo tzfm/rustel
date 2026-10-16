@@ -542,6 +542,10 @@ fn hermetic_over_inner(
     capabilities: rustel_studio::editor::KeyboardCapabilities,
     opening: Opening,
 ) -> Hermetic {
+    assert!(
+        rustel_audio::tripwire::allocator_is_armed(),
+        "studio tests require the audio callback allocator"
+    );
     // The local `bd` bank every hermetic studio gets. The starter score
     // names `bd`, and the studio warms a clean score's readiness when its
     // first lint lands. For a bank known only from the default manifests,

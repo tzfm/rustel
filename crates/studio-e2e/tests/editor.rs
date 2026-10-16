@@ -89,23 +89,6 @@ fn undo_and_redo_walk_history() {
     );
 }
 
-/// Ctrl+Y also redoes, as the docs table's *always available* column says.
-#[test]
-fn ctrl_y_also_redoes() {
-    let mut studio = hermetic();
-
-    studio.type_text("$: s(\"hh\")\n");
-    studio.chord("ctrl+z");
-    assert!(!studio.source().contains("hh"), "setup: undone");
-
-    studio.chord("ctrl+y");
-    assert!(
-        studio.source().contains("hh"),
-        "Ctrl+Y redid:\n{}",
-        studio.source()
-    );
-}
-
 /// Ctrl+/ comments the line under the caret and uncomment on a second
 /// press. On a legacy keyboard the chord may arrive as Ctrl+7 (the 0x1F
 /// byte); both spellings must work, which is why the alias exists.

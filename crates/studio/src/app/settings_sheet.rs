@@ -1263,3 +1263,576 @@ impl App {
         .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod settings_sheet {
+        //! Tests for `app/settings_sheet.rs`.
+
+        use crate::app::tests::support::*;
+        use crate::app::*;
+
+        #[test]
+        fn samples_reveal_shortcut_targets_only_the_selected_local_import() {
+            use crate::settings::{SOURCE_CONTROL_COUNT, SettingsPage};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let local = directory.path().join("takes");
+            std::fs::create_dir(&local).expect("local sample folder");
+            let mut app = app_over(directory.path());
+            app.prefs.sample_sources = vec![
+                crate::prefs::SampleSourcePref {
+                    spec: local.display().to_string(),
+                    enabled: true,
+                },
+                crate::prefs::SampleSourcePref {
+                    spec: "https://example.com/samples.json".into(),
+                    enabled: true,
+                },
+            ];
+            let mut sheet = SettingsSheet::default();
+            sheet.show_page(SettingsPage::Sources);
+            sheet.source_count = 2;
+            sheet.default_count = 1;
+            app.settings_sheet = Some(sheet);
+
+            app.settings_sheet.as_mut().unwrap().selected = SOURCE_CONTROL_COUNT;
+            assert_eq!(app.selected_sample_source_folder(), Some(local));
+
+            for selected in [0, SOURCE_CONTROL_COUNT + 1, SOURCE_CONTROL_COUNT + 2] {
+                app.settings_sheet.as_mut().unwrap().selected = selected;
+                assert_eq!(app.selected_sample_source_folder(), None);
+            }
+
+            // The chord stays with Settings when a remote pack is selected.
+            app.settings_sheet.as_mut().unwrap().selected = SOURCE_CONTROL_COUNT + 1;
+            assert!(
+                app.dispatch_panel_key(PanelKind::Settings, KeyCode::Char('o'), false, false, true)
+                    .expect("settings chord")
+            );
+            assert!(app.reveal_pending.is_none());
+
+            app.settings_sheet
+                .as_mut()
+                .unwrap()
+                .show_page(SettingsPage::Settings);
+            app.settings_sheet.as_mut().unwrap().selected = SOURCE_CONTROL_COUNT;
+            assert_eq!(app.selected_sample_source_folder(), None);
+        }
+
+        #[test]
+        fn settings_leave_the_studio_footer_visible() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            app.regions = view::regions(app.frame, false, 1, false, true, None, None);
+            app.settings_sheet = Some(SettingsSheet::default());
+            app.status = "footer remains visible".into();
+
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+                .expect("test terminal");
+            terminal
+                .draw(|frame| app.paint_into(frame, Instant::now()).expect("frame paints"))
+                .expect("draw");
+            let footer = app.regions.footer;
+            let mut text = String::new();
+            for y in footer.y..footer.bottom() {
+                for x in footer.x..footer.right() {
+                    if let Some(cell) = terminal.backend().buffer().cell((x, y)) {
+                        text.push_str(cell.symbol());
+                    }
+                }
+            }
+            assert!(
+                text.contains("footer remains visible"),
+                "footer was covered: {text:?}"
+            );
+            assert!(app.settings_sheet_frame().bottom() <= footer.y);
+        }
+
+        #[test]
+        fn the_wheel_walks_every_scrollable_settings_page() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 24);
+            app.regions = view::regions(app.frame, false, 1, false, true, None, None);
+            let wheel_down = |app: &mut App| {
+                let (sheet, _) =
+                    crate::settings::SettingsSheetView::geometry(app.settings_sheet_frame())
+                        .expect("settings geometry");
+                app.handle_mouse(MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: sheet.x + 2,
+                    row: sheet.y + 2,
+                    modifiers: KeyModifiers::NONE,
+                })
+                .expect("wheel");
+            };
+
+            for page in [
+                crate::settings::SettingsPage::Keybinds,
+                crate::settings::SettingsPage::Settings,
+                crate::settings::SettingsPage::Sources,
+            ] {
+                let mut sheet = SettingsSheet::default();
+                sheet.show_page(page);
+                sheet.keybind_count = crate::settings::RESET_KEYBINDS_ROW + 1;
+                sheet.source_count = 3;
+                sheet.default_count = 3;
+                app.settings_sheet = Some(sheet);
+                wheel_down(&mut app);
+                assert_eq!(
+                    app.settings_sheet.expect("sheet").selected,
+                    1,
+                    "wheel did not move {page:?}"
+                );
+            }
+        }
+
+        /// The natively drawn camera theme opens a camera on the same terms
+        /// its Hydra siblings do: the switch is the consent, the theme has to
+        /// be kept or on the picker, a draft being typed never acquires, and a
+        /// score's own picture drawn over the theme's suppresses it.
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn the_native_camera_theme_requests_capture_only_while_its_picture_is_visible() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let host = rustel_hydra::HydraHost::new();
+            let inputs = rustel_runtime::test_support::HydraInputs::new(host.input_sink());
+            let policy = inputs.policy();
+            policy.set_webcam_allowed(true);
+            app.hydra_input_policy = Some(policy.clone());
+            app.frame = Rect::new(0, 0, 120, 40);
+            app.regions = view::regions(app.frame, false, 1, false, true, None, None);
+            app.theme = crate::theme::Theme::built_in("webcam-braille").expect("theme");
+
+            // The switch is the consent, and it is off.
+            app.ui_settings.hydra_webcam = false;
+            app.theme_camera_confirmed = Some(app.theme.name.clone());
+            app.sync_settings_webcam_preview();
+            assert!(
+                !policy.webcam_status().requested,
+                "the switch is the consent"
+            );
+
+            // On, but the theme is neither kept nor on the picker.
+            app.ui_settings.hydra_webcam = true;
+            app.theme_camera_confirmed = None;
+            app.theme_picker = None;
+            app.sync_settings_webcam_preview();
+            assert!(!policy.webcam_status().requested, "not chosen, not opened");
+
+            // Kept: the picture is the backdrop, so the camera opens.
+            app.theme_camera_confirmed = Some(app.theme.name.clone());
+            app.sync_settings_webcam_preview();
+            assert!(policy.webcam_status().requested);
+
+            // A score's own picture is drawn over the theme's, so the theme's
+            // camera would be opened for something nobody can see.
+            app.hydra_last = Some(crate::app::view::VisualBackdrop {
+                width: 1,
+                height: 1,
+                rgba: vec![0, 0, 0, 255],
+                strength: 1.0,
+                interface: 0.0,
+            });
+            app.sync_settings_webcam_preview();
+            assert!(
+                !policy.webcam_status().requested,
+                "the score's picture wins"
+            );
+            app.hydra_last = None;
+            app.sync_settings_webcam_preview();
+            assert!(policy.webcam_status().requested);
+
+            // A theme being typed is not a theme being chosen.
+            app.open_theme_editor(&app.theme.clone(), String::new(), true);
+            app.sync_settings_webcam_preview();
+            assert!(!policy.webcam_status().requested, "a draft never acquires");
+        }
+
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn webcam_thumbnail_request_follows_only_the_visible_selected_settings_row() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let host = rustel_hydra::HydraHost::new();
+            let inputs = rustel_runtime::test_support::HydraInputs::new(host.input_sink());
+            let policy = inputs.policy();
+            policy.set_webcam_allowed(true);
+            app.hydra_input_policy = Some(policy.clone());
+            app.ui_settings.hydra_webcam = true;
+            app.frame = Rect::new(0, 0, 120, 40);
+            app.regions = view::regions(app.frame, false, 1, false, true, None, None);
+
+            let webcam_row = (0..64)
+                .find(|selected| {
+                    let mut sheet = SettingsSheet::default();
+                    sheet.selected = *selected;
+                    sheet.webcam_row_selected()
+                })
+                .expect("webcam row");
+            let mut sheet = SettingsSheet::default();
+            sheet.selected = webcam_row;
+            app.settings_sheet = Some(sheet);
+            app.focus = Focus::Panel(PanelKind::Settings);
+            app.sync_settings_webcam_preview();
+            assert!(
+                !policy.webcam_status().requested,
+                "landing on the row alone must not open the camera"
+            );
+            assert!(!app.settings_webcam_preview_visible());
+
+            // Enter opens the preview; that is what requests the camera.
+            assert!(app.handle_settings_key(KeyCode::Enter, false, false));
+            assert!(policy.webcam_status().requested);
+            assert!(
+                app.settings_webcam_preview_visible(),
+                "the visible preview participates in the redraw cadence"
+            );
+
+            // Keyboard row navigation releases immediately.
+            assert!(app.handle_settings_key(KeyCode::Up, false, false));
+            assert!(!policy.webcam_status().requested);
+            app.settings_sheet.as_mut().unwrap().select(webcam_row);
+            assert!(app.handle_settings_key(KeyCode::Enter, false, false));
+            assert!(policy.webcam_status().requested);
+
+            // A modal over Settings releases and closing it restores the request
+            // only because Enter had opened the preview on that row again.
+            app.toggle_help();
+            assert!(!policy.webcam_status().requested);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(policy.webcam_status().requested);
+
+            // Mouse page navigation releases just like the keyboard tab.
+            let (panel, _) =
+                crate::settings::SettingsSheetView::geometry(app.frame).expect("settings geometry");
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: panel.x + 14,
+                row: panel.y,
+                modifiers: KeyModifiers::NONE,
+            })
+            .expect("advanced tab click");
+            assert!(!policy.webcam_status().requested);
+
+            // Esc/shortcut close cannot leave a hidden preview worker requested.
+            if let Some(sheet) = app.settings_sheet.as_mut() {
+                sheet.show_page(crate::settings::SettingsPage::Settings);
+                sheet.select(webcam_row);
+                sheet.webcam_preview = true;
+            }
+            app.sync_settings_webcam_preview();
+            assert!(policy.webcam_status().requested);
+            assert!(app.handle_settings_key(KeyCode::Esc, false, false));
+            assert!(!policy.webcam_status().requested);
+
+            // Resizing below the sheet's minimum width revokes immediately;
+            // the logical panel may remain open, but it is no longer visible.
+            let mut sheet = SettingsSheet::default();
+            sheet.select(webcam_row);
+            sheet.webcam_preview = true;
+            app.settings_sheet = Some(sheet);
+            app.focus = Focus::Panel(PanelKind::Settings);
+            app.sync_settings_webcam_preview();
+            assert!(policy.webcam_status().requested);
+            app.handle_terminal_event(Event::Resize(59, 14))
+                .expect("resize handled");
+            assert!(!app.settings_webcam_preview_visible());
+            assert!(!policy.webcam_status().requested);
+        }
+
+        /// Enter opens the camera preview while the switch is still off. The
+        /// header's camera chip is lit while `webcam_status().requested` is true,
+        /// because the device is open. Esc closes the preview, not the sheet:
+        /// the switch stays off, the camera is released and the chip goes out.
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn esc_on_an_unconfirmed_webcam_preview_returns_to_the_sheet_with_the_camera_still_off() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let host = rustel_hydra::HydraHost::new();
+            let inputs = rustel_runtime::test_support::HydraInputs::new(host.input_sink());
+            let policy = inputs.policy();
+            app.hydra_input_policy = Some(policy.clone());
+            // The switch starts off, and stays off until a second Enter agrees.
+            assert!(!app.ui_settings.hydra_webcam);
+            app.frame = Rect::new(0, 0, 120, 40);
+            app.regions = view::regions(app.frame, false, 1, false, true, None, None);
+
+            let webcam_row = (0..64)
+                .find(|selected| {
+                    let mut sheet = SettingsSheet::default();
+                    sheet.selected = *selected;
+                    sheet.webcam_row_selected()
+                })
+                .expect("webcam row");
+            let mut sheet = SettingsSheet::default();
+            sheet.selected = webcam_row;
+            app.settings_sheet = Some(sheet);
+            app.focus = Focus::Panel(PanelKind::Settings);
+            app.sync_settings_webcam_preview();
+            assert!(
+                !policy.webcam_allowed(),
+                "landing on the row alone must never open a camera the switch never agreed to"
+            );
+
+            assert!(app.handle_settings_key(KeyCode::Enter, false, false));
+            assert!(
+                !app.ui_settings.hydra_webcam,
+                "the picture is not the consent"
+            );
+            assert!(
+                policy.webcam_allowed(),
+                "the open preview is the one session the switch did not grant"
+            );
+            assert!(
+                policy.webcam_status().requested,
+                "the privacy indicator lights from exactly this flag"
+            );
+            assert_ne!(
+                policy.webcam_status().state,
+                rustel_runtime::hydra::HydraWebcamState::Blocked,
+                "a lit indicator must mean the device is genuinely being asked for"
+            );
+
+            assert!(app.handle_settings_key(KeyCode::Esc, false, false));
+            assert!(
+                app.settings_sheet.is_some(),
+                "Esc backs out of the preview, not out of the whole sheet"
+            );
+            assert!(!app.ui_settings.hydra_webcam, "nothing was kept");
+            assert!(
+                !policy.webcam_allowed(),
+                "the camera is released with the picture"
+            );
+            assert!(
+                !policy.webcam_status().requested,
+                "the indicator goes out with the preview it was lit for"
+            );
+            assert!(app.status.contains("stays off"), "{}", app.status);
+        }
+
+        /// Enter looks; the arrows choose. A second Enter puts the picture
+        /// away and leaves the switch exactly where it was, and it is the
+        /// arrows that turn the camera on - with its picture arriving in the
+        /// same keystroke, so it can never come on unseen.
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn the_arrows_turn_the_webcam_on_and_enter_only_ever_shows_the_picture() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let host = rustel_hydra::HydraHost::new();
+            let inputs = rustel_runtime::test_support::HydraInputs::new(host.input_sink());
+            let policy = inputs.policy();
+            app.hydra_input_policy = Some(policy.clone());
+            app.frame = Rect::new(0, 0, 120, 40);
+            app.regions = view::regions(app.frame, false, 1, false, true, None, None);
+
+            let webcam_row = (0..64)
+                .find(|selected| {
+                    let mut sheet = SettingsSheet::default();
+                    sheet.selected = *selected;
+                    sheet.webcam_row_selected()
+                })
+                .expect("webcam row");
+            let mut sheet = SettingsSheet::default();
+            sheet.selected = webcam_row;
+            app.settings_sheet = Some(sheet);
+            app.focus = Focus::Panel(PanelKind::Settings);
+
+            // Enter raises the picture and keeps nothing.
+            assert!(app.handle_settings_key(KeyCode::Enter, false, false));
+            assert!(!app.ui_settings.hydra_webcam);
+            assert!(policy.webcam_status().requested, "the picture is up");
+
+            // And a second Enter puts it away again, still keeping nothing.
+            assert!(app.handle_settings_key(KeyCode::Enter, false, false));
+            assert!(
+                !app.ui_settings.hydra_webcam,
+                "Enter is the look, never the yes"
+            );
+            assert!(
+                app.settings_sheet.is_some(),
+                "looking keeps the sheet open - it is not a close action"
+            );
+
+            // The arrow is what chooses, and the picture comes up with it.
+            assert!(app.handle_settings_key(KeyCode::Right, false, false));
+            assert!(app.ui_settings.hydra_webcam, "the arrows are the yes");
+            assert!(policy.webcam_allowed());
+            assert!(
+                policy.webcam_status().requested,
+                "the camera never comes on unseen"
+            );
+
+            // Esc puts the picture away and leaves the sheet standing; the
+            // next one closes the sheet, and the switch keeps its answer.
+            assert!(app.handle_settings_key(KeyCode::Esc, false, false));
+            assert!(
+                app.settings_sheet.is_some(),
+                "the first Esc takes the picture"
+            );
+            assert!(app.handle_settings_key(KeyCode::Esc, false, false));
+            assert!(app.settings_sheet.is_none());
+            assert!(
+                app.ui_settings.hydra_webcam,
+                "closing the sheet keeps the switch's answer"
+            );
+        }
+
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn clicking_a_scrolled_webcam_row_selects_its_absolute_row() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let host = rustel_hydra::HydraHost::new();
+            let inputs = rustel_runtime::test_support::HydraInputs::new(host.input_sink());
+            let policy = inputs.policy();
+            policy.set_webcam_allowed(true);
+            app.hydra_input_policy = Some(policy.clone());
+            app.ui_settings.hydra_webcam = true;
+
+            // Four rows fit. Selecting two rows below webcam scrolls it to the
+            // second painted row, where the old viewport-relative hit test
+            // mistook it for absolute row 1.
+            // Short enough that the sheet scrolls, tall enough that the two rows
+            // and the group border under the webcam rows fit above the selection.
+            app.frame = Rect::new(0, 0, 120, 17);
+            app.regions = view::regions(app.frame, false, 1, false, true, None, None);
+            let webcam_row = (0..64)
+                .find(|selected| {
+                    let mut sheet = SettingsSheet::default();
+                    sheet.selected = *selected;
+                    sheet.webcam_row_selected()
+                })
+                .expect("webcam row");
+            let mut sheet = SettingsSheet::default();
+            sheet.selected = webcam_row + 2;
+            app.settings_sheet = Some(sheet);
+            app.focus = Focus::Panel(PanelKind::Settings);
+            app.sync_settings_webcam_preview();
+            assert!(!policy.webcam_status().requested);
+
+            let settings_frame = app.settings_sheet_frame();
+            let (_, rows) = crate::settings::SettingsSheetView::geometry(settings_frame)
+                .expect("short settings geometry");
+            let click_y = (rows.y..rows.bottom())
+                .find(|y| sheet.row_at_for(settings_frame, rows.x + 2, *y) == Some(webcam_row))
+                .expect("webcam row is visible in the scrolled viewport");
+            assert_ne!(
+                usize::from(click_y - rows.y),
+                webcam_row,
+                "the regression needs a genuinely scrolled row"
+            );
+
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rows.x + 2,
+                row: click_y,
+                modifiers: KeyModifiers::NONE,
+            })
+            .expect("webcam row click");
+
+            assert_eq!(app.settings_sheet.expect("sheet").selected, webcam_row);
+            assert!(
+                !policy.webcam_status().requested,
+                "a click only selects - Enter opens the camera preview"
+            );
+            assert!(app.handle_settings_key(KeyCode::Enter, false, false));
+            assert!(policy.webcam_status().requested);
+        }
+
+        #[test]
+        fn reference_shortcuts_do_not_take_focus_from_settings() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            for (code, modifiers) in [
+                (KeyCode::Char('f'), KeyModifiers::CONTROL),
+                (KeyCode::F(2), KeyModifiers::NONE),
+                (KeyCode::Char(' '), KeyModifiers::CONTROL),
+                (KeyCode::Null, KeyModifiers::NONE),
+            ] {
+                let mut app = app_over(directory.path());
+                press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+                press(&mut app, code, modifiers);
+                assert!(app.settings_sheet.is_some(), "settings closed for {code:?}");
+                assert!(
+                    app.reference_panel.is_none(),
+                    "reference opened for {code:?}"
+                );
+                assert_eq!(app.focus, Focus::Panel(PanelKind::Settings));
+            }
+        }
+
+        /// `rustel studio --buffer-frames 64` names the size the worker starts
+        /// with. Adopting the terminal applies the kept preferences and must not
+        /// replace that size.
+        #[test]
+        fn the_command_line_buffer_size_survives_adopting_the_terminal() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            app.prefs.set_ui_settings(&{
+                let mut kept = app.ui_settings.clone();
+                kept.output_latency = OutputLatency::Frames1024;
+                kept
+            });
+            app.cli_output_latency = Some(OutputLatency::from_frames(64));
+            app.adopt_terminal(TerminalFeatures::default());
+            assert_eq!(app.ui_settings.output_latency, OutputLatency::Frames64);
+
+            // Without the flag the kept size is what the row shows.
+            let mut app = app_over(directory.path());
+            app.prefs.set_ui_settings(&{
+                let mut kept = app.ui_settings.clone();
+                kept.output_latency = OutputLatency::Frames1024;
+                kept
+            });
+            app.cli_output_latency = None;
+            app.adopt_terminal(TerminalFeatures::default());
+            assert_eq!(app.ui_settings.output_latency, OutputLatency::Frames1024);
+        }
+
+        #[test]
+        fn advanced_polyphony_changes_the_live_bus_and_persists_without_restarting() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            assert_eq!(app.worker.master().max_polyphony(), 128);
+            let mut sheet = SettingsSheet::default();
+            sheet.show_page(crate::settings::SettingsPage::Advanced);
+            app.settings_sheet = Some(sheet);
+            app.focus = Focus::Panel(PanelKind::Settings);
+            // Past the load mode and the output buffer.
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+            assert_eq!(app.ui_settings.max_polyphony, 192);
+            assert_eq!(app.worker.master().max_polyphony(), 192);
+            assert_eq!(app.prefs.max_polyphony, Some(192));
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+            assert_eq!(app.worker.master().max_polyphony(), 256);
+            assert_eq!(app.prefs.max_polyphony, Some(256));
+        }
+
+        #[test]
+        fn the_load_mode_row_reaches_the_engine_and_persists() {
+            use crate::settings::LoadMode;
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            assert_eq!(app.worker.master().load_mode(), LoadMode::Wait);
+            let mut sheet = SettingsSheet::default();
+            sheet.show_page(crate::settings::SettingsPage::Advanced);
+            app.settings_sheet = Some(sheet);
+            app.focus = Focus::Panel(PanelKind::Settings);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+            assert_eq!(app.ui_settings.load_mode, LoadMode::Async);
+            assert_eq!(app.worker.master().load_mode(), LoadMode::Async);
+            assert_eq!(app.prefs.load_mode.as_deref(), Some("async"));
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+            assert_eq!(app.worker.master().load_mode(), LoadMode::Wait);
+        }
+    }
+}
