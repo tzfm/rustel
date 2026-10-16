@@ -285,9 +285,12 @@ impl App {
     /// same way. What it never owes is the flash: that confirms a press,
     /// and nobody pressed anything.
     pub(super) fn auto_evaluate(&mut self) {
+        // The snapshot trails a Stop press by up to 100 ms, so the local
+        // flag holds the apply until it catches up.
         if !self.ui_settings.auto_evaluate
             || !self.is_playing()
             || self.is_stopping()
+            || self.stop_requested
             || self.current_prebake().is_some()
             || self.current_replay().is_some()
         {
@@ -778,10 +781,12 @@ impl App {
                 self.dirty_frame = true;
             }
             StudioControlEvent::Snapshot(snapshot) => {
+                let now = Instant::now();
                 self.dirty_frame |= if self.stop_requested {
-                    self.audio_advisory.reset()
+                    self.audio_advisory.reset() | self.power_advisory.reset()
                 } else {
-                    self.audio_advisory.observe(&snapshot, Instant::now())
+                    self.audio_advisory.observe(&snapshot, now)
+                        | self.power_advisory.observe(&snapshot, now)
                 };
                 // A score can finish draining while the keyboard keeps the
                 // device open. There is no device-stop acknowledgement in
@@ -837,11 +842,18 @@ impl App {
             StudioControlEvent::EngineFailure(failure) => {
                 if failure.playback_stopped {
                     self.audio_advisory.reset();
+                    self.power_advisory.reset();
                     self.worker.discard_visual_updates();
                     self.visual.stop();
                     self.snapshot = None;
                 }
                 self.set_error(ErrorOwner::Engine, Self::failure_line(&failure));
+            }
+            StudioControlEvent::LinkRefused => {
+                self.link_enabled = false;
+                self.link_seen_playing = None;
+                self.status = "link session not joined".into();
+                self.dirty_frame = true;
             }
         }
         self.refresh_input_lint(input_channels_before);
@@ -1012,6 +1024,7 @@ impl App {
             self.prebake_inflight = None;
             self.snapshot = None;
             self.audio_advisory.reset();
+            self.power_advisory.reset();
             self.visual.stop();
             self.set_error(
                 ErrorOwner::Engine,
@@ -1248,6 +1261,19 @@ mod tests {
             assert!(
                 queued_by(&app, scene).is_empty(),
                 "a stopped set stays put until update starts it"
+            );
+        }
+
+        /// A pause that ends just after Stop must not start the set again.
+        #[test]
+        fn a_paused_edit_does_not_restart_a_set_being_stopped() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene) = playing_app(directory.path(), true);
+            app.stop_requested = true;
+            app.auto_evaluate();
+            assert!(
+                queued_by(&app, scene).is_empty(),
+                "the stop holds while the snapshot still says playing"
             );
         }
 

@@ -105,6 +105,16 @@ mod tests {
         }
 
         #[test]
+        fn a_refused_link_clears_the_checkbox() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "$: s(\"bd\")\n");
+            app.link_enabled = true;
+            app.handle_control(StudioControlEvent::LinkRefused);
+            assert!(!app.link_enabled, "the box shows what the engine did");
+            assert!(app.status.contains("not joined"), "{}", app.status);
+        }
+
+        #[test]
         fn a_session_that_starts_playing_starts_this_studio_too() {
             let directory = tempfile::tempdir().expect("temp dir");
             let (mut app, _scene) = plain_app(directory.path(), "$: s(\"bd\")\n");

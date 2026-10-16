@@ -524,6 +524,18 @@ pub(super) fn sbd_saturation(input: f32, curve: &[f32]) -> f32 {
     }
 }
 
+/// The phase step `cycles_per_sample.rem_euclid(1.0)`. An audible step is
+/// already in `0..1`, where the remainder is the step itself, so it skips
+/// the library call.
+#[inline]
+pub(crate) fn saw_step(cycles_per_sample: f32) -> f32 {
+    if (0.0..1.0).contains(&cycles_per_sample) {
+        cycles_per_sample
+    } else {
+        cycles_per_sample.rem_euclid(1.0)
+    }
+}
+
 /// Polyblep-corrected saw.
 pub(crate) fn saw_blep(phase: f32, mut dt: f32) -> f32 {
     let v = 2.0 * phase - 1.0;
@@ -1475,7 +1487,7 @@ impl ScalarBackend {
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn render_fm_offset(
-        fm: FmControls,
+        fm: &FmControls,
         freq_hz: f32,
         t: f32,
         duration_secs: f32,
@@ -3386,6 +3398,24 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn saw_step_matches_the_euclidean_remainder_bit_for_bit() {
+        for x in [
+            0.0f32,
+            -0.0,
+            1e-30,
+            0.25,
+            0.999_999_9,
+            1.0,
+            1.5,
+            -0.25,
+            f32::INFINITY,
+            f32::NAN,
+        ] {
+            assert_eq!(saw_step(x).to_bits(), x.rem_euclid(1.0).to_bits(), "{x}");
         }
     }
 }

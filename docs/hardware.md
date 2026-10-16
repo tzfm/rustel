@@ -128,6 +128,10 @@ network, between participants such as DAWs and rustel itself. Rustel finds
 the other participants on its own; no address is given. Participants on
 this machine count too: they are found over loopback, with no network.
 
+The session that started first leads. Rustel joins a session that is
+already running and takes its tempo and grid. A participant that starts
+after rustel joins the rustel session the same way.
+
 A session that is playing starts rustel, and a session that stops stops it.
 When rustel starts or stops, the session is told the same. A tempo from a
 fresh evaluation is given to the session, and a tempo change made elsewhere
@@ -288,8 +292,30 @@ A small buffer leaves little time for each callback: 32 frames at 48 kHz is
 0.67 ms. The reverb (`room`) does one larger step every 2048 frames. At 32 or
 64 frames that step can take longer than one callback, and Studio then shows
 the hint to raise the audio out latency. With reverb in the score, use 128
-frames, or 64 on a fast machine. On Linux, the `powersave` CPU governor makes
-each callback slower; use `performance` for small buffers.
+frames, or 64 on a fast machine.
+
+A laptop in a power-saving mode keeps the CPU clock low for short, regular
+work such as an audio callback, and it changes the clock often. The same
+score can then need two to four times the DSP time, and some callbacks miss
+their deadline. A larger buffer does not fix that. When callbacks keep
+missing their deadline, or the DSP load stays above 70%, for three seconds
+in a power-saving mode, Studio shows a hint to set the power mode to
+performance. Studio reads the mode on Linux and Windows. Performance mode
+uses more power, so the battery runs down sooner and the fan can run more.
+
+Select the performance mode in the system power settings. On Linux with
+power-profiles-daemon, you can also run:
+
+```sh
+powerprofilesctl set performance
+```
+
+On Linux without that service, set the CPU governor. On Ubuntu, `cpupower`
+comes in the `linux-tools-generic` package.
+
+```sh
+sudo cpupower frequency-set -g performance
+```
 
 CoreAudio and ALSA adjust the callback buffer. WSL usually needs automatic
 or larger. WASAPI shared mode keeps the device period; requests below that

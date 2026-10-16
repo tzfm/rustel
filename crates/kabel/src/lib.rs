@@ -551,6 +551,11 @@ impl Graph {
                 .map(dsp::Delay::heap_bytes)
                 .sum::<usize>()
     }
+    /// The sample rate the graph was built for. Its oscillators, filters
+    /// and delays keep this rate.
+    pub fn sample_rate(&self) -> f64 {
+        self.sample_rate
+    }
     /// Reports whether existing storage can run the supplied program.
     pub fn can_reuse(&self, program: &Program) -> bool {
         program.delay_count() <= self.delays.len()

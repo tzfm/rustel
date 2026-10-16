@@ -164,7 +164,7 @@ impl App {
         self.expire_remote_activity(now);
         self.follow_loading_line(now);
         self.dirty_frame |= if self.stop_requested {
-            self.audio_advisory.reset()
+            self.audio_advisory.reset() | self.power_advisory.reset()
         } else {
             self.audio_advisory.expire(now)
         };

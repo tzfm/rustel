@@ -37,23 +37,53 @@ impl DistortControls {
     /// for any feedback. The orbit then stays silent, even after the score
     /// changes. This function returns silence for that sample instead.
     pub fn apply(&self, x: f32, shape: f32) -> f32 {
-        let y = self.transfer(x, shape);
-        if y.is_finite() { y } else { 0.0 }
+        self.curve(shape).apply(x)
     }
 
-    fn transfer(&self, x: f32, shape: f32) -> f32 {
-        let y = match self.algorithm {
-            0 => scurve(x, shape),
-            1 => soft(x, shape),
-            2 => hard(x, shape),
-            3 => cubic(x, shape),
-            4 => diode(x, shape, false),
-            5 => diode(x, shape, true),
-            6 => fold(x, shape),
-            7 => sinefold(x, shape),
-            _ => chebyshev(x, shape),
+    /// The curve at `shape`, with its shape-only terms computed once.
+    pub(crate) fn curve(&self, shape: f32) -> DistortCurve {
+        let k = shape;
+        let terms = match self.algorithm {
+            0 => CurveTerms::Scurve,
+            1 => CurveTerms::Soft,
+            2 => CurveTerms::Hard,
+            3 => {
+                let t = squash(k.ln_1p());
+                CurveTerms::Cubic {
+                    t3: t / 3.0,
+                    scale: 1.0 - t / 3.0,
+                }
+            }
+            4 | 5 => {
+                let g = 1.0 + 2.0 * k;
+                let t = squash(k.ln_1p());
+                let bias = 0.07 * t;
+                let sech = 1.0 / (g * bias).cosh();
+                let sech2 = sech * sech;
+                if self.algorithm == 4 {
+                    CurveTerms::Diode {
+                        bias,
+                        denom: (2.0 * g * sech2).max(1e-8),
+                    }
+                } else {
+                    CurveTerms::Asym {
+                        bias,
+                        neg: soft(bias, 2.0 * k),
+                        denom: (g * sech2).max(1e-8),
+                    }
+                }
+            }
+            6 => CurveTerms::Fold,
+            7 => CurveTerms::Sinefold,
+            _ => CurveTerms::Chebyshev {
+                kl: 10.0 * k.ln_1p(),
+            },
         };
-        self.postgain * y
+        DistortCurve {
+            postgain: self.postgain,
+            shape,
+            terms,
+        }
     }
 
     /// The largest shape any curve here stays finite at.
@@ -103,6 +133,69 @@ impl DistortControls {
     }
 }
 
+/// One curve at one shape, ready for the sample loop. The terms that depend
+/// only on the shape are already computed, so [`Self::apply`] gives the same
+/// result as [`DistortControls::apply`] at that shape with less work.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DistortCurve {
+    postgain: f32,
+    shape: f32,
+    terms: CurveTerms,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CurveTerms {
+    Scurve,
+    Soft,
+    Hard,
+    Cubic {
+        t3: f32,
+        scale: f32,
+    },
+    Diode {
+        bias: f32,
+        denom: f32,
+    },
+    /// `neg` is the negative branch, which does not depend on the input.
+    Asym {
+        bias: f32,
+        neg: f32,
+        denom: f32,
+    },
+    Fold,
+    Sinefold,
+    Chebyshev {
+        kl: f32,
+    },
+}
+
+impl DistortCurve {
+    /// The per-sample transfer. Like [`DistortControls::apply`], the result
+    /// is always finite.
+    #[inline]
+    pub(crate) fn apply(&self, x: f32) -> f32 {
+        let k = self.shape;
+        let y = match self.terms {
+            CurveTerms::Scurve => scurve(x, k),
+            CurveTerms::Soft => soft(x, k),
+            CurveTerms::Hard => hard(x, k),
+            CurveTerms::Cubic { t3, scale } => soft((x - t3 * x * x * x) / scale, k),
+            CurveTerms::Diode { bias, denom } => {
+                let y = soft(x + bias, 2.0 * k) - soft(-x + bias, 2.0 * k);
+                soft(y / denom, k)
+            }
+            CurveTerms::Asym { bias, neg, denom } => {
+                soft((soft(x + bias, 2.0 * k) - neg) / denom, k)
+            }
+            CurveTerms::Fold => fold(x, k),
+            CurveTerms::Sinefold => sinefold(x, k),
+            CurveTerms::Chebyshev { kl } => chebyshev(x, kl),
+        };
+        let y = self.postgain * y;
+        if y.is_finite() { y } else { 0.0 }
+    }
+}
+
 #[inline]
 fn clamp(x: f32, lo: f32, hi: f32) -> f32 {
     x.max(lo).min(hi)
@@ -127,7 +220,30 @@ fn scurve(x: f32, k: f32) -> f32 {
 
 #[inline]
 fn soft(x: f32, k: f32) -> f32 {
-    (x * (1.0 + k)).tanh()
+    tanh(x * (1.0 + k))
+}
+
+/// `tanh` in f64, rounded once to f32. Over every input it stays within one
+/// ulp of the exact value. glibc's `tanhf` is off by up to two ulps and is
+/// slower, and the diode alone calls this six times per stereo sample.
+#[inline]
+fn tanh(x: f32) -> f32 {
+    let a = f64::from(x).abs();
+    let t = if a < 0.125 {
+        // Taylor series. The first omitted term is below 2^-36 of the result.
+        let a2 = a * a;
+        a * (1.0
+            + a2 * (-1.0 / 3.0 + a2 * (2.0 / 15.0 + a2 * (-17.0 / 315.0 + a2 * (62.0 / 2835.0)))))
+    } else if a < 10.0 {
+        let e = (2.0 * a).exp();
+        (e - 1.0) / (e + 1.0)
+    } else if a.is_nan() {
+        return x;
+    } else {
+        // Past 9.02 the exact value rounds to one in f32.
+        1.0
+    };
+    (t as f32).copysign(x)
 }
 
 #[inline]
@@ -147,30 +263,9 @@ fn sinefold(x: f32, k: f32) -> f32 {
     ((std::f32::consts::PI / 2.0) * fold(x, k)).sin()
 }
 
+/// `kl` is `10 * ln(1 + shape)`.
 #[inline]
-fn cubic(x: f32, k: f32) -> f32 {
-    let t = squash(k.ln_1p());
-    let cubic = (x - (t / 3.0) * x * x * x) / (1.0 - t / 3.0);
-    soft(cubic, k)
-}
-
-#[inline]
-fn diode(x: f32, k: f32, asym: bool) -> f32 {
-    let g = 1.0 + 2.0 * k;
-    let t = squash(k.ln_1p());
-    let bias = 0.07 * t;
-    let pos = soft(x + bias, 2.0 * k);
-    let neg = soft(if asym { bias } else { -x + bias }, 2.0 * k);
-    let y = pos - neg;
-    let sech = 1.0 / (g * bias).cosh();
-    let sech2 = sech * sech;
-    let denom = ((if asym { 1.0 } else { 2.0 }) * g * sech2).max(1e-8);
-    soft(y / denom, k)
-}
-
-#[inline]
-fn chebyshev(x: f32, k: f32) -> f32 {
-    let kl = 10.0 * k.ln_1p();
+fn chebyshev(x: f32, kl: f32) -> f32 {
     let mut tnm1 = 1.0f32;
     let mut tnm2 = x;
     let mut y = 0.0f32;
@@ -225,6 +320,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tanh_stays_within_one_ulp_of_the_exact_value() {
+        for bits in (0..=20.0f32.to_bits()).step_by(997) {
+            let x = f32::from_bits(bits);
+            let exact = f64::from(x).tanh() as f32;
+            let got = tanh(x);
+            assert!(
+                got.to_bits().abs_diff(exact.to_bits()) <= 1,
+                "{x}: {got} vs {exact}"
+            );
+            assert_eq!(tanh(-x).to_bits(), (-got).to_bits(), "odd at {x}");
+        }
+        assert!(tanh(f32::NAN).is_nan());
+        assert_eq!(tanh(f32::INFINITY), 1.0);
+        assert_eq!(tanh(f32::NEG_INFINITY), -1.0);
+        assert_eq!(tanh(-0.0).to_bits(), (-0.0f32).to_bits());
     }
 
     /// The browser computes this in double, where `expm1(99)` is finite and
