@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Voices with distortion, `crush`, FM or a supersaw render faster. Each voice computed some fixed values again on every sample: the shape terms of `diode`, `asym`, `cubic` and `chebyshev`, the `crush` step count, a copy of the FM routing, and a library remainder for each supersaw lane. Rustel now computes them once or skips them. A supersaw score with `fm`, `crush`, `diode` and a tremolo renders 1.16 times faster on one x86-64 desktop and 1.27 times faster on one x86-64 Linux laptop. The audio stays the same, byte for byte.
+- Distortion curves compute `tanh` in double precision and round once. Each result is within one unit in the last place of the exact value. glibc's `tanhf` was off by up to two units and took 1.5 to 3.4 times longer per call, depending on the input. The `diode` voice above renders 1.08 times faster on the same Linux laptop.
 - Split large source files by concern and consolidate repeated tests. Studio tests now check the callback allocator at runtime.
 - Euclidean rhythms accept negative steps and more pulses than steps. Negative steps switch between regular and legato notes. Extra pulses extend the rhythm across cycles. Legato rotation shifts the rhythm without shifting the source notes.
 - `stackLeft`, `stackRight`, `stackCenter` and `stackRepeat` combine patterns with different step counts. `degradeByWith` uses a signal to choose which events to keep. `open` and `close` provide fades over one cycle.

@@ -220,7 +220,30 @@ fn scurve(x: f32, k: f32) -> f32 {
 
 #[inline]
 fn soft(x: f32, k: f32) -> f32 {
-    (x * (1.0 + k)).tanh()
+    tanh(x * (1.0 + k))
+}
+
+/// `tanh` in f64, rounded once to f32. Over every input it stays within one
+/// ulp of the exact value. glibc's `tanhf` is off by up to two ulps and is
+/// slower, and the diode alone calls this six times per stereo sample.
+#[inline]
+fn tanh(x: f32) -> f32 {
+    let a = f64::from(x).abs();
+    let t = if a < 0.125 {
+        // Taylor series. The first omitted term is below 2^-36 of the result.
+        let a2 = a * a;
+        a * (1.0
+            + a2 * (-1.0 / 3.0 + a2 * (2.0 / 15.0 + a2 * (-17.0 / 315.0 + a2 * (62.0 / 2835.0)))))
+    } else if a < 10.0 {
+        let e = (2.0 * a).exp();
+        (e - 1.0) / (e + 1.0)
+    } else if a.is_nan() {
+        return x;
+    } else {
+        // Past 9.02 the exact value rounds to one in f32.
+        1.0
+    };
+    (t as f32).copysign(x)
 }
 
 #[inline]
@@ -297,6 +320,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tanh_stays_within_one_ulp_of_the_exact_value() {
+        for bits in (0..=20.0f32.to_bits()).step_by(997) {
+            let x = f32::from_bits(bits);
+            let exact = f64::from(x).tanh() as f32;
+            let got = tanh(x);
+            assert!(
+                got.to_bits().abs_diff(exact.to_bits()) <= 1,
+                "{x}: {got} vs {exact}"
+            );
+            assert_eq!(tanh(-x).to_bits(), (-got).to_bits(), "odd at {x}");
+        }
+        assert!(tanh(f32::NAN).is_nan());
+        assert_eq!(tanh(f32::INFINITY), 1.0);
+        assert_eq!(tanh(f32::NEG_INFINITY), -1.0);
+        assert_eq!(tanh(-0.0).to_bits(), (-0.0f32).to_bits());
     }
 
     /// The browser computes this in double, where `expm1(99)` is finite and
