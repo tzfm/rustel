@@ -2,6 +2,8 @@
 //! callback, and returned to the plugin thread at the end.
 
 use std::cell::Cell;
+use std::mem::ManuallyDrop;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
@@ -95,8 +97,13 @@ impl HeldNote {
 }
 
 /// A plugin with its two halves connected. The plugin thread owns a
-/// `Loaded` value from the first call to the last.
-pub(crate) struct Loaded {
+/// `Loaded` value from the first call to the last. The value is one field
+/// so that its drop can move the whole value to the main thread, which
+/// releases it.
+pub(crate) struct Loaded(ManuallyDrop<Whole>);
+
+/// The fields of [`Loaded`].
+pub(crate) struct Whole {
     // The order of the fields is the order of release. The plugin objects
     // go before the host objects, and the library goes last.
     connection: Option<(ComPtr<IConnectionPoint>, ComPtr<IConnectionPoint>)>,
@@ -113,12 +120,37 @@ pub(crate) struct Loaded {
     _module: Arc<Module>,
 }
 
-// SAFETY: a `Loaded` value moves between threads only inside an `Instance`,
-// and the plugin thread makes every call except the audio processing.
-unsafe impl Send for Loaded {}
+// SAFETY: a `Whole` value moves between threads only inside an `Instance`,
+// and the plugin thread makes every call except the audio processing. On
+// macOS the value is created and released on the process's main thread
+// while the plugin thread waits for each step.
+unsafe impl Send for Whole {}
+
+impl Deref for Loaded {
+    type Target = Whole;
+
+    fn deref(&self) -> &Whole {
+        &self.0
+    }
+}
+
+impl DerefMut for Loaded {
+    fn deref_mut(&mut self) -> &mut Whole {
+        &mut self.0
+    }
+}
 
 impl Loaded {
+    /// Creates the plugin: the factory call and the calls up to the
+    /// plugin's start state. On macOS the creation runs on the process's
+    /// main thread, and the plugin thread waits for it: a plugin may
+    /// create objects that AppKit allows only on that thread.
     pub(crate) fn new(module: Arc<Module>, class: &ClassInfo) -> Result<Self, String> {
+        let class = class.clone();
+        crate::main_thread::run(move || Self::make(module, &class))
+    }
+
+    fn make(module: Arc<Module>, class: &ClassInfo) -> Result<Self, String> {
         let host = ComWrapper::new(HostApp);
         let handler = ComWrapper::new(Handler);
         let context: *mut FUnknown = pointer::<_, IHostApplication>(&host).cast();
@@ -164,7 +196,7 @@ impl Loaded {
                 connection = Some((from, to));
             }
         }
-        let loaded = Self {
+        let loaded = Self(ManuallyDrop::new(Whole {
             connection,
             controller,
             processor,
@@ -175,7 +207,7 @@ impl Loaded {
             _handler: handler,
             _host: host,
             _module: module,
-        };
+        }));
         // The controller starts from the state of the processor.
         let state = Stream::new(Vec::new());
         if unsafe { loaded.component.getState(pointer(&state)) } == kResultOk && !state.is_empty() {
@@ -507,6 +539,23 @@ impl Loaded {
 
 impl Drop for Loaded {
     fn drop(&mut self) {
+        // The plugin ends on the process's main thread on macOS: the end
+        // calls and the releases after them may destroy objects that
+        // belong on that thread, so the whole value moves there and every
+        // field of it drops there.
+        //
+        // SAFETY: the value moves out of the one field, which is a
+        // `ManuallyDrop`, so no part of it drops a second time here.
+        let whole = unsafe { std::ptr::read(&*self.0) };
+        crate::main_thread::run(move || whole.end());
+    }
+}
+
+impl Whole {
+    /// The plugin's end calls, in the order the VST3 call sequence asks.
+    /// The fields drop where this runs: the final release of a plugin
+    /// object can destroy objects that belong on this thread.
+    fn end(self) {
         if let Some(running) = &self.running {
             running.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }

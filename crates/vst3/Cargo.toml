@@ -23,3 +23,11 @@ rustel-vst3-fixture = { path = "../vst3-fixture" }
 # The live probe reads the policy of the audio thread.
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 libc = "0.2"
+
+# The main-thread scenario spawns this test as its own child processes,
+# which need their real main thread to serve the plugin steps; a harness
+# would run its own code there, so the target has none.
+[[test]]
+name = "main_thread"
+path = "tests/main_thread.rs"
+harness = false

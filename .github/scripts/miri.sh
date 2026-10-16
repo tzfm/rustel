@@ -51,5 +51,10 @@ MIRIFLAGS="$MIRIFLAGS -Zmiri-many-seeds=0..16" \
 # turns AVX2 on.
 RUSTFLAGS="-C target-feature=+avx2" miri -p rustel-audio --lib -- _kernel::
 
+# The plugin main-thread step queue. The queue and its panic transfer are
+# plain Rust; the macOS run-loop calls behind it are FFI and stay outside
+# Miri.
+miri -p rustel-vst3 --lib -- main_thread::tests
+
 # QuickJS allocator and bridge frame stack.
 miri -p rustel-jsruntime --lib -- alloc:: bridge:: runtime::inspection::

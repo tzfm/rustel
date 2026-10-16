@@ -201,6 +201,14 @@ struct Processor {
     prints: bool,
 }
 
+/// The final release of the object, wherever it runs: a host that ends the
+/// plugin on the main thread destroys it there.
+impl Drop for Processor {
+    fn drop(&mut self) {
+        thread_mark("destroy");
+    }
+}
+
 impl Class for Processor {
     type Interfaces = (IComponent, IAudioProcessor);
 }
@@ -211,6 +219,7 @@ impl IPluginBaseTrait for Processor {
     }
 
     unsafe fn terminate(&self) -> tresult {
+        thread_mark("end");
         kResultOk
     }
 }
@@ -416,6 +425,12 @@ struct Controller {
     values: Values,
 }
 
+impl Drop for Controller {
+    fn drop(&mut self) {
+        thread_mark("destroy");
+    }
+}
+
 impl Class for Controller {
     type Interfaces = (IEditController,);
 }
@@ -541,6 +556,12 @@ struct Tone {
     calls: Cell<u32>,
 }
 
+impl Drop for Tone {
+    fn drop(&mut self) {
+        thread_mark("destroy");
+    }
+}
+
 impl Tone {
     fn new() -> Self {
         Self {
@@ -584,6 +605,7 @@ impl IPluginBaseTrait for Tone {
     }
 
     unsafe fn terminate(&self) -> tresult {
+        thread_mark("end");
         kResultOk
     }
 }
@@ -819,16 +841,22 @@ impl IPluginFactoryTrait for Factory {
         obj: *mut *mut c_void,
     ) -> tresult {
         let instance = match unsafe { *(cid as *const TUID) } {
-            PROCESSOR => ComWrapper::new(Processor {
-                values: Values::new(),
-                prints: std::env::var_os(PRINT_ENV).is_some(),
-            })
-            .to_com_ptr::<FUnknown>(),
+            PROCESSOR => {
+                thread_mark("make");
+                ComWrapper::new(Processor {
+                    values: Values::new(),
+                    prints: std::env::var_os(PRINT_ENV).is_some(),
+                })
+                .to_com_ptr::<FUnknown>()
+            }
             CONTROLLER => ComWrapper::new(Controller {
                 values: Values::new(),
             })
             .to_com_ptr::<FUnknown>(),
-            TONE => ComWrapper::new(Tone::new()).to_com_ptr::<FUnknown>(),
+            TONE => {
+                thread_mark("make");
+                ComWrapper::new(Tone::new()).to_com_ptr::<FUnknown>()
+            }
             _ => None,
         };
         let Some(instance) = instance else {
@@ -887,6 +915,53 @@ pub const SLOW_ENV: &str = "RUSTEL_VST3_FIXTURE_SLOW";
 /// load and in each audio block of the effect, as a plugin with debug text
 /// does.
 pub const PRINT_ENV: &str = "RUSTEL_VST3_FIXTURE_PRINT";
+
+/// With this variable set to a path, the plugin appends one line to the
+/// file for each audio class it creates, each one it ends at `terminate`,
+/// and each object the final release destroys: `make main` when the
+/// system's main thread runs the call, `make other` when another thread
+/// does, and the same for `end` and `destroy`. The plugin host's tests
+/// read the lines, so the variable is set for a test process only.
+pub const THREAD_MARK_ENV: &str = "RUSTEL_VST3_FIXTURE_MARK_THREAD";
+
+/// Writes the mark of one moment of the lifecycle, naming the thread that
+/// runs it.
+fn thread_mark(step: &str) {
+    use std::io::Write as _;
+    let Some(mark) = std::env::var_os(THREAD_MARK_ENV) else {
+        return;
+    };
+    let thread = if on_the_main_thread() {
+        "main"
+    } else {
+        "other"
+    };
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&mark)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{step} {thread}");
+}
+
+/// True when the system's main thread runs this call.
+#[cfg(target_os = "macos")]
+fn on_the_main_thread() -> bool {
+    unsafe extern "C" {
+        fn pthread_main_np() -> i32;
+    }
+    // SAFETY: the call reads nothing but the calling thread.
+    unsafe { pthread_main_np() != 0 }
+}
+
+/// The other systems have no thread to name: the host puts no step of the
+/// plugin lifecycle on their main thread.
+#[cfg(not(target_os = "macos"))]
+fn on_the_main_thread() -> bool {
+    false
+}
 
 /// One line through the standard library and one through the C runtime. On
 /// Windows the two have a path of their own to the standard output.
