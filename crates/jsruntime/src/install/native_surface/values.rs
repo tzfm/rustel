@@ -33,16 +33,11 @@ pub(super) fn midi_to_freq<'js>(
     )?))
 }
 
-pub(super) fn get_freq<'js>(ctx: Ctx<'js>, value: rquickjs::Value<'js>) -> rquickjs::Result<f64> {
-    let midi = if value.is_number() {
-        coerced_number(&ctx, value)?
-    } else if let Some(note) = value.as_string() {
-        rustel_core::util::note_to_midi(&note.to_string()?, 3)
-            .map_err(|message| rquickjs::Exception::throw_message(&ctx, &message))?
-    } else {
-        return Err(rquickjs::Exception::throw_message(&ctx, "not a note"));
-    };
-    Ok(rustel_core::util::midi_to_freq(midi))
+pub(super) fn get_freq<'js>(
+    ctx: Ctx<'js>,
+    value: rquickjs::Value<'js>,
+) -> rquickjs::Result<rquickjs::Value<'js>> {
+    super::super::core_utils::get_frequency_value(ctx, value)
 }
 
 pub(super) fn is_note<'js>(ctx: Ctx<'js>, value: rquickjs::Value<'js>) -> rquickjs::Result<bool> {

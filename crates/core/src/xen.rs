@@ -14,8 +14,8 @@ later version.
 
 //! The xen layer: `xen`, `withBase`, `ftrans`, `tuning`, `tune`, and
 //! `edoScale`. The layer matches strudel.cc wherever a score can observe the
-//! result: fractional scale indices yield NaN frequencies, context values
-//! stay string-typed, and `root` is a fixed-4 string.
+//! result: fractional indices in numeric scales yield NaN frequencies,
+//! context values stay string-typed, and `root` is a fixed-4 string.
 
 use crate::ops::PatOps;
 use crate::value::OrderedMap;
@@ -229,7 +229,7 @@ fn is_edo(name: &str) -> bool {
 /// EVERY path is multiplied by the 220 Hz default base unconditionally.
 fn get_xen_scale(arg: &Value) -> Result<Vec<f64>, String> {
     let ratios = match arg {
-        Value::List(items) => items.iter().filter_map(Value::as_f64).collect::<Vec<f64>>(),
+        Value::List(items) => items.iter().map(xen_ratio).collect::<Vec<f64>>(),
         Value::Str(name) => {
             if is_edo(name) {
                 edo(name)?
@@ -254,6 +254,153 @@ fn get_xen_scale(arg: &Value) -> Result<Vec<f64>, String> {
         .iter()
         .map(|ratio| ratio * XEN_DEFAULT_BASE)
         .collect())
+}
+
+fn xen_ratio(value: &Value) -> f64 {
+    if crate::query_error_pending() || crate::budget_exhausted() {
+        return f64::NAN;
+    }
+    let materialized;
+    let value = if matches!(value, Value::JsValue(_)) {
+        materialized = crate::materialize_js_value(value);
+        &materialized
+    } else {
+        value
+    };
+    match value {
+        Value::List(parts) => parts
+            .iter()
+            .map(js_number)
+            .reduce(|numerator, denominator| numerator / denominator)
+            .unwrap_or(f64::NAN),
+        Value::Str(ratio) => ratio
+            .split(':')
+            .map(|part| js_number(&Value::Str(part.into())))
+            .reduce(|numerator, denominator| numerator / denominator)
+            .unwrap_or(f64::NAN),
+        other => js_number(other),
+    }
+}
+
+/// Tune each note from the intersected patterns of its scale degrees.
+pub fn xen_patterns(pat: &crate::Pattern, ratios: Vec<crate::Pattern>) -> crate::Pattern {
+    if ratios.is_empty() {
+        return xen(pat, Value::List(Vec::new()));
+    }
+    crate::Pattern::of(crate::Node::XenPatterns(pat.clone(), ratios)).with_steps(pat.steps)
+}
+
+pub(crate) fn query_xen_patterns(
+    pat: &crate::Pattern,
+    ratios: &[crate::Pattern],
+    state: &crate::State,
+) -> Vec<Hap> {
+    let source = pat.query(state);
+    if crate::query_error_pending() || crate::budget_exhausted() {
+        return Vec::new();
+    }
+    let scale = ratios
+        .iter()
+        .fold(crate::pure(Value::List(Vec::new())), |scale, ratio| {
+            scale.app_both_with(ratio.clone(), |values, value| {
+                let Value::List(values) = values else {
+                    return Value::Undefined;
+                };
+                let mut values = values.clone();
+                values.push(value.clone());
+                Value::List(values)
+            })
+        })
+        .fmap(|value| {
+            let Value::List(ratios) = value else {
+                return Value::Undefined;
+            };
+            Value::List(
+                ratios
+                    .iter()
+                    .map(|ratio| Value::F64(xen_ratio(ratio)))
+                    .collect(),
+            )
+        });
+    let mut output = Vec::new();
+    for outer in source {
+        let outer = crate::combinators::materialized_hap(&outer).into_owned();
+        if crate::query_error_pending() || crate::budget_exhausted() {
+            return Vec::new();
+        }
+        let (offset, mut controls) = match xen_note(&outer.value) {
+            Ok(note) => note,
+            Err(message) => {
+                signal_query_error(move || message);
+                return Vec::new();
+            }
+        };
+        let Some(span) = outer.whole_or_part().intersection(&state.span) else {
+            continue;
+        };
+        let degree = outer.value.get("i").map(js_number).unwrap_or(f64::NAN);
+        let index = js_mod(degree, ratios.len() as f64);
+        let ratio_state = state.set_span(span);
+        let mut voices = Vec::new();
+        for (degree, ratio) in ratios.iter().enumerate() {
+            let haps = ratio.query(&ratio_state);
+            if crate::query_error_pending() || crate::budget_exhausted() {
+                return Vec::new();
+            }
+            if degree == index as usize {
+                voices = haps;
+            }
+        }
+        let scales = scale.query(&ratio_state);
+        if crate::query_error_pending() || crate::budget_exhausted() {
+            return Vec::new();
+        }
+        if !index.is_finite() || index.fract() != 0.0 {
+            signal_query_error(|| "xen scale degree must be an integer".into());
+            return Vec::new();
+        }
+        for (voice_index, ratio) in voices.into_iter().enumerate() {
+            let Some(scale) = scales.get(voice_index) else {
+                signal_query_error(|| "xen scale has no value for a selected ratio event".into());
+                return Vec::new();
+            };
+            let scale = match get_xen_scale(&scale.value) {
+                Ok(scale) => scale,
+                Err(message) => {
+                    signal_query_error(move || message);
+                    return Vec::new();
+                }
+            };
+            if crate::query_error_pending() || crate::budget_exhausted() {
+                return Vec::new();
+            }
+            controls.insert(
+                "freq".into(),
+                Value::F64(trim_freq(xen_offset(&scale, offset))),
+            );
+            // Pair scale events by position and keep the source spans.
+            let voice = outer
+                .combine_context(&ratio)
+                .with_value(|_| Value::Object(controls.clone()))
+                .with_pitch_live_controls(&outer);
+            if !crate::push_budgeted(&mut output, voice) {
+                return Vec::new();
+            }
+        }
+    }
+    output
+}
+
+fn xen_note(value: &Value) -> Result<(f64, OrderedMap), String> {
+    if !is_js_object(value) {
+        return Err("Expected hap to have control 'i' set, but received undefined, try wrapping input in i()".into());
+    }
+    if matches!(value, Value::Null) {
+        return Err("Cannot destructure property 'i' of 'hVal' as it is null.".into());
+    }
+    let (step, others) = destructure(value, "i");
+    let step = step.ok_or_else(|| "cannot parse as numeral: \"undefined\"".to_string())?;
+    Ok((parse_numeral(&step)?, others))
 }
 
 /// Scale lookup with octave folding. Fractional offsets miss the table and
@@ -293,26 +440,8 @@ pub fn xen<P: PatOps>(pat: &P, arg: Value) -> P {
     };
     pat.map_pitch_haps_native(move |hap| {
         let hap = &*crate::combinators::materialized_hap(hap);
-        if !is_js_object(&hap.value) {
-            // A primitive hap value has no `i` control.
-            return query_error(|| {
-                "Expected hap to have control 'i' set, but received undefined, try wrapping input in i()".to_string()
-            });
-        }
-        if matches!(hap.value, Value::Null) {
-            return query_error(|| {
-                "Cannot destructure property 'i' of 'hVal' as it is null.".to_string()
-            });
-        }
-        let (step, others) = destructure(&hap.value, "i");
-        let Some(step) = step else {
-            // A missing `i` fails numeral parsing as "undefined".
-            return query_error(|| {
-                "cannot parse as numeral: \"undefined\"".to_string()
-            });
-        };
-        let offset = match parse_numeral(&step) {
-            Ok(offset) => offset,
+        let (offset, others) = match xen_note(&hap.value) {
+            Ok(note) => note,
             Err(message) => return query_error(move || message),
         };
         let freq = trim_freq(xen_offset(&scale, offset));
@@ -1132,8 +1261,75 @@ mod tests {
         // A raw ratio list is scaled by the base too.
         let raw = get_xen_scale(&Value::List(vec![Value::F64(1.0), Value::F64(2.0)])).unwrap();
         assert_eq!(raw, vec![220.0, 440.0]);
+        let ratios = get_xen_scale(&Value::List(vec![
+            Value::Str("3:2".into()),
+            Value::List(vec![Value::F64(5.0), Value::F64(4.0)]),
+            Value::Str("bad".into()),
+            Value::F64(2.0),
+        ]))
+        .unwrap();
+        assert_eq!(ratios.len(), 4);
+        assert_eq!(&ratios[..2], &[330.0, 275.0]);
+        assert!(ratios[2].is_nan());
+        assert_eq!(ratios[3], 440.0);
         // The '12ji' preset resolves through the table.
         assert_eq!(get_xen_scale(&Value::Str("12ji".into())).unwrap().len(), 12);
+    }
+
+    #[test]
+    fn patterned_xen_keeps_the_source_and_wraps_degrees_safely() {
+        use rustel_fraction::Fraction;
+
+        let source = crate::stack(
+            [-1.0, 0.0, 1.0, 2.0, 3.0, -1e-20]
+                .map(|step| {
+                    crate::pure(Value::object([
+                        ("i".into(), Value::F64(step)),
+                        ("gain".into(), Value::F64(0.25)),
+                    ]))
+                })
+                .to_vec(),
+        )
+        .with_added_context(vec![(3, 8)])
+        .with_ui_visual_slot(2);
+        let before = source.query_arc(Fraction::ZERO, Fraction::ONE);
+        let tuned = xen_patterns(
+            &source,
+            vec![crate::pure(Value::F64(1.0)), crate::pure(Value::F64(1.5))],
+        );
+        assert!(tuned.is_pure());
+        let haps = tuned.query_arc(Fraction::ZERO, Fraction::ONE);
+        assert_eq!(haps.len(), 6);
+        for (hap, frequency) in haps.iter().zip([165.0, 220.0, 330.0, 440.0, 660.0, 110.0]) {
+            assert_eq!(
+                hap.value.get("freq").and_then(Value::as_f64),
+                Some(frequency)
+            );
+            assert_eq!(hap.value.get("gain").and_then(Value::as_f64), Some(0.25));
+            assert_eq!(hap.context, vec![(3, 8)]);
+            assert_eq!(hap.ui_visuals_context(), 4);
+            assert!(hap.value.get("i").is_none());
+        }
+        let after = source.query_arc(Fraction::ZERO, Fraction::ONE);
+        assert_eq!(after.len(), before.len());
+        for (after, before) in after.iter().zip(before) {
+            assert_eq!(after.value, before.value);
+            assert_eq!(after.whole, before.whole);
+            assert_eq!(after.part, before.part);
+            assert_eq!(after.context, before.context);
+        }
+        let doubled = xen_patterns(
+            &source,
+            vec![crate::stack(vec![
+                crate::pure(Value::F64(1.0)),
+                crate::pure(Value::F64(1.5)),
+            ])],
+        );
+        let state = crate::State::new(crate::TimeSpan::new(Fraction::ZERO, Fraction::ONE));
+        assert!(matches!(
+            doubled.try_query_state_with_budget(&state, 7),
+            Err(crate::QueryLimit::HapBudget { budget: 7 })
+        ));
     }
 
     /// The 10-significant-digit frequency trim.

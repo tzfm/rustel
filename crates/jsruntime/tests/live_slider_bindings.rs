@@ -101,6 +101,7 @@ fn pitch_combinators_after_sliders_keep_their_bound_controls_on_every_voice() {
         "note('c3').gain(sliderWithID('gain', 0)).lpf(sliderWithID('filter', 800)).scale('C:major').transpose(12).scaleTranspose(2).slow(16)",
         "chord('C').gain(sliderWithID('gain', 0)).lpf(sliderWithID('filter', 800)).voicing()",
         "i(0).gain(sliderWithID('gain', 0)).lpf(sliderWithID('filter', 800)).xen('12edo').withBase(440).ftrans(1)",
+        "i(0).gain(sliderWithID('gain', 0)).lpf(sliderWithID('filter', 800)).xen([\"[1:1 3:2]\", '5:4']).withBase(440)",
     ] {
         evaluate(&runtime, expression);
         let bindings = [

@@ -12,7 +12,7 @@ const EUCLID: crate::reference::ReferenceEntry = crate::reference::ReferenceEntr
     name: "euclid",
     synonyms: &[],
     summary: "Changes the structure of the pattern to form an Euclidean rhythm.",
-    description: "Changes the structure of the pattern to form an Euclidean rhythm.\nEuclidean rhythms are rhythms obtained using the greatest common\ndivisor of two numbers.  They were described in 2004 by Godfried\nToussaint, a Canadian computer scientist.  Euclidean rhythms are\nreally useful for computer/algorithmic music because they can\ndescribe a large number of rhythms with a couple of numbers.",
+    description: "Spreads pulses as evenly as possible across the steps. Negative pulses select the gaps. Negative steps hold each pulse until the next. When the pulse count exceeds the step count, the rhythm extends across enough cycles to fit the pulses.",
     params: &[
         crate::reference::ReferenceParam {
             name: "pulses",
@@ -82,7 +82,7 @@ const EUCLID_LEGATO: crate::reference::ReferenceEntry = crate::reference::Refere
     name: "euclidLegato",
     synonyms: &[],
     summary: "Similar to `euclid`, but each pulse is held until the next pulse, so there will be no gaps.",
-    description: "Similar to `euclid`, but each pulse is held until the next pulse,\nso there will be no gaps.",
+    description: "Holds each pulse until the next pulse. Negative pulses select the gaps before extending them. Negative steps use ordinary pulses with gaps. Extra pulses extend the rhythm across more cycles.",
     params: &[
         crate::reference::ReferenceParam {
             name: "pulses",
@@ -178,10 +178,10 @@ pub(super) fn register(r: &mut Registry) {
         EUCLID,
         3,
         false,
-        crate::native_combinator!(|args, pat| c::euclid_rot(
+        crate::native_combinator!(|args, pat| c::euclid_with_steps(
             &pat,
             arg_number(args, 0) as i32,
-            arg_number(args, 1) as i32,
+            arg_number(args, 1),
             0
         )),
     );
@@ -192,10 +192,10 @@ pub(super) fn register(r: &mut Registry) {
         EUCLID_ROT,
         4,
         false,
-        crate::native_combinator!(|args, pat| c::euclid_rot(
+        crate::native_combinator!(|args, pat| c::euclid_with_steps(
             &pat,
             arg_number(args, 0) as i32,
-            arg_number(args, 1) as i32,
+            arg_number(args, 1),
             arg_number(args, 2) as i32
         )),
     );
@@ -218,10 +218,10 @@ pub(super) fn register(r: &mut Registry) {
         EUCLID_LEGATO,
         3,
         false,
-        crate::native_combinator!(|args, pat| c::euclid_legato(
+        crate::native_combinator!(|args, pat| c::euclid_with_steps(
             &pat,
             arg_number(args, 0) as i32,
-            arg_number(args, 1) as i32,
+            -arg_number(args, 1),
             0
         )),
     );
@@ -232,10 +232,10 @@ pub(super) fn register(r: &mut Registry) {
         EUCLID_LEGATO_ROT,
         4,
         false,
-        crate::native_combinator!(|args, pat| c::euclid_legato(
+        crate::native_combinator!(|args, pat| c::euclid_with_steps(
             &pat,
             arg_number(args, 0) as i32,
-            arg_number(args, 1) as i32,
+            -arg_number(args, 1),
             arg_number(args, 2) as i32
         )),
     );

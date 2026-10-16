@@ -890,48 +890,60 @@ fn get_frequency<'js>(
     ctx: Ctx<'js>,
     args: Rest<rquickjs::Value<'js>>,
 ) -> rquickjs::Result<rquickjs::Value<'js>> {
-    let hap = argument(&ctx, &args.0, 0)
-        .into_object()
-        .ok_or_else(|| rquickjs::Exception::throw_type(&ctx, "hap is not an object"))?;
-    let value: rquickjs::Value = hap.get("value")?;
-    let context: rquickjs::Object = hap.get("context")?;
-    let context_type: rquickjs::Value = context.get("type")?;
-    let frequency = context_type
-        .as_string()
-        .is_some_and(|value| value.to_string().ok().as_deref() == Some("frequency"));
+    let value = argument(&ctx, &args.0, 0);
+    get_frequency_value(ctx, value)
+}
+
+pub(super) fn get_frequency_value<'js>(
+    ctx: Ctx<'js>,
+    input: rquickjs::Value<'js>,
+) -> rquickjs::Result<rquickjs::Value<'js>> {
+    let (mut value, mut frequency) = if let Some(hap) = input.as_object() {
+        let value = hap.get("value")?;
+        let context: rquickjs::Value = hap.get("context")?;
+        let context_type: Option<String> = match context.as_object() {
+            Some(context) => context
+                .get::<_, rquickjs::Value>("type")?
+                .as_string()
+                .map(|value| value.to_string())
+                .transpose()?,
+            None => None,
+        };
+        (value, context_type.as_deref() == Some("frequency"))
+    } else {
+        (input, false)
+    };
     if let Some(object) = value.as_object() {
         let freq: rquickjs::Value = object.get("freq")?;
         if truthy(&ctx, freq.clone())? {
             return Ok(freq);
         }
+        let mut note = rquickjs::Value::new_undefined(ctx.clone());
         for key in ["note", "n", "value"] {
             let candidate: rquickjs::Value = object.get(key)?;
             if !candidate.is_null() && !candidate.is_undefined() {
-                let get_freq: Function = ctx.globals().get("getFreq")?;
-                return get_freq.call((candidate,));
+                note = candidate;
+                break;
             }
         }
-        let get_freq: Function = ctx.globals().get("getFreq")?;
-        return get_freq.call((rquickjs::Value::new_undefined(ctx),));
+        value = note;
+        frequency = false;
     }
-    if value.is_number() && !frequency {
-        let midi_to_freq: Function = ctx.globals().get("midiToFreq")?;
-        return midi_to_freq.call((value,));
-    }
-    if let Some(text) = value.as_string()
-        && rustel_core::util::is_note(&text.to_string()?)
-    {
-        let midi = rustel_core::util::note_to_midi(&text.to_string()?, 3)
-            .map_err(|message| rquickjs::Exception::throw_message(&ctx, &message))?;
-        return numeric_result(&ctx, rustel_core::util::midi_to_freq(midi));
-    }
-    if !value.is_number() {
+    let midi = if let Some(number) = value.as_number() {
+        if frequency {
+            return Ok(value);
+        }
+        number
+    } else if let Some(note) = value.as_string() {
+        rustel_core::util::note_to_midi(&note.to_string()?, 3)
+            .map_err(|message| rquickjs::Exception::throw_message(&ctx, &message))?
+    } else {
         return Err(rquickjs::Exception::throw_message(
             &ctx,
-            &format!("not a note or frequency: {}", string(&ctx, value)?),
+            "not a note or frequency",
         ));
-    }
-    Ok(value)
+    };
+    numeric_result(&ctx, rustel_core::util::midi_to_freq(midi))
 }
 
 fn get_playable_note_value<'js>(

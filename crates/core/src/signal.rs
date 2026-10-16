@@ -15,6 +15,7 @@ later version.
 use crate::host_value::{HostValue, Pointer};
 use crate::rng::rand_at_time;
 use crate::{Pattern, Value, signal};
+use rustel_fraction::Fraction;
 
 pub fn saw() -> Pattern {
     signal(|time, _| Value::F64(time.to_f64().rem_euclid(1.0)))
@@ -73,6 +74,16 @@ pub fn isquare2() -> Pattern {
 
 pub fn time() -> Pattern {
     signal(|time, _| Value::F64(time.to_f64()))
+}
+
+/// Rises from zero to one over one cycle, then stays at one.
+pub fn open() -> Pattern {
+    signal(|time, _| Value::F64(time.min(Fraction::ONE).to_f64()))
+}
+
+/// Falls from one to zero over one cycle, then stays at zero.
+pub fn close() -> Pattern {
+    signal(|time, _| Value::F64((1.0 - time.to_f64()).max(0.0)))
 }
 
 pub fn rand() -> Pattern {
@@ -164,9 +175,8 @@ pub fn randrun(n: usize) -> Pattern {
 
 /// A list of `n` random values, sampled together at each moment.
 ///
-/// Unlike every other random signal, `randL` ignores `randSeed` - kept that
-/// way on purpose: a seeded score must get the same list strudel.cc gives.
-/// `partials(randL(8))` is the use: one value per harmonic, one instant.
+/// `randSeed` selects the random stream. For example, `partials(randL(8))`
+/// samples one value per harmonic at the same instant.
 /// A count past [`crate::MAX_STEPWISE_ENTRIES`] is refused as
 /// `StepwiseExpansion` before any list is built.
 pub fn rand_list_value(count: Value) -> Pattern {
@@ -185,8 +195,12 @@ pub fn rand_list_value(count: Value) -> Pattern {
         ));
     }
     let count = count as usize;
-    signal(move |time, _| {
-        let rands = crate::rng::rands_at_time(time.to_f64(), count, 0.0);
+    signal(move |time, controls| {
+        let seed = controls
+            .get("randSeed")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let rands = crate::rng::rands_at_time(time.to_f64(), count, seed);
         Value::List(
             rands
                 .into_iter()
@@ -285,6 +299,8 @@ pub fn signals(pointer: Option<&Pointer>) -> Vec<(&'static str, Pattern)> {
         ("itri", itri()),
         ("itri2", itri2()),
         ("time", time()),
+        ("open", open()),
+        ("close", close()),
         // Both spellings of each axis are exposed.
         ("mousex", mouse(x)),
         ("mouseX", mouse(x)),
@@ -344,5 +360,25 @@ mod tests {
             isaw().query_arc(quarter, Fraction::new(1, 2))[0].value,
             Value::F64(0.75)
         );
+    }
+
+    #[test]
+    fn open_and_close_stop_at_the_end_without_clamping_negative_time() {
+        for (time, opening, closing) in [
+            (
+                Fraction::int(i128::MIN),
+                i128::MIN as f64,
+                -(i128::MIN as f64),
+            ),
+            (Fraction::new(-1, 4), -0.25, 1.25),
+            (Fraction::ZERO, 0.0, 1.0),
+            (Fraction::new(1, 4), 0.25, 0.75),
+            (Fraction::ONE, 1.0, 0.0),
+            (Fraction::from(2), 1.0, 0.0),
+        ] {
+            let end = time + Fraction::ONE;
+            assert_eq!(open().query_arc(time, end)[0].value, Value::F64(opening));
+            assert_eq!(close().query_arc(time, end)[0].value, Value::F64(closing));
+        }
     }
 }

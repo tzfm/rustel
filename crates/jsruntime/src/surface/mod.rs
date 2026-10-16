@@ -484,6 +484,15 @@ pub(super) fn install_combinator<'js>(
                 method_registration.takes_function,
                 &args.0,
             )?;
+            if method_name.as_ref() == "xen"
+                && args.0.len() == 1
+                && let Some(array) = args.0[0].as_array()
+            {
+                let (pattern, nested) = reify_xen_array(&ctx, array, &receiver)?;
+                sidecars.extend(nested);
+                publish_owner_cells(&sidecars)?;
+                return derive_wrapper(ctx, pattern, &sidecars);
+            }
             let (arg_pats, arg_sidecars) = if midi || serial || bare_osc {
                 // A bare `.midi()` - or `.osc()` - deliberately stays
                 // argument-free so the native body selects its default
@@ -539,9 +548,20 @@ pub(super) fn install_combinator<'js>(
     }
 
     // Free-function form: the PATTERN IS THE LAST ARGUMENT.
+    let xen_array = name == "xen";
     let free = Function::new(
         ctx.clone(),
         hr_rest(move |ctx, args| {
+            if xen_array
+                && args.0.len() == 2
+                && let Some(array) = args.0[0].as_array()
+            {
+                let (receiver, owner) = reify_bridged(&ctx, &args.0[1])?;
+                let (pattern, mut sidecars) = reify_xen_array(&ctx, array, &receiver)?;
+                sidecars.push(owner);
+                publish_owner_cells(&sidecars)?;
+                return derive_wrapper(ctx, pattern, &sidecars);
+            }
             let (mut pats, sidecars) = reify_registered_args(&ctx, &args.0, indexed_transformer)?;
             let receiver = pats.pop().unwrap_or_else(rustel_core::silence);
             publish_owner_cells(&sidecars)?;

@@ -71,6 +71,73 @@ fn the_numeric_helpers_behave_as_upstream_writes_them() {
 }
 
 #[test]
+fn frequency_helpers_accept_notes_midi_and_events() {
+    for helper in ["getFreq", "getFrequency"] {
+        for input in [
+            "69",
+            "'a4'",
+            "{value: 69}",
+            "{value: 'a4', context: {type: 'note'}}",
+            "{value: 440, context: {type: 'frequency'}}",
+            "{value: {freq: 440, note: 0}}",
+            "{value: {note: 69}}",
+            "{value: {n: 'a4'}}",
+            "{value: {value: 69}}",
+            "{value: {note: null, n: 69}}",
+            "{value: {freq: null, note: 69}}",
+            "{value: {freq: 0, note: 69}}",
+            "{value: {freq: false, note: 69}}",
+            "{value: {freq: '', note: 69}}",
+            "{value: {freq: NaN, note: 69}}",
+            "note('a4').queryArc(0, 1)[0]",
+        ] {
+            assert_eq!(n(&format!("{helper}({input})")), 440.0, "{helper}({input})");
+        }
+        assert_eq!(
+            n(&format!(
+                "{helper}({{value: 0, context: {{type: 'frequency'}}}})"
+            )),
+            0.0
+        );
+        assert_eq!(
+            n(&format!("{helper}({{value: {{note: 0, n: 69}}}})")),
+            rustel_core::util::midi_to_freq(0.0)
+        );
+        assert_eq!(
+            n(&format!("{helper}('a')")),
+            rustel_core::util::midi_to_freq(57.0)
+        );
+        assert_eq!(
+            n(&format!(
+                "{helper}({{value: {{freq: '440', note: 69}}}}) === '440' ? 1 : 0"
+            )),
+            1.0
+        );
+    }
+}
+
+#[test]
+fn frequency_helpers_reject_missing_or_invalid_values() {
+    for helper in ["getFreq", "getFrequency"] {
+        for input in [
+            "null",
+            "undefined",
+            "true",
+            "'not a note'",
+            "{}",
+            "{value: null}",
+            "{value: {}}",
+            "{value: {note: false, n: 69}}",
+        ] {
+            assert!(
+                n_of(&format!("{helper}({input})")).is_err(),
+                "{helper}({input})"
+            );
+        }
+    }
+}
+
+#[test]
 fn uniq_works_here_although_upstream_throws() {
     // Upstream's `uniq` calls `seen.hasOwn(item)`. `hasOwn` is a static on
     // `Object`, so upstream throws a TypeError on every non-empty array.

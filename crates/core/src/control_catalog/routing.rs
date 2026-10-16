@@ -161,20 +161,18 @@ pub(super) const DELAYSPEED: ControlRow = ControlRow {
     aliases: &[],
     reference: ReferenceEntry {
         name: "delayspeed",
-        synonyms: &["delayt", "dt"],
-        summary: "Sets the time of the delay effect.",
-        description: "Sets the time of the delay effect.",
+        synonyms: &[],
+        summary: "Delay playback speed. Unsupported in native audio.",
+        description: "Stores a delay playback speed for external output. Rustel does not apply this control to native audio. Use delaytime to set the time between echoes.",
         params: &[
             ReferenceParam {
                 name: "delayspeed",
                 r#type: "number | Pattern",
-                description: "controls the pitch of the delay feedback",
+                description: "playback speed multiplier",
             },
         ],
-        examples: &[
-            "note(\"d d a# a\".fast(2)).s(\"sawtooth\").delay(.8).delaytime(1/2).delayspeed(\"<2 .5 -1 -2>\")",
-        ],
-        tags: &["orbit", "audio"],
+        examples: &[],
+        tags: &["orbit", "osc"],
         no_autocomplete: false,
         deprecated: false,
         origin: "rustel",
@@ -187,8 +185,8 @@ pub(super) const DELAYTIME: ControlRow = ControlRow {
     reference: ReferenceEntry {
         name: "delaytime",
         synonyms: &["delayt", "dt"],
-        summary: "Delay time in seconds; requires a positive delay send.",
-        description: "Overrides delaysync when explicit. Without it the default is 3/16 cycles divided by cycles per second. Positive times are capped at 1 second; a nonpositive time disables the send. delay and delayfeedback must also be positive.",
+        summary: "Delay time in seconds. Requires a positive delay send.",
+        description: "Overrides delaysync when explicit. Without it the default is 3/16 cycles divided by cycles per second. Positive times are capped at 1 second. A nonpositive time disables the send. delay and delayfeedback must also be positive.",
         params: &[
             ReferenceParam {
                 name: "delay",
@@ -197,7 +195,7 @@ pub(super) const DELAYTIME: ControlRow = ControlRow {
             },
         ],
         examples: &[
-            "note(\"d d a# a\".fast(2))\n.s(\"sawtooth\")\n.delay(.8)\n.delaytime(1/2)\n.delayspeed(\"<2 .5 -1 -2>\")",
+            "note(\"d d a# a\".fast(2))\n.s(\"sawtooth\")\n.delay(.8)\n.delaytime(1/2)",
         ],
         tags: &["orbit", "audio"],
         no_autocomplete: false,
@@ -365,7 +363,7 @@ pub(super) const ROOM: ControlRow = ControlRow {
             ReferenceParam {
                 name: "level",
                 r#type: "number | Pattern",
-                description: "between 0 and 1",
+                description: "Reverb send amount. Values above 1 increase the send.",
             },
         ],
         examples: &[
