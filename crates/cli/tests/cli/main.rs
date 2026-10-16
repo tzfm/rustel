@@ -28,23 +28,34 @@ fn rustel() -> Command {
     command
 }
 
+/// The wall-clock bound of one run, unless a test names its own.
+const RUN_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Run with a hard wall-clock bound.
 ///
 /// A subprocess that never returns is worse than one that crashes: without a
 /// timeout the test suite hangs instead of failing, and a supervisor cannot
 /// tell it from slow work. `--duration inf` did exactly that.
 fn run(args: &[&str]) -> Output {
+    run_within(args, RUN_LIMIT)
+}
+
+fn run_within(args: &[&str], limit: std::time::Duration) -> Output {
     let child = rustel()
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn rustel");
-    wait_for_output(child, args)
+    wait_within(child, args, limit)
 }
 
-fn wait_for_output(mut child: Child, args: &[&str]) -> Output {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+fn wait_for_output(child: Child, args: &[&str]) -> Output {
+    wait_within(child, args, RUN_LIMIT)
+}
+
+fn wait_within(mut child: Child, args: &[&str], limit: std::time::Duration) -> Output {
+    let deadline = std::time::Instant::now() + limit;
     loop {
         if child.try_wait().expect("wait").is_some() {
             return child.wait_with_output().expect("collect output");
@@ -52,7 +63,7 @@ fn wait_for_output(mut child: Child, args: &[&str]) -> Output {
         if std::time::Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("{args:?} did not terminate within 60s");
+            panic!("{args:?} did not terminate within {limit:?}");
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -134,7 +145,15 @@ fn ok_stdout(args: &[&str]) -> String {
 /// this surface must never produce - the caller cannot tell a diagnosed error
 /// from a crash any other way.
 fn assert_reported_failure(args: &[&str], expect_in_stderr: &str) {
-    let out = run(args);
+    assert_reported_failure_within(args, expect_in_stderr, RUN_LIMIT);
+}
+
+fn assert_reported_failure_within(
+    args: &[&str],
+    expect_in_stderr: &str,
+    limit: std::time::Duration,
+) {
+    let out = run_within(args, limit);
     let code = out.status.code();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -7193,11 +7212,30 @@ fn an_impossibly_slow_replay_is_refused_not_panicked_in_delivery() {
 }
 
 #[test]
+fn a_closed_output_pipe_ends_the_output_quietly() {
+    let args = ["trace", "-e", r#"s("bd*16")"#, "--duration", "60"];
+    let mut child = rustel()
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rustel");
+    // The reader goes before the first line, as `head` goes after its own.
+    drop(child.stdout.take());
+    let out = wait_for_output(child, &args);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
+#[test]
 fn an_unbounded_onset_count_is_refused_not_accumulated() {
     // The density half. `play` holds the whole timeline before emitting it, so
     // the onset COUNT is the allocation input; a duration cap alone does not
     // bound it.
-    assert_reported_failure(
+    // The cap is 1,000,000 onsets, and a debug build takes about 70 s to
+    // reach it.
+    assert_reported_failure_within(
         &[
             "trace",
             "--json",
@@ -7207,6 +7245,7 @@ fn an_unbounded_onset_count_is_refused_not_accumulated() {
             "86400",
         ],
         "onsets",
+        std::time::Duration::from_secs(300),
     );
 }
 

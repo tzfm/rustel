@@ -6,6 +6,9 @@
 - Euclidean rhythms accept negative steps and more pulses than steps. Negative steps switch between regular and legato notes. Extra pulses extend the rhythm across cycles. Legato rotation shifts the rhythm without shifting the source notes.
 - `stackLeft`, `stackRight`, `stackCenter` and `stackRepeat` combine patterns with different step counts. `degradeByWith` uses a signal to choose which events to keep. `open` and `close` provide fades over one cycle.
 - Custom `xen` scales accept ratio strings and patterns. `randL` uses the score's random seed. `getFreq` and `getFrequency` both accept notes and events.
+- Rustel joins a Link session that is already running and takes its tempo. Before, the running session took the rustel tempo: an app playing at 128 BPM jumped to 90 BPM when `rustel play --link` started at 90 BPM.
+- Stop stops the set when auto evaluate is on. An edit that applied in the 100 ms after the press started the set again.
+- `rustel vst | head -1` and other pipes into a reader that stops early end quietly with exit code 0. Rustel printed a panic when the reader closed the pipe.
 
 ## v0.1.3
 

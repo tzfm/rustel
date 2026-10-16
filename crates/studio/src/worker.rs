@@ -119,6 +119,8 @@ pub enum StudioControlEvent {
     Snapshot(Box<StudioSnapshot>),
     Stopped(Box<StudioStop>),
     EngineFailure(EngineFailure),
+    /// Link could not start. The diagnostic before it says why.
+    LinkRefused,
 }
 
 #[derive(Debug)]
@@ -1828,6 +1830,7 @@ fn process_command(
                         format!("link: {error}"),
                     )),
                 );
+                push_control(pending, StudioControlEvent::LinkRefused);
             }
             false
         }

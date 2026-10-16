@@ -171,7 +171,8 @@ pub fn out() -> &'static Out {
 impl Out {
     /// The stream for a number of writes with no line of a different
     /// thread between them. A process with no standard output loses each
-    /// write with no error, as the standard library does.
+    /// write with no error, as the standard library does. So does a pipe
+    /// whose reader has gone, as `head` goes after its lines.
     pub fn lock(&self) -> OutLock<'_> {
         OutLock(self.0.lock().unwrap_or_else(|error| error.into_inner()))
     }
@@ -219,17 +220,33 @@ impl Out {
 /// The locked stream of [`Out::lock`].
 pub struct OutLock<'a>(MutexGuard<'a, Option<Stream>>);
 
+impl OutLock<'_> {
+    /// The reader of the pipe has gone. The output ends, and the run goes
+    /// on to its usual end.
+    fn close(&mut self) {
+        *self.0 = None;
+    }
+}
+
 impl Write for OutLock<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        match self.0.as_mut() {
-            Some(stream) => stream.write(bytes),
+        match self.0.as_mut().map(|stream| stream.write(bytes)) {
+            Some(Err(error)) if error.kind() == io::ErrorKind::BrokenPipe => {
+                self.close();
+                Ok(bytes.len())
+            }
+            Some(written) => written,
             None => Ok(bytes.len()),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        match self.0.as_mut() {
-            Some(stream) => stream.flush(),
+        match self.0.as_mut().map(Write::flush) {
+            Some(Err(error)) if error.kind() == io::ErrorKind::BrokenPipe => {
+                self.close();
+                Ok(())
+            }
+            Some(flushed) => flushed,
             None => Ok(()),
         }
     }
