@@ -526,3 +526,148 @@ impl StudioUiState {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::tests::accepted;
+    use rustel_audio::TakeoverCut;
+
+    /// A delivered layout answers two questions apart: that the display has
+    /// something to draw, and which generation it draws.
+    #[test]
+    fn a_delivered_layout_knows_which_generation_it_describes() {
+        let source = "$: s(\"bd\")._spectrum()";
+        let mut delivery = LayoutDelivery::default();
+        assert!(!delivery.delivered());
+
+        // Generation 7 has been evaluated; the device is still on 6.
+        assert!(delivery.observe(source, 7).expect("layout"));
+        assert!(delivery.try_deliver(&mut accepted));
+
+        assert!(delivery.delivered());
+        assert!(!delivery.ready_for(6));
+        assert!(delivery.ready_for(7));
+    }
+
+    /// A widget is placed from the score that was evaluated, not from the one
+    /// still coming out of the speakers.
+    ///
+    /// The two differ while a replacement waits to be prefilled. Gating on
+    /// the audible generation meant a `_spectrum()` added to a playing score
+    /// did not appear until the sound swapped, which reads as the studio
+    /// being slow rather than as it being careful. Upstream places the widget
+    /// during evaluation, before the pattern is even handed to its scheduler.
+    ///
+    /// What still waits for the cutover is the widget's tap: a voice carries
+    /// its slot bit as numbered by the generation that evaluated it, and the
+    /// tap reset takes the device's current generation as its capture floor,
+    /// so arming early would draw the old score's voices in the new widget.
+    #[test]
+    fn after_step_delivers_the_evaluated_layout_before_the_device_cuts_over() {
+        let mut session = Session::new().expect("session");
+        // The device stays on the generation that was current BEFORE the
+        // evaluation, as it does while the replacement's first window is
+        // still being prefilled.
+        let device =
+            LiveScalarDevice::start_silent(48_000, session.generation()).expect("silent output");
+        session.evaluate("$: s(\"bd\")._spectrum()").expect("score");
+        assert_ne!(device.generation(), session.generation());
+
+        let mut ui = StudioUiState::new(Duration::from_millis(50));
+        let mut diagnostics = PendingDiagnostics::default();
+        let mut updates = Vec::new();
+        ui.after_step(
+            &mut session,
+            &device,
+            Duration::ZERO,
+            true,
+            false,
+            Vec::new(),
+            &mut diagnostics,
+            &mut |update| {
+                updates.push(update);
+                Ok(())
+            },
+        );
+
+        let layout = updates
+            .iter()
+            .find_map(|update| match update {
+                StudioUpdate::Layout(layout) => Some(layout),
+                _ => None,
+            })
+            .expect("a layout was emitted before the device cut over");
+        assert_eq!(layout.ui_layout.generation, session.generation());
+        assert!(ui.layout.delivered());
+        assert!(!ui.layout.ready_for(device.generation()));
+        assert_eq!(
+            ui.visual_audio_mask, AUDITION_VISUALS,
+            "the widget's tap waits for the device to take its generation"
+        );
+
+        // The cutover: the device takes the evaluated generation, and only
+        // now is the widget's tap armed.
+        device.set_generation(session.generation(), 0, TakeoverCut::None);
+        ui.after_step(
+            &mut session,
+            &device,
+            Duration::from_millis(100),
+            true,
+            false,
+            Vec::new(),
+            &mut diagnostics,
+            &mut accepted,
+        );
+        assert!(ui.layout.ready_for(device.generation()));
+        assert_eq!(ui.visual_audio_mask, AUDITION_VISUALS | 1);
+        device.stop();
+    }
+
+    #[test]
+    fn layout_is_retried_and_gates_its_generation() {
+        let mut delivery = LayoutDelivery::default();
+        let source = "note(\"c4\").scope()";
+        assert!(delivery.observe(source, 7).expect("layout"));
+        assert!(!delivery.ready_for(7));
+
+        let mut refused = |update| match update {
+            StudioUpdate::Layout(_) => Err((UiEventSendStatus::DroppedFull, update)),
+            _ => unreachable!(),
+        };
+        assert!(!delivery.try_deliver(&mut refused));
+        assert!(!delivery.ready_for(7));
+        assert!(delivery.pending.is_some());
+
+        assert!(delivery.try_deliver(&mut accepted));
+        assert!(delivery.ready_for(7));
+        assert!(delivery.pending.is_none());
+    }
+
+    #[test]
+    fn invalid_new_layout_still_clears_the_previous_generation() {
+        let mut delivery = LayoutDelivery::default();
+        assert!(
+            delivery
+                .observe("note(60)._pianoroll()", 1)
+                .expect("initial layout")
+        );
+        assert!(delivery.try_deliver(&mut accepted));
+
+        let invalid = std::iter::repeat_n(
+            "p.scope()",
+            rustel_runtime::ui_events::MAX_UI_LAYOUT_VISUALS + 1,
+        )
+        .collect::<Vec<_>>()
+        .join(";\n");
+        assert!(delivery.observe(&invalid, 2).is_err());
+        let reset = delivery.pending.as_ref().expect("empty reset layout");
+        assert_eq!(reset.ui_layout.generation, 2);
+        assert_eq!(reset.ui_layout.source_revision, source_revision(&invalid));
+        assert!(reset.ui_layout.visuals.is_empty());
+        assert!(reset.ui_layout.sliders.is_empty());
+        assert!(reset.ui_layout.mini_locations.is_empty());
+        assert!(delivery.try_deliver(&mut accepted));
+        assert!(delivery.ready_for(2));
+    }
+}

@@ -458,3 +458,446 @@ impl App {
         self.queue_evaluation_for(scene, revision, source, false);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod prebakes {
+        //! Tests for `app/prebakes.rs`.
+
+        use crate::app::tests::support::*;
+        use crate::app::*;
+
+        /// Enter on a prebake row opens it as a tab and hands over the keyboard.
+        #[test]
+        fn the_settings_sheet_opens_a_prebake_as_a_tab() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+
+            app.toggle_settings_sheet();
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Settings));
+            // Up from the top wraps to the last row (full paths), then trim
+            // recordings, then the local prebake.
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+            assert!(app.settings_sheet.is_none(), "the sheet handed over");
+            assert_eq!(app.focus, Focus::Editor);
+            assert_eq!(app.current_prebake(), Some(PrebakeScope::Local));
+            assert_eq!(app.editor().source(), prebake::PREBAKE_STARTER);
+            assert!(!app.scenes.current().dirty, "a tab opens on what is stored");
+            assert_eq!(app.scenes.score_count(), 1);
+            assert_eq!(app.scenes.len(), 2);
+            assert!(app.status.contains("prebake (local)"), "{}", app.status);
+        }
+
+        /// A prebake tab is never a file: its text goes where its scope keeps
+        /// it, and the folder gains no score.
+        #[test]
+        fn a_prebake_tab_is_kept_but_never_written_as_a_score() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+
+            app.open_prebake(PrebakeScope::Global);
+            type_text(&mut app, "globalThis.riff = 1");
+            assert!(app.scenes.current().dirty);
+            press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+
+            assert_eq!(app.scenes.len(), 1, "the tab closed");
+            assert!(app.global_prebake.contains("globalThis.riff = 1"));
+            let file = directory.path().join("config").join("prebake.strudel");
+            assert!(file.exists(), "the global prebake was not kept");
+            assert!(
+                std::fs::read_to_string(&file)
+                    .expect("read")
+                    .contains("globalThis.riff = 1")
+            );
+            let scores = std::fs::read_dir(directory.path())
+                .expect("read dir")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "strudel"))
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                scores,
+                ["first.strudel"],
+                "a prebake tab was written as a score, or the global one as a scene"
+            );
+            assert!(
+                !directory.path().join("rustel-set.json").exists(),
+                "a global prebake earned the set a project file"
+            );
+        }
+
+        /// Closing a dirty local prebake keeps it in the set's project file.
+        #[test]
+        fn closing_a_local_prebake_keeps_it_in_the_project_file() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+
+            app.open_prebake(PrebakeScope::Local);
+            type_text(&mut app, "globalThis.k = 1");
+            press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+
+            let manifest = std::fs::read_to_string(directory.path().join("rustel-set.json"))
+                .expect("project file");
+            assert!(manifest.contains("globalThis.k = 1"), "{manifest}");
+            assert!(manifest.contains("first.strudel"));
+            assert!(
+                !manifest.contains("prebake (local)"),
+                "the tab was listed as a scene: {manifest}"
+            );
+        }
+
+        /// A prebake that does not check out is still kept - nothing is lost by
+        /// closing - but it says so, and keeps saying so.
+        #[test]
+        fn closing_a_prebake_that_does_not_check_out_keeps_it_and_says_so() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+
+            app.open_prebake(PrebakeScope::Global);
+            type_text(&mut app, "globalThis.a = (");
+            press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+
+            assert!(
+                app.global_prebake.contains("globalThis.a = ("),
+                "the text was thrown away"
+            );
+            assert_eq!(
+                app.prebake_rows()[PrebakeScope::Global.index()].verdict,
+                PrebakeVerdict::Rejected
+            );
+            let error = app.errors.get(ErrorOwner::Setup).expect("a setup error");
+            assert!(error.contains("prebake (global)"), "{error}");
+
+            // A later score refusal does not take the setup's message away: the
+            // setup is still broken after the newer message.
+            app.set_error(ErrorOwner::Evaluation, "something else".into());
+            assert!(app.errors.get(ErrorOwner::Setup).is_some());
+        }
+
+        /// Update on a prebake tab keeps it, runs it, and never pretends to be
+        /// an evaluation.
+        #[test]
+        fn update_on_a_prebake_tab_keeps_it_and_queues_it_without_touching_the_score() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+
+            app.open_prebake(PrebakeScope::Local);
+            type_text(&mut app, "globalThis.riff = () => note('c')");
+            press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+
+            assert!(
+                app.scenes.local_prebake().contains("globalThis.riff"),
+                "update did not keep the setup"
+            );
+            assert!(!app.scenes.current().dirty, "the tab stayed dirty");
+            assert!(app.inflight.is_empty(), "a setup went out as an evaluation");
+            assert!(app.pending_evaluation.is_none());
+            assert!(app.armed_scene.is_none());
+            assert_eq!(app.next_launch, Launch::Now);
+
+            settle(&mut app);
+            assert_eq!(
+                app.prebake_rows()[PrebakeScope::Local.index()].verdict,
+                PrebakeVerdict::Applied,
+                "status: {}",
+                app.status
+            );
+            assert!(
+                app.applied_setup[PrebakeScope::Local.index()]
+                    .names
+                    .iter()
+                    .any(|name| name == "riff"),
+                "the checker was not told what the setup defined"
+            );
+        }
+
+        /// A global update runs global first and the set's own behind it, so
+        /// one heap sees them in the documented order.
+        #[test]
+        fn a_global_update_reapplies_the_local_one_behind_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.scenes.set_local_prebake("globalThis.l = 1");
+
+            app.open_prebake(PrebakeScope::Global);
+            type_text(&mut app, "globalThis.g = 1");
+            press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+
+            let queued = std::iter::once(
+                app.prebake_inflight
+                    .as_ref()
+                    .map(|request| request.scope)
+                    .expect("the global one went first"),
+            )
+            .chain(app.prebake_queue.iter().map(|request| request.scope))
+            .collect::<Vec<_>>();
+            assert_eq!(queued, [PrebakeScope::Global, PrebakeScope::Local]);
+            assert!(
+                !app.prebake_inflight
+                    .as_ref()
+                    .expect("in flight")
+                    .reinstall_after,
+                "only the end of a chain re-installs"
+            );
+        }
+
+        /// An empty prebake is kept as nothing and never run.
+        #[test]
+        fn an_empty_prebake_is_kept_as_nothing_and_never_run() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+
+            app.open_prebake(PrebakeScope::Global);
+            // The starter is comments, which are text; empty it entirely.
+            app.scenes.current_mut().editor = crate::editor::Editor::new("   ").expect("editor");
+            press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+
+            assert!(app.prebake_inflight.is_none());
+            assert!(app.prebake_queue.is_empty());
+            assert!(app.global_prebake.is_empty());
+            assert!(
+                !directory
+                    .path()
+                    .join("config")
+                    .join("prebake.strudel")
+                    .exists(),
+                "an empty prebake left a file behind"
+            );
+            assert!(app.status.contains("empty"), "{}", app.status);
+        }
+
+        /// A prebake the checker refuses is neither kept nor run.
+        #[test]
+        fn a_prebake_the_checker_refuses_is_not_applied() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+
+            app.open_prebake(PrebakeScope::Global);
+            type_text(&mut app, "setcps(1)");
+            press(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+
+            assert!(app.prebake_inflight.is_none(), "a refused setup was run");
+            assert!(app.global_prebake.is_empty(), "a refused setup was kept");
+            assert!(app.status.contains("refused"), "{}", app.status);
+            assert!(
+                app.status.contains("setup was not applied"),
+                "{}",
+                app.status
+            );
+        }
+
+        /// A score may call what an applied setup defined; without it, the same
+        /// score is an unknown function.
+        #[test]
+        fn a_score_calling_a_setup_helper_is_not_refused() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let score = Arc::<str>::from("$: riff()");
+            let revision = app.editor().revision();
+
+            assert!(
+                app.refuse_unclean(revision, &score),
+                "without a setup this really is unknown"
+            );
+
+            app.applied_setup[PrebakeScope::Global.index()] = Arc::new(
+                rustel_transpiler::setup_definitions("globalThis.riff = () => note('c')"),
+            );
+            assert!(
+                !app.refuse_unclean(revision, &score),
+                "the setup's names did not reach the checker"
+            );
+        }
+
+        /// A setup applying while a score sounds installs that score again, off
+        /// the tape, so the music takes the new definitions.
+        #[test]
+        fn a_setup_reinstalls_the_sounding_score_but_never_records_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let scene = app.scenes.current().id;
+            let source = Arc::<str>::from("$: s(\"bd\")");
+
+            app.snapshot = Some(sounding(true, false));
+            app.installed_revision = Some(source_revision(&source));
+            app.audible_scene = Some(scene);
+            app.visual_revision = Some(app.editor().revision());
+            app.evaluated_source = Some(Arc::clone(&source));
+            app.ui_settings.quantise = crate::settings::Quantise::Cycle;
+
+            app.prebake_inflight = Some(PrebakeRequest {
+                request_id: 4_242,
+                scope: PrebakeScope::Global,
+                source: Arc::from("globalThis.g = 1"),
+                reinstall_after: true,
+            });
+            app.handle_prebake(PrebakeOutcome {
+                request_id: 4_242,
+                scope: PrebakeScope::Global,
+                result: Ok(()),
+            });
+
+            let sent = app
+                .pending_evaluation
+                .as_ref()
+                .or_else(|| app.inflight.values().next())
+                .expect("the sounding score was not installed again");
+            assert_eq!(&*sent.source, &*source);
+            assert!(!sent.record, "the re-install reached the tape");
+            assert_eq!(sent.launch, Launch::Quantised { unit_cycles: 1.0 });
+            assert!(
+                app.log
+                    .lines()
+                    .iter()
+                    .any(|line| line.text.contains("re-installing")),
+                "the log did not say why the score was installed again"
+            );
+        }
+
+        /// Stopped, a setup changes the heap and nothing else: it never starts
+        /// the transport, so there is nothing to re-install.
+        #[test]
+        fn nothing_is_reinstalled_while_the_studio_is_stopped() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.snapshot = None;
+            app.audible_scene = Some(app.scenes.current().id);
+            app.visual_revision = Some(app.editor().revision());
+            app.evaluated_source = Some(Arc::from("$: s(\"bd\")"));
+
+            app.prebake_inflight = Some(PrebakeRequest {
+                request_id: 7,
+                scope: PrebakeScope::Global,
+                source: Arc::from("globalThis.g = 1"),
+                reinstall_after: true,
+            });
+            app.handle_prebake(PrebakeOutcome {
+                request_id: 7,
+                scope: PrebakeScope::Global,
+                result: Ok(()),
+            });
+
+            assert!(app.pending_evaluation.is_none());
+            assert!(app.inflight.is_empty());
+        }
+
+        /// A refused setup ends its chain and reports under `setup`, and the
+        /// sounding score is left alone.
+        #[test]
+        fn a_refused_setup_ends_the_chain_and_never_reinstalls() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.snapshot = Some(sounding(true, false));
+            app.audible_scene = Some(app.scenes.current().id);
+            app.visual_revision = Some(app.editor().revision());
+            app.evaluated_source = Some(Arc::from("$: s(\"bd\")"));
+
+            app.prebake_inflight = Some(PrebakeRequest {
+                request_id: 9,
+                scope: PrebakeScope::Global,
+                source: Arc::from("globalThis.g = 1"),
+                reinstall_after: false,
+            });
+            app.prebake_queue.push_back(PrebakeRequest {
+                request_id: 10,
+                scope: PrebakeScope::Local,
+                source: Arc::from("globalThis.l = 1"),
+                reinstall_after: true,
+            });
+            app.handle_prebake(PrebakeOutcome {
+                request_id: 9,
+                scope: PrebakeScope::Global,
+                result: Err(crate::worker::EngineFailure {
+                    kind: "evaluation".into(),
+                    message: "boom".into(),
+                    recoverable: true,
+                    playback_stopped: false,
+                }),
+            });
+
+            assert!(
+                app.prebake_queue.is_empty(),
+                "the set's setup ran on half a heap"
+            );
+            assert!(app.pending_evaluation.is_none() && app.inflight.is_empty());
+            let error = app.errors.get(ErrorOwner::Setup).expect("a setup error");
+            assert!(error.contains("prebake (global)"), "{error}");
+            assert!(
+                app.log
+                    .lines()
+                    .iter()
+                    .any(|line| line.kind == "setup" && line.level == LogLevel::Error),
+                "the log did not carry it under setup"
+            );
+        }
+
+        /// A Stop is about the transport. It does not throw a setup away.
+        #[test]
+        fn a_stop_does_not_lose_a_queued_setup() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.prebake_queue.push_back(PrebakeRequest {
+                request_id: 3,
+                scope: PrebakeScope::Local,
+                source: Arc::from("globalThis.l = 1"),
+                reinstall_after: false,
+            });
+
+            app.dispatch_editor(Command::Stop).expect("stop");
+            assert_eq!(app.prebake_queue.len(), 1);
+        }
+
+        /// A prebake tab is not launched, renamed, padded or exported.
+        #[test]
+        fn a_prebake_tab_refuses_what_only_a_scene_answers_to() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.open_prebake(PrebakeScope::Local);
+            let index = app.scenes.current_index();
+
+            app.launch_scene(index).expect("launch");
+            assert!(app.inflight.is_empty() && app.pending_evaluation.is_none());
+            assert!(app.status.contains("setup"), "{}", app.status);
+
+            app.begin_rename();
+            assert_eq!(app.strip_mode, SceneStripMode::Idle);
+            app.begin_learn();
+            assert_eq!(app.strip_mode, SceneStripMode::Idle);
+            app.toggle_export_sheet();
+            assert!(app.export_sheet.is_none());
+            app.new_scene(true);
+            assert_eq!(
+                app.scenes.score_count(),
+                1,
+                "a setup was duplicated as a score"
+            );
+        }
+
+        /// A setup stored broken is reported at startup and never run, and the
+        /// scores open regardless.
+        #[test]
+        fn a_broken_stored_setup_is_reported_at_startup_and_the_scores_still_open() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.global_prebake = "globalThis.a = (".to_owned();
+            app.scenes.set_local_prebake("globalThis.l = 1");
+
+            app.queue_startup_prebakes();
+
+            let queued = app
+                .prebake_inflight
+                .iter()
+                .map(|request| request.scope)
+                .chain(app.prebake_queue.iter().map(|request| request.scope))
+                .collect::<Vec<_>>();
+            assert_eq!(queued, [PrebakeScope::Local], "a broken setup was run");
+            assert!(app.errors.get(ErrorOwner::Setup).is_some());
+            assert_eq!(app.scenes.score_count(), 1);
+            assert_eq!(app.editor().source(), "$: s(\"bd\")\n");
+        }
+    }
+}

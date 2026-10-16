@@ -334,3 +334,292 @@ impl App {
         shutdown_error
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod persistence {
+        //! Tests for `app/persistence.rs`.
+
+        use crate::app::tests::support::*;
+        use crate::app::*;
+
+        #[test]
+        fn failed_preferences_write_stays_visible_and_retries_without_losing_changes() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let path = StudioPrefs::path().expect("test config path");
+            // A directory at the destination gives an OS-level write failure even
+            // when the test runs with elevated filesystem permissions.
+            std::fs::create_dir(&path).expect("block preferences destination");
+
+            app.set_error(ErrorOwner::Save, "scene save failed".into());
+            app.prefs.frame_rate = Some("30".into());
+            app.save_prefs_soon();
+            app.flush_prefs();
+            assert!(app.prefs_pending, "failed write remains owed");
+            assert!(app.prefs_retry_at.is_some(), "a retry is scheduled");
+            assert!(
+                app.errors
+                    .get(ErrorOwner::Preferences)
+                    .is_some_and(|message| message.contains("preferences not saved")),
+                "the failure is visible in the footer"
+            );
+            assert_eq!(app.errors.get(ErrorOwner::Save), Some("scene save failed"));
+            app.set_error(ErrorOwner::Engine, "engine stopped".into());
+
+            app.prefs.show_full_paths = Some(true);
+            app.save_prefs_soon();
+            assert!(
+                app.prefs_retry_at.is_none(),
+                "a new edit may retry promptly"
+            );
+            app.flush_prefs();
+            assert!(app.prefs_pending, "the second failed write remains owed");
+            assert_eq!(
+                app.log
+                    .lines()
+                    .iter()
+                    .filter(|line| line.kind == "prefs")
+                    .count(),
+                1,
+                "a failure that persists is logged once"
+            );
+            assert_eq!(
+                app.errors.visible(),
+                Some("engine stopped"),
+                "a failure that persists does not take the footer from a newer error"
+            );
+            std::fs::remove_dir(&path).expect("restore write access");
+            app.pump_turn();
+            assert!(app.prefs_pending, "no retry before the retry delay");
+            app.prefs_retry_at = Some(Instant::now() - Duration::from_millis(1));
+            app.pump_turn();
+            assert!(!app.prefs_pending);
+            assert!(app.prefs_retry_at.is_none());
+            assert!(app.errors.get(ErrorOwner::Preferences).is_none());
+            assert_eq!(app.errors.get(ErrorOwner::Save), Some("scene save failed"));
+            let saved = StudioPrefs::load();
+            assert_eq!(saved.frame_rate.as_deref(), Some("30"));
+            assert_eq!(saved.show_full_paths, Some(true));
+        }
+
+        /// A debounced set-file write does not outlive the set that asked for
+        /// it. Opening another set writes the old set at once and clears the
+        /// pending write, so the write does not go to the new set's file.
+        #[test]
+        fn a_pending_set_write_does_not_follow_the_next_set() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "$: s(\"bd*4\")\n");
+
+            app.remember_master_limiter(rustel_audio::LimiterSettings {
+                threshold_db: -5.0,
+                character: rustel_audio::LimiterCharacter::Punchy,
+            });
+            assert!(app.manifest_pending, "the drag owes the set file a write");
+
+            let elsewhere = directory.path().join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).expect("another folder");
+            std::fs::write(elsewhere.join("other.strudel"), "$: s(\"hh\")\n").expect("a score");
+            let set = SceneSet::open(&elsewhere, "// starter").expect("set");
+            app.switch_set(set, "opened set");
+
+            assert!(
+                !app.manifest_pending,
+                "the debt was paid by the write on the way out, not carried over"
+            );
+            // And the old set's limiter reached its file on the way out.
+            let kept = SceneSet::open(directory.path(), "// starter").expect("reopen");
+            assert_eq!(
+                *kept.limiter(),
+                crate::scenes::SetLimiter::Says {
+                    bypassed: false,
+                    settings: rustel_audio::LimiterSettings {
+                        threshold_db: -5.0,
+                        character: rustel_audio::LimiterCharacter::Punchy,
+                    },
+                },
+                "the set that was left keeps what it was given"
+            );
+            // The set opened has said nothing, so it follows the studio's default.
+            assert_eq!(*app.scenes.limiter(), crate::scenes::SetLimiter::Defer);
+        }
+
+        /// A set pulled off Open recent to hear what was in it is left as
+        /// it was: a play of a score the file already holds is not a save,
+        /// and putting a set down whose project file already says what it
+        /// says is not a write. Only the changed dates moving would tell
+        /// the player the set was touched, and the open list orders by
+        /// them.
+        #[test]
+        fn a_set_only_opened_and_played_is_left_as_it_was() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+
+            // A second score, so the set carries a project file a close
+            // could churn.
+            let second = directory.path().join("second.strudel");
+            std::fs::write(&second, "$: s(\"hh\")\n").expect("a second score");
+            app.scenes.open_file(&second).expect("open the score");
+            app.land_on_current_scene();
+            app.persist_manifest();
+            let settle_in_the_past = |path: &std::path::Path| {
+                let when = std::time::SystemTime::now() - Duration::from_secs(3_600);
+                std::fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .expect("open to set times")
+                    .set_times(std::fs::FileTimes::new().set_modified(when))
+                    .expect("set the changed time");
+                when
+            };
+            let manifest = app.scenes.manifest_path();
+            let score_changed = settle_in_the_past(&second);
+            let set_changed = settle_in_the_past(&manifest);
+
+            // Play it: update on a score with no edit behind it.
+            app.handle_editor_effect(EditorEffect::Evaluate {
+                revision: app.editor().revision(),
+                source: ropey::Rope::from_str(&app.editor().source()),
+            })
+            .expect("play");
+            app.wait_for_saves();
+
+            // Close it: another set takes the studio.
+            let elsewhere = directory.path().join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).expect("another folder");
+            std::fs::write(elsewhere.join("other.strudel"), "$: s(\"bd\")\n").expect("a score");
+            let set = SceneSet::open(&elsewhere, "// starter").expect("set");
+            app.switch_set(set, "opened set");
+
+            let changed = |path: &std::path::Path| {
+                std::fs::metadata(path)
+                    .expect("the file")
+                    .modified()
+                    .expect("its changed time")
+            };
+            assert_eq!(
+                changed(&second),
+                score_changed,
+                "playing a score the file already holds rewrote it"
+            );
+            assert_eq!(
+                changed(&manifest),
+                set_changed,
+                "closing the set rewrote a project file that had nothing to say"
+            );
+        }
+
+        /// A save that finds the file already holding the score stays quiet -
+        /// unless the status still says the last save failed. The file came
+        /// to hold the buffer after that failure, so the failure line must
+        /// not outlive it.
+        #[test]
+        fn a_skip_replaces_a_stale_save_failure_line() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            let scene_id = app.scenes.current().id;
+            let path = app.scenes.current().path.clone();
+
+            // A real write, so the completion can be matched to a pending
+            // save and reaches the branches under test.
+            let revision = app.scenes.current().editor.revision();
+            let source = Arc::<str>::from(app.scenes.current().editor.source());
+            app.write_scene(scene_id, revision, source);
+            let request_id = app
+                .scenes
+                .current()
+                .latest_save
+                .as_ref()
+                .expect("the write registered a pending save")
+                .request_id;
+
+            // The save before this one failed, and its line still stands.
+            app.status = "save failed - the editor buffer is unchanged".into();
+
+            app.handle_save_result(SaveResult {
+                request_id,
+                path,
+                editor_revision: app.scenes.current().editor.revision(),
+                source_revision: "current".to_owned(),
+                result: Ok(false),
+            });
+
+            assert_ne!(
+                app.status, "save failed - the editor buffer is unchanged",
+                "the skip must not leave a failure that no longer stands"
+            );
+            assert!(
+                app.status.contains("already holds this score"),
+                "the line says where the score is: {}",
+                app.status
+            );
+        }
+
+        #[test]
+        fn a_save_that_lands_on_a_path_the_scene_no_longer_owns_is_not_taken_as_saved() {
+            // The race: a write is in flight, the scene is renamed, and the
+            // worker then reports success for the path the scene has left.
+            // Taking that as "saved" would mark the RENAMED file clean when
+            // nothing has written it yet.
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            let scene_id = app.scenes.current().id;
+            let stale = app.scenes.current().path.clone();
+
+            // A real write, so the scene carries a pending save the completion
+            // can be matched to. Without one, `handle_save_result` cannot find
+            // the scene at all and returns before reaching the mismatch at issue.
+            let revision = app.scenes.current().editor.revision();
+            let source = Arc::<str>::from(app.scenes.current().editor.source());
+            app.write_scene(scene_id, revision, source);
+            let in_flight = app
+                .scenes
+                .current()
+                .latest_save
+                .as_ref()
+                .expect("the write registered a pending save")
+                .request_id;
+
+            app.finish_rename("second");
+            let renamed = app.scenes.current().path.clone();
+            assert_ne!(renamed, stale, "the rename must move the scene");
+
+            app.handle_save_result(SaveResult {
+                request_id: in_flight,
+                path: stale.clone(),
+                editor_revision: app.scenes.current().editor.revision(),
+                source_revision: "stale".to_owned(),
+                result: Ok(true),
+            });
+
+            let scene = app
+                .scenes
+                .scenes()
+                .iter()
+                .find(|scene| scene.id == scene_id)
+                .expect("the scene survives the rename");
+            assert_eq!(scene.path, renamed, "the scene keeps its new path");
+
+            // The renamed file is what a later completion must be able to mark
+            // saved, so the rename has to have queued a write of its own. That
+            // follow-up is the fix: without it the bytes only ever reached the
+            // abandoned path.
+            let pending = scene
+                .latest_save
+                .as_ref()
+                .expect("the rename queued a write to the new path");
+            assert_ne!(
+                pending.request_id, in_flight,
+                "the pending save must be the follow-up, not the one already in flight"
+            );
+
+            // And the stale completion changed nothing: it is neither found by
+            // the path the scene has left nor matched to the newer request, so
+            // it cannot mark the renamed file saved.
+            assert!(
+                app.scenes.by_path(&stale).is_none(),
+                "nothing should answer to the abandoned path"
+            );
+        }
+    }
+}

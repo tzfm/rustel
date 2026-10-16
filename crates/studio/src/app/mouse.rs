@@ -879,3 +879,1031 @@ pub(super) fn widen_selection(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod keybind_mouse {
+        //! The Keybinds page works from the mouse as well as the keyboard: a row
+        //! is a button - the click arms the learn on it, a second click calls it
+        //! off - and the page's own geometry answers where the rows live, so a
+        //! test clicks the way a hand would.
+
+        use crate::app::tests::support::app_over;
+        use crate::app::*;
+        use crate::keybinds::{KeybindLearn, Keybinds};
+        use crate::settings::{
+            KEYBIND_ACTION_START, SettingsPage, SettingsSheet, SettingsSheetView,
+            TERMINAL_PROFILE_ROW,
+        };
+
+        /// The first of the five panel rows, which close the table.
+        const SHOW_FILE_ROW: usize = crate::settings::RESET_KEYBINDS_ROW - 5;
+
+        /// A studio with the settings sheet open on the Keybinds page, focused,
+        /// and the frame sized the way a painted one would be - the sheet's
+        /// hit-tests read `self.frame`, so that is all they need.
+        fn keybinds_page_app(directory: &std::path::Path) -> App {
+            let mut app = app_over(directory);
+            app.frame = Rect::new(0, 0, 140, 40);
+            app.capabilities = KeyboardCapabilities::enhanced();
+            let mut sheet = SettingsSheet::default();
+            sheet.show_page(SettingsPage::Keybinds);
+            // The row count the app refreshes on every key and click arrival: the
+            // learnable rows plus the fixed ones past them.
+            sheet.keybind_count = crate::settings::RESET_KEYBINDS_ROW + 1;
+            app.settings_sheet = Some(sheet);
+            app.focus = Focus::Panel(PanelKind::Settings);
+            app
+        }
+
+        /// A click, Down then Up, through the whole routing as the terminal
+        /// sends it. The app acts on the Down.
+        fn click(app: &mut App, x: u16, y: u16) {
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                app.handle_terminal_event(Event::Mouse(MouseEvent {
+                    kind,
+                    column: x,
+                    row: y,
+                    modifiers: KeyModifiers::NONE,
+                }))
+                .expect("the click is handled");
+            }
+        }
+
+        /// The screen point of a keybind row, found through the page's own
+        /// geometry - a test that clicks where the page says a row is breaks
+        /// exactly when the geometry breaks.
+        fn row_point(app: &App, index: usize) -> (u16, u16) {
+            let (_, rows) =
+                SettingsSheetView::geometry(app.frame).expect("the sheet fits the frame");
+            let shown = usize::from(rows.height).max(1);
+            assert!(
+                index < shown,
+                "row {index} is on screen at 140x40; keep the test on a visible row"
+            );
+            (rows.x + 2, rows.y + index as u16)
+        }
+
+        /// A click on a row arms the learn on its action, exactly as Enter does.
+        #[test]
+        fn clicking_a_keybind_row_arms_the_learn() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = keybinds_page_app(directory.path());
+            let (x, y) = row_point(&app, KEYBIND_ACTION_START); // the first binding is update / play
+
+            click(&mut app, x, y);
+
+            assert!(app.keybind_learn.is_some(), "the learn armed");
+            assert_eq!(
+                app.keybind_learn.unwrap().action(),
+                BindAction::Evaluate,
+                "the row clicked is the row armed"
+            );
+            assert!(
+                app.keybind_rows()[KEYBIND_ACTION_START].learning,
+                "the row says it is waiting for a chord"
+            );
+        }
+
+        #[test]
+        fn clicking_the_terminal_row_cycles_the_profile_without_learning_a_binding() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = keybinds_page_app(directory.path());
+            app.ui_settings.terminal_profile = None;
+            app.keybind_learn = Some(KeybindLearn::arm(BindAction::Evaluate));
+            let custom = app.keybinds.prefs();
+            let (x, y) = row_point(&app, TERMINAL_PROFILE_ROW);
+
+            click(&mut app, x, y);
+
+            assert_eq!(app.settings_sheet.unwrap().selected, TERMINAL_PROFILE_ROW);
+            assert_eq!(
+                app.ui_settings.terminal_profile.as_deref(),
+                Some("Windows Terminal")
+            );
+            assert!(
+                app.keybind_learn.is_none(),
+                "the profile is not a learnable binding"
+            );
+            assert_eq!(
+                app.keybinds.prefs(),
+                custom,
+                "a profile click learns nothing"
+            );
+            assert_eq!(app.keybind_rows()[TERMINAL_PROFILE_ROW].action, "Terminal");
+            assert_eq!(
+                app.keybind_rows()[KEYBIND_ACTION_START].action,
+                BindAction::Evaluate.label()
+            );
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Settings));
+        }
+
+        /// A second click on the armed row calls the learn off - the mouse's
+        /// answer to Esc - and learns nothing in the meantime.
+        #[test]
+        fn a_second_click_on_the_armed_row_calls_the_learn_off() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = keybinds_page_app(directory.path());
+            let (x, y) = row_point(&app, KEYBIND_ACTION_START + 1); // stop all sound
+
+            app.keybind_learn = Some(KeybindLearn::arm(BindAction::Stop));
+            click(&mut app, x, y);
+
+            assert!(
+                app.keybind_learn.is_none(),
+                "the learn was called off, not re-armed"
+            );
+            assert_eq!(
+                app.keybinds.binding(BindAction::Stop).unwrap().key(),
+                "ctrl+.",
+                "calling a learn off learns nothing"
+            );
+        }
+
+        /// While a take is being asked - the chord in hand is another action's -
+        /// a click cannot take it: choosing to take is Enter's work alone.
+        #[test]
+        fn a_click_cannot_confirm_a_take() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = keybinds_page_app(directory.path());
+            // The ask is up for undo onto ^R, rename-scene's chord.
+            app.keybind_learn = Some(KeybindLearn::Confirm {
+                action: BindAction::Undo,
+                chord: Keybinds::default()
+                    .binding(BindAction::RenameScene)
+                    .unwrap(),
+                held_by: BindAction::RenameScene,
+            });
+            let (x, y) = row_point(&app, KEYBIND_ACTION_START);
+
+            click(&mut app, x, y);
+
+            assert_eq!(
+                app.keybinds.binding(BindAction::Undo).unwrap().key(),
+                "ctrl+z",
+                "the take did not happen by click"
+            );
+            assert!(
+                app.keybind_learn.is_some(),
+                "the ask was not silently swallowed either"
+            );
+        }
+
+        /// A click below the rows claims the sheet - the editor underneath must
+        /// not take the press - without arming anything.
+        #[test]
+        fn a_click_below_the_rows_claims_the_sheet_without_arming() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = keybinds_page_app(directory.path());
+            let (sheet, rows) = SettingsSheetView::geometry(app.frame).expect("the sheet fits");
+            let x = rows.x + 2;
+            let y = sheet.bottom().saturating_sub(1); // the hint row, not a chord row
+
+            click(&mut app, x, y);
+
+            assert!(app.keybind_learn.is_none(), "no row, no learn");
+            assert_eq!(
+                app.focus,
+                Focus::Panel(PanelKind::Settings),
+                "the press still belongs to the sheet"
+            );
+        }
+
+        /// The panel actions close the table. Each row shows the Alt chord
+        /// the panel answers to until a chord is learnt.
+        #[test]
+        fn the_panel_rows_close_the_table_on_their_alt_chords() {
+            let directory = tempfile::tempdir().unwrap();
+            let app = keybinds_page_app(directory.path());
+
+            let rows = app.keybind_rows();
+            assert_eq!(rows.len(), crate::settings::RESET_KEYBINDS_ROW + 1);
+            let panel = &rows[SHOW_FILE_ROW..crate::settings::RESET_KEYBINDS_ROW];
+            let chords: Vec<&str> = panel.iter().map(|row| row.chord.as_str()).collect();
+            assert_eq!(
+                chords,
+                ["Alt+O", "Alt+R", "Alt+D", "Alt+T", "Alt+T"].map(crate::keybinds::shortcut_label),
+                "the row names the chord"
+            );
+            assert!(
+                panel[0].action.contains("file"),
+                "the row says what the chord does: {}",
+                panel[0].action
+            );
+            assert!(panel.iter().all(|row| !row.learnt && !row.learning));
+        }
+
+        /// Enter or a click on a panel row arms a learn, as on every other row.
+        #[test]
+        fn enter_or_a_click_on_a_panel_row_arms_a_learn() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = keybinds_page_app(directory.path());
+            // Selecting the row first scrolls the page, since at 140x40 the
+            // row sits past the last visible one.
+            if let Some(sheet) = app.settings_sheet.as_mut() {
+                sheet.selected = SHOW_FILE_ROW;
+            }
+            let armed = Some(KeybindLearn::arm(BindAction::ShowFile));
+
+            app.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .expect("Enter is handled");
+            assert_eq!(app.keybind_learn, armed);
+            app.keybind_learn = None;
+
+            let sheet = *app.settings_sheet.as_ref().expect("the sheet is up");
+            let (_, rows) = SettingsSheetView::geometry(app.frame).expect("the sheet fits");
+            let point = (rows.y..rows.bottom())
+                .map(|y| (rows.x + 2, y))
+                .find(|&(x, y)| sheet.keybind_row_at(app.frame, x, y) == Some(SHOW_FILE_ROW))
+                .expect("the selected row is on screen after the scroll");
+            click(&mut app, point.0, point.1);
+            assert_eq!(app.keybind_learn, armed);
+        }
+
+        /// The Sources page too: a click on a row selects it, exactly as the
+        /// arrows do - an import or a shipped pack - and selects only. Acting on
+        /// it stays the keys' work, so a click cannot start a download or drop an
+        /// import; and the rule between the two lists is not a row.
+        #[test]
+        fn clicking_a_source_row_selects_it() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 140, 40);
+            app.prefs.sample_sources = ["/tmp/first", "/tmp/second"]
+                .into_iter()
+                .map(|spec| crate::prefs::SampleSourcePref {
+                    spec: spec.to_owned(),
+                    enabled: true,
+                })
+                .collect();
+            let mut sheet = SettingsSheet::default();
+            sheet.show_page(SettingsPage::Sources);
+            // The app syncs the page's row counts as it draws and answers; a
+            // test building the sheet by hand owes the same two numbers.
+            sheet.source_count = app.prefs.sample_sources.len();
+            sheet.default_count = app.shipped_sources.len();
+            app.settings_sheet = Some(sheet);
+            app.focus = Focus::Panel(PanelKind::Settings);
+            let packs = app.shipped_sources.len();
+            assert!(packs > 0, "the studio ships with packs");
+            let (_, rows) = SettingsSheetView::geometry(app.frame).expect("the sheet fits");
+            let x = rows.x + 3;
+
+            // Each click lands where the page says the row is drawn, the same
+            // mapping the handler uses: a click on a drawn row selects it.
+            let drawn_at = |app: &App, row: usize| {
+                (0..app.frame.height)
+                    .map(|dy| rows.y + dy)
+                    .find(|&y| {
+                        app.settings_sheet
+                            .as_ref()
+                            .expect("the sheet is open")
+                            .source_row_at(app.frame, x, y)
+                            == Some(row)
+                    })
+                    .unwrap_or_else(|| panic!("row {row} is drawn on the page"))
+            };
+            // Row map with the four controls: imports at 4 and 5, packs from 6.
+            let second_import = drawn_at(&app, 5);
+            click(&mut app, x, second_import);
+            assert_eq!(app.settings_sheet.unwrap().selected, 5, "the second import");
+            let first_pack = drawn_at(&app, 6);
+            click(&mut app, x, first_pack);
+            assert_eq!(app.settings_sheet.unwrap().selected, 6, "the first pack");
+            // The defaults header above the packs is a label, not a row.
+            let header_above = first_pack - 1;
+            click(&mut app, x, header_above);
+            assert_eq!(
+                app.settings_sheet.unwrap().selected,
+                6,
+                "the default-samples rule is not a row: the selection stays"
+            );
+            assert_eq!(app.prefs.sample_sources.len(), 2, "a click removes nothing");
+            assert!(
+                app.shipped_sources.iter().all(|pack| pack.cache.is_none()),
+                "a click starts no download"
+            );
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Settings));
+        }
+
+        fn press(app: &mut App, code: KeyCode) {
+            app.handle_terminal_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+                .expect("the key is handled");
+        }
+
+        /// `a` on the Sources page asks for the source over the page, which
+        /// stays: Esc comes back to it rather than to a closed sheet, and an
+        /// import lands on the page as a row, under the cursor, without the
+        /// browser opening over it.
+        #[test]
+        fn adding_a_source_asks_over_the_sources_page() {
+            let directory = tempfile::tempdir().unwrap();
+            let kit = directory.path().join("kit");
+            std::fs::create_dir_all(&kit).unwrap();
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 140, 40);
+            let mut sheet = SettingsSheet::default();
+            sheet.show_page(SettingsPage::Sources);
+            app.settings_sheet = Some(sheet);
+            app.focus = Focus::Panel(PanelKind::Settings);
+
+            let on_sources = |app: &App| {
+                app.settings_sheet
+                    .is_some_and(|sheet| sheet.shows_sources())
+            };
+
+            press(&mut app, KeyCode::Char('a'));
+            assert_eq!(
+                app.set_prompt.as_ref().map(|(prompt, _)| *prompt),
+                Some(SetPrompt::AddSampleSource),
+                "a asks for the source"
+            );
+            assert!(on_sources(&app), "the page stays under the prompt");
+
+            press(&mut app, KeyCode::Esc);
+            assert!(app.set_prompt.is_none(), "Esc closes the prompt");
+            assert!(on_sources(&app), "and comes back to the page");
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Settings));
+
+            press(&mut app, KeyCode::Char('a'));
+            app.set_prompt
+                .as_mut()
+                .unwrap()
+                .1
+                .offer(&kit.to_string_lossy());
+            press(&mut app, KeyCode::Enter);
+            assert!(
+                app.set_prompt.is_none(),
+                "Enter imports and closes the prompt"
+            );
+            assert_eq!(
+                app.prefs
+                    .sample_sources
+                    .iter()
+                    .map(|source| source.spec.as_str())
+                    .collect::<Vec<_>>(),
+                vec![kit.to_string_lossy().as_ref()],
+                "the folder is imported"
+            );
+            assert!(on_sources(&app), "the page is still up");
+            assert_eq!(
+                app.settings_sheet.unwrap().selected,
+                crate::settings::SOURCE_CONTROL_COUNT,
+                "the cursor is on the new row, past the cache controls"
+            );
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Settings));
+            assert!(
+                app.reference_panel.is_none(),
+                "the browser does not open over the page"
+            );
+        }
+
+        /// A folder dropped while the Sources page is open imports onto that
+        /// page: the sheet stays, the browser does not open over it, and the
+        /// cursor lands on the new row.
+        #[test]
+        fn dropping_on_the_sources_page_imports_there() {
+            let directory = tempfile::tempdir().unwrap();
+            let kit = directory.path().join("kit");
+            std::fs::create_dir_all(&kit).unwrap();
+            std::fs::write(kit.join("kick.wav"), b"RIFF....WAVEfmt ").unwrap();
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 140, 40);
+            let mut sheet = SettingsSheet::default();
+            sheet.show_page(SettingsPage::Sources);
+            app.settings_sheet = Some(sheet);
+            app.focus = Focus::Panel(PanelKind::Settings);
+
+            app.handle_terminal_event(Event::Paste(kit.to_string_lossy().into_owned()))
+                .expect("the drop is handled");
+
+            assert!(
+                app.settings_sheet
+                    .is_some_and(|sheet| sheet.shows_sources()),
+                "the Sources page stays"
+            );
+            assert_eq!(
+                app.prefs
+                    .sample_sources
+                    .iter()
+                    .map(|source| source.spec.as_str())
+                    .collect::<Vec<_>>(),
+                vec![kit.to_string_lossy().as_ref()]
+            );
+            assert_eq!(
+                app.settings_sheet.unwrap().selected,
+                crate::settings::SOURCE_CONTROL_COUNT,
+                "the cursor is on the new import"
+            );
+            assert!(
+                app.reference_panel.is_none(),
+                "the samples browser does not open over the page"
+            );
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Settings));
+        }
+
+        /// Emptying the sample cache asks twice, clears pack counts at once, and
+        /// does the folder walk off the UI thread so Enter cannot freeze the sheet.
+        #[test]
+        fn emptying_the_sample_cache_asks_twice_and_refreshes_the_packs() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 140, 40);
+            let mut sheet = SettingsSheet::default();
+            sheet.show_page(SettingsPage::Sources);
+            // The clear-cache control is the fourth row: the pre-cache switch,
+            // the defaults ask, the refresh, then the cache empty.
+            sheet.selected = 3;
+            app.settings_sheet = Some(sheet);
+            app.focus = Focus::Panel(PanelKind::Settings);
+            if let Some(pack) = app.shipped_sources.first_mut() {
+                pack.files = 10;
+                pack.cached_files = 10;
+                pack.cache_bytes = 1_000_000;
+            }
+            app.sample_cache_bytes = Some(1_000_000);
+
+            press(&mut app, KeyCode::Enter);
+            assert!(
+                app.settings_sheet
+                    .is_some_and(|sheet| sheet.confirm_clear_cache),
+                "the first Enter arms the empty"
+            );
+            assert!(
+                app.status.contains("Enter again"),
+                "the status asks for a second Enter: {}",
+                app.status
+            );
+            assert_eq!(
+                app.shipped_sources[0].cached_files, 10,
+                "nothing is cleared until confirmed"
+            );
+
+            press(&mut app, KeyCode::Esc);
+            assert!(
+                app.settings_sheet
+                    .is_some_and(|sheet| !sheet.confirm_clear_cache),
+                "Esc cancels the ask"
+            );
+            assert!(
+                app.settings_sheet
+                    .is_some_and(|sheet| sheet.shows_sources()),
+                "Esc keeps the sheet"
+            );
+
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Enter);
+            assert!(
+                app.cache_clear.is_some() || app.sample_cache_bytes.is_none(),
+                "the clear is under way or already reflected"
+            );
+            assert_eq!(
+                app.shipped_sources[0].cached_files, 0,
+                "pack rows stop claiming the cache at once"
+            );
+            assert_eq!(app.shipped_sources[0].cache_bytes, 0);
+            // Drain the background clear so the test process does not race drop.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while app.cache_clear.is_some() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                app.poll_readiness();
+            }
+            assert!(app.cache_clear.is_none(), "the clear finishes");
+        }
+
+        #[test]
+        fn reset_all_click_requests_but_never_confirms_the_reset() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = keybinds_page_app(directory.path());
+            app.keybinds.learn(
+                BindAction::Undo,
+                crate::keybinds::KeyCombo::parse("ctrl+shift+q"),
+            );
+            let custom = app.keybinds.prefs();
+            let at = crate::settings::RESET_KEYBINDS_ROW;
+            app.settings_sheet.as_mut().unwrap().select(at);
+            let sheet = app.settings_sheet.unwrap();
+            let (_, rows) = SettingsSheetView::geometry(app.frame).unwrap();
+            let (x, y) = (rows.y..rows.bottom())
+                .map(|y| (rows.x + 2, y))
+                .find(|&(x, y)| sheet.keybind_row_at(app.frame, x, y) == Some(at))
+                .unwrap();
+            click(&mut app, x, y);
+            assert!(app.settings_sheet.unwrap().confirm_reset_keybinds);
+            assert!(app.keybind_learn.is_none());
+            click(&mut app, x, y);
+            assert_eq!(
+                app.keybinds.prefs(),
+                custom,
+                "a double click is not confirmation"
+            );
+            app.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+            assert!(app.keybinds.prefs().is_empty());
+        }
+    }
+
+    mod mouse {
+        //! Tests for `app/mouse.rs`.
+
+        use crate::app::tests::support::*;
+        use crate::app::*;
+        use crate::editor::MemoryClipboard;
+
+        #[test]
+        fn resizing_cancels_the_old_track_and_refreshed_metrics_convert_new_pixels() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene, call) = slider_app(directory.path());
+            let (x, _, row) = lay_out(&mut app, scene, call);
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, row);
+            app.handle_terminal_event(Event::Resize(100, 30))
+                .expect("resize handled");
+            assert!(!matches!(app.pointer, Some(Pointer::Slider { .. })));
+            mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 99, row);
+            assert_eq!(
+                value(&app, scene, call),
+                0.0,
+                "old coordinates cannot move a resized rail"
+            );
+
+            app.features.pixel_mouse = true;
+            app.features.cell_pixels = Some((9, 18));
+            app.last_pty_cell_pixels = Some((10, 20));
+            app.refresh_cell_pixels(Some((10, 20)));
+            assert_eq!(
+                app.features.cell_pixels,
+                Some((9, 18)),
+                "an unchanged PTY estimate preserves the terminal's direct report"
+            );
+            app.refresh_cell_pixels(Some((11, 22)));
+            assert_eq!(app.features.cell_pixels, Some((11, 22)));
+            let mut event = Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 38,
+                row: 55,
+                modifiers: KeyModifiers::NONE,
+            });
+            app.pointer_to_cells(&mut event);
+            let Event::Mouse(converted) = event else {
+                panic!("mouse event")
+            };
+            assert_eq!((converted.column, converted.row), (3, 2));
+            assert!((app.pointer_subcell - 5.0 / 11.0).abs() < 1e-9);
+            app.refresh_cell_pixels(None);
+            app.refresh_cell_pixels(Some((0, 0)));
+            assert_eq!(
+                app.features.cell_pixels,
+                Some((11, 22)),
+                "failed metric reads retain known dimensions"
+            );
+        }
+
+        #[test]
+        fn late_cell_dimensions_activate_the_selected_pixel_renderer() {
+            use crate::graphics::{self, RenderingMode, Tier};
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, _, _) = slider_app(directory.path());
+            let before = graphics::tier();
+            app.features.kitty_graphics = true;
+            app.features.fine_glyphs = true;
+            app.features.cell_pixels = None;
+            app.last_pty_cell_pixels = None;
+            app.ui_settings.rendering = RenderingMode::Kitty;
+            graphics::set_tier(app.ui_settings.rendering.resolve(&app.features));
+            assert_eq!(
+                graphics::tier(),
+                Tier::Fine,
+                "safe fallback while dimensions are unavailable"
+            );
+            app.refresh_cell_pixels(Some((10, 20)));
+            assert_eq!(graphics::tier(), Tier::Pixels);
+            graphics::set_tier(before);
+        }
+
+        /// A terminal reporting the pointer in pixels (DECSET 1016) is brought
+        /// back to the cell grid, with the fraction of the cell kept for the
+        /// slider; one reporting cells is left exactly as it was.
+        #[test]
+        fn a_pixel_pointer_is_brought_back_to_cells() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let report = |column: u16, row: u16| {
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                })
+            };
+            app.features.pixel_mouse = true;
+            app.features.cell_pixels = Some((9, 18));
+            let mut event = report(31, 40);
+            app.pointer_to_cells(&mut event);
+            let Event::Mouse(mouse) = event else {
+                panic!("still a mouse event");
+            };
+            assert_eq!((mouse.column, mouse.row), (3, 2));
+            assert!(
+                (app.pointer_subcell - 4.0 / 9.0).abs() < 1e-9,
+                "{}",
+                app.pointer_subcell
+            );
+            // Down the cell as well as along it: the desk's faders are
+            // columns, so the row's fraction is the one they need.
+            assert!(
+                (app.pointer_subrow - 4.0 / 18.0).abs() < 1e-9,
+                "{}",
+                app.pointer_subrow
+            );
+
+            // Cells are cells.
+            app.features.pixel_mouse = false;
+            let mut event = report(31, 40);
+            app.pointer_to_cells(&mut event);
+            let Event::Mouse(mouse) = event else {
+                panic!("still a mouse event");
+            };
+            assert_eq!((mouse.column, mouse.row), (31, 40));
+            assert_eq!(app.pointer_subcell, 0.0);
+            assert_eq!(app.pointer_subrow, 0.0);
+
+            // And pixels without a known cell size were never asked for; if
+            // they arrive anyway they are left alone rather than divided by
+            // nothing.
+            app.features.pixel_mouse = true;
+            app.features.cell_pixels = None;
+            let mut event = report(31, 40);
+            app.pointer_to_cells(&mut event);
+            let Event::Mouse(mouse) = event else {
+                panic!("still a mouse event");
+            };
+            assert_eq!((mouse.column, mouse.row), (31, 40));
+        }
+
+        /// One selection on the screen at a time. A band left lying in the
+        /// log while a name is picked out in the score is a line of log
+        /// output about to be pasted into the music - and two selections
+        /// drawn at once are two answers to "what does ^C take".
+        #[test]
+        fn a_selection_in_one_surface_takes_it_from_the_others() {
+            use crate::editor::Selection;
+            use crate::textblock::{TextPoint, TextSelection};
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("$: s(\"bd\")".into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed");
+
+            // A band in the score, and another in the log behind it.
+            app.editor_mut()
+                .set_selection(Selection::range(ByteOffset(0), ByteOffset(5)))
+                .expect("score selection");
+            app.toggle_log_panel();
+            // The panel's editor holds the log's text, so there has to be
+            // some before there is anything to select.
+            app.log
+                .push(LogLevel::Info, "test", "a line worth selecting");
+            let list = Rect::new(0, 0, 80, 10);
+            if let Some(panel) = app.log_panel.as_mut() {
+                panel.prepare(&app.log, list);
+                panel
+                    .editor
+                    .set_selection(Selection::range(ByteOffset(0), ByteOffset(3)))
+                    .expect("log selection");
+            }
+            assert!(!app.editor().primary_selection().is_empty());
+
+            // The log takes it: the score's band goes, and the caret stays
+            // where the hand left it rather than jumping to the top.
+            app.own_text_selection(TextSurface::Log);
+            assert!(
+                app.editor().primary_selection().is_empty(),
+                "the score let go"
+            );
+            assert_eq!(
+                app.editor().primary_selection().head,
+                ByteOffset(5),
+                "and kept its caret where the selection ended"
+            );
+            assert!(
+                !app.log_panel
+                    .as_ref()
+                    .expect("the log")
+                    .editor
+                    .primary_selection()
+                    .is_empty(),
+                "the surface that claimed it keeps it"
+            );
+
+            // And back the other way, with the reference column in play too.
+            app.toggle_reference_browse();
+            if let Some(panel) = app.reference_panel.as_mut() {
+                panel.selection = Some(crate::reference::PaneSelection {
+                    target: crate::reference::SelectionTarget::Entry {
+                        index: 0,
+                        width: 40,
+                    },
+                    selection: TextSelection {
+                        anchor: TextPoint { line: 0, column: 0 },
+                        head: TextPoint { line: 0, column: 3 },
+                    },
+                });
+            }
+            app.own_text_selection(TextSurface::Score);
+            assert!(
+                app.log_panel
+                    .as_ref()
+                    .expect("the log")
+                    .editor
+                    .primary_selection()
+                    .is_empty(),
+                "the log let go"
+            );
+            assert!(
+                app.reference_panel
+                    .as_ref()
+                    .is_none_or(|panel| panel.selection.is_none()),
+                "and so did the column"
+            );
+        }
+
+        #[test]
+        fn a_reference_click_wins_over_the_settings_row_beneath_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 140, 40);
+            press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+            app.reference_panel = Some(ReferencePanel::samples(&app.reference, Vec::new()));
+            app.focus_panel(PanelKind::Reference);
+            app.regions = view::regions(app.frame, false, 1, true, true, None, None);
+
+            let inner = crate::reference::inner_area(app.regions.reference);
+            let (_, meter_y) = crate::reference::sample_pulse_rows(inner);
+            let (sheet, _) =
+                crate::settings::SettingsSheetView::geometry(app.frame).expect("settings sheet");
+            let x = inner.x.max(sheet.x) + 1;
+            assert!(within(sheet, x, meter_y) && within(app.regions.reference, x, meter_y));
+
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x,
+                row: meter_y,
+                modifiers: KeyModifiers::NONE,
+            })
+            .expect("click");
+
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Reference));
+            assert!(app.reference_on_top());
+            assert_eq!(app.pointer, Some(Pointer::PreviewVolume));
+        }
+
+        /// The readiness chip counts what the log has to say about the score,
+        /// so pressing it is how you go and read it - and the pointer says so
+        /// before you press.
+        #[test]
+        fn the_readiness_chip_opens_the_log() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            app.regions = view::regions(app.frame, false, 1, false, true, None, None);
+            // A score the linter refused, which is the state the chip counts.
+            let scene = app.scenes.current().id;
+            app.absorb_lint(crate::lint::LintResult {
+                scene,
+                revision: app.scenes.current().editor.revision(),
+                input_channels: app.lint_input_channels(),
+                diagnostics: vec![rustel_runtime::lint::Diagnostic {
+                    level: LintLevel::Value,
+                    message: "unknown sound \"top\"".into(),
+                    from: 0,
+                    to: 1,
+                }],
+            });
+            assert_eq!(app.go_state(), view::GoState::Problems { count: 1 });
+            let chip = app.go_chip();
+            assert!(chip.width > 0, "there is a chip to press");
+            assert_eq!(app.pointer_shape_at(chip.x, chip.y), "pointer");
+            // Its neighbours are not it: the transport word to the left keeps
+            // its own meaning, and so does the empty header to the right.
+            assert_eq!(app.pointer_shape_at(chip.x - 2, chip.y), "default");
+            assert_eq!(app.pointer_shape_at(chip.right() + 4, chip.y), "default");
+
+            let press = |app: &mut App, x: u16, y: u16| {
+                app.handle_terminal_event(Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: x,
+                    row: y,
+                    modifiers: KeyModifiers::NONE,
+                }))
+                .expect("mouse handled");
+            };
+
+            assert!(app.log_panel.is_none());
+            press(&mut app, chip.x + 1, chip.y);
+            assert!(app.log_panel.is_some(), "the log opens where it was asked");
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Log));
+
+            // Pressing it again with the log already open brings it forward
+            // rather than shutting the thing you just asked to read.
+            app.focus = Focus::Editor;
+            press(&mut app, chip.x + 1, chip.y);
+            assert!(app.log_panel.is_some());
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Log));
+        }
+
+        /// A drag in a prompt's field is the field's alone, down to the release: a
+        /// score drag whose release never arrived stays where it was.
+        #[test]
+        fn a_prompt_field_drag_never_reaches_the_score() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            type_text(
+                &mut app,
+                "$: s(\"bd hh sd hh bd hh sd hh bd hh sd hh bd hh\")",
+            );
+            app.editor_mut().set_wrap(false);
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+                .expect("test terminal");
+            let mut draw = |app: &mut App| {
+                terminal
+                    .draw(|frame| app.paint_into(frame, Instant::now()).expect("frame paints"))
+                    .expect("draw");
+            };
+            draw(&mut app);
+
+            // A drag in the score whose release never arrives.
+            let score = app.focused_map().expect("the score is drawn").area();
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                score.x + 2,
+                score.y,
+            );
+            mouse(
+                &mut app,
+                MouseEventKind::Drag(MouseButton::Left),
+                score.x + 6,
+                score.y,
+            );
+            draw(&mut app);
+            let selection = app.editor().primary_selection();
+            let viewport = app.editor().viewport();
+            assert!(!selection.is_empty(), "a score drag is live");
+
+            app.set_prompt = Some((SetPrompt::OpenSet, FilePicker::naming("new set", "create")));
+            app.set_prompt
+                .as_mut()
+                .unwrap()
+                .1
+                .offer("a longer set name");
+            draw(&mut app);
+            let picker = &app.set_prompt.as_ref().unwrap().1;
+            let (area, list) = picker.geometry(app.frame).expect("the prompt fits");
+            let row = area.y + 1;
+            let start = list.x + picker.label.len() as u16 + 2;
+            assert_eq!(picker.field_at(app.frame, start, row), Some(0));
+
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                start,
+                row,
+            );
+            assert_eq!(app.pointer, Some(Pointer::PromptField));
+            mouse(
+                &mut app,
+                MouseEventKind::Drag(MouseButton::Left),
+                start + 4,
+                row,
+            );
+            mouse(
+                &mut app,
+                MouseEventKind::Up(MouseButton::Left),
+                start + 4,
+                row,
+            );
+
+            assert_eq!(
+                app.set_prompt.as_ref().unwrap().1.selection(),
+                Some(0..4),
+                "the drag selected in the prompt's field"
+            );
+            assert_eq!(
+                app.editor().primary_selection(),
+                selection,
+                "the score's selection did not follow the prompt's release"
+            );
+            assert_eq!(
+                app.editor().viewport(),
+                viewport,
+                "the score did not scroll"
+            );
+        }
+
+        /// A press starts a new gesture wherever it lands. The go chip takes its
+        /// press without holding the pointer, so the drag and release after it
+        /// went on to the score's editor, which still held a drag whose release
+        /// had never arrived.
+        #[test]
+        fn a_press_that_holds_no_pointer_still_ends_the_last_drag() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            type_text(
+                &mut app,
+                "$: s(\"bd hh sd hh bd hh sd hh bd hh sd hh bd hh\")",
+            );
+            app.editor_mut().set_wrap(false);
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+                .expect("test terminal");
+            let mut draw = |app: &mut App| {
+                terminal
+                    .draw(|frame| app.paint_into(frame, Instant::now()).expect("frame paints"))
+                    .expect("draw");
+            };
+            draw(&mut app);
+
+            // A drag in the score whose release never arrives.
+            let score = app.focused_map().expect("the score is drawn").area();
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                score.x + 2,
+                score.y,
+            );
+            mouse(
+                &mut app,
+                MouseEventKind::Drag(MouseButton::Left),
+                score.x + 6,
+                score.y,
+            );
+            draw(&mut app);
+            let selection = app.editor().primary_selection();
+            let viewport = app.editor().viewport();
+            assert!(!selection.is_empty(), "a score drag is live");
+
+            // A score the linter refused, so the header shows the go chip.
+            let scene = app.scenes.current().id;
+            app.absorb_lint(crate::lint::LintResult {
+                scene,
+                revision: app.scenes.current().editor.revision(),
+                input_channels: app.lint_input_channels(),
+                diagnostics: vec![rustel_runtime::lint::Diagnostic {
+                    level: LintLevel::Value,
+                    message: "unknown sound \"top\"".into(),
+                    from: 0,
+                    to: 1,
+                }],
+            });
+            draw(&mut app);
+            let chip = app.go_chip();
+            assert!(!chip.is_empty(), "the header shows the go chip");
+            assert!(app.log_panel.is_none());
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                chip.x,
+                chip.y,
+            );
+            assert!(app.log_panel.is_some(), "the chip opened the log");
+            draw(&mut app);
+            for column in [chip.x + 1, chip.x + 2, score.x + score.width - 1] {
+                mouse(
+                    &mut app,
+                    MouseEventKind::Drag(MouseButton::Left),
+                    column,
+                    chip.y,
+                );
+            }
+            mouse(
+                &mut app,
+                MouseEventKind::Up(MouseButton::Left),
+                score.x + score.width - 1,
+                chip.y,
+            );
+
+            assert_eq!(
+                app.editor().primary_selection(),
+                selection,
+                "the score's selection did not follow a gesture that began on the chip"
+            );
+            assert_eq!(
+                app.editor().viewport(),
+                viewport,
+                "the score did not scroll"
+            );
+        }
+    }
+}

@@ -566,3 +566,539 @@ impl App {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod replay_tabs {
+        //! Tests for `app/replay_tabs.rs`.
+
+        use crate::app::tests::support::*;
+        use crate::app::*;
+        use crate::editor::MemoryClipboard;
+
+        /// The set panel lists the tapes under its fold; Enter opens one as a
+        /// replay tab on its first block; Alt+→ and a click on the timeline
+        /// choose blocks; ^S starts the
+        /// run from the chosen block, and the run's clock walks to the next one,
+        /// loading and evaluating it. ^W closes the tab.
+        #[test]
+        fn a_tape_opens_as_a_replay_tab_and_its_run_walks_the_blocks() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let tapes = directory.path().join("sessions");
+            std::fs::create_dir_all(&tapes).expect("sessions");
+            let path = write_tape(
+                &tapes,
+                "2026-09-05T12-09-48",
+                &[
+                    (0.0, "$: s(\"sine\")"),
+                    (4.0, "$: s(\"sawtooth\")"),
+                    (9.0, "$: s(\"square\")"),
+                ],
+            );
+            let mut app = app_over(directory.path());
+
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Set));
+            press(&mut app, KeyCode::End, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let panel = app.set_panel.as_ref().expect("the panel is open");
+            assert!(panel.sessions_open, "Enter on the fold opens it");
+            assert_eq!(
+                panel
+                    .tapes
+                    .iter()
+                    .map(|tape| tape.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["2026-09-05T12-09-48"]
+            );
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.set_panel.is_some(), "the panel stays");
+            assert_eq!(app.focus, Focus::Editor);
+            let scene = app.scenes.current();
+            assert!(scene.is_replay());
+            assert_eq!(scene.name(), "2026-09-05T12-09-48");
+            assert_eq!(scene.editor.source(), "$: s(\"sine\")");
+            let id = scene.id;
+            assert_eq!(app.replays[&id].events.len(), 3);
+
+            // Alt+→ walks the blocks and puts each one's code up.
+            press(&mut app, KeyCode::Right, KeyModifiers::ALT);
+            assert_eq!(app.replays[&id].selected, 1);
+            assert_eq!(app.scenes.current().editor.source(), "$: s(\"sawtooth\")");
+            assert!(
+                !app.scenes.current().dirty,
+                "the block's own text is not an edit"
+            );
+
+            // A click on the timeline chooses the block under it: the regions
+            // the app keeps carry the split, as the frame's do.
+            app.frame = Rect::new(0, 0, 100, 30);
+            let mut regions = view::regions(app.frame, false, 1, false, true, None, None);
+            app.split_replay_timelines(&mut regions);
+            app.regions = regions;
+            let strip = app.regions.panes[0].timeline;
+            assert!(!strip.is_empty(), "the timeline has its rows");
+            assert_eq!(app.regions.panes[0].editor.y, strip.bottom());
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: strip.x + 2 * crate::replay::BLOCK_WIDTH + 1,
+                row: strip.y + 2,
+                modifiers: KeyModifiers::NONE,
+            })
+            .expect("click");
+            assert_eq!(app.replays[&id].selected, 2);
+            assert_eq!(app.scenes.current().editor.source(), "$: s(\"square\")");
+
+            // ^S from block 2 starts the run there; it has nothing after it.
+            press(&mut app, KeyCode::Left, KeyModifiers::ALT);
+            assert_eq!(app.replays[&id].selected, 1);
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+            let run = app.replays[&id].run.expect("the run started");
+            assert_eq!(run.event, 1);
+            assert!(
+                run.next_due.is_some(),
+                "block 3 is due after block 2's five seconds"
+            );
+            assert!(
+                app.inflight.values().any(|sent| sent.scene == id),
+                "the block's code went to the engine"
+            );
+
+            // When the block's time is up the next one loads and plays.
+            app.inflight.clear();
+            app.replays
+                .get_mut(&id)
+                .unwrap()
+                .run
+                .as_mut()
+                .unwrap()
+                .next_due = Some(Instant::now() - Duration::from_millis(1));
+            app.tick_replays();
+            assert_eq!(app.replays[&id].selected, 2);
+            assert_eq!(app.scenes.current().editor.source(), "$: s(\"square\")");
+            assert!(
+                app.inflight.values().any(|sent| sent.scene == id),
+                "the block's code went to the engine"
+            );
+            assert_eq!(app.replays[&id].run.map(|run| run.event), Some(2));
+            assert!(
+                app.replays[&id].countdown(Instant::now()).is_none(),
+                "the last block"
+            );
+
+            // ^G stops the run; another tape replaces what the tab shows; the
+            // scrollbar scrolls the strip.
+            press(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+            assert!(app.replays[&id].run.is_none());
+            let long: Vec<(f64, String)> = (0..20)
+                .map(|index| (index as f64, format!("$: s(\"sine\") // block {index}")))
+                .collect();
+            let borrowed: Vec<(f64, &str)> = long
+                .iter()
+                .map(|(at, source)| (*at, source.as_str()))
+                .collect();
+            let other = write_tape(&tapes, "2026-09-05T15-00-00", &borrowed);
+            let tabs_before = app.scenes.len();
+            app.open_replay_tab(&other);
+            assert_eq!(app.scenes.len(), tabs_before, "one replay tab, retargeted");
+            assert_eq!(app.scenes.current().id, id);
+            assert_eq!(app.scenes.current().path, other);
+            assert_eq!(app.replays[&id].events.len(), 20);
+            assert_eq!(
+                app.scenes.current().editor.source(),
+                "$: s(\"sine\") // block 0"
+            );
+            let bar = crate::replay::ReplayTab::scrollbar_row(strip);
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: strip.x + strip.width / 2,
+                row: bar,
+                modifiers: KeyModifiers::NONE,
+            })
+            .expect("click the bar");
+            assert!(
+                app.replays[&id].scroll > 0,
+                "halfway along the bar scrolled the strip"
+            );
+            assert!(matches!(
+                app.pointer,
+                Some(Pointer::TimelineBar { scene, .. }) if scene == id
+            ));
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: strip.x,
+                row: bar,
+                modifiers: KeyModifiers::NONE,
+            })
+            .expect("drag the bar");
+            assert_eq!(app.replays[&id].scroll, 0, "dragged back to the start");
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: strip.x,
+                row: bar,
+                modifiers: KeyModifiers::NONE,
+            })
+            .expect("let go");
+
+            // Dragging a block's time on the ruler resizes the block before it,
+            // a second a cell, and letting go writes the times to the tape.
+            let ruler = crate::replay::ReplayTab::ruler_row(strip);
+            let second = strip.x + crate::replay::BLOCK_WIDTH + 1;
+            assert_eq!(app.replays[&id].duration_of(0), Some(1.0));
+            for (kind, column) in [
+                (MouseEventKind::Down(MouseButton::Left), second),
+                (MouseEventKind::Drag(MouseButton::Left), second + 3),
+                (MouseEventKind::Up(MouseButton::Left), second + 3),
+            ] {
+                app.handle_mouse(MouseEvent {
+                    kind,
+                    column,
+                    row: ruler,
+                    modifiers: KeyModifiers::NONE,
+                })
+                .expect("drag the boundary");
+            }
+            assert_eq!(app.replays[&id].duration_of(0), Some(4.0));
+            assert!(!app.replays[&id].dirty, "let go wrote the tape");
+            let written = crate::replay::ReplayTab::open(&other).unwrap();
+            assert!(
+                (written.events[1].at - 4.0).abs() < 1e-9,
+                "the tape has the new time"
+            );
+            assert!(
+                (written.events[19].at - 22.0).abs() < 1e-9,
+                "and everything after moved"
+            );
+
+            // ^S on an edited block writes the code back too.
+            app.load_replay_block(id, 0);
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText("// edited\n".into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("edit the block");
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+            let written = crate::replay::ReplayTab::open(&other).unwrap();
+            assert!(
+                written.events[0].source.starts_with("// edited"),
+                "{}",
+                written.events[0].source
+            );
+            press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+            assert!(!app.scenes.current().is_replay());
+            assert!(!app.replays.contains_key(&id));
+            assert!(app.scenes.replay_index(&path).is_none());
+        }
+
+        /// A replay tab open on the tape being written grows a block on every
+        /// save from any tab, and the sessions panel will not delete that tape.
+        #[test]
+        fn a_replay_tab_on_the_live_tape_grows_with_every_save() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let tapes = tempfile::tempdir().expect("tapes");
+            let path = tapes
+                .path()
+                .join("session-2026-09-05T13-00-00.rustel-session");
+            let mut app = app_over(directory.path());
+            app.options.recording = Some(RecordingOptions {
+                mode: rustel_runtime::session_log::SessionMode::Normal,
+                file: Some(path.clone()),
+            });
+            // The first save starts the tape; the tab opens on it.
+            app.record_save(SaveStatus::Installed, "$: s(\"bd\")", None, None);
+            app.open_replay_tab(&path);
+            let id = app.scenes.current().id;
+            assert!(app.scenes.current().is_replay());
+            assert_eq!(app.replays[&id].events.len(), 1);
+
+            // Every later save lands on the same tape, and the tab sees the
+            // block arrive.
+            app.record_save(SaveStatus::Installed, "$: s(\"sd\")", None, None);
+            assert_eq!(
+                app.replays[&id].events.len(),
+                2,
+                "the save landed as a block"
+            );
+            assert_eq!(&*app.replays[&id].events[1].source, "$: s(\"sd\")");
+            app.record_save(SaveStatus::Installed, "$: s(\"hh\")", None, Some("replay"));
+            assert_eq!(
+                app.replays[&id].events.len(),
+                2,
+                "a save marked replay is kept off the timeline"
+            );
+            assert_eq!(app.replays[&id].aside.len(), 1);
+            // Played from the tab, nothing goes on any tape.
+            let revision = app.scenes.current().editor.revision();
+            app.queue_evaluation_for(id, revision, Arc::<str>::from("$: s(\"cp\")"), true);
+            let queued = app
+                .pending_evaluation
+                .iter()
+                .chain(app.inflight.values())
+                .filter(|pending| pending.scene == id)
+                .collect::<Vec<_>>();
+            assert!(!queued.is_empty(), "the evaluation was queued");
+            assert!(
+                queued.iter().all(|pending| !pending.record),
+                "an evaluation from the replay view is not recorded"
+            );
+            app.pending_evaluation = None;
+            app.inflight.clear();
+
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::End, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            let panel = app.set_panel.as_ref().expect("open");
+            assert!(
+                panel.selected_tape().is_some_and(|tape| tape.recording),
+                "the tape being written is marked"
+            );
+            press(&mut app, KeyCode::Delete, KeyModifiers::NONE);
+            let panel = app.set_panel.as_ref().expect("open");
+            assert!(panel.deleting.is_none());
+            assert_eq!(
+                panel.error.as_deref(),
+                Some("recording · press n for a new tape")
+            );
+            assert!(app.status.contains("being written"));
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(path.exists(), "the live tape is not deleted");
+        }
+
+        /// A tape takes the studio for itself: one pane, its chip alone on the
+        /// strip; closing it gives the set back as it was, and choosing a
+        /// score from under it leaves the tape first.
+        #[test]
+        fn a_tape_has_the_studio_to_itself_and_gives_the_set_back() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+            assert_eq!(app.panes.len(), 2);
+            let before: Vec<_> = app.panes.iter().map(|pane| pane.scene).collect();
+            let current = app.scenes.current().id;
+            let tapes = tempfile::tempdir().expect("tapes");
+            let tape = write_tape(
+                tapes.path(),
+                "2026-09-05T16-10-00",
+                &[(0.0, "$: s(\"bd\")")],
+            );
+            app.open_replay_tab(&tape);
+            assert!(app.replay_view.is_some());
+            assert_eq!(app.panes.len(), 1);
+            assert!(app.scenes.current().is_replay());
+            assert_eq!(app.scene_chips().len(), 1, "the strip is the tape's alone");
+
+            press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+            assert!(app.replay_view.is_none());
+            assert_eq!(
+                app.panes.iter().map(|pane| pane.scene).collect::<Vec<_>>(),
+                before
+            );
+            assert_eq!(app.scenes.current().id, current);
+            assert!(app.scenes.scenes().iter().all(|scene| !scene.is_replay()));
+
+            app.open_replay_tab(&tape);
+            let score = app
+                .scenes
+                .scenes()
+                .iter()
+                .position(|scene| scene.is_score())
+                .expect("a score");
+            app.select_scene(score);
+            assert!(app.replay_view.is_none(), "choosing a score left the tape");
+            assert!(app.scenes.current().is_score());
+        }
+
+        /// With the keyboard, the timeline walks its blocks: each goes in the
+        /// editor without playing, Enter plays from the chosen one, and Esc
+        /// gives the keyboard back.
+        #[test]
+        fn the_focused_timeline_walks_blocks_without_playing_them() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let tapes = tempfile::tempdir().expect("tapes");
+            let tape = write_tape(
+                tapes.path(),
+                "2026-09-05T16-00-00",
+                &[
+                    (0.0, "$: s(\"sine\")"),
+                    (2.0, "$: s(\"sawtooth\")"),
+                    (4.0, "$: s(\"square\")"),
+                ],
+            );
+            app.open_replay_tab(&tape);
+            let id = app.current_replay().expect("a replay tab");
+            press(&mut app, KeyCode::Right, KeyModifiers::ALT);
+            assert_eq!(
+                app.focus,
+                Focus::Timeline,
+                "Alt+Right gave the timeline the keyboard"
+            );
+            assert_eq!(app.replays[&id].selected, 1);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+            assert_eq!(app.replays[&id].selected, 2);
+            assert_eq!(app.scenes.current().editor.source(), "$: s(\"square\")");
+            assert!(
+                app.inflight.is_empty() && app.pending_evaluation.is_none(),
+                "chosen, not played"
+            );
+            press(&mut app, KeyCode::Home, KeyModifiers::NONE);
+            assert_eq!(app.replays[&id].selected, 0);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert_eq!(app.focus, Focus::Editor);
+            press(&mut app, KeyCode::Left, KeyModifiers::ALT);
+            assert_eq!(app.replays[&id].selected, 2, "wrapped round to the last");
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(
+                app.pending_evaluation.is_some() || !app.inflight.is_empty(),
+                "Enter plays from the chosen block"
+            );
+            assert_eq!(app.focus, Focus::Timeline);
+        }
+
+        /// A tape plays on its own clock: a block takes the transport at
+        /// once, whatever the launch setting says, and the text matching what
+        /// already sounds is no reason to leave the set's music playing.
+        #[test]
+        fn a_replayed_block_takes_the_transport_at_once() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            let source = "$: s(\"sine*4\")";
+            let sessions = directory.path().join("sessions");
+            std::fs::create_dir_all(&sessions).expect("sessions");
+            let tape = write_tape(
+                &sessions,
+                "2026-09-05T12-09-48",
+                &[(0.0, source), (1.0, source)],
+            );
+            app.open_replay_tab(&tape);
+            let id = app.current_replay().expect("the tape is open");
+
+            // The set is playing this very text, on the cycle-line setting.
+            app.installed_revision = Some(source_revision(source));
+            app.audible_scene = Some(app.scenes.current().id);
+            app.snapshot = Some(sounding(true, false));
+            app.ui_settings.quantise = crate::settings::Quantise::Cycle;
+
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+            let sent = app
+                .pending_evaluation
+                .as_ref()
+                .map(|pending| (pending.scene, pending.launch))
+                .or_else(|| {
+                    app.inflight
+                        .values()
+                        .next()
+                        .map(|sent| (sent.scene, sent.launch))
+                })
+                .expect("the block went out");
+            assert_eq!(sent.0, id, "the tape's own scene");
+            assert!(
+                matches!(sent.1, Launch::Now),
+                "a tape does not wait for a cycle line: {:?}",
+                sent.1
+            );
+            assert_eq!(app.armed_scene, None, "and nothing is armed");
+            assert!(
+                app.replays[&id].run.is_some(),
+                "the run walks from the chosen block"
+            );
+        }
+
+        #[test]
+        fn replay_decorations_follow_the_playing_block_not_the_replaced_editor() {
+            use rustel_runtime::ui_events::{UiEventBatch, UiScheduledEvent};
+            let directory = tempfile::tempdir().unwrap();
+            let source = r#"s("sine").gain(slider(0.5, 0, 1))"#;
+            let path = write_tape(
+                directory.path(),
+                "first",
+                &[
+                    (0.0, source),
+                    (100.0, r#"s("sawtooth").gain(slider(0.5, 0, 1))"#),
+                ],
+            );
+            let mut app = app_over(directory.path());
+            app.open_replay_tab(&path);
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+            let id = app.scenes.current().id;
+            app.snapshot = Some(StudioSnapshot {
+                playing: true,
+                ..StudioSnapshot::default()
+            });
+            let layout = rustel_runtime::ui_events::visual_layout(source, 1).unwrap();
+            app.handle_control(StudioControlEvent::Layout(layout.clone()));
+            app.visual.start();
+            let event = UiScheduledEvent {
+                onset_id: 1,
+                generation: 1,
+                whole_begin: "0/1".into(),
+                whole_end: "100/1".into(),
+                part_begin: "0/1".into(),
+                part_end: "100/1".into(),
+                target_time: 10.0,
+                duration_seconds: 100.0,
+                value: Some("sine".into()),
+                color: None,
+                label: Some("sine".into()),
+                active_label: None,
+                scale: None,
+                frequency_hz: None,
+                gain: Some(1.0),
+                ui_visuals: 0,
+                context: vec![(3, 5)],
+            };
+            assert!(
+                app.visual.install_batch(
+                    UiEventBatch::new(
+                        10.0,
+                        0.0,
+                        1.0,
+                        1,
+                        layout.ui_layout.source_revision.clone(),
+                        vec![event],
+                        0,
+                    )
+                    .unwrap()
+                )
+            );
+            app.refresh_decorations();
+            assert!(!app.marks.is_empty());
+            assert!(!app.mini_spans.is_empty());
+            assert!(!app.sliders.is_empty());
+
+            press(&mut app, KeyCode::Right, KeyModifiers::ALT);
+            assert_eq!(app.replays[&id].playing(), Some(0));
+            assert!(app.is_playing(), "browsing does not stop the audio");
+            assert!(app.marks.is_empty());
+            assert!(app.mini_spans.is_empty());
+            assert!(app.sliders.is_empty());
+            // The layout can arrive after the reader has already moved away.
+            app.handle_control(StudioControlEvent::Layout(layout.clone()));
+            app.refresh_decorations();
+            assert!(app.visual_revision.is_none());
+            assert!(app.marks.is_empty());
+            assert!(app.mini_spans.is_empty());
+            assert!(app.sliders.is_empty());
+
+            press(&mut app, KeyCode::Left, KeyModifiers::ALT);
+            assert!(app.visual_revision.is_some());
+            assert!(!app.marks.is_empty());
+            assert!(!app.mini_spans.is_empty());
+            assert!(!app.sliders.is_empty());
+
+            // Identical code in a different tape still belongs to that tape.
+            let other = write_tape(directory.path(), "second", &[(0.0, source)]);
+            app.open_replay_tab(&other);
+            app.handle_control(StudioControlEvent::Layout(layout));
+            app.refresh_decorations();
+            assert!(app.visual_revision.is_none());
+            assert!(app.marks.is_empty());
+            assert!(app.sliders.is_empty());
+        }
+    }
+}

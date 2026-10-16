@@ -327,3 +327,354 @@ impl App {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod bank_context {
+        //! Tests for `app/bank_context.rs`.
+
+        use crate::app::bank_context::*;
+
+        fn bank_sounds_at(marked: &str) -> Vec<String> {
+            static REFERENCE: std::sync::OnceLock<Reference> = std::sync::OnceLock::new();
+            let caret = marked.find('¦').expect("caret marker");
+            bank_receiver_sounds(
+                &marked.replace('¦', ""),
+                caret,
+                REFERENCE.get_or_init(|| Reference::load(|_| true)),
+            )
+        }
+
+        #[test]
+        fn bank_context_follows_the_receiving_chain_and_keeps_literal_indexes() {
+            assert_eq!(bank_sounds_at(r#"s("bd:3").dec(0.1).bank("¦")"#), ["bd:3"]);
+            assert_eq!(
+                bank_sounds_at(r#"s("hh:3*16").velocity(tri.fast(4)).bank("¦")"#),
+                ["hh:3"]
+            );
+            assert_eq!(
+                bank_sounds_at(r#"s("hh:3*16").vel(tri.fast(4)).bank("¦")"#),
+                ["hh:3"]
+            );
+            assert_eq!(
+                bank_sounds_at("sound ( 'bd:3 hh' )\n  .dec(0.1)\n  .bank('¦')"),
+                ["bd:3", "hh"]
+            );
+            assert_eq!(
+                bank_sounds_at(r#"s("hh").bank("Old"); s("bd:3").bank("¦")"#),
+                ["bd:3"]
+            );
+            assert_eq!(
+                bank_sounds_at("// s(\"hh\")\ns(`bd:3`) /* commentaire é */ .bank(\"¦\")"),
+                ["bd:3"]
+            );
+            // A combiner given a plain value brings no sound of its own.
+            assert_eq!(bank_sounds_at(r#"s("bd").cat("~").bank("¦")"#), ["bd"]);
+        }
+
+        #[test]
+        fn uncertain_bank_context_does_not_hide_banks() {
+            for source in [
+                r#"s(value).bank("¦")"#,
+                r#"s("bd").bank("Old"); s(value).bank("¦")"#,
+                r#"stack(s("bd"), s("hh")).bank("¦")"#,
+                r#"s("a".pick({a: "bd"})).bank("¦")"#,
+                r#"s("bd" + suffix).bank("¦")"#,
+                r#"s(`${sound}`).bank("¦")"#,
+                r#"s("bd").sometimes(x => x.s ("hh")).bank("¦")"#,
+                r#"s("bd").set(pattern).bank("¦")"#,
+                r#"const change = p => p.s('hh'); s("bd").every(1, change).bank("¦")"#,
+                r#"s("bd").sometimes(change).bank("¦")"#,
+                r#"s("bd").apply(change).bank("¦")"#,
+                r#"s("bd").layer(change).bank("¦")"#,
+                r#"s("bd").superimpose(change).bank("¦")"#,
+                r#"s("bd").customTransform(value).bank("¦")"#,
+                // A pattern combined in from elsewhere can carry sounds of its own.
+                r#"const hats = s("hh"); s("bd").cat(hats).bank("¦")"#,
+                r#"s("bd").slowcat(hats).bank("¦")"#,
+                r#"s("bd").cat("~", hats).bank("¦")"#,
+                r#"s("bd").cat(nan).bank("¦")"#,
+                r#"s("bd").appLeft(hats).bank("¦")"#,
+                r#"s("bd").appBoth(hats).bank("¦")"#,
+            ] {
+                assert!(bank_sounds_at(source).is_empty(), "{source}");
+            }
+        }
+
+        #[test]
+        fn bank_context_does_not_mistake_mini_operands_or_synths_for_sounds() {
+            assert_eq!(
+                bank_sounds_at(r#"s("hh:3*16 bd(3,8)").bank("¦")"#),
+                ["hh:3", "bd"]
+            );
+            assert_eq!(
+                bank_sounds_at(r#"s("[bd hh]:3").bank("¦")"#),
+                ["bd:3", "hh:3"]
+            );
+            assert_eq!(bank_sounds_at(r#"s("bd:<0 3>").bank("¦")"#), ["bd"]);
+            assert_eq!(bank_sounds_at(r#"s("bd:3").n(value).bank("¦")"#), ["bd"]);
+            assert_eq!(bank_sounds_at(r#"s("sbd hh").bank("¦")"#), ["hh"]);
+            assert_eq!(
+                bank_sounds_at(r#"s("sbd:3 <hh supersaw>").bank("¦")"#),
+                ["hh"]
+            );
+            assert!(bank_sounds_at(r#"s("white*8 sine").bank("¦")"#).is_empty());
+        }
+
+        /// Selectors and function-taking links hide nothing, whatever their
+        /// argument.
+        #[test]
+        fn selectors_and_function_arguments_hide_nothing_whatever_their_argument() {
+            for source in [
+                r#"s("bd").pick("x").bank("¦")"#,
+                r#"s("bd").pick().bank("¦")"#,
+                r#"s("bd").pickSqueeze("x").bank("¦")"#,
+                r#"s("bd").pickmodSqueeze().bank("¦")"#,
+                r#"s("bd").squeeze().bank("¦")"#,
+                r#"s("bd").inhabit("x").bank("¦")"#,
+                r#"s("bd").inhabitmod().bank("¦")"#,
+                r#"s("bd").pickF("0", [rev]).bank("¦")"#,
+                r#"s("bd").fmap().bank("¦")"#,
+                r#"s("bd").withValue().bank("¦")"#,
+                r#"s("bd").src(x => x).bank("¦")"#,
+                r#"s("bd").source(f).bank("¦")"#,
+                r#"s("bd").layer(3).bank("¦")"#,
+            ] {
+                assert!(bank_sounds_at(source).is_empty(), "{source}");
+            }
+        }
+
+        /// Comments, line breaks and controls between links keep the sounds and
+        /// their sample numbers.
+        #[test]
+        fn values_and_comments_between_links_keep_the_sounds() {
+            assert_eq!(
+                bank_sounds_at(
+                    "s(\"bd\") /* x */ .fast(2) // y\n  .lpf(sine.range(200, 2000)).bank(\"¦\")"
+                ),
+                ["bd"]
+            );
+            assert_eq!(bank_sounds_at(r#"s("bd:3").note("c").bank("¦")"#), ["bd:3"]);
+            assert_eq!(
+                bank_sounds_at(r#"s("bd:3").velocity(.5).bank("¦")"#),
+                ["bd:3"]
+            );
+        }
+
+        /// A bank whose receiver is not a call hides nothing.
+        #[test]
+        fn a_receiver_that_is_not_a_call_hides_nothing() {
+            for source in [
+                r#"x.bank("¦")"#,
+                r#"s("bd")[0].bank("¦")"#,
+                r#""bd".s().bank("¦")"#,
+                r#"bank("¦")"#,
+            ] {
+                assert!(bank_sounds_at(source).is_empty(), "{source}");
+            }
+        }
+
+        /// Only a single-atom sample number narrows a word, the first tail wins,
+        /// and a range hides nothing.
+        #[test]
+        fn mini_words_that_narrow_the_banks() {
+            assert_eq!(bank_sounds_at(r#"s("bd:3:5").bank("¦")"#), ["bd:3"]);
+            assert_eq!(
+                bank_sounds_at(r#"s("[bd:1 sd]:3").bank("¦")"#),
+                ["bd:1", "sd:3"]
+            );
+            assert_eq!(bank_sounds_at(r#"s("bd:x").bank("¦")"#), ["bd"]);
+            assert_eq!(
+                bank_sounds_at(r#"s("<bd sd>:<1 2>").bank("¦")"#),
+                ["bd", "sd"]
+            );
+            assert_eq!(
+                bank_sounds_at(r#"s("bd bd:3 bd").bank("¦")"#),
+                ["bd", "bd:3"]
+            );
+            assert!(matches!(
+                rustel_mini::parse("bd 0 .. 3"),
+                Ok(rustel_mini::Ast::Seq { ref items, .. })
+                    if matches!(items[1].ast, rustel_mini::Ast::Range { .. })
+            ));
+            assert!(bank_sounds_at(r#"s("bd 0 .. 3").bank("¦")"#).is_empty());
+        }
+
+        /// A link's declarations decide what passes: a combiner given a plain value,
+        /// a name containing `function`, and a hidden control keep the sounds; `.n`
+        /// drops sample numbers and lists each name once.
+        #[test]
+        fn a_links_declarations_decide_what_comes_through() {
+            for source in [
+                r#"s("bd").set("~").bank("¦")"#,
+                r#"s("bd").set(2).bank("¦")"#,
+                r#"s("bd").set().bank("¦")"#,
+                r#"s("bd").fast(myfunction).bank("¦")"#,
+                r#"s("bd").gain(functional).bank("¦")"#,
+                r#"s("bd").chorus(.5).bank("¦")"#,
+            ] {
+                assert_eq!(bank_sounds_at(source), ["bd"], "{source}");
+            }
+            for source in [
+                r#"s("bd").set(pattern).bank("¦")"#,
+                r#"s("bd").fast(function (x) { return x }).bank("¦")"#,
+                r#"s("bd").gain(s("hh")).bank("¦")"#,
+                r#"s("bd").gain(sound ("hh")).bank("¦")"#,
+                r#"s("bd").Pick("x").bank("¦")"#,
+                "s(\"bd\")\u{3000}.fast(2).bank(\"¦\")",
+            ] {
+                assert!(bank_sounds_at(source).is_empty(), "{source}");
+            }
+            assert_eq!(
+                bank_sounds_at(r#"s("bd:1 hh bd:2").n(x).bank("¦")"#),
+                ["bd", "hh"]
+            );
+        }
+
+        /// A function the reference does not declare hides nothing; once declared,
+        /// its entry alone decides whether the sounds pass.
+        #[test]
+        fn a_function_declared_once_is_honoured() {
+            let entry = |json: serde_json::Value| {
+                serde_json::from_value::<crate::reference::Entry>(json).expect("an entry")
+            };
+            let source = r#"s("bd").chooseKit("x").bank("¦")"#;
+            let caret = source.find('¦').expect("caret marker");
+            let sounds = |reference: &Reference| {
+                bank_receiver_sounds(&source.replace('¦', ""), caret, reference)
+            };
+
+            let plain = Reference::load(|_| true);
+            assert_eq!(plain.sound_effect("chooseKit"), None);
+            assert!(sounds(&plain).is_empty(), "undeclared, it hides nothing");
+
+            let documented = Reference::load(|_| true).with_entry(entry(serde_json::json!({
+                "name": "chooseKit",
+                "params": [{ "name": "which", "type": "string" }],
+            })));
+            assert_eq!(
+                sounds(&documented),
+                ["bd"],
+                "a plain parameter keeps the sound"
+            );
+
+            let selector = Reference::load(|_| true).with_entry(entry(serde_json::json!({
+                "name": "chooseKit",
+                "params": [{ "name": "which", "type": "string" }],
+                "tags": ["combiners", "selectors"],
+            })));
+            assert!(sounds(&selector).is_empty(), "a selector's arguments play");
+
+            let callback = Reference::load(|_| true).with_entry(entry(serde_json::json!({
+                "name": "chooseKit",
+                "params": [{ "name": "pick", "type": "Function" }],
+            })));
+            assert!(
+                sounds(&callback).is_empty(),
+                "a function argument builds its own"
+            );
+        }
+
+        fn banks_at(marked: &str) -> Vec<String> {
+            let at = marked.find('¦').expect("caret marker");
+            chain_banks(&marked.replace('¦', ""), at)
+        }
+
+        /// `chain_banks` names the machines of the last bank that applies at the
+        /// caret: on the caret's chain across lines, on a call it rests right after
+        /// on the same line, after every call enclosing it, and on an enclosing
+        /// call's receiver only through a parameter of a function opening that
+        /// call's argument. A bank names the machines of the string its argument
+        /// opens with, read as preload reads it, so a template's `${…}` is left out;
+        /// one whose argument opens with anything else, or one in a comment or a
+        /// string, names nothing.
+        #[test]
+        fn chain_banks_names_the_bank_that_applies_at_the_caret() {
+            let cases: &[(&str, &[&str])] = &[
+                (r#"s("c¦ym").bank("Metal")"#, &["Metal"]),
+                ("s('c¦ym')\n  .fast(2)\n  .bank('Metal')", &["Metal"]),
+                (r#"s("a").bank("A"); s("c¦ym").bank("B")"#, &["B"]),
+                (r#"stack(s("c¦ym"), s("hh")).bank("Metal")"#, &["Metal"]),
+                (r#"s("c¦ym").bank(v).s("hh")"#, &[]),
+                ("// .bank(\"Metal\")\ns(\"c¦ym\")", &[]),
+                (r#"s("c¦ym").gain(".bank(\"X\")")"#, &[]),
+                (r#"s("cym").bank("Metal")¦"#, &["Metal"]),
+                (r#"s("cym").bank("Metal").ga¦"#, &["Metal"]),
+                (r#"s("c¦ym").bank("Metal Tin Metal")"#, &["Metal", "Tin"]),
+                (r#"s("c¦ym").bank("Met"#, &["Met"]),
+                (r#"¦s("cym").bank("Metal")"#, &[]),
+                ("s(\"cym\").bank(\"Metal\")\n¦", &[]),
+                ("s(\"cym\").bank(\"Metal\")\n\n¦", &[]),
+                ("s(\"cym\").bank(\"Metal\")\n// next\n¦", &[]),
+                ("s(\"a\").bank(\"A\")\n¦s(\"cym\")", &[]),
+                ("s(\"cym\").bank(\"Metal\")\n  .ga¦", &["Metal"]),
+                (r#"s("bd").bank("A").stack(s("c¦ym"))"#, &[]),
+                (
+                    "$: s(\"bd*4\").bank(\"RolandTR909\")\n  .stack(s(\"c¦ym\"))",
+                    &[],
+                ),
+                (r#"s("bd").bank("A").off(1/8, x => x.s("c¦ym"))"#, &["A"]),
+                (
+                    r#"s("bd").bank("A").off(1/8, x => x.stack(s("c¦ym")))"#,
+                    &[],
+                ),
+                (
+                    r#"s("bd").bank("A").off(1/8, x => x.bank("B").s("c¦ym"))"#,
+                    &["B"],
+                ),
+                (r#"s("bd").bank("A").off(1/8, (x) => x.s("c¦ym"))"#, &["A"]),
+                (
+                    r#"s("bd").bank("A").off(1/8, x => x.fast(2).s("c¦ym"))"#,
+                    &["A"],
+                ),
+                (
+                    r#"s("bd").bank("A").off(1/8, function (x) { return x.s("c¦ym") })"#,
+                    &["A"],
+                ),
+                (
+                    r#"s("bd").bank("A").every(2, x => x.sometimes(y => y.s("c¦ym")))"#,
+                    &["A"],
+                ),
+                (
+                    r#"s("bd").bank("A").stack(s("hh").sometimes(x => x.speed(2)), s("c¦ym"))"#,
+                    &[],
+                ),
+                (
+                    r#"s("bd").bank("A").stack(n("0 1").sometimes(x => x.speed(2)).s("c¦ym"))"#,
+                    &[],
+                ),
+                (r#"s("bd").bank("A").off(1/8, x => s("c¦ym"))"#, &[]),
+                (r#"s("bd").bank("A").off(1/8, y => x.s("c¦ym"))"#, &[]),
+                (r#"s("bd").bank("A").off(1/8, x => o.x.s("c¦ym"))"#, &[]),
+                (r#"s("bd").bank("A").off(1/8, [x => x.s("c¦ym")])"#, &[]),
+                // The rule stops at a call between the function and the chain,
+                // although the receiver does reach `x` here.
+                (
+                    r#"s("bd").bank("A").off(1/8, x => stack(x.s("c¦ym")))"#,
+                    &[],
+                ),
+                (r#"s("c¦ym").bank("A").bank("B")"#, &["B"]),
+                (r#"stack(s("c¦ym").bank("A")).bank("B")"#, &["B"]),
+                (r#"((s("c¦ym"))).bank("A")"#, &["A"]),
+                (r#"stack((s("c¦ym")), s("hh").bank("A"))"#, &[]),
+                (r#"s("c¦ym").bank("A").bank(kit)"#, &[]),
+                (r#"s("c¦ym").bank("A" + kit)"#, &["A"]),
+                (r#"s("c¦ym").bank(kit + "A")"#, &[]),
+                ("s(\"c¦ym\").bank(`Metal${x}`)", &["Metal"]),
+                ("s(\"c¦ym\").bank(`${x}`)", &[]),
+                // A name the scan reads only the ASCII tail of is not a parameter.
+                (r#"s("bd").bank("A").off(1/8, x => éx.s("c¦ym"))"#, &[]),
+                (r#"s("bd").bank("A").off(1/8, éx => éx.s("c¦ym"))"#, &[]),
+            ];
+            for (marked, expected) in cases {
+                assert_eq!(banks_at(marked), *expected, "{marked}");
+            }
+            // A template bank connects what preload loads for it.
+            let template = "s(\"cym\").bank(`Metal${x}`)";
+            assert_eq!(
+                banks_at("s(\"c¦ym\").bank(`Metal${x}`)"),
+                rustel_runtime::sounds::banks_in_score(template)
+            );
+        }
+    }
+}

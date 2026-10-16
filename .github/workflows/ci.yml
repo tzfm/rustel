@@ -23,9 +23,8 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
-  # A pull request with only Markdown changes needs no build and no test. Four
-  # Markdown files are test inputs, so a change to one of them is code. A push
-  # to main always counts as code.
+  # Markdown-only pull requests skip builds except for the four contract
+  # documents listed below. A push to main always runs the checks.
   changes:
     name: Changes
     runs-on: ubuntu-latest

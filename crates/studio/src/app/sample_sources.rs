@@ -1896,4 +1896,569 @@ mod tests {
             "counts resume after the clear"
         );
     }
+
+    mod sample_refresh_receipt {
+        //! A source scan that finishes before the refresh command reports it.
+
+        use crate::app::*;
+        use rustel_runtime::samples::{GlobalSourceState, SampleLibrary};
+
+        #[test]
+        fn a_refresh_already_ready_before_its_status_step_keeps_the_receipt() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let folder = directory.path().join("local drums");
+            std::fs::create_dir(&folder).unwrap();
+            std::fs::write(
+                folder.join("kick.wav"),
+                include_bytes!("../../../audio/assets/bd.wav"),
+            )
+            .unwrap();
+            let spec = folder.display().to_string();
+            let library = Arc::new(SampleLibrary::empty());
+            app.worker.set_library(Arc::clone(&library));
+            app.prefs.sample_sources = vec![crate::prefs::SampleSourcePref {
+                spec: spec.clone(),
+                enabled: true,
+            }];
+
+            // Wait for the real folder walk to finish before the command
+            // consumes its adoption reports.
+            app.source_reports = library.adopt_global_sources_settled(&app.prefs.global_sources());
+            assert_eq!(
+                app.source_reports[0].state,
+                GlobalSourceState::Ready { banks: 1 }
+            );
+            assert_eq!(library.manifests_pending(), 0);
+            for full in [false, true] {
+                app.ui_settings.show_full_paths = full;
+                app.status = "previous action".into();
+                app.show_sample_source_status(&spec, "fetching again");
+                let receipt = format!(
+                    "{} - 1 sound(s) imported",
+                    status_sample_source(&spec, full)
+                );
+                assert_eq!(app.status, receipt);
+
+                // There is no later Loading→Ready transition to rescue a stale
+                // 'fetching again' message: the poll receives the same Ready report.
+                app.poll_source_reports_precache_and_aliases();
+                assert_eq!(app.source_reports, library.global_source_reports());
+                assert_eq!(app.status, receipt);
+            }
+        }
+    }
+
+    mod sample_sources {
+        //! Tests for `app/sample_sources.rs`.
+
+        use crate::app::sample_sources::*;
+        use crate::app::tests::support::*;
+        use rustel_runtime::samples::{GlobalSourceReport, GlobalSourceState};
+
+        /// A failed import writes its reason to the log. For a local folder the
+        /// footer says "could not import; see Log", so the log line gives the
+        /// real reason and does not repeat the footer's sentence.
+        #[test]
+        fn a_failed_import_says_why_in_the_log() {
+            use rustel_runtime::samples::{GlobalSourceReport, GlobalSourceState};
+
+            let report = |spec: &str, state: GlobalSourceState| GlobalSourceReport {
+                spec: spec.to_owned(),
+                state,
+            };
+            let loading = |spec: &str| report(spec, GlobalSourceState::Loading);
+            // Use an absolute path for this platform. `Path::is_absolute` decides
+            // whether a spec is a local folder, and on Windows it needs a drive
+            // prefix.
+            let folder = {
+                let mut path = std::path::PathBuf::from(if cfg!(windows) { "C:\\" } else { "/" });
+                for component in [
+                    "Users",
+                    "somebody",
+                    "Dropbox",
+                    "Projects Musicaux",
+                    "Samples",
+                ] {
+                    path.push(component);
+                }
+                path.display().to_string()
+            };
+            let why = "local samples: audio-file count passed its limit of 16384 - \
+               import the subfolders separately, or a folder further in";
+
+            let settled = settled_sources(
+                &[loading(&folder)],
+                &[report(&folder, GlobalSourceState::Failed(why.to_owned()))],
+                false,
+                None,
+            )
+            .expect("a source settled");
+
+            // The footer stays short and may point at the log.
+            let status = settled.status.clone().expect("a source that speaks");
+            assert!(status.contains("could not import"), "{status:?}");
+            // The log does not point anywhere. It says the path and the reason.
+            assert_eq!(settled.log.len(), 1);
+            let (level, line, alert) = &settled.log[0];
+            assert_eq!(*level, LogLevel::Warn, "a failed import is not chatter");
+            assert_eq!(
+                alert.as_deref(),
+                Some(crate::engine::import_alert(&folder).as_str())
+            );
+            assert!(line.contains(&folder), "the whole path: {line}");
+            assert!(line.contains("16384"), "and the actual reason: {line}");
+            assert!(
+                !line.contains("see Log"),
+                "the log must not send its reader to the log: {line}"
+            );
+
+            // Several at once: one line each, whatever the footer settles on.
+            let others = [
+                report("/kit/one", GlobalSourceState::Ready { banks: 9 }),
+                report(
+                    "/kit/two",
+                    GlobalSourceState::Failed("permission denied".into()),
+                ),
+            ];
+            let settled = settled_sources(
+                &[loading("/kit/one"), loading("/kit/two")],
+                &others,
+                false,
+                None,
+            )
+            .expect("two sources settled");
+            assert_eq!(settled.log.len(), 2, "{:?}", settled.log);
+            assert!(
+                settled.log[0].1.contains("/kit/one") && settled.log[0].1.contains("9 sound(s)")
+            );
+            assert_eq!(settled.log[1].0, LogLevel::Warn);
+            assert!(
+                settled.log[1].1.contains("permission denied"),
+                "{:?}",
+                settled.log[1]
+            );
+            let status = settled.status.expect("a source that speaks");
+            assert!(status.contains("1 of 2"), "{status}");
+        }
+
+        /// A take registers a source for itself and has already put the word to
+        /// type in the footer. When that source settles a moment later its receipt
+        /// belongs in the log, not over the top of the name nobody else will
+        /// repeat.
+        #[test]
+        fn a_takes_own_source_settles_into_the_log_without_taking_the_status_line() {
+            use rustel_runtime::samples::{GlobalSourceReport, GlobalSourceState};
+            let report = |spec: &str, state: GlobalSourceState| GlobalSourceReport {
+                spec: spec.to_owned(),
+                state,
+            };
+            let loading = |spec: &str| report(spec, GlobalSourceState::Loading);
+            let absolute = |parts: &[&str]| {
+                let mut path = std::path::PathBuf::from(if cfg!(windows) { "C:\\" } else { "/" });
+                path.extend(parts);
+                path.display().to_string()
+            };
+            let take = absolute(&["sessions", "session-one.wav"]);
+            let other = absolute(&["kit", "two"]);
+            let settled = settled_sources(
+                &[loading(&take)],
+                &[report(&take, GlobalSourceState::Ready { banks: 1 })],
+                false,
+                Some(&take),
+            )
+            .expect("the take's source settled");
+            assert_eq!(settled.status, None, "{:?}", settled.status);
+            assert_eq!(settled.log.len(), 1);
+            assert!(
+                settled.log[0].1.contains("session-one.wav"),
+                "{:?}",
+                settled.log[0]
+            );
+
+            // Any other source in the same batch still speaks for itself.
+            let both = settled_sources(
+                &[loading(&take), loading(&other)],
+                &[
+                    report(&take, GlobalSourceState::Ready { banks: 1 }),
+                    report(&other, GlobalSourceState::Ready { banks: 9 }),
+                ],
+                false,
+                Some(&take),
+            )
+            .expect("both settled");
+            let status = both.status.expect("the other source speaks");
+            assert!(
+                status.contains("two") && status.contains("9 sound(s)"),
+                "{status}"
+            );
+            assert!(!status.contains(&other), "{status}");
+            assert_eq!(both.log.len(), 2);
+        }
+
+        #[test]
+        fn parent_sample_sources_silently_replace_and_absorb_children() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let parent = directory.path().join("samples");
+            let child = parent.join("drums");
+            std::fs::create_dir_all(&child).expect("sample folders");
+            std::fs::write(child.join("kick.wav"), b"fixture").expect("sample");
+            let parent = parent.display().to_string();
+            let child = child.display().to_string();
+
+            assert_eq!(app.add_sample_sources(std::slice::from_ref(&parent)), 1);
+            app.status = "quiet".into();
+            assert_eq!(
+                app.add_sample_sources(std::slice::from_ref(&child)),
+                0,
+                "an owned child is not another source"
+            );
+            assert_eq!(app.status, "quiet", "deduplication has no receipt");
+            assert_eq!(app.prefs.sample_sources.len(), 1);
+            assert_eq!(app.prefs.sample_sources[0].spec, parent);
+
+            app.prefs.sample_sources.clear();
+            assert_eq!(app.add_sample_sources(std::slice::from_ref(&child)), 1);
+            assert_eq!(app.add_sample_sources(std::slice::from_ref(&parent)), 1);
+            assert_eq!(app.prefs.sample_sources.len(), 1);
+            assert_eq!(app.prefs.sample_sources[0].spec, parent);
+        }
+
+        /// The Sources page uses list keys. The two keys that leave the page
+        /// must still work.
+        #[test]
+        fn the_sources_page_edits_a_list_and_still_lets_you_leave() {
+            use crate::settings::{SettingsAction, SettingsPage, SettingsSheet};
+            let mut settings = crate::settings::UiSettings::default();
+            let features = crate::terminal::TerminalFeatures::default();
+            let mut sheet = SettingsSheet::default();
+            sheet.show_page(SettingsPage::Sources);
+            sheet.source_count = 3;
+            // Walk past the cache controls onto the second import.
+            let second = crate::settings::SOURCE_CONTROL_COUNT + 1;
+            sheet.selected = second;
+
+            assert_eq!(
+                sheet.key(KeyCode::Down, &mut settings, &features),
+                SettingsAction::Nothing
+            );
+            assert_eq!(sheet.selected, second + 1);
+            sheet.selected = second;
+            assert_eq!(
+                sheet.key(KeyCode::Char(' '), &mut settings, &features),
+                SettingsAction::ToggleSource(1)
+            );
+            assert_eq!(
+                sheet.key(KeyCode::Char(']'), &mut settings, &features),
+                SettingsAction::Nothing,
+                "`]` no longer reorders - aliases are set with r"
+            );
+            assert_eq!(
+                sheet.key(KeyCode::Enter, &mut settings, &features),
+                SettingsAction::RefreshSource(1)
+            );
+            assert_eq!(
+                sheet.key(KeyCode::Char('a'), &mut settings, &features),
+                SettingsAction::AddSource
+            );
+            assert_eq!(
+                sheet.key(KeyCode::Char('e'), &mut settings, &features),
+                SettingsAction::EditSource(1)
+            );
+            assert_eq!(
+                sheet.key(KeyCode::Char('d'), &mut settings, &features),
+                SettingsAction::RemoveSource(1)
+            );
+            // Nothing on this page is a setting, so nothing on it was changed.
+            assert_eq!(settings, crate::settings::UiSettings::default());
+
+            sheet.key(KeyCode::Tab, &mut settings, &features);
+            #[cfg(feature = "vst")]
+            assert_eq!(sheet.page(), SettingsPage::Vst, "Tab still pages");
+            #[cfg(not(feature = "vst"))]
+            assert_eq!(sheet.page(), SettingsPage::Reference, "Tab still pages");
+            sheet.show_page(SettingsPage::Sources);
+            assert_eq!(
+                sheet.key(KeyCode::Esc, &mut settings, &features),
+                SettingsAction::Close,
+                "Esc still closes"
+            );
+
+            // An empty list has nothing to act on, and says so by declining
+            // rather than by acting on row zero of nothing.
+            let mut empty = SettingsSheet::default();
+            empty.show_page(SettingsPage::Sources);
+            assert_eq!(
+                empty.key(KeyCode::Char('d'), &mut settings, &features),
+                SettingsAction::Ignored
+            );
+            assert_eq!(
+                empty.key(KeyCode::Char('a'), &mut settings, &features),
+                SettingsAction::AddSource,
+                "adding the first one is what the empty page is for"
+            );
+        }
+
+        /// A folder is dropped, and then one of its subfolders. Every bank in
+        /// the second is already in the first, so one of the two shows a
+        /// heading and no rows. The import succeeds, and the studio must still
+        /// report this.
+        #[test]
+        fn an_import_whose_banks_another_import_took_says_so() {
+            let parent = "/packs/Sounds of KSHMR";
+            let child = "/packs/Sounds of KSHMR/percussions";
+            let reports = [
+                GlobalSourceReport {
+                    spec: parent.into(),
+                    state: GlobalSourceState::Ready { banks: 3 },
+                },
+                GlobalSourceReport {
+                    spec: child.into(),
+                    state: GlobalSourceState::Ready { banks: 2 },
+                },
+            ];
+            // The later row won both of the names they share.
+            let catalogue = [
+                bank("KSHMR_Kick_Enhancer_01", parent),
+                bank("KSHMR_Orchestral_Drums", child),
+                bank("KSHMR_Orchestral_Taiko", child),
+            ];
+            assert_eq!(
+                shadowed_banks(&reports, &catalogue),
+                [(parent.to_owned(), 2, 3)],
+                "the folder that lost them is named, with what it lost"
+            );
+
+            // Nothing to say when every import is showing what it brought.
+            let apart = [bank("kick", parent), bank("snare", child)];
+            let even = [
+                GlobalSourceReport {
+                    spec: parent.into(),
+                    state: GlobalSourceState::Ready { banks: 1 },
+                },
+                GlobalSourceReport {
+                    spec: child.into(),
+                    state: GlobalSourceState::Ready { banks: 1 },
+                },
+            ];
+            assert!(shadowed_banks(&even, &apart).is_empty());
+
+            // A source still fetching has no count to be short of yet.
+            let loading = [GlobalSourceReport {
+                spec: "github:tidalcycles/dirt-samples".into(),
+                state: GlobalSourceState::Loading,
+            }];
+            assert!(shadowed_banks(&loading, &[]).is_empty());
+        }
+
+        /// A source whose folder is missing at start is not a warning and adds
+        /// nothing to the header's badge. The log reports it once as information,
+        /// and the row stays on Sources as missing. A second adoption of the
+        /// sources does not report it again.
+        #[test]
+        fn a_source_whose_folder_is_gone_at_start_is_said_once_and_is_not_a_warning() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let gone = directory
+                .path()
+                .join(rustel_runtime::product::SESSIONS_DIRECTORY_NAME)
+                .display()
+                .to_string();
+            app.prefs.sample_sources = vec![crate::prefs::SampleSourcePref {
+                spec: gone.clone(),
+                enabled: true,
+            }];
+            let warnings = app.log.unseen();
+            let said = |app: &App, level: LogLevel| {
+                app.log
+                    .lines()
+                    .iter()
+                    .filter(|line| line.level == level && line.text.contains(&gone))
+                    .count()
+            };
+
+            app.adopt_global_sources();
+            app.settle_sample_sources();
+
+            assert_eq!(app.log.unseen(), warnings, "no warning badge");
+            assert_eq!(said(&app, LogLevel::Warn), 0);
+            assert_eq!(said(&app, LogLevel::Info), 1);
+            let line = app
+                .log
+                .lines()
+                .iter()
+                .find(|line| line.level == LogLevel::Info && line.text.contains(&gone))
+                .map(|line| line.text.clone())
+                .unwrap_or_default();
+            assert_eq!(
+                line,
+                format!("{gone} is missing - Settings → Samples to remove it")
+            );
+            assert_eq!(app.prefs.sample_sources.len(), 1, "the row stays");
+            let rows = app.source_rows();
+            assert!(rows[0].state.starts_with("missing"), "{:?}", rows[0].state);
+
+            app.adopt_global_sources();
+            app.settle_sample_sources();
+            assert_eq!(said(&app, LogLevel::Info), 1, "said once");
+            assert_eq!(app.log.unseen(), warnings);
+
+            app.refresh_sample_source(0);
+            assert!(app.status.contains("is missing"), "{}", app.status);
+        }
+
+        /// A source that is there and will not read as a folder, here a file, is
+        /// a real failure: it still warns, and its row reads failed rather than
+        /// missing.
+        #[test]
+        fn a_source_that_is_there_but_will_not_read_still_warns() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let not_a_folder = directory.path().join("notes.txt");
+            std::fs::write(&not_a_folder, "not a folder").expect("fixture");
+            let spec = not_a_folder.display().to_string();
+            let warnings = app.log.unseen();
+
+            app.add_sample_sources(std::slice::from_ref(&spec));
+            app.settle_sample_sources();
+
+            assert_eq!(app.log.unseen(), warnings + 1, "a warning badge");
+            assert!(
+                app.log
+                    .lines()
+                    .iter()
+                    .any(|line| line.level == LogLevel::Warn && line.text.contains(&spec)),
+                "the log warns about it"
+            );
+            let rows = app.source_rows();
+            assert!(rows[0].state.starts_with("failed"), "{:?}", rows[0].state);
+        }
+
+        /// A folder waiting for its first samples is still a valid source. Its row
+        /// reports zero sounds and the import does not raise a warning badge.
+        #[test]
+        fn an_empty_sample_folder_has_a_ready_row_without_a_warning() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let empty = directory.path().join("empty-kit");
+            std::fs::create_dir(&empty).expect("fixture");
+            let spec = empty.display().to_string();
+            let warnings = app.log.unseen();
+
+            app.add_sample_sources(std::slice::from_ref(&spec));
+            app.settle_sample_sources();
+
+            assert_eq!(
+                app.source_reports[0].state,
+                GlobalSourceState::Ready { banks: 0 }
+            );
+            let rows = app.source_rows();
+            assert_eq!(rows[0].state, "0 sound(s)");
+            assert!(!rows[0].dimmed);
+            assert_eq!(app.log.unseen(), warnings, "an empty folder does not warn");
+        }
+
+        /// A source left inside a set that is gone from the sets folder - deleted
+        /// or renamed outside the studio - is forgotten at start with an
+        /// information line. One inside a set that is still there stays, even
+        /// when its own folder is missing.
+        #[test]
+        fn a_source_inside_a_deleted_set_is_forgotten_at_start() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let sets = directory.path().join("sets");
+            let kept = sets.join("tuesday").join("kit");
+            std::fs::create_dir_all(&kept).expect("a set that is there");
+            let gone = sets
+                .join("monday")
+                .join(rustel_runtime::product::SESSIONS_DIRECTORY_NAME);
+            let missing = sets.join("tuesday").join("unplugged");
+            app.prefs.sets_directory = Some(sets.display().to_string());
+            app.prefs.sample_sources = [&gone, &kept, &missing]
+                .into_iter()
+                .map(|folder| crate::prefs::SampleSourcePref {
+                    spec: folder.display().to_string(),
+                    enabled: true,
+                })
+                .collect();
+            let gone = gone.display().to_string();
+            app.prefs
+                .sample_source_renames
+                .entry(gone.clone())
+                .or_default()
+                .insert("sessions".into(), "old".into());
+
+            app.forget_sources_in_gone_sets();
+
+            let specs: Vec<&str> = app
+                .prefs
+                .sample_sources
+                .iter()
+                .map(|source| source.spec.as_str())
+                .collect();
+            assert_eq!(
+                specs,
+                [
+                    kept.display().to_string().as_str(),
+                    missing.display().to_string().as_str()
+                ]
+            );
+            assert!(app.prefs.sample_source_renames.is_empty());
+            assert!(
+                app.log
+                    .lines()
+                    .iter()
+                    .any(|line| line.level == LogLevel::Info
+                        && line.text.contains(&gone)
+                        && line.text.contains("the set it was in is gone")),
+                "the log says what went"
+            );
+        }
+
+        /// A source that is there and could not be imported counts on the header's
+        /// warning chip until it comes in; its line stays in the log, resolved.
+        #[test]
+        fn a_failed_source_stops_counting_once_it_comes_in() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            // A file where the folder should be: there, and will not read.
+            let kit = directory.path().join("kit");
+            std::fs::write(&kit, "not a folder").expect("fixture");
+            let spec = kit.display().to_string();
+            app.prefs.sample_sources = vec![crate::prefs::SampleSourcePref {
+                spec: spec.clone(),
+                enabled: true,
+            }];
+            let unseen = app.log.unseen();
+            app.adopt_global_sources();
+            app.settle_sample_sources();
+            assert!(
+                matches!(app.source_reports[0].state, GlobalSourceState::Failed(_)),
+                "{:?}",
+                app.source_reports
+            );
+            assert_eq!(app.log.unseen(), unseen + 1, "the chip counts it");
+
+            std::fs::remove_file(&kit).expect("the file goes");
+            std::fs::create_dir(&kit).expect("the kit arrives");
+            std::fs::write(kit.join("kick.wav"), b"fixture").expect("sample");
+            let library = app.worker.library().expect("the engine's library");
+            library.adopt_global_sources_settled(&app.prefs.global_sources());
+            app.settle_sample_sources();
+            assert!(
+                matches!(app.source_reports[0].state, GlobalSourceState::Ready { .. }),
+                "{:?}",
+                app.source_reports
+            );
+            assert_eq!(app.log.unseen(), unseen, "the chip counts it down");
+            assert!(
+                app.log
+                    .lines()
+                    .iter()
+                    .any(|line| line.resolved && line.text.contains(&spec)),
+                "the line stays, resolved"
+            );
+        }
+    }
 }

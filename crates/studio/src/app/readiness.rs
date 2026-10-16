@@ -734,3 +734,1009 @@ impl App {
         Arc::new(context)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod input_hint {
+        //! Tests for input hint.
+
+        use crate::app::tests::support::app_over;
+        use crate::app::*;
+
+        const SOURCE: &str = "$: s(\"in\").speed(2)";
+
+        const HINT: &str = "speed does not change live input";
+
+        fn prepare(app: &mut App) -> LintResult {
+            app.worker
+                .set_library(Arc::new(rustel_runtime::samples::SampleLibrary::empty()));
+            app.scenes.current_mut().editor = Editor::new(SOURCE).unwrap();
+            app.focus = Focus::Editor;
+            app.status = "updated".into();
+            LintResult {
+                scene: app.scenes.current().id,
+                revision: app.editor().revision(),
+                input_channels: app.lint_input_channels(),
+                diagnostics: vec![rustel_runtime::lint::Diagnostic {
+                    level: LintLevel::Note,
+                    message: HINT.into(),
+                    from: SOURCE.find("speed").unwrap(),
+                    to: SOURCE.find("speed").unwrap() + "speed".len(),
+                }],
+            }
+        }
+
+        #[test]
+        fn input_notes_keep_ready_without_error_marks_or_refusing_updates() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            let result = prepare(&mut app);
+            let scene = result.scene;
+            app.absorb_lint(result);
+            assert_eq!(app.go_state(), GoState::Ready);
+            assert!(app.lint_ranges(scene).is_empty());
+            assert!(app.lint_message().is_none());
+            assert!(app.scene_chips().iter().all(|chip| !chip.errors));
+            assert!(!app.refuse_unclean(app.editor().revision(), &Arc::from(SOURCE)));
+            assert_eq!(app.footer_status(), format!("updated · hint: {HINT}"));
+        }
+
+        #[test]
+        fn an_invalid_input_outranks_a_note_even_when_the_note_comes_first() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            let mut result = prepare(&mut app);
+            let source = "$: s(\"in:2323\").speed(2)";
+            app.scenes.current_mut().editor = Editor::new(source).unwrap();
+            result.revision = app.editor().revision();
+            let context = app.lint_context_for(app.scenes.current());
+            let library = app.worker.library();
+            result.diagnostics.extend(
+                lint_with(source, false, library.as_deref(), &context)
+                    .into_iter()
+                    .filter(|diagnostic| diagnostic.level != LintLevel::Note),
+            );
+            app.absorb_lint(result);
+            assert_eq!(app.go_state(), GoState::Problems { count: 1 });
+            let start = source.find("in:2323").unwrap();
+            assert_eq!(
+                app.lint_ranges(app.scenes.current().id),
+                [(start, start + 7)]
+            );
+            assert!(app.lint_message().unwrap().contains("2323"));
+            assert_eq!(app.footer_status(), "updated");
+            assert!(app.refuse_unclean(app.editor().revision(), &Arc::from(source)));
+        }
+
+        #[test]
+        fn contextual_notes_do_not_repeat_toasts_or_logs_or_replace_owned_status() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            let result = prepare(&mut app);
+            let lines = app.log.lines().len();
+            let toast = app.toast.clone();
+            for _ in 0..3 {
+                app.absorb_lint(result.clone());
+                assert_eq!(app.footer_status(), format!("updated · hint: {HINT}"));
+            }
+            assert_eq!(app.status, "updated");
+            assert_eq!(app.log.lines().len(), lines);
+            assert_eq!(app.toast, toast);
+
+            app.status = "master -6 dB".into();
+            assert!(app.footer_status().starts_with("master -6 dB · "));
+            app.set_error(ErrorOwner::Engine, "audio device disconnected".into());
+            assert_eq!(app.footer_status(), app.status);
+            assert_eq!(app.errors.visible(), Some("audio device disconnected"));
+            app.clear_error(ErrorOwner::Engine);
+
+            app.dispatch_editor(Command::InsertText(" ".into()))
+                .unwrap();
+            assert_ne!(app.editor().revision(), result.revision);
+            assert!(
+                !app.footer_status().contains(HINT),
+                "old source hints disappear"
+            );
+        }
+    }
+
+    mod input_lint {
+        //! Tests for input lint.
+
+        use crate::app::tests::support::app_over;
+        use crate::app::*;
+
+        fn input_snapshot(app: &mut App, channels: usize) {
+            app.handle_control(StudioControlEvent::Snapshot(Box::new(StudioSnapshot {
+                playing: true,
+                input_device: (channels > 0).then(|| "test input".into()),
+                input_channels: channels,
+                ..Default::default()
+            })));
+        }
+
+        fn checked(app: &App) -> LintResult {
+            let scene = app.scenes.current();
+            let context = app.lint_context_for(scene);
+            let library = app.worker.library();
+            LintResult {
+                scene: scene.id,
+                revision: scene.editor.revision(),
+                input_channels: context.input_channels,
+                diagnostics: lint_with(&scene.editor.source(), false, library.as_deref(), &context),
+            }
+        }
+
+        #[test]
+        fn invalid_input_update_is_refused_before_saving_or_replacing_the_performance() {
+            for (channels, source) in [(0, "$: s(\"in:2323\")"), (2, "$: s(\"in:3\")")] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut app = app_over(directory.path());
+                app.worker
+                    .set_library(Arc::new(rustel_runtime::samples::SampleLibrary::empty()));
+                input_snapshot(&mut app, channels);
+                let previous: Arc<str> = Arc::from("$: s(\"sine\")");
+                let previous_hash = source_revision(&previous);
+                app.installed_revision = Some(previous_hash.clone());
+                app.evaluated_source = Some(Arc::clone(&previous));
+                app.audible_scene = Some(app.scenes.current().id);
+                app.scenes.current_mut().editor = Editor::new(source).unwrap();
+                let path = app.scenes.current().path.clone();
+                let stored = std::fs::read_to_string(&path).unwrap();
+                let request_id = app.next_request_id;
+                app.handle_editor_effect(EditorEffect::Evaluate {
+                    revision: app.editor().revision(),
+                    source: ropey::Rope::from_str(source),
+                })
+                .unwrap();
+                assert!(app.status.contains("refused"), "{}", app.status);
+                assert!(app.status.contains("input"), "{}", app.status);
+                assert_eq!(app.go_state(), GoState::Problems { count: 1 });
+                assert_eq!(
+                    app.installed_revision.as_deref(),
+                    Some(previous_hash.as_str())
+                );
+                assert_eq!(app.evaluated_source.as_deref(), Some(previous.as_ref()));
+                assert!(app.is_playing());
+                assert_eq!(app.next_request_id, request_id, "no evaluation was queued");
+                assert_eq!(
+                    std::fs::read_to_string(path).unwrap(),
+                    stored,
+                    "no bad save"
+                );
+            }
+        }
+
+        #[test]
+        fn input_device_changes_invalidate_old_lint_without_an_editor_change() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.worker
+                .set_library(Arc::new(rustel_runtime::samples::SampleLibrary::empty()));
+            app.scenes.current_mut().editor = Editor::new("$: s(\"in:3\")").unwrap();
+            let scene = app.scenes.current().id;
+            let revision = app.editor().revision();
+            input_snapshot(&mut app, 2);
+            let stereo_result = checked(&app);
+            assert_eq!(stereo_result.diagnostics.len(), 1);
+            app.absorb_lint(stereo_result.clone());
+            assert_eq!(app.go_state(), GoState::Problems { count: 1 });
+            assert!(!app.lint_ranges(scene).is_empty());
+            app.handle_editor_effect(EditorEffect::Evaluate {
+                revision,
+                source: ropey::Rope::from_str("$: s(\"in:3\")"),
+            })
+            .unwrap();
+            assert!(app.status.contains("refused"), "{}", app.status);
+
+            app.lint_pending = false;
+            input_snapshot(&mut app, 4);
+            assert!(app.lint_pending);
+            assert_eq!(app.editor().revision(), revision);
+            assert_eq!(app.go_state(), GoState::Unchecked);
+            assert!(app.lint_ranges(scene).is_empty());
+            assert!(app.lint_message().is_none());
+            app.absorb_lint(stereo_result);
+            assert_eq!(app.go_state(), GoState::Unchecked, "old result stays stale");
+            let four_channel_result = checked(&app);
+            assert!(four_channel_result.diagnostics.is_empty());
+            app.absorb_lint(four_channel_result.clone());
+            assert_eq!(app.go_state(), GoState::Ready);
+            assert!(!app.status.contains("refused"), "{}", app.status);
+
+            input_snapshot(&mut app, 2);
+            app.absorb_lint(four_channel_result);
+            assert_eq!(app.go_state(), GoState::Unchecked, "old ready is stale too");
+            app.absorb_lint(checked(&app));
+            assert_eq!(app.go_state(), GoState::Problems { count: 1 });
+
+            // Losing the input restores the established silence-without-a-device
+            // behavior; it cannot retain a count-specific error from the old device.
+            input_snapshot(&mut app, 0);
+            assert_eq!(app.lint_input_channels(), None);
+            app.absorb_lint(checked(&app));
+            assert_eq!(app.go_state(), GoState::Ready);
+        }
+
+        #[test]
+        fn background_lint_receives_the_selected_inputs_channel_count() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.worker
+                .set_library(Arc::new(rustel_runtime::samples::SampleLibrary::empty()));
+            app.scenes.current_mut().editor = Editor::new("$: s(\"in:2\")").unwrap();
+            input_snapshot(&mut app, 2);
+            app.submit_lint();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let result = loop {
+                if let Some(result) = app.linter.try_recv() {
+                    break result;
+                }
+                assert!(Instant::now() < deadline, "lint worker did not answer");
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(result.input_channels, Some(2));
+            assert_eq!(result.diagnostics.len(), 1);
+            assert_eq!(
+                &app.editor().source()[result.diagnostics[0].from..result.diagnostics[0].to],
+                "in:2"
+            );
+            app.absorb_lint(result);
+            assert_eq!(app.go_state(), GoState::Problems { count: 1 });
+        }
+
+        #[test]
+        fn background_lint_marks_stray_names_before_any_evaluation() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.worker
+                .set_library(Arc::new(rustel_runtime::samples::SampleLibrary::empty()));
+            app.scenes.current_mut().editor = Editor::new("$: s('sine')\n\n kaskaskjas").unwrap();
+            let request_id = app.next_request_id;
+            app.submit_lint();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let result = loop {
+                if let Some(result) = app.linter.try_recv() {
+                    break result;
+                }
+                assert!(Instant::now() < deadline, "lint worker did not answer");
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+            let finding = &result.diagnostics[0];
+            assert_eq!(
+                &app.editor().source()[finding.from..finding.to],
+                "kaskaskjas"
+            );
+            app.absorb_lint(result);
+            assert_eq!(app.go_state(), GoState::Problems { count: 1 });
+            assert!(!app.lint_ranges(app.scenes.current().id).is_empty());
+            assert_eq!(app.next_request_id, request_id);
+            assert!(app.inflight.is_empty());
+        }
+    }
+
+    mod readiness {
+        //! Tests for `app/readiness.rs`.
+
+        use crate::app::readiness::*;
+        use crate::app::tests::support::*;
+
+        #[test]
+        fn readiness_reads_banks_and_counts_each_sound_once() {
+            assert_eq!(
+                rustel_runtime::sounds::banks_in_score(
+                    "s(\"bd\").bank(\"RolandTR909\")\n$: s(\"hh\").bank('<tr808 tr909>')"
+                ),
+                ["RolandTR909", "tr808", "tr909"]
+            );
+            let library = rustel_runtime::samples::SampleLibrary::empty();
+            library
+                .register_trusted_custom(r#"{"tr909_bd":["http://127.0.0.1:9/a.wav"]}"#, None)
+                .expect("bank");
+            let readiness = Readiness::of("s(\"bd sine nope\").bank(\"tr909\")", &library);
+            // `sine` is a synth and ready; `bd` resolves through the bank and is
+            // on its way; `nope` is nobody's.
+            assert_eq!(readiness.ready, 1, "{readiness:?}");
+            assert_eq!(readiness.loading, 1, "{readiness:?}");
+            assert_eq!(readiness.unknown, 1, "{readiness:?}");
+            assert_eq!(readiness.total(), 3);
+        }
+
+        /// The samples start downloading as the names are typed - the string
+        /// still open, no lint yet, the bank named on the same keystrokes.
+        #[test]
+        fn typing_a_sound_name_asks_the_library_before_any_lint() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let library = std::sync::Arc::new(rustel_runtime::samples::SampleLibrary::empty());
+            library
+                .register_trusted_custom(r#"{"tr909_bd":["http://127.0.0.1:9/a.wav"]}"#, None)
+                .expect("bank");
+            app.worker.set_library(std::sync::Arc::clone(&library));
+            let scene = app.scenes.current().id;
+            assert!(!app.readiness.contains_key(&scene));
+
+            type_text(&mut app, "$: s(\"bd\").bank(\"tr909");
+            let (due_scene, due) = app.readiness_due.expect("a keystroke schedules the ask");
+            assert_eq!(due_scene, scene);
+            assert!(!app.lint.contains_key(&scene), "no check has run");
+
+            app.settle_readiness(due - Duration::from_millis(1));
+            assert!(!app.readiness.contains_key(&scene), "not before the settle");
+            app.settle_readiness(due);
+            let readiness = app.readiness.get(&scene).expect("asked");
+            assert_eq!(
+                readiness.loading, 1,
+                "tr909_bd is on its way: {readiness:?}"
+            );
+            assert!(app.readiness_due.is_none(), "spent");
+            assert!(
+                matches!(app.go_state(), GoState::Loading { total: 1, .. }),
+                "the header says so without waiting for the checker"
+            );
+        }
+
+        /// An update the engine refused leaves its message in the footer while
+        /// the refused text stands, even checked clean again; once the text has
+        /// changed and the checker finds it fine, the message comes down.
+        #[test]
+        fn a_refused_update_message_comes_down_once_the_edited_text_checks_out() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let scene = app.scenes.current().id;
+            app.log.push(LogLevel::Warn, "device", "unrelated warning");
+            let unseen_before = app.log.unseen();
+            type_text(&mut app, "$: s(\"bd\"");
+            let refused = app.scenes.current().editor.revision();
+            app.inflight.insert(
+                3,
+                PendingEvaluation {
+                    request_id: 3,
+                    scene,
+                    editor_revision: refused,
+                    source: Arc::from("$: s(\"bd\""),
+                    launch: Launch::Now,
+                    rewind: false,
+                    record: false,
+                },
+            );
+            app.handle_evaluation(EvaluationOutcome {
+                request_id: 3,
+                editor_revision: refused.0,
+                result: Err(crate::EngineFailure {
+                    kind: "compile".into(),
+                    message: "Expected `)` but found `EOF`".into(),
+                    recoverable: true,
+                    playback_stopped: false,
+                }),
+            });
+            assert_eq!(app.update_failure, Some((scene, refused)));
+            assert_eq!(app.log.unseen(), unseen_before + 1);
+            let message = app.errors.visible().expect("the footer says so").to_owned();
+            assert!(message.contains("Expected `)`"), "{message}");
+
+            let clean = |revision| crate::lint::LintResult {
+                scene,
+                revision,
+                input_channels: None,
+                diagnostics: Vec::new(),
+            };
+            app.absorb_lint(clean(refused));
+            assert_eq!(
+                app.errors.visible(),
+                Some(message.as_str()),
+                "the same text checked clean keeps the message"
+            );
+
+            assert_eq!(app.log.unseen(), unseen_before + 1);
+            type_text(&mut app, ")");
+            let stale = app.scenes.current().editor.revision();
+            type_text(&mut app, " ");
+            let fixed = app.scenes.current().editor.revision();
+            assert!(fixed > stale && stale > refused);
+            app.absorb_lint(clean(stale));
+            assert_eq!(app.errors.visible(), Some(message.as_str()));
+            assert_eq!(
+                app.log.unseen(),
+                unseen_before + 1,
+                "a stale check resolves nothing"
+            );
+            app.absorb_lint(clean(fixed));
+            assert_eq!(app.errors.visible(), None, "fixed and found fine: gone");
+            assert_eq!(app.update_failure, None);
+            assert_eq!(
+                app.log.unseen(),
+                unseen_before,
+                "the unrelated warning remains"
+            );
+            assert!(
+                app.log
+                    .lines()
+                    .iter()
+                    .any(|line| line.kind == "update" && line.resolved)
+            );
+        }
+
+        #[test]
+        fn a_stopped_scores_recoverable_error_clears_after_the_edit_checks_out() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.audible_scene = None;
+            assert!(app.audible_text().is_none(), "the test starts stopped");
+
+            let scene = app.scenes.current().id;
+            let refused = app.editor().revision();
+            app.handle_control(StudioControlEvent::Diagnostic(
+                crate::engine::StudioDiagnostic {
+                    kind: "audio".into(),
+                    message: "reverb capacity reached".into(),
+                    recoverable: true,
+                    level: StudioDiagnosticLevel::Error,
+                    alert: None,
+                },
+            ));
+            let unseen_before = app.log.unseen();
+            app.handle_control(StudioControlEvent::Diagnostic(
+                crate::engine::StudioDiagnostic {
+                    kind: "evaluation".into(),
+                    message: "[mini] parse error at line 1".into(),
+                    recoverable: true,
+                    level: StudioDiagnosticLevel::Error,
+                    alert: None,
+                },
+            ));
+            assert_eq!(app.update_failure, Some((scene, refused)));
+            assert!(app.errors.get(ErrorOwner::Evaluation).is_some());
+            assert_eq!(app.log.unseen(), unseen_before + 1);
+
+            type_text(&mut app, " ");
+            let fixed = app.editor().revision();
+            app.absorb_lint(crate::lint::LintResult {
+                scene,
+                revision: fixed,
+                input_channels: app.lint_input_channels(),
+                diagnostics: Vec::new(),
+            });
+
+            assert_eq!(app.errors.get(ErrorOwner::Evaluation), None);
+            assert_eq!(app.update_failure, None);
+            assert_eq!(app.log.unseen(), unseen_before, "the audio warning remains");
+            assert!(
+                app.log
+                    .lines()
+                    .iter()
+                    .any(|line| line.kind == "evaluation" && line.resolved)
+            );
+            assert!(
+                app.log
+                    .lines()
+                    .iter()
+                    .any(|line| line.kind == "audio" && !line.resolved)
+            );
+        }
+
+        #[test]
+        fn a_clean_live_lint_resolves_its_warning_badge_without_an_update() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.log
+                .push(LogLevel::Warn, "device", "an unrelated warning");
+
+            type_text(&mut app, "$: s(\"bd\"");
+            let scene = app.scenes.current().id;
+            let refused = app.editor().revision();
+            let source = Arc::<str>::from(app.editor().source());
+            assert!(app.refuse_unclean(refused, &source));
+            assert_eq!(app.update_failure, Some((scene, refused)));
+            assert!(app.status.starts_with("refused -"), "{}", app.status);
+            assert_eq!(app.log.unseen(), 2);
+
+            type_text(&mut app, ")");
+            let fixed = app.editor().revision();
+            app.absorb_lint(crate::lint::LintResult {
+                scene,
+                revision: fixed,
+                input_channels: app.lint_input_channels(),
+                diagnostics: Vec::new(),
+            });
+
+            assert_eq!(
+                app.log.unseen(),
+                1,
+                "the fixed lint alert clears without hiding the device warning"
+            );
+            assert_eq!(app.update_failure, None);
+            assert_eq!(app.status, "ready");
+            assert!(
+                app.log.lines().iter().any(|line| line.kind == "check"),
+                "the resolved refusal remains in the log"
+            );
+        }
+
+        /// The score's imports count in the header like its sounds: one on its
+        /// way keeps it at loading, one refused says failed, and one the
+        /// library has not been asked for yet is not counted at all.
+        #[test]
+        fn imports_count_in_the_headers_readiness() {
+            let library = rustel_runtime::samples::SampleLibrary::empty();
+            library.note_samples_source_state_for_tests(
+                "github:me/slow",
+                rustel_runtime::samples::SourceState::Loading,
+            );
+            library.note_samples_source_state_for_tests(
+                "github:me/gone",
+                rustel_runtime::samples::SourceState::Failed("refused".into()),
+            );
+            let of = |source: &str| Readiness::of(source, &library);
+            assert_eq!(of("samples('github:me/slow')").loading, 1);
+            assert_eq!(of("samples('github:me/gone')").failed, 1);
+            assert_eq!(of("samples('github:me/unasked')").total(), 0);
+            assert_eq!(
+                of("// samples('github:me/gone')").total(),
+                0,
+                "a commented-out import is no import"
+            );
+        }
+
+        /// A hyphenated name is one sound, looked up whole at the variant it
+        /// names: `mlkr-grsl:3` is on its way, not two names nobody has.
+        #[test]
+        fn a_hyphenated_name_is_one_sound() {
+            let library = rustel_runtime::samples::SampleLibrary::empty();
+            library
+                .register_trusted_custom(
+                    r#"{"_base":"http://127.0.0.1:9/","mlkr-grsl":["a.wav","b.wav","c.wav","d.wav"]}"#,
+                    None,
+                )
+                .expect("bank");
+            let readiness = Readiness::of("s(\"mlkr-grsl:3\")", &library);
+            assert_eq!(readiness.loading, 1, "{readiness:?}");
+            assert_eq!(readiness.total(), 1, "{readiness:?}");
+        }
+
+        /// The line under the caret keeps its marks to itself while it is being
+        /// typed on; a pause, or leaving the line, paints them. The header says
+        /// so all along.
+        #[test]
+        fn marks_stay_off_the_line_being_typed_until_the_typing_pauses() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let scene = app.scenes.current().id;
+            type_text(&mut app, "$: s(\n$: s(\"hh\")");
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            let source = app.scenes.current().editor.source().to_string();
+            let broken = source.find("$: s(\n").expect("the broken line") + 5;
+            let revision = app.scenes.current().editor.revision();
+            app.absorb_lint(crate::lint::LintResult {
+                scene,
+                revision,
+                input_channels: None,
+                diagnostics: vec![rustel_runtime::lint::Diagnostic {
+                    level: rustel_runtime::lint::Level::Syntax,
+                    message: "Expected `)` but found `EOF`".into(),
+                    from: broken - 2,
+                    to: broken,
+                }],
+            });
+            assert!(app.lint_ranges(scene).is_empty(), "quiet under the fingers");
+            assert!(app.lint_message().is_some(), "the header still says so");
+
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            assert_eq!(
+                app.lint_ranges(scene),
+                [(broken - 2, broken)],
+                "leaving the line paints it"
+            );
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            assert!(app.lint_ranges(scene).is_empty(), "back on it, quiet again");
+
+            app.last_edit_at = Instant::now() - MARK_SETTLE;
+            app.settle_marks(Instant::now());
+            assert!(app.marks_muted.is_none() && app.dirty_frame);
+            assert_eq!(
+                app.lint_ranges(scene),
+                [(broken - 2, broken)],
+                "a pause paints it"
+            );
+        }
+
+        /// The sounds a load skipped arrive once, as one line under an alert: the
+        /// log keeps it and the header counts it, the status line is left to the
+        /// music, and the engine resolving the alert stops the count.
+        #[test]
+        fn the_late_sounds_line_is_logged_quietly_and_resolves() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            let message = "notes skipped while loading: bd:0, hh:2";
+            app.status = "quiet".into();
+            let unseen = app.log.unseen();
+            app.handle_control(StudioControlEvent::Diagnostic(crate::StudioDiagnostic {
+                kind: rustel_runtime::SAMPLE_LOADING_DIAGNOSTIC.into(),
+                message: message.into(),
+                recoverable: true,
+                level: StudioDiagnosticLevel::Warning,
+                alert: Some(DiagnosticAlert::Raise("samples:late:1".into())),
+            }));
+            assert_eq!(app.status, "quiet", "the status line stays on the music");
+            assert!(app.log.lines().iter().any(|line| line.text == message));
+            assert_eq!(app.log.unseen(), unseen + 1);
+
+            app.handle_control(StudioControlEvent::Diagnostic(crate::StudioDiagnostic {
+                kind: "alert".into(),
+                message: String::new(),
+                recoverable: true,
+                level: StudioDiagnosticLevel::Trace,
+                alert: Some(DiagnosticAlert::Resolve("samples:late:1".into())),
+            }));
+            assert_eq!(app.log.unseen(), unseen, "the header counts it down");
+            let line = app
+                .log
+                .lines()
+                .iter()
+                .find(|line| line.text == message)
+                .expect("the line stays as history");
+            assert!(line.resolved);
+            assert!(
+                !app.log.lines().iter().any(|line| line.kind == "alert"),
+                "a resolution is not a line of its own"
+            );
+        }
+
+        const GONE: &str = "github:me/gone";
+
+        /// An app whose score imports [`GONE`], its library's pinned manifests in so
+        /// an ask about the import waits behind nothing.
+        fn app_importing_gone(
+            directory: &std::path::Path,
+        ) -> (App, Arc<rustel_runtime::samples::SampleLibrary>) {
+            let mut app = app_over(directory);
+            let library = app.worker.library().expect("the engine's library");
+            library.wait_until_idle(Duration::from_secs(60));
+            app.scenes.current_mut().editor =
+                Editor::new(&format!("samples('{GONE}')\n$: s(\"bd\")\n")).expect("editor");
+            (app, library)
+        }
+
+        /// Where [`GONE`] stands once the engine has answered with anything but
+        /// `was`, asking through `ask` until it has. The engine's command line is
+        /// short, so an ask can be dropped; the studio asks again on its next turn,
+        /// and so does this.
+        fn answered(
+            library: &rustel_runtime::samples::SampleLibrary,
+            was: &rustel_runtime::samples::SourceState,
+            mut ask: impl FnMut(),
+        ) -> Option<rustel_runtime::samples::SourceState> {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                ask();
+                let state = library.samples_source_state(GONE);
+                if state.as_ref() != Some(was) || Instant::now() >= deadline {
+                    return state;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn update(app: &mut App) {
+            let revision = app.editor().revision();
+            let source = ropey::Rope::from_str(&app.editor().source());
+            app.handle_editor_effect(EditorEffect::Evaluate { revision, source })
+                .expect("update");
+        }
+
+        /// An import that failed is asked again once it has rested, by the
+        /// half-second poll and by an update, which does not wait out the poll's
+        /// longer rest, and the failure refuses the update until an answer replaces
+        /// it.
+        #[test]
+        fn a_rested_import_failure_is_asked_again_by_the_poll_and_by_an_update() {
+            use rustel_runtime::samples::SourceState;
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, library) = app_importing_gone(directory.path());
+            let offline = SourceState::Failed("offline".into());
+            library.note_samples_source_state_for_tests(GONE, offline.clone());
+
+            update(&mut app);
+            assert!(
+                app.status.starts_with("refused - ") && app.status.contains("samples: offline"),
+                "{}",
+                app.status
+            );
+
+            // Rested, the poll asks again. This studio grants scores no network, so
+            // the answer is a refusal with a reason of its own.
+            library.rest_samples_source_for_tests(GONE);
+            let answer = answered(&library, &offline, || app.poll_readiness());
+            assert!(
+                matches!(&answer, Some(SourceState::Failed(reason)) if reason != "offline"),
+                "{answer:?}"
+            );
+
+            // So does an update once the failure has rested a few seconds, however
+            // often it failed in a row: after these, the poll's rest outlasts the
+            // wait below. The update is still refused while the answer is on its
+            // way.
+            for _ in 0..4 {
+                library.note_samples_source_state_for_tests(GONE, offline.clone());
+            }
+            library.rest_samples_source_for_tests(GONE);
+            let answer = answered(&library, &offline, || {
+                update(&mut app);
+                assert!(app.status.starts_with("refused - "), "{}", app.status);
+            });
+            assert!(
+                matches!(&answer, Some(SourceState::Failed(reason)) if reason != "offline"),
+                "{answer:?}"
+            );
+        }
+
+        /// An import that stops failing is checked again without an edit, so its
+        /// finding does not outlast the failure.
+        #[test]
+        fn an_import_that_stops_failing_is_checked_again() {
+            use rustel_runtime::samples::SourceState;
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, library) = app_importing_gone(directory.path());
+            library
+                .note_samples_source_state_for_tests(GONE, SourceState::Failed("offline".into()));
+            app.poll_readiness();
+            app.lint_pending = false;
+
+            library.note_samples_source_state_for_tests(GONE, SourceState::Ready);
+            app.poll_readiness();
+            assert!(app.lint_pending, "the checker looks again");
+        }
+    }
+
+    mod syntax_check {
+        //! The syntax check's modes. Unless it is full a paused text is not checked
+        //! and nothing is marked, while everything else a pause does still happens;
+        //! an update refuses a broken score the same way in every mode, and says why
+        //! in the footer and the log, marking where only when the mode is not off.
+
+        use crate::app::tests::support::app_over;
+        use crate::app::*;
+
+        /// A score that does not parse, and names an orbit so the mixer's strips
+        /// have something to follow.
+        const BROKEN: &str = "$: s(\"bd\").orbit(3) (((";
+
+        fn app_with_library(directory: &std::path::Path) -> App {
+            let mut app = app_over(directory);
+            app.worker
+                .set_library(Arc::new(rustel_runtime::samples::SampleLibrary::empty()));
+            app
+        }
+
+        /// Wait for the lint thread's answer to a submitted request.
+        fn lint_answer(app: &App) -> LintResult {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(result) = app.linter.try_recv() {
+                    return result;
+                }
+                assert!(Instant::now() < deadline, "lint worker did not answer");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        #[test]
+        fn with_the_switch_off_a_pause_checks_nothing_but_still_settles_the_text() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_with_library(directory.path());
+            app.ui_settings.syntax_check = SyntaxCheck::OnUpdate;
+            app.scenes.current_mut().editor = Editor::new(BROKEN).unwrap();
+            let scene = app.scenes.current().id;
+
+            app.lint_pending = true;
+            app.submit_lint();
+
+            assert!(
+                !app.lint_pending,
+                "the pause is spent, as it is with checking on"
+            );
+            assert!(!app.lint.contains_key(&scene), "no verdict is recorded");
+            assert!(app.lint_ranges(scene).is_empty(), "nothing is underlined");
+            assert!(app.lint_message().is_none(), "the footer says nothing");
+            assert!(!matches!(app.go_state(), GoState::Problems { .. }));
+            // What a pause does besides checking still happens.
+            assert_eq!(app.orbits_in_code, vec![1, 3], "the mixer follows the text");
+            assert!(
+                app.readiness.contains_key(&scene),
+                "the sounds are asked for as a check's result would have asked"
+            );
+            // And no request reached the lint thread: give it the time it takes
+            // to answer one, and nothing arrives.
+            std::thread::sleep(Duration::from_millis(250));
+            assert!(
+                app.linter.try_recv().is_none(),
+                "the linter was never asked"
+            );
+        }
+
+        #[test]
+        fn with_the_switch_off_an_update_still_refuses_and_marks_it_until_the_text_moves_on() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_with_library(directory.path());
+            app.ui_settings.syntax_check = SyntaxCheck::OnUpdate;
+            app.scenes.current_mut().editor = Editor::new(BROKEN).unwrap();
+            let scene = app.scenes.current().id;
+            let request_id = app.next_request_id;
+
+            app.handle_editor_effect(EditorEffect::Evaluate {
+                revision: app.editor().revision(),
+                source: ropey::Rope::from_str(BROKEN),
+            })
+            .unwrap();
+
+            assert!(app.status.starts_with("refused - "), "{}", app.status);
+            assert_eq!(app.next_request_id, request_id, "no evaluation was queued");
+            assert!(
+                matches!(app.go_state(), GoState::Problems { .. }),
+                "the refusal shows where it was refused"
+            );
+
+            // The text moves on and typing pauses: nothing checks it again, so the
+            // refusal's marks do not outstay the text they were about.
+            app.lint_pending = true;
+            app.submit_lint();
+            assert!(!app.lint.contains_key(&scene));
+            assert!(app.lint_ranges(scene).is_empty());
+            assert!(!matches!(app.go_state(), GoState::Problems { .. }));
+        }
+
+        #[test]
+        fn switching_off_takes_the_marks_down_and_switching_on_checks_at_once() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_with_library(directory.path());
+            app.scenes.current_mut().editor = Editor::new(BROKEN).unwrap();
+            let scene = app.scenes.current().id;
+
+            // On, as it ships: the pause checks and the verdict is marked.
+            assert_eq!(app.ui_settings.syntax_check, SyntaxCheck::Full);
+            app.submit_lint();
+            let result = lint_answer(&app);
+            app.absorb_lint(result);
+            assert!(matches!(app.go_state(), GoState::Problems { .. }));
+            assert!(app.lint_message().is_some());
+
+            // Off: every mark comes down now, not at the next keystroke.
+            app.ui_settings.syntax_check = SyntaxCheck::OnUpdate;
+            app.apply_syntax_check();
+            assert!(app.lint.is_empty());
+            assert!(app.lint_ranges(scene).is_empty());
+            assert!(app.lint_message().is_none());
+            assert!(!matches!(app.go_state(), GoState::Problems { .. }));
+
+            // On again: the focused scene is due a check at the very next turn.
+            app.lint_pending = false;
+            app.ui_settings.syntax_check = SyntaxCheck::Full;
+            app.apply_syntax_check();
+            assert!(app.lint_pending);
+            assert!(
+                app.last_edit_at.elapsed() >= LINT_DEBOUNCE,
+                "the debounce has already run out"
+            );
+            app.submit_lint();
+            let result = lint_answer(&app);
+            app.absorb_lint(result);
+            assert!(matches!(app.go_state(), GoState::Problems { .. }));
+        }
+
+        #[test]
+        fn a_check_already_under_way_when_the_switch_goes_off_is_not_shown() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_with_library(directory.path());
+            app.scenes.current_mut().editor = Editor::new(BROKEN).unwrap();
+            let scene = app.scenes.current().id;
+
+            app.submit_lint();
+            app.ui_settings.syntax_check = SyntaxCheck::OnUpdate;
+            app.apply_syntax_check();
+            // Drain until the in-flight answer has certainly arrived and been
+            // passed over.
+            let deadline = Instant::now() + Duration::from_millis(1500);
+            while Instant::now() < deadline {
+                app.drain_lint();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                !app.lint.contains_key(&scene),
+                "the late answer is not kept"
+            );
+            assert!(!matches!(app.go_state(), GoState::Problems { .. }));
+        }
+
+        /// A minimal WAV: a header and two silent frames, enough for a folder scan
+        /// to take it for a sample.
+        fn tiny_wav() -> Vec<u8> {
+            let data: [u8; 4] = [0; 4];
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"RIFF");
+            bytes.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(b"WAVEfmt ");
+            bytes.extend_from_slice(&16u32.to_le_bytes());
+            bytes.extend_from_slice(&1u16.to_le_bytes());
+            bytes.extend_from_slice(&1u16.to_le_bytes());
+            bytes.extend_from_slice(&8000u32.to_le_bytes());
+            bytes.extend_from_slice(&16000u32.to_le_bytes());
+            bytes.extend_from_slice(&2u16.to_le_bytes());
+            bytes.extend_from_slice(&16u16.to_le_bytes());
+            bytes.extend_from_slice(b"data");
+            bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&data);
+            bytes
+        }
+
+        /// The check at launch runs before the sample library has its banks, so it
+        /// cannot judge a sound name, and nothing in the text changes when they
+        /// arrive. The focused scene is checked again then, without a keystroke -
+        /// once, not on every poll after.
+        #[test]
+        fn the_scene_is_checked_again_once_sound_names_can_be_judged() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.worker
+                .set_library(Arc::new(rustel_runtime::samples::SampleLibrary::empty()));
+            app.scenes.current_mut().editor = Editor::new("$: s(\"no-such-sound\")").unwrap();
+
+            // Launch: the first check has been made, with nothing to judge by.
+            app.poll_readiness();
+            app.lint_pending = false;
+            app.poll_readiness();
+            assert!(!app.lint_pending, "nothing new to judge by, nothing to ask");
+
+            // The library's banks arrive.
+            let samples = directory.path().join("kit");
+            let kicks = samples.join("kicks");
+            std::fs::create_dir_all(&kicks).unwrap();
+            std::fs::write(kicks.join("a.wav"), tiny_wav()).unwrap();
+            let library = rustel_runtime::samples::SampleLibrary::empty();
+            library.adopt_set_folder(&samples).expect("adopt the kit");
+            app.worker.set_library(Arc::new(library));
+            app.poll_readiness();
+            assert!(app.lint_pending, "checked again once names can be judged");
+
+            app.lint_pending = false;
+            app.poll_readiness();
+            assert!(!app.lint_pending, "and only the once");
+        }
+
+        /// Off, a refused update marks nothing in the editor - no underline, no
+        /// count in the header - but the footer still says why and the log still
+        /// has it: an error that keeps a score from playing is never kept quiet.
+        #[test]
+        fn off_marks_nothing_but_the_footer_and_the_log_still_say_why() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_with_library(directory.path());
+            app.ui_settings.syntax_check = SyntaxCheck::Off;
+            app.scenes.current_mut().editor = Editor::new(BROKEN).unwrap();
+            let scene = app.scenes.current().id;
+            let request_id = app.next_request_id;
+
+            app.handle_editor_effect(EditorEffect::Evaluate {
+                revision: app.editor().revision(),
+                source: ropey::Rope::from_str(BROKEN),
+            })
+            .unwrap();
+
+            assert_eq!(app.next_request_id, request_id, "no evaluation was queued");
+            assert!(!app.lint.contains_key(&scene), "nothing is marked");
+            assert!(app.lint_ranges(scene).is_empty());
+            assert!(!matches!(app.go_state(), GoState::Problems { .. }));
+            assert!(
+                app.status.starts_with("refused - "),
+                "the footer says why: {}",
+                app.status
+            );
+            assert!(
+                app.log
+                    .lines()
+                    .iter()
+                    .any(|line| line.kind == "check" && line.text.starts_with("refused - ")),
+                "and the log has it"
+            );
+        }
+    }
+}

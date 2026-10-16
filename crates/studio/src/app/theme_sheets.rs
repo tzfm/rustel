@@ -1248,3 +1248,1030 @@ impl App {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod theme_degenerate_sizes {
+        //! Every built-in theme's visual must survive frames at degenerate sizes.
+        //! This sweeps all of them. Run:
+        //! `cargo test -p rustel-studio --features harness --lib
+        //! theme_visuals_survive_degenerate_sizes -- --nocapture`.
+
+        use ratatui::{Terminal, backend::TestBackend};
+        use std::time::Instant;
+
+        #[test]
+        fn theme_visuals_survive_degenerate_sizes() {
+            let sizes = [
+                (80, 11),
+                (80, 6),
+                (3, 40),
+                (30, 24),
+                (80, 10),
+                (2, 2),
+                (1, 1),
+            ];
+            let names = crate::theme::Theme::available_names();
+            for required in ["forest", "rustel-live"] {
+                assert!(names.iter().any(|name| name == required));
+                crate::theme::Theme::resolve(Some(required)).expect("bundled theme");
+            }
+            let mut failures = Vec::new();
+            for name in names {
+                if name == "randomize" {
+                    continue;
+                }
+                let Ok(theme) = crate::theme::Theme::resolve(Some(&name)) else {
+                    continue;
+                };
+                for &(width, height) in &sizes {
+                    let directory = tempfile::tempdir().unwrap();
+                    let mut app = crate::app::tests::support::app_over(directory.path());
+                    app.theme = theme.clone();
+                    app.invalidate_maps();
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        // Two frames: animated state advances between them.
+                        terminal
+                            .draw(|frame| {
+                                app.paint_into(frame, Instant::now()).expect("paint");
+                            })
+                            .unwrap();
+                        terminal
+                            .draw(|frame| {
+                                app.paint_into(frame, Instant::now()).expect("paint");
+                            })
+                            .unwrap();
+                    }));
+                    if drawn.is_err() {
+                        failures.push(format!("{name} at {width}x{height}"));
+                    }
+                }
+            }
+            assert!(failures.is_empty(), "{failures:#?}");
+        }
+    }
+
+    mod theme_sheets {
+        //! Tests for `app/theme_sheets.rs`.
+
+        use crate::app::tests::support::*;
+        use crate::app::*;
+
+        /// Scrolling the theme editor's code must scroll it, and nothing else.
+        ///
+        /// The wheel extends a live drag on purpose, so a selection can continue
+        /// past the bottom of the screen while the button is held. The release
+        /// must end the drag, or a later scroll changes the selection.
+        #[test]
+        fn scrolling_the_theme_editor_does_not_drag_a_selection() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            let theme = app.theme.clone();
+            app.open_theme_editor(&theme, String::new(), true);
+            if let Some(editor) = app.theme_editor.as_mut() {
+                editor.tab = crate::theme_editor::EditorTab::Code;
+            }
+            let code = crate::theme_editor::ThemeEditorView::code_area(app.frame)
+                .expect("the code area is drawn at this size");
+            let (x, y) = (code.x + 2, code.y + 1);
+
+            let click = |app: &mut App, kind: MouseEventKind| {
+                app.handle_terminal_event(Event::Mouse(MouseEvent {
+                    kind,
+                    column: x,
+                    row: y,
+                    modifiers: KeyModifiers::NONE,
+                }))
+                .expect("mouse handled");
+            };
+            click(&mut app, MouseEventKind::Down(MouseButton::Left));
+            click(&mut app, MouseEventKind::Up(MouseButton::Left));
+
+            let before = app
+                .theme_editor
+                .as_ref()
+                .expect("editor open")
+                .code
+                .viewport()
+                .top_row;
+            for _ in 0..4 {
+                click(&mut app, MouseEventKind::ScrollDown);
+            }
+            let editor = app.theme_editor.as_ref().expect("editor open");
+            assert!(
+                editor.code.primary_selection().is_empty(),
+                "the wheel dragged a selection out of a click that had already ended"
+            );
+            assert_ne!(
+                editor.code.viewport().top_row,
+                before,
+                "the wheel did not scroll at all"
+            );
+        }
+
+        #[test]
+        fn held_arrows_set_theme_save_buttons_without_repeat_flicker() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let theme = app.theme.clone();
+            app.open_theme_editor(&theme, "mine".into(), false);
+            app.theme_editor.as_mut().expect("editor").saving =
+                Some(crate::theme_editor::SaveSheet {
+                    name: "mine".into(),
+                    keep: false,
+                    note: None,
+                    closing: false,
+                });
+
+            for kind in [KeyEventKind::Press, KeyEventKind::Repeat] {
+                app.handle_terminal_event(Event::Key(KeyEvent::new_with_kind(
+                    KeyCode::Right,
+                    KeyModifiers::NONE,
+                    kind,
+                )))
+                .expect("right handled");
+            }
+            assert!(
+                app.theme_editor
+                    .as_ref()
+                    .and_then(|editor| editor.saving.as_ref())
+                    .is_some_and(|saving| saving.keep),
+                "right consistently selects save & keep"
+            );
+
+            for kind in [KeyEventKind::Press, KeyEventKind::Repeat] {
+                app.handle_terminal_event(Event::Key(KeyEvent::new_with_kind(
+                    KeyCode::Left,
+                    KeyModifiers::NONE,
+                    kind,
+                )))
+                .expect("left handled");
+            }
+            assert!(
+                app.theme_editor
+                    .as_ref()
+                    .and_then(|editor| editor.saving.as_ref())
+                    .is_some_and(|saving| !saving.keep),
+                "left consistently selects save"
+            );
+        }
+
+        #[test]
+        fn typing_filters_the_theme_picker_and_the_arrows_belong_to_the_chance_row() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.toggle_theme_picker();
+            for character in "snow".chars() {
+                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+            }
+            let picker = app.theme_picker.as_ref().expect("picker open");
+            assert_eq!(picker.query, "snow");
+            assert_eq!(picker.match_count(), 1);
+            assert_eq!(picker.selected_name(), Some("snow"));
+            // Typing waits for the settle, like the arrows; settled, it previews
+            // the only match.
+            app.theme_apply_due = None;
+            app.preview_theme();
+            assert_eq!(app.theme.name, "snow", "typing previews the only match");
+
+            for _ in 0..4 {
+                press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            }
+            app.theme_apply_due = None;
+            app.preview_theme();
+
+            // ↑/↓ walk the list.
+            let before = app.theme.name.clone();
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            app.theme_apply_due = None;
+            app.preview_theme();
+            assert_ne!(app.theme.name, before, "Down previews the next theme");
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            app.theme_apply_due = None;
+            app.preview_theme();
+            assert_eq!(app.theme.name, before, "Up previews the previous theme");
+
+            // ←/→ do not: they belong to the randomize row, where the list is
+            // infinite in both directions and the arrows are drawn on the row
+            // itself to say so.
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+            assert_eq!(
+                app.theme.name, before,
+                "Right walked the list instead of leaving it alone"
+            );
+            press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+            assert_eq!(app.theme.name, before, "Left walked the list");
+
+            // On the randomize row they roll it, and the row grows a back arrow
+            // once there is a roll to go back to.
+            let chance = app
+                .theme_picker
+                .as_ref()
+                .expect("picker open")
+                .matches()
+                .position(|name| name == crate::theme::RANDOMIZE_THEME)
+                .expect("the randomize row is in the list");
+            let at = app.theme_picker.as_ref().expect("picker").selected;
+            for _ in at..chance {
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            }
+            assert!(app.theme_picker.as_ref().expect("picker").on_randomize());
+            assert!(!app.theme_picker.as_ref().expect("picker").rolled);
+            let seed = app.theme_picker.as_ref().expect("picker").randomize_seed;
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+            let picker = app.theme_picker.as_ref().expect("picker");
+            assert_ne!(
+                picker.randomize_seed, seed,
+                "Right did not roll the randomize row"
+            );
+            assert!(picker.rolled, "the back arrow never appears");
+        }
+
+        /// The picker's modified E opens the editor. A built-in theme arrives
+        /// without its name, so a save needs a new name: the built-in themes
+        /// cannot be overwritten.
+        #[test]
+        fn editing_a_built_in_theme_starts_the_editor_without_its_name() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.toggle_theme_picker();
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+
+            assert!(app.theme_picker.is_none(), "the picker hands over");
+            let editor = app.theme_editor.as_ref().expect("editor open");
+            assert!(editor.from_built_in);
+            assert!(editor.name.is_empty(), "a built-in cannot keep its name");
+            assert_eq!(app.focus, Focus::Panel(PanelKind::ThemeEditor));
+
+            // s raises the save sheet, seeded with a free name. The sheet never
+            // offers a built-in's own name.
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+            let editor = app.theme_editor.as_ref().expect("still open");
+            let sheet = editor.saving.as_ref().expect("save sheet up");
+            assert!(!sheet.name.is_empty(), "a suggestion is seeded");
+            assert!(
+                !Theme::built_in_names().any(|known| known == sheet.name),
+                "never a built-in's name: {}",
+                sheet.name
+            );
+        }
+
+        /// Hand the sketch to the worker the way the event loop does.
+        ///
+        /// `sync_theme_sketch` sends over the shared two-slot command queue and
+        /// is allowed to drop - the loop pumps it again next pass, so a dropped
+        /// send is a beat late rather than lost. A test that asserts on what was
+        /// sent has to pump too, or it is asserting on the worker thread's
+        /// scheduling.
+        #[cfg(feature = "hydra")]
+        fn settle_theme_sketch(app: &mut App) {
+            for _ in 0..400 {
+                app.sync_theme_sketch();
+                if app.theme_sketch_sent.is_some() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            panic!("the theme sketch was never accepted by the worker");
+        }
+
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn a_taken_snippet_becomes_the_theme_sketch_while_the_editor_is_open() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.toggle_theme_picker();
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+            assert!(app.theme_editor.is_some());
+
+            // Open the shelf on the snippets tab and take the first snippet.
+            let mut shelf = crate::reference::ReferencePanel::browse(&app.reference);
+            shelf.tab = crate::reference::Tab::Examples;
+            // The chains are the hydra section's, which the tab does not open on.
+            let hydra =
+                crate::examples::section_of(crate::examples::Kind::Hydra).expect("a hydra section");
+            shelf.section_open.clear();
+            shelf.section_open.insert(hydra);
+            shelf.snippet_open.insert((hydra, 0));
+            shelf.snippet_selected = shelf
+                .snippet_lines()
+                .iter()
+                .position(|line| *line == crate::reference::SnippetLine::Snippet(hydra, 0, 0))
+                .unwrap();
+            app.reference_panel = Some(shelf);
+            app.focus_panel(PanelKind::Reference);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+            let editor = app.theme_editor.as_ref().expect("editor still open");
+            let sketch = editor.draft.hydra.as_deref().expect("the chain landed");
+            assert!(sketch.contains(".out()"), "a whole chain, not a name");
+            assert_eq!(app.theme.hydra.as_deref(), Some(sketch), "and it is live");
+            assert!(app.reference_panel.is_none(), "the shelf closed behind it");
+            assert_eq!(app.focus, Focus::Panel(PanelKind::ThemeEditor));
+        }
+
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn keyboard_and_mouse_theme_previews_never_confirm_camera_acquisition() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.theme_picker = Some(ThemePicker {
+                names: vec!["rustel-dark".into(), "webcam-clean".into()],
+                query: String::new(),
+                selected: 0,
+                original: Box::new(app.theme.clone()),
+                deleting: None,
+                randomize_seed: 1,
+                rolled: false,
+                scroll: std::cell::Cell::new(0),
+                hold_scroll: false,
+            });
+            app.focus = Focus::Panel(PanelKind::Theme);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            assert_eq!(
+                app.theme_picker.as_ref().map(|picker| picker.selected),
+                Some(1),
+                "the cursor moved"
+            );
+            assert_ne!(
+                app.theme.name, "webcam-clean",
+                "a held arrow must not apply every theme it passes"
+            );
+            assert!(
+                app.theme_apply_due.is_some(),
+                "keyboard browsing waits before applying"
+            );
+            app.theme_apply_due = None;
+            app.preview_theme();
+            assert_eq!(app.theme.name, "webcam-clean");
+            app.theme_sketch_sent = None;
+            settle_theme_sketch(&mut app);
+            assert!(matches!(
+                app.theme_sketch_sent.as_ref(),
+                Some((Some(_), false))
+            ));
+
+            // Enter/keep is the explicit confirmation boundary. Avoid writing a
+            // real preferences file in this unit test; establish the state that
+            // `keep_theme` establishes and prove the next sync carries consent.
+            app.theme_picker = None;
+            app.theme_camera_confirmed = Some(app.theme.name.clone());
+            app.theme_sketch_sent = None;
+            settle_theme_sketch(&mut app);
+            assert!(matches!(
+                app.theme_sketch_sent.as_ref(),
+                Some((Some(_), true))
+            ));
+
+            let mut mouse_app = app_over(directory.path());
+            mouse_app.frame = Rect::new(0, 0, 80, 30);
+            mouse_app.theme_picker = Some(ThemePicker {
+                names: vec!["rustel-dark".into(), "webcam-distort".into()],
+                query: String::new(),
+                selected: 0,
+                original: Box::new(mouse_app.theme.clone()),
+                deleting: None,
+                randomize_seed: 1,
+                rolled: false,
+                scroll: std::cell::Cell::new(0),
+                hold_scroll: false,
+            });
+            let (_, list) = mouse_app
+                .theme_picker
+                .as_ref()
+                .unwrap()
+                .geometry(mouse_app.frame)
+                .expect("picker geometry");
+            mouse_app
+                .handle_mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: list.x,
+                    row: list.y + 1,
+                    modifiers: KeyModifiers::NONE,
+                })
+                .expect("mouse preview");
+            assert_eq!(mouse_app.theme.name, "webcam-distort");
+            assert!(
+                mouse_app.theme_apply_due.is_none(),
+                "a click applies the theme immediately"
+            );
+            mouse_app.theme_sketch_sent = None;
+            settle_theme_sketch(&mut mouse_app);
+            assert!(matches!(
+                mouse_app.theme_sketch_sent.as_ref(),
+                Some((Some(_), false))
+            ));
+        }
+
+        #[test]
+        fn keyboard_theme_browsing_applies_only_the_last_row() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let original = app.theme.name.clone();
+            app.theme_picker = Some(ThemePicker {
+                names: vec![
+                    "rustel-dark".into(),
+                    "rustel-light".into(),
+                    "strudel".into(),
+                ],
+                query: String::new(),
+                selected: 0,
+                original: Box::new(app.theme.clone()),
+                deleting: None,
+                randomize_seed: 1,
+                rolled: false,
+                scroll: std::cell::Cell::new(0),
+                hold_scroll: false,
+            });
+            app.focus = Focus::Panel(PanelKind::Theme);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            assert_eq!(
+                app.theme_picker.as_ref().map(|picker| picker.selected),
+                Some(2)
+            );
+            assert_eq!(
+                app.theme.name, original,
+                "fast arrows must not activate every theme they pass"
+            );
+            app.theme_apply_due = None;
+            app.preview_theme();
+            assert_eq!(app.theme.name, "strudel");
+        }
+
+        /// Holds `RUSTEL_THEME_DIR` for the scope of one test and puts back
+        /// whatever was there before.
+        ///
+        /// The restore also runs when the test panics, so later tests keep the
+        /// theme directory that the suite started with. Tests here run one at a
+        /// time, so the process-wide variable is not raced.
+        struct ScopedThemeDir(Option<std::ffi::OsString>);
+
+        impl ScopedThemeDir {
+            fn set(directory: &std::path::Path) -> Self {
+                let previous = std::env::var_os("RUSTEL_THEME_DIR");
+                // SAFETY: `--test-threads=1`; read on this thread only.
+                unsafe { std::env::set_var("RUSTEL_THEME_DIR", directory) };
+                Self(previous)
+            }
+        }
+
+        impl Drop for ScopedThemeDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    // SAFETY: as above.
+                    Some(previous) => unsafe { std::env::set_var("RUSTEL_THEME_DIR", previous) },
+                    None => unsafe { std::env::remove_var("RUSTEL_THEME_DIR") },
+                }
+            }
+        }
+
+        /// A taken name is refused and a free variation is offered in its
+        /// place. The existing theme is not overwritten.
+        #[test]
+        fn a_conflicting_save_name_is_turned_into_a_free_suggestion() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            // The suggestion depends on the names that the theme directory
+            // already holds. Use an empty directory, so a `rustel-dark-2.json` in
+            // the real one cannot change the result.
+            let themes = directory.path().join("themes");
+            std::fs::create_dir_all(&themes).expect("theme directory");
+            let _scoped = ScopedThemeDir::set(&themes);
+            let mut app = app_over(directory.path());
+            app.toggle_theme_picker();
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+            // Type a built-in's name over the suggestion.
+            if let Some(editor) = app.theme_editor.as_mut()
+                && let Some(sheet) = editor.saving.as_mut()
+            {
+                sheet.name = "rustel-dark".into();
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let editor = app.theme_editor.as_ref().expect("editor still open");
+            let sheet = editor
+                .saving
+                .as_ref()
+                .expect("sheet still up - nothing saved");
+            assert!(
+                sheet
+                    .note
+                    .as_deref()
+                    .is_some_and(|note| note.contains("taken")),
+                "the refusal says why: {:?}",
+                sheet.note
+            );
+            assert_eq!(sheet.name, "rustel-dark-2", "and offers the free variation");
+        }
+
+        /// Enter on a colour row opens the painter; the arrows paint LIVE and
+        /// Esc puts the old colour back.
+        #[test]
+        fn the_colour_picker_paints_live_and_esc_reverts() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.toggle_theme_picker();
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+            // Walk to the first colour row and open the picker.
+            for _ in 0..crate::theme_editor::HEAD_ROWS {
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            }
+            let before = app.theme.background;
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(
+                app.theme_editor
+                    .as_ref()
+                    .is_some_and(|e| e.picker.is_some()),
+                "the painter opens"
+            );
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+            assert_ne!(app.theme.background, before, "painting applies live");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(
+                app.theme_editor
+                    .as_ref()
+                    .is_some_and(|e| e.picker.is_none()),
+                "Esc closes the painter"
+            );
+            assert_eq!(app.theme.background, before, "and puts the colour back");
+            // The editor itself is still open - Esc walked one rung only.
+            assert!(app.theme_editor.is_some());
+        }
+
+        /// The editor's Esc lands on the theme that was applied when it opened.
+        ///
+        /// Walking the picker changes the theme, so the theme in force when the
+        /// editor opens is the one that Esc restores.
+        #[test]
+        fn escaping_the_theme_editor_puts_the_applied_theme_back() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let opened_on = app.theme.name.clone();
+            app.toggle_theme_picker();
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            app.theme_apply_due = None;
+            app.preview_theme();
+            let walked_to = app.theme.name.clone();
+            assert_ne!(walked_to, opened_on, "walking the list changes the theme");
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+            assert!(app.theme_editor.is_some());
+
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.theme_editor.is_none());
+            assert_eq!(
+                app.theme.name, walked_to,
+                "Esc lands on the theme the editor opened from"
+            );
+            assert!(
+                app.theme_picker.is_some(),
+                "Esc goes back to the list it came from"
+            );
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Theme));
+        }
+
+        /// Keeping a camera theme says what to expect: the picture in a moment,
+        /// or the setting that stands in its way.
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn keeping_a_camera_theme_says_what_stands_between_the_reader_and_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.theme = Theme::built_in("webcam-hacker").expect("webcam-hacker");
+            app.ui_settings.hydra_webcam = false;
+            app.theme_picker = Some(ThemePicker::open(&app.theme));
+            assert_eq!(
+                app.theme_camera_note(None),
+                Some(crate::theme::CameraNote::Off)
+            );
+            app.keep_theme();
+            assert!(
+                app.status.contains("turn on Hydra webcam"),
+                "{}",
+                app.status
+            );
+
+            app.ui_settings.hydra_webcam = true;
+            app.theme_picker = Some(ThemePicker::open(&app.theme));
+            assert_eq!(
+                app.theme_camera_note(None),
+                Some(crate::theme::CameraNote::Starting)
+            );
+            app.keep_theme();
+            assert!(app.status.contains("webcam starting"), "{}", app.status);
+            // A theme without a camera says nothing of the kind.
+            app.theme = Theme::built_in_default();
+            assert_eq!(app.theme_camera_note(None), None);
+        }
+
+        /// The wheel over the picker walks its list, like the arrows.
+        #[test]
+        fn the_wheel_walks_the_theme_picker() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            app.toggle_theme_picker();
+            let wheel = |app: &mut App, kind: MouseEventKind| {
+                app.handle_mouse(MouseEvent {
+                    kind,
+                    column: 10,
+                    row: 10,
+                    modifiers: KeyModifiers::NONE,
+                })
+                .expect("mouse");
+            };
+            // The picker opens on the theme in use, wherever that is in the list.
+            let start = app.theme_picker.as_ref().expect("picker").selected;
+            wheel(&mut app, MouseEventKind::ScrollDown);
+            wheel(&mut app, MouseEventKind::ScrollDown);
+            assert_eq!(
+                app.theme_picker.as_ref().expect("picker").selected,
+                start + 2
+            );
+            wheel(&mut app, MouseEventKind::ScrollUp);
+            assert_eq!(
+                app.theme_picker.as_ref().expect("picker").selected,
+                start + 1
+            );
+            assert!(app.status.starts_with("theme - "), "{}", app.status);
+        }
+
+        /// Esc over unsaved work asks; a second Esc lets it go.
+        #[test]
+        fn escaping_a_changed_theme_editor_asks_and_a_second_esc_discards() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let opened_on = app.theme.name.clone();
+            app.toggle_theme_picker();
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+            let editor = app.theme_editor.as_mut().expect("editor");
+            assert!(!editor.is_modified(), "an untouched draft is not a change");
+            editor.draft.accent = ratatui::style::Color::Rgb(1, 2, 3);
+            assert!(editor.is_modified());
+
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            let editor = app.theme_editor.as_ref().expect("still open, asking");
+            assert!(
+                editor.saving.as_ref().is_some_and(|sheet| sheet.closing),
+                "the save sheet is up, in its leaving mode"
+            );
+            assert!(app.theme_picker.is_none());
+
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.theme_editor.is_none(), "the second Esc leaves");
+            assert!(app.theme_picker.is_some(), "onto the list");
+            assert_eq!(app.theme.name, opened_on, "with the change let go");
+            assert_ne!(app.theme.accent, ratatui::style::Color::Rgb(1, 2, 3));
+        }
+
+        /// Enter on that sheet saves, keeps, and still lands on the list.
+        #[test]
+        fn saving_from_the_leaving_sheet_keeps_the_theme_and_lands_on_the_list() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let opened_on = app.theme.name.clone();
+            app.toggle_theme_picker();
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+            app.theme_editor.as_mut().expect("editor").draft.accent =
+                ratatui::style::Color::Rgb(1, 2, 3);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(
+                app.theme_editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.saving.is_some())
+            );
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(
+                app.theme_editor.is_none(),
+                "saved and closed: {}",
+                app.status
+            );
+            assert!(app.theme_picker.is_some(), "onto the list");
+            assert_eq!(
+                app.theme.accent,
+                ratatui::style::Color::Rgb(1, 2, 3),
+                "wearing the saved theme"
+            );
+            assert_ne!(app.theme.name, opened_on, "under a name of its own");
+            assert!(
+                app.status.starts_with("theme saved and kept"),
+                "{}",
+                app.status
+            );
+            app.status_notice.as_mut().expect("theme save notice").1 = Instant::now();
+            app.dirty_frame = false;
+            app.pump_turn();
+            assert!(app.status.is_empty());
+            assert!(app.dirty_frame, "expiry redraws without a keypress");
+        }
+
+        /// A roll of the randomize row waits until the arrows stop. The palette
+        /// and the sketch then apply together.
+        ///
+        /// Every distinct sketch compiles three GPU objects, and a held arrow
+        /// rolls about thirty a second - enough to trip the renderer's
+        /// shaders-per-device guard, whose answer is to rebuild the whole device.
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn rolling_waits_for_the_settle_then_lands_palette_and_sketch_together() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 100, 30);
+            app.toggle_theme_picker();
+            let at = app
+                .theme_picker
+                .as_ref()
+                .expect("picker")
+                .matches()
+                .position(|name| name == crate::theme::RANDOMIZE_THEME)
+                .expect("randomize is in the list");
+            if let Some(picker) = app.theme_picker.as_mut() {
+                picker.selected = at;
+            }
+            app.preview_theme();
+            let before = app.theme.background;
+
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+            assert!(app.theme_apply_due.is_some(), "a roll left a settle owed");
+            assert_eq!(
+                app.theme.background, before,
+                "a roll must not apply while the arrows are still repeating"
+            );
+
+            // Each settled roll changes the palette, and the sketch goes with it
+            // rather than waiting behind a timer of its own.
+            let mut palettes = Vec::new();
+            for _ in 0..8 {
+                press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+                app.theme_apply_due = None;
+                app.preview_theme();
+                palettes.push(app.theme.background);
+            }
+            palettes.dedup();
+            assert!(
+                palettes.len() > 1,
+                "the palette must change across settled rolls"
+            );
+
+            // Closing settles the apply rather than leaving the timer to no one.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.theme_apply_due.is_none(), "the apply stayed owed");
+        }
+
+        /// A theme suggests its opacities; the reader's choice outranks it and
+        /// outlives a restart.
+        ///
+        /// The whole contract turns on one distinction that a value alone cannot
+        /// carry: 85 because this theme asked for it is not the same as 85 because
+        /// the reader chose it. The first must be replaceable by the next theme,
+        /// the second must not.
+        #[test]
+        fn a_theme_suggests_opacity_and_the_reader_overrules_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+
+            // Applying a theme takes its three, and records that none of them is
+            // the reader's.
+            app.theme.opacity = crate::theme::ThemeOpacity {
+                backdrop: Some(30),
+                interface: Some(40),
+                editor: Some(20),
+            };
+            app.keep_theme();
+            assert_eq!(app.ui_settings.backdrop_opacity, 30);
+            assert_eq!(app.ui_settings.interface_opacity, 40);
+            assert_eq!(app.ui_settings.editor_opacity, 20);
+            assert_eq!(
+                app.prefs.backdrop_opacity, None,
+                "a suggestion is not a choice"
+            );
+
+            // A theme that says nothing asks for the placeholder, not for
+            // whatever the last theme happened to want.
+            app.theme.opacity = crate::theme::ThemeOpacity::default();
+            app.theme.ui_opacity = None;
+            app.keep_theme();
+            let default = crate::theme::THEME_OPACITY_DEFAULT;
+            assert_eq!(app.ui_settings.backdrop_opacity, default);
+            assert_eq!(app.ui_settings.editor_opacity, default);
+
+            // The reader turning a row claims all three.
+            app.ui_settings.editor_opacity = 77;
+            app.prefs.claim_opacities(&app.ui_settings);
+            assert_eq!(app.prefs.editor_opacity, Some(77));
+
+            // And a claimed value survives the next theme's suggestion on a
+            // restart, which is the half a value alone cannot express.
+            let mut loud = crate::theme::Theme::built_in_default();
+            loud.opacity = crate::theme::ThemeOpacity {
+                backdrop: Some(11),
+                interface: Some(12),
+                editor: Some(13),
+            };
+            let reopened = app.prefs.ui_settings_for(&loud);
+            assert_eq!(
+                reopened.editor_opacity, 77,
+                "the reader's choice was overwritten by a theme on restart"
+            );
+
+            // Whereas an unclaimed one follows the theme.
+            app.prefs.follow_theme_opacity();
+            assert_eq!(app.prefs.ui_settings_for(&loud).editor_opacity, 13);
+
+            // Selecting a calibrated preset explicitly replaces even manually
+            // claimed settings; a restart alone, above, still preserves them.
+            for name in ["rustel-drift", "unicorn", "smoke", "randomize"] {
+                app.ui_settings.backdrop_opacity = 0;
+                app.ui_settings.interface_opacity = 100;
+                app.ui_settings.editor_opacity = 100;
+                app.prefs.claim_opacities(&app.ui_settings);
+                app.theme = Theme::built_in(name).unwrap();
+                let expected = app.theme.opacities();
+                app.keep_theme();
+                assert_eq!(
+                    app.ui_settings.backdrop_opacity, expected.backdrop,
+                    "{name}"
+                );
+                assert_eq!(
+                    app.ui_settings.interface_opacity, expected.interface,
+                    "{name}"
+                );
+                assert_eq!(app.ui_settings.editor_opacity, expected.editor, "{name}");
+                assert_eq!(app.prefs.backdrop_opacity, None);
+                assert_eq!(app.prefs.interface_opacity, None);
+                assert_eq!(app.prefs.editor_opacity, None);
+            }
+        }
+
+        /// Both doors out of the picker keep what is on screen.
+        #[test]
+        fn the_picker_keeps_whatever_it_is_closed_on() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            for close in [KeyCode::Esc, KeyCode::Enter] {
+                let mut app = app_over(directory.path());
+                let opened_on = app.theme.name.clone();
+                app.toggle_theme_picker();
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+                // Walking is debounced: the row is landed on only at close.
+                assert_eq!(
+                    app.theme.name, opened_on,
+                    "{close:?}: the walk applied before the settle"
+                );
+                let walked_to = app
+                    .theme_picker
+                    .as_ref()
+                    .expect("picker still open")
+                    .selected_name()
+                    .map(str::to_owned)
+                    .expect("a named row");
+                press(&mut app, close, KeyModifiers::NONE);
+                assert!(app.theme_picker.is_none(), "{close:?} left the picker open");
+                assert_eq!(
+                    app.theme.name, walked_to,
+                    "{close:?} put the old theme back instead of keeping this one"
+                );
+            }
+        }
+
+        /// The form applies live: stepping ui opacity changes the draft, and the
+        /// change is on the studio's theme immediately, before any save.
+        #[test]
+        fn stepping_a_form_row_applies_to_the_studio_at_once() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.toggle_theme_picker();
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+            let editor = app.theme_editor.as_ref().expect("editor open");
+            assert!(!editor.from_built_in || editor.name.is_empty());
+
+            // Row 1 is the first of the three opacities; → steps it up.
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+            let stepped = app
+                .theme_editor
+                .as_ref()
+                .expect("still open")
+                .draft
+                .opacity
+                .backdrop;
+            assert!(stepped.is_some(), "the step writes the field");
+            assert_eq!(
+                Some(app.ui_settings.backdrop_opacity),
+                stepped,
+                "and the studio wears it"
+            );
+        }
+
+        /// With the editor focused on its code tab, letters belong to the theme's
+        /// JSON, not the score.
+        #[test]
+        fn code_tab_typing_stays_out_of_the_score() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let score = app.scenes.current().editor.source().to_owned();
+            app.toggle_theme_picker();
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            let before = app
+                .theme_editor
+                .as_ref()
+                .expect("editor open")
+                .code
+                .revision();
+            press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+            let editor = app.theme_editor.as_ref().expect("still open");
+            assert_ne!(
+                editor.code.revision(),
+                before,
+                "the letter reached the JSON"
+            );
+            assert!(editor.code_dirty_at.is_some(), "and started the debounce");
+            assert_eq!(
+                app.scenes.current().editor.source(),
+                score,
+                "the score never saw it"
+            );
+        }
+
+        /// Ctrl+T with the editor open must not raise a picker under its
+        /// sheet - an invisible focused picker whose n would silently replace
+        /// the draft.
+        #[test]
+        fn the_theme_chord_cannot_open_a_picker_under_the_editor() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.toggle_theme_picker();
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+            assert!(app.theme_editor.is_some());
+
+            press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+            assert!(app.theme_picker.is_none(), "no picker under the sheet");
+            assert!(app.theme_editor.is_some(), "the draft survives");
+            assert!(app.status.contains("theme editor"));
+        }
+
+        /// Tab with a half-typed entry commits it rather than stranding it -
+        /// a stranded entry made Esc a dead key on the code tab.
+        #[test]
+        fn tab_commits_the_open_entry_before_flipping() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.toggle_theme_picker();
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE); // first opacity row
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE); // entry opens
+            for digit in ['4', '2'] {
+                press(&mut app, KeyCode::Char(digit), KeyModifiers::NONE);
+            }
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+
+            let editor = app.theme_editor.as_ref().expect("open");
+            assert!(editor.entry.is_none(), "the entry is not stranded");
+            assert_eq!(editor.draft.opacity.backdrop, Some(42), "and it committed");
+            // …and Esc from the code tab leaves too - asking first, since the
+            // committed entry is an unsaved change.
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(
+                app.theme_editor.as_ref().is_some_and(|editor| editor
+                    .saving
+                    .as_ref()
+                    .is_some_and(|sheet| sheet.closing)),
+                "the first Esc asks about the unsaved change"
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.theme_editor.is_none(), "the second lets it go");
+            assert!(app.theme_picker.is_some(), "and lands on the list");
+        }
+
+        /// The draft's ui opacity applies live and Esc puts the old one back;
+        /// entry typing that would edit the invisible score is swallowed.
+        #[test]
+        fn draft_opacity_is_live_and_the_hidden_score_is_safe() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            let before_opacity = app.ui_settings.backdrop_opacity;
+            let score = app.scenes.current().editor.source().to_owned();
+            app.toggle_theme_picker();
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE); // step opacity
+            let stepped = app.theme.opacity.backdrop.expect("stepped");
+            assert_eq!(
+                app.ui_settings.backdrop_opacity, stepped,
+                "the step is on the interface at once"
+            );
+            // A paste with the form focused must not reach the hidden score.
+            app.handle_terminal_event(Event::Paste("s(\"jvbass\")".into()))
+                .expect("paste handled");
+            assert_eq!(app.scenes.current().editor.source(), score);
+
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert_eq!(
+                app.ui_settings.backdrop_opacity, before_opacity,
+                "Esc puts the opacity back with the theme"
+            );
+        }
+    }
+}

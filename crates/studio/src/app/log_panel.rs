@@ -408,3 +408,516 @@ impl App {
         self.dirty_frame = true;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod log_panel {
+        //! Tests for `app/log_panel.rs`.
+
+        use crate::app::tests::support::*;
+        use crate::app::*;
+
+        /// In zen a sticky log has no docked region. It is a full-frame popup,
+        /// `log_is_docked` is false, and Esc closes it.
+        #[test]
+        fn a_log_left_sticky_from_before_zen_is_a_popup_esc_can_reach() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            app.toggle_log_sticky();
+            assert!(app.log_panel.as_ref().is_some_and(|panel| panel.sticky));
+            app.focus = Focus::Editor;
+            assert!(app.log_is_docked(), "still docked outside zen");
+
+            press(&mut app, KeyCode::F(11), KeyModifiers::NONE);
+            assert!(app.ui_settings.zen);
+            assert!(
+                !app.log_is_docked(),
+                "a sticky log in zen must not answer as docked furniture"
+            );
+            assert_eq!(
+                app.log_sheet_frame(),
+                app.frame,
+                "the log's sheet must cover the frame in zen, not the docked \
+             region zen never carves"
+            );
+            assert_eq!(
+                app.front_panel(),
+                Some(PanelKind::Log),
+                "zen has no docked furniture, so the log is a sheet Esc can reach"
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(
+                app.log_panel.is_none(),
+                "Esc did not close the sticky log's zen popup"
+            );
+        }
+
+        /// The same log, focused rather than merely open: Esc while the
+        /// keyboard is on it must close it outright in zen too, not just
+        /// hand the keyboard back the way it does docked.
+        #[test]
+        fn esc_closes_a_focused_sticky_log_in_zen_instead_of_merely_unfocusing_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            press(&mut app, KeyCode::F(11), KeyModifiers::NONE);
+            app.toggle_log_sticky();
+            assert!(app.log_panel.is_some());
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Log));
+
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(
+                app.log_panel.is_none(),
+                "Esc did not close the focused sticky log in zen"
+            );
+            assert_eq!(app.focus, Focus::Editor);
+        }
+
+        /// ⇧F9 opens the log if it was closed and docks it - furniture like
+        /// the set panel and the mixer, not a sheet `dismiss_dialogs` puts
+        /// away when some other dialog opens.
+        #[test]
+        fn a_sticky_log_is_not_closed_by_dismiss_dialogs() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 140, 40);
+            assert!(app.log_panel.is_none());
+
+            press(&mut app, KeyCode::F(9), KeyModifiers::SHIFT);
+            assert!(app.log_panel.is_some(), "⇧F9 opens the log too");
+            assert!(
+                app.log_panel.as_ref().unwrap().sticky,
+                "and docks it, first press"
+            );
+            assert_eq!(app.prefs.log_sticky, Some(true));
+
+            app.dismiss_dialogs(None);
+            assert!(
+                app.log_panel.is_some(),
+                "sticky: dismiss_dialogs must leave it be"
+            );
+
+            // The control: turned back into a plain sheet, the very same call
+            // closes it, the way it always closed a floating log.
+            app.log_panel.as_mut().unwrap().sticky = false;
+            app.dismiss_dialogs(None);
+            assert!(
+                app.log_panel.is_none(),
+                "not sticky: dismiss_dialogs closes it like any other sheet"
+            );
+        }
+
+        /// `e` on a sticky log flips its band between bottom and top.
+        #[test]
+        fn e_flips_the_sticky_log_between_top_and_bottom_and_the_region_moves() {
+            use crate::viz_panel::Edge;
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 140, 40);
+            let layout = |app: &App| {
+                app.layout_with_fixtures(
+                    app.mixer_panel.map(MixerPanel::dock),
+                    app.log_dock_request(),
+                    app.memory_dock_request(),
+                )
+                .log
+            };
+
+            press(&mut app, KeyCode::F(9), KeyModifiers::SHIFT);
+            assert!(app.log_panel.as_ref().unwrap().sticky);
+            assert_eq!(app.log_panel.as_ref().unwrap().edge, Edge::Bottom);
+            let bottom = layout(&app);
+            assert!(!bottom.is_empty(), "a sticky log keeps a region");
+            assert_eq!(bottom.width, app.frame.width);
+
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+            assert_eq!(app.log_panel.as_ref().unwrap().edge, Edge::Top);
+            assert_eq!(app.prefs.log_edge, Some(Edge::Top));
+            let top = layout(&app);
+            assert!(top.y < bottom.y);
+            assert_eq!(top.width, app.frame.width);
+
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+            assert_eq!(app.log_panel.as_ref().unwrap().edge, Edge::Bottom);
+            assert_eq!(app.prefs.log_edge, Some(Edge::Bottom));
+            assert_eq!(layout(&app), bottom);
+        }
+
+        fn laid_log(app: &App) -> Rect {
+            app.layout_with_fixtures(
+                app.mixer_panel.map(MixerPanel::dock),
+                app.log_dock_request(),
+                app.memory_dock_request(),
+            )
+            .log
+        }
+
+        #[test]
+        fn the_docked_log_takes_a_third_of_the_terminal_by_default() {
+            use crate::viz_panel::BAND_DEFAULT_HEIGHT;
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 140, 40);
+            press(&mut app, KeyCode::F(9), KeyModifiers::SHIFT);
+            assert_eq!(laid_log(&app).height, 13);
+
+            app.frame = Rect::new(0, 0, 140, 25);
+            assert_eq!(laid_log(&app).height, BAND_DEFAULT_HEIGHT);
+            app.frame = Rect::new(0, 0, 140, 60);
+            assert_eq!(laid_log(&app).height, 20);
+        }
+
+        #[test]
+        fn minus_and_plus_resize_the_docked_log_and_the_height_is_kept() {
+            use crate::viz_panel::BAND_MIN_HEIGHT;
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 140, 40);
+            press(&mut app, KeyCode::F(9), KeyModifiers::SHIFT);
+            assert_eq!(laid_log(&app).height, 13);
+
+            press(&mut app, KeyCode::Char('+'), KeyModifiers::SHIFT);
+            assert_eq!(laid_log(&app).height, 14);
+            assert_eq!(app.prefs.log_height, Some(14));
+            press(&mut app, KeyCode::Char('='), KeyModifiers::NONE);
+            assert_eq!(laid_log(&app).height, 15);
+
+            for _ in 0..20 {
+                press(&mut app, KeyCode::Char('-'), KeyModifiers::NONE);
+            }
+            assert_eq!(laid_log(&app).height, BAND_MIN_HEIGHT);
+            assert!(app.status.contains("as short as a band goes"));
+            press(&mut app, KeyCode::Char('+'), KeyModifiers::SHIFT);
+            press(&mut app, KeyCode::Char('+'), KeyModifiers::SHIFT);
+            assert_eq!(app.prefs.log_height, Some(BAND_MIN_HEIGHT + 2));
+
+            let prefs = app.prefs.clone();
+            let mut next = app_over(directory.path());
+            next.prefs = prefs;
+            next.frame = app.frame;
+            next.restore_panels_from_prefs();
+            assert_eq!(
+                next.log_panel.as_ref().unwrap().height,
+                Some(BAND_MIN_HEIGHT + 2)
+            );
+            assert_eq!(laid_log(&next).height, BAND_MIN_HEIGHT + 2);
+        }
+
+        #[test]
+        fn the_docked_log_grows_only_as_far_as_the_terminal_allows() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 140, 24);
+            press(&mut app, KeyCode::F(9), KeyModifiers::SHIFT);
+            assert_eq!(laid_log(&app).height, 9);
+            press(&mut app, KeyCode::Char('+'), KeyModifiers::SHIFT);
+            press(&mut app, KeyCode::Char('+'), KeyModifiers::SHIFT);
+            assert_eq!(laid_log(&app).height, 11);
+            press(&mut app, KeyCode::Char('+'), KeyModifiers::SHIFT);
+            assert_eq!(laid_log(&app).height, 11);
+            assert!(app.status.contains("as tall as this terminal allows"));
+
+            app.log_panel.as_mut().unwrap().height = Some(20);
+            assert_eq!(laid_log(&app).height, 11);
+            press(&mut app, KeyCode::Char('-'), KeyModifiers::NONE);
+            assert_eq!(laid_log(&app).height, 10);
+            assert_eq!(app.prefs.log_height, Some(10));
+        }
+
+        #[test]
+        fn a_log_kept_docked_at_a_side_comes_back_along_the_bottom() {
+            use crate::viz_panel::Edge;
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 140, 40);
+            for side in [Edge::Left, Edge::Right] {
+                app.log_panel = None;
+                app.prefs.log_sticky = Some(true);
+                app.prefs.log_edge = Some(side);
+                app.restore_panels_from_prefs();
+                assert_eq!(app.log_panel.as_ref().unwrap().edge, Edge::Bottom);
+                assert_eq!(laid_log(&app).width, app.frame.width);
+            }
+            app.focus = Focus::Panel(PanelKind::Log);
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+            assert_eq!(app.prefs.log_edge, Some(Edge::Top));
+        }
+
+        /// The log's own scroll keys - the same ones the panel already
+        /// answers to when it is a sheet - reach it only while it holds the
+        /// keyboard; with the score focused they edit the score as usual.
+        #[test]
+        fn the_logs_scroll_keys_reach_it_only_while_it_has_the_keyboard() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 140, 40);
+            for index in 0..40 {
+                app.log
+                    .push(LogLevel::Info, "engine", format!("line {index}"));
+            }
+            press(&mut app, KeyCode::F(9), KeyModifiers::NONE);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Log));
+            let list =
+                LogPanelView::list_area(app.log_sheet_frame(), app.log_extent()).expect("list");
+            app.log_panel.as_mut().unwrap().prepare(&app.log, list);
+            assert!(app.log_panel.as_ref().unwrap().following);
+
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            assert!(
+                !app.log_panel.as_ref().unwrap().following,
+                "Up scrolled it while it was focused"
+            );
+
+            // The control: the very same key, with the score focused instead,
+            // must not reach the log at all.
+            press(&mut app, KeyCode::End, KeyModifiers::NONE);
+            assert!(app.log_panel.as_ref().unwrap().following, "End caught up");
+            app.focus = Focus::Editor;
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            assert!(
+                app.log_panel.as_ref().unwrap().following,
+                "Up with the score focused never reached the log"
+            );
+            assert_eq!(app.focus, Focus::Editor, "and stayed the score's key");
+        }
+
+        /// The log's lines are text: a drag through them selects, the wheel
+        /// scrolls, and ^C copies the selection.
+        #[test]
+        fn the_log_is_selectable_and_scrolls_with_the_wheel() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            for index in 0..40 {
+                app.log
+                    .push(LogLevel::Info, "engine", format!("line {index}"));
+            }
+            press(&mut app, KeyCode::F(9), KeyModifiers::NONE);
+            assert!(app.log_panel.is_some());
+            let list = LogPanelView::list_area(app.frame, app.log_extent()).expect("a list");
+            app.log_panel.as_mut().unwrap().prepare(&app.log, list);
+            assert!(app.log_panel.as_ref().unwrap().following);
+            let mouse = |kind: MouseEventKind, column: u16, row: u16| {
+                Event::Mouse(MouseEvent {
+                    kind,
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                })
+            };
+            // The wheel scrolls the log up, letting go of the newest line.
+            app.handle_terminal_event(mouse(MouseEventKind::ScrollUp, list.x + 2, list.y + 1))
+                .expect("wheel");
+            assert!(
+                !app.log_panel.as_ref().unwrap().following,
+                "scrolled up, the view no longer follows"
+            );
+            // A drag along a line selects it, and ^C copies the selection.
+            app.handle_terminal_event(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                list.x,
+                list.y,
+            ))
+            .expect("press");
+            app.handle_terminal_event(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                list.x + 12,
+                list.y,
+            ))
+            .expect("drag");
+            app.handle_terminal_event(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                list.x + 12,
+                list.y,
+            ))
+            .expect("release");
+            let selected = app
+                .log_panel
+                .as_ref()
+                .unwrap()
+                .editor
+                .selected_text()
+                .unwrap();
+            assert_eq!(selected.chars().count(), 12, "{selected:?}");
+            press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+            assert!(
+                app.status.starts_with("copied 12 characters"),
+                "{}",
+                app.status
+            );
+        }
+
+        /// ^C after a drag in the log puts the selection in the clipboard, even
+        /// when a new log line arrives between the drag and the chord.
+        #[test]
+        fn copying_the_log_lands_in_the_clipboard_and_survives_new_lines() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            for index in 0..40 {
+                app.log
+                    .push(LogLevel::Info, "engine", format!("line {index}"));
+            }
+            press(&mut app, KeyCode::F(9), KeyModifiers::NONE);
+            let list = LogPanelView::list_area(app.frame, app.log_extent()).expect("a list");
+            let mouse = |kind: MouseEventKind, column: u16, row: u16| {
+                Event::Mouse(MouseEvent {
+                    kind,
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                })
+            };
+            app.handle_terminal_event(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                list.x,
+                list.y,
+            ))
+            .expect("press");
+            app.handle_terminal_event(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                list.x + 12,
+                list.y,
+            ))
+            .expect("drag");
+            app.handle_terminal_event(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                list.x + 12,
+                list.y,
+            ))
+            .expect("release");
+
+            // The very next frame redraws the log - and a line lands in it.
+            app.log.push(LogLevel::Info, "engine", "line 40");
+            app.log_panel.as_mut().unwrap().prepare(&app.log, list);
+
+            press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+            assert!(
+                app.status.starts_with("copied 12 characters"),
+                "{}",
+                app.status
+            );
+            let contents = app.clipboard.get_text().expect("the clipboard holds text");
+            assert_eq!(
+                contents,
+                app.log_panel
+                    .as_ref()
+                    .unwrap()
+                    .editor
+                    .selected_text()
+                    .unwrap(),
+                "what ^C said it copied is what the clipboard holds"
+            );
+            assert_eq!(contents.chars().count(), 12, "{contents:?}");
+        }
+
+        /// The log sheet anchors against the frame short of the footer, so it
+        /// sits over the score and the footer stays visible under it.
+        #[test]
+        fn the_log_sheet_leaves_the_footer_showing() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let app = app_over(directory.path());
+            let frame = Rect::new(0, 0, 140, 40);
+            let footer = Rect::new(0, 38, 140, 2);
+            let (sheet, _) = crate::log::LogPanelView::geometry(
+                Rect {
+                    height: frame.height - footer.height,
+                    ..frame
+                },
+                app.log_extent(),
+            )
+            .expect("the sheet fits");
+            assert!(
+                sheet.bottom() <= footer.y,
+                "the sheet stops above the footer: {sheet:?}"
+            );
+            let (over_the_footer, _) = crate::log::LogPanelView::geometry(frame, app.log_extent())
+                .expect("the sheet fits the whole frame too");
+            assert!(
+                over_the_footer.bottom() > footer.y,
+                "anchoring on the whole frame is what hid the footer: {over_the_footer:?}"
+            );
+        }
+
+        /// A press anywhere begins a new gesture, and that ends the log's own
+        /// drag when its release never came, as it ends the score's. The wheel
+        /// extends a live drag, so a stale one made every later scroll over the
+        /// log move its selection under a pointer that had not moved.
+        #[test]
+        fn a_new_press_ends_a_log_drag_whose_release_never_came() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            for index in 0..40 {
+                app.log
+                    .push(LogLevel::Info, "engine", format!("line {index}"));
+            }
+            press(&mut app, KeyCode::F(9), KeyModifiers::NONE);
+            // A score the linter refused, so the header shows the go chip.
+            let scene = app.scenes.current().id;
+            app.absorb_lint(crate::lint::LintResult {
+                scene,
+                revision: app.scenes.current().editor.revision(),
+                input_channels: app.lint_input_channels(),
+                diagnostics: vec![rustel_runtime::lint::Diagnostic {
+                    level: LintLevel::Value,
+                    message: "unknown sound \"top\"".into(),
+                    from: 0,
+                    to: 1,
+                }],
+            });
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+                .expect("test terminal");
+            let mut draw = |app: &mut App| {
+                terminal
+                    .draw(|frame| app.paint_into(frame, Instant::now()).expect("frame paints"))
+                    .expect("draw");
+            };
+            draw(&mut app);
+            let list = LogPanelView::list_area(app.frame, app.log_extent()).expect("a list");
+
+            // A drag along a log line whose release never arrives.
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                list.x,
+                list.y,
+            );
+            mouse(
+                &mut app,
+                MouseEventKind::Drag(MouseButton::Left),
+                list.x + 5,
+                list.y,
+            );
+            let selected = app.log_panel.as_ref().unwrap().editor.primary_selection();
+            assert!(!selected.is_empty(), "a log drag is live");
+
+            // A press and release on the go chip, which points at the log without
+            // holding the pointer, then the wheel over the log.
+            let chip = app.go_chip();
+            assert!(!chip.is_empty(), "the header shows the go chip");
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                chip.x,
+                chip.y,
+            );
+            mouse(
+                &mut app,
+                MouseEventKind::Up(MouseButton::Left),
+                chip.x,
+                chip.y,
+            );
+            draw(&mut app);
+            for _ in 0..3 {
+                mouse(&mut app, MouseEventKind::ScrollUp, list.x + 2, list.y + 1);
+            }
+
+            assert_eq!(
+                app.log_panel.as_ref().unwrap().editor.primary_selection(),
+                selected,
+                "the wheel scrolled the log without moving its selection"
+            );
+        }
+    }
+}

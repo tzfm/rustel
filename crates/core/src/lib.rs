@@ -11,10 +11,12 @@ pub mod controls;
 pub mod gamepad;
 pub mod midi_in;
 pub mod midimap;
-// Keep the public module path stable.
-#[path = "control_catalog.rs"]
 #[rustfmt::skip]
-pub mod controls_generated;
+mod control_catalog;
+// Keep the public module path stable.
+pub mod controls_generated {
+    pub use super::control_catalog::*;
+}
 pub mod euclid;
 pub mod extension_node;
 pub mod fdlibm;

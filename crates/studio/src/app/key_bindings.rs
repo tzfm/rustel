@@ -434,3 +434,923 @@ impl App {
             .map_or_else(|| menu.to_owned(), |key| key.hint())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod keybind_cascade {
+        //! The chord cascade, end to end: a chord learnt in Settings fires from
+        //! wherever its action lives, the key it was moved off means nothing
+        //! rather than its old meaning, and an armed learn belongs to the open
+        //! sheet and to nothing else.
+
+        use crate::app::tests::support::press;
+        use crate::app::*;
+        use crate::keybinds::KeyCombo;
+        use crate::settings::SettingsSheet;
+        use crossterm::event::ModifierKeyCode;
+
+        fn cascade_app(directory: &std::path::Path) -> App {
+            let mut app = crate::app::tests::support::app_over(directory);
+            app.frame = Rect::new(0, 0, 140, 40);
+            app.capabilities = KeyboardCapabilities::enhanced();
+            app.focus_pane(0);
+            app.focus = Focus::Editor;
+            app
+        }
+
+        /// Type a word into the score through the real event loop, so every test
+        /// can see the caret move or the text change without reaching into the
+        /// editor's internals.
+        fn typed(app: &mut App, text: &str) {
+            for character in text.chars() {
+                press(app, KeyCode::Char(character), KeyModifiers::NONE);
+            }
+        }
+
+        fn source(app: &App) -> String {
+            app.editor().source()
+        }
+
+        /// An evaluation actually went out: the transport's proof of work.
+        fn evaluation_underway(app: &App) -> bool {
+            app.pending_evaluation.is_some() || !app.inflight.is_empty()
+        }
+
+        fn use_builtin_synth(app: &mut App) {
+            // These tests exercise shortcut dispatch. The default test scene uses
+            // `bd`, which may be absent from an isolated sample catalogue and is
+            // rejected before the transport can queue an evaluation.
+            app.scenes.current_mut().editor =
+                Editor::new("$: note('c4').s('sine')\n").expect("valid synth score");
+        }
+
+        #[test]
+        fn ctrl_q_is_reserved_during_capture_and_quits_everywhere_else() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = cascade_app(directory.path());
+            app.settings_sheet = Some(SettingsSheet::default());
+            app.focus = Focus::Panel(PanelKind::Settings);
+            app.keybind_learn = Some(crate::keybinds::KeybindLearn::arm(BindAction::Undo));
+
+            press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+            assert!(!app.quit_armed && !app.quit, "binding Ctrl+Q tried to quit");
+            assert!(
+                app.keybind_learn.is_some(),
+                "Ctrl+Q was captured as a binding"
+            );
+            assert!(app.status.contains("reserved for quit"), "{}", app.status);
+
+            app.keybind_learn = None;
+            press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+            assert!(app.quit_armed, "Ctrl+Q was unavailable in Settings");
+            press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+            assert!(app.quit, "Ctrl+Q could not confirm quit from Settings");
+        }
+
+        /// A chord learnt onto undo fires in the editor from its new key, F2
+        /// here. The key that undo moved off does nothing.
+        #[test]
+        fn a_learnt_editor_chord_fires_from_its_new_key_and_frees_the_old_one() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = cascade_app(directory.path());
+            app.learn_keybind(
+                BindAction::Undo,
+                Some(KeyCombo::parse("f2").expect("F2 parses")),
+            );
+            typed(&mut app, "hello");
+            assert_eq!(source(&app), "hello$: s(\"bd\")\n");
+
+            press(&mut app, KeyCode::F(2), KeyModifiers::NONE);
+            assert_eq!(
+                source(&app),
+                "$: s(\"bd\")\n",
+                "the learnt chord undoes the typing"
+            );
+
+            // The freed ^Z is nobody's: it inserts nothing and undoes nothing.
+            press(&mut app, KeyCode::Char('z'), KeyModifiers::CONTROL);
+            assert_eq!(
+                source(&app),
+                "$: s(\"bd\")\n",
+                "the moved-off key is freed, not still undo"
+            );
+        }
+
+        /// Undo learnt onto ^F, the reference's default key, moves the whole
+        /// chord: ^F undoes from inside the editor.
+        #[test]
+        fn a_chord_learnt_over_another_action_s_default_fires_whole() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = cascade_app(directory.path());
+            app.learn_keybind(
+                BindAction::Undo,
+                Some(KeyCombo::parse("ctrl+f").expect("^F parses")),
+            );
+            typed(&mut app, "hi");
+
+            press(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+            assert_eq!(
+                source(&app),
+                "$: s(\"bd\")\n",
+                "undo fires from the reference's key"
+            );
+        }
+
+        /// Put the caret in an empty argument that takes one of a list of values.
+        fn at_a_value_argument(app: &mut App) {
+            let marked = "$: s(\"bd\").warpmode(|)";
+            let caret = marked.find('|').expect("caret marker");
+            app.scenes.current_mut().editor =
+                Editor::new(&marked.replace('|', "")).expect("editor");
+            app.editor_mut()
+                .set_selection(crate::editor::Selection::caret(ByteOffset(caret)))
+                .expect("caret");
+            app.set_reference_panel(None);
+            app.focus = Focus::Editor;
+        }
+
+        /// What a chord opened: the argument's values, the function's entry,
+        /// another list, or nothing.
+        fn opened(app: &App) -> &'static str {
+            match app.reference_panel.as_ref() {
+                None => "nothing",
+                Some(panel) if panel.vocabulary.is_some() => "values",
+                Some(panel)
+                    if matches!(panel.mode, crate::reference::ReferenceMode::Entry { .. }) =>
+                {
+                    "docs"
+                }
+                Some(_) => "list",
+            }
+        }
+
+        /// In an empty argument, Ctrl+F, F2 and both encodings of Ctrl+Space
+        /// list the values. Ctrl+D opens the documentation of the function.
+        #[test]
+        fn the_values_chords_list_values_and_the_docs_chord_opens_the_entry() {
+            let directory = tempfile::tempdir().unwrap();
+            for (code, modifiers, expected) in [
+                (KeyCode::Char('f'), KeyModifiers::CONTROL, "values"),
+                (KeyCode::F(2), KeyModifiers::NONE, "values"),
+                (KeyCode::Null, KeyModifiers::NONE, "values"),
+                (KeyCode::Char(' '), KeyModifiers::CONTROL, "values"),
+                (KeyCode::Char('d'), KeyModifiers::CONTROL, "docs"),
+            ] {
+                let mut app = cascade_app(directory.path());
+                at_a_value_argument(&mut app);
+                press(&mut app, code, modifiers);
+                assert_eq!(opened(&app), expected, "{code:?}");
+            }
+        }
+
+        /// A chord learnt for one of the two actions moves that action alone.
+        /// The other keeps its own key, and the key moved off does nothing.
+        #[test]
+        fn the_values_chord_and_the_docs_chord_are_learnt_apart() {
+            let directory = tempfile::tempdir().unwrap();
+            let f3 = KeyCombo::parse("f3").expect("F3 parses");
+            for (learnt, on_f3, on_ctrl_f, on_ctrl_d) in [
+                (BindAction::Reference, "values", "nothing", "docs"),
+                (BindAction::Docs, "docs", "values", "nothing"),
+            ] {
+                let mut app = cascade_app(directory.path());
+                app.learn_keybind(learnt, Some(f3));
+                for (code, modifiers, expected) in [
+                    (KeyCode::F(3), KeyModifiers::NONE, on_f3),
+                    (KeyCode::Char('f'), KeyModifiers::CONTROL, on_ctrl_f),
+                    (KeyCode::Char('d'), KeyModifiers::CONTROL, on_ctrl_d),
+                ] {
+                    at_a_value_argument(&mut app);
+                    let before = source(&app);
+                    press(&mut app, code, modifiers);
+                    assert_eq!(opened(&app), expected, "{learnt:?}: {code:?}");
+                    assert_eq!(source(&app), before, "{learnt:?}: {code:?}");
+                }
+            }
+        }
+
+        /// The docs panel does not replace the settings sheet. A docs chord,
+        /// default or learnt, opens nothing while the sheet has the keyboard.
+        #[test]
+        fn a_docs_chord_opens_nothing_while_the_settings_have_the_keyboard() {
+            let directory = tempfile::tempdir().unwrap();
+            for learnt in [false, true] {
+                let mut app = cascade_app(directory.path());
+                at_a_value_argument(&mut app);
+                let (code, modifiers) = if learnt {
+                    app.learn_keybind(BindAction::Docs, KeyCombo::parse("f3"));
+                    (KeyCode::F(3), KeyModifiers::NONE)
+                } else {
+                    (KeyCode::Char('d'), KeyModifiers::CONTROL)
+                };
+                app.toggle_settings_sheet();
+                assert!(app.settings_hold_the_keys(), "learnt={learnt}");
+                press(&mut app, code, modifiers);
+                assert_eq!(opened(&app), "nothing", "learnt={learnt}");
+                assert!(app.settings_hold_the_keys(), "learnt={learnt}");
+            }
+        }
+
+        /// Rewind-update moved onto a new chord fires as the transport from
+        /// anywhere, and the ^⇧S it was moved off does not fall through to the
+        /// legacy reading of ^S, which would make the freed key an update.
+        #[test]
+        fn a_moved_transport_chord_fires_and_frees_its_old_key() {
+            // The learnt chord evaluates, from anywhere the loop reaches.
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = cascade_app(directory.path());
+            app.learn_keybind(
+                BindAction::RewindEvaluate,
+                Some(KeyCombo::parse("f7").expect("F7 parses")),
+            );
+            use_builtin_synth(&mut app);
+            press(&mut app, KeyCode::F(7), KeyModifiers::NONE);
+            assert!(
+                evaluation_underway(&app),
+                "the learnt chord evaluates, from anywhere the loop reaches: {}",
+                app.status
+            );
+            assert!(!app.next_rewind, "the rewind flag rode along and was spent");
+
+            // The freed ^⇧S re-means nothing: not the moved rewind, and not the
+            // legacy reading of ^S either, which would make the freed key a
+            // quiet update. A fresh studio over the same table, so the transport
+            // proof is this press's own and nobody's left over.
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = cascade_app(directory.path());
+            app.learn_keybind(
+                BindAction::RewindEvaluate,
+                Some(KeyCombo::parse("f7").expect("F7 parses")),
+            );
+            press(
+                &mut app,
+                KeyCode::Char('s'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            );
+            assert!(!app.next_rewind, "the freed chord does not rewind");
+            assert!(
+                !evaluation_underway(&app),
+                "and does not quietly evaluate either"
+            );
+        }
+
+        /// The learn capture is the open sheet's: armed, then the sheet closed by
+        /// any door, the next key means what it always meant instead of binding
+        /// in silence.
+        #[test]
+        fn an_armed_learn_dies_with_the_sheet() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = cascade_app(directory.path());
+            app.settings_sheet = Some(SettingsSheet::default());
+            app.focus = Focus::Panel(PanelKind::Settings);
+            app.keybind_learn = Some(crate::keybinds::KeybindLearn::arm(BindAction::Undo));
+            // The sheet closes without a key: the mouse's door.
+            app.settings_sheet = None;
+            app.focus = Focus::Editor;
+
+            press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+            assert!(
+                app.keybinds.binding(BindAction::Undo).unwrap().key() == "ctrl+z",
+                "nothing was learnt"
+            );
+            assert!(
+                !app.keybinds.overridden(BindAction::Quit),
+                "and ^Q did not become undo, or quit anything"
+            );
+        }
+
+        /// With a learn armed, the next press is the chord. When another action
+        /// holds that chord, the learn asks first: Enter takes it and the other
+        /// action goes unbound.
+        #[test]
+        fn an_armed_learn_asks_before_taking_a_chord_somebody_holds() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = cascade_app(directory.path());
+            app.settings_sheet = Some(SettingsSheet::default());
+            app.focus = Focus::Panel(PanelKind::Settings);
+            app.keybind_learn = Some(crate::keybinds::KeybindLearn::arm(BindAction::Undo));
+
+            // ^R is rename-scene's: the learn asks rather than taking in silence.
+            press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+            assert_eq!(
+                app.keybinds.binding(BindAction::Undo).unwrap().key(),
+                "ctrl+z",
+                "nothing moved while the ask is up"
+            );
+            assert!(
+                matches!(
+                    app.keybind_learn,
+                    Some(crate::keybinds::KeybindLearn::Confirm {
+                        held_by: BindAction::RenameScene,
+                        ..
+                    })
+                ),
+                "the learn is asking, and says who would lose the chord"
+            );
+
+            // Enter confirms: the chord moves whole, the loser goes unbound.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(
+                app.keybinds.binding(BindAction::Undo).unwrap().key(),
+                "ctrl+r",
+                "the chord was taken, whatever it used to mean"
+            );
+            assert!(app.keybinds.overridden(BindAction::Undo));
+            assert!(
+                app.keybinds.is_unbound(BindAction::RenameScene),
+                "rename-scene was displaced, not silently repointed"
+            );
+            assert!(app.keybind_learn.is_none(), "the learn is over");
+        }
+
+        /// The ask is answerable in both directions: Esc keeps what the other
+        /// action has and the learn ends having changed nothing.
+        #[test]
+        fn esc_on_a_take_keeps_the_other_action_s_chord() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = cascade_app(directory.path());
+            app.settings_sheet = Some(SettingsSheet::default());
+            app.focus = Focus::Panel(PanelKind::Settings);
+            app.keybind_learn = Some(crate::keybinds::KeybindLearn::arm(BindAction::Undo));
+
+            press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert_eq!(
+                app.keybinds.binding(BindAction::Undo).unwrap().key(),
+                "ctrl+z",
+                "undo keeps its own chord"
+            );
+            assert_eq!(
+                app.keybinds.binding(BindAction::RenameScene).unwrap().key(),
+                "ctrl+r",
+                "rename-scene keeps what it held"
+            );
+            assert!(app.keybind_learn.is_none());
+        }
+
+        /// Enter pressed while the learn is merely ARMED is refused, not
+        /// captured: it is the key that arms and confirms, and a page whose
+        /// Enter could be learnt away would strand itself.
+        #[test]
+        fn enter_is_refused_while_a_learn_is_armed() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = cascade_app(directory.path());
+            app.settings_sheet = Some(SettingsSheet::default());
+            app.focus = Focus::Panel(PanelKind::Settings);
+            app.keybind_learn = Some(crate::keybinds::KeybindLearn::arm(BindAction::Undo));
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(
+                app.keybinds.binding(BindAction::Undo).unwrap().key(),
+                "ctrl+z",
+                "nothing was learnt"
+            );
+            assert!(
+                app.keybind_learn.is_some(),
+                "the learn stays armed, no deafer for one refused press"
+            );
+            // And the sheet still works: Enter on the row re-learns the action.
+            assert!(
+                app.keybind_rows().iter().any(|row| row.learning),
+                "the row still says it is waiting for a chord"
+            );
+        }
+
+        /// The reserved family is refused at the capture path too, not just in
+        /// the model: Esc closes sheets and cancels learns, Tab pages the sheet,
+        /// Backspace and Delete unbind rows, Space types spaces, the arrows walk
+        /// the page and the score. Armed, none of them becomes a chord; the
+        /// learn stays armed and the key keeps its own meaning.
+        #[test]
+        fn the_reserved_keys_are_never_captured_as_chords() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = cascade_app(directory.path());
+            app.settings_sheet = Some(SettingsSheet::default());
+            app.focus = Focus::Panel(PanelKind::Settings);
+
+            for (code, name) in [
+                (KeyCode::Enter, "enter"),
+                (KeyCode::Esc, "esc"),
+                (KeyCode::Tab, "tab"),
+                (KeyCode::Backspace, "backspace"),
+                (KeyCode::Delete, "delete"),
+                (KeyCode::Char(' '), "space"),
+                (KeyCode::Left, "left"),
+                (KeyCode::Right, "right"),
+                (KeyCode::Up, "up"),
+                (KeyCode::Down, "down"),
+            ] {
+                app.keybind_learn = Some(crate::keybinds::KeybindLearn::arm(BindAction::Undo));
+                press(&mut app, code, KeyModifiers::NONE);
+                assert_eq!(
+                    app.keybinds.binding(BindAction::Undo).unwrap().key(),
+                    "ctrl+z",
+                    "{name} was refused and learnt nothing"
+                );
+                // Esc and Tab close and page the sheet, so they also dismiss
+                // the armed learn. Every other key leaves the learn armed.
+                if matches!(code, KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab) {
+                    assert!(app.keybind_learn.is_none(), "{name} did its own work");
+                    // Re-open what Esc closed, for the next pass of the loop.
+                    app.settings_sheet = Some(SettingsSheet::default());
+                    app.focus = Focus::Panel(PanelKind::Settings);
+                } else {
+                    assert!(app.keybind_learn.is_some(), "{name} leaves the learn armed");
+                }
+            }
+            // And the sheet survived the whole walk: still open, still on its
+            // rows, still working.
+            assert!(app.settings_sheet.is_some());
+        }
+
+        /// ctrl+space is refused AND SAID: terminals that never send it whole
+        /// (gnome-terminal delivers only the modifier's work) would otherwise
+        /// bind a key that cannot fire, so the capture keeps the learn armed and
+        /// says on the status exactly why the key it saw is not a chord.
+        #[test]
+        fn ctrl_space_is_refused_with_a_word_not_a_dead_binding() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = cascade_app(directory.path());
+            app.settings_sheet = Some(SettingsSheet::default());
+            app.focus = Focus::Panel(PanelKind::Settings);
+            app.keybind_learn = Some(crate::keybinds::KeybindLearn::arm(BindAction::Undo));
+
+            press(&mut app, KeyCode::Char(' '), KeyModifiers::CONTROL);
+            assert_eq!(
+                app.keybinds.binding(BindAction::Undo).unwrap().key(),
+                "ctrl+z",
+                "nothing was learnt"
+            );
+            assert!(app.keybind_learn.is_some(), "the learn stays armed");
+            assert!(
+                app.status.contains("cannot be a custom shortcut"),
+                "the refusal is said, not silent: {:?}",
+                app.status
+            );
+            assert!(
+                !app.keybinds.overridden(BindAction::Undo),
+                "and studio.json keeps no dead binding"
+            );
+        }
+
+        /// Most terminals fold ctrl+' down to a bare ', which is a typing key.
+        /// The learn refuses a typing key with a status message and stays
+        /// armed, because a binding on ' would fire on every typed apostrophe.
+        /// After the learn ends, the letter types into the editor again.
+        #[test]
+        fn a_typing_key_is_refused_with_a_word_not_bound_in_silence() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = cascade_app(directory.path());
+            app.settings_sheet = Some(SettingsSheet::default());
+            app.focus = Focus::Panel(PanelKind::Settings);
+            app.keybind_learn = Some(crate::keybinds::KeybindLearn::arm(BindAction::Undo));
+
+            // The terminal folds ctrl+' down to a bare ' - the press the app
+            // actually sees, indistinguishable from typing an apostrophe.
+            press(&mut app, KeyCode::Char('\''), KeyModifiers::NONE);
+            assert_eq!(
+                app.keybinds.binding(BindAction::Undo).unwrap().key(),
+                "ctrl+z",
+                "the typing key bound nothing"
+            );
+            assert!(
+                !app.keybinds.overridden(BindAction::Undo),
+                "studio.json keeps no binding on a typing key"
+            );
+            assert!(
+                app.status.contains("typing key"),
+                "the refusal is said, not silent: {:?}",
+                app.status
+            );
+            assert!(app.keybind_learn.is_some(), "the learn stays armed");
+        }
+
+        /// Kitty-protocol terminals report a bare modifier press before the
+        /// letter of a chord. The learn ignores it, stays armed and shows no
+        /// status message.
+        #[test]
+        fn a_bare_modifier_press_is_the_first_half_of_a_chord_not_one() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = cascade_app(directory.path());
+            app.settings_sheet = Some(SettingsSheet::default());
+            app.focus = Focus::Panel(PanelKind::Settings);
+            app.keybind_learn = Some(crate::keybinds::KeybindLearn::arm(BindAction::Undo));
+            let status_before = app.status.clone();
+
+            press(
+                &mut app,
+                KeyCode::Modifier(ModifierKeyCode::LeftControl),
+                KeyModifiers::NONE,
+            );
+            assert!(
+                app.keybind_learn.is_some(),
+                "the learn waits for the letter of the chord"
+            );
+            assert_eq!(
+                app.keybinds.binding(BindAction::Undo).unwrap().key(),
+                "ctrl+z",
+                "the modifier alone bound nothing"
+            );
+            assert_eq!(
+                app.status, status_before,
+                "the first half of a chord says nothing at all"
+            );
+
+            // A chord that arrives whole still binds. No action holds
+            // Ctrl+Shift+Q, so the learn takes it at once.
+            press(
+                &mut app,
+                KeyCode::Char('Q'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            );
+            assert_eq!(
+                app.keybinds.binding(BindAction::Undo).unwrap().key(),
+                "ctrl+shift+q",
+                "the shortcut arrived whole and was taken"
+            );
+        }
+
+        /// Space does not clear a row: it types spaces and steps lists, and a
+        /// reflexive press on a row must not wipe a binding. Delete and
+        /// Backspace are the clearing keys.
+        #[test]
+        fn space_does_not_clear_a_row_delete_and_backspace_do() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = cascade_app(directory.path());
+            let undo_at = BindAction::ALL
+                .iter()
+                .position(|action| *action == BindAction::Undo)
+                .expect("undo is a row");
+            let mut sheet = SettingsSheet::default();
+            sheet.show_page(crate::settings::SettingsPage::Keybinds);
+            sheet.selected = crate::settings::KEYBIND_ACTION_START + undo_at;
+            app.settings_sheet = Some(sheet);
+            app.focus = Focus::Panel(PanelKind::Settings);
+            app.learn_keybind(BindAction::Undo, Some(KeyCombo::parse("f2").unwrap()));
+            assert_eq!(app.keybinds.binding(BindAction::Undo).unwrap().key(), "f2");
+
+            // Space on the row: the binding stands.
+            press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+            assert_eq!(
+                app.keybinds.binding(BindAction::Undo).unwrap().key(),
+                "f2",
+                "space cleared nothing"
+            );
+
+            // Delete clears it back to the studio's own chord.
+            press(&mut app, KeyCode::Delete, KeyModifiers::NONE);
+            assert_eq!(
+                app.keybinds.binding(BindAction::Undo).unwrap().key(),
+                "ctrl+z",
+                "delete puts the studio's own chord back"
+            );
+
+            // Backspace does the same work, on a fresh learnt chord.
+            app.learn_keybind(BindAction::Undo, Some(KeyCombo::parse("f2").unwrap()));
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            assert_eq!(
+                app.keybinds.binding(BindAction::Undo).unwrap().key(),
+                "ctrl+z",
+                "backspace puts the studio's own chord back too"
+            );
+        }
+
+        /// A learnt chord pressed with alt held is not the learnt chord. Alt
+        /// folds into the primary modifier, so the press falls through and the
+        /// default reading of ^S evaluates, the same as with no override learnt.
+        #[test]
+        fn an_alt_held_learnt_chord_falls_through_like_its_default_does() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = cascade_app(directory.path());
+            app.learn_keybind(
+                BindAction::Evaluate,
+                Some(KeyCombo::parse("ctrl+s").expect("^S parses")),
+            );
+            use_builtin_synth(&mut app);
+            press(
+                &mut app,
+                KeyCode::Char('s'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            );
+            assert!(
+                evaluation_underway(&app),
+                "alt folds into the chord, as it does for every default"
+            );
+
+            // And the same press on an untouched studio is the same: the learnt
+            // chord did not change what alt+^S means.
+            let directory = tempfile::tempdir().unwrap();
+            let mut reference = cascade_app(directory.path());
+            use_builtin_synth(&mut reference);
+            press(
+                &mut reference,
+                KeyCode::Char('s'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            );
+            assert!(evaluation_underway(&reference));
+        }
+    }
+
+    mod shortcut_hint {
+        //! User-visible shortcuts and their contextual input routes share one table.
+
+        use crate::app::tests::support::press;
+        use crate::app::*;
+        use crate::keybinds::{KeyCombo, Reach};
+
+        fn app(directory: &std::path::Path) -> App {
+            let mut app = crate::app::tests::support::app_over(directory);
+            app.frame = Rect::new(0, 0, 160, 50);
+            app.capabilities = KeyboardCapabilities::enhanced();
+            app.keybinds.set_reach(Reach {
+                enhanced: true,
+                terminal: "xterm".into(),
+            });
+            app.focus_pane(0);
+            app.focus = Focus::Editor;
+            app
+        }
+
+        fn bind(app: &mut App, action: BindAction, number: u8) {
+            app.keybinds.learn(
+                action,
+                Some(KeyCombo {
+                    code: KeyCode::F(number),
+                    control: true,
+                    shift: false,
+                }),
+            );
+        }
+
+        fn custom(app: &mut App, number: u8) {
+            press(app, KeyCode::F(number), KeyModifiers::CONTROL);
+        }
+
+        #[test]
+        fn scene_and_split_status_hints_follow_rebindings_and_unbound_actions() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app(directory.path());
+            bind(&mut app, BindAction::NewScene, 1);
+            bind(&mut app, BindAction::RenameScene, 2);
+            bind(&mut app, BindAction::HopPane, 3);
+            bind(&mut app, BindAction::Split, 4);
+            app.step_scene(1);
+            assert!(app.status.contains("^F1 adds another"), "{}", app.status);
+            app.toggle_split();
+            for hint in ["^F3 hops panes", "^F2 names it", "^F4 closes the split"] {
+                assert!(app.status.contains(hint), "{}", app.status);
+            }
+            app.close_split();
+            app.keybinds.unbind(BindAction::Split);
+            app.toggle_split();
+            assert!(
+                app.status.contains("View > Close the split"),
+                "{}",
+                app.status
+            );
+            app.new_scene(false);
+            assert!(app.status.contains("^F2 names it"), "{}", app.status);
+        }
+
+        #[test]
+        fn set_log_and_zen_status_hints_follow_the_current_bindings() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app(directory.path());
+            bind(&mut app, BindAction::SetPanel, 1);
+            bind(&mut app, BindAction::LogSticky, 2);
+            bind(&mut app, BindAction::Zen, 3);
+            app.open_set_panel(true);
+            assert!(app.status.contains("^F1 hides the panel"), "{}", app.status);
+            assert!(app.status.contains("Del deletes"), "{}", app.status);
+            assert!(!app.status.contains("^D deletes"), "{}", app.status);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.status.contains("^F1 hides it"), "{}", app.status);
+            app.toggle_log_sticky();
+            app.focus_panel(PanelKind::Log);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.status.contains("^F2 un-docks it"), "{}", app.status);
+            app.ui_settings.zen = true;
+            app.viz_docks[0] = None;
+            app.toggle_viz_dock(0);
+            assert!(
+                app.status.contains("^F3 restores the stage"),
+                "{}",
+                app.status
+            );
+            assert!(!app.status.contains("F11"));
+        }
+
+        #[test]
+        fn a_rebound_copy_copies_the_log_and_retires_the_old_key() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app(directory.path());
+            bind(&mut app, BindAction::Copy, 1);
+            app.toggle_log_panel();
+            let panel = app.log_panel.as_mut().unwrap();
+            panel.editor = Editor::new("this is the selected log").unwrap();
+            panel
+                .editor
+                .dispatch(
+                    Command::SelectAll,
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .unwrap();
+            let score = app.editor().source();
+            app.clipboard.set_text("kept".into()).unwrap();
+            press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+            assert_eq!(app.clipboard.get_text().unwrap(), "kept");
+            custom(&mut app, 1);
+            assert_eq!(
+                app.clipboard.get_text().unwrap(),
+                "this is the selected log"
+            );
+            assert_eq!(app.editor().source(), score);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Log));
+            app.keybinds.unbind(BindAction::Copy);
+            app.clipboard.set_text("unbound".into()).unwrap();
+            press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+            assert_eq!(app.clipboard.get_text().unwrap(), "unbound");
+        }
+
+        #[test]
+        fn a_rebound_copy_uses_the_theme_form_and_code_selection() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app(directory.path());
+            bind(&mut app, BindAction::Copy, 1);
+            let theme = app.theme.clone();
+            app.open_theme_editor(&theme, "test theme".into(), false);
+            let json = app.theme_editor.as_ref().unwrap().draft.to_json();
+            app.clipboard.set_text("kept".into()).unwrap();
+            press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+            assert_eq!(app.clipboard.get_text().unwrap(), "kept");
+            custom(&mut app, 1);
+            assert_eq!(app.clipboard.get_text().unwrap(), json);
+            let theme_editor = app.theme_editor.as_mut().unwrap();
+            theme_editor.tab = crate::theme_editor::EditorTab::Code;
+            theme_editor.code = Editor::new("selected theme code").unwrap();
+            theme_editor
+                .code
+                .dispatch(
+                    Command::SelectAll,
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .unwrap();
+            custom(&mut app, 1);
+            assert_eq!(app.clipboard.get_text().unwrap(), "selected theme code");
+            assert_eq!(app.focus, Focus::Panel(PanelKind::ThemeEditor));
+        }
+
+        #[test]
+        fn learned_editing_shortcuts_stay_in_the_active_prompt() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app(directory.path());
+            bind(&mut app, BindAction::Paste, 1);
+            bind(&mut app, BindAction::SelectAll, 2);
+            app.open_set_prompt(SetPrompt::RenameSet);
+            let score = app.editor().source();
+            custom(&mut app, 2);
+            assert!(app.set_prompt.as_ref().unwrap().1.selection().is_some());
+            app.clipboard.set_text("new name".into()).unwrap();
+            custom(&mut app, 1);
+            assert_eq!(app.set_prompt.as_ref().unwrap().1.path, "new name");
+            assert_eq!(app.editor().source(), score);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Set));
+        }
+
+        #[test]
+        fn moved_panel_toggles_retire_their_old_close_keys() {
+            for (action, panel, code, modifiers) in [
+                (
+                    BindAction::Log,
+                    PanelKind::Log,
+                    KeyCode::Char('d'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                ),
+                (
+                    BindAction::Devices,
+                    PanelKind::Devices,
+                    KeyCode::Char('p'),
+                    KeyModifiers::CONTROL,
+                ),
+                (
+                    BindAction::Export,
+                    PanelKind::Export,
+                    KeyCode::Char('x'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                ),
+                (
+                    BindAction::ThemePicker,
+                    PanelKind::Theme,
+                    KeyCode::Char('t'),
+                    KeyModifiers::CONTROL,
+                ),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut app = app(directory.path());
+                bind(&mut app, action, 1);
+                custom(&mut app, 1);
+                assert_eq!(app.focus, Focus::Panel(panel), "{action:?} opens");
+                press(&mut app, code, modifiers);
+                assert_eq!(
+                    app.focus,
+                    Focus::Panel(panel),
+                    "{action:?} old key closed the panel"
+                );
+                custom(&mut app, 1);
+                assert_ne!(app.focus, Focus::Panel(panel), "{action:?} new key closes");
+            }
+        }
+
+        #[test]
+        fn settings_replacement_dialogs_accept_default_adapted_and_learned_shortcuts() {
+            for (enhanced, learned) in [(true, false), (false, false), (false, true)] {
+                for action in [
+                    BindAction::ThemePicker,
+                    BindAction::Export,
+                    BindAction::Devices,
+                    BindAction::OpenSet,
+                    BindAction::Log,
+                ] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let mut app = app(directory.path());
+                    app.capabilities = if enhanced {
+                        KeyboardCapabilities::enhanced()
+                    } else {
+                        KeyboardCapabilities::legacy()
+                    };
+                    app.keybinds.set_reach(Reach {
+                        enhanced,
+                        terminal: "xterm".into(),
+                    });
+                    if learned {
+                        bind(&mut app, action, 1);
+                    }
+                    let chord = app.keybinds.binding(action).expect("available shortcut");
+                    app.toggle_settings_sheet();
+                    assert!(app.settings_hold_the_keys());
+                    let modifiers = (if chord.control {
+                        KeyModifiers::CONTROL
+                    } else {
+                        KeyModifiers::NONE
+                    }) | (if chord.shift {
+                        KeyModifiers::SHIFT
+                    } else {
+                        KeyModifiers::NONE
+                    });
+                    press(&mut app, chord.code, modifiers);
+                    assert!(
+                        app.settings_sheet.is_none(),
+                        "{action:?}, enhanced={enhanced}, learned={learned}"
+                    );
+                    let opened = match action {
+                        BindAction::ThemePicker => app.theme_picker.is_some(),
+                        BindAction::Export => app.export_sheet.is_some(),
+                        BindAction::Devices => app.panel.is_some(),
+                        BindAction::OpenSet => {
+                            matches!(app.set_prompt, Some((SetPrompt::OpenSet, _)))
+                        }
+                        BindAction::Log => app.log_panel.is_some(),
+                        _ => unreachable!(),
+                    };
+                    assert!(opened, "{action:?}, enhanced={enhanced}, learned={learned}");
+                }
+            }
+        }
+
+        #[test]
+        fn settings_blocks_editing_and_cancels_reset_before_replacement_dialogs() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app(directory.path());
+            bind(&mut app, BindAction::Paste, 1);
+            let binding = app.keybinds.binding(BindAction::Paste);
+            let source = app.editor().source();
+            app.clipboard
+                .set_text("must not enter the score".into())
+                .unwrap();
+            app.toggle_settings_sheet();
+            let sheet = app.settings_sheet.as_mut().unwrap();
+            sheet.show_page(crate::settings::SettingsPage::Keybinds);
+            sheet.selected = crate::settings::RESET_KEYBINDS_ROW;
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.settings_sheet.unwrap().confirm_reset_keybinds);
+            custom(&mut app, 1);
+            assert!(!app.settings_sheet.unwrap().confirm_reset_keybinds);
+            assert!(app.settings_hold_the_keys());
+            assert_eq!(app.editor().source(), source);
+            assert_eq!(app.keybinds.binding(BindAction::Paste), binding);
+            // The next Enter arms a new confirmation; the swallowed edit never
+            // leaves an old confirmation waiting to reset the user's bindings.
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.settings_sheet.unwrap().confirm_reset_keybinds);
+            assert_eq!(app.keybinds.binding(BindAction::Paste), binding);
+            press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+            assert!(app.theme_picker.is_some());
+            assert!(app.settings_sheet.is_none());
+            assert_eq!(app.keybinds.binding(BindAction::Paste), binding);
+            app.toggle_settings_sheet();
+            assert!(!app.settings_sheet.unwrap().confirm_reset_keybinds);
+        }
+    }
+}

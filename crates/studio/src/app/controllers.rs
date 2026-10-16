@@ -520,3 +520,523 @@ fn stick_push(axis: super::super::settings::StickAxis) -> f64 {
         });
     if axis.is_vertical() { -push } else { push }
 }
+
+#[cfg(test)]
+mod tests {
+    mod controllers {
+        //! Tests for `app/controllers.rs`.
+
+        use crate::app::tests::support::*;
+        use crate::app::*;
+        use crate::editor::Selection;
+
+        /// The pads are process-wide state: the tests that move them take turns.
+        static PAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        /// A stick bound to a slot drives that slot's fader. A full push
+        /// crosses the travel in two seconds, a small push moves it slowly, the
+        /// dead zone is rest, and up on a vertical axis raises the value.
+        /// Release stops it. The fader is the score's first slider, not the
+        /// focused one.
+        #[test]
+        fn a_stick_on_a_slot_pushes_that_slots_fader() {
+            use crate::settings::{MappingSource, StickAxis};
+            let _pads = PAD_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene, call) = slider_app(directory.path());
+            app.audible_scene = Some(scene);
+            app.armed_slider = None;
+            let pad = rustel_core::gamepad::pad(3).expect("pad 3");
+            pad.set_connected(true);
+            app.ui_settings.mappings[0] = Some(MappingSource::Stick(StickAxis::X1));
+            let mut now = Instant::now();
+            app.stick_ticked_at = now;
+            // Full push right for one second, in tenths: half the travel.
+            pad.set_axis(0, 1.0);
+            for _ in 0..10 {
+                now += Duration::from_millis(100);
+                app.drive_mapped_faders(now);
+            }
+            assert!(app.stick_pushing, "the loop keeps frames coming");
+            let after_a_second = value(&app, scene, call);
+            assert!(
+                (after_a_second - 1.0).abs() < 0.02,
+                "0.5 plus half the travel: {after_a_second}"
+            );
+            // At rest nothing moves, and the run is let go.
+            pad.set_axis(0, 0.1);
+            now += Duration::from_millis(100);
+            app.drive_mapped_faders(now);
+            assert!(!app.stick_pushing);
+            assert!(app.stick_run[0].is_none());
+            assert_eq!(value(&app, scene, call), after_a_second);
+            // A small push walks: half over is about a sixth of full speed.
+            pad.set_axis(0, -0.6);
+            for _ in 0..10 {
+                now += Duration::from_millis(100);
+                app.drive_mapped_faders(now);
+            }
+            let walked = after_a_second - value(&app, scene, call);
+            assert!(walked > 0.05 && walked < 0.2, "walked {walked}");
+            // Up on a vertical axis raises the value: the page reads up as negative.
+            app.ui_settings.mappings[0] = Some(MappingSource::Stick(StickAxis::Y2));
+            pad.set_axis(0, 0.0);
+            pad.set_axis(3, -1.0);
+            let before = value(&app, scene, call);
+            now += Duration::from_millis(100);
+            app.drive_mapped_faders(now);
+            assert!(value(&app, scene, call) > before, "up raises");
+            // A slot nobody bound drives nothing.
+            app.ui_settings.mappings[0] = None;
+            let before = value(&app, scene, call);
+            now += Duration::from_millis(100);
+            app.drive_mapped_faders(now);
+            assert_eq!(value(&app, scene, call), before);
+            pad.set_axis(3, 0.0);
+            pad.set_connected(false);
+        }
+
+        /// A slow push still gets there: the run carries the fraction of a step
+        /// between frames, so a coarse slider moves a step at a time instead of
+        /// rounding every frame's sliver away.
+        #[test]
+        fn a_slow_push_adds_up_on_a_coarse_slider() {
+            use crate::settings::{MappingSource, StickAxis};
+            let _pads = PAD_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene, call) =
+                slider_app_with_source(directory.path(), "$: s(\"bd\").n(slider(5, 0, 10, 1))\n");
+            app.audible_scene = Some(scene);
+            let pad = rustel_core::gamepad::pad(2).expect("pad 2");
+            pad.set_connected(true);
+            app.ui_settings.mappings[0] = Some(MappingSource::Stick(StickAxis::X1));
+            let mut now = Instant::now();
+            app.stick_ticked_at = now;
+            pad.set_axis(0, 0.5);
+            let start = value(&app, scene, call);
+            for _ in 0..120 {
+                now += Duration::from_millis(16);
+                app.drive_mapped_faders(now);
+            }
+            assert!(
+                value(&app, scene, call) > start,
+                "two seconds of a half push moved a step"
+            );
+            pad.set_axis(0, 0.0);
+            pad.set_connected(false);
+        }
+
+        /// A MIDI knob bound to a slot drives that slot's fader, absolutely: the
+        /// fader goes where the knob points. The caret is not consulted - a
+        /// mapping is positional, so what it drives does not move when the caret
+        /// does. Another knob, or another channel, does nothing.
+        #[test]
+        fn a_midi_knob_on_a_slot_drives_that_slots_fader() {
+            use crate::pads::CcTurn;
+            use crate::settings::{MappingSource, SliderCc};
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene, call) = slider_app(directory.path());
+            app.audible_scene = Some(scene);
+            // Deliberately away from the slider: this is not focus-follows-knob.
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(0)))
+                .expect("caret at the top");
+            app.ui_settings.mappings[0] = Some(MappingSource::Knob(SliderCc {
+                controller: 74,
+                channel: Some(2),
+            }));
+            // This is about where a message lands, not about how a turn is read:
+            // pin the absolute mode so one message is one value.
+            app.ui_settings.takeover[0] = crate::settings::Takeover::Jump;
+            app.pads.turn_for_test(CcTurn {
+                controller: 74,
+                channel: 2,
+                value: 127,
+            });
+            app.drain_pads();
+            assert_eq!(
+                value(&app, scene, call),
+                1.0,
+                "the knob's top is the fader's"
+            );
+            assert!(app.mapping_slot_views()[0].live, "the slot says it arrived");
+            app.pads.turn_for_test(CcTurn {
+                controller: 74,
+                channel: 2,
+                value: 0,
+            });
+            app.drain_pads();
+            assert_eq!(value(&app, scene, call), 0.0);
+            app.pads.turn_for_test(CcTurn {
+                controller: 75,
+                channel: 2,
+                value: 64,
+            });
+            app.pads.turn_for_test(CcTurn {
+                controller: 74,
+                channel: 1,
+                value: 64,
+            });
+            app.drain_pads();
+            assert_eq!(
+                value(&app, scene, call),
+                0.0,
+                "another knob, another channel: nothing"
+            );
+            // A slot past the score's last slider has nothing to drive, and says
+            // so by moving nothing rather than by panicking.
+            app.ui_settings.mappings[5] = Some(MappingSource::Knob(SliderCc {
+                controller: 90,
+                channel: None,
+            }));
+            app.pads.turn_for_test(CcTurn {
+                controller: 90,
+                channel: 7,
+                value: 127,
+            });
+            app.drain_pads();
+            assert_eq!(value(&app, scene, call), 0.0);
+            assert!(
+                app.mapping_slot_views()[5].live,
+                "the light is the mapping arriving, not the fader moving"
+            );
+            // No mapping at all.
+            app.ui_settings.mappings[0] = None;
+            app.pads.turn_for_test(CcTurn {
+                controller: 74,
+                channel: 2,
+                value: 127,
+            });
+            app.drain_pads();
+            assert!(value(&app, scene, call).abs() < 1e-9);
+        }
+
+        /// Learning a slot from the settings sheet: Enter waits, the first stick
+        /// pushed past the threshold or the next control change is kept, channel
+        /// included; Esc cancels; both are remembered; and a control already on
+        /// another slot moves rather than driving two faders at once.
+        #[test]
+        fn a_settings_slot_learns_a_knob_or_a_stick() {
+            use crate::pads::CcTurn;
+            use crate::settings::{MappingSource, SliderCc, StickAxis};
+            let _pads = PAD_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene, _call) = slider_app(directory.path());
+            // A learn is the open sheet's: without it, nothing is waiting.
+            app.dispatch_settings_action_for_test(SettingsAction::LearnSlot(0));
+            app.drive_mapped_faders(Instant::now());
+            assert_eq!(app.mapping_learn, None, "no sheet, no learn");
+            app.settings_sheet = Some(Default::default());
+            app.dispatch_settings_action_for_test(SettingsAction::LearnSlot(0));
+            assert_eq!(app.mapping_learn, Some(0));
+            let pad = rustel_core::gamepad::pad(1).expect("pad 1");
+            pad.set_connected(true);
+            pad.set_axis(2, 0.3);
+            app.drive_mapped_faders(Instant::now());
+            assert_eq!(app.mapping_learn, Some(0), "a nudge is not a choice");
+            pad.set_axis(2, 0.9);
+            app.drive_mapped_faders(Instant::now());
+            assert_eq!(app.mapping_learn, None);
+            assert_eq!(
+                app.ui_settings.mappings[0],
+                Some(MappingSource::Stick(StickAxis::X2))
+            );
+            pad.set_axis(2, 0.0);
+            pad.set_connected(false);
+
+            app.dispatch_settings_action_for_test(SettingsAction::LearnSlot(1));
+            assert_eq!(app.mapping_learn, Some(1));
+            app.pads.turn_for_test(CcTurn {
+                controller: 21,
+                channel: 5,
+                value: 40,
+            });
+            app.drain_pads();
+            assert_eq!(app.mapping_learn, None);
+            let knob = MappingSource::Knob(SliderCc {
+                controller: 21,
+                channel: Some(5),
+            });
+            assert_eq!(app.ui_settings.mappings[1], Some(knob));
+            // Twelve slots, always written in order, so a slot's place survives.
+            assert_eq!(
+                app.prefs.mappings.as_deref().map(<[String]>::to_vec),
+                Some(
+                    [
+                        "x2", "cc21/ch5", "off", "off", "off", "off", "off", "off", "off", "off",
+                        "off", "off"
+                    ]
+                    .map(str::to_owned)
+                    .to_vec()
+                )
+            );
+
+            // The same knob learnt onto another slot leaves the first: one control
+            // driving two faders is never what was meant.
+            app.dispatch_settings_action_for_test(SettingsAction::LearnSlot(4));
+            app.pads.turn_for_test(CcTurn {
+                controller: 21,
+                channel: 5,
+                value: 90,
+            });
+            app.drain_pads();
+            assert_eq!(app.ui_settings.mappings[1], None, "it moved");
+            assert_eq!(app.ui_settings.mappings[4], Some(knob));
+
+            // Space unbinds it again.
+            app.dispatch_settings_action_for_test(SettingsAction::ClearSlot(4));
+            assert_eq!(app.ui_settings.mappings[4], None);
+
+            // Esc on the sheet cancels a learn and keeps the sheet.
+            app.focus = Focus::Panel(PanelKind::Settings);
+            app.dispatch_settings_action_for_test(SettingsAction::LearnSlot(2));
+            assert!(app.handle_settings_key(KeyCode::Esc, false, false));
+            assert_eq!(app.mapping_learn, None);
+            assert!(app.settings_sheet.is_some(), "the sheet stays");
+        }
+
+        /// `l` on a fader learns a controller for it, without leaving the desk.
+        ///
+        /// Mid-set the mixer is where your hands already are, and a mapping you
+        /// have to open Settings to make is a mapping you do not make. It is the
+        /// same learn the Settings page arms, into the slot this fader answers to.
+        #[test]
+        fn l_on_a_mixer_fader_learns_a_knob_for_it() {
+            use crate::pads::CcTurn;
+            use crate::settings::{MappingSource, SliderCc};
+
+            // drive_mapped_faders reads every pad's axes while learning, and the
+            // learn-stick tests write those axes behind this lock. Held here too,
+            // or a sibling mid-write has this desk's learn stolen by a stick that
+            // no one pushed.
+            let _pads = PAD_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene, call) = slider_app(directory.path());
+            app.audible_scene = Some(scene);
+            precision_key(&mut app, KeyCode::F(4), KeyModifiers::NONE);
+            app.regions.mixer = Rect::new(0, 18, 120, 12);
+            app.focus = Focus::Panel(PanelKind::Mixer);
+            app.mixer_on_faders = true;
+            app.mixer_fader = 0;
+
+            precision_key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+            assert_eq!(app.mapping_learn, Some(0));
+            assert!(app.status.contains("slot 1"), "{}", app.status);
+
+            // With no settings sheet anywhere: the desk's own learn has to survive
+            // the turn that settles it, or it is disarmed before a knob can move.
+            app.drive_mapped_faders(Instant::now());
+            assert_eq!(app.mapping_learn, Some(0), "the desk keeps its own learn");
+
+            app.pads.turn_for_test(CcTurn {
+                controller: 91,
+                channel: 3,
+                value: 64,
+            });
+            app.drain_pads();
+            assert_eq!(app.mapping_learn, None, "and the knob lands");
+            assert_eq!(
+                app.ui_settings.mappings[0],
+                Some(MappingSource::Knob(SliderCc {
+                    controller: 91,
+                    channel: Some(3)
+                }))
+            );
+
+            // It drives that fader from now on, from the desk it was learnt at.
+            // Two turns, because a freshly learnt knob has not been read as a
+            // movement yet: the first says where the hand is, the second moves.
+            for value in [64, 127] {
+                app.pads.turn_for_test(CcTurn {
+                    controller: 91,
+                    channel: 3,
+                    value,
+                });
+                app.drain_pads();
+            }
+            assert_value(&app, scene, call, 1.0);
+
+            // Esc cancels an armed learn before it gives the keyboard back.
+            precision_key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+            assert_eq!(app.mapping_learn, Some(0));
+            precision_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert_eq!(app.mapping_learn, None);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Mixer), "the desk stays");
+        }
+
+        /// Opening a set must not jump its faders to the knob positions.
+        ///
+        /// A score's faders are where the score says; the knobs are where a hand
+        /// last left them. If the first touch after a set opens is read as a
+        /// position, the fader jumps to the knob.
+        #[test]
+        fn a_knob_takes_over_its_fader_without_jumping() {
+            use crate::pads::CcTurn;
+            use crate::settings::{MappingSource, SliderCc, Takeover};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let turn = |app: &mut App, value: u8| {
+                app.pads.turn_for_test(CcTurn {
+                    controller: 74,
+                    channel: 2,
+                    value,
+                });
+                app.drain_pads();
+            };
+            let setup = |app: &mut App, mode: Takeover| {
+                app.ui_settings.mappings[0] = Some(MappingSource::Knob(SliderCc {
+                    controller: 74,
+                    channel: Some(2),
+                }));
+                app.ui_settings.takeover[0] = mode;
+                app.mapping_knob[0] = None;
+            };
+
+            // Scaled: the score sits at 0.5 and the knob is down at a quarter.
+            let (mut app, scene, call) = slider_app(directory.path());
+            app.audible_scene = Some(scene);
+            setup(&mut app, Takeover::Scaled);
+            assert_value(&app, scene, call, 0.5);
+            turn(&mut app, 32);
+            assert_value(&app, scene, call, 0.5);
+            // Turning up from a quarter: the fader moves by the share of the sweep
+            // covered, and cannot pass the knob's own end.
+            turn(&mut app, 64);
+            let midway = value(&app, scene, call);
+            assert!(
+                midway > 0.5 && midway < 1.0,
+                "it moved toward the knob without arriving: {midway}"
+            );
+            turn(&mut app, 127);
+            assert_value(&app, scene, call, 1.0);
+            // Coming back down it tracks the knob the same way.
+            turn(&mut app, 64);
+            let back = value(&app, scene, call);
+            assert!(back > 0.0 && back < 1.0, "back down toward it: {back}");
+
+            // Jump: the first message is the value, which is the old behaviour and
+            // still what somebody with a matching controller wants.
+            let (mut app, scene, call) = slider_app(directory.path());
+            app.audible_scene = Some(scene);
+            setup(&mut app, Takeover::Jump);
+            turn(&mut app, 32);
+            let jumped = value(&app, scene, call);
+            assert!((jumped - 32.0 / 127.0).abs() < 0.01, "{jumped}");
+
+            // Relative: 64 is still, and each unit either side is one of the
+            // slider's own steps - the endless-encoder mode.
+            let (mut app, scene, call) = slider_app(directory.path());
+            app.audible_scene = Some(scene);
+            setup(&mut app, Takeover::Relative);
+            let before = value(&app, scene, call);
+            turn(&mut app, 64);
+            assert_value(&app, scene, call, before);
+            turn(&mut app, 65);
+            let up = value(&app, scene, call);
+            assert!(up > before, "one notch up: {before} -> {up}");
+            turn(&mut app, 63);
+            assert!(
+                (value(&app, scene, call) - before).abs() < 1e-9,
+                "and one back down returns"
+            );
+            // A knob at rest does not creep, however long it sits there.
+            for _ in 0..32 {
+                turn(&mut app, 64);
+            }
+            assert!((value(&app, scene, call) - before).abs() < 1e-9);
+        }
+
+        /// Opening a set clears the knob position that the scaled takeover
+        /// measures from. If the position carries over, the first turn on the new
+        /// set moves the fader by the distance between the two sets.
+        #[test]
+        fn opening_a_set_forgets_where_the_knob_was() {
+            use crate::pads::CcTurn;
+            use crate::settings::{MappingSource, SliderCc, Takeover};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene, _) = slider_app(directory.path());
+            app.audible_scene = Some(scene);
+            app.ui_settings.mappings[0] = Some(MappingSource::Knob(SliderCc {
+                controller: 74,
+                channel: Some(2),
+            }));
+            app.ui_settings.takeover[0] = Takeover::Scaled;
+            let turn = |app: &mut App, value: u8| {
+                app.pads.turn_for_test(CcTurn {
+                    controller: 74,
+                    channel: 2,
+                    value,
+                });
+                app.drain_pads();
+            };
+
+            // A session's worth of turning leaves the knob near the top.
+            turn(&mut app, 8);
+            turn(&mut app, 120);
+            assert!(
+                app.mapping_knob[0].is_some(),
+                "the knob has said where it is"
+            );
+
+            // Then another set opens, its own fader at the half where its score
+            // puts it.
+            let elsewhere = directory.path().join("elsewhere.strudel");
+            std::fs::write(&elsewhere, SOURCE).expect("the other set's score");
+            let set = SceneSet::open(&elsewhere, "// starter").expect("set");
+            app.switch_set(set, "opened set");
+            let scene = app.scenes.current().id;
+            app.audible_scene = Some(scene);
+            app.live_sliders.insert(
+                scene,
+                LiveSliderSet {
+                    revision: app.editor().revision(),
+                    sliders: rustel_runtime::ui_events::literal_sliders(&app.editor().source()),
+                },
+            );
+            let call = SOURCE.find("slider(").expect("slider call");
+            assert_value(&app, scene, call, 0.5);
+
+            // The hand comes back to the middle of the knob's travel. Measured
+            // against the old position that is most of a turn downward, and the
+            // fader would follow it down; measured against nothing, which is all
+            // this set knows, it stays where the score put it and learns the
+            // position instead.
+            turn(&mut app, 64);
+            assert_value(&app, scene, call, 0.5);
+            // The turn after that is a real move, from where the hand actually is.
+            turn(&mut app, 127);
+            assert_value(&app, scene, call, 1.0);
+        }
+
+        /// Listening to a port with nothing bound to it is no reason to wake the
+        /// loop every few milliseconds; a pad, a knob mapping or a learn is.
+        #[test]
+        fn only_a_bound_or_learning_control_keeps_the_pad_cap_on() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            assert!(!app.pad_press_can_act(), "nothing bound, nothing learning");
+            app.mapping_learn = Some(0);
+            assert!(app.pad_press_can_act(), "a knob is being learnt");
+            app.mapping_learn = None;
+            app.ui_settings.mappings[0] = Some(crate::settings::MappingSource::Knob(
+                crate::settings::SliderCc {
+                    controller: 74,
+                    channel: None,
+                },
+            ));
+            assert!(app.pad_press_can_act(), "a knob drives a slot");
+            app.ui_settings.mappings[0] = None;
+            app.strip_mode = SceneStripMode::Learning;
+            assert!(app.pad_press_can_act(), "a pad is being learnt");
+        }
+    }
+}

@@ -386,3 +386,116 @@ pub(super) fn edits_document(command: &Command) -> bool {
             | Command::Redo
     )
 }
+
+#[cfg(test)]
+mod tests {
+    mod editing {
+        //! Tests for `app/editing.rs`.
+
+        use crate::app::*;
+        use crate::editor::MemoryClipboard;
+
+        /// A rendered control is one block: the caret warps over it instead of
+        /// resting inside, where it used to silently un-render the widget and
+        /// let arrows edit invisible text.
+        #[test]
+        fn the_caret_warps_over_a_control_instead_of_entering_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let scene = app.scenes.current().id;
+            let source = "$: s(\"bd\").velocity(slider(0.5, 0.1, 1))\n";
+            app.editor_mut()
+                .dispatch(
+                    Command::PasteText(source.into()),
+                    HistoryMoment(0),
+                    &mut MemoryClipboard::default(),
+                )
+                .expect("seed the score");
+            let revision = app.scenes.current().editor.revision();
+            app.live_sliders.insert(
+                scene,
+                LiveSliderSet {
+                    revision,
+                    sliders: rustel_runtime::ui_events::literal_sliders(
+                        &app.scenes.current().editor.source(),
+                    ),
+                },
+            );
+            let call = app
+                .scenes
+                .current()
+                .editor
+                .source()
+                .find("slider(")
+                .unwrap();
+            // The pill covers `slider(` alone; the numbers stay text.
+            let end = call + "slider(".len();
+
+            // Stand just before the call and step Right: the caret lands after
+            // the whole block, not one byte into it.
+            app.editor_mut()
+                .set_selection(crate::editor::Selection::caret(ByteOffset(call)))
+                .expect("place caret");
+            app.dispatch_editor(Command::Move {
+                motion: crate::editor::Motion::Right,
+                extend: false,
+            })
+            .expect("move");
+            assert_eq!(
+                app.editor().primary_selection().head.0,
+                end,
+                "Right warps to the far edge"
+            );
+
+            // And Left from there warps straight back.
+            app.dispatch_editor(Command::Move {
+                motion: crate::editor::Motion::Left,
+                extend: false,
+            })
+            .expect("move");
+            assert_eq!(
+                app.editor().primary_selection().head.0,
+                call,
+                "Left warps back to the near edge"
+            );
+
+            // At either edge the control still answers the keyboard nudge.
+            assert!(app.nudge_slider_at_caret(1.0), "nudge from the near edge");
+            app.editor_mut()
+                .set_selection(crate::editor::Selection::caret(ByteOffset(end)))
+                .expect("place caret");
+            assert!(app.nudge_slider_at_caret(-1.0), "nudge from the far edge");
+        }
+
+        /// The footer's caret reading is the editor's own: a move changes the
+        /// column, a newline the line. The gutter can be turned off and the
+        /// column is shown nowhere else, so this is the one place both live.
+        #[test]
+        fn the_caret_reading_follows_the_editor() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let key = |app: &mut App, code: KeyCode| {
+                app.handle_terminal_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+                    .expect("the key is handled");
+            };
+
+            key(&mut app, KeyCode::Home);
+            let (line, column) = app.caret_position().expect("a caret");
+            assert_eq!((line, column), (line, 1), "Home is column 1");
+
+            key(&mut app, KeyCode::Right);
+            assert_eq!(
+                app.caret_position(),
+                Some((line, 2)),
+                "one right is column 2 on the same line"
+            );
+
+            key(&mut app, KeyCode::Enter);
+            assert_eq!(
+                app.caret_position(),
+                Some((line + 1, 1)),
+                "a newline is the next line, column 1"
+            );
+        }
+    }
+}

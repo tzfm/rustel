@@ -482,3 +482,730 @@ impl App {
         self.dirty_frame = true;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    mod focus {
+        //! Tests for `app/focus.rs`.
+
+        use crate::app::focus::*;
+        use crate::app::tests::support::*;
+
+        /// A menu row opens one sheet and the sheet takes the place of any
+        /// other; the set panel is not a sheet and stays through all of it.
+        #[test]
+        fn opening_a_dialog_puts_the_others_away() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            assert!(app.set_panel.is_some());
+            press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+            assert!(app.settings_sheet.is_some(), "^O opens the settings");
+            assert!(app.set_panel.is_some(), "the set panel stays");
+            press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+            assert!(app.theme_picker.is_some());
+            assert!(app.settings_sheet.is_none());
+            app.dispatch_menu_action(crate::menu::MenuAction::OpenSet)
+                .expect("menu");
+            assert!(app.set_prompt.is_some());
+            assert!(app.theme_picker.is_none());
+            app.dispatch_menu_action(crate::menu::MenuAction::Devices)
+                .expect("menu");
+            assert!(app.panel.is_some());
+            assert!(app.set_prompt.is_none(), "the prompt is a sheet and goes");
+            assert!(app.set_panel.is_some(), "the panel is not");
+            press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+            assert!(app.settings_sheet.is_some());
+            assert!(app.panel.is_none());
+        }
+
+        /// Esc from the score puts the front panel away in one press.
+        #[test]
+        fn escape_from_the_score_closes_the_panel_in_one_press() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.toggle_reference_browse();
+            app.focus = Focus::Editor; // stands in for a click on the score
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.reference_panel.is_none());
+            assert_eq!(app.focus, Focus::Editor);
+        }
+
+        /// While the rotation flash is lit, the rotation hands the room of the
+        /// panel it landed on to the chrome. It hands nothing after the flash.
+        #[test]
+        fn the_rotations_landing_hands_its_room_to_the_chrome() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.open_viz_dock(0, false);
+            app.regions.viz[0] = Rect::new(0, 0, 20, 8);
+            assert_eq!(app.focus_rotation_flash_room(), None, "nothing lit yet");
+
+            app.rotate_panel_focus();
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Viz));
+            assert_eq!(
+                app.focus_rotation_flash_room(),
+                Some(Rect::new(0, 0, 20, 8)),
+                "the dock the rotation landed on"
+            );
+
+            // Spent, and the room goes with it.
+            app.focus_rotation_flash = Some((RotationStop::Viz(0), Instant::now()));
+            assert_eq!(app.focus_rotation_flash_room(), None, "the landing is over");
+
+            // A panel with no room on screen has nothing to outline.
+            app.regions.viz[0] = Rect::new(0, 0, 0, 0);
+            app.focus_rotation_flash = Some((
+                RotationStop::Viz(0),
+                Instant::now() + Duration::from_secs(9),
+            ));
+            assert_eq!(app.focus_rotation_flash_room(), None, "no room, no outline");
+        }
+
+        /// Esc from the score closes the front-most sheet. A docked log is not
+        /// a sheet, so Esc leaves it open.
+        #[test]
+        fn esc_from_the_score_leaves_a_docked_log_standing() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.toggle_log_panel();
+            app.focus = Focus::Editor;
+            assert_eq!(
+                app.front_panel(),
+                Some(PanelKind::Log),
+                "a floating log is a sheet, and Esc is for sheets"
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.log_panel.is_none(), "the sheet goes");
+
+            app.toggle_log_sticky();
+            app.focus = Focus::Editor;
+            assert!(app.log_is_docked());
+            assert_eq!(
+                app.front_panel(),
+                None,
+                "furniture is not a sheet, whatever else is on screen"
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.log_panel.is_some(), "the docked log stays put");
+        }
+
+        /// The landing accent is for every stop on the walk, not only the
+        /// visuals docks: the desk and the docked log get outlined too, each
+        /// in the room the layout carved for it. A walk that lit some of its
+        /// stops and not others would be worse than one that lit none.
+        #[test]
+        fn the_landing_accent_covers_the_desk_and_the_docked_log_too() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.regions.mixer = Rect::new(0, 30, 120, 8);
+            app.regions.log = Rect::new(0, 22, 120, 8);
+            app.regions.sidebar = Rect::new(0, 0, 24, 30);
+
+            for (stop, room) in [
+                (RotationStop::Mixer, app.regions.mixer),
+                (RotationStop::Log, app.regions.log),
+                (RotationStop::Set, app.regions.sidebar),
+            ] {
+                app.arm_focus_rotation_flash(stop);
+                assert_eq!(
+                    app.focus_rotation_flash_room(),
+                    Some(room),
+                    "{stop:?} lights the room the layout gave it"
+                );
+            }
+
+            // A panel the layout could not find room for is drawn nowhere, so
+            // there is nothing to outline - and nothing to walk onto either.
+            app.regions.mixer = Rect::default();
+            app.arm_focus_rotation_flash(RotationStop::Mixer);
+            assert_eq!(app.focus_rotation_flash_room(), None, "no room, no accent");
+            app.open_mixer_panel(false);
+            app.focus = Focus::Editor;
+            app.rotate_panel_focus();
+            assert_ne!(
+                app.focus,
+                Focus::Panel(PanelKind::Mixer),
+                "the walk does not stop at a desk with no room on screen"
+            );
+        }
+
+        /// The settings sheet keeps the keyboard until Esc closes it. A panel
+        /// chord pressed under it does not move the focus.
+        #[test]
+        fn the_settings_sheet_keeps_the_keyboard_until_esc() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+            let focused = app.focused;
+            app.toggle_settings_sheet();
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Settings));
+
+            // Every chord that moves the keyboard to another surface.
+            for (code, modifiers) in [
+                (KeyCode::Char('b'), KeyModifiers::CONTROL),
+                (KeyCode::F(4), KeyModifiers::NONE),
+                (KeyCode::F(1), KeyModifiers::SHIFT),
+                (KeyCode::F(2), KeyModifiers::SHIFT),
+                (KeyCode::F(10), KeyModifiers::SHIFT),
+            ] {
+                press(&mut app, code, modifiers);
+                assert_eq!(
+                    app.focus,
+                    Focus::Panel(PanelKind::Settings),
+                    "{code:?} took the keyboard off the sheet"
+                );
+                assert!(app.settings_sheet.is_some(), "and the sheet is still up");
+                assert_eq!(app.focused, focused, "{code:?} hopped to a covered pane");
+            }
+            assert!(matches!(
+                app.focus_rotation_flash,
+                Some((RotationStop::Settings, _))
+            ));
+            assert_eq!(app.status, "keyboard on settings");
+
+            // Esc is the way out, and it hands the keyboard back.
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.settings_sheet.is_none());
+            assert_eq!(app.focus, Focus::Editor);
+        }
+
+        /// ⇧F10 with one visuals dock open: the score, the dock, and back.
+        #[test]
+        fn the_rotation_visits_one_open_dock_and_returns_to_the_score() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.open_viz_dock(0, false);
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 40))
+                .expect("test terminal");
+            terminal
+                .draw(|frame| app.paint_into(frame, Instant::now()).expect("frame paints"))
+                .expect("draw");
+            assert_eq!(app.focus, Focus::Editor);
+
+            app.rotate_panel_focus();
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Viz));
+            assert_eq!(app.viz_focus, 0);
+
+            app.rotate_panel_focus();
+            assert_eq!(app.focus, Focus::Editor);
+
+            app.rotate_panel_focus();
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Viz));
+            assert_eq!(app.viz_focus, 0, "the rotation is a loop, not a one-shot");
+        }
+
+        /// The screen order with everything open: the score, visuals 1,
+        /// visuals 2, the set panel, the reference, and back. Sheets are not
+        /// rotation stops.
+        #[test]
+        fn the_rotation_visits_two_docks_and_the_set_panel_in_screen_order() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.open_viz_dock(0, false);
+            app.open_viz_dock(1, false);
+            app.open_set_panel(false);
+            app.toggle_reference_browse();
+            app.focus = Focus::Editor;
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(300, 40))
+                .expect("test terminal");
+            terminal
+                .draw(|frame| app.paint_into(frame, Instant::now()).expect("frame paints"))
+                .expect("draw");
+            assert_eq!(app.focus, Focus::Editor);
+
+            app.rotate_panel_focus();
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Viz));
+            assert_eq!(app.viz_focus, 0, "visuals 1 before visuals 2");
+
+            app.rotate_panel_focus();
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Viz));
+            assert_eq!(app.viz_focus, 1);
+
+            app.rotate_panel_focus();
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Set));
+
+            app.rotate_panel_focus();
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Reference));
+
+            app.rotate_panel_focus();
+            assert_eq!(app.focus, Focus::Editor, "the loop closes on the score");
+        }
+
+        #[test]
+        fn the_rotation_stays_on_an_open_settings_sheet() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.settings_sheet = Some(SettingsSheet::default());
+            app.focus = Focus::Editor;
+
+            app.rotate_panel_focus();
+
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Settings));
+            assert_eq!(app.status, "keyboard on settings");
+            assert!(matches!(
+                app.focus_rotation_flash,
+                Some((RotationStop::Settings, _))
+            ));
+            assert_eq!(
+                app.focus_rotation_flash_room(),
+                crate::settings::SettingsSheetView::geometry(app.settings_sheet_frame())
+                    .map(|(sheet, _)| sheet),
+                "Settings gets the same landing outline as the other stops"
+            );
+        }
+
+        /// The rotation only ever moves the keyboard: nothing it walks past is
+        /// opened or closed along the way.
+        #[test]
+        fn the_rotation_never_opens_or_closes_a_panel() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.open_viz_dock(0, false);
+            app.open_viz_dock(1, false);
+            app.open_set_panel(false);
+            let open_before = (
+                app.viz_docks[0].is_some(),
+                app.viz_docks[1].is_some(),
+                app.set_panel.is_some(),
+            );
+            for _ in 0..8 {
+                app.rotate_panel_focus();
+            }
+            let open_after = (
+                app.viz_docks[0].is_some(),
+                app.viz_docks[1].is_some(),
+                app.set_panel.is_some(),
+            );
+            assert_eq!(
+                open_before, open_after,
+                "walking the rotation must not open or close anything"
+            );
+        }
+
+        /// With nothing open there is nowhere to walk to, and the rotation
+        /// says so rather than doing nothing in silence.
+        #[test]
+        fn the_rotation_says_so_when_nothing_is_open_to_walk_onto() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            assert_eq!(app.focus, Focus::Editor);
+
+            app.rotate_panel_focus();
+            assert_eq!(
+                app.focus,
+                Focus::Editor,
+                "the score is the only stop there is"
+            );
+            assert!(app.status.contains("nothing open"), "{}", app.status);
+        }
+
+        /// The landing accent is the rotation's alone: `focus_panel` on its
+        /// own - the way a chord or a click reaches a panel - must never light
+        /// it, or every ordinary focus change would flash too.
+        #[test]
+        fn the_rotations_flash_lights_only_from_the_chord_not_from_focus_panel() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.open_viz_dock(0, false);
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 40))
+                .expect("test terminal");
+            terminal
+                .draw(|frame| app.paint_into(frame, Instant::now()).expect("frame paints"))
+                .expect("draw");
+
+            app.focus_panel(PanelKind::Viz);
+            assert!(
+                app.focus_rotation_flash.is_none(),
+                "focus_panel alone must not arm the flash"
+            );
+
+            app.focus = Focus::Editor;
+            app.rotate_panel_focus();
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Viz));
+            assert!(
+                matches!(app.focus_rotation_flash, Some((RotationStop::Viz(0), _))),
+                "the rotation must light the panel it landed on"
+            );
+        }
+
+        /// The rotation's flash is lit up to its deadline, gone from it on, and
+        /// asks for one more repaint the instant it goes out so it cannot stick.
+        #[test]
+        fn the_rotations_flash_decays_and_asks_for_one_more_repaint() {
+            let started = Instant::now();
+            let mut flash = Some((RotationStop::Set, started + FOCUS_ROTATION_FLASH_DURATION));
+            assert_eq!(
+                advance_focus_rotation_flash(&mut flash, started),
+                (true, false)
+            );
+            assert_eq!(
+                advance_focus_rotation_flash(
+                    &mut flash,
+                    started + FOCUS_ROTATION_FLASH_DURATION - Duration::from_millis(1)
+                ),
+                (true, false)
+            );
+            assert_eq!(
+                advance_focus_rotation_flash(&mut flash, started + FOCUS_ROTATION_FLASH_DURATION),
+                (false, true),
+                "the deadline itself is when it goes out"
+            );
+            assert!(flash.is_none());
+            assert_eq!(
+                advance_focus_rotation_flash(&mut flash, started + FOCUS_ROTATION_FLASH_DURATION),
+                (false, false),
+                "once out it stays out"
+            );
+        }
+
+        /// The reference and the sheets stack by when they were raised: opened
+        /// after the settings, the reference is on top - Esc puts it away
+        /// first and the pointer over their overlap is the reference's; a
+        /// press on the settings raises the sheet back over it.
+        #[test]
+        fn the_surface_raised_last_is_on_top() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 140, 40);
+            press(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+            assert!(app.settings_sheet.is_some());
+            assert_eq!(app.front_panel(), Some(PanelKind::Settings));
+            app.toggle_reference_browse();
+            assert!(app.reference_panel.is_some() && app.settings_sheet.is_some());
+            assert!(app.reference_on_top(), "raised after the settings");
+            assert_eq!(app.front_panel(), Some(PanelKind::Reference));
+            app.regions = view::regions(app.frame, false, 1, true, true, None, None);
+            let (sheet, _) = crate::app::settings::SettingsSheetView::geometry(app.frame)
+                .expect("room for the sheet");
+            let overlap = (
+                app.regions.reference.x + 2,
+                sheet.y.max(app.regions.reference.y) + 1,
+            );
+            assert!(
+                within(app.regions.reference, overlap.0, overlap.1)
+                    && within(sheet, overlap.0, overlap.1),
+                "the two share cells"
+            );
+            assert_eq!(
+                app.pointer_shape_at(overlap.0, overlap.1),
+                app.reference_pointer_shape(overlap.0, overlap.1).unwrap(),
+                "the pointer answers for the reference"
+            );
+            // A press on the sheet where they do not overlap raises the sheet.
+            app.focus_panel(PanelKind::Settings);
+            assert!(!app.reference_on_top());
+            assert_eq!(app.front_panel(), Some(PanelKind::Settings));
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.settings_sheet.is_none(), "Esc took the sheet on top");
+            assert!(app.reference_panel.is_some());
+        }
+    }
+
+    mod theme_stacking {
+        //! Floating sheets must not rearrange the docked surfaces beneath them.
+
+        use crate::app::tests::support::*;
+        use crate::app::*;
+        use crate::viz_panel::Edge;
+        use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
+
+        fn paint(app: &mut App, terminal: &mut Terminal<TestBackend>) -> Buffer {
+            terminal
+                .draw(|frame| app.paint_into(frame, Instant::now()).unwrap())
+                .unwrap();
+            terminal.backend().buffer().clone()
+        }
+
+        fn theme_shortcut(app: &mut App) {
+            app.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('t'),
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
+        }
+
+        fn set_bands(app: &mut App, edges: [Edge; 2]) {
+            app.theme = Theme::built_in_default();
+            app.ui_settings.animation = false;
+            app.ui_settings.zen = false;
+            app.ui_settings.viz_edges = edges;
+            app.ui_settings.apply();
+            app.mixer_panel = None;
+            app.log_panel = None;
+            for (index, edge) in edges.into_iter().enumerate() {
+                app.prefs.visuals[index].edge = edge;
+                app.prefs.visuals[index].extent = Some(9);
+                app.prefs.visuals[index].widgets.clear();
+                app.viz_docks[index] = Some(VizPanel {
+                    edge,
+                    ..VizPanel::default()
+                });
+            }
+            app.toggle_reference_browse();
+        }
+
+        #[test]
+        fn theme_picker_keeps_both_visual_bands_behind_the_reference() {
+            for edges in [
+                [Edge::Top, Edge::Top],
+                [Edge::Bottom, Edge::Bottom],
+                [Edge::Top, Edge::Bottom],
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut app = app_over(directory.path());
+                set_bands(&mut app, edges);
+                let mut terminal = Terminal::new(TestBackend::new(140, 48)).unwrap();
+                let before = paint(&mut app, &mut terminal);
+                let layout = app.regions;
+                // Losing focus legitimately changes the shortcut footer. Compare
+                // the actual list, using the same geometry as rendering/hit tests,
+                // so the regression concerns covered content rather than hints.
+                let content = app
+                    .reference_panel
+                    .as_ref()
+                    .unwrap()
+                    .geometry(crate::reference::inner_area(layout.reference))
+                    .list;
+                assert!(app.reference_on_top());
+
+                theme_shortcut(&mut app);
+                assert!(app.theme_picker.is_some());
+                assert!(!app.reference_on_top(), "the picker is the raised sheet");
+                let opened = paint(&mut app, &mut terminal);
+                assert_eq!(
+                    app.regions, layout,
+                    "opening a sheet changes no dock geometry"
+                );
+                let (picker, _) = app
+                    .theme_picker
+                    .as_ref()
+                    .unwrap()
+                    .geometry(app.frame)
+                    .unwrap();
+
+                for band in layout.viz {
+                    let shared = band.intersection(content);
+                    assert!(
+                        !shared.is_empty(),
+                        "a full-width band passes behind reference"
+                    );
+                    let mut visible_cells = 0;
+                    let mut visible_text = 0;
+                    for y in shared.y..shared.bottom() {
+                        for x in shared.x..shared.right() {
+                            if picker.contains((x, y).into()) {
+                                continue;
+                            }
+                            let original = before.cell((x, y)).unwrap().symbol();
+                            visible_cells += 1;
+                            visible_text += usize::from(!original.trim().is_empty());
+                            assert_eq!(
+                                opened.cell((x, y)).unwrap().symbol(),
+                                original,
+                                "{edges:?}: opening themes repainted reference cell ({x}, {y}) as a visual band"
+                            );
+                        }
+                    }
+                    assert!(visible_cells > 0 && visible_text > 0);
+                }
+
+                theme_shortcut(&mut app);
+                assert!(app.theme_picker.is_none());
+                let closed = paint(&mut app, &mut terminal);
+                assert_eq!(
+                    app.regions, layout,
+                    "closing the picker preserves geometry too"
+                );
+                for band in layout.viz {
+                    let shared = band.intersection(content);
+                    for y in shared.y..shared.bottom() {
+                        for x in shared.x..shared.right() {
+                            assert_eq!(
+                                closed.cell((x, y)).unwrap().symbol(),
+                                before.cell((x, y)).unwrap().symbol(),
+                                "{edges:?}: closing themes changed reference cell ({x}, {y})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn reference_above_a_visual_band_keeps_mouse_ownership_under_the_theme_picker() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            set_bands(&mut app, [Edge::Top, Edge::Top]);
+            let mut terminal = Terminal::new(TestBackend::new(140, 48)).unwrap();
+            paint(&mut app, &mut terminal);
+            theme_shortcut(&mut app);
+            paint(&mut app, &mut terminal);
+            let (picker, _) = app
+                .theme_picker
+                .as_ref()
+                .unwrap()
+                .geometry(app.frame)
+                .unwrap();
+            let shared = app.regions.reference.intersection(app.regions.viz[0]);
+            let mut target = None;
+            for y in shared.y..shared.bottom() {
+                for x in shared.x..shared.right() {
+                    if !picker.contains((x, y).into())
+                        && app.reference_pointer_shape(x, y) == Some(SHAPE_POINTER)
+                        && app.viz_widget_at(0, x, y).is_none()
+                    {
+                        target = Some((x, y));
+                        break;
+                    }
+                }
+            }
+            let (x, y) = target.expect("an exposed reference row over the first visual band");
+            assert_eq!(app.pointer_shape_at(x, y), SHAPE_POINTER);
+            app.handle_terminal_event(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .unwrap();
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Reference));
+            assert!(
+                app.theme_picker.is_some(),
+                "clicking reference need not close the picker"
+            );
+        }
+
+        #[cfg(feature = "hydra")]
+        #[test]
+        fn theme_picker_does_not_mask_late_shelf_pixels_with_lower_visual_bands() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            set_bands(&mut app, [Edge::Top, Edge::Bottom]);
+            let mut terminal = Terminal::new(TestBackend::new(140, 48)).unwrap();
+            paint(&mut app, &mut terminal);
+            theme_shortcut(&mut app);
+            paint(&mut app, &mut terminal);
+            let (picker, _) = app
+                .theme_picker
+                .as_ref()
+                .unwrap()
+                .geometry(app.frame)
+                .unwrap();
+            let covered = app.shelf_exclusions(false);
+            assert!(
+                covered.contains(&picker),
+                "the actual raised picker still masks its cells"
+            );
+            for band in app.regions.viz {
+                assert!(
+                    !covered.contains(&band),
+                    "a lower dock cannot mask a reference picture"
+                );
+            }
+            let area = app.regions.reference;
+            let image = crate::graphics::PixelImage {
+                area,
+                width: u32::from(area.width),
+                height: u32::from(area.height),
+                rgba: [40, 80, 120, 255].repeat(usize::from(area.width) * usize::from(area.height)),
+                depth: 0,
+                cells: Some((area.width, area.height)),
+            };
+            let masked = stage_pixels::mask_shelf(image, &covered)
+                .expect("reference remains partly visible");
+            for (index, pixel) in masked.rgba.as_chunks::<4>().0.iter().enumerate() {
+                let x = area.x + (index % usize::from(area.width)) as u16;
+                let y = area.y + (index / usize::from(area.width)) as u16;
+                assert_eq!(
+                    pixel[3],
+                    if picker.contains((x, y).into()) {
+                        0
+                    } else {
+                        255
+                    }
+                );
+            }
+        }
+
+        /// A sheet opened over the set panel is on top of it: the pointer
+        /// over the sheet's rows is a hand, and a click there is the sheet's,
+        /// whether the panel is docked or a sheet itself.
+        #[test]
+        fn a_sheet_over_the_set_panel_is_on_top() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 100, 30);
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            // Docked at the right, where the theme picker's sheet also goes.
+            app.regions = view::regions(
+                app.frame,
+                false,
+                1,
+                false,
+                true,
+                Some(app.set_panel_side()),
+                None,
+            );
+            assert!(!app.regions.sidebar.is_empty());
+            press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+            let picker = app.theme_picker.as_ref().expect("the picker is open");
+            let (sheet, rows) = picker.geometry(app.frame).expect("room");
+            assert!(
+                sheet.right() > app.regions.sidebar.x,
+                "the sheet lies over the panel's column"
+            );
+            let point = (rows.x + 2, rows.y + 1);
+            assert_eq!(app.pointer_shape_at(point.0, point.1), SHAPE_POINTER);
+            let before = app.theme_picker.as_ref().map(|picker| picker.selected);
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: point.0,
+                row: point.1,
+                modifiers: KeyModifiers::NONE,
+            })
+            .expect("click");
+            assert_eq!(
+                app.focus,
+                Focus::Panel(PanelKind::Theme),
+                "the sheet took the press"
+            );
+            assert_ne!(
+                app.theme_picker.as_ref().map(|picker| picker.selected),
+                before,
+                "and chose its row"
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.theme_picker.is_none());
+            assert!(app.set_panel.is_some(), "the panel was under it all along");
+            // The sheet form of the panel is under a sheet too.
+            app.frame = Rect::new(0, 0, 60, 24);
+            app.regions = view::regions(
+                app.frame,
+                false,
+                1,
+                false,
+                true,
+                Some(app.set_panel_side()),
+                None,
+            );
+            assert!(app.regions.sidebar.is_empty());
+            press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+            let (_, rows) = app
+                .theme_picker
+                .as_ref()
+                .and_then(|picker| picker.geometry(app.frame))
+                .expect("room");
+            assert_eq!(app.pointer_shape_at(rows.x + 2, rows.y), SHAPE_POINTER);
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rows.x + 2,
+                row: rows.y,
+                modifiers: KeyModifiers::NONE,
+            })
+            .expect("click");
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Theme));
+        }
+    }
+}
