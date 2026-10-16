@@ -33,6 +33,7 @@ pub mod meter;
 pub mod mmcss;
 mod output_options;
 mod periodic_wave;
+pub mod power_mode;
 pub mod pressure;
 #[cfg(feature = "device-audio")]
 mod realtime;

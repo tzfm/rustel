@@ -168,6 +168,7 @@ impl App {
 
     pub(super) fn settle_stopped_transport(&mut self) {
         self.audio_advisory.reset();
+        self.power_advisory.reset();
         self.worker.discard_visual_updates();
         self.visual.stop();
         self.pending_slider = None;

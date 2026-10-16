@@ -778,10 +778,12 @@ impl App {
                 self.dirty_frame = true;
             }
             StudioControlEvent::Snapshot(snapshot) => {
+                let now = Instant::now();
                 self.dirty_frame |= if self.stop_requested {
-                    self.audio_advisory.reset()
+                    self.audio_advisory.reset() | self.power_advisory.reset()
                 } else {
-                    self.audio_advisory.observe(&snapshot, Instant::now())
+                    self.audio_advisory.observe(&snapshot, now)
+                        | self.power_advisory.observe(&snapshot, now)
                 };
                 // A score can finish draining while the keyboard keeps the
                 // device open. There is no device-stop acknowledgement in
@@ -837,6 +839,7 @@ impl App {
             StudioControlEvent::EngineFailure(failure) => {
                 if failure.playback_stopped {
                     self.audio_advisory.reset();
+                    self.power_advisory.reset();
                     self.worker.discard_visual_updates();
                     self.visual.stop();
                     self.snapshot = None;
@@ -1012,6 +1015,7 @@ impl App {
             self.prebake_inflight = None;
             self.snapshot = None;
             self.audio_advisory.reset();
+            self.power_advisory.reset();
             self.visual.stop();
             self.set_error(
                 ErrorOwner::Engine,
