@@ -4,9 +4,9 @@
 //! takes about as long as a load. The host keeps the answer for each bundle
 //! in one file: a bundle with the same files as at its test is not tested
 //! again, and its plugins have their names before the first load. The
-//! answer is the plugins of a bundle that loads, or the fault of a bundle
-//! that does not, so the next start tests no unchanged bundle a second
-//! time.
+//! answer is the plugins of a bundle, with the fault of each plugin that
+//! does not load, or the fault of a bundle with no plugin that loads. So
+//! the next start tests no unchanged bundle a second time.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -29,6 +29,10 @@ pub(crate) struct Scanned {
     pub vendor: String,
     /// For example "Fx|Reverb" or "Instrument|Synth".
     pub categories: String,
+    /// The reason the plugin did not load at its test, while other plugins
+    /// of its bundle did. A file of an older version has no such field.
+    #[serde(default)]
+    pub fault: Option<String>,
 }
 
 /// The files of a bundle at one time: the count, and a mark from the path,
@@ -214,11 +218,20 @@ mod tests {
         std::fs::create_dir_all(bundle.join("Contents")).unwrap();
         std::fs::write(bundle.join("Contents/plugin.so"), [0u8; 16]).unwrap();
         let first = stamp(&bundle);
-        let plugins = vec![Scanned {
-            name: "One \"Deluxe\"".into(),
-            vendor: "Maker".into(),
-            categories: "Fx|Delay".into(),
-        }];
+        let plugins = vec![
+            Scanned {
+                name: "One \"Deluxe\"".into(),
+                vendor: "Maker".into(),
+                categories: "Fx|Delay".into(),
+                fault: None,
+            },
+            Scanned {
+                name: "One Synth".into(),
+                vendor: "Maker".into(),
+                categories: "Instrument|Synth".into(),
+                fault: Some("the plugin processor did not start".into()),
+            },
+        ];
 
         let file = root.join("vst").join(FILE_NAME);
         let mut cache = Cache::read(&file);
@@ -263,6 +276,7 @@ mod tests {
             name: "Bad".into(),
             vendor: "Maker".into(),
             categories: "Fx".into(),
+            fault: None,
         }];
         assert!(cache.store(&bundle, first, &plugins));
         assert_eq!(cache.plugins(&bundle, first), Some(plugins.as_slice()));

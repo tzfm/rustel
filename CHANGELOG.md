@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- A VST3 bundle with several plugins keeps the plugins that start when one of them does not. The whole bundle failed, and all of its plugins stayed off until a rescan.
+
 ## v0.1.3
 
 - Scores use `.vst()` for VST3 effects and `.vsti()` for VST3 instruments, with parameters and presets. Plugin support is experimental. `rustel vst` lists your plugins. Studio lists the plugins in the reference panel and completes plugin names, parameters and presets. See [Plugins](https://github.com/tzfm/rustel/blob/main/docs/plugins.md).

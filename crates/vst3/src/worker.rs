@@ -74,7 +74,10 @@ pub fn serve(bundle: &Path) -> i32 {
     });
     let loaded = load_bundle(bundle);
     let answer: Answer = match &loaded {
-        Ok(plugins) => Ok(plugins.iter().map(Plugin::scanned).collect()),
+        Ok((plugins, failed)) => {
+            let loads = plugins.iter().map(Plugin::scanned);
+            Ok(loads.chain(failed.iter().cloned()).collect())
+        }
         Err(reason) => Err(reason.clone()),
     };
     // The host takes an answer only with its end of line.
@@ -212,6 +215,7 @@ mod tests {
             name: "Tone".into(),
             vendor: "rustel".into(),
             categories: "Instrument|Synth".into(),
+            fault: None,
         }]);
         let mut line = serde_json::to_vec(&answer).expect("answer text");
         std::fs::write(&file.0, &line).expect("part of the answer");

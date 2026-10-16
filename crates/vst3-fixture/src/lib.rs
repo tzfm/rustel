@@ -580,6 +580,9 @@ impl Class for Tone {
 
 impl IPluginBaseTrait for Tone {
     unsafe fn initialize(&self, _context: *mut FUnknown) -> tresult {
+        if std::env::var_os(BROKEN_TONE_ENV).is_some() {
+            return kResultFalse;
+        }
         kResultOk
     }
 
@@ -887,6 +890,10 @@ pub const SLOW_ENV: &str = "RUSTEL_VST3_FIXTURE_SLOW";
 /// load and in each audio block of the effect, as a plugin with debug text
 /// does.
 pub const PRINT_ENV: &str = "RUSTEL_VST3_FIXTURE_PRINT";
+
+/// With this variable set, the instrument does not start, as a plugin with
+/// no licence sometimes does. The effect of the bundle still loads.
+pub const BROKEN_TONE_ENV: &str = "RUSTEL_VST3_FIXTURE_BROKEN_TONE";
 
 /// One line through the standard library and one through the C runtime. On
 /// Windows the two have a path of their own to the standard output.

@@ -77,11 +77,7 @@ impl Plugin {
             .iter()
             .map(|param| (param.key.clone(), param.id))
             .collect();
-        let class = Scanned {
-            name: info.name.clone(),
-            vendor: info.vendor.clone(),
-            categories: info.categories.clone(),
-        };
+        let class = scanned(&info, None);
         Self {
             module,
             info,
@@ -397,6 +393,13 @@ impl State {
             entry.key = key;
             entry.vendor = plugin.vendor.clone();
             entry.categories = plugin.categories.clone();
+            // A plugin that did not load stays off, as a bundle does, until
+            // its files change or a rescan.
+            if let Some(fault) = &plugin.fault
+                && matches!(entry.stage, Stage::Found | Stage::Loading)
+            {
+                entry.stage = Stage::Failed(fault.clone());
+            }
         }
     }
 
@@ -999,15 +1002,15 @@ impl Host {
         let start = Instant::now();
         let stamp = cache::stamp(&bundle);
         let loaded = contained("load", || load_bundle(&bundle));
-        let loaded = loaded.map(|mut plugins: Vec<Plugin>| {
+        let loaded = loaded.map(|(mut plugins, failed): (Vec<Plugin>, Vec<Scanned>)| {
             for plugin in &mut plugins {
                 plugin.load_time = start.elapsed();
             }
-            plugins
+            (plugins, failed)
         });
         let mut state = self.state();
         match loaded {
-            Ok(plugins) => {
+            Ok((plugins, failed)) => {
                 // A score asks for a preset right after the load, so the
                 // preset folders are read here, on the plugin thread.
                 let root = state.preset_root.clone();
@@ -1027,7 +1030,8 @@ impl Host {
                 }
                 // A plugin keeps its row, and so its number, over an unload
                 // and a new load.
-                let scanned: Vec<Scanned> = plugins.iter().map(Plugin::scanned).collect();
+                let loads = plugins.iter().map(Plugin::scanned);
+                let scanned: Vec<Scanned> = loads.chain(failed).collect();
                 state.name_rows(&bundle, &scanned);
                 // A row that is loaded keeps its plugin: the copies in the
                 // audio engine are copies of that plugin. A plugin with no
@@ -1655,21 +1659,39 @@ fn contained<T>(work: &str, run: impl FnOnce() -> Result<T, String>) -> Result<T
     std::panic::catch_unwind(run).unwrap_or_else(|_| Err(format!("the {work} panicked")))
 }
 
+/// A class as the scan cache keeps it, with the fault of a class that did
+/// not load.
+fn scanned(class: &ClassInfo, fault: Option<String>) -> Scanned {
+    Scanned {
+        name: class.name.clone(),
+        vendor: class.vendor.clone(),
+        categories: class.categories.clone(),
+        fault,
+    }
+}
+
 /// Loads a bundle in this process and reads the parameters of each plugin
-/// in the bundle. Runs on the plugin thread.
-pub(crate) fn load_bundle(bundle: &Path) -> Result<Vec<Plugin>, String> {
+/// in the bundle. Runs on the plugin thread. Answers the plugins that load
+/// and each class that does not, with its fault. A bundle with no class
+/// that loads fails with the fault of its first class.
+pub(crate) fn load_bundle(bundle: &Path) -> Result<(Vec<Plugin>, Vec<Scanned>), String> {
     let module = Arc::new(Module::load(bundle)?);
     let classes = module.classes();
     if classes.is_empty() {
         return Err("the bundle has no audio plugin".into());
     }
-    classes
-        .into_iter()
-        .map(|class| {
-            let params = Loaded::new(Arc::clone(&module), &class)?.params();
-            Ok(Plugin::new(Arc::clone(&module), class, params))
-        })
-        .collect()
+    let mut plugins = Vec::new();
+    let mut failed = Vec::new();
+    for class in classes {
+        match Loaded::new(Arc::clone(&module), &class).map(|loaded| loaded.params()) {
+            Ok(params) => plugins.push(Plugin::new(Arc::clone(&module), class, params)),
+            Err(fault) => failed.push(scanned(&class, Some(fault))),
+        }
+    }
+    match failed.first() {
+        Some(first) if plugins.is_empty() => Err(first.fault.clone().unwrap_or_default()),
+        _ => Ok((plugins, failed)),
+    }
 }
 
 /// Makes one running plugin. `preset` is the content of a preset file. Runs
@@ -1710,5 +1732,32 @@ mod tests {
         assert!(host.shared.state.is_poisoned() && host.shared.gate.is_poisoned());
         assert!(host.plugins().is_empty());
         assert!(host.wait_idle_within(WAIT_LIMIT, || false));
+    }
+
+    /// A class that does not start leaves the other class of its bundle
+    /// loaded, in a load in this process too.
+    #[test]
+    fn a_class_that_fails_its_load_leaves_the_others_of_its_bundle() {
+        let root = std::env::temp_dir().join(format!("rustel-vst3-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("plugin folder");
+        rustel_vst3_fixture::install(&root);
+        // SAFETY: no other test of this binary loads the fixture, and the
+        // host threads start after the variable.
+        unsafe { std::env::set_var(rustel_vst3_fixture::BROKEN_TONE_ENV, "1") };
+        let host = Host::new();
+        host.scan(std::slice::from_ref(&root));
+        host.wait_idle();
+        let effect = host.resolve(rustel_vst3_fixture::NAME, true);
+        let tone = host.resolve(rustel_vst3_fixture::TONE_NAME, true);
+        // SAFETY: the loads are over.
+        unsafe { std::env::remove_var(rustel_vst3_fixture::BROKEN_TONE_ENV) };
+        assert!(matches!(effect, Resolved::Ready(..)));
+        assert!(matches!(
+            &tone,
+            Resolved::Failed(reason) if reason == "the plugin processor did not start"
+        ));
+        drop(host);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
