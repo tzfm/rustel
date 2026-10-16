@@ -200,6 +200,7 @@ impl Loaded {
             | ParameterInfo_::ParameterFlags_::kIsHidden;
         let groups = self.groups();
         let mut params: Vec<ParamInfo> = Vec::new();
+        let mut keys = std::collections::HashSet::new();
         for index in 0..unsafe { controller.getParameterCount() } {
             let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
             if unsafe { controller.getParameterInfo(index, &mut info) } != kResultOk
@@ -212,9 +213,10 @@ impl Loaded {
             // empty or already used gives way to the parameter number, and
             // so does `preset`: a score writes that word for a preset file.
             let mut key = canonical(&name);
-            if key.is_empty() || key == "preset" || params.iter().any(|param| param.key == key) {
+            if key.is_empty() || key == "preset" || keys.contains(&key) {
                 key = info.id.to_string();
             }
+            keys.insert(key.clone());
             let mut text: String128 = [0; 128];
             // A plugin sometimes gives a start value that is no number. Such
             // a value has no form in a score.

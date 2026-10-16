@@ -398,7 +398,12 @@ impl AudioBackend for ScalarBackend {
                     }
                     return false;
                 }
-                if !kabel_available(&self.kabel_pool, &self.kabel_programs, &e.controls) {
+                if !kabel_available(
+                    &self.kabel_pool,
+                    &self.kabel_programs,
+                    &e.controls,
+                    f64::from(self.sample_rate),
+                ) {
                     // Asset installs and onsets use independent SPSC queues. A
                     // producer may publish this onset after this block's asset
                     // snapshot. Keep it pending until the next install pass.
@@ -1028,7 +1033,7 @@ impl AudioBackend for ScalarBackend {
                     .saturating_add(u64::try_from(faded).unwrap_or(u64::MAX));
                 // Lease before the Voice literal so the FX-stage block can
                 // borrow the same pool without overlapping the main-chain pop.
-                let kabel = e.controls.kabel.map(|controls| lease_kabel(&mut self.kabel_pool, &self.kabel_programs, controls));
+                let kabel = e.controls.kabel.map(|controls| lease_kabel(&mut self.kabel_pool, &self.kabel_programs, controls, f64::from(self.sample_rate)));
                 let stretch = e.controls.stretch.and_then(|_| self.stretch_pool.pop());
                 let fx_stage_state = if voice_controls.fx_stages.iter().all(Option::is_none) {
                     None
@@ -1058,7 +1063,7 @@ impl AudioBackend for ScalarBackend {
                                 source_is_mono = false;
                             }
                             FxStageState {
-                            kabel: stage.kabel.map(|controls| lease_kabel(&mut self.kabel_pool, &self.kabel_programs, controls)),
+                            kabel: stage.kabel.map(|controls| lease_kabel(&mut self.kabel_pool, &self.kabel_programs, controls, f64::from(self.sample_rate))),
                             controls: stage,
                             filters: {
                                 let mut chain = FilterChain::new(stage.filters, sample_rate);

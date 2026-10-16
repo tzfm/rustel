@@ -137,6 +137,26 @@ fn overlapping_graphs_have_independent_state_and_mix() {
 }
 
 #[test]
+fn pooled_graphs_follow_a_new_sample_rate() {
+    let sine = Program::from_json(
+        r#"{"nodes":[{"type":"n","value":441},{"type":"sine","inputs":[0]},{"type":"n","value":0},{"type":"n","value":1},{"type":"output","inputs":[1,2]},{"type":"output","inputs":[1,3]}]}"#,
+    )
+    .unwrap();
+    let rising = |pcm: &[f32]| {
+        let frames = pcm.as_chunks::<2>().0;
+        frames
+            .windows(2)
+            .filter(|pair| pair[0][0] < 0.0 && pair[1][0] >= 0.0)
+            .count()
+    };
+    let mut backend = ScalarBackend::new();
+    render_pcm(&mut backend, 48_000, 24_000, &[event(sine, 0, 24_000, 1.0)]).unwrap();
+    let pcm = render_pcm(&mut backend, 44_100, 22_050, &[event(sine, 0, 24_000, 1.0)]).unwrap();
+    // 441 Hz rises through zero 220 times in half a second.
+    assert_eq!(rising(&pcm), 220);
+}
+
+#[test]
 fn offline_render_reports_processor_capacity_instead_of_silent_notes() {
     let constant = stereo(r#"{"type":"n","value":1}"#);
     let events = vec![event(constant, 0, 256, 1.0); rustel_audio::MAX_KABEL_GRAPHS + 1];

@@ -43,8 +43,8 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const MEASURE_RETRIES: u32 = 5;
 /// Samples enough for a session clock to be decided on.
 const MEASURE_SAMPLES: usize = 24;
-/// A foreign session measured and not joined waits this long before it
-/// is measured again.
+/// How long a measured session waits before it is measured again: a
+/// foreign session not joined, and the founder of the session stood in.
 const REMEASURE_AFTER: Duration = Duration::from_secs(30);
 /// How long a target that never answered waits before it is asked
 /// again. Loss is common and cheap to retry, unlike a decline.
@@ -108,7 +108,7 @@ impl Link {
         });
         let (commands, inbox) = channel();
         let node_id = random_id();
-        let session = core::Session::found(node_id, bpm, cycle, host_micros(Instant::now()));
+        let session = found_session(node_id, bpm, cycle);
         let shared = Arc::new(Mutex::new(Shared {
             peers: 0,
             timeline: session.timeline,
@@ -223,6 +223,8 @@ struct Actor {
     peers: HashMap<[u8; 8], Peer>,
     /// A foreign session measured lately and not joined.
     measured_elsewhere: HashMap<[u8; 8], Instant>,
+    /// When the founder of the session stood in was last measured.
+    ours_measured: Option<Instant>,
     /// A session whose target stayed quiet, and when it may be asked
     /// again. Silence is lost packets or a busy wire, not a decision,
     /// so it comes due far sooner than a session declined.
@@ -265,6 +267,7 @@ impl Actor {
             session,
             peers: HashMap::new(),
             measured_elsewhere: HashMap::new(),
+            ours_measured: None,
             silent_until: HashMap::new(),
             measure: None,
             next_alive: Instant::now(),
@@ -488,9 +491,7 @@ impl Actor {
             // The session this machine stands in, measured against its
             // founder: the offset tracks the founder's clock.
             self.session.host_offset = offset;
-            if let Some(measure) = self.measure.as_mut() {
-                measure.samples.clear();
-            }
+            self.ours_measured = Some(at);
         } else {
             let their_session = core::Session {
                 id: target_session,
@@ -514,12 +515,13 @@ impl Actor {
             );
             if join {
                 self.session.join(&their_session);
+                self.ours_measured = Some(at);
                 self.announce_now = true;
             } else {
                 self.measured_elsewhere.insert(target_session, at);
             }
-            self.measure = None;
         }
+        self.measure = None;
         self.publish();
     }
 
@@ -537,9 +539,10 @@ impl Actor {
     }
 
     /// Keep one peer measured at a time: the founder of the session stood
-    /// in, else the founder of a session not measured lately. A ping the
-    /// target never answered is sent again, and a target that stays quiet
-    /// is given up on until its session comes due again.
+    /// in, else the founder of another session, each when not measured
+    /// lately. A ping the target never answered is sent again, and a
+    /// target that stays quiet is given up on until its session comes due
+    /// again.
     fn maintain_measurement(&mut self, now: Instant) {
         self.maintain_target(now);
         let Some(measure) = self.measure.as_ref() else {
@@ -587,8 +590,14 @@ impl Actor {
                 continue;
             }
             if peer.session_id == self.session.id {
-                ours = Some((*id, peer.session_id, peer.measure_endpoint()));
-                break;
+                let measured_lately = self.ours_measured.is_some_and(|measured| {
+                    now.saturating_duration_since(measured) < REMEASURE_AFTER
+                });
+                if !measured_lately {
+                    ours = Some((*id, peer.session_id, peer.measure_endpoint()));
+                    break;
+                }
+                continue;
             }
             let declined_lately = self
                 .measured_elsewhere
@@ -688,6 +697,14 @@ fn host_micros(at: Instant) -> i64 {
     });
     let micros = wall + at.saturating_duration_since(*start).as_micros();
     micros.min(i64::MAX as u128) as i64
+}
+
+/// A session founded here. As in Link, its ghost time starts at 0 now,
+/// so a session founded earlier elsewhere is ahead, and this one joins it.
+fn found_session(id: [u8; 8], bpm: f64, cycle: f64) -> core::Session {
+    let mut session = core::Session::found(id, bpm, cycle, 0);
+    session.host_offset = -host_micros(Instant::now());
+    session
 }
 
 /// An id no other participant on this network is likely to hold.
@@ -1008,5 +1025,82 @@ mod tests {
             second.unwrap_err()
         );
         drop(first);
+    }
+
+    /// An actor on loopback sockets, standing in a session of its own.
+    fn actor() -> Actor {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("socket");
+        let measure_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("measure socket");
+        let (_, inbox) = channel();
+        let node_id = random_id();
+        let session = found_session(node_id, 120.0, 0.0);
+        let shared = Arc::new(Mutex::new(Shared {
+            peers: 0,
+            timeline: session.timeline,
+            playing: false,
+            host_offset: session.host_offset,
+        }));
+        Actor::new(
+            socket,
+            measure_socket,
+            inbox,
+            shared,
+            node_id,
+            None,
+            session,
+        )
+    }
+
+    #[test]
+    fn a_session_founded_here_joins_an_older_one() {
+        let ours = found_session(random_id(), 120.0, 0.0);
+        // A session founded a minute ago is a minute into its ghost time.
+        let theirs = 60_000_000 - host_micros(Instant::now());
+        assert!(core::should_join(
+            ours.id,
+            ours.host_offset,
+            random_id(),
+            theirs
+        ));
+    }
+
+    #[test]
+    fn the_founder_of_our_session_is_measured_again_only_after_a_rest() {
+        let mut actor = actor();
+        let founder = random_id();
+        actor.session.id = founder;
+        actor.peers.insert(
+            founder,
+            Peer {
+                addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9).into(),
+                session_id: founder,
+                timeline: None,
+                start_stop: None,
+                measure_v4: None,
+                last_seen: Instant::now(),
+            },
+        );
+        let now = Instant::now();
+        actor.maintain_target(now);
+        let endpoint = actor
+            .measure
+            .as_ref()
+            .expect("the founder is measured")
+            .endpoint;
+        for _ in 0..MEASURE_SAMPLES {
+            let pong = wire::StateMessage {
+                pong: true,
+                session_id: Some(founder),
+                ghost_time: Some(1_000_000),
+                host_time: Some(host_micros(now)),
+                prev_ghost_time: None,
+            };
+            actor.hear_pong(pong, endpoint, now);
+        }
+        assert!(actor.measure.is_none(), "the decision ends the measurement");
+        actor.maintain_target(now + Duration::from_secs(1));
+        assert!(actor.measure.is_none(), "no ping before the rest ends");
+        actor.maintain_target(now + REMEASURE_AFTER);
+        assert!(actor.measure.is_some(), "the founder is measured again");
     }
 }

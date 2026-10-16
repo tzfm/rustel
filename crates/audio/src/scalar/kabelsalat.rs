@@ -37,18 +37,30 @@ impl KabelState {
     }
 }
 
+/// Whether a pooled graph can run `program` at `sample_rate`. A graph keeps
+/// the rate it was built for, so a graph from before a rate change is not
+/// reused.
+fn kabel_fits(
+    graph: &rustel_kabel::Graph,
+    program: &rustel_kabel::Program,
+    sample_rate: f64,
+) -> bool {
+    graph.can_reuse(program) && graph.sample_rate() == sample_rate
+}
+
 #[allow(clippy::vec_box)]
 pub(super) fn lease_kabel(
     pool: &mut Vec<Box<rustel_kabel::Graph>>,
     programs: &[Box<crate::assets::PreparedKabelProgram>],
     controls: CompactKabelControls,
+    sample_rate: f64,
 ) -> KabelState {
     let program =
         find_kabel_program(programs, controls.program).expect("admitted program is installed");
     let index = pool
         .iter()
         .enumerate()
-        .filter(|(_, graph)| graph.can_reuse(program))
+        .filter(|(_, graph)| kabel_fits(graph, program, sample_rate))
         .min_by_key(|(_, graph)| graph.heap_bytes())
         .map(|(index, _)| index)
         .expect("KabelSalat graph admission reserves every stage");
@@ -78,6 +90,7 @@ pub(super) fn kabel_available(
     pool: &[Box<rustel_kabel::Graph>],
     programs: &[Box<crate::assets::PreparedKabelProgram>],
     controls: &OscillatorControls<CompactKabelControls>,
+    sample_rate: f64,
 ) -> bool {
     let mut used = [false; MAX_KABEL_GRAPHS];
     for controls in kabel_controls(controls) {
@@ -87,7 +100,7 @@ pub(super) fn kabel_available(
         let index = pool
             .iter()
             .enumerate()
-            .filter(|(index, graph)| !used[*index] && graph.can_reuse(program))
+            .filter(|(index, graph)| !used[*index] && kabel_fits(graph, program, sample_rate))
             .min_by_key(|(_, graph)| graph.heap_bytes())
             .map(|(index, _)| index);
         let Some(index) = index else {
@@ -296,6 +309,7 @@ impl ScalarBackend {
         &mut self,
         programs: &[&rustel_kabel::Program],
     ) -> Result<(), String> {
+        let rate = f64::from(self.sample_rate);
         let mut used = [false; MAX_KABEL_GRAPHS];
         let mut protected = [false; MAX_KABEL_GRAPHS];
         // Previously admitted future events retain their capacity even when
@@ -320,7 +334,7 @@ impl ScalarBackend {
                     .kabel_pool
                     .iter()
                     .enumerate()
-                    .filter(|(index, graph)| !protected[*index] && graph.can_reuse(program))
+                    .filter(|(index, graph)| !protected[*index] && kabel_fits(graph, program, rate))
                     .min_by_key(|(_, graph)| graph.heap_bytes())
                     .map(|(index, _)| index)
                 {
@@ -335,7 +349,7 @@ impl ScalarBackend {
                 .kabel_pool
                 .iter()
                 .enumerate()
-                .filter(|(index, graph)| !used[*index] && graph.can_reuse(program))
+                .filter(|(index, graph)| !used[*index] && kabel_fits(graph, program, rate))
                 .min_by_key(|(_, graph)| graph.heap_bytes())
                 .map(|(index, _)| index);
             let index = match index {

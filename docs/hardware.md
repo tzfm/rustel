@@ -128,6 +128,10 @@ network, between participants such as DAWs and rustel itself. Rustel finds
 the other participants on its own; no address is given. Participants on
 this machine count too: they are found over loopback, with no network.
 
+The session that started first leads. Rustel joins a session that is
+already running and takes its tempo and grid. A participant that starts
+after rustel joins the rustel session the same way.
+
 A session that is playing starts rustel, and a session that stops stops it.
 When rustel starts or stops, the session is told the same. A tempo from a
 fresh evaluation is given to the session, and a tempo change made elsewhere
