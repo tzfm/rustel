@@ -302,9 +302,11 @@ impl Widget for Header<'_, '_> {
         } else {
             crate::jobs::set_jobs_chip(None);
         }
-        // Something went on under the scene: a small count, until the log
-        // is opened. Small on purpose, and a button - clicking it opens the
-        // log, which is also what makes it go away.
+        // Something went on under the scene: a small count of what still
+        // stands - a condition whose alert has not resolved, or keyless
+        // news inside its stay. Opening the log takes the count down, and
+        // what nothing resolved lets go of it on its own. Small on purpose,
+        // and a button - clicking it opens the log.
         if self.chrome.unseen_warnings > 0 {
             let text = format!("⚠ {}", self.chrome.unseen_warnings);
             let width = UnicodeWidthStr::width(text.as_str()) as u16;

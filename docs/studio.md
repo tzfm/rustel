@@ -700,6 +700,9 @@ The log file is `<rustel-config>/sessions/studio.log` unless
 
 `2026-08-25T18:04:11.482Z pid 1234 warn  [check] refused - line 2: unknown sound "abcde"`
 
-Read the source and line number before retrying a failed update. Opening the
-Log acknowledges its warning badge. Resolved alerts remain visible as history.
+Read the source and line number before retrying a failed update. The header's
+warning count shows what still stands: a warning whose condition clears, such
+as a score that checks clean again, leaves the count by itself, and a warning
+nothing clears leaves it after ten seconds. Opening the Log acknowledges the
+count right away. Resolved alerts remain visible as history.
 For device failures, check Devices and the [hardware guide](hardware.md).

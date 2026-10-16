@@ -163,6 +163,7 @@ impl App {
         #[cfg(feature = "remote-control")]
         self.expire_remote_activity(now);
         self.follow_loading_line(now);
+        self.dirty_frame |= self.log.expire_badges(now);
         self.dirty_frame |= if self.stop_requested {
             self.audio_advisory.reset() | self.power_advisory.reset()
         } else {

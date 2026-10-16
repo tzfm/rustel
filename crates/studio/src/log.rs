@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -29,6 +29,15 @@ use rustel_runtime::{EnginePressureSnapshot, ProducerPhase};
 /// Lines kept in memory for the panel.
 const CAPACITY: usize = 2000;
 pub const LOG_FILE_NAME: &str = "studio.log";
+
+/// How long a warning with no key keeps its header badge. A keyed alert
+/// stands for a condition the studio can re-evaluate, and its badge comes
+/// down when that condition resolves or retires. A keyless warning - an
+/// engine refusal, a refused action - has no condition anyone will report
+/// cleared, so the badge treats it as news rather than state: said again
+/// inside the stay, the stay starts over; left quiet, the badge lets it go
+/// and the log keeps the line.
+const BADGE_STAY: Duration = Duration::from_secs(10);
 
 /// How much a line is worth interrupting a set for, quietest first.
 ///
@@ -85,7 +94,14 @@ pub struct Line {
     pub text: String,
     /// An active header alert this line owns, until it is seen or resolved.
     alert: Option<String>,
+    /// Whether the header still counts this line. Raised for every warning
+    /// and error, and let down by being seen, resolved, retired, or - for a
+    /// keyless line - by its stay passing.
     unseen: bool,
+    /// When a keyless warning stops counting: its stay, from the last time
+    /// it was said. `None` while it counts, and always for a keyed alert,
+    /// whose badge only its condition takes down.
+    expires_at: Option<Instant>,
     /// The condition its alert names has cleared: the panel shows the line
     /// dim, with a ✓, and the header no longer counts it.
     pub resolved: bool,
@@ -102,8 +118,6 @@ pub struct StudioLog {
     file: Option<File>,
     path: Option<PathBuf>,
     started: Instant,
-    /// Warnings and errors since the panel was last open.
-    unseen: usize,
     /// Moves whenever a line is resolved or raised again, so a panel
     /// notices a change that leaves the ring's length alone.
     resolutions: u64,
@@ -194,7 +208,6 @@ impl StudioLog {
             file: None,
             path: None,
             started: Instant::now(),
-            unseen: 0,
             resolutions: 0,
             tally: [0; Level::COUNT],
             saved_stderr: None,
@@ -254,6 +267,7 @@ impl StudioLog {
 
     fn push_record(&mut self, level: Level, kind: &str, text: String, alert: Option<String>) {
         let at = self.started.elapsed().as_secs_f64();
+        let now = Instant::now();
         if let Some(file) = self.file.as_mut() {
             // Whole seconds cannot separate a pad press from the install
             // it asked for: every line of a one-second burst shares a stamp.
@@ -270,6 +284,9 @@ impl StudioLog {
             let _ = file.write_all(line.as_bytes());
         }
         let unseen = level >= Level::Warn;
+        // A keyless warning badges as news for a stay; a keyed alert badges
+        // until its condition clears it. See [`BADGE_STAY`].
+        let expires_at = (unseen && alert.is_none()).then(|| now + BADGE_STAY);
         // The same line again, straight after itself: counted on the row it
         // already has. The file above still got its own record - the file
         // is the stopwatch, the panel is what a person reads.
@@ -288,20 +305,20 @@ impl StudioLog {
             }
             if unseen && !last.unseen {
                 last.unseen = true;
-                self.unseen = self.unseen.saturating_add(1);
+            }
+            // Said again inside its stay: the stay starts over, so a
+            // condition that keeps speaking keeps its badge, and one that
+            // went quiet loses it a stay after its last word. This also
+            // re-arms a badge the sweep had let go: the news is back.
+            if last.expires_at.is_some() {
+                last.expires_at = Some(now + BADGE_STAY);
             }
             return;
-        }
-        if unseen {
-            self.unseen = self.unseen.saturating_add(1);
         }
         if self.lines.len() >= CAPACITY
             && let Some(dropped) = self.lines.pop_front()
         {
             self.tally[dropped.level as usize] -= 1;
-            if dropped.unseen {
-                self.unseen = self.unseen.saturating_sub(1);
-            }
         }
         self.tally[level as usize] += 1;
         self.lines.push_back(Line {
@@ -311,6 +328,7 @@ impl StudioLog {
             text,
             alert,
             unseen,
+            expires_at,
             resolved: false,
             repeats: 1,
         });
@@ -394,16 +412,37 @@ impl StudioLog {
         self.path.as_deref()
     }
 
-    /// Warnings and errors nobody has looked at yet.
+    /// Warnings and errors the header still counts: raised, not resolved,
+    /// and not past their stay. Counted from the lines, so the number the
+    /// badge shows cannot drift from the ring it summarizes. Opening the
+    /// log makes everything seen; [`Self::expire_badges`] takes the rest
+    /// down as their stays pass.
     pub fn unseen(&self) -> usize {
-        self.unseen
+        self.lines
+            .iter()
+            .filter(|line| line.unseen && !line.resolved)
+            .count()
     }
 
     pub fn mark_seen(&mut self) {
         for line in &mut self.lines {
             line.unseen = false;
         }
-        self.unseen = 0;
+    }
+
+    /// Let the keyless badges down whose stay has passed. The lines stay in
+    /// the log as ordinary history, resolved by nothing. Keyed badges have
+    /// no stay: their condition resolves or retires them. Answers whether
+    /// any badge came down, so the caller repaints the header.
+    pub fn expire_badges(&mut self, now: Instant) -> bool {
+        let mut let_go = false;
+        for line in &mut self.lines {
+            if line.unseen && line.expires_at.is_some_and(|until| now >= until) {
+                line.unseen = false;
+                let_go = true;
+            }
+        }
+        let_go
     }
 
     /// Mark every line raised under `alert` resolved, and take its badge
@@ -416,10 +455,7 @@ impl StudioLog {
             if !line.resolved && line.alert.as_deref() == Some(alert) {
                 line.resolved = true;
                 resolved += 1;
-                if line.unseen {
-                    line.unseen = false;
-                    self.unseen = self.unseen.saturating_sub(1);
-                }
+                line.unseen = false;
             }
         }
         if resolved > 0 {
@@ -439,7 +475,6 @@ impl StudioLog {
                 retired += 1;
             }
         }
-        self.unseen = self.unseen.saturating_sub(retired);
         retired
     }
 }
@@ -1439,6 +1474,101 @@ mod resolved_tests {
         log.push(Level::Info, "samples", "something else");
         log.push_alert(Level::Warn, "samples", "gone", "samples:/kit");
         assert_eq!(log.unseen(), 1, "and so does a new line under the key");
+    }
+
+    /// A keyless warning is news, not state: its badge lasts a stay and
+    /// then lets go, the line staying in the log as ordinary history.
+    #[test]
+    fn a_keyless_warning_badges_for_a_stay_and_then_lets_go() {
+        let mut log = StudioLog::open(None);
+        let raised = Instant::now();
+        log.push(Level::Warn, "voice-refused", "unknown sound \"nope\"");
+        log.push(Level::Error, "export", "disk full");
+        assert_eq!(log.unseen(), 2);
+
+        // One moment inside the stay: both still count.
+        assert!(!log.expire_badges(raised + BADGE_STAY - Duration::from_secs(1)));
+        assert_eq!(log.unseen(), 2);
+
+        // A moment past the stay: both let go at once, and saying so once
+        // more changes nothing.
+        assert!(log.expire_badges(raised + BADGE_STAY + Duration::from_secs(1)));
+        assert!(!log.expire_badges(raised + BADGE_STAY + Duration::from_secs(1)));
+        assert_eq!(log.unseen(), 0);
+        let refused = log
+            .lines()
+            .iter()
+            .find(|line| line.text.contains("nope"))
+            .expect("the line is kept");
+        assert!(!refused.resolved, "nothing resolved it");
+        assert!(!format_line(refused).contains('✓'), "{refused:?}");
+    }
+
+    /// A keyed alert has no stay: it counts until its condition clears it,
+    /// however long that takes.
+    #[test]
+    fn a_keyed_alert_keeps_its_badge_past_any_stay() {
+        let mut log = StudioLog::open(None);
+        let raised = Instant::now();
+        log.push_alert(Level::Error, "engine", "device lost", "error:engine");
+        assert!(!log.expire_badges(raised + BADGE_STAY * 10));
+        assert_eq!(log.unseen(), 1);
+        assert_eq!(log.resolve_alert("error:engine"), 1);
+        assert_eq!(log.unseen(), 0);
+    }
+
+    /// Said again inside its stay, the stay starts over: a condition that
+    /// keeps speaking keeps its badge, and after it goes quiet the badge
+    /// leaves a stay after its last word.
+    #[test]
+    fn a_repeated_keyless_warning_restarts_its_stay() {
+        let mut log = StudioLog::open(None);
+        log.push(Level::Warn, "voice-refused", "late");
+        let first_stay = log
+            .lines()
+            .back()
+            .expect("the row")
+            .expires_at
+            .expect("a stay");
+        // One moment later the condition says it again.
+        std::thread::sleep(Duration::from_millis(25));
+        log.push(Level::Warn, "voice-refused", "late");
+        let row = log.lines().back().expect("the row");
+        assert_eq!(row.repeats, 2, "one row, counted");
+        let second_stay = row.expires_at.expect("a stay");
+        assert!(
+            second_stay > first_stay,
+            "the stay is measured from the last word"
+        );
+
+        // Past the first stay, still inside the second: still counted.
+        assert!(!log.expire_badges(first_stay + Duration::from_millis(1)));
+        assert_eq!(log.unseen(), 1);
+        assert!(log.expire_badges(second_stay + Duration::from_millis(1)));
+        assert_eq!(log.unseen(), 0);
+    }
+
+    /// News that comes back after its stay had passed: the repeat re-arms
+    /// the badge on the row it already had, with a fresh stay.
+    #[test]
+    fn news_that_comes_back_after_its_stay_badges_again() {
+        let mut log = StudioLog::open(None);
+        let raised = Instant::now();
+        log.push(Level::Warn, "take", "ended: disk full");
+        assert!(log.expire_badges(raised + BADGE_STAY + Duration::from_secs(1)));
+        assert_eq!(log.unseen(), 0);
+
+        log.push(Level::Warn, "take", "ended: disk full");
+        assert_eq!(log.unseen(), 1, "the same line again is news again");
+        let row = log.lines().back().expect("the row");
+        assert_eq!(row.repeats, 2);
+        let stay = row.expires_at.expect("a fresh stay");
+        assert!(
+            stay > raised + BADGE_STAY,
+            "the stay is measured from the last word"
+        );
+        assert!(!log.expire_badges(stay - Duration::from_secs(1)));
+        assert_eq!(log.unseen(), 1);
     }
 
     /// The open panel follows a resolution, which leaves the ring's length

@@ -192,8 +192,9 @@ impl App {
         self.dirty_frame = true;
     }
 
-    /// F9: the log sheet, or close it. Opening it is what clears the
-    /// header's count.
+    /// F9: the log sheet, or close it. Opening it takes the header's count
+    /// down at once; what nothing resolves also leaves the count on its
+    /// own, a stay after its last word.
     pub(super) fn toggle_log_panel(&mut self) {
         if self.log_panel.is_some() && self.focus != Focus::Panel(PanelKind::Log) {
             self.focus_panel(PanelKind::Log);
