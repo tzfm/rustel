@@ -1745,8 +1745,8 @@ fn build_validated(ast: &Ast) -> Pattern {
                     euclid_pattern(
                         build_validated(pat),
                         pulses_value.to_f64() as i32,
-                        steps_value.to_f64() as usize,
-                        rotation_value.to_f64() as isize,
+                        steps_value.to_f64(),
+                        rotation_value.to_f64() as i32,
                     ),
                     spans,
                 )
@@ -1797,7 +1797,7 @@ fn build_validated(ast: &Ast) -> Pattern {
                             .get(2)
                             .and_then(rustel_core::register::value_to_fraction)
                             .unwrap_or(Fraction::ZERO)
-                            .to_f64() as isize;
+                            .to_f64() as i32;
                         euclid_pattern(base.clone(), pulses, steps, rotation)
                     })
                     .inner_join()
@@ -1868,24 +1868,8 @@ fn apply_patterned_fast(pattern: Pattern, factor: Pattern) -> Pattern {
         .call(&[factor], pattern)
 }
 
-fn euclid_pattern(pattern: Pattern, pulses: i32, steps: usize, rotation: isize) -> Pattern {
-    if steps > rustel_core::euclid::MAX_EUCLID_STEPS {
-        return rustel_core::query_limit_pattern(rustel_core::QueryLimit::EuclidSteps {
-            steps: steps as u64,
-            limit: MAX_NATIVE_EUCLID_STEPS,
-        });
-    }
-    match rustel_core::euclid::euclid_rot(pulses, steps, rotation) {
-        Ok(mask) => {
-            let structure = fastcat(
-                mask.into_iter()
-                    .map(|value| pure(Value::Bool(value != 0)))
-                    .collect(),
-            );
-            pattern.struct_with(structure)
-        }
-        Err(_) => silence(),
-    }
+fn euclid_pattern(pattern: Pattern, pulses: i32, steps: f64, rotation: i32) -> Pattern {
+    rustel_core::combinators::euclid_with_steps(&pattern, pulses, steps, rotation)
 }
 
 /// How many elements a mini range (`0 .. 7`) may expand to. Bounds native
@@ -2148,26 +2132,23 @@ enum EuclidExtentError {
     NativeLimit { steps: u64 },
 }
 
-fn checked_euclid_extents(pulses: f64, steps: f64) -> Result<(i32, usize), EuclidExtentError> {
-    if !pulses.is_finite()
-        || !steps.is_finite()
-        || pulses.fract() != 0.0
-        || steps.fract() != 0.0
-        || steps < 0.0
-    {
+fn checked_euclid_extents(pulses: f64, steps: f64) -> Result<(i32, f64), EuclidExtentError> {
+    if !pulses.is_finite() || !steps.is_finite() || pulses.fract() != 0.0 {
         return Err(EuclidExtentError::InvalidArrayLength);
     }
-    let ons = pulses.abs();
-    let offs = steps - ons;
-    if offs < 0.0 || ons > f64::from(u32::MAX) || offs > f64::from(u32::MAX) {
+    if pulses == 0.0 || steps == 0.0 {
+        return Ok((0, 0.0));
+    }
+    let total = (pulses.abs() / steps.abs()).ceil() * steps.abs();
+    if total.fract() != 0.0 {
         return Err(EuclidExtentError::InvalidArrayLength);
     }
-    if steps > MAX_NATIVE_EUCLID_STEPS as f64 {
+    if total > MAX_NATIVE_EUCLID_STEPS as f64 {
         return Err(EuclidExtentError::NativeLimit {
-            steps: steps as u64,
+            steps: total as u64,
         });
     }
-    Ok((pulses as i32, steps as usize))
+    Ok((pulses as i32, steps))
 }
 
 fn ast_weight(ast: &Ast) -> Fraction {
@@ -2587,20 +2568,18 @@ fn step_metadata(ast: &Ast) -> Option<StepMetadata> {
                     .as_ref()
                     .is_none_or(|rotation| euclid_argument_is_pure_atom(&rotation.ast));
             Some(StepMetadata {
-                // Eager `euclid`/`euclidRot` takes its structure from the
-                // Euclid mask, whose fastcat has `steps` steps. The dynamic
-                // register path inner-joins and has undefined `_steps`;
-                // Fraction(undefined) becomes zero when a sourced receiver is
-                // consumed by its parent sequence.
+                // The dynamic register path has no step count. An ordinary
+                // mask counts all steps across its cycles. Legato has one.
                 steps: if eager {
+                    let pulses = static_number_fraction(euclid_argument_source(&pulses.ast))
+                        .expect("eager Euclid pulses");
                     let steps = static_number_fraction(euclid_argument_source(&steps.ast))
                         .expect("eager Euclid steps");
-                    if steps == Fraction::ZERO {
-                        // The empty mask IS silence, and silence carries one
-                        // step.
+                    if pulses == Fraction::ZERO || steps <= Fraction::ZERO {
                         Fraction::ONE
                     } else {
-                        steps
+                        let cycles = (pulses.to_f64().abs() / steps.to_f64()).ceil() as i128;
+                        steps.checked_mul(Fraction::int(cycles))?
                     }
                 } else {
                     Fraction::ZERO
@@ -2849,6 +2828,17 @@ mod tests {
             checked_euclid_extents(3.0, (MAX_NATIVE_EUCLID_STEPS + 1) as f64),
             Err(EuclidExtentError::NativeLimit { steps: 16_385 })
         ));
+        assert!(checked_euclid_extents(16_384.0, -4.0).is_ok());
+        for (pulses, steps) in [(16_385.0, 4.0), (-16_385.0, -4.0)] {
+            assert!(matches!(
+                checked_euclid_extents(pulses, steps),
+                Err(EuclidExtentError::NativeLimit { steps: 16_388 })
+            ));
+        }
+        assert!(matches!(
+            checked_euclid_extents(3.0, -16_385.0),
+            Err(EuclidExtentError::NativeLimit { steps: 16_385 })
+        ));
 
         let pattern = mini("a(3,16384)").expect("the accepted boundary must construct");
         assert_eq!(
@@ -2858,6 +2848,41 @@ mod tests {
             3,
             "the accepted boundary must remain queryable"
         );
+    }
+
+    #[test]
+    fn euclid_static_and_patterned_arguments_share_extended_timing() {
+        let timing = |source: &str| {
+            mini(source)
+                .expect("euclid notation")
+                .query_arc_sorted(Fraction::ZERO, Fraction::int(2))
+                .into_iter()
+                .map(|hap| {
+                    let whole = hap.whole.expect("euclid event");
+                    (whole.begin, whole.end)
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected = [0, 2, 3, 5, 6]
+            .into_iter()
+            .map(|start| (Fraction::new(start, 4), Fraction::new(start + 1, 4)))
+            .collect::<Vec<_>>();
+        for source in ["x(5,4)", "x(<5>,<4>)"] {
+            assert_eq!(timing(source), expected, "{source}");
+        }
+        let expected = [0, 2, 3, 3, 5, 6]
+            .into_iter()
+            .zip([2, 3, 5, 5, 6, 8])
+            .map(|(start, end)| (Fraction::new(start, 4), Fraction::new(end, 4)))
+            .collect::<Vec<_>>();
+        for source in ["x(5,-4)", "x(<5>,<-4>)"] {
+            assert_eq!(timing(source), expected, "{source}");
+        }
+        let expected = [(0, 2), (2, 4), (2, 4), (4, 6)]
+            .map(|(begin, end)| (Fraction::new(begin, 3), Fraction::new(end, 3)));
+        for source in ["x(3,1.5)", "x(<3>,<1.5>)"] {
+            assert_eq!(timing(source), expected, "{source}");
+        }
     }
 
     /// A Euclid rotation may follow the steps after whitespace alone and plays

@@ -1316,6 +1316,63 @@ pub fn stepcat_missing_weight(known: &[Fraction]) -> Option<Fraction> {
         .and_then(|sum| sum.checked_div(Fraction::int(known.len() as i128)))
 }
 
+/// Placement of shorter lanes in a stack with equal step lengths.
+#[derive(Clone, Copy)]
+pub enum StackMode {
+    Left,
+    Right,
+    Center,
+    Repeat,
+}
+
+/// Aligns or repeats each lane within the longest lane's step count.
+/// Every lane must have a known step count.
+pub fn stack_with<P: PatOps>(patterns: &[P], mode: StackMode) -> P {
+    if patterns.is_empty() {
+        return P::pat_silence();
+    }
+    if patterns.len() == 1 {
+        return patterns[0].clone();
+    }
+    let Some(steps) = patterns
+        .iter()
+        .map(P::pat_steps)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return P::pat_query_error("aligned stacks require a step count for each pattern");
+    };
+    let longest = *steps.iter().max().expect("nonempty stack");
+    let mut aligned = Vec::with_capacity(patterns.len());
+    for (pat, steps) in patterns.iter().zip(steps) {
+        if matches!(mode, StackMode::Repeat) {
+            aligned.push(pace(pat, longest));
+            continue;
+        }
+        if steps == longest {
+            aligned.push(pat.clone());
+            continue;
+        }
+        let Some(gap) = longest.checked_sub(steps) else {
+            return native_fraction_refusal("stack");
+        };
+        let item = (Some(steps), pat.clone());
+        let silence = (Some(gap), P::pat_silence());
+        aligned.push(match mode {
+            StackMode::Left => stepcat(&[item, silence]),
+            StackMode::Right => stepcat(&[silence, item]),
+            StackMode::Center => {
+                let Some(half) = gap.checked_div(Fraction::int(2)) else {
+                    return native_fraction_refusal("stackCenter");
+                };
+                let silence = (Some(half), P::pat_silence());
+                stepcat(&[silence.clone(), item, silence])
+            }
+            StackMode::Repeat => unreachable!("repeat uses pace"),
+        });
+    }
+    P::pat_stack(aligned).set_steps(Some(longest))
+}
+
 #[derive(Clone, Copy)]
 struct StepwiseSegment {
     zoom_begin: Fraction,
@@ -1733,32 +1790,70 @@ pub fn time_cat<P: PatOps>(items: &[(Fraction, P)]) -> P {
     P::pat_stack(pats)
 }
 
-/// The binary euclidean mask; `None` when `steps` is non-positive.
-fn euclid_mask(pulses: i32, steps: i32, rotation: i32) -> Option<Vec<bool>> {
-    if steps <= 0 {
-        return None;
+/// Structures a pattern with a step width that can expand to an integer grid.
+pub fn euclid_with_steps<P: PatOps>(pat: &P, pulses: i32, steps: f64, rotation: i32) -> P {
+    if pulses == 0 || steps == 0.0 {
+        return P::pat_silence();
     }
-    crate::euclid::euclid_rot(pulses, steps as usize, rotation as isize)
-        .ok()
-        .map(|mask| mask.into_iter().map(|bit| bit != 0).collect())
-}
-
-fn mask_pattern<P: PatOps>(mask: &[bool]) -> P {
-    P::pat_fastcat(mask.iter().map(|b| P::pat_pure(Value::Bool(*b))).collect())
-}
-
-/// Structures `pat` by the euclidean `(pulses, steps)` mask, rotated.
-pub fn euclid_rot<P: PatOps>(pat: &P, pulses: i32, steps: i32, rotation: i32) -> P {
-    if steps > crate::euclid::MAX_EUCLID_STEPS as i32 {
+    if !steps.is_finite() {
+        return P::pat_query_error("Invalid array length");
+    }
+    let width = steps.abs();
+    let cycles = (f64::from(pulses.unsigned_abs()) / width).ceil();
+    let total = cycles * width;
+    if !total.is_finite() || total > crate::euclid::MAX_EUCLID_STEPS as f64 {
         return P::pat_query_limit(crate::QueryLimit::EuclidSteps {
-            steps: steps as u64,
+            steps: total as u64,
             limit: crate::euclid::MAX_EUCLID_STEPS as u64,
         });
     }
-    match euclid_mask(pulses, steps, rotation) {
-        Some(mask) => struct_with(pat, &mask_pattern::<P>(&mask)),
-        None => P::pat_silence(),
+    if total.fract() != 0.0 {
+        return P::pat_query_error("Invalid array length");
     }
+    let Some(cycles) = Fraction::from_f64(cycles) else {
+        return native_fraction_refusal("euclid");
+    };
+    let total = total as u64;
+    let mask_rotation = if steps < 0.0 { 0 } else { rotation as isize };
+    let Ok(mut mask) = crate::euclid::euclid_rot(pulses, total as usize, mask_rotation) else {
+        return P::pat_silence();
+    };
+    let structure = if steps < 0.0 {
+        let Some(first) = mask.iter().position(|bit| *bit != 0) else {
+            return P::pat_silence();
+        };
+        mask.rotate_left(first);
+        let mut onsets = mask
+            .iter()
+            .enumerate()
+            .filter_map(|(index, bit)| (*bit != 0).then_some(index))
+            .peekable();
+        let mut spans = Vec::new();
+        while let Some(begin) = onsets.next() {
+            let end = onsets.peek().copied().unwrap_or(mask.len());
+            spans.push((
+                Fraction::int((end - begin) as i128),
+                P::pat_pure(Value::Bool(true)),
+            ));
+        }
+        time_cat(&spans).late(Fraction::new(
+            i128::from(rotation) + first as i128,
+            i128::from(total),
+        ))
+    } else {
+        P::pat_fastcat(
+            mask.into_iter()
+                .map(|bit| P::pat_pure(Value::Bool(bit != 0)))
+                .collect(),
+        )
+    };
+    struct_with(&checked_fast(pat, cycles, "euclid"), &structure).slow(cycles)
+}
+
+/// Structures `pat` by a rotated Euclidean rhythm. Negative steps hold each
+/// pulse until the next. Extra pulses extend the rhythm across more cycles.
+pub fn euclid_rot<P: PatOps>(pat: &P, pulses: i32, steps: i32, rotation: i32) -> P {
+    euclid_with_steps(pat, pulses, f64::from(steps), rotation)
 }
 
 /// [`euclid_rot`] from a `[pulses, steps?, rotation?]` value; `steps`
@@ -1766,47 +1861,17 @@ pub fn euclid_rot<P: PatOps>(pat: &P, pulses: i32, steps: i32, rotation: i32) ->
 pub fn bjork<P: PatOps>(pat: &P, value: &Value) -> P {
     let items = slots(value, 3);
     let pulses = util::parse_numeral(&items[0]).unwrap_or(f64::NAN) as i32;
-    let steps = util::parse_numeral(&items[1])
-        .map(|n| n as i32)
-        .unwrap_or(pulses);
+    let steps = util::parse_numeral(&items[1]).unwrap_or(f64::from(pulses));
     let rotation = util::parse_numeral(&items[2])
         .map(|n| n as i32)
         .unwrap_or(0);
-    euclid_rot(pat, pulses, steps, rotation)
+    euclid_with_steps(pat, pulses, steps, rotation)
 }
 
-/// Euclidean rhythm with each pulse held until the next: the run of `0`s
-/// after a `1` becomes that pulse's width, and anything before the first
-/// pulse is dropped.
+/// Holds each Euclidean pulse until the next. Negative steps select the
+/// ordinary rhythm with gaps instead.
 pub fn euclid_legato<P: PatOps>(pat: &P, pulses: i32, steps: i32, rotation: i32) -> P {
-    if pulses < 1 {
-        return P::pat_silence();
-    }
-    if steps > crate::euclid::MAX_EUCLID_STEPS as i32 {
-        return P::pat_query_limit(crate::QueryLimit::EuclidSteps {
-            steps: steps as u64,
-            limit: crate::euclid::MAX_EUCLID_STEPS as u64,
-        });
-    }
-    let Some(mask) = euclid_mask(pulses, steps, 0) else {
-        return P::pat_silence();
-    };
-    let binary: String = mask.iter().map(|b| if *b { '1' } else { '0' }).collect();
-    let gapless: Vec<(Fraction, P)> = binary
-        .split('1')
-        .skip(1)
-        .map(|run| {
-            (
-                Fraction::int(run.len() as i128 + 1),
-                P::pat_pure(Value::Bool(true)),
-            )
-        })
-        .collect();
-    if gapless.is_empty() {
-        return P::pat_silence();
-    }
-    struct_with(pat, &time_cat(&gapless))
-        .late(Fraction::int(i128::from(rotation)).div(Fraction::int(i128::from(steps))))
+    euclid_with_steps(pat, pulses, -f64::from(steps), rotation)
 }
 
 // -- the degrade / sometimes family ------------------------------------------
@@ -1830,6 +1895,10 @@ pub fn degrade_by_with<P: PatOps>(pat: &P, with_pat: &P, x: f64) -> P {
     let gate = with_pat.filter_values(move |v| util::parse_numeral(v).is_ok_and(|n| n > x));
     pat.app_left_with_lookup(gate, |a, _| a.clone(), crate::LookupFlow::Left)
         .set_steps(pat.pat_steps())
+}
+
+pub(crate) fn degrade_by_with_value<P: PatOps>(pat: &P, chooser: &Value, x: f64) -> P {
+    degrade_by_with(pat, &P::pat_pure(chooser.clone()), x)
 }
 
 /// [`degrade_by_with`] over `rand`.

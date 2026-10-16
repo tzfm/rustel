@@ -38,9 +38,11 @@ devices, add live visuals, and export audio. No browser is required.
 | --- | --- |
 | **Strudel patterns** | Patterns, samples, synths, and effects from the Strudel language. See [compatibility](docs/compatibility.md) for the exceptions. |
 | **Studio** | A terminal editor with live update, visuals, a mixer, and a key reference. A bad update leaves the last good score playing. |
+| **Auto evaluate** | Apply valid edits after a typing pause while the set plays. Off by default. See [auto evaluate](docs/studio.md#auto-evaluate). |
 | **Your editor** | Run `rustel play song.strudel --watch` and edit in any editor. Audio keeps running across saves. |
 | **Session tapes** | Studio logs each installed update with its time. See [sessions](docs/sessions.md). |
-| **Hardware** | Speakers, audio input, MIDI, OSC, and serial. MIDI clock can follow or lead. Link shares tempo and transport on the network. See [hardware](docs/hardware.md). |
+| **Hardware** | Speakers, audio input, MIDI, OSC, and serial. MIDI clock can follow or lead. See [hardware](docs/hardware.md). |
+| **Ableton Link** | Sync tempo with Ableton Live and other Link apps. Link also shares play and stop states. See [Link setup](docs/hardware.md#link). |
 | **Plugins** | VST3 effects and instruments from a score: `.vsti("serum 2").vst("ott")`. See [plugins](docs/plugins.md). |
 | **Visuals** | Scope, piano roll, spectrum, and [Hydra](docs/hydra.md) in the terminal. |
 | **Offline render** | Export to WAV or MP3 with repeatable output. |
@@ -65,6 +67,9 @@ and play, and **Ctrl+G** (or **F8**) to stop. Studio shows the keys your
 terminal supports in its menus and **Settings → Keybinds**.
 
 Press **Ctrl+Q** twice to quit. Use Control on macOS too.
+
+For automatic updates while playing, enable auto evaluate under Settings >
+Live coding. Valid edits apply after a typing pause. See [auto evaluate](docs/studio.md#auto-evaluate).
 
 A score also plays your VST3 plugins. `.vsti()` plays the notes on an
 instrument plugin, and `.vst()` sends them through an effect plugin:

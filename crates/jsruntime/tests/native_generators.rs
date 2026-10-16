@@ -26,6 +26,233 @@ fn values(runtime: &JsRuntime, source: &str) -> Vec<Value> {
 }
 
 #[test]
+fn euclid_extends_extra_pulses_and_holds_negative_steps() {
+    let runtime = runtime();
+    for (method, ends) in [
+        ("euclid(5, 4)", [1, 3, 4, 6, 7]),
+        ("euclidLegato(5, 4)", [2, 3, 5, 6, 8]),
+        ("euclid(5, -4)", [2, 3, 5, 6, 8]),
+    ] {
+        evaluate(&runtime, &format!("slowcat(pure('a'), pure('b')).{method}"));
+        let haps = runtime
+            .query(Slot::Active, 0, Fraction::ZERO, Fraction::int(2))
+            .expect("extended rhythm");
+        let actual = haps
+            .iter()
+            .map(|hap| {
+                let whole = hap.whole.expect("rhythm event");
+                (whole.begin, whole.end, hap.value.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut expected = [0, 2, 3, 5, 6]
+            .into_iter()
+            .zip(ends)
+            .map(|(start, end)| {
+                (
+                    Fraction::new(start, 4),
+                    Fraction::new(end, 4),
+                    Value::Str(if start < 4 { "a" } else { "b" }.into()),
+                )
+            })
+            .collect::<Vec<_>>();
+        if method != "euclid(5, 4)" {
+            expected.insert(
+                3,
+                (
+                    Fraction::new(3, 4),
+                    Fraction::new(5, 4),
+                    Value::Str("b".into()),
+                ),
+            );
+        }
+        assert_eq!(actual, expected, "{method}");
+        assert!(!runtime.active_needs_host());
+    }
+
+    for source in ["pure('x').euclid(3, 1.5)", "mini('x(3,1.5)')"] {
+        evaluate(&runtime, source);
+        let haps = runtime
+            .query(Slot::Active, 0, Fraction::ZERO, Fraction::int(2))
+            .expect("fractional step width");
+        let spans = haps
+            .iter()
+            .map(|hap| {
+                let whole = hap.whole.expect("rhythm event");
+                (whole.begin, whole.end)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            spans,
+            [(0, 2), (2, 4), (2, 4), (4, 6)]
+                .map(|(begin, end)| (Fraction::new(begin, 3), Fraction::new(end, 3))),
+            "{source}"
+        );
+    }
+
+    for source in [
+        "pure('x').euclid(-1, -4)",
+        "pure('x').euclidLegato(-1, 4)",
+        "mini('x(-1,-4)')",
+    ] {
+        let haps = evaluate(&runtime, source);
+        assert_eq!(haps.len(), 4, "{source}");
+        assert_eq!(haps[0].whole.expect("held gap").begin, Fraction::new(-1, 4));
+        assert_eq!(haps[0].whole.expect("held gap").end, Fraction::new(1, 4));
+    }
+}
+
+#[test]
+fn euclid_legato_rotation_keeps_source_notes_in_their_cycles() {
+    let runtime = runtime();
+    evaluate(
+        &runtime,
+        r#"note("<eb4 f4 g4 d4>").euclidLegatoRot(3, 16, 14)"#,
+    );
+    let haps = runtime
+        .query(Slot::Active, 0, Fraction::ZERO, Fraction::int(4))
+        .expect("rotated rhythm");
+    let onsets = haps
+        .iter()
+        .filter(|hap| hap.has_onset())
+        .map(|hap| (hap.part.begin, hap.value.clone()))
+        .collect::<Vec<_>>();
+    let expected = ["eb4", "f4", "g4", "d4"]
+        .into_iter()
+        .enumerate()
+        .flat_map(|(cycle, note)| {
+            [3, 8, 14].map(|step| {
+                (
+                    Fraction::new(cycle as i128 * 16 + step, 16),
+                    Value::object([("note".into(), Value::Str(note.into()))]),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(onsets, expected);
+    let boundary = haps
+        .iter()
+        .filter(|hap| {
+            hap.whole.is_some_and(|whole| {
+                whole.begin == Fraction::new(7, 8) && whole.end == Fraction::new(19, 16)
+            })
+        })
+        .map(|hap| (hap.part.begin, hap.part.end, hap.value.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        boundary,
+        [
+            (
+                Fraction::new(7, 8),
+                Fraction::ONE,
+                Value::object([("note".into(), Value::Str("eb4".into()))]),
+            ),
+            (
+                Fraction::ONE,
+                Fraction::new(19, 16),
+                Value::object([("note".into(), Value::Str("f4".into()))]),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn aligned_stacks_reify_strings_and_keep_short_lane_placement() {
+    let runtime = runtime();
+    runtime.eval("setStringParser(mini)").expect("mini parser");
+    for (name, offset) in [
+        ("stackLeft", Fraction::ZERO),
+        ("stackRight", Fraction::new(1, 3)),
+        ("stackCenter", Fraction::new(1, 6)),
+        ("stackCentre", Fraction::new(1, 6)),
+    ] {
+        for source in [
+            format!("{name}('a b c', 'x y')"),
+            format!("reify('a b c').{name}(['x', 'y'])"),
+        ] {
+            let haps = evaluate(&runtime, &source);
+            let short = haps
+                .iter()
+                .filter(
+                    |hap| matches!(&hap.value, Value::Str(value) if value == "x" || value == "y"),
+                )
+                .map(|hap| {
+                    let whole = hap.whole.expect("stack event");
+                    (whole.begin, whole.end)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                short,
+                [
+                    (offset, offset + Fraction::new(1, 3)),
+                    (offset + Fraction::new(1, 3), offset + Fraction::new(2, 3)),
+                ],
+                "{source}"
+            );
+            assert_eq!(haps.len(), 5, "{source}");
+            assert!(!runtime.active_needs_host());
+        }
+    }
+}
+
+#[test]
+fn repeat_stack_keeps_each_lanes_step_rate_across_cycles() {
+    let runtime = runtime();
+    runtime.eval("setStringParser(mini)").expect("mini parser");
+    evaluate(&runtime, "stackRepeat('a b c', ['x', 'y'])");
+    let haps = runtime
+        .query(Slot::Active, 0, Fraction::ZERO, Fraction::int(2))
+        .expect("repeated lanes");
+    let short = haps
+        .into_iter()
+        .filter(|hap| matches!(&hap.value, Value::Str(value) if value == "x" || value == "y"))
+        .map(|hap| (hap.whole.expect("stack event").begin, hap.value))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        short,
+        (0..6)
+            .map(|index| (
+                Fraction::new(index, 3),
+                Value::Str(if index % 2 == 0 { "x" } else { "y" }.into())
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert!(!runtime.active_needs_host());
+    assert_eq!(values(&runtime, "stackLeft()"), []);
+    assert_eq!(
+        values(&runtime, "stackRepeat(pure('a'))"),
+        [Value::Str("a".into())]
+    );
+}
+
+#[test]
+fn degrade_by_with_uses_chooser_values_and_a_strict_threshold() {
+    let runtime = runtime();
+    runtime.eval("setStringParser(mini)").expect("mini parser");
+    assert_eq!(
+        values(
+            &runtime,
+            "reify('a b c d').degradeByWith('0 0.5 1 0.75', 0.5)"
+        ),
+        [Value::Str("c".into()), Value::Str("d".into())]
+    );
+    assert!(values(&runtime, "reify('a b c d').degradeByWith(saw, 0.5)").is_empty());
+    let sampled = runtime
+        .query(Slot::Active, 0, Fraction::new(3, 4), Fraction::ONE)
+        .expect("signal chooser");
+    assert_eq!(sampled.len(), 1);
+    assert_eq!(sampled[0].value, Value::Str("d".into()));
+    assert_eq!(
+        sampled[0].whole.expect("source event").begin,
+        Fraction::new(3, 4)
+    );
+    assert_eq!(
+        values(&runtime, "degradeByWith(0.5, '0 1', reify('a b c d'))"),
+        [Value::Str("a".into()), Value::Str("b".into())]
+    );
+    assert!(!runtime.active_needs_host());
+}
+
+#[test]
 fn numeric_generators_keep_their_values_and_timing() {
     let runtime = runtime();
     assert_eq!(
@@ -297,6 +524,46 @@ fn rand_list_refuses_oversized_lists_before_sampling() {
         .query(Slot::Active, 0, Fraction::ZERO, Fraction::from(8))
         .expect("a multi-cycle randL query");
     assert_eq!(haps.len(), 64 * 8);
+}
+
+#[test]
+fn rand_list_uses_the_same_seed_as_rand() {
+    let runtime = runtime();
+    let unseeded = values(&runtime, "randL(4).segment(4)");
+    assert_eq!(unseeded, values(&runtime, "randL(4).segment(4).seed(0)"));
+    for seed in [0.5, 42.0, 4_294_967_296.25] {
+        let source = format!("randL(4).segment(4).seed({seed})");
+        let lists = values(&runtime, &source);
+        assert_eq!(lists, values(&runtime, &source));
+        assert_ne!(lists, unseeded, "seed {seed}");
+        let numbers = values(&runtime, &format!("rand.segment(4).seed({seed})"));
+        for (list, number) in lists.iter().zip(numbers) {
+            let Value::List(list) = list else {
+                panic!("randL returned {list:?}");
+            };
+            assert_eq!(list.len(), 4);
+            assert_eq!(list[0], number, "seed {seed}");
+        }
+    }
+    for count in ["0", "-1", "NaN", "Infinity"] {
+        assert_eq!(
+            values(&runtime, &format!("randL({count}).seed(42)")),
+            [Value::List(Vec::new())]
+        );
+    }
+}
+
+#[test]
+fn open_and_close_are_signals_that_stop_after_one_cycle() {
+    let runtime = runtime();
+    assert_eq!(
+        values(&runtime, "open.fast(2).segment(4)"),
+        [0.0, 0.5, 1.0, 1.0].map(Value::F64)
+    );
+    assert_eq!(
+        values(&runtime, "close.fast(2).segment(4)"),
+        [1.0, 0.5, 0.0, 0.0].map(Value::F64)
+    );
 }
 
 /// `signal(f)` makes one hap per query span valued `f` at the span's begin,

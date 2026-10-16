@@ -8,6 +8,30 @@ use super::{Registry, add, add_fn, arg_function, arg_number};
 use crate::combinators as c;
 use crate::ops::PatOps;
 
+const DEGRADE_BY_WITH: crate::reference::ReferenceEntry = crate::reference::ReferenceEntry {
+    name: "degradeByWith",
+    synonyms: &[],
+    summary: "Removes events using a chooser pattern and a threshold.",
+    description: "Keeps an event when the chooser value is greater than the threshold. Use a signal for continuous control or a pattern for a fixed gate.",
+    params: &[
+        crate::reference::ReferenceParam {
+            name: "chooser",
+            r#type: "number | Pattern",
+            description: "the values to compare with the threshold",
+        },
+        crate::reference::ReferenceParam {
+            name: "amount",
+            r#type: "number | Pattern",
+            description: "events at or below this threshold are removed",
+        },
+    ],
+    examples: &["s(\"hh*8\").degradeByWith(sine, 0.5)"],
+    tags: &["temporal"],
+    no_autocomplete: false,
+    deprecated: false,
+    origin: "rustel",
+};
+
 const DEGRADE_BY: crate::reference::ReferenceEntry = crate::reference::ReferenceEntry {
     name: "degradeBy",
     synonyms: &[],
@@ -264,6 +288,19 @@ const ALWAYS: crate::reference::ReferenceEntry = crate::reference::ReferenceEntr
 
 pub(super) fn register(r: &mut Registry) {
     // -- the degrade / sometimes family -------------------------------------
+    add(
+        r,
+        &["degradeByWith"],
+        DEGRADE_BY_WITH,
+        3,
+        false,
+        crate::native_combinator!(|args, pat| c::degrade_by_with_value(
+            &pat,
+            args.first().unwrap_or(&crate::Value::Undefined),
+            arg_number(args, 1)
+        )),
+    );
+
     add(
         r,
         &["degradeBy"],

@@ -68,7 +68,9 @@ pub(crate) fn native_mini<'js>(
             rquickjs::Error::new_from_js_message("string", "Pattern", error.to_string())
         })?;
     if offset < 0 {
-        pattern = pattern.map_haps_native(|hap| Some(hap.clone().with_context(Vec::new())));
+        pattern = pattern
+            .map_haps_native(|hap| Some(hap.clone().with_context(Vec::new())))
+            .with_steps(pattern.steps);
     }
     new_wrapper(&ctx, NativePatternWrapper::plain(pattern))
 }
@@ -112,7 +114,11 @@ pub(crate) fn native_mini_sequence<'js>(
         })?;
         // The string is not in the score. Its positions would mark the
         // first characters of the score as playing.
-        patterns.push(parsed.map_haps_native(|hap| Some(hap.clone().with_context(Vec::new()))));
+        patterns.push(
+            parsed
+                .map_haps_native(|hap| Some(hap.clone().with_context(Vec::new())))
+                .with_steps(parsed.steps),
+        );
     }
     let pattern = if patterns.is_empty() {
         // Empty slowcat IS silence, so `sequence()`

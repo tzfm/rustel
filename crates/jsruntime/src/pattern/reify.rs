@@ -58,6 +58,31 @@ pub(crate) fn reify_args<'js>(
     Ok((pats, sidecars))
 }
 
+/// Reify each scale degree separately so its rhythm and callback owners survive.
+pub(crate) fn reify_xen_array<'js>(
+    ctx: &Ctx<'js>,
+    array: &rquickjs::Array<'js>,
+    receiver: &Pattern,
+) -> rquickjs::Result<(Pattern, Vec<Sidecar<'js>>)> {
+    let len = js_array_len(array)?;
+    let mut values = reserve_js_array(ctx, len)?;
+    for index in 0..len {
+        values.push(array.get::<rquickjs::Value>(index)?);
+    }
+    if values.iter().all(rquickjs::Value::is_number) {
+        let ratios = Value::List(values.iter().map(from_js).collect());
+        return Ok((rustel_core::xen::xen(receiver, ratios), Vec::new()));
+    }
+    let mut patterns = reserve_js_array(ctx, len)?;
+    let mut sidecars = reserve_js_array(ctx, len)?;
+    for value in values {
+        let (pattern, sidecar) = reify_bridged(ctx, &value)?;
+        patterns.push(pattern);
+        sidecars.push(sidecar);
+    }
+    Ok((rustel_core::xen::xen_patterns(receiver, patterns), sidecars))
+}
+
 /// Reify one argument, bridging a user-authored function into a callback cell.
 ///
 /// A JS function that is NOT a registered-combinator reference becomes an
@@ -455,6 +480,11 @@ fn combinator_reference_within(
     // Pattern, far larger than the element the budget counts.
     let bound_values: Vec<rquickjs::Value> =
         genuine_bound_args(&name, &bound, remaining)?.collect();
+    // Scale arrays parse their entries when called, through the current
+    // lexical parser. Keep that callable and its nested callback owners.
+    if name == "xen" && bound_values.first().is_some_and(rquickjs::Value::is_array) {
+        return None;
+    }
     if bound_values
         .iter()
         .any(|value| requires_callable_bridge(value, 0, remaining))

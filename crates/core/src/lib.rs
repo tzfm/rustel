@@ -4259,6 +4259,8 @@ enum Node {
     /// hap, including exact lookup shape, while `dependencies` makes every
     /// graph it may return explicit to purity/ownership analysis.
     PatternOfHap(Pattern, Vec<Pattern>, HapToPatternFn),
+    /// Tune from ratio patterns while keeping the source note's spans.
+    XenPatterns(Pattern, Vec<Pattern>),
     /// Flatten a `PatternOf`, choosing whose whole survives.
     Join(Pattern, JoinMode),
     /// `fmap` with a USER callback. Holds only the opaque id.
@@ -4372,10 +4374,12 @@ fn inherited_runtime_settings(node: &Node) -> Option<settings::RuntimeSettings> 
             .runtime_settings
             .clone()
             .or_else(|| from_patterns(lookup.patterns())),
-        Node::PatternOfHap(pattern, dependencies, _) => pattern
-            .runtime_settings
-            .clone()
-            .or_else(|| from_patterns(dependencies)),
+        Node::PatternOfHap(pattern, dependencies, _) | Node::XenPatterns(pattern, dependencies) => {
+            pattern
+                .runtime_settings
+                .clone()
+                .or_else(|| from_patterns(dependencies))
+        }
     }
 }
 
@@ -5308,6 +5312,8 @@ impl Pattern {
                 signal_query_error(pattern_valued_hap_error);
                 Vec::new()
             }
+
+            Node::XenPatterns(pat, ratios) => xen::query_xen_patterns(pat, ratios, state),
 
             // bindWhole: each inner pattern is queried over its outer hap's
             // part; the mode picks whose whole survives, and contexts
@@ -7409,7 +7415,7 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
         | Node::Stack(patterns)
         | Node::SlowCat(patterns)
         | Node::SlowCatPrime(patterns) => out.extend(std::mem::take(patterns)),
-        Node::PatternOfHap(pattern, patterns, _) => {
+        Node::PatternOfHap(pattern, patterns, _) | Node::XenPatterns(pattern, patterns) => {
             take_child(pattern, out);
             out.extend(std::mem::take(patterns));
         }
@@ -7639,7 +7645,7 @@ fn compute_purity(node: &Node) -> purity::Purity {
         Node::PatternOfDynamic(p, _) => {
             purity::Purity::merge(vec![p.purity.clone(), purity::Purity::opaque()])
         }
-        Node::PatternOfHap(outer, dependencies, _) => {
+        Node::PatternOfHap(outer, dependencies, _) | Node::XenPatterns(outer, dependencies) => {
             let mut parts = vec![outer.purity.clone()];
             parts.extend(
                 dependencies

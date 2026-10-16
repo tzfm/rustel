@@ -11,10 +11,10 @@ const XEN: crate::reference::ReferenceEntry = crate::reference::ReferenceEntry {
     name: "xen",
     synonyms: &[],
     summary: "Assumes a numerical pattern of scale steps, and a scale.",
-    description: "Assumes a numerical pattern of scale steps, and a scale. Scales accepted are all preset scale names of `tune`, arbitrary edos such as 31edo, or an array of frequency ratios. Assumes scales repeat at octave (2/1). Returns a new pattern with all values mapped to their associated frequency, assuming a base frequency of 220hz.",
+    description: "Assumes a numerical pattern of scale steps, and a scale. Scales accepted are all preset scale names of `tune`, arbitrary edos such as 31edo, or an array of frequency ratios. Each ratio can be a number, a ratio such as `3:2`, or a pattern of ratios. Patterned ratios require integer scale steps. Their rhythms combine across all scale degrees. Rests can leave an incomplete scale and cause a query error. Assumes scales repeat at octave (2/1). Returns a new pattern with all values mapped to their associated frequency, assuming a base frequency of 220hz.",
     params: &[crate::reference::ReferenceParam {
         name: "scaleNameOrRatios",
-        r#type: "tuning | number[]",
+        r#type: "tuning | (number | string | Pattern)[]",
         description: "an EDO name such as `31edo`, a tuning name, or the ratios themselves.",
     }],
     examples: &[
@@ -22,6 +22,7 @@ const XEN: crate::reference::ReferenceEntry = crate::reference::ReferenceEntry {
         "// You can also use xen with frequency ratios.\n// This is equivalent to the above:\ni(\"0 1 2\").xen([\n  Math.pow(2, 0/31),\n  Math.pow(2, 8/31),\n  Math.pow(2, 18/31),\n]).piano()",
         "// xen also supports all scale names that\n// tune does:\ni(\"0 1 2 3 4 5\").xen(\"hexany15\")\n// equiv to:\n// \"0 1 2 3 4 5\".tune(\"hexany15\").mul(\"220\").freq()",
         "i(\"0 1 2 3 4 5 6 7\").xen(\"<5edo 10edo 15edo hexany15>\")",
+        "i(\"0 1 2 3\").xen(['1:1', '5:4', \"[3:2 4:3]\", '5:3']).s(\"triangle\")",
     ],
     tags: &["tonal"],
     no_autocomplete: false,
