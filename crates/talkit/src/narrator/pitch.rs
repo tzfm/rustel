@@ -38,32 +38,32 @@ use crate::params::Quality;
 use crate::personality::Timbre;
 
 /// The level before the first accent.
-const START: f32 = 0.983;
+const START: f32 = 0.985;
 /// Accent height per stress digit 4 to 9, at range 100.
-const HEIGHT: [f32; 6] = [0.181, 0.182, 0.24, 0.333, 0.42, 0.45];
+const HEIGHT: [f32; 6] = [0.17, 0.186, 0.24, 0.333, 0.42, 0.45];
 /// After an accent that is not the last: the floor and the sinking rate per
 /// second.
-const FLOOR: f32 = 0.998;
-const SINK: f32 = 0.416;
+const FLOOR: f32 = 1.009;
+const SINK: f32 = 0.456;
 /// A later accent rises this share of its height above the line.
-const LATER: f32 = 0.551;
+const LATER: f32 = 0.495;
 /// Where a phrase ends after a full stop, with and without accents.
-const FALL_ACCENTED: f32 = 0.714;
-const FALL_PLAIN: f32 = 0.747;
+const FALL_ACCENTED: f32 = 0.703;
+const FALL_PLAIN: f32 = 0.767;
 /// The level the line reaches before the final rise of a question or an
 /// open ending.
-const BEFORE_QUESTION: f32 = 1.012;
+const BEFORE_QUESTION: f32 = 1.021;
 const BEFORE_OPEN: f32 = 1.026;
 /// The level of a phrase with no accent before a final rise.
 const PLAIN_LEVEL: f32 = 0.97;
 /// The final rise over the last syllable: after an accent, and without one.
-const RISE_QUESTION: f32 = 0.28;
+const RISE_QUESTION: f32 = 0.299;
 const RISE_OPEN: f32 = 0.16;
 const RISE_QUESTION_PLAIN: f32 = 0.18;
 const RISE_OPEN_PLAIN: f32 = 0.24;
 /// An accent reaches its height this long after its syllable starts, ms at
 /// speed 150.
-const ACCENT_DELAY: f32 = 117.0;
+const ACCENT_DELAY: f32 = 112.0;
 
 /// One syllable as the pitch rules see it.
 #[derive(Clone, Copy)]
