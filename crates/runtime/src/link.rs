@@ -45,7 +45,14 @@ const MEASURE_RETRIES: u32 = 5;
 const MEASURE_SAMPLES: usize = 24;
 /// How long a measured session waits before it is measured again: a
 /// foreign session not joined, and the founder of the session stood in.
-const REMEASURE_AFTER: Duration = Duration::from_secs(30);
+const REMEASURE_AFTER: Duration = Duration::from_secs(10);
+/// How long a member waits for the founder of its session before it
+/// re-founds the session where the grid stands. A founder announces
+/// once a second and a peer is gone after [`PEER_LIFETIME`], so a
+/// founder silent this long has left. The session needs a founder: it
+/// is the founder a member measures its clock against, and the one a
+/// new participant measures to join.
+const FOUNDER_GRACE: Duration = Duration::from_secs(10);
 /// How long a target that never answered waits before it is asked
 /// again. Loss is common and cheap to retry, unlike a decline.
 const SILENT_RETRY_AFTER: Duration = Duration::from_secs(1);
@@ -225,6 +232,10 @@ struct Actor {
     measured_elsewhere: HashMap<[u8; 8], Instant>,
     /// When the founder of the session stood in was last measured.
     ours_measured: Option<Instant>,
+    /// When the founder of the session stood in was last heard. A member
+    /// whose founder stays silent past [`FOUNDER_GRACE`] re-founds the
+    /// session where the grid stands.
+    founder_seen: Option<Instant>,
     /// A session whose target stayed quiet, and when it may be asked
     /// again. Silence is lost packets or a busy wire, not a decision,
     /// so it comes due far sooner than a session declined.
@@ -268,6 +279,7 @@ impl Actor {
             peers: HashMap::new(),
             measured_elsewhere: HashMap::new(),
             ours_measured: None,
+            founder_seen: None,
             silent_until: HashMap::new(),
             measure: None,
             next_alive: Instant::now(),
@@ -384,6 +396,11 @@ impl Actor {
                     .start_stop
                     .is_some_and(|start_stop| self.session.observe_start_stop(start_stop)));
         self.announce_now |= adopted;
+        // The founder of the session stood in announcing it: the session
+        // still has the clock its members measure against.
+        if state.session_id == self.session.id && state.session_id == state.node_id {
+            self.founder_seen = Some(at);
+        }
         // An announcement gets a reply to its author alone, so a crowded
         // network still hears from a participant that arrived last.
         if message.alive && !message.response && (changed || adopted) && self.quiet_long_enough(at)
@@ -492,6 +509,7 @@ impl Actor {
             // founder: the offset tracks the founder's clock.
             self.session.host_offset = offset;
             self.ours_measured = Some(at);
+            self.founder_seen = Some(at);
         } else {
             let their_session = core::Session {
                 id: target_session,
@@ -516,6 +534,7 @@ impl Actor {
             if join {
                 self.session.join(&their_session);
                 self.ours_measured = Some(at);
+                self.founder_seen = Some(at);
                 self.announce_now = true;
             } else {
                 self.measured_elsewhere.insert(target_session, at);
@@ -527,6 +546,7 @@ impl Actor {
 
     /// The periodic work: announcements, peer expiry, the measurement.
     fn maintain(&mut self, now: Instant) {
+        self.refound_without_a_founder(now);
         self.peers
             .retain(|_, peer| now.duration_since(peer.last_seen) < PEER_LIFETIME);
         self.maintain_measurement(now);
@@ -536,6 +556,29 @@ impl Actor {
             self.announce_now = false;
         }
         self.publish();
+    }
+
+    /// Stand as the founder of the session again when its founder is
+    /// gone. A session lives on its founder's clock: the members measure
+    /// themselves against it, and a new participant measures it to join.
+    /// A founder can leave, and two participants that join each other's
+    /// sessions at once leave both sessions without one - a member of
+    /// either is left with no founder to measure and no way back to one
+    /// grid. Each member then re-founds the session where the grid
+    /// stands, keeping its tempo, its phase and its clock, so a founder
+    /// is announcing it again and the participants merge.
+    fn refound_without_a_founder(&mut self, now: Instant) {
+        if self.session.id == self.node_id {
+            return;
+        }
+        let founder_gone = self
+            .founder_seen
+            .is_none_or(|seen| now.duration_since(seen) >= FOUNDER_GRACE);
+        if !founder_gone {
+            return;
+        }
+        self.session.refound(self.node_id);
+        self.announce_now = true;
     }
 
     /// Keep one peer measured at a time: the founder of the session stood
@@ -1102,5 +1145,26 @@ mod tests {
         assert!(actor.measure.is_none(), "no ping before the rest ends");
         actor.maintain_target(now + REMEASURE_AFTER);
         assert!(actor.measure.is_some(), "the founder is measured again");
+    }
+
+    /// Two participants that joined each other's sessions stand without
+    /// a founder, each announcing a session its own founder no longer
+    /// speaks for. The member re-founds the session where the grid
+    /// stands, so the two have a founder to merge on again.
+    #[test]
+    fn a_member_whose_founder_is_gone_refounds_where_the_grid_stands() {
+        let mut actor = actor();
+        let founder = random_id();
+        actor.session.join(&found_session(founder, 90.0, 3.0));
+        actor.founder_seen = Some(Instant::now());
+        let timeline = actor.session.timeline;
+        actor.refound_without_a_founder(Instant::now() + FOUNDER_GRACE - Duration::from_secs(1));
+        assert_eq!(actor.session.id, founder, "the founder's grace holds");
+        actor.refound_without_a_founder(Instant::now() + FOUNDER_GRACE);
+        assert_eq!(
+            actor.session.id, actor.node_id,
+            "the member stands as founder"
+        );
+        assert_eq!(actor.session.timeline, timeline, "the grid does not move");
     }
 }
