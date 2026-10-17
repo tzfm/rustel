@@ -4329,6 +4329,10 @@ pub struct VstPage {
     pub scanned: Vec<VstScanned>,
     /// The number of plugins the host found in all folders.
     pub plugins: usize,
+    /// Where the scan of the folders is, as (bundles read, bundles in
+    /// all), while it runs. The rescan row says it, so the page itself
+    /// shows the scan the header badge stands for.
+    pub scan: Option<(usize, usize)>,
     /// The folder with one folder of `.vstpreset` files for each plugin.
     pub presets: String,
 }
@@ -8416,6 +8420,7 @@ mod tests {
                 },
             ],
             plugins: 2,
+            scan: Some((3, 124)),
             presets: "~/Music/presets".into(),
         };
         let mut sheet = SettingsSheet {
@@ -8465,6 +8470,7 @@ mod tests {
         assert!(text.contains("scanned plugins"), "{text}");
         assert!(text.contains("Tone · ready"), "{text}");
         assert!(text.contains("Kick · found"), "{text}");
+        assert!(text.contains("scanning · 3 of 124 bundles"), "{text}");
         // The rows are part of the walk: five Downs from the first action
         // reach the last plugin, and the hint under the list says so.
         let mut walked = UiSettings::default();

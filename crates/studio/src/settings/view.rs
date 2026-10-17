@@ -1239,6 +1239,16 @@ fn render_vst(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer: &mu
             SourceLine::Control(index) => {
                 let selected = *index == view.sheet.selected;
                 let (label, explain) = VST_CONTROLS[*index];
+                // The scan is what fills the list, so the row that starts
+                // a rescan also says where the read is.
+                let progress = (*index == VST_RESCAN_ROW)
+                    .then(|| {
+                        view.vst
+                            .scan
+                            .map(|(read, in_all)| format!("scanning · {read} of {in_all} bundles"))
+                    })
+                    .flatten();
+                let explain = progress.as_deref().unwrap_or(explain);
                 let text = format!("{} {label:<label_width$}", marker(selected));
                 let style = if selected {
                     Style::default()

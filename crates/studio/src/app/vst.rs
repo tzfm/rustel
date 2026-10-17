@@ -437,6 +437,7 @@ impl App {
                 })
                 .collect(),
             plugins: plugins.len(),
+            scan: self.plugin_scan,
             presets: vst::presets_folder()
                 .map(|presets| shorten_home(&presets))
                 .unwrap_or_default(),
