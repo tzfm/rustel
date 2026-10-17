@@ -76,7 +76,9 @@ names.
 
 A name ignores upper case, spaces and punctuation. `"valhalla supermassive"`
 finds `ValhallaSupermassive`. A part of a plugin name finds the plugin with
-the shortest name: `"serum"` finds `Serum 2`.
+the shortest name: `"serum"` finds `Serum 2`. A part that is a whole word of
+a name comes first, then a part at the start of a word, then a part inside a
+word. `"tal"` finds `TAL-NoiseMaker`, not `Talk Box` or `Vital`.
 
 A parameter needs its full name: `predelay` finds `Pre-Delay`. The first
 column of `rustel vst <name>` is the name to write. Each value goes from 0 to

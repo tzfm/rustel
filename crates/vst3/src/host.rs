@@ -478,10 +478,23 @@ impl State {
                 .filter(|(_, entry)| entry.present)
         };
         // A part of a name finds the plugin with the shortest name that
-        // has the part.
-        let partial = present()
-            .filter(|(_, entry)| entry.key.contains(&wanted) || entry.stem.contains(&wanted))
-            .min_by_key(|(_, entry)| entry.key.len());
+        // has the part: first as whole words, then at the start of a word,
+        // then anywhere. "tal" finds TAL-NoiseMaker before Talk Box and
+        // Vital.
+        let words = |entry: &Entry| {
+            let stem = entry.bundle.file_stem().unwrap_or_default();
+            let stem = word_match(&stem.to_string_lossy(), &entry.stem, &wanted);
+            word_match(&entry.name, &entry.key, &wanted).max(stem)
+        };
+        let anywhere = |entry: &Entry| entry.key.contains(&wanted) || entry.stem.contains(&wanted);
+        let shortest = |has: &dyn Fn(&Entry) -> bool| {
+            present()
+                .filter(|(_, entry)| has(entry))
+                .min_by_key(|(_, entry)| entry.key.len())
+        };
+        let partial = shortest(&|entry| words(entry) == 2)
+            .or_else(|| shortest(&|entry| words(entry) == 1))
+            .or_else(|| shortest(&anywhere));
         if let Some((index, _)) = partial {
             return Some(index);
         }
@@ -511,6 +524,42 @@ impl State {
         let found = found.or_else(|| present().find(|(_, entry)| entry.stem == wanted));
         found.map(|(index, _)| index)
     }
+}
+
+/// Where `wanted` is in `name`: 2 when it covers whole words, as "tal" in
+/// "TAL-NoiseMaker", 1 when it starts a word, as "tal" in "Talk Box",
+/// and 0 for no part at the start of a word, as "tal" in "Vital". A word
+/// starts after a space or a sign, at a capital after a small letter, and
+/// at a digit after a letter. `key` is the compare form of `name`, and
+/// `wanted` is in compare form too.
+fn word_match(name: &str, key: &str, wanted: &str) -> u8 {
+    let mut rank = 0;
+    // The ends of the parts found so far: a part that ends where a word
+    // starts covers whole words.
+    let mut ends: Vec<usize> = Vec::new();
+    let mut at = 0;
+    let mut before: Option<char> = None;
+    for char in name.chars() {
+        if char.is_alphanumeric() {
+            let head = before.is_none_or(|before| {
+                !before.is_alphanumeric()
+                    || (before.is_lowercase() && char.is_uppercase())
+                    || (before.is_alphabetic() && char.is_numeric())
+            });
+            if head {
+                if ends.contains(&at) {
+                    return 2;
+                }
+                if key.get(at..).is_some_and(|rest| rest.starts_with(wanted)) {
+                    rank = 1;
+                    ends.push(at + wanted.len());
+                }
+            }
+            at += char.to_lowercase().map(char::len_utf8).sum::<usize>();
+        }
+        before = Some(char);
+    }
+    if ends.contains(&at) { 2 } else { rank }
 }
 
 /// Reads the preset files of a plugin from the folder with its name under
@@ -1764,6 +1813,30 @@ fn build_instance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A part of a name finds the plugin with the part as whole words, then
+    /// at the start of a word, before a shorter name with the part inside a
+    /// word.
+    #[test]
+    fn a_part_of_a_name_finds_whole_words_first() {
+        let mut state = State::default();
+        for name in [
+            "Vital",
+            "Talk Box",
+            "TAL-NoiseMaker",
+            "ValhallaSupermassive",
+        ] {
+            let bundle = PathBuf::from(format!("{name}.vst3"));
+            let entry = Entry::new(name.to_owned(), bundle, Stage::Found);
+            state.entries.push(entry);
+        }
+        let found = |name: &str| state.find(name).map(|row| state.entries[row].name.as_str());
+        assert_eq!(found("TAL"), Some("TAL-NoiseMaker"));
+        assert_eq!(found("talk"), Some("Talk Box"));
+        assert_eq!(found("noise"), Some("TAL-NoiseMaker"));
+        assert_eq!(found("supermassive"), Some("ValhallaSupermassive"));
+        assert_eq!(found("ital"), Some("Vital"));
+    }
 
     /// A panic in a load or a build is a failure with a reason. A panic of
     /// a thread with the locks of the host leaves the host in use.
