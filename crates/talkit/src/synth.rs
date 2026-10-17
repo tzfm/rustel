@@ -31,6 +31,10 @@ const OPEN_QUOTIENT: f32 = 0.62;
 const OPEN_QUOTIENT_BREATHY: f32 = 0.8;
 /// Overall gain before the render pass normalizes the peak.
 const GAIN: f32 = 0.6;
+/// The noise branch against the voiced one. It puts a sibilant about 12 dB
+/// under the vowels around it, as in natural speech, where an equal level
+/// sounds like a hiss on top of the voice.
+const FRICATION_GAIN: f32 = 0.5;
 
 /// One two-pole resonator.
 struct Resonator {
@@ -145,7 +149,7 @@ pub fn synthesize(utterance: &Utterance, plan: &Plan, effort: Effort) -> Vec<f32
 
         let frication = if fric_hz > 0.0 && fric_amp > 0.0 {
             fric_res.set(fric_hz, fric_hz.mul_add(0.25, 100.0));
-            fric_res.run(noise.next_f32()) * fric_amp
+            fric_res.run(noise.next_f32()) * fric_amp * FRICATION_GAIN
         } else {
             0.0
         };

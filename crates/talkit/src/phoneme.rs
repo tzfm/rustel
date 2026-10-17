@@ -202,8 +202,10 @@ const fn stop(
     }
 }
 
+/// An unvoiced fricative: noise alone, with no glottal buzz under it.
 const fn fricative(fric_hz: f32, fric_amp: f32, ms: u32) -> Frame {
     Frame {
+        voice: 0.0,
         fric_hz,
         fric_amp,
         ..voiced(400.0, 1400.0, 2500.0, ms)

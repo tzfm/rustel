@@ -60,7 +60,7 @@ const COMMA_MS: f32 = 220.0;
 const END_MS: f32 = 420.0;
 /// The burst a stop release adds, in ms before speed scaling.
 const BURST_MS: f32 = 12.0;
-/// The pad after the last span so its target is held, not cut.
+/// The closing pause after the last sound, long enough for it to glide out.
 const TAIL_MS: f32 = 60.0;
 /// A stretched vowel is held longer than its unstressed form.
 const STRETCH: f32 = 1.3;
@@ -114,7 +114,16 @@ pub fn build(phones: &[Phone], speed: u32) -> Utterance {
         }
     }
 
-    let total_ms = cursor + TAIL_MS;
+    // The closing pad is a pause, so the last sound glides out to silence
+    // over the transition instead of holding: a final `s` stops hissing.
+    push_span(
+        &mut spans,
+        &mut cursor,
+        frame(Phoneme::Pause),
+        TAIL_MS,
+        false,
+    );
+    let total_ms = cursor;
     Utterance {
         spans,
         total_ms,
@@ -185,10 +194,15 @@ mod tests {
     #[test]
     fn speed_scales_durations_and_pauses_stay_fixed() {
         let phones = Language::English.transcribe("ah");
-        let slow = build(&phones, 75);
-        let fast = build(&phones, 300);
-        let slow_vowel = slow.spans.last().unwrap().end - slow.spans.last().unwrap().start;
-        let fast_vowel = fast.spans.last().unwrap().end - fast.spans.last().unwrap().start;
+        let vowel = |speed| {
+            let u = build(&phones, speed);
+            let span = u.spans.iter().find(|span| span.nucleus).copied().unwrap();
+            let tail = u.spans.last().unwrap();
+            (span.end - span.start, tail.end - tail.start)
+        };
+        let (slow_vowel, slow_tail) = vowel(75);
+        let (fast_vowel, fast_tail) = vowel(300);
         assert!(slow_vowel > fast_vowel * 3.5);
+        assert_eq!(slow_tail, fast_tail, "the closing pause keeps its length");
     }
 }
