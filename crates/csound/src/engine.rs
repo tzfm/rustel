@@ -322,9 +322,13 @@ mod tests {
             .iter()
             .position(|path| path == "/Library/Frameworks/CsoundLib64.framework/CsoundLib64")
             .expect("the system framework");
+        // The engine joins the home with `PathBuf`, which spells the
+        // separators the local way - the expected path is built the same
+        // way, so the test says the same on every platform.
         assert_eq!(
-            with_home[at + 1],
-            "/Users/someone/Library/Frameworks/CsoundLib64.framework/CsoundLib64"
+            std::path::Path::new(&with_home[at + 1]),
+            std::path::PathBuf::from(home)
+                .join("Library/Frameworks/CsoundLib64.framework/CsoundLib64")
         );
         assert!(
             without_home
