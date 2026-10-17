@@ -2,9 +2,10 @@
 //!
 //! The engine refuses `await import('https://...')` from an origin that is
 //! not trusted. The page reads as a switch: Enter trusts a refused origin,
-//! and Space flips a row where it stands, so a trust can be taken back
-//! without the origin leaving the page. A refused or turned-off origin
-//! stays listed until the studio closes; a trust is kept in the settings.
+//! and the left and right arrows, like Space, flip a row where it stands,
+//! so a trust can be taken back without the origin leaving the page. A
+//! refused or turned-off origin stays listed until the studio closes; a
+//! trust is kept in the settings.
 
 use super::super::settings::TrustRow;
 use super::super::worker::EngineFailure;

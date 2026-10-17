@@ -747,8 +747,8 @@ pub(super) fn render_trust(
     // for one line, and a player who cannot see "Enter trusts" cannot
     // work the page.
     let keys = match view.trust.get(view.sheet.selected) {
-        Some(row) if row.allowed => "Space off · d removes · Tab pages",
-        Some(_) => "Enter trusts · Space on/off · d dismisses · Tab pages",
+        Some(row) if row.allowed => "←/→/Space off · d removes · Tab pages",
+        Some(_) => "Enter trusts · ←/→/Space on/off · d dismisses · Tab pages",
         None => "Tab pages",
     };
     let text = format!(

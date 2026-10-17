@@ -95,6 +95,65 @@ pub(crate) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         origin: "rustel",
     },
     ReferenceEntry {
+        name: "talkit",
+        synonyms: &[],
+        summary: "Speak the text through the built-in speech synthesizer.",
+        description: "Speak the text instead of playing a sample or a synth. Single quotes speak one phrase per cycle, spaces and punctuation included: `talkit('hello there, how are you?')`. Double quotes are mini-notation, one word per event: `talkit(\"my name is skrillex\")`. An array plays its phrases one after another in the cycle.\n\nThe second argument sets the voice: `talkit('hola', { personality: \"little-robot\", language: \"es\" })`. The keys are personality (`v`), pitch (`p`) 50 to 500 Hz, speed (`s`) 50 to 400, quality (`q`), effort (`e`) and language (`l`), each itself a pattern.\n\nA note sets the pitch the voice starts on: `note(\"c3 e3 g3\").talkit('la')` sings three notes. An explicit `pitch` outranks the note. The ordinary controls apply as to a sample.",
+        params: &[
+            ReferenceParam {
+                name: "text",
+                r#type: "string | Pattern",
+                description: "the words to speak: one phrase in single quotes, one word per event in double quotes",
+            },
+            ReferenceParam {
+                name: "config",
+                r#type: "Object",
+                description: "voice settings by name: personality, pitch, speed, quality, effort, language.",
+            },
+            ReferenceParam {
+                name: "config.personality",
+                r#type: "string | Pattern",
+                description: "a named voice that sets pitch, speed, quality and effort at once. Alias: v",
+            },
+            ReferenceParam {
+                name: "config.pitch",
+                r#type: "number | Pattern",
+                description: "the pitch the voice starts on, 50 to 500 Hz. Alias: p",
+            },
+            ReferenceParam {
+                name: "config.speed",
+                r#type: "number | Pattern",
+                description: "how fast the voice speaks, 50 to 400, 150 nominal. Alias: s",
+            },
+            ReferenceParam {
+                name: "config.quality",
+                r#type: "string | Pattern",
+                description: "natural, monotone or sung. Alias: q",
+            },
+            ReferenceParam {
+                name: "config.effort",
+                r#type: "string | Pattern",
+                description: "normal, breathy or whispered. Alias: e",
+            },
+            ReferenceParam {
+                name: "config.language",
+                r#type: "string | Pattern",
+                description: "english or spanish. Alias: l",
+            },
+        ],
+        examples: &[
+            "$: talkit('hello there').slow(2)",
+            "$: talkit(\"my name is skrillex\")",
+            "$: talkit('hola mundo', { personality: \"little-robot\", language: \"es\" })",
+            "$: talkit(['question?', 'answer.'], { effort: \"whispered\" })",
+            "$: note(\"c3 e3 g3 c4\").talkit('la', { v: \"singing-boy\", q: \"monotone\" })",
+        ],
+        tags: &["audio", "samples", "experimental"],
+        no_autocomplete: false,
+        deprecated: false,
+        origin: "rustel",
+    },
+    ReferenceEntry {
         name: "loadSoundfont",
         synonyms: &[],
         summary: "Loading soundfonts through this call is not supported in Rustel.",
@@ -128,7 +187,7 @@ fn define_method<'js>(
         "filterHaps" => ("", 1),
         "filterValues" | "withQuerySpan" => ("value", 1),
         "modulate" => ("value", 3),
-        "lfo" | "env" | "bmod" | "vst" | "vsti" => ("value", 2),
+        "lfo" | "env" | "bmod" | "vst" | "vsti" | "talkit" => ("value", 2),
         _ => ("value", 0),
     };
     function
@@ -435,6 +494,17 @@ pub(super) fn install<'js>(
         set_function_length(&free, 2)?;
         globals.set(call, free).map_err(|error| error.to_string())?;
     }
+    define_method(
+        proto,
+        "talkit",
+        Function::new(ctx.clone(), speech::speech_method).map_err(|error| error.to_string())?,
+    )?;
+    let talkit =
+        Function::new(ctx.clone(), speech::speech_free).map_err(|error| error.to_string())?;
+    set_function_length(&talkit, 2)?;
+    globals
+        .set("talkit", talkit)
+        .map_err(|error| error.to_string())?;
     define_method(
         proto,
         "piano",

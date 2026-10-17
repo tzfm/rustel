@@ -3779,6 +3779,7 @@ dependencies = [
  "rustel-osc",
  "rustel-scheduler",
  "rustel-serial",
+ "rustel-talkit",
  "rustel-transpiler",
  "rustel-voice",
  "rustel-vst3",
@@ -3868,6 +3869,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustel-talkit"
+version = "0.1.3"
+dependencies = [
+ "cpal",
+]
+
+[[package]]
 name = "rustel-transpiler"
 version = "0.1.3"
 dependencies = [
@@ -3889,6 +3897,7 @@ version = "0.1.3"
 dependencies = [
  "rustel-audio",
  "rustel-core",
+ "rustel-talkit",
  "serde_json",
 ]
 

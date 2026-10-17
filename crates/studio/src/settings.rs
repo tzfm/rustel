@@ -2681,9 +2681,10 @@ impl SettingsSheet {
         matches!(self.page, SettingsPage::Trust)
     }
 
-    /// The arrows walk the origins and wrap. Enter trusts, Space flips a
-    /// row's trust where it stands, and Delete, Backspace or `d` takes an
-    /// origin off the page. Esc and Tab stay the sheet's.
+    /// The arrows walk the origins and wrap. Enter trusts. A row has two
+    /// states, so Left, Right and Space each flip its trust where it stands,
+    /// and Delete, Backspace or `d` takes an origin off the page. Esc and Tab
+    /// stay the sheet's.
     fn trust_key(&mut self, code: crossterm::event::KeyCode) -> SettingsAction {
         use crossterm::event::KeyCode;
         let len = self.trust_count;
@@ -2701,7 +2702,7 @@ impl SettingsSheet {
                 SettingsAction::Nothing
             }
             KeyCode::Enter => SettingsAction::TrustImport(at),
-            KeyCode::Char(' ') => SettingsAction::ToggleImport(at),
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => SettingsAction::ToggleImport(at),
             KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('d' | 'D') => {
                 SettingsAction::ForgetImport(at)
             }
@@ -7749,6 +7750,9 @@ mod tests {
         sheet.trust_count = 2;
         let mut trust_key = |code| sheet.key(code, &mut settings, &TerminalFeatures::default());
         assert_eq!(trust_key(KeyCode::Up), SettingsAction::Nothing);
+        // Left and Right flip the row as Space does, like a settings row.
+        assert_eq!(trust_key(KeyCode::Right), SettingsAction::ToggleImport(1));
+        assert_eq!(trust_key(KeyCode::Left), SettingsAction::ToggleImport(1));
         assert_eq!(trust_key(KeyCode::Enter), SettingsAction::TrustImport(1));
         assert_eq!(
             trust_key(KeyCode::Char(' ')),

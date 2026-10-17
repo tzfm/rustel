@@ -22,6 +22,7 @@ members = [
     "crates/vst3-fixture",
     "crates/kabel",
     "crates/studio-e2e",
+    "crates/talkit",
     "xtask",
 ]
 

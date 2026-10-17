@@ -7,6 +7,7 @@ Use `rustel --help` for command options and `rustel doc NAME` for pattern help.
 | --- | --- |
 | Live code in the terminal | [Studio](studio.md) |
 | Play, check, or export a score | [Command line](cli.md) |
+| Speak text | [Talkit](talkit.md) |
 | Use your own samples | [Local samples](local-samples.md) |
 | Record or replay a set | [Sessions](sessions.md) |
 | Connect devices | [Hardware](hardware.md) |

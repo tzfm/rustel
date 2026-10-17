@@ -1446,10 +1446,10 @@ mod tests {
                 reference.by_name.get("setcpm"),
                 reference.by_name.get("setCpm")
             );
-            // The VST3 calls are experimental. So is each call whose text
-            // says so, and the body says it one time. A stable call has no
-            // mark.
-            for name in ["vst", "vsti"] {
+            // The VST3 calls and talkit are experimental. So is each call
+            // whose text says so, and the body says it one time. A stable
+            // call has no mark.
+            for name in ["vst", "vsti", "talkit"] {
                 assert_eq!(body(name, BodyKind::Origin), ["experimental"], "{name}");
             }
             for index in 0..reference.len() {
