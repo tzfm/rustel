@@ -44,6 +44,10 @@ const FRICATION_GAIN: f32 = 0.35;
 /// The breath of an `h` against the voice: about 10 dB under the vowel it
 /// leads into, as the original engine speaks it.
 const ASPIRATION_GAIN: f32 = 0.3;
+/// The breath of breathy speech, against the voice's running level.
+const BREATH: f32 = 2.0;
+/// How fast the voice's running level follows it: about 10 ms.
+const POWER_FOLLOW: f32 = 1.0 / (0.01 * RATE as f32);
 
 /// One two-pole resonator.
 struct Resonator {
@@ -126,6 +130,8 @@ pub fn synthesize(utterance: &Utterance, plan: &Plan, effort: Effort, timbre: Ti
         0.0
     };
     let mut softened = 0.0f32;
+    let mut voice_power = 0.0f32;
+    let mut last_noise = 0.0f32;
 
     for n in 0..frames {
         let ms = n as f32 * 1000.0 / RATE as f32;
@@ -160,9 +166,19 @@ pub fn synthesize(utterance: &Utterance, plan: &Plan, effort: Effort, timbre: Ti
             let mut voiced_source = glottal + (buzz - glottal) * buzz_share;
             softened = voiced_source + (softened - voiced_source) * soft_pole;
             voiced_source = softened;
+            // The breath follows the voice's own running level, so it keeps
+            // its share whatever the tone and the pitch.
+            voice_power += (voiced_source * voiced_source - voice_power) * POWER_FOLLOW;
             source = match effort {
                 Effort::Normal => voiced_source,
-                Effort::Breathy => voiced_source * 0.75 + noise.next_f32() * 0.3,
+                Effort::Breathy => {
+                    // Breath is turbulence high in the spectrum: the noise's
+                    // first difference.
+                    let n = noise.next_f32();
+                    let breath = (n - last_noise) * voice_power.sqrt() * BREATH;
+                    last_noise = n;
+                    voiced_source * 0.75 + breath
+                }
                 Effort::Whispered => noise.next_f32() * 0.9,
             } * voice;
         }

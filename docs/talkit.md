@@ -4,6 +4,8 @@ Speak text. `talkit` is a speech synthesizer built on the parameter model of
 the old Talk It! program, with a formant engine written in Rust. It has no GUI
 and no external libraries, just text in and sound out.
 
+Talkit is experimental.
+
 ## In a score
 
 `talkit(text, options)` speaks text, the way `s("...")` plays a sample. The
@@ -53,6 +55,10 @@ a little across each phrase and starts again after a pause, a final `.`
 falls and a final `?` rises. For a melody that stays on its notes, use
 `quality: "monotone"`.
 
+A whispered voice has no pitch: `effort: "whispered"` replaces the voice with
+breath, so a note or a `pitch` setting changes nothing. A breathy voice keeps
+its pitch.
+
 ### Controls
 
 The `speed` option is how fast the synthesizer speaks. The hap control
@@ -98,7 +104,7 @@ the other keys in any order.
 | `pitch` or `p` | 50 to 500 | the pitch the voice starts on in Hz, default 100 |
 | `speed`, `rate` or `s` | 50 to 400 | whole numbers, 150 is nominal, higher is faster |
 | `quality` or `q` | natural, monotone, sung | monotone holds one pitch, sung walks a chord |
-| `effort` or `e` | normal, breathy, whispered | whispered drops voicing entirely |
+| `effort` or `e` | normal, breathy, whispered | whispered drops voicing entirely, and with it the pitch |
 | `language`, `lang` or `l` | english, spanish | letter rules and number words per language |
 | `out` or `o` | a `.wav` path | command line only, writes the file instead of playing |
 

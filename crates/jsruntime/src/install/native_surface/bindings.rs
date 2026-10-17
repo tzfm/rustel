@@ -147,7 +147,7 @@ pub(crate) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
             "$: talkit([\"question?\", \"answer.\"], { effort: \"whispered\" })",
             "$: note(\"c3 e3 g3 c4\").talkit(\"la\", { v: \"choir-boy\" })",
         ],
-        tags: &["audio", "samples"],
+        tags: &["audio", "samples", "experimental"],
         no_autocomplete: false,
         deprecated: false,
         origin: "rustel",
