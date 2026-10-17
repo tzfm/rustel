@@ -18,14 +18,15 @@
 //! ranges all lie outside the labeled statements, as a pattern kept in a
 //! variable does, still gets a row for its sound, without a lane label.
 //! The rows of a lane share its colour, and a sound keeps its mark in every
-//! lane.
+//! lane. Behind the score the rows keep to a strip along the bottom of the
+//! stage.
 
 use std::ops::Range;
 use std::sync::Arc;
 
 use super::*;
 
-/// The marks of the sounds without a pitch, one per sound in turn.
+/// The marks of the sounds without a pitch, chosen by the sound's name.
 const HITS: [char; 4] = ['▮', '¦', '×', '▪'];
 /// A pitched row draws each note as a block whose height is its pitch
 /// within the row's range.
@@ -122,34 +123,58 @@ impl Widget for Lanes<'_, '_> {
         for (rank, &index) in order.iter().enumerate() {
             ranks[index] = rank;
         }
-        let palette = [
+        // The theme's colours, each once. A theme of one colour keeps it.
+        let mut palette: Vec<Color> = Vec::with_capacity(9);
+        for color in [
             theme.event,
             theme.accent,
             theme.syntax.string,
-            theme.syntax.number,
-            theme.syntax.keyword.unwrap_or(theme.warn),
-        ];
-        // Each row's colour, by its lane, and its mark, by its sound.
+            theme.syntax.punctuation,
+            theme.error,
+        ]
+        .into_iter()
+        .chain(theme.syntax.function)
+        .chain(theme.syntax.keyword)
+        .chain([theme.syntax.number, theme.mini])
+        {
+            if !palette.contains(&color) {
+                palette.push(color);
+            }
+        }
+        // A row's colour follows its lane's place in the score, and its mark
+        // the sound's name, so neither changes as other rows come and go. A
+        // sound whose name chooses a mark another sound here already has
+        // takes the next free one.
         let mut colors = vec![theme.event; rows.len()];
         let mut hits = vec![HITS[0]; rows.len()];
-        let mut sounds: Vec<&str> = Vec::new();
-        let mut lane_count = 0;
-        for (rank, &index) in order.iter().enumerate() {
+        let mut chosen: Vec<(&str, usize)> = Vec::new();
+        for &index in &order {
             let row = &rows[index];
-            let previous = rank.checked_sub(1).map(|rank| rows[order[rank]].lane);
-            if rank > 0 && (row.lane.is_none() || previous != Some(row.lane)) {
-                lane_count += 1;
-            }
-            colors[index] = palette[lane_count % palette.len()];
-            let sound = sounds
-                .iter()
-                .position(|sound| *sound == row.sound)
-                .unwrap_or_else(|| {
-                    sounds.push(row.sound);
-                    sounds.len() - 1
-                });
-            hits[index] = HITS[sound % HITS.len()];
+            let place = row.lane.unwrap_or_else(|| name_hash(row.sound));
+            colors[index] = palette[place % palette.len()];
+            let mark = match chosen.iter().find(|(sound, _)| *sound == row.sound) {
+                Some(&(_, mark)) => mark,
+                None => {
+                    let first = name_hash(row.sound) % HITS.len();
+                    let mark = (0..HITS.len())
+                        .map(|step| (first + step) % HITS.len())
+                        .find(|mark| chosen.iter().all(|(_, taken)| taken != mark))
+                        .unwrap_or(first);
+                    chosen.push((row.sound, mark));
+                    mark
+                }
+            };
+            hits[index] = HITS[mark];
         }
+
+        // Behind the score the rows keep to a strip along the bottom of the
+        // stage, a blank line between them, clear of the code at the top.
+        let area = if request.inline {
+            area
+        } else {
+            let height = (rows.len().max(1) * 2 + 3).min(usize::from(area.height)) as u16;
+            Rect::new(area.x, area.bottom() - height, area.width, height)
+        };
 
         // The caps take the first and last rows when the rows leave room
         // for them. The rows share what is left, each on the middle line of
@@ -289,6 +314,13 @@ fn put(buffer: &mut Buffer, x: u16, y: u16, symbol: char, color: Color) {
     if let Some(cell) = buffer.cell_mut((x, y)) {
         cell.set_char(symbol).set_fg(color);
     }
+}
+
+/// A name's place in a short list, the same in every picture.
+fn name_hash(name: &str) -> usize {
+    name.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+    }) as usize
 }
 
 /// The labeled statement an event comes from: the first of its source

@@ -498,10 +498,10 @@ bass  ▃▃▃·▅▅┊▅▅·▂▂▂▂·▃▃▃·▅▅
 ```
 
 A labeled lane, such as `kick:`, gives its name to its rows. A `$:` lane, and a
-pattern that a variable holds, show the sound name. Each lane has its own
-colour, and a sound has the same mark in every lane. A pitched sound shows each
-note as a block, and the height of the block follows the pitch. The number
-beside the playhead is the current cycle.
+pattern that a variable holds, show the sound name. Each lane takes its own
+colour from the theme, and a sound has the same mark in every lane. A pitched
+sound shows each note as a block, and the height of the block follows the
+pitch. The number beside the playhead is the current cycle.
 
 When the panel has the keyboard, `e` moves it between the top and the bottom,
 `-` and `+` change its height, and Esc gives the keyboard back to the score.
@@ -509,7 +509,8 @@ The panel stays open, and it opens again at the next launch. The panel has no
 shortcut. To add one, learn a key in Settings ▸ Keybinds.
 
 A score can draw the same view. `_lanes()` draws the rows of its own pattern
-under the call, and `lanes()` draws every lane behind the score:
+under the call. `lanes()` draws every lane in a strip along the bottom, behind
+the score:
 
 ```js
 kick: s("sbd*4")
