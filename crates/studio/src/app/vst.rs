@@ -432,12 +432,15 @@ impl App {
                         Status::Ready => "ready".to_owned(),
                         Status::Loading => "loading".to_owned(),
                         Status::Found => "found".to_owned(),
-                        Status::Failed(_) => "failed".to_owned(),
+                        Status::Failed(reason) => {
+                            let reason = reason.lines().next().unwrap_or_default();
+                            format!("failed · {reason}")
+                        }
                     },
                 })
                 .collect(),
             plugins: plugins.len(),
-            scan: self.plugin_scan,
+            scan: self.plugin_scan.clone(),
             presets: vst::presets_folder()
                 .map(|presets| shorten_home(&presets))
                 .unwrap_or_default(),

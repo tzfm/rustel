@@ -1242,12 +1242,14 @@ fn render_vst(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer: &mu
                 // The scan is what fills the list, so the row that starts
                 // a rescan also says where the read is.
                 let progress = (*index == VST_RESCAN_ROW)
-                    .then(|| {
-                        view.vst
-                            .scan
-                            .map(|(read, in_all)| format!("scanning · {read} of {in_all} bundles"))
-                    })
-                    .flatten();
+                    .then_some(view.vst.scan.as_ref())
+                    .flatten()
+                    .map(|scan| {
+                        format!(
+                            "scanning · {} of {} bundles · {}",
+                            scan.read, scan.bundles, scan.plugin
+                        )
+                    });
                 let explain = progress.as_deref().unwrap_or(explain);
                 let text = format!("{} {label:<label_width$}", marker(selected));
                 let style = if selected {
@@ -1318,7 +1320,7 @@ fn render_vst(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer: &mu
     let hint = if at == VST_ADD_ROW {
         "Enter opens the folder prompt"
     } else if at == VST_RESCAN_ROW {
-        "Enter reads every folder and tests each plugin again"
+        "Enter empties the scan cache and tests each plugin again"
     } else if at < VST_CONTROL_COUNT + added {
         "d removes this folder"
     } else if at < VST_CONTROL_COUNT + folders.len() {

@@ -12,13 +12,14 @@
 //! ```
 //!
 //! The answer is in a file, so no line a plugin prints is in the answer.
-//! The scan process writes one line of progress after each class it reads,
-//! and each finished line restarts the wait of the host: the limit is the
-//! time of one class, not of the bundle as a whole, so a bundle of many
-//! slow classes scans to its end.
+//! The scan process writes one line of progress with the name of each
+//! class before its load, and each finished line restarts the wait of the
+//! host: the limit is the time of one class, not of the bundle as a whole,
+//! so a bundle of many slow classes scans to its end.
 //! A scan process that ends with no answer, or gives no answer in the time
-//! limit, fails its bundle and no more. A scan that did not run, with no
-//! file or no process from the system, fails no bundle.
+//! limit, fails its bundle and no more. The fault names the class in its
+//! load. A scan that did not run, with no file or no process from the
+//! system, fails no bundle.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -31,6 +32,8 @@ use crate::host::{Plugin, WorkerProgram, load_bundle};
 
 /// The scan process reads the path of its answer file from this variable.
 const ANSWER_ENV: &str = "RUSTEL_VST3_WORKER";
+/// The start of a line of progress. The name of the class follows.
+const CLASS_LINE: &str = "class ";
 /// The scan process reads its work limit, in milliseconds, from this
 /// variable. The host sets it to the limit it waits itself, so the two
 /// sides end a load that shows no progress at the same time.
@@ -117,7 +120,8 @@ fn write_line(file: &Path, line: &[u8]) -> bool {
 /// The scan process: loads the bundle, writes its plugins to the answer
 /// file, and returns the exit code of the process. The worker program calls
 /// this with the bundle path the host gave as the last argument. One line
-/// of progress goes in the file after each class the load reads.
+/// of progress with the name of the class goes in the file before the load
+/// of each class.
 pub fn serve(bundle: &Path) -> i32 {
     let Some(file) = std::env::var_os(ANSWER_ENV).map(PathBuf::from) else {
         return 2;
@@ -144,10 +148,11 @@ pub fn serve(bundle: &Path) -> i32 {
             }
         });
     }
-    let loaded = load_bundle(bundle, &mut || {
+    let loaded = load_bundle(bundle, &mut |class| {
         // The line goes in the file first, so a slow write keeps the
-        // watchdog waiting.
-        let _ = write_line(&file, b"class\n");
+        // watchdog waiting. A name with a line break is still one line.
+        let name = class.replace(char::is_control, " ");
+        let _ = write_line(&file, format!("{CLASS_LINE}{name}\n").as_bytes());
         mark(&moved);
     });
     let answer: Answer = match &loaded {
@@ -186,6 +191,8 @@ struct Look {
     /// The lines the scan process finished. A line without its newline,
     /// such as a write a kill cut apart, is no line at all.
     lines: usize,
+    /// The class in its load, from the last finished line of progress.
+    class: Option<String>,
     /// The answer, when the last finished line of the file is one.
     answer: Option<Answer>,
 }
@@ -216,6 +223,7 @@ impl AnswerFile {
         let Ok(bytes) = std::fs::read(&self.0) else {
             return Look {
                 lines: 0,
+                class: None,
                 answer: None,
             };
         };
@@ -225,6 +233,7 @@ impl AnswerFile {
         let Some(cut) = bytes.iter().rposition(|byte| *byte == b'\n') else {
             return Look {
                 lines: 0,
+                class: None,
                 answer: None,
             };
         };
@@ -233,9 +242,13 @@ impl AnswerFile {
             .iter()
             .rposition(|byte| *byte == b'\n')
             .map_or(0, |at| at + 1);
+        let last = &finished[start..];
         Look {
             lines: 1 + finished.iter().filter(|byte| **byte == b'\n').count(),
-            answer: serde_json::from_slice(&finished[start..]).ok(),
+            class: last
+                .strip_prefix(CLASS_LINE.as_bytes())
+                .map(|name| String::from_utf8_lossy(name).into_owned()),
+            answer: serde_json::from_slice(last).ok(),
         }
     }
 }
@@ -248,12 +261,14 @@ impl Drop for AnswerFile {
 
 /// Loads a bundle in a scan process and gives its plugins. Each class of
 /// the bundle has `limit` to finish, and each line of progress restarts
-/// the wait. `closed` ends the wait: the host ends.
+/// the wait and gives `class` the name of the class in its load. `closed`
+/// ends the wait: the host ends.
 pub(crate) fn scan(
     program: &WorkerProgram,
     bundle: &Path,
     limit: Duration,
     closed: &AtomicBool,
+    class: &mut dyn FnMut(&str),
 ) -> Scan {
     let Ok(file) = AnswerFile::new() else {
         return Scan::NotRun;
@@ -279,7 +294,11 @@ pub(crate) fn scan(
     };
     let mut seen = 0;
     let mut deadline = Instant::now() + limit;
+    let mut loading: Option<String> = None;
     let answer = loop {
+        // The look after the check of the process: a process that ended
+        // wrote its last line before.
+        let ended = child.try_wait();
         let look = file.look();
         if let Some(answer) = look.answer {
             break answer;
@@ -289,8 +308,12 @@ pub(crate) fn scan(
         if look.lines > seen {
             seen = look.lines;
             deadline = Instant::now() + limit;
+            if let Some(name) = look.class {
+                class(&name);
+                loading = Some(name);
+            }
         }
-        match child.try_wait() {
+        match ended {
             Ok(None) => {}
             // A process that ended wrote all of its answer, or none. A
             // process that ended well wrote all of it.
@@ -302,13 +325,14 @@ pub(crate) fn scan(
                     }
                     file.look().answer
                 });
-                let ended = || Err(format!("the plugin process ended ({status})"));
-                break read.unwrap_or_else(ended);
+                let reason = format!("the plugin process ended ({status})");
+                break read.unwrap_or_else(|| Err(in_load(reason, loading.as_deref())));
             }
             Err(error) => break Err(error.to_string()),
         }
         if closed.load(Ordering::Relaxed) || Instant::now() > deadline {
-            break Err("the plugin process did not answer".into());
+            let reason = "the plugin process did not answer".to_owned();
+            break Err(in_load(reason, loading.as_deref()));
         }
         std::thread::sleep(Duration::from_millis(5));
     };
@@ -325,6 +349,14 @@ pub(crate) fn scan(
     let _ = child.kill();
     let _ = child.wait();
     Scan::Read(answer)
+}
+
+/// A fault of the scan process, with the name of the class in its load.
+fn in_load(reason: String, class: Option<&str>) -> String {
+    match class {
+        Some(class) => format!("{reason} while it loaded {class}"),
+        None => reason,
+    }
 }
 
 #[cfg(test)]
@@ -401,7 +433,13 @@ mod tests {
             args: Vec::new(),
         };
         let closed = AtomicBool::new(false);
-        let scan = scan(&program, Path::new("some.vst3"), WORK_LIMIT, &closed);
+        let scan = scan(
+            &program,
+            Path::new("some.vst3"),
+            WORK_LIMIT,
+            &closed,
+            &mut |_| {},
+        );
         assert_eq!(scan, Scan::NotRun);
     }
 
@@ -453,7 +491,13 @@ mod tests {
                     format!("slow={slow}").into(),
                 ],
             };
-            scan(&program, &bundle, LIMIT, &AtomicBool::new(false))
+            scan(
+                &program,
+                &bundle,
+                LIMIT,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
         };
         let names = |scan: Scan| match scan {
             Scan::Read(Ok(plugins)) => plugins
@@ -467,11 +511,15 @@ mod tests {
             [rustel_vst3_fixture::NAME, rustel_vst3_fixture::TONE_NAME]
         );
         // One class of 10.5 s takes more than the limit: the scan gives up
-        // on the bundle, and the scan of the next bundle goes on.
+        // on the bundle, names the class, and the scan of the next bundle
+        // goes on.
         match run(10_500) {
-            Scan::Read(Err(reason)) => assert!(
-                reason.contains("the plugin process did not answer"),
-                "{reason}"
+            Scan::Read(Err(reason)) => assert_eq!(
+                reason,
+                format!(
+                    "the plugin process did not answer while it loaded {}",
+                    rustel_vst3_fixture::NAME
+                )
             ),
             other => panic!("the scan gave {other:?}"),
         }

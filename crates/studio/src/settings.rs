@@ -2058,7 +2058,10 @@ const VST_CONTROLS: [(&str, &str); 2] = [
         "add folder",
         "opens a prompt for a folder with VST3 plugins",
     ),
-    ("rescan", "reads every folder and tests each plugin again"),
+    (
+        "rescan",
+        "empties the scan cache and tests each plugin again",
+    ),
 ];
 #[cfg(feature = "vst")]
 pub(super) const VST_CONTROL_COUNT: usize = VST_CONTROLS.len();
@@ -4329,10 +4332,10 @@ pub struct VstPage {
     pub scanned: Vec<VstScanned>,
     /// The number of plugins the host found in all folders.
     pub plugins: usize,
-    /// Where the scan of the folders is, as (bundles read, bundles in
-    /// all), while it runs. The rescan row says it, so the page itself
-    /// shows the scan the header badge stands for.
-    pub scan: Option<(usize, usize)>,
+    /// Where the scan of the folders is, while it runs. The rescan row
+    /// says it, so the page itself shows the scan the header badge stands
+    /// for.
+    pub scan: Option<rustel_runtime::vst::ScanProgress>,
     /// The folder with one folder of `.vstpreset` files for each plugin.
     pub presets: String,
 }
@@ -8420,7 +8423,11 @@ mod tests {
                 },
             ],
             plugins: 2,
-            scan: Some((3, 124)),
+            scan: Some(rustel_runtime::vst::ScanProgress {
+                read: 3,
+                bundles: 124,
+                plugin: "Shell › Comp".into(),
+            }),
             presets: "~/Music/presets".into(),
         };
         let mut sheet = SettingsSheet {
@@ -8470,7 +8477,10 @@ mod tests {
         assert!(text.contains("scanned plugins"), "{text}");
         assert!(text.contains("Tone · ready"), "{text}");
         assert!(text.contains("Kick · found"), "{text}");
-        assert!(text.contains("scanning · 3 of 124 bundles"), "{text}");
+        assert!(
+            text.contains("scanning · 3 of 124 bundles · Shell › Comp"),
+            "{text}"
+        );
         // The rows are part of the walk: five Downs from the first action
         // reach the last plugin, and the hint under the list says so.
         let mut walked = UiSettings::default();

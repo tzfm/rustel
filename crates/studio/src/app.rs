@@ -834,10 +834,9 @@ struct App {
     /// The plugins in their load at the last turn: see `rustel_runtime::vst::loads`.
     #[cfg(feature = "vst")]
     plugin_loads: Vec<String>,
-    /// The bundles the plugin scan tested and the bundles of the scan in
-    /// all at the last turn, while the scan runs.
+    /// Where the plugin scan was at the last turn, while the scan runs.
     #[cfg(feature = "vst")]
-    plugin_scan: Option<(usize, usize)>,
+    plugin_scan: Option<rustel_runtime::vst::ScanProgress>,
     /// The plugin rows of the memory breakdown, as last measured.
     #[cfg(feature = "vst")]
     plugin_memory: Vec<super::memory::PluginMemory>,

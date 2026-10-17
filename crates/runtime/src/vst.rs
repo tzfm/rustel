@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 use rustel_audio::{InsertControls, InsertSlot};
 use rustel_transpiler::LaneStatement;
-pub use rustel_vst3::{Host, ParamInfo, PluginInfo, Resolved, Status, canonical, serve};
+pub use rustel_vst3::{
+    Host, ParamInfo, PluginInfo, Resolved, ScanProgress, Status, canonical, serve,
+};
 
 /// Folders with plugins, in place of the standard VST3 folders of the
 /// system. The form is the form of `PATH`.
@@ -1275,9 +1277,8 @@ pub fn scan_in_background() {
     host().scan_plugins();
 }
 
-/// The bundles the scan read and the bundles of the scan in all, while
-/// the scan runs: see [`scan_in_background`].
-pub fn scan_progress() -> Option<(usize, usize)> {
+/// Where the scan is, while it runs: see [`scan_in_background`].
+pub fn scan_progress() -> Option<ScanProgress> {
     started().and_then(Host::scan_progress)
 }
 

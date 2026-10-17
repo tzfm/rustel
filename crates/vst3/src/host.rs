@@ -322,6 +322,36 @@ struct Scan {
     running: bool,
     /// The bundles the thread read since its start.
     done: usize,
+    /// The bundle in its read now, and the class of the bundle in its load.
+    bundle: Option<PathBuf>,
+    class: Option<String>,
+}
+
+/// Where the scan is, while it runs: see [`Host::scan_progress`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanProgress {
+    /// The bundles the scan read.
+    pub read: usize,
+    /// The bundles of the scan in all.
+    pub bundles: usize,
+    /// The plugin in its test now. The name of the bundle goes first when
+    /// the two names are not alike, as for a shell of many plugins:
+    /// `Shell › Comp`.
+    pub plugin: String,
+}
+
+/// The name of the plugin in its test: see [`ScanProgress::plugin`].
+fn name_in_test(bundle: &Path, class: Option<&str>) -> String {
+    let stem = bundle.file_stem().unwrap_or_default().to_string_lossy();
+    let Some(class) = class.filter(|class| !canonical(class).is_empty()) else {
+        return stem.into_owned();
+    };
+    let (outer, inner) = (canonical(&stem), canonical(class));
+    if outer.contains(&inner) || inner.contains(&outer) {
+        class.to_owned()
+    } else {
+        format!("{stem} › {class}")
+    }
 }
 
 impl State {
@@ -778,15 +808,19 @@ impl Host {
         self.enqueue(move || host.scan_soon());
     }
 
-    /// The bundles the scan read and the bundles of the scan in all, while
-    /// the scan runs.
-    pub fn scan_progress(&self) -> Option<(usize, usize)> {
+    /// Where the scan is, while it runs.
+    pub fn scan_progress(&self) -> Option<ScanProgress> {
         let state = self.state();
-        let done = state.scan.done;
-        state
-            .scan
-            .running
-            .then(|| (done, done + state.unscanned().len()))
+        let scan = &state.scan;
+        scan.running.then(|| ScanProgress {
+            read: scan.done,
+            bundles: scan.done + state.unscanned().len(),
+            plugin: scan
+                .bundle
+                .as_deref()
+                .map(|bundle| name_in_test(bundle, scan.class.as_deref()))
+                .unwrap_or_default(),
+        })
     }
 
     /// Starts the scan thread when a caller asked for the scan and a
@@ -799,6 +833,8 @@ impl Host {
         }
         state.scan.running = true;
         state.scan.done = 0;
+        state.scan.bundle = state.unscanned().into_iter().next();
+        state.scan.class = None;
         let host = self.clone();
         let thread = std::thread::Builder::new().name("rustel-vst3-scan".into());
         if thread.spawn(move || host.run_scan()).is_err() {
@@ -830,6 +866,8 @@ impl Host {
                 let bundle = state.unscanned().into_iter().next().filter(|_| !closed);
                 let next = bundle.zip(state.worker.clone());
                 state.scan.running = next.is_some();
+                state.scan.bundle = next.as_ref().map(|(bundle, _)| bundle.clone());
+                state.scan.class = None;
                 next
             };
             let Some((bundle, program)) = next else {
@@ -842,6 +880,7 @@ impl Host {
                 &bundle,
                 crate::worker::WORK_LIMIT,
                 &self.shared.closed,
+                &mut |class| self.state().scan.class = Some(class.to_owned()),
             );
             // With no scan process, each bundle stays as it is, and loads
             // in this process when a score names it. The next scan tries
@@ -1006,7 +1045,7 @@ impl Host {
     fn finish_load(&self, bundle: PathBuf) {
         let start = Instant::now();
         let stamp = cache::stamp(&bundle);
-        let loaded = contained("load", || load_bundle(&bundle, &mut || {}));
+        let loaded = contained("load", || load_bundle(&bundle, &mut |_| {}));
         let loaded = loaded.map(|(mut plugins, failed): (Vec<Plugin>, Vec<Scanned>)| {
             for plugin in &mut plugins {
                 plugin.load_time = start.elapsed();
@@ -1676,14 +1715,14 @@ fn scanned(class: &ClassInfo, fault: Option<String>) -> Scanned {
 }
 
 /// Loads a bundle in this process and reads the parameters of each plugin
-/// in the bundle, as the load of a score does. Calls `progress` after each
-/// class, so a caller can report that the read moves. Answers the plugins
-/// that load and each class that does not, with its fault. A bundle with
-/// no class that loads fails with the fault of its first class. Runs on
-/// the plugin thread.
+/// in the bundle, as the load of a score does. Calls `progress` with the
+/// name of each class before its load, so a caller can report where the
+/// read is. Answers the plugins that load and each class that does not,
+/// with its fault. A bundle with no class that loads fails with the fault
+/// of its first class. Runs on the plugin thread.
 pub(crate) fn load_bundle(
     bundle: &Path,
-    progress: &mut dyn FnMut(),
+    progress: &mut dyn FnMut(&str),
 ) -> Result<(Vec<Plugin>, Vec<Scanned>), String> {
     let module = Arc::new(Module::load(bundle)?);
     let classes = module.classes();
@@ -1693,11 +1732,11 @@ pub(crate) fn load_bundle(
     let mut plugins = Vec::new();
     let mut failed = Vec::new();
     for class in classes {
+        progress(&class.name);
         match Loaded::new(Arc::clone(&module), &class).map(|loaded| loaded.params()) {
             Ok(params) => plugins.push(Plugin::new(Arc::clone(&module), class, params)),
             Err(fault) => failed.push(scanned(&class, Some(fault))),
         }
-        progress();
     }
     match failed.first() {
         Some(first) if plugins.is_empty() => Err(first.fault.clone().unwrap_or_default()),

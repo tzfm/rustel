@@ -58,9 +58,19 @@ minutes at the scan, so a bundle with many slow classes scans to its end
 while a class that hangs still fails.
 Studio scans in the background, so you play and edit during the scan.
 
+The scan names the plugin in its test: on the status line of `rustel vst`,
+in the Studio background jobs and on the rescan row in Settings. A shell
+bundle holds many plugins. The name then has the bundle first, as
+`Shell › Comp`. A plugin that stops the scan stays on the screen, so you know
+which plugin to update or remove. A bundle that ends the scan process, or
+gives no answer in 2 minutes, stays off. Its fault names the plugin in its
+load, as `the plugin process did not answer while it loaded Comp`. In
+Studio, the plugin row on the vst page of Settings shows the fault.
+
 The file `~/.rustel/vst/scan.json` keeps the result. `rustel vst --rescan`,
-or the rescan row in Settings, scans each bundle again. `rustel play` and
-`rustel render` run no scan. They load the plugins the score names.
+or the rescan row in Settings, empties the cache and scans each bundle again.
+`rustel play` and `rustel render` run no scan. They load the plugins the score
+names.
 
 ## Names and values
 
