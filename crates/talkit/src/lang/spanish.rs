@@ -27,6 +27,7 @@ const RULES: &[Rule] = &[
     rule("", "g", "", "G"),
     rule("", "j", "", "HH"),
     rule("", "z", "", "S"),
+    rule(" ", "hu", "e", "HHW"),
     rule("", "h", "", ""),
     rule("", "ñ", "", "NY"),
     rule("", "x", "", "KS"),
@@ -41,7 +42,10 @@ const RULES: &[Rule] = &[
     rule("", "ey", " ", "EHY"),
     rule("", "oi", "", "OY"),
     rule("", "oy", "", "OY"),
+    rule("g", "u", "a", "UW"),
+    rule("g", "u", "o", "UW"),
     rule("n", "u", "#", "UW"),
+    rule("s", "u", "#", "UW"),
     rule("", "u", "#", "W"),
     rule("", "a", "", "AA"),
     rule("", "e", "", "EH"),
@@ -96,8 +100,11 @@ fn syllables(chars: &[char]) -> Vec<Vec<usize>> {
         if !matches!(chars[i], 'a' | 'e' | 'i' | 'o' | 'u' | 'ü') || silent_u {
             continue;
         }
+        // The `u` of `agua` is a syllable of its own.
+        let hiatus =
+            matches!(chars[i], 'a' | 'o') && i >= 2 && chars[i - 1] == 'u' && chars[i - 2] == 'g';
         match runs.last_mut() {
-            Some(run) if run.last().copied() == i.checked_sub(1) => run.push(i),
+            Some(run) if run.last().copied() == i.checked_sub(1) && !hiatus => run.push(i),
             _ => runs.push(vec![i]),
         }
     }
@@ -119,11 +126,18 @@ fn beat(
             .find_map(|(r, run)| run.iter().position(|&i| i == a).map(|k| (r, Some(k))));
     }
     let penult = matches!(chars.last(), Some('a' | 'e' | 'i' | 'o' | 'u' | 'n' | 's'));
-    match runs.len() {
-        0 => None,
-        n if penult && n >= 2 => Some((n - 2, None)),
-        n => Some((n - 1, None)),
-    }
+    let r = match runs.len() {
+        0 => return None,
+        n if penult && n >= 2 => n - 2,
+        n => n - 1,
+    };
+    // In the run, the open vowel takes the beat, else the last one.
+    let run = &runs[r];
+    let k = run
+        .iter()
+        .position(|&i| matches!(chars[i], 'a' | 'e' | 'o'))
+        .unwrap_or(run.len() - 1);
+    Some((r, Some(k)))
 }
 
 /// Short words that take no stress, as the original engine reads them.
