@@ -1682,6 +1682,10 @@ mod tests {
                         format!(r#"{}("{current}")\n"#, set.entry)
                     }
                     "lfo" => format!(r#"$: s("sine").lfo({{ shape: "{current}" }})\n"#),
+                    "talkit" => format!(
+                        r#"$: talkit("hello", {{ {}: "{current}" }})\n"#,
+                        set.parameter.trim_start_matches("config.")
+                    ),
                     _ => format!(r#"$: s("sine").{}("{current}")\n"#, set.entry),
                 };
                 let mut app = app_over(directory.path());

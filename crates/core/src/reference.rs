@@ -434,6 +434,134 @@ const RNG_MODES: &[ReferenceChoice] = &[
     },
 ];
 
+/// The talkit voices, in the original button order. A voice name matches
+/// ignoring case and every character that is not a letter. Each is written
+/// with hyphens, as one word, because an option value is mini-notation, where
+/// a space separates two events.
+const TALKIT_VOICES: &[ReferenceChoice] = &[
+    ReferenceChoice {
+        value: "male",
+        description: "The default voice: 100 Hz.",
+    },
+    ReferenceChoice {
+        value: "female",
+        description: "200 Hz.",
+    },
+    ReferenceChoice {
+        value: "large-male",
+        description: "190 Hz, fast.",
+    },
+    ReferenceChoice {
+        value: "child",
+        description: "350 Hz.",
+    },
+    ReferenceChoice {
+        value: "giant-male",
+        description: "75 Hz.",
+    },
+    ReferenceChoice {
+        value: "mellow-female",
+        description: "190 Hz, breathy.",
+    },
+    ReferenceChoice {
+        value: "mellow-male",
+        description: "310 Hz, sung, slow.",
+    },
+    ReferenceChoice {
+        value: "crisp-male",
+        description: "200 Hz.",
+    },
+    ReferenceChoice {
+        value: "the-fly",
+        description: "480 Hz.",
+    },
+    ReferenceChoice {
+        value: "robotoid",
+        description: "90 Hz, monotone.",
+    },
+    ReferenceChoice {
+        value: "martian",
+        description: "80 Hz, monotone.",
+    },
+    ReferenceChoice {
+        value: "colossus",
+        description: "66 Hz, monotone.",
+    },
+    ReferenceChoice {
+        value: "fast-fred",
+        description: "135 Hz, fast.",
+    },
+    ReferenceChoice {
+        value: "old-woman",
+        description: "270 Hz.",
+    },
+    ReferenceChoice {
+        value: "munchkin",
+        description: "90 Hz.",
+    },
+    ReferenceChoice {
+        value: "troll",
+        description: "110 Hz, fast.",
+    },
+    ReferenceChoice {
+        value: "nerd",
+        description: "140 Hz.",
+    },
+    ReferenceChoice {
+        value: "milk-toast",
+        description: "120 Hz.",
+    },
+    ReferenceChoice {
+        value: "tipsy",
+        description: "145 Hz, sung.",
+    },
+    ReferenceChoice {
+        value: "choir-boy",
+        description: "310 Hz, sung, slow.",
+    },
+];
+
+const TALKIT_QUALITIES: &[ReferenceChoice] = &[
+    ReferenceChoice {
+        value: "natural",
+        description: "Pitch moves with the sentence. The default.",
+    },
+    ReferenceChoice {
+        value: "monotone",
+        description: "Holds one pitch.",
+    },
+    ReferenceChoice {
+        value: "sung",
+        description: "Walks a scale while speaking.",
+    },
+];
+
+const TALKIT_EFFORTS: &[ReferenceChoice] = &[
+    ReferenceChoice {
+        value: "normal",
+        description: "Fully voiced. The default.",
+    },
+    ReferenceChoice {
+        value: "breathy",
+        description: "Soft, with breath in the voice.",
+    },
+    ReferenceChoice {
+        value: "whispered",
+        description: "No voicing, only breath.",
+    },
+];
+
+const TALKIT_LANGUAGES: &[ReferenceChoice] = &[
+    ReferenceChoice {
+        value: "english",
+        description: "English letter rules and number words. The default.",
+    },
+    ReferenceChoice {
+        value: "spanish",
+        description: "Spanish letter rules and number words.",
+    },
+];
+
 /// Finite choices documented by an entry and parameter.
 pub const REFERENCE_CHOICE_SETS: &[ReferenceChoiceSet] = &[
     ReferenceChoiceSet {
@@ -644,6 +772,30 @@ pub const REFERENCE_CHOICE_SETS: &[ReferenceChoiceSet] = &[
         entry: "useRNG",
         parameter: "mod",
         choices: RNG_MODES,
+        completes_string: true,
+    },
+    ReferenceChoiceSet {
+        entry: "talkit",
+        parameter: "config.personality",
+        choices: TALKIT_VOICES,
+        completes_string: true,
+    },
+    ReferenceChoiceSet {
+        entry: "talkit",
+        parameter: "config.quality",
+        choices: TALKIT_QUALITIES,
+        completes_string: true,
+    },
+    ReferenceChoiceSet {
+        entry: "talkit",
+        parameter: "config.effort",
+        choices: TALKIT_EFFORTS,
+        completes_string: true,
+    },
+    ReferenceChoiceSet {
+        entry: "talkit",
+        parameter: "config.language",
+        choices: TALKIT_LANGUAGES,
         completes_string: true,
     },
 ];

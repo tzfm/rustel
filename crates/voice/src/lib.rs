@@ -363,6 +363,148 @@ mod tests {
         assert!(banked.contains("still loading"), "{banked}");
     }
 
+    /// A `talkit` hap asks the host for speech and plays the sample it gets
+    /// back, with the settings the score asked for, shortcut keys included.
+    /// A host with no speech refuses the hap.
+    #[test]
+    fn a_talkit_hap_speaks_through_the_sample_path() {
+        use rustel_talkit::params::{Effort, Params, Quality};
+        use std::cell::RefCell;
+        struct Speaks(RefCell<Vec<(String, Params)>>);
+        impl super::SampleLookup for Speaks {
+            fn resolve(&self, _s: &str, _n: f64, _midi: f64) -> super::SampleResolution {
+                super::SampleResolution::Unknown
+            }
+            fn insert_speech(
+                &self,
+                request: &super::SpeechRequest<'_>,
+            ) -> Result<super::SampleResolution, String> {
+                self.0
+                    .borrow_mut()
+                    .push((request.text.to_owned(), request.params));
+                Ok(super::SampleResolution::Found {
+                    id: rustel_audio::SampleId(7),
+                    transpose: 0.0,
+                    duration_secs: 0.75,
+                    loop_secs: None,
+                    envelope_peak: 1.0,
+                    soundfont: false,
+                })
+            }
+        }
+        let speaks = Speaks(RefCell::new(Vec::new()));
+        let resolve = |value: serde_json::Value| {
+            super::resolve_voice_with_samples(&value, 1, 0.25, 0.0, 48_000, 0.5, &speaks)
+        };
+        let asked = || speaks.0.borrow().last().cloned().expect("an ask");
+        let spoken = resolve(serde_json::json!({
+            "talkit": { "text": "hello there, nice to meet you", "p": 250, "v": "robotoid",
+                        "q": "sung", "l": "es", "s": 160 },
+            "s": "sine"
+        }))
+        .expect("speech resolves");
+        let sample = spoken.sample.expect("the word is a sample");
+        assert_eq!(sample.sample, rustel_audio::SampleId(7));
+        assert_eq!(sample.playback_rate, 1.0);
+        assert!(!sample.muted);
+        assert!(spoken.synth.is_none(), "the words outrank a synth `s`");
+        // The personality applies first though the object lists it after
+        // the pitch, so the pitch overrides the preset's 90 Hz.
+        assert_eq!(
+            asked(),
+            (
+                "hello there, nice to meet you".to_owned(),
+                Params {
+                    pitch: 250.0,
+                    speed: 160,
+                    quality: Quality::Sung,
+                    effort: Effort::Normal,
+                    language: rustel_talkit::lang::Language::Spanish,
+                }
+            )
+        );
+        // `freq` or `note` name the pitch the voice starts on, to the cent,
+        // and `octave` moves it. An explicit `pitch` setting outranks them,
+        // and zero and "" are no pitch at all.
+        let pitch_of = |controls: serde_json::Value| {
+            let mut value = serde_json::json!({ "talkit": { "text": "hey" } });
+            value
+                .as_object_mut()
+                .expect("object")
+                .extend(controls.as_object().expect("controls").clone());
+            resolve(value).expect("a pitched speech resolves");
+            asked().1.pitch
+        };
+        for (controls, hz) in [
+            (serde_json::json!({ "note": "c3" }), 130.8128),
+            (serde_json::json!({ "note": 48.004 }), 130.8128),
+            (serde_json::json!({ "note": "c3", "octave": 1 }), 261.6256),
+            (serde_json::json!({ "freq": 220, "note": "c3" }), 220.0),
+            (serde_json::json!({ "note": 0 }), 100.0),
+            (serde_json::json!({ "note": "" }), 100.0),
+        ] {
+            let pitch = pitch_of(controls.clone());
+            assert!((pitch - hz).abs() < 0.01, "{controls}: {pitch} Hz");
+        }
+        resolve(serde_json::json!({ "talkit": { "text": "hey", "pitch": 200 }, "note": "c3" }))
+            .expect("an explicit pitch resolves");
+        assert_eq!(asked().1.pitch, 200.0);
+        let refused = resolve(serde_json::json!({ "talkit": { "text": "hey" }, "note": "c0" }))
+            .expect_err("a note below C1 is refused");
+        assert!(refused.contains("C1 to C7"), "{refused}");
+        // The word plays to its end; a release hands the gate to the hap.
+        assert!(matches!(sample.hold, rustel_audio::SampleHold::Slice));
+        let gated = resolve(serde_json::json!({
+            "talkit": { "text": "hey" }, "release": 0.2
+        }))
+        .expect("gated speech resolves");
+        assert!(matches!(
+            gated.sample.expect("a sample").hold,
+            rustel_audio::SampleHold::Hap
+        ));
+        // `speed` is the playback rate, 0 the same per-hap no-op as a sample.
+        let fast = resolve(serde_json::json!({ "talkit": { "text": "hey" }, "speed": 2 }))
+            .expect("fast speech resolves");
+        assert_eq!(fast.sample.expect("a sample").playback_rate, 2.0);
+        let silent = resolve(serde_json::json!({ "talkit": { "text": "hey" }, "speed": 0 }))
+            .expect("speed 0 mutes rather than refusing");
+        assert!(silent.sample.expect("a sample").muted);
+        // The refusals name the setting, not the host.
+        let refused = resolve(serde_json::json!({ "talkit": "hey" }))
+            .expect_err("a bare string names no speech object");
+        assert!(refused.contains("talkit must be an object"), "{refused}");
+        let refused = resolve(serde_json::json!({ "talkit": { "text": ["hey"] } }))
+            .expect_err("non-text talkit is refused");
+        assert!(refused.contains("talkit text must be text"), "{refused}");
+        for (fields, says) in [
+            (
+                serde_json::json!({ "text": "hey", "timbre": "warm" }),
+                "`timbre` is not a setting",
+            ),
+            (
+                serde_json::json!({ "text": "hey", "pitch": "high" }),
+                "pitch takes 50 to 500",
+            ),
+            (serde_json::json!({ "text": "hey", "v": "the" }), "the-fly"),
+        ] {
+            let refused = resolve(serde_json::json!({ "talkit": fields }))
+                .expect_err("a bad setting is refused");
+            assert!(refused.contains(says), "{refused}");
+        }
+        // A host that cannot speak says so rather than playing a synth.
+        let refused = super::resolve_voice_with_samples(
+            &serde_json::json!({ "talkit": { "text": "hello" } }),
+            1,
+            0.25,
+            0.0,
+            48_000,
+            0.5,
+            &super::BundledOnly,
+        )
+        .expect_err("an unspeaking host refuses");
+        assert!(refused.contains("talkit needs a sample bank"), "{refused}");
+    }
+
     #[test]
     fn native_synth_names_match_the_generator_surface() {
         for name in [
@@ -2043,6 +2185,16 @@ pub trait SampleLookup {
     ) -> Result<Option<rustel_audio::InsertControls>, String> {
         Err("this host has no plugins".into())
     }
+
+    /// The sample for a `talkit(...)` speech request, rendered by the host.
+    ///
+    /// `Err` names text that can never sound and refuses the hap like any
+    /// other invalid control. `Ok(Failed)` is an asset failure, such as a full
+    /// sample bank, that refuses only this onset. `Ok(Unknown)` is a host with
+    /// no speech: the hap is refused with a note that this host cannot speak.
+    fn insert_speech(&self, _request: &SpeechRequest<'_>) -> Result<SampleResolution, String> {
+        Ok(SampleResolution::Unknown)
+    }
 }
 
 /// What a note asks of a plugin, in the names the score wrote.
@@ -2054,6 +2206,14 @@ pub struct PluginRequest<'a> {
     pub preset: Option<&'a str>,
     /// Parameter values by name, each from 0 to 1.
     pub params: &'a [(&'a str, f64)],
+}
+
+/// What a `talkit("text", { ... })` hap asks of the host: the words, and the
+/// settings its options, `freq`, `note` and `octave` resolve to.
+pub struct SpeechRequest<'a> {
+    /// The words to speak, spaces and punctuation included.
+    pub text: &'a str,
+    pub params: rustel_talkit::params::Params,
 }
 
 /// Why one onset could not be converted, independently of its diagnostic text.
@@ -2328,12 +2488,24 @@ fn resolve_voice_at(
             // With `.vsti()` the plugin makes the sound: the note needs no
             // sample, wavetable or synth of the engine.
             plays_plugin = object.contains_key("vsti");
-            let wavetable = if plays_plugin {
+            // A `talkit` hap speaks its own sound the same way: the host
+            // renders the text and the sampler plays the result.
+            let speech = if plays_plugin {
+                None
+            } else {
+                speech_controls(object, samples)?
+            };
+            let speaks = speech.is_some();
+            let wavetable = if plays_plugin || speaks {
                 None
             } else {
                 wavetable_controls(object, samples, cps)?
             };
-            let sample = if plays_plugin || wavetable.is_some() {
+            let sample = if speech.is_some() {
+                // The spoken word is the source: a `talkit` hap never
+                // resolves an `s` it happens to carry as well.
+                speech
+            } else if plays_plugin || wavetable.is_some() {
                 None
             } else {
                 sample_controls(object, samples)?
@@ -2426,7 +2598,9 @@ fn resolve_voice_at(
                 cps,
                 frequency,
             )?;
-            let synth = if plays_plugin {
+            // A spoken word is the whole sound: an `s` naming a synth on the
+            // same hap does not take its place.
+            let synth = if plays_plugin || speaks {
                 None
             } else {
                 // A sample named `one` is the sound, not the constant signal.
@@ -3458,6 +3632,218 @@ fn slice_refusal(begin: f64, end: f64) -> String {
         "this plays the sound from {begin} to {end}, and a position in a sound runs from 0 to 1 \
          - with slice(n, …) the pieces are numbered 0 to n-1"
     )
+}
+
+/// The longest text one `talkit` hap speaks, in characters.
+const MAX_SPEECH_CHARS: usize = 300;
+
+/// The `talkit` hap: the host renders the text to a sample and the sampler
+/// plays it. The spoken word is the source, so `speed` is its playback rate
+/// and `cut`, `release` and `clip` keep their sample meanings. `freq`, `note`
+/// and `octave` set the pitch the voice speaks at, so they never transpose
+/// the playback.
+fn speech_controls(
+    object: &serde_json::Map<String, serde_json::Value>,
+    samples: &dyn SampleLookup,
+) -> Result<Option<rustel_audio::SampleControls>, VoiceError> {
+    let Some(fields) = object.get("talkit") else {
+        return Ok(None);
+    };
+    // The talkit call writes one object: `talkit("hi", { quality: "sung" })`
+    // carries `{ talkit: { text: "hi", quality: "sung" } }`.
+    let Some(fields) = fields.as_object() else {
+        return Err(VoiceError::InvalidControl(
+            "talkit must be an object with a text field".into(),
+        ));
+    };
+    let text = fields
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| VoiceError::InvalidControl("talkit text must be text".into()))?;
+    let length = text.chars().count();
+    if length > MAX_SPEECH_CHARS {
+        return Err(VoiceError::InvalidControl(format!(
+            "talkit text is {length} characters; maximum is {MAX_SPEECH_CHARS}"
+        )));
+    }
+    let request = SpeechRequest {
+        text,
+        params: speech_params(object, fields)?,
+    };
+    let (id, natural_duration_secs, envelope_peak) = match samples.insert_speech(&request)? {
+        SampleResolution::Found {
+            id,
+            duration_secs,
+            envelope_peak,
+            ..
+        } => (id, duration_secs, envelope_peak),
+        SampleResolution::Loading => {
+            return Err(VoiceError::SampleLoading(
+                "talkit speech is still rendering".into(),
+            ));
+        }
+        SampleResolution::Failed => {
+            return Err(VoiceError::SampleFailed(
+                "talkit speech failed to render".into(),
+            ));
+        }
+        SampleResolution::Unknown => {
+            return Err(VoiceError::UnknownSound(
+                "talkit needs a sample bank, and this host has none".into(),
+            ));
+        }
+    };
+    let speed = optional_f64(object.get("speed"), "speed")?.unwrap_or(1.0);
+    // The same per-hap no-op as a silent sample event.
+    if speed == 0.0 {
+        return Ok(Some(rustel_audio::SampleControls {
+            sample: id,
+            playback_rate: 1.0,
+            begin: 0.0,
+            end: 1.0,
+            hold: rustel_audio::SampleHold::Slice,
+            muted: true,
+            loop_secs: None,
+            envelope_peak: 1.0,
+            reversed: false,
+            nudge_secs: 0.0,
+            cut: None,
+        }));
+    }
+    let rate = speed.abs();
+    if !rate.is_finite() || rate <= 0.0 {
+        return Err(format!("talkit playback rate {rate} is not finite and positive").into());
+    }
+    let slice_duration = natural_duration_secs / rate;
+    if !slice_duration.is_finite() || slice_duration > 24.0 * 60.0 * 60.0 {
+        return Err(
+            format!("talkit speech lasts {slice_duration} seconds; maximum is 86400").into(),
+        );
+    }
+    let playback_rate = checked_f32(rate, "talkit playback rate")?;
+    if playback_rate == 0.0 {
+        return Err(VoiceError::InvalidControl(
+            "talkit speed is too small for native f32 playback".into(),
+        ));
+    }
+    Ok(Some(rustel_audio::SampleControls {
+        sample: id,
+        playback_rate,
+        // The word plays whole: slicing a spoken word at `begin`/`end` has no
+        // useful meaning, so the slice stays the entire buffer.
+        begin: 0.0,
+        end: 1.0,
+        // Like a sample: the word plays to its end unless the hap gates it
+        // (`release`, `clip`).
+        hold: if object.get("clip").is_some_and(|value| !value.is_null())
+            || object.get("release").is_some_and(|value| !value.is_null())
+        {
+            rustel_audio::SampleHold::Hap
+        } else {
+            rustel_audio::SampleHold::Slice
+        },
+        muted: false,
+        loop_secs: None,
+        envelope_peak: checked_f32(envelope_peak, "talkit envelope peak")?,
+        reversed: speed < 0.0,
+        nudge_secs: 0.0,
+        cut: optional_f64(object.get("cut"), "cut")?
+            .map(|cut| checked_f32(cut, "cut"))
+            .transpose()?,
+    }))
+}
+
+/// The settings a `talkit` hap speaks with. The keys and values are the ones
+/// the talkit command line takes, read by the same parser. A personality
+/// applies its whole preset first, so the single settings override it in
+/// whatever order the object lists them. `freq` or `note` set the pitch when
+/// no `pitch` setting does.
+fn speech_params(
+    object: &serde_json::Map<String, serde_json::Value>,
+    fields: &serde_json::Map<String, serde_json::Value>,
+) -> Result<rustel_talkit::params::Params, VoiceError> {
+    use rustel_talkit::params::{ParamError, Params, Setting};
+    let refused = |error: ParamError| VoiceError::InvalidControl(format!("talkit: {error}"));
+    let mut settings = Vec::with_capacity(fields.len());
+    for (key, value) in fields {
+        if key == "text" || value.is_null() {
+            continue;
+        }
+        let setting =
+            Setting::parse(key).ok_or_else(|| refused(ParamError::UnknownKey(key.clone())))?;
+        settings.push((setting, value));
+    }
+    settings.sort_by_key(|(setting, _)| *setting != Setting::Personality);
+    let mut params = Params::default();
+    for &(setting, value) in &settings {
+        let written = match value {
+            serde_json::Value::String(text) => std::borrow::Cow::Borrowed(text.as_str()),
+            // A whole number reads as one, wherever the JSON form put it.
+            serde_json::Value::Number(number) => match number.as_f64() {
+                Some(whole) if whole.fract() == 0.0 && whole.abs() < 1e15 => {
+                    std::borrow::Cow::Owned((whole as i64).to_string())
+                }
+                _ => std::borrow::Cow::Owned(number.to_string()),
+            },
+            other => std::borrow::Cow::Owned(other.to_string()),
+        };
+        params.set(setting, &written).map_err(refused)?;
+    }
+    if !settings
+        .iter()
+        .any(|(setting, _)| *setting == Setting::Pitch)
+        && let Some(hz) = speech_note_pitch(object)?
+    {
+        params.pitch = hz;
+    }
+    Ok(params)
+}
+
+/// The pitch a hap's `freq`, or else its `note`, asks the voice to start on,
+/// moved by `octave`, the way the synth path reads them: a zero `freq`, a
+/// zero note and an empty note are no pitch at all. The pitch rounds to the
+/// nearest cent, so float noise in a computed note does not render the same
+/// words twice.
+fn speech_note_pitch(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<f32>, VoiceError> {
+    let midi = match optional_f64(object.get("freq"), "freq")? {
+        Some(hz) if hz != 0.0 => {
+            if !(hz.is_finite() && hz > 0.0) {
+                return Err(VoiceError::InvalidControl(format!(
+                    "talkit: freq {hz} is not a positive frequency"
+                )));
+            }
+            69.0 + 12.0 * (hz / 440.0).log2()
+        }
+        _ => match object.get("note") {
+            None | Some(serde_json::Value::Null) => return Ok(None),
+            Some(serde_json::Value::Number(midi)) => match midi.as_f64() {
+                Some(0.0) => return Ok(None),
+                Some(midi) => midi,
+                None => return Err(non_scalar_speech_note()),
+            },
+            Some(serde_json::Value::String(text)) if text.is_empty() => return Ok(None),
+            Some(serde_json::Value::String(text)) => rustel_core::util::note_to_midi(text, 3)?,
+            Some(_) => return Err(non_scalar_speech_note()),
+        },
+    };
+    let octave = optional_f64(object.get("octave"), "octave")?.unwrap_or(0.0);
+    let midi = ((midi + 12.0 * octave) * 100.0).round() / 100.0;
+    let hz = midi_to_hz(midi)? as f32;
+    let range = rustel_talkit::params::NOTE_PITCH;
+    if !range.contains(&hz) {
+        return Err(VoiceError::InvalidControl(format!(
+            "talkit: a voice speaks from C1 to C7 ({} to {} Hz), and this note asks for {hz:.1} Hz",
+            range.start(),
+            range.end()
+        )));
+    }
+    Ok(Some(hz))
+}
+
+fn non_scalar_speech_note() -> VoiceError {
+    VoiceError::InvalidControl("talkit: note must be a note name or a MIDI number".into())
 }
 
 fn sample_controls(
