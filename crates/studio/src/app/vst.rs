@@ -400,6 +400,7 @@ impl App {
     pub(super) fn count_vst_folders(&self, sheet: &mut SettingsSheet) {
         sheet.vst_folder_count = self.prefs.vst_folders.len();
         sheet.vst_standard_count = vst::standard_folders().len();
+        sheet.vst_scanned_count = vst::host().plugins().len();
     }
 
     /// The vst page as the Settings sheet reads the page. Empty while a
@@ -413,6 +414,7 @@ impl App {
             standard,
         };
         let added = self.prefs.vst_folders.iter().map(PathBuf::from);
+        let plugins = vst::host().plugins();
         settings::VstPage {
             folders: added
                 .map(|path| folder(path, false))
@@ -422,7 +424,19 @@ impl App {
                         .map(|path| folder(path, true)),
                 )
                 .collect(),
-            plugins: vst::host().plugins().len(),
+            scanned: plugins
+                .iter()
+                .map(|plugin| settings::VstScanned {
+                    name: plugin.name.clone(),
+                    state: match &plugin.status {
+                        Status::Ready => "ready".to_owned(),
+                        Status::Loading => "loading".to_owned(),
+                        Status::Found => "found".to_owned(),
+                        Status::Failed(_) => "failed".to_owned(),
+                    },
+                })
+                .collect(),
+            plugins: plugins.len(),
             presets: vst::presets_folder()
                 .map(|presets| shorten_home(&presets))
                 .unwrap_or_default(),
@@ -564,6 +578,20 @@ impl App {
         if scanning != self.plugins_scanning {
             self.plugins_scanning = scanning;
             self.dirty_frame = true;
+        }
+        // The vst page of the Settings sheet ends in a row for every
+        // plugin the scan found, so its cursor needs the new count as the
+        // list grows. The page redraws from the host either way.
+        if self
+            .settings_sheet
+            .as_ref()
+            .is_some_and(|sheet| sheet.shows_vst())
+        {
+            let count = vst::host().plugins().len();
+            if let Some(sheet) = self.settings_sheet.as_mut() {
+                self.dirty_frame |= sheet.vst_scanned_count != count;
+                sheet.vst_scanned_count = count;
+            }
         }
         // The list of background jobs has a row for the scan and a row
         // for each load. A test of the scan gives the list new names.

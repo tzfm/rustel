@@ -2539,6 +2539,10 @@ pub struct SettingsSheet {
     /// as one. A standard folder is read-only.
     #[cfg(feature = "vst")]
     pub vst_standard_count: usize,
+    /// How many plugins the scan found follow the folders. The rows are
+    /// read-only: the scan is what changes them.
+    #[cfg(feature = "vst")]
+    pub vst_scanned_count: usize,
     /// The first line of the page drawn, kept from key to key so walking
     /// through the middle of a page leaves it still. The page keeps a margin
     /// of rows around the selection; see [`super::scroll`].
@@ -2870,13 +2874,14 @@ impl SettingsSheet {
     }
 
     /// The vst page is a list, as the sources page is: the arrows walk the
-    /// two actions, the folders the player added, then the standard
-    /// folders. Only a folder the player added is removed.
+    /// two actions, the folders the player added, the standard folders,
+    /// then the plugins the scan found. Only a folder the player added is
+    /// removed.
     #[cfg(feature = "vst")]
     fn vst_key(&mut self, code: crossterm::event::KeyCode) -> SettingsAction {
         use crossterm::event::KeyCode;
         let added = self.vst_folder_count;
-        let len = VST_CONTROL_COUNT + added + self.vst_standard_count;
+        let len = VST_CONTROL_COUNT + added + self.vst_standard_count + self.vst_scanned_count;
         let at = self.selected.min(len - 1);
         let on_added = at >= VST_CONTROL_COUNT && at < VST_CONTROL_COUNT + added;
         match code {
@@ -3076,14 +3081,18 @@ impl SettingsSheet {
                 })
                 .collect(),
             #[cfg(feature = "vst")]
-            SettingsPage::Vst => vst_lines(self.vst_folder_count, self.vst_standard_count)
-                .iter()
-                .enumerate()
-                .filter_map(|(line, row)| match row {
-                    SourceLine::Control(index) | SourceLine::Row(index) => Some((line, *index)),
-                    _ => None,
-                })
-                .collect(),
+            SettingsPage::Vst => vst_lines(
+                self.vst_folder_count,
+                self.vst_standard_count,
+                self.vst_scanned_count,
+            )
+            .iter()
+            .enumerate()
+            .filter_map(|(line, row)| match row {
+                SourceLine::Control(index) | SourceLine::Row(index) => Some((line, *index)),
+                _ => None,
+            })
+            .collect(),
             SettingsPage::Keybinds => (0..self.keybind_count)
                 .map(|index| (index, index))
                 .collect(),
@@ -3588,7 +3597,11 @@ impl SettingsSheet {
             #[cfg(feature = "vst")]
             SettingsPage::Vst => self.first_choice(
                 shown,
-                &vst_lines(self.vst_folder_count, self.vst_standard_count),
+                &vst_lines(
+                    self.vst_folder_count,
+                    self.vst_standard_count,
+                    self.vst_scanned_count,
+                ),
             ),
             SettingsPage::Mapping => self.mapping_first(rows),
             SettingsPage::About => self
@@ -3749,7 +3762,11 @@ impl SettingsSheet {
         if !self.shows_vst() {
             return None;
         }
-        let lines = vst_lines(self.vst_folder_count, self.vst_standard_count);
+        let lines = vst_lines(
+            self.vst_folder_count,
+            self.vst_standard_count,
+            self.vst_scanned_count,
+        );
         self.choice_at(available, x, y, &lines)
     }
 
@@ -4202,6 +4219,8 @@ enum SourceSection {
     PluginFolders,
     #[cfg(feature = "vst")]
     StandardFolders,
+    #[cfg(feature = "vst")]
+    Scanned,
 }
 
 impl SourceSection {
@@ -4216,6 +4235,8 @@ impl SourceSection {
             Self::PluginFolders => "your folders",
             #[cfg(feature = "vst")]
             Self::StandardFolders => "standard folders",
+            #[cfg(feature = "vst")]
+            Self::Scanned => "scanned plugins",
         }
     }
 }
@@ -4236,16 +4257,29 @@ fn source_lines(imported: usize, shipped: usize) -> Vec<SourceLine> {
 }
 
 /// The lines of the vst page in order: the two actions, the folders the
-/// player added (or the empty-state line), then the standard folders.
+/// player added (or the empty-state line), the standard folders, then one
+/// row for every plugin the scan found.
 #[cfg(feature = "vst")]
-fn vst_lines(added: usize, standard: usize) -> Vec<SourceLine> {
-    use SourceSection::{PluginFolders, Plugins, StandardFolders};
-    section_lines(
+fn vst_lines(added: usize, standard: usize, scanned: usize) -> Vec<SourceLine> {
+    use SourceSection::{PluginFolders, Plugins, Scanned, StandardFolders};
+    let mut lines = section_lines(
         [Plugins, PluginFolders, StandardFolders],
         VST_CONTROL_COUNT,
         added,
         standard,
-    )
+    );
+    if scanned > 0 {
+        let folders = VST_CONTROL_COUNT + added + standard;
+        lines.pop();
+        lines.push(SourceLine::Gap);
+        lines.push(SourceLine::Header {
+            section: Scanned,
+            first: false,
+        });
+        lines.extend((folders..folders + scanned).map(SourceLine::Row));
+        lines.push(SourceLine::Footer);
+    }
+    lines
 }
 
 /// Three boxed groups: `controls` rows, the `listed` rows the player owns
@@ -4284,17 +4318,30 @@ fn section_lines(
     lines
 }
 
-/// The vst page as the page reads: the plugin folders in cursor order, and
-/// the two facts under the list.
+/// The vst page as the page reads: the plugin folders in cursor order, one
+/// row for every plugin the scan found, and the two facts under the list.
 #[cfg(feature = "vst")]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VstPage {
     /// The folders the player added, then the standard folders.
     pub folders: Vec<VstFolder>,
+    /// Every plugin the host found, in the order the page lists them.
+    pub scanned: Vec<VstScanned>,
     /// The number of plugins the host found in all folders.
     pub plugins: usize,
     /// The folder with one folder of `.vstpreset` files for each plugin.
     pub presets: String,
+}
+
+/// One plugin the scan found, as its row reads: the name, and where the
+/// plugin is now.
+#[cfg(feature = "vst")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VstScanned {
+    pub name: String,
+    /// The state of the plugin in this studio: `found` before its first
+    /// load, then `loading`, `ready`, or `failed`.
+    pub state: String,
 }
 
 /// One plugin folder, as its row reads.
@@ -8337,5 +8384,134 @@ mod tests {
         }
         assert_eq!(LoadMode::parse(LoadMode::Async.key()), LoadMode::Async);
         assert_eq!(LoadMode::parse("strudel-like"), LoadMode::Async);
+    }
+
+    /// The vst page lists every plugin the scan found below the folders,
+    /// each with its state, and the cursor walks down into the rows.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn the_vst_page_lists_the_plugins_the_scan_found() {
+        let settings = UiSettings::default();
+        let features = TerminalFeatures::default();
+        let theme = Theme::default();
+        let vst = VstPage {
+            folders: vec![
+                VstFolder {
+                    path: "~/Music/vst".into(),
+                    standard: false,
+                },
+                VstFolder {
+                    path: "/Library/Audio/Plug-Ins/VST3".into(),
+                    standard: true,
+                },
+            ],
+            scanned: vec![
+                VstScanned {
+                    name: "Tone".into(),
+                    state: "ready".into(),
+                },
+                VstScanned {
+                    name: "Kick".into(),
+                    state: "found".into(),
+                },
+            ],
+            plugins: 2,
+            presets: "~/Music/presets".into(),
+        };
+        let mut sheet = SettingsSheet {
+            page: SettingsPage::Vst,
+            vst_folder_count: 1,
+            vst_standard_count: 1,
+            vst_scanned_count: 2,
+            ..Default::default()
+        };
+        let frame = Rect::new(0, 0, 120, 24);
+        let mut buffer = Buffer::empty(frame);
+        SettingsSheetView {
+            sheet,
+            settings: &settings,
+            features: &features,
+            tier: settings.rendering.resolve(&features),
+            registry: rustel_runtime::capability_registry(),
+            build_features: &[],
+            device: None,
+            pressure: None,
+            max_polyphony_override: None,
+            capabilities: KeyboardCapabilities::legacy(),
+            #[cfg(feature = "hydra")]
+            hydra_webcam: None,
+            prebakes: [PrebakeRow::default(); 2],
+            sets_folder: String::new(),
+            recordings_folder: String::new(),
+            set_limiter: None,
+            theme: &theme,
+            sample_cache: String::new(),
+            precache: None,
+            sources: Vec::new(),
+            mappings: Default::default(),
+            bindings: Vec::new(),
+            trust: Vec::new(),
+            vst: vst.clone(),
+        }
+        .render(frame, &mut buffer);
+        let text = (0..frame.height)
+            .map(|y| {
+                (0..frame.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("scanned plugins"), "{text}");
+        assert!(text.contains("Tone · ready"), "{text}");
+        assert!(text.contains("Kick · found"), "{text}");
+        // The rows are part of the walk: five Downs from the first action
+        // reach the last plugin, and the hint under the list says so.
+        let mut walked = UiSettings::default();
+        for _ in 0..5 {
+            sheet.key(crossterm::event::KeyCode::Down, &mut walked, &features);
+        }
+        assert_eq!(sheet.selected, 5);
+        let mut buffer = Buffer::empty(frame);
+        SettingsSheetView {
+            sheet,
+            settings: &settings,
+            features: &features,
+            tier: settings.rendering.resolve(&features),
+            registry: rustel_runtime::capability_registry(),
+            build_features: &[],
+            device: None,
+            pressure: None,
+            max_polyphony_override: None,
+            capabilities: KeyboardCapabilities::legacy(),
+            #[cfg(feature = "hydra")]
+            hydra_webcam: None,
+            prebakes: [PrebakeRow::default(); 2],
+            sets_folder: String::new(),
+            recordings_folder: String::new(),
+            set_limiter: None,
+            theme: &theme,
+            sample_cache: String::new(),
+            precache: None,
+            sources: Vec::new(),
+            mappings: Default::default(),
+            bindings: Vec::new(),
+            trust: Vec::new(),
+            vst,
+        }
+        .render(frame, &mut buffer);
+        let text = (0..frame.height)
+            .map(|y| {
+                (0..frame.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("the list of every plugin the scan found"),
+            "{text}"
+        );
+        assert!(text.contains("▸ Kick"), "{text}");
     }
 }
