@@ -924,8 +924,35 @@ const RULES: &[Rule] = &[
 ];
 
 /// One lowercase word to phonemes.
+/// Words that carry no beat of their own in a sentence: articles, pronouns,
+/// prepositions, conjunctions and auxiliary verbs.
+const FUNCTION_WORDS: &[&str] = &[
+    "a", "an", "the", "and", "or", "but", "nor", "of", "to", "in", "on", "at", "by", "for", "with",
+    "from", "into", "onto", "as", "if", "so", "than", "that", "this", "these", "those", "is",
+    "are", "was", "were", "be", "been", "being", "am", "do", "does", "did", "have", "has", "had",
+    "will", "would", "can", "could", "shall", "should", "may", "might", "must", "i", "you", "he",
+    "she", "it", "we", "they", "me", "him", "her", "us", "them", "my", "your", "his", "its", "our",
+    "their",
+];
+
+/// One word's phonemes, with the first vowel of a content word stressed:
+/// English stresses most words on their first syllable, and the stress
+/// gives the sentence its beats.
 pub(super) fn word_phones(word: &str) -> Vec<Phone> {
     let normalized = normalize(word);
+    let mut phones = unstressed_phones(&normalized);
+    if !FUNCTION_WORDS.contains(&normalized.as_str())
+        && let Some(first) = phones
+            .iter_mut()
+            .find(|phone| matches!(phone, Phone::Sound(ph) if ph.is_nucleus()))
+        && let Phone::Sound(ph) = *first
+    {
+        *first = Phone::Stressed(ph);
+    }
+    phones
+}
+
+fn unstressed_phones(normalized: &str) -> Vec<Phone> {
     if let Some((_, phones)) = EXCEPTIONS.iter().find(|(w, _)| *w == normalized) {
         return phones.iter().map(|p| Phone::Sound(*p)).collect();
     }

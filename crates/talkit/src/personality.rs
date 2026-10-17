@@ -9,28 +9,34 @@ use crate::params::{Effort, Quality};
 /// The sound of a voice apart from its settings.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Timbre {
-    /// How much of the glottal source is a sharp buzz, from 0 to 1. A buzz
-    /// keeps the snap of each closure and loses the soft slope between them,
-    /// so the voice reaches up to its third formant at nearly full strength:
-    /// a machine voice.
-    pub buzz: f32,
-    /// The factor on every formant: above 1 for a shorter vocal tract, as a
-    /// child's.
-    pub tract: f32,
+    /// The factors on the first three formants, the shape of the vocal
+    /// tract: all above 1 for a short tract, as a child's. F4 and F5 follow
+    /// the third.
+    pub formants: [f32; 3],
+    /// The factor on every vowel's length. A sung voice holds its vowels.
+    pub vowels: f32,
+    /// The brightness of the glottal source, from -1 to 1. Below 0 the
+    /// source is softened, above 0 it buzzes: at 1 each closure snaps and
+    /// the voice reaches up to its third formant at nearly full strength, a
+    /// machine voice.
+    pub tone: f32,
 }
 
 impl Timbre {
     /// The adult voice the formant tables describe.
-    pub const PLAIN: Self = Self {
-        buzz: PLAIN_BUZZ,
-        tract: 1.0,
-    };
+    pub const PLAIN: Self = timbre([1.0, 1.0, 1.0], 1.0, PLAIN_TONE);
 }
 
-/// The plain voice's buzz and Colossus's, as the published samples' spectra
-/// put them.
-const PLAIN_BUZZ: f32 = 0.13;
-const COLOSSUS_BUZZ: f32 = 1.0;
+const fn timbre(formants: [f32; 3], vowels: f32, tone: f32) -> Timbre {
+    Timbre {
+        formants,
+        vowels,
+        tone,
+    }
+}
+
+/// The plain voice's tone.
+const PLAIN_TONE: f32 = 0.35;
 
 /// A named voice preset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -273,21 +279,31 @@ impl Personality {
         }
     }
 
-    /// The voice's own sound. Each value that differs from [`Timbre::PLAIN`]
-    /// is measured from the original engine's published samples: Colossus
-    /// buzzes about twice as bright as the plain voice, and the child's
-    /// formants sit about a third higher.
+    /// The voice's own sound, measured from the original engine's output:
+    /// each voice speaking the same vowels at the same steady pitch, against
+    /// the plain male voice.
     pub fn timbre(self) -> Timbre {
         match self {
-            Self::Colossus => Timbre {
-                buzz: COLOSSUS_BUZZ,
-                ..Timbre::PLAIN
-            },
-            Self::Child => Timbre {
-                tract: 1.3,
-                ..Timbre::PLAIN
-            },
-            _ => Timbre::PLAIN,
+            Self::Male => Timbre::PLAIN,
+            Self::Female => timbre([1.24, 1.11, 1.16], 1.02, 0.25),
+            Self::LargeMale => timbre([1.24, 1.11, 1.16], 1.12, 0.20),
+            Self::Child => timbre([1.69, 1.43, 1.43], 0.99, 0.55),
+            Self::GiantMale => timbre([0.87, 0.91, 0.92], 1.01, 0.15),
+            Self::MellowFemale => timbre([1.26, 1.11, 1.19], 1.21, 0.10),
+            Self::MellowMale => timbre([1.39, 1.29, 1.31], 2.46, 0.50),
+            Self::CrispMale => timbre([1.20, 1.08, 1.12], 1.16, 0.10),
+            Self::TheFly => timbre([1.86, 1.84, 1.57], 0.44, 0.25),
+            Self::Robotoid => timbre([1.45, 1.03, 1.00], 0.96, 1.0),
+            Self::Martian => timbre([1.12, 1.00, 0.99], 1.04, 0.0),
+            Self::Colossus => timbre([1.05, 0.99, 1.01], 1.14, 1.0),
+            Self::FastFred => timbre([1.0, 1.0, 1.0], 1.0, 0.15),
+            Self::OldWoman => timbre([1.28, 1.12, 1.16], 0.98, 0.40),
+            Self::Munchkin => timbre([1.48, 1.38, 1.37], 1.00, 0.40),
+            Self::Troll => timbre([1.08, 1.10, 1.15], 1.64, 0.50),
+            Self::Nerd => timbre([1.39, 1.00, 1.00], 0.79, 0.65),
+            Self::Milktoast => timbre([0.89, 1.20, 1.22], 1.00, 0.75),
+            Self::Tipsy => timbre([1.0, 1.0, 1.0], 2.44, 0.30),
+            Self::Choirboy => timbre([1.16, 1.04, 1.12], 2.49, -0.85),
         }
     }
 

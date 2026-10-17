@@ -25,19 +25,12 @@ pub fn render(text: &str, params: &Params) -> Vec<f32> {
     }) {
         return Vec::new();
     }
-    let utterance = build(&phones, params.speed);
-    let nuclei: Vec<(f32, f32)> = utterance
-        .spans
-        .iter()
-        .filter(|span| span.nucleus)
-        .map(|span| (span.start, span.end))
-        .collect();
+    let utterance = build(&phones, params.speed, params.timbre.vowels);
     let plan = Plan::new(
         params.pitch,
         params.quality,
-        &nuclei,
-        utterance.total_ms,
-        utterance.terminal,
+        &utterance.nuclei(),
+        &utterance.phrases,
     );
     let mut samples = synthesize(&utterance, &plan, params.effort, params.timbre);
     finish(&mut samples);

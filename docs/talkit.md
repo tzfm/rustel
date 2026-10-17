@@ -47,9 +47,11 @@ cycle, so `talkit("la").note("c3 e3 g3")` keeps that one event and speaks
 only at C3.
 
 The first syllable sits exactly on the note. After it, the quality decides:
-monotone holds the note, natural drifts down and falls or rises at a final
-`.` or `?`, and sung walks a major chord up from the note. A word of one
-syllable with no final punctuation sounds at the note in all three.
+monotone holds the note, and sung walks a major chord up from it. Natural
+moves like speech: a stressed syllable rises above the note, the voice sinks
+a little across each phrase and starts again after a pause, a final `.`
+falls and a final `?` rises. For a melody that stays on its notes, use
+`quality: "monotone"`.
 
 ### Controls
 
@@ -115,10 +117,11 @@ Names match ignoring case and anything that is not a letter, so `the-fly`,
 `TheFly` and, on the command line, `"the fly"` pick the same voice.
 
 Each voice starts from the pitch, speed, quality and effort of its original
-preset. Colossus also has a harder buzz, the sound of a machine, and Child a
-shorter vocal tract, which raises every formant. Both are measured from the
-samples the original engine's makers publish. The other voices share one
-timbre.
+preset, and has a timbre of its own: the shape of its vocal tract, how long
+it holds its vowels, and how soft or buzzy its voice is. Colossus and
+Robotoid buzz like machines, Child and The Fly have short vocal tracts, and
+Choir Boy is soft. The timbres, the vowels, the timing and the natural
+intonation are measured from the original engine's output.
 
 ## Text handling
 

@@ -41,6 +41,9 @@ const GAIN: f32 = 0.6;
 /// under the vowels around it, near the original engine's balance. An equal
 /// level sounds like a hiss on top of the voice.
 const FRICATION_GAIN: f32 = 0.35;
+/// The breath of an `h` against the voice: about 10 dB under the vowel it
+/// leads into, as the original engine speaks it.
+const ASPIRATION_GAIN: f32 = 0.3;
 
 /// One two-pole resonator.
 struct Resonator {
@@ -104,15 +107,25 @@ pub fn synthesize(utterance: &Utterance, plan: &Plan, effort: Effort, timbre: Ti
     let spans = &utterance.spans;
 
     let mut r: [Resonator; 5] = std::array::from_fn(|_| Resonator::new());
-    let tract = timbre.tract;
-    r[3].set(F4.0 * tract, F4.1);
-    r[4].set(F5.0 * tract, F5.1);
+    let [k1, k2, k3] = timbre.formants;
+    r[3].set(F4.0 * k3, F4.1);
+    r[4].set(F5.0 * k3, F5.1);
     let mut nasal_res = Resonator::new();
     let mut fric_res = Resonator::new();
 
     let mut phase = 0.0f32;
     let mut last_glottal = 0.0f32;
     let mut noise = Noise(0x5eed);
+    // A positive tone blends in the buzz; a negative one low-passes the
+    // source, its corner falling from 6 kHz to 600 Hz across the range.
+    let buzz_share = timbre.tone.max(0.0);
+    let soft_pole = if timbre.tone < 0.0 {
+        let corner = 6000.0 * 0.1f32.powf(-timbre.tone);
+        (-std::f32::consts::TAU * corner / RATE as f32).exp()
+    } else {
+        0.0
+    };
+    let mut softened = 0.0f32;
 
     for n in 0..frames {
         let ms = n as f32 * 1000.0 / RATE as f32;
@@ -124,6 +137,7 @@ pub fn synthesize(utterance: &Utterance, plan: &Plan, effort: Effort, timbre: Ti
         let fric_hz = noise_band(spans, i, ms);
         let fric_amp = track(spans, i, ms, |f| f.fric_amp);
         let nasal = track(spans, i, ms, |f| f.nasal);
+        let asp = track(spans, i, ms, |f| f.asp);
 
         // Voiced source.
         let mut source = 0.0;
@@ -143,7 +157,9 @@ pub fn synthesize(utterance: &Utterance, plan: &Plan, effort: Effort, timbre: Ti
             // follow the pitch.
             let buzz = (glottal - last_glottal) * (RATE as f32 / f0).sqrt() * BUZZ_GAIN;
             last_glottal = glottal;
-            let voiced_source = glottal + (buzz - glottal) * timbre.buzz;
+            let mut voiced_source = glottal + (buzz - glottal) * buzz_share;
+            softened = voiced_source + (softened - voiced_source) * soft_pole;
+            voiced_source = softened;
             source = match effort {
                 Effort::Normal => voiced_source,
                 Effort::Breathy => voiced_source * 0.75 + noise.next_f32() * 0.3,
@@ -151,16 +167,20 @@ pub fn synthesize(utterance: &Utterance, plan: &Plan, effort: Effort, timbre: Ti
             } * voice;
         }
 
-        r[0].set(f1 * tract, 70.0);
-        r[1].set(f2 * tract, 105.0);
-        r[2].set(f3 * tract, 160.0);
+        if asp > 0.0 {
+            source += noise.next_f32() * asp * ASPIRATION_GAIN;
+        }
+
+        r[0].set(f1 * k1, 70.0);
+        r[1].set(f2 * k2, 105.0);
+        r[2].set(f3 * k3, 160.0);
         let mut voiced = source;
         for res in &mut r {
             voiced = res.run(voiced);
         }
 
         if nasal > 0.0 {
-            nasal_res.set(NASAL.0 * tract, NASAL.1);
+            nasal_res.set(NASAL.0 * k1, NASAL.1);
             let nas = nasal_res.run(source);
             voiced = voiced.mul_add(1.0 - 0.65 * nasal, nas * 1.9 * nasal);
         }
@@ -248,7 +268,7 @@ mod tests {
     use crate::lang::Language;
     use crate::params::{Effort, Quality};
     use crate::prosody::Plan;
-    use crate::utterance::{Terminal, build};
+    use crate::utterance::build;
 
     fn samples(text: &str, effort: Effort) -> Vec<f32> {
         let params = crate::params::Params {
@@ -256,19 +276,12 @@ mod tests {
             ..Default::default()
         };
         let phones = Language::English.transcribe(text);
-        let utterance = build(&phones, params.speed);
-        let nuclei: Vec<(f32, f32)> = utterance
-            .spans
-            .iter()
-            .filter(|s| s.nucleus)
-            .map(|s| (s.start, s.end))
-            .collect();
+        let utterance = build(&phones, params.speed, params.timbre.vowels);
         let plan = Plan::new(
             params.pitch,
             Quality::Natural,
-            &nuclei,
-            utterance.total_ms,
-            Terminal::None,
+            &utterance.nuclei(),
+            &utterance.phrases,
         );
         synthesize(&utterance, &plan, effort, params.timbre)
     }

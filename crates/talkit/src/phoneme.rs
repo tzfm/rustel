@@ -2,8 +2,9 @@
 //!
 //! One `Phoneme` is one identifiable sound of English or Spanish speech. Its
 //! [`Frame`] holds the formant targets, source amplitudes and nominal duration
-//! the synthesizer works from. The values follow the classic male reference
-//! measurements used by cascade formant synthesizers.
+//! the synthesizer works from. The vowel formants are measured from the
+//! original engine's plain male voice. The consonants follow the classic
+//! reference values of cascade formant synthesizers.
 
 /// A speech sound, or the inter-word gap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,6 +161,9 @@ pub struct Frame {
     pub fric_amp: f32,
     /// Nasal side-branch amount, 0 to 1.
     pub nasal: f32,
+    /// Aspiration amplitude, 0 to 1: breath noise sent through the vocal
+    /// tract, so the formants around it color it, as in `h`.
+    pub asp: f32,
     /// Nominal duration in ms at speed 150. A stop's value is its closure;
     /// the burst adds a fixed 12 ms.
     pub ms: u32,
@@ -174,6 +178,7 @@ const fn voiced(f1: f32, f2: f32, f3: f32, ms: u32) -> Frame {
         fric_hz: 0.0,
         fric_amp: 0.0,
         nasal: 0.0,
+        asp: 0.0,
         ms,
     }
 }
@@ -223,22 +228,22 @@ const fn voiced_fric(fric_hz: f32, fric_amp: f32, ms: u32) -> Frame {
 /// The acoustic target of a sound.
 pub fn frame(ph: Phoneme) -> Frame {
     match ph {
-        Phoneme::Aa => voiced(710.0, 1100.0, 2540.0, 125),
-        Phoneme::Ae => voiced(690.0, 1660.0, 2490.0, 125),
-        Phoneme::Ah => voiced(620.0, 1220.0, 2550.0, 90),
-        Phoneme::Ao => voiced(590.0, 880.0, 2540.0, 120),
-        Phoneme::Aw => voiced(710.0, 1100.0, 2540.0, 165),
-        Phoneme::Ay => voiced(710.0, 1100.0, 2540.0, 175),
+        Phoneme::Aa => voiced(730.0, 1100.0, 2530.0, 125),
+        Phoneme::Ae => voiced(605.0, 1640.0, 2445.0, 125),
+        Phoneme::Ah => voiced(600.0, 1315.0, 2455.0, 90),
+        Phoneme::Ao => voiced(590.0, 990.0, 2615.0, 120),
+        Phoneme::Aw => voiced(730.0, 1100.0, 2530.0, 165),
+        Phoneme::Ay => voiced(730.0, 1100.0, 2530.0, 175),
         Phoneme::Ax => voiced(500.0, 1500.0, 2500.0, 65),
-        Phoneme::Eh => voiced(550.0, 1770.0, 2490.0, 105),
-        Phoneme::Er => voiced(490.0, 1350.0, 1690.0, 110),
-        Phoneme::Ey => voiced(550.0, 1770.0, 2490.0, 160),
-        Phoneme::Ih => voiced(400.0, 1920.0, 2560.0, 100),
-        Phoneme::Iy => voiced(280.0, 2250.0, 2890.0, 130),
-        Phoneme::Ow => voiced(590.0, 880.0, 2540.0, 160),
-        Phoneme::Oy => voiced(590.0, 880.0, 2540.0, 175),
-        Phoneme::Uh => voiced(450.0, 1030.0, 2380.0, 95),
-        Phoneme::Uw => voiced(310.0, 870.0, 2250.0, 125),
+        Phoneme::Eh => voiced(540.0, 1805.0, 2545.0, 105),
+        Phoneme::Er => voiced(475.0, 1380.0, 1755.0, 110),
+        Phoneme::Ey => voiced(540.0, 1805.0, 2545.0, 160),
+        Phoneme::Ih => voiced(420.0, 1770.0, 2615.0, 100),
+        Phoneme::Iy => voiced(300.0, 2195.0, 2760.0, 130),
+        Phoneme::Ow => voiced(590.0, 990.0, 2615.0, 160),
+        Phoneme::Oy => voiced(590.0, 990.0, 2615.0, 175),
+        Phoneme::Uh => voiced(465.0, 1130.0, 2260.0, 95),
+        Phoneme::Uw => voiced(395.0, 1195.0, 2455.0, 125),
         Phoneme::B => stop(350.0, 900.0, 2200.0, 0.2, 750.0, 0.25, 55),
         Phoneme::D => stop(350.0, 1700.0, 2600.0, 0.2, 3800.0, 0.3, 50),
         Phoneme::G => stop(350.0, 1600.0, 2400.0, 0.2, 2200.0, 0.3, 55),
@@ -261,8 +266,11 @@ pub fn frame(ph: Phoneme) -> Frame {
         Phoneme::Z => voiced_fric(5800.0, 0.45, 85),
         Phoneme::Sh => fricative(2600.0, 0.6, 105),
         Phoneme::Zh => voiced_fric(2600.0, 0.5, 85),
-        // Aspiration: weak broadband noise the neighboring vowels color.
-        Phoneme::Hh => fricative(1500.0, 0.12, 65),
+        // Aspiration: breath through the tract the neighboring vowels shape.
+        Phoneme::Hh => Frame {
+            asp: 1.0,
+            ..fricative(1500.0, 0.0, 65)
+        },
         Phoneme::X => fricative(2200.0, 0.45, 100),
         Phoneme::Pause => Frame {
             f1: 500.0,
@@ -272,6 +280,7 @@ pub fn frame(ph: Phoneme) -> Frame {
             fric_hz: 0.0,
             fric_amp: 0.0,
             nasal: 0.0,
+            asp: 0.0,
             ms: 40,
         },
     }

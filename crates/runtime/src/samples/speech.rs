@@ -23,8 +23,8 @@ pub(super) struct SpeechKey {
     quality: Quality,
     effort: Effort,
     language: Language,
-    /// The timbre's buzz and tract, by their bits.
-    timbre: (u32, u32),
+    /// The timbre, by its bits: three formant factors, vowel length, tone.
+    timbre: [u32; 5],
 }
 
 impl SpeechKey {
@@ -37,7 +37,16 @@ impl SpeechKey {
             quality: params.quality,
             effort: params.effort,
             language: params.language,
-            timbre: (params.timbre.buzz.to_bits(), params.timbre.tract.to_bits()),
+            timbre: {
+                let t = params.timbre;
+                [
+                    t.formants[0].to_bits(),
+                    t.formants[1].to_bits(),
+                    t.formants[2].to_bits(),
+                    t.vowels.to_bits(),
+                    t.tone.to_bits(),
+                ]
+            },
         }
     }
 }
