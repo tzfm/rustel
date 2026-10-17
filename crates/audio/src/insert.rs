@@ -111,6 +111,7 @@ pub struct InsertControls {
     /// The note for an insert that makes the sound. 0 frames means the
     /// insert gets no note.
     note: InsertNote,
+    score: Option<u64>,
 }
 
 impl InsertControls {
@@ -126,6 +127,7 @@ impl InsertControls {
                 velocity: 0.0,
                 frames: 0,
             },
+            score: None,
         }
     }
 
@@ -139,6 +141,16 @@ impl InsertControls {
     /// The note for the insert, if the insert makes the sound.
     pub fn note(&self) -> Option<InsertNote> {
         (self.note.frames > 0).then_some(self.note)
+    }
+
+    /// Selects a score event prepared by the host outside the callback.
+    pub fn with_score(mut self, score: u64) -> Self {
+        self.score = Some(score);
+        self
+    }
+
+    pub fn score(&self) -> Option<u64> {
+        self.score
     }
 
     /// Gives the note its place in the music, so an effect with a tempo
@@ -212,6 +224,9 @@ pub trait OrbitInsert: Send {
     /// Starts a note `frames` from now. The insert ends the note after the
     /// length of the note.
     fn note(&mut self, _note: InsertNote, _frames: u32) {}
+
+    /// Starts a prepared score event `frames` from now.
+    fn score(&mut self, _score: u64, _frames: u32) {}
 
     /// Ends each note `frames` from now: a note that sounds then, and a
     /// note that starts before then. A rewind cuts the engine voices at the

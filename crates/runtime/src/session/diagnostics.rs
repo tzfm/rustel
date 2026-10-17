@@ -76,6 +76,10 @@ impl Session {
                 self.report_plugin_line(message, record);
             }
         }
+        for message in self.csound.take_errors() {
+            let record = serde_json::json!({ "csound_failed": { "message": &message } });
+            self.report_plugin_line(message, record);
+        }
     }
 
     /// Queue one plugin line as a [`PLUGIN_DIAGNOSTIC`]. A note gives its

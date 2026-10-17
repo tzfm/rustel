@@ -38,8 +38,8 @@ impl Widget for SettingsSheetView<'_> {
             render_about(&self, panel, rows, buffer);
             return;
         }
-        if self.sheet.page == SettingsPage::Trust {
-            render_trust(&self, panel, rows, buffer);
+        if self.sheet.page == SettingsPage::Permissions {
+            render_permissions(&self, panel, rows, buffer);
             return;
         }
         if self.sheet.page == SettingsPage::Mapping {
@@ -685,8 +685,9 @@ pub(super) fn render_keybinds(
     }
 }
 
-/// The trust page: one origin a row, and what the keys do below the list.
-pub(super) fn render_trust(
+/// The permissions page: one row an origin or a switch, and what the
+/// keys do below the list.
+pub(super) fn render_permissions(
     view: &SettingsSheetView<'_>,
     panel: Rect,
     rows: Rect,
@@ -695,24 +696,27 @@ pub(super) fn render_trust(
     let theme = view.theme;
     let width = usize::from(rows.width);
     let shown = usize::from(rows.height).max(1);
-    let first = view.sheet.first_row(shown, view.trust.len());
-    if view.trust.is_empty() {
+    let first = view.sheet.first_row(shown, view.permissions.len());
+    if view.permissions.is_empty() {
         buffer.set_stringn(
             rows.x,
             rows.y,
-            "  none yet · a score that imports a script puts its origin here",
+            "  none yet · a refused import or orchestra puts its row here",
             width,
             Style::default().fg(theme.muted),
         );
     }
     let origin_width = view
-        .trust
+        .permissions
         .iter()
-        .map(|row| row.origin.width())
+        .map(|row| match row {
+            PermissionRow::Origin { origin, .. } => origin.width(),
+            PermissionRow::Csound { .. } => "native orchestras".width(),
+        })
         .max()
         .unwrap_or(0);
     for (offset, (index, row)) in view
-        .trust
+        .permissions
         .iter()
         .enumerate()
         .skip(first)
@@ -725,12 +729,16 @@ pub(super) fn render_trust(
         } else {
             " "
         };
-        let state = if row.allowed { "on" } else { "off" };
+        let (label, allowed) = match row {
+            PermissionRow::Origin { origin, allowed } => (origin.as_str(), *allowed),
+            PermissionRow::Csound { allowed } => ("native orchestras", *allowed),
+        };
+        let state = if allowed { "on" } else { "off" };
         let style = if selected {
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD)
-        } else if row.allowed {
+        } else if allowed {
             Style::default().fg(theme.foreground)
         } else {
             Style::default().fg(theme.muted)
@@ -738,22 +746,28 @@ pub(super) fn render_trust(
         buffer.set_stringn(
             rows.x,
             rows.y + offset as u16,
-            format!("{marker} {:<origin_width$}  {state}", row.origin),
+            format!("{marker} {:<origin_width$}  {state}", label),
             width,
             style,
         );
     }
     // The keys lead, as on every other page: the footer often has room
-    // for one line, and a player who cannot see "Enter trusts" cannot
+    // for one line, and a player who cannot see "Enter permits" cannot
     // work the page.
-    let keys = match view.trust.get(view.sheet.selected) {
-        Some(row) if row.allowed => "Space off · d removes · Tab pages",
-        Some(_) => "Enter trusts · Space on/off · d dismisses · Tab pages",
+    let keys = match view.permissions.get(view.sheet.selected) {
+        Some(row) if row.allowed() => "Space off · d removes · Tab pages",
+        Some(_) => "Enter permits · Space on/off · d dismisses · Tab pages",
         None => "Tab pages",
     };
-    let text = format!(
-        "{keys} · a score loads a script with await import('https://...') only from a trusted origin. The script runs as setup code before the score."
-    );
+    let says = match view.permissions.get(view.sheet.selected) {
+        Some(PermissionRow::Csound { .. }) => {
+            "an orchestra runs native code that reads files and starts processes. On lasts this studio run; the studio does not keep it."
+        }
+        _ => {
+            "a score loads a script with await import('https://...') only from a trusted origin. The script runs as setup code before the score."
+        }
+    };
+    let text = format!("{keys} · {says}");
     let lines = wrap_words(&text, width);
     let height = usize::from(
         panel

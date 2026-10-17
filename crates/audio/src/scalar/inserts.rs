@@ -309,6 +309,170 @@ mod tests {
         }
 
         #[test]
+        fn instrument_events_keep_their_offsets_across_replacements() {
+            struct Scores {
+                key: InsertKey,
+                events: [(u64, u32); 2],
+                count: usize,
+                frame: u32,
+                level: f32,
+            }
+
+            impl OrbitInsert for Scores {
+                fn key(&self) -> InsertKey {
+                    self.key
+                }
+
+                fn set_param(&mut self, _: InsertParam, _: u32) {}
+
+                fn score(&mut self, score: u64, frames: u32) {
+                    assert_eq!(self.key.plugin, u32::MAX);
+                    self.events[self.count] = (score, self.frame + frames);
+                    self.count += 1;
+                }
+
+                fn note(&mut self, note: InsertNote, frames: u32) {
+                    assert_ne!(self.key.plugin, u32::MAX);
+                    self.events[self.count] = (note.pitch as u64, self.frame + frames);
+                    self.count += 1;
+                }
+
+                fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+                    for (left, right) in left.iter_mut().zip(right) {
+                        for (score, frame) in &self.events[..self.count] {
+                            if *frame == self.frame {
+                                self.level = *score as f32 / 8.0;
+                            }
+                        }
+                        (*left, *right) = (self.level, self.level);
+                        self.frame += 1;
+                    }
+                }
+            }
+
+            let score_key = InsertKey {
+                plugin: u32::MAX,
+                preset: 1,
+            };
+            let next_score_key = InsertKey {
+                plugin: u32::MAX,
+                preset: 2,
+            };
+            let midi_key = InsertKey {
+                plugin: 1,
+                preset: 0,
+            };
+            let build = |key| {
+                Box::new(Scores {
+                    key,
+                    events: [(0, 0); 2],
+                    count: 0,
+                    frame: 0,
+                    level: 0.0,
+                }) as Box<dyn OrbitInsert>
+            };
+            for (first_key, next_key, first_frame, held_key) in [
+                (score_key, next_score_key, 37, None),
+                (score_key, midi_key, 37, None),
+                (midi_key, score_key, 37, None),
+                (midi_key, score_key, 0, Some(score_key)),
+            ] {
+                for (live, routed) in [(false, false), (false, true), (true, false), (true, true)] {
+                    if live && held_key.is_some() {
+                        continue;
+                    }
+                    let mut backend = ScalarBackend::prepared(48_000, 4).unwrap();
+                    backend.orbit_pairs[0] = u8::from(routed);
+                    let slot = crate::insert::instrument_slot(0);
+                    if live {
+                        assert!(backend.install_insert(slot, build(first_key)).is_none());
+                        assert!(backend.prepare_insert(slot, build(next_key)).is_none());
+                        backend.allow_inline_reverb = false;
+                    } else {
+                        backend.set_insert_provider(Arc::new(move |key, _, _| Some(build(key))));
+                        if let Some(held_key) = held_key {
+                            assert!(backend.install_insert(slot, build(held_key)).is_none());
+                        }
+                    }
+                    for (score, frame, key) in [
+                        (1, first_frame, first_key),
+                        (2, 91, next_key),
+                        (3, 191, next_key),
+                    ] {
+                        let mut event = OnsetEvent::new(frame, 440.0, 1.0, 0.02);
+                        event.controls.orbit = 0;
+                        let controls = InsertControls::new(key);
+                        event.controls.instrument = Some(if key.plugin == u32::MAX {
+                            controls.with_score(score)
+                        } else {
+                            controls.with_note(InsertNote {
+                                pitch: score as f32,
+                                velocity: 1.0,
+                                frames: 960,
+                            })
+                        });
+                        backend.note(event);
+                    }
+                    let mut output = [0.0; 512];
+                    backend.process_block(&mut output, 256);
+                    let samples = if routed {
+                        backend.orbit_mix(0, 256)
+                    } else {
+                        &output
+                    };
+                    for (frame, samples) in samples.as_chunks::<2>().0.iter().enumerate() {
+                        let level = if frame < first_frame as usize {
+                            0.0
+                        } else if frame < 91 {
+                            0.125
+                        } else if frame < 191 {
+                            0.25
+                        } else {
+                            0.375
+                        };
+                        assert_eq!(
+                            *samples, [level; 2],
+                            "frame {frame}, live={live}, routed={routed}, first={first_key:?}, next={next_key:?}, held={held_key:?}"
+                        );
+                    }
+                }
+            }
+
+            let ring = Arc::new(crate::input::InputRing::new());
+            ring.set_sample_rate(24_000);
+            ring.set_channels(1);
+            ring.write(
+                &(0..8192)
+                    .map(|frame| frame as f32 / 8192.0)
+                    .collect::<Vec<_>>(),
+                1,
+            );
+            let render_input = |replace| {
+                let mut backend = ScalarBackend::prepared(48_000, 4).unwrap();
+                backend.set_input(Some(Arc::clone(&ring)));
+                backend.orbit_pairs[0] = 1;
+                backend.set_insert_provider(Arc::new(move |key, _, _| Some(build(key))));
+                let mut input = OnsetEvent::new(0, 440.0, 1.0, 1.0);
+                input.synth = Some(crate::SynthSource::Input { channel: 0 });
+                backend.note(input);
+                if replace {
+                    for (frame, key) in [(37, score_key), (91, next_score_key)] {
+                        let mut event = OnsetEvent::new(frame, 440.0, 1.0, 0.02);
+                        event.controls.orbit = 0;
+                        event.controls.instrument = Some(InsertControls::new(key).with_score(1));
+                        backend.note(event);
+                    }
+                }
+                let mut output = vec![0.0; 8192];
+                backend.process_block(&mut output, 4096);
+                output
+            };
+            let input = render_input(false);
+            assert!(input.iter().any(|sample| *sample != 0.0));
+            assert_eq!(render_input(true), input);
+        }
+
+        #[test]
         fn independent_insert_chains_sum_into_one_orbit_without_processing_dry_siblings() {
             struct Gain(InsertKey);
             impl OrbitInsert for Gain {

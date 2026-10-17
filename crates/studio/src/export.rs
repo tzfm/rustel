@@ -521,17 +521,23 @@ pub struct ExportGlance {
 
 /// Snapshot the host default and any persisted score override for an isolated
 /// export. Re-evaluating source text can then override this inherited value.
-/// The export imports scripts from the origins of the Trust page too.
+/// The export imports scripts from the origins of the permissions page, and
+/// runs orchestras under its switch, too.
 pub(super) fn session_config(
     default: &SessionConfig,
     host_default: usize,
     score_override: Option<usize>,
     import_origins: &[String],
+    csound_allowed: bool,
 ) -> SessionConfig {
     default
         .clone()
         .with_max_polyphony(score_override.unwrap_or(host_default))
-        .with_score_import_access(super::engine::import_access(default, import_origins))
+        .with_score_import_access(super::engine::import_access(
+            default,
+            import_origins,
+            csound_allowed,
+        ))
 }
 
 /// What one bounce plays: the score's source, the flag that says how to
@@ -540,6 +546,7 @@ pub struct ExportScore {
     pub source: String,
     pub mini: bool,
     pub prebakes: [String; 2],
+    pub csound: rustel_runtime::CsoundSnapshot,
 }
 
 /// The render, on its own thread.
@@ -668,6 +675,10 @@ fn render(
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     }
     let mut session = Session::with_config(config).map_err(|error| error.to_string())?;
+    // Seed cached files before setups can request them again.
+    session
+        .restore_csound_snapshot(&score.csound)
+        .map_err(|error| error.to_string())?;
     session.set_export_limiter(settings.limiter_enabled.then_some(settings.limiter));
     // The render does not care what the CLI would print; a library that
     // cannot be reached bounces the synths and says so in the log.
@@ -684,6 +695,10 @@ fn render(
             .evaluate_prebake(setup)
             .map_err(|error| format!("prebake ({}): {error}", scope.label()))?;
     }
+    // A setup can repeat an older definition. Keep the accepted order.
+    session
+        .restore_csound_snapshot(&score.csound)
+        .map_err(|error| error.to_string())?;
     if score.mini {
         session.evaluate_mini(&score.source)
     } else {
@@ -1033,6 +1048,7 @@ mod tests {
             source: source.into(),
             mini: false,
             prebakes: no_prebakes(),
+            csound: rustel_runtime::CsoundSnapshot::default(),
         }
     }
 
@@ -1464,6 +1480,7 @@ mod tests {
                     source: "$: s('sine').gain(half())".into(),
                     mini: false,
                     prebakes,
+                    csound: rustel_runtime::CsoundSnapshot::default(),
                 },
                 ExportSettings {
                     length: Length::Cycles(0.5),
@@ -1496,6 +1513,60 @@ mod tests {
             "the refusal names the setup, not the score: {error}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_bounce_keeps_the_live_csound_orchestra() {
+        let dir = tempfile::tempdir().expect("export dir");
+        let orchestra = dir.path().join("helper.orc");
+        std::fs::write(&orchestra, "instr ExportHelper\nendin").expect("orchestra file");
+        let mut config = SessionConfig::default();
+        config.score_import_access.permit_csound();
+        config
+            .score_import_access
+            .permit_local_root(dir.path())
+            .expect("orchestra grant");
+        let mut session = Session::with_config(config.clone()).expect("session");
+        let setup = "await loadOrc('local:helper.orc');\n\
+                     loadCSound(`instr ExportVoice\n aout oscili 0.01, p4\n outs aout, aout\nendin`)";
+        if let Err(error) = session.evaluate_prebake(setup) {
+            if std::env::var_os("RUSTEL_CSOUND_LIBRARY").is_none()
+                && error.to_string().contains("Csound 6 is not available")
+            {
+                return;
+            }
+            panic!("load the live orchestra: {error}");
+        }
+        session
+            .evaluate(
+                "loadCSound(`instr ExportVoice\n aout oscili 0.2, p4\n outs aout, aout\nendin`);\n\
+                 note('a3').csound('ExportVoice')",
+            )
+            .expect("accept the edited orchestra");
+        std::fs::remove_file(orchestra).expect("remove the cached orchestra file");
+        let target = dir.path().join("csound.wav");
+        let mut score = plain_score("note('a3').csound('ExportVoice')");
+        score.prebakes[0] = setup.to_owned();
+        score.csound = session.csound_snapshot();
+        drop(session);
+        let job = ExportJob::start(
+            "csound".into(),
+            score,
+            ExportSettings {
+                length: Length::Cycles(0.25),
+                mp3: false,
+                ..ExportSettings::default()
+            },
+            session_config(&config, config.max_polyphony, None, &[], true),
+            target.clone(),
+        )
+        .expect("job");
+        await_outcome(&job, Duration::from_secs(120)).expect("render the saved orchestra");
+        let pcm = rustel_runtime::test_support::read_pcm16_stereo_wav(&target).expect("WAV");
+        assert!(
+            pcm.iter().any(|sample| sample.abs() > 0.05),
+            "the accepted orchestra takes precedence over the earlier setup"
+        );
     }
 
     #[test]
@@ -1579,7 +1650,7 @@ mod tests {
                 "polyphony".into(),
                 plain_score(&format!("{setter} stack(note('c3'), note('e3'), note('g3'), note('c4')).s('sine').gain(0.05).attack(0).decay(0).sustain(1)")),
                 ExportSettings { length: Length::Cycles(0.025), mp3: false, ..ExportSettings::default() },
-                session_config(&SessionConfig::default(), voices, inherited, &[]),
+                session_config(&SessionConfig::default(), voices, inherited, &[], false),
                 target.clone(),
             ).expect("start export job");
             let deadline = Instant::now() + std::time::Duration::from_secs(30);
@@ -1601,9 +1672,9 @@ mod tests {
             limited, unrestricted,
             "the job must use the passed host budget"
         );
-        // The origins of the Trust page reach the export.
+        // The origins of the permissions page reach the export.
         let origins = ["https://glossing.dev".to_owned()];
-        let config = session_config(&SessionConfig::default(), 192, None, &origins);
+        let config = session_config(&SessionConfig::default(), 192, None, &origins, false);
         assert_eq!(config.max_polyphony, 192);
         assert_eq!(config.score_import_access.origins(), origins);
         let mut live = Session::new().expect("live session");

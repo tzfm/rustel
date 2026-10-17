@@ -182,7 +182,7 @@ impl Studio {
                 // ^H would open the host's default input; a hermetic
                 // studio answers it as a machine with no input does.
                 open_default_input: false,
-                // As `run_once` does: the Trust page of the last studio.
+                // As `run_once` does: the permissions page of the last studio.
                 import_origins: crate::prefs::StudioPrefs::load().import_origins,
                 ..Default::default()
             },

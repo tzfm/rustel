@@ -204,7 +204,10 @@ impl Session {
                     log_line: None,
                 };
                 match self.live_audio_event(&onset, sample_rate, cps, lookup) {
-                    Ok(_) => rendered = true,
+                    Ok(event) => {
+                        self.csound.discard(&event.controls);
+                        rendered = true;
+                    }
                     Err(error @ rustel_voice::VoiceError::SampleLoading(_)) => {
                         loading = Some(error.to_string());
                     }
@@ -1303,6 +1306,9 @@ impl Session {
             left_out_events.sort_unstable();
         }
         if !left_out_events.is_empty() {
+            for &index in &left_out_events {
+                self.csound.discard(&events[index].controls);
+            }
             handover::remove_ascending(&mut events, &left_out_events);
             if !sample_identities.is_empty() {
                 handover::remove_ascending(&mut sample_identities, &left_out_events);
@@ -1371,6 +1377,9 @@ impl Session {
         // reaches the output. Asset skips and external-only onsets keep their
         // separate policies; their diagnostic text is not a failure class.
         if let Some(message) = invalid_control {
+            for event in &events {
+                self.csound.discard(&event.controls);
+            }
             let scope = if events.is_empty() && !self.has_pending_external_output() {
                 "every onset of"
             } else {

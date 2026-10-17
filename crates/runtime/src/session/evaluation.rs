@@ -133,6 +133,10 @@ impl Session {
         // before the score, which is exactly when the files should start
         // arriving. Registrations and preloads enter one ordered loader job
         // so an override is visible before its preload resolves.
+        let csound = self
+            .csound
+            .stage(&effects.csound, &self.config.score_import_access)?;
+        self.csound.commit(csound);
         self.apply_sample_effects(effects.samples, effects.preload);
         self.retain_recovery_prebake(source, None);
         Ok(())
@@ -229,6 +233,18 @@ impl Session {
                 Err(other) => return Err(other),
             };
             for effects in effects {
+                let csound = match self
+                    .csound
+                    .stage(&effects.csound, &self.config.score_import_access)
+                {
+                    Ok(csound) => csound,
+                    Err(error) => {
+                        self.import_errors
+                            .insert(specifier.clone(), Arc::from(error.to_string()));
+                        return Err(error);
+                    }
+                };
+                self.csound.commit(csound);
                 self.apply_sample_effects(effects.samples, effects.preload);
             }
         }
@@ -594,7 +610,7 @@ impl Session {
         cancellation: &AtomicBool,
         allow_mini_fallback: bool,
         no_pattern: NoPatternPolicy,
-        seed: Option<&RuntimeSettings>,
+        seed: Option<(&RuntimeSettings, &crate::CsoundSnapshot)>,
     ) -> Result<EvaluatedScore, RuntimeError> {
         #[cfg(any(test, feature = "test-support"))]
         self.panic_if_injected(SessionPanicPoint::Evaluation);
@@ -632,7 +648,7 @@ impl Session {
         cancellation: &AtomicBool,
         allow_mini_fallback: bool,
         no_pattern: NoPatternPolicy,
-        seed: Option<&RuntimeSettings>,
+        seed: Option<(&RuntimeSettings, &crate::CsoundSnapshot)>,
     ) -> Result<EvaluatedScore, RuntimeError> {
         // A bounded first-install probe may reject the score after JavaScript
         // has published its slider and voicing candidates. Save the empty
@@ -652,14 +668,14 @@ impl Session {
             ..TranspileOptions::default()
         };
         let evaluated = match seed {
-            Some(seed) => self
+            Some((settings, _)) => self
                 .js
                 .evaluate_score_candidate_with_effects_cancellable_seeded(
                     source,
                     &options,
                     budget,
                     cancellation,
-                    seed,
+                    settings,
                 ),
             None => self.js.evaluate_score_candidate_with_effects_cancellable(
                 source,
@@ -691,11 +707,22 @@ impl Session {
                 {
                     self.staged_hydra = Some(effects.hydra.take().unwrap_or_default());
                 }
+                let csound = match seed {
+                    Some((_, snapshot)) => self.csound.stage_from_snapshot(
+                        snapshot,
+                        &effects.csound,
+                        &self.config.score_import_access,
+                    )?,
+                    None => self
+                        .csound
+                        .stage(&effects.csound, &self.config.score_import_access)?,
+                };
                 match self.js.active_pattern() {
                     Some(pattern) => Ok(EvaluatedScore::JavaScript {
                         pattern,
-                        effects,
+                        effects: Box::new(effects),
                         settings,
+                        csound,
                     }),
                     None if no_pattern == NoPatternPolicy::Reject => Err(RuntimeError::NoPattern),
                     None if allow_mini_fallback => {
@@ -1106,6 +1133,7 @@ impl Session {
                 pattern,
                 mut effects,
                 settings,
+                csound,
             } => {
                 // The bounded host publishes the active graph only after
                 // construction succeeds. The scheduler generation follows
@@ -1124,6 +1152,7 @@ impl Session {
                     .commit_midi_input_effects(&mut effects, expected_generation)
                     .map_err(RuntimeError::Js)?;
                 self.js.adopt_runtime_settings(&settings);
+                self.csound.commit(csound);
                 // Named rather than elided: a field added to `ScoreEffects`
                 // and forgotten here compiles clean and simply never happens,
                 // which is the quietest bug this seam can produce.
@@ -1135,7 +1164,7 @@ impl Session {
                     gamepad,
                     hydra: _taken_before_the_no_pattern_arms,
                     ..
-                } = effects;
+                } = *effects;
                 #[cfg(not(feature = "hydra"))]
                 let ScoreEffects {
                     cps,
@@ -1143,7 +1172,7 @@ impl Session {
                     preload,
                     gamepad,
                     ..
-                } = effects;
+                } = *effects;
                 let cps = cps.filter(|cps| {
                     debug_assert!(
                         cps.is_finite() && *cps > 0.0,
@@ -1217,6 +1246,7 @@ impl Session {
                 None
             }
         };
+        self.csound.score_changed();
         // The replacement is installed: only now does it own the takeover
         // and its cut. If they were set before the fallible install above,
         // a failed commit would leave a rewind's AtFlip/AtTakeover for the
@@ -1539,6 +1569,7 @@ impl Session {
         let bundled = rustel_voice::BundledOnly;
         let lookup: &dyn rustel_voice::SampleLookup =
             self.samples.as_deref().map_or(&bundled, |library| library);
+        let lookup = crate::csound::ValidationLookup(lookup);
         // The window that plays reports its own notices; the probe's are dropped.
         let (invalid, _notices) = rustel_voice::with_diagnostic_policy(false, || {
             haps.iter().filter(|hap| hap.has_onset()).find_map(|hap| {
@@ -1625,7 +1656,7 @@ impl Session {
                     &onset,
                     self.config.sample_rate,
                     cps,
-                    lookup,
+                    &lookup,
                 );
                 match event {
                     Err(rustel_voice::VoiceError::InvalidControl(message)) => Some(message),
@@ -1667,6 +1698,7 @@ impl Session {
             source,
             mini: self.last_path == EvaluateSource::MiniRust,
             settings: self.js.snapshot_published_runtime_settings(),
+            csound: self.csound_snapshot(),
             cps: self.scheduler.cps(),
             cycle_zero_time: self.scheduler.time_at_cycle(Fraction::ZERO),
         }))
@@ -1736,7 +1768,7 @@ impl Session {
             Duration::from_millis(1),
             cancellation,
             clock,
-            Some(&previous.settings),
+            Some((&previous.settings, &previous.csound)),
         )?;
         // A deferred attempt did not run score code, so retain the target for
         // the next recovery attempt.
@@ -1799,7 +1831,7 @@ impl Session {
         continuation_reserve: Duration,
         cancellation: &AtomicBool,
         mut clock: F,
-        seed: Option<&RuntimeSettings>,
+        seed: Option<(&RuntimeSettings, &crate::CsoundSnapshot)>,
     ) -> Result<LiveScoreAttempt, RuntimeError>
     where
         F: FnMut() -> f64,
@@ -1827,7 +1859,7 @@ impl Session {
         continuation_reserve: Duration,
         cancellation: &AtomicBool,
         mut clock: F,
-        seed: Option<&RuntimeSettings>,
+        seed: Option<(&RuntimeSettings, &crate::CsoundSnapshot)>,
     ) -> Result<LiveScoreAttempt, RuntimeError>
     where
         F: FnMut() -> f64,
@@ -1837,7 +1869,7 @@ impl Session {
                 return Err(RuntimeError::Cancelled);
             }
             let settings = match seed {
-                Some(seed) => Some(self.js.seeded_candidate_runtime_settings(seed)),
+                Some((settings, _)) => Some(self.js.seeded_candidate_runtime_settings(settings)),
                 None if !self.core_settings_owned => {
                     Some(self.js.snapshot_ambient_runtime_settings())
                 }
@@ -1855,6 +1887,14 @@ impl Session {
             if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(RuntimeError::Cancelled);
             }
+            let csound = match seed {
+                Some((_, snapshot)) => self.csound.stage_from_snapshot(
+                    snapshot,
+                    &[],
+                    &self.config.score_import_access,
+                )?,
+                None => None,
+            };
             self.install_evaluated_score_with_clock(
                 EvaluatedScore::MiniFallback(pattern),
                 source,
@@ -1865,6 +1905,7 @@ impl Session {
                 false,
                 clock,
             )?;
+            self.csound.commit(csound);
             return Ok(LiveScoreAttempt::Applied(self.generation()));
         }
 
@@ -1884,6 +1925,12 @@ impl Session {
         );
         self.record_producer_phase(ProducerPhase::Evaluation, evaluation_started.elapsed());
         let evaluated = evaluated?;
+        let csound = match (&evaluated, seed) {
+            (EvaluatedScore::MiniFallback(_), Some((_, snapshot))) => self
+                .csound
+                .stage_from_snapshot(snapshot, &[], &self.config.score_import_access)?,
+            _ => None,
+        };
         self.install_evaluated_score_with_clock(
             evaluated,
             source,
@@ -1899,6 +1946,7 @@ impl Session {
         if self.holds_edit(source) {
             return Ok(LiveScoreAttempt::Waiting);
         }
+        self.csound.commit(csound);
         Ok(LiveScoreAttempt::Applied(self.generation()))
     }
 
@@ -2997,6 +3045,41 @@ mod tests {
             let error = session.evaluate(&score).expect_err("the script throws");
             assert!(error.to_string().contains("first run"), "{error}");
         }
+    }
+
+    /// A score uses a native orchestra only while the host permits one. The
+    /// refusal is typed, so the studio can offer its switch, and a permit
+    /// the host takes back refuses the next score again.
+    #[test]
+    fn an_orchestra_loads_only_while_it_is_permitted() {
+        let load = "loadCSound`instr voice
+endin`";
+        let mut session = Session::new().expect("session");
+        let refused = session.evaluate_prebake(load).expect_err("no permission");
+        assert_eq!(refused.kind(), "csound-permission");
+        assert!(
+            refused.to_string().starts_with("Csound is not permitted"),
+            "{refused}"
+        );
+
+        let mut access = ScoreImportAccess::denied();
+        access.permit_csound();
+        session.set_score_import_access(access);
+        // The gate passed. Without the native library the next refusal is
+        // the library's own, never the permission's.
+        if let Err(error) = session.evaluate_prebake(load) {
+            assert!(
+                std::env::var_os("RUSTEL_CSOUND_LIBRARY").is_none()
+                    && error.to_string().contains("Csound 6 is not available"),
+                "{error}"
+            );
+        }
+
+        session.set_score_import_access(ScoreImportAccess::denied());
+        let refused = session
+            .evaluate_prebake(load)
+            .expect_err("permission taken back");
+        assert_eq!(refused.kind(), "csound-permission");
     }
 
     /// Two scripts give `sc` two meanings. A score gets the meaning of the

@@ -227,6 +227,14 @@ impl App {
         self.sync_live_material(now);
         self.send_sample_memory();
         self.send_import_origins();
+        self.send_csound();
+        // A permit that unblocked a refused update re-runs it here, once
+        // the sends above have put the permission in the engine's hands -
+        // a re-run ahead of them would be refused by the old state.
+        if self.refused_update_owed && !self.csound_owed && !self.import_origins_owed {
+            self.refused_update_owed = false;
+            self.retry_refused_update();
+        }
         #[cfg(feature = "hydra")]
         self.warm_selected_snippet();
         self.settle_marks(now);

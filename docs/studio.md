@@ -165,10 +165,21 @@ setup code before the text with the import.
 
 Studio loads a script only from an origin you trust. The first update of such
 a score stops with `https://glossing.dev is not trusted`. Press Ctrl+O, go to
-the Trust page, and press Enter on the origin. Then update the score again.
+the Permissions page, and press Enter on the origin: the refused update runs
+again by itself, so the score loads with no second keypress.
 Each origin reads `on` or `off`: Space flips a row in place, so you can take
 a trust back without the origin leaving the page. Studio keeps the trusted
 origins in `studio.json`. Press `d` on an origin to remove the origin.
+
+### Native orchestras
+
+The Permissions page also holds the `native orchestras` switch, which starts
+on while a Csound library is installed: open the studio and an orchestra
+score plays. Space turns it off for the run, and a score that loads an
+orchestra while it is off stops with `Csound is not permitted`. Press Enter
+on the switch and the refused update runs again by itself. The switch
+lasts one studio run: Studio does not keep an off state either. See
+[Csound](csound.md) for what an orchestra can do.
 
 The first update after you trust an origin fetches the script. The update
 waits for the fetch, 8 seconds at most. Studio fetches each script one time

@@ -1479,8 +1479,7 @@ pub(super) fn play_live(
     )
     .map_err(runtime_device_error)?;
     sync_live_polyphony(session, &device);
-    #[cfg(feature = "vst")]
-    session.attach_plugins(&device);
+    session.attach_instruments(&device);
     // What opened, once: the host, the device, the buffer's real cost.
     output.event(
         LiveDetail::Essential,
@@ -1988,6 +1987,7 @@ pub(super) fn play_live(
         #[cfg(feature = "gamepad")]
         rustel_runtime::gamepad::pump();
         session.consume_audio_confirmations();
+        producer.reap_completed_output(device.completed_intake_frames(), device.sample_rate());
         if live_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             session.transport().stop();
             break Ok(());

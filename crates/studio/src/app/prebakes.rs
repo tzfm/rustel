@@ -409,6 +409,7 @@ impl App {
                 self.prebake_queue.clear();
                 let message = self
                     .note_untrusted_import(&failure)
+                    .or_else(|| self.note_csound_refusal(&failure))
                     .unwrap_or_else(|| format!("{}: {}", failure.kind, failure.message));
                 self.set_error(
                     ErrorOwner::Setup,

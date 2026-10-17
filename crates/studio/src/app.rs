@@ -13,7 +13,7 @@
 //! | completion lists at the caret (Ctrl+Space, Tab) | `completion.rs`, `string_roles.rs`, `bank_context.rs` |
 //! | hearing a chord, scale, sound or snippet | `previews.rs` |
 //! | the Settings sheet | `settings_sheet.rs` |
-//! | its Trust page: origins for script imports | `import_trust.rs` |
+//! | its Permissions page: origins and orchestras | `permissions.rs` |
 //! | the theme picker, editor and save sheet | `theme_sheets.rs` |
 //! | the export sheet | `export_sheet.rs` |
 //! | the top menu and help | `menu_bar.rs` |
@@ -157,7 +157,6 @@ mod event_loop;
 mod export_sheet;
 mod focus;
 mod hydra_backdrop;
-mod import_trust;
 mod jobs_panel;
 mod key_bindings;
 mod keyboard;
@@ -170,6 +169,7 @@ mod menu_bar;
 mod mixer;
 mod mouse;
 mod panes;
+mod permissions;
 mod persistence;
 mod piano_mode;
 mod pointer_shape;
@@ -620,6 +620,10 @@ fn run_once(options: StudioOptions) -> Result<Session, RuntimeError> {
             preview_budget_bytes: sample_settings.preview_budget.bytes(),
             unused_sample_idle: sample_settings.unused_sample_idle.duration(),
             import_origins: prefs.import_origins.clone(),
+            // `csound_allowed` stays at its default: on, because an
+            // installed Csound library is the studio's opt-in. The
+            // permissions page takes it back for a run, and the one-shot
+            // commands keep `--allow-csound`.
             ..StudioConfig::default()
         },
         #[cfg(feature = "hydra")]
@@ -1160,10 +1164,25 @@ struct App {
     /// the next update to say the same.
     update_failure: Option<(SceneId, Revision)>,
     /// The origins whose script imports the engine refused in this studio,
-    /// newest last. The Trust page offers them, so nobody types an origin.
+    /// newest last. The permissions page offers them, so nobody types an origin.
     blocked_imports: Vec<String>,
-    /// The Trust page changed and the engine does not have the list yet.
+    /// Whether native orchestras run in this studio. The switch starts on -
+    /// an installed library is the opt-in - and the permissions page flips
+    /// it for the run. The studio keeps neither state, so the next start is
+    /// on again.
+    csound_allowed: bool,
+    /// A score asked for an orchestra and the engine refused it, so the
+    /// permissions page offers the switch.
+    csound_refused: bool,
+    /// The permissions page flipped the switch and the engine does not
+    /// have it yet.
+    csound_owed: bool,
+    /// The permissions page changed and the engine does not have the list yet.
     import_origins_owed: bool,
+    /// A permit unblocked a refused update and the studio owes its re-run.
+    /// It waits for the engine to hold the permission, so the re-run cannot
+    /// be refused by the state it is running to use.
+    refused_update_owed: bool,
     /// Latest refused revision for each scene with an unresolved log alert.
     evaluation_alerts: HashMap<SceneId, Revision>,
     /// A diagnostic copied into the ordinary status line by the navigation
@@ -1515,6 +1534,9 @@ impl App {
         let theme_camera_confirmed = theme.camera_enabled().then(|| theme.name.clone());
         let prefs = StudioPrefs::load();
         let mixer = MixerState::new(prefs.input_gain_tenths_db);
+        // The switch starts on, as the engine's does: an installed library
+        // is the opt-in, and the permissions page owns the switch from here.
+        let csound_at_start = true;
         let mut app = Self {
             output_latency_pending: true,
             cli_output_latency: options.output_buffer_frames.map(OutputLatency::from_frames),
@@ -1703,7 +1725,11 @@ impl App {
             inflight: HashMap::new(),
             update_failure: None,
             blocked_imports: Vec::new(),
+            csound_allowed: csound_at_start,
+            csound_refused: false,
+            csound_owed: false,
             import_origins_owed: false,
+            refused_update_owed: false,
             evaluation_alerts: HashMap::new(),
             lint_status: None,
             pending_evaluation: None,
