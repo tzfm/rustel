@@ -37,6 +37,30 @@ fn row_with(studio: &mut Hermetic, label: &str) -> String {
         .unwrap_or_else(|| panic!("no row reads {label:?}:\n{}", studio.rows().join("\n")))
 }
 
+/// Open the sheet and walk to the permissions page, wherever the sheet
+/// left it - the sheet keeps its page across closes, so a second visit
+/// does not start on the first one. The orchestra switch is on that page
+/// from the studio's first breath, so the page always draws it.
+fn open_permissions(studio: &mut Hermetic) {
+    studio.chord("ctrl+o");
+    studio.settle();
+    for _ in 0..10 {
+        if studio
+            .rows()
+            .iter()
+            .any(|row| row.contains("native orchestras"))
+        {
+            return;
+        }
+        studio.press(KeyCode::BackTab, KeyModifiers::SHIFT);
+        studio.pump();
+    }
+    panic!(
+        "no page reads native orchestras:\n{}",
+        studio.rows().join("\n")
+    );
+}
+
 /// The selected row, by its marker - inside the sheet, not the header's
 /// scene chips, which wear the same `▸`.
 fn selected_row(studio: &mut Hermetic) -> Option<String> {
@@ -805,11 +829,8 @@ fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
         ),
     );
 
-    open_sheet(&mut studio);
-    for _ in 0..2 {
-        studio.press(KeyCode::BackTab, KeyModifiers::SHIFT);
-    }
-    studio.settle();
+    open_permissions(&mut studio);
+    select_row(&mut studio, "▸ https://scripts.invalid");
     let refused = row_with(&mut studio, "https://scripts.invalid");
     assert!(
         refused.contains("▸") && refused.contains("off"),
@@ -835,25 +856,56 @@ fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
     studio.pump();
     studio.quit();
     let mut studio = reopen_over(studio);
-    open_sheet(&mut studio);
-    for _ in 0..2 {
-        studio.press(KeyCode::BackTab, KeyModifiers::SHIFT);
-    }
-    studio.settle();
+    open_permissions(&mut studio);
+    select_row(&mut studio, "▸ https://scripts.invalid");
     assert!(row_with(&mut studio, "https://scripts.invalid").contains("  on"));
-    // `d` takes the origin off the page.
+    // `d` takes the origin off the page; the orchestra switch stays. The
+    // status line still names the origin - it reports the removal - so the
+    // check reads the row shape: a row is the origin, two spaces, its state.
     studio.press(KeyCode::Char('d'), KeyModifiers::NONE);
     studio.settle();
-    assert!(studio.rows().join("\n").contains("none yet"));
+    assert!(
+        studio
+            .rows()
+            .into_iter()
+            .all(|row| !row.contains("scripts.invalid  ")),
+        "no row carries the origin as its label:\n{}",
+        studio.rows().join("\n")
+    );
+    assert!(row_with(&mut studio, "native orchestras").contains("  on"));
 }
 
-/// A score that loads an orchestra without permission is refused, and the
-/// footer names the permissions page. Enter permits native orchestras for
-/// this run; the next studio asks again, because nothing is kept.
+/// An orchestra score plays with no flag and no keypress: an installed
+/// library is the studio's opt-in. Space takes the switch off for the run,
+/// the next save of an edited score stops with the refusal that names the
+/// page, Enter puts the switch back, and the next studio starts with it on
+/// again.
 #[test]
-fn a_refused_orchestra_is_permitted_with_one_key_and_not_kept() {
+fn the_orchestra_switch_starts_on_and_space_takes_it_back_for_a_run() {
     let mut studio = hermetic();
     studio.set_score("loadCSound`instr voice\nendin`\n$: note(\"c3\").csound(\"voice\")");
+    studio.chord("ctrl+s");
+    studio.settle();
+    // No permission refusal. A machine without the native library reports
+    // the library's own absence, never the permission's.
+    match studio.errors() {
+        None => {}
+        Some(error) => assert!(error.contains("Csound 6 is not available"), "{error}"),
+    }
+
+    open_permissions(&mut studio);
+    assert!(row_with(&mut studio, "native orchestras").contains("  on"));
+
+    studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
+    studio.settle();
+    assert!(row_with(&mut studio, "native orchestras").contains("  off"));
+
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.settle();
+    // An edit makes the save a new generation - the first one still plays,
+    // with the library's own absence a recoverable failure - so the press
+    // must not land as a repeat of it.
+    studio.set_score("loadCSound`instr voice\nendin`\n$: note(\"d3\").csound(\"voice\")");
     studio.chord("ctrl+s");
     studio.settle();
     assert_eq!(
@@ -861,16 +913,7 @@ fn a_refused_orchestra_is_permitted_with_one_key_and_not_kept() {
         Some("Csound is not permitted - Settings → Permissions lets native orchestras run"),
     );
 
-    open_sheet(&mut studio);
-    for _ in 0..2 {
-        studio.press(KeyCode::BackTab, KeyModifiers::SHIFT);
-    }
-    studio.settle();
-    let refused = row_with(&mut studio, "native orchestras");
-    assert!(
-        refused.contains("▸") && refused.contains("off"),
-        "{refused}"
-    );
+    open_permissions(&mut studio);
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();
     assert!(row_with(&mut studio, "native orchestras").contains("  on"));
@@ -880,25 +923,10 @@ fn a_refused_orchestra_is_permitted_with_one_key_and_not_kept() {
         "the refusal left with the permission"
     );
 
-    studio.press(KeyCode::Esc, KeyModifiers::NONE);
-    studio.settle();
-    studio.chord("ctrl+s");
-    studio.settle();
-    // With the permission granted, a machine without the native library
-    // reports the library's own absence, never the permission's.
-    match studio.errors() {
-        None => {}
-        Some(error) => assert!(error.contains("Csound 6 is not available"), "{error}"),
-    }
-
     studio.quit();
     let mut studio = reopen_over(studio);
-    studio.chord("ctrl+s");
-    studio.settle();
-    assert_eq!(
-        studio.errors().as_deref(),
-        Some("Csound is not permitted - Settings → Permissions lets native orchestras run"),
-    );
+    open_permissions(&mut studio);
+    assert!(row_with(&mut studio, "native orchestras").contains("  on"));
 }
 
 /// Tab walks the strip's pages in order and wraps - each page
@@ -915,7 +943,7 @@ fn tab_cycles_the_pages_and_wraps() {
         "fetch imports",        // sources
         "add folder",           // vst
         "OSC / SuperDirt",      // reference
-        "none yet",             // trust
+        "native orchestras",    // trust: the switch is on from the start
         "Terminal: rustel-e2e", // about
         "launch on",            // and back to settings
     ] {

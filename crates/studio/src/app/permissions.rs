@@ -261,23 +261,31 @@ mod tests {
             }
         }
 
-        /// A refused orchestra puts the switch on the page, Enter turns it
-        /// on, and the refusal comes down. The studio keeps nothing: a
-        /// fresh studio starts with the switch off and no row.
+        /// The switch starts on, as the engine's does: an installed library
+        /// is the studio's opt-in. Space takes it back for the run, a
+        /// refusal keeps the row for Enter, and nothing reaches the
+        /// preferences.
         #[test]
-        fn a_refused_orchestra_is_permitted_for_the_run_and_not_kept() {
+        fn the_orchestra_switch_starts_on_and_space_takes_it_back_for_a_run() {
             let directory = tempfile::tempdir().expect("temp dir");
             let mut app = app_over(directory.path());
-            assert_eq!(app.permission_rows(), Vec::new());
+            assert!(app.csound_allowed);
+            assert_eq!(
+                app.permission_rows(),
+                vec![PermissionRow::Csound { allowed: true }]
+            );
 
+            // Space takes the permission back; the row stays for a second
+            // Space, and the refusal names the page.
+            app.toggle_row(0);
+            assert_eq!(
+                app.permission_rows(),
+                vec![PermissionRow::Csound { allowed: false }]
+            );
             let footer = app.note_csound_refusal(&refusal()).expect("a footer");
             assert_eq!(
                 footer,
                 "Csound is not permitted - Settings → Permissions lets native orchestras run"
-            );
-            assert_eq!(
-                app.permission_rows(),
-                vec![PermissionRow::Csound { allowed: false }]
             );
 
             app.permit_row(0);
@@ -289,38 +297,15 @@ mod tests {
             // The row never reaches the preferences.
             assert!(app.prefs.import_origins.is_empty());
 
-            // Space takes the permission back; the row stays for a second
-            // Space, and `d` takes it off the page.
-            app.toggle_row(0);
-            assert_eq!(
-                app.permission_rows(),
-                vec![PermissionRow::Csound { allowed: false }]
-            );
+            // `d` takes the row off the page, off either way, and a fresh
+            // refusal brings it back.
             app.forget_row(0);
             assert_eq!(app.permission_rows(), Vec::new());
             assert!(!app.csound_allowed);
-
-            // A fresh refusal brings one row back, and permitting it
-            // again leaves one row on.
             assert!(app.note_csound_refusal(&refusal()).is_some());
-            app.permit_row(0);
             assert_eq!(
                 app.permission_rows(),
-                vec![PermissionRow::Csound { allowed: true }]
-            );
-        }
-
-        /// The launch flag is the switch's first state, so a studio started
-        /// with it shows the row on and can turn it off.
-        #[test]
-        fn a_launch_permission_shows_as_the_switch_on() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            assert!(!app.csound_allowed);
-            app.csound_allowed = true;
-            assert_eq!(
-                app.permission_rows(),
-                vec![PermissionRow::Csound { allowed: true }]
+                vec![PermissionRow::Csound { allowed: false }]
             );
         }
     }

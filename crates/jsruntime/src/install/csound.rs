@@ -11,7 +11,7 @@ pub(crate) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         name: "loadCSound",
         synonyms: &["loadcsound", "loadCsound"],
         summary: "compile Csound orchestra code",
-        description: "Compiles orchestra code before the score starts. Requires double-precision Csound 6.18 or a later 6.x release and --allow-csound. Accepts a string or a tagged template with substitutions. Call without code to initialize the built-in instruments. Use this during score or setup evaluation. A compile error leaves the previous score playing.",
+        description: "Compiles orchestra code before the score starts. Requires double-precision Csound 6.18 or a later 6.x release and the Csound permission: --allow-csound on the command line, on by default in the studio. Accepts a string or a tagged template with substitutions. Call without code to initialize the built-in instruments. Use this during score or setup evaluation. A compile error leaves the previous score playing.",
         params: &[ReferenceParam {
             name: "code",
             r#type: "string",
@@ -29,7 +29,7 @@ pub(crate) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         name: "loadOrc",
         synonyms: &[],
         summary: "load a Csound orchestra from a URL or file",
-        description: "Loads and compiles an orchestra before the score starts. Requires double-precision Csound 6.18 or a later 6.x release and --allow-csound. Accepts a trusted HTTPS URL, github:owner/repository/revision/file.orc, or a local path within the host's orchestra grant. Pin remote revisions to a commit for reproducible scores. Use this during score or setup evaluation.",
+        description: "Loads and compiles an orchestra before the score starts. Requires double-precision Csound 6.18 or a later 6.x release and the Csound permission: --allow-csound on the command line, on by default in the studio. Accepts a trusted HTTPS URL, github:owner/repository/revision/file.orc, or a local path within the host's orchestra grant. Pin remote revisions to a commit for reproducible scores. Use this during score or setup evaluation.",
         params: &[ReferenceParam {
             name: "url",
             r#type: "string",

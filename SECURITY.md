@@ -212,21 +212,22 @@ offline render routes do not open these external outputs.
 
 ## Csound orchestras
 
-Native Csound execution is off by default. `--allow-csound` enables it for
-the session, including orchestra compilation and exports. The Studio
-permissions page can flip the same switch during a session; the flip lasts
-until Studio closes and is not written to any file. An orchestra runs
-through the native library in the host process. Its opcodes can read files,
-write files, load native libraries and start processes with the rights of the user.
-QuickJS limits do not contain those operations. Enable it only for scores
-and orchestras you trust.
+Native Csound execution runs when the library is installed. The one-shot
+commands ask for `--allow-csound`; the Studio permits it while a Csound
+library is present, because installing one is itself a decision to run
+orchestras, and its Permissions page switch takes the permission back for a
+run. The flip lasts until Studio closes and is not written to any file. An
+orchestra runs through the native library in the host process. Its opcodes
+can read files, write files, load native libraries and start processes with
+the rights of the user. QuickJS limits do not contain those operations.
+Enable it only for scores and orchestras you trust.
 
 `loadOrc` fetches HTTPS text only from a granted import origin. Redirects
 stay on that origin and use the same network address checks as script
 imports. `--allow-local-orchestras DIR` confines the host's orchestra text
 loader to that canonical folder. These grants control loading, not what a
-compiled orchestra can do. Inline `loadCSound` code also requires
-`--allow-csound`.
+compiled orchestra can do. Inline `loadCSound` code also requires the
+Csound permission.
 
 The host loads double-precision Csound 6.18 from system library locations,
 or from `RUSTEL_CSOUND_LIBRARY` set by the host environment. A score cannot

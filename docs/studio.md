@@ -173,15 +173,12 @@ origins in `studio.json`. Press `d` on an origin to remove the origin.
 
 ### Native orchestras
 
-The Permissions page also holds the `native orchestras` switch. A score that
-loads an orchestra while native execution is not permitted stops with
-`Csound is not permitted`. Press Ctrl+O, go to the Permissions page, and
-press Enter on `native orchestras`. Then update the score again. See
+The Permissions page also holds the `native orchestras` switch, which starts
+on while a Csound library is installed: open the studio and an orchestra
+score plays. Space turns it off for the run, and a score that loads an
+orchestra while it is off stops with `Csound is not permitted`. The switch
+lasts one studio run: Studio does not keep an off state either. See
 [Csound](csound.md) for what an orchestra can do.
-
-The switch reads `on` or `off` and lasts one studio run: Studio does not
-keep it, so the next start asks again. Start with `rustel studio
---allow-csound` to begin with the switch on.
 
 The first update after you trust an origin fetches the script. The update
 waits for the fetch, 8 seconds at most. Studio fetches each script one time

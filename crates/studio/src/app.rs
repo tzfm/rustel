@@ -612,7 +612,10 @@ fn run_once(options: StudioOptions) -> Result<Session, RuntimeError> {
             preview_budget_bytes: sample_settings.preview_budget.bytes(),
             unused_sample_idle: sample_settings.unused_sample_idle.duration(),
             import_origins: prefs.import_origins.clone(),
-            csound_allowed: options.session.score_import_access.csound_allowed(),
+            // `csound_allowed` stays at its default: on, because an
+            // installed Csound library is the studio's opt-in. The
+            // permissions page takes it back for a run, and the one-shot
+            // commands keep `--allow-csound`.
             ..StudioConfig::default()
         },
         #[cfg(feature = "hydra")]
@@ -1140,9 +1143,10 @@ struct App {
     /// The origins whose script imports the engine refused in this studio,
     /// newest last. The permissions page offers them, so nobody types an origin.
     blocked_imports: Vec<String>,
-    /// Whether native orchestras run in this studio. The launch flag can
-    /// turn them on; the permissions page flips the switch for the run.
-    /// The studio does not keep it, so the next start asks again.
+    /// Whether native orchestras run in this studio. The switch starts on -
+    /// an installed library is the opt-in - and the permissions page flips
+    /// it for the run. The studio keeps neither state, so the next start is
+    /// on again.
     csound_allowed: bool,
     /// A score asked for an orchestra and the engine refused it, so the
     /// permissions page offers the switch.
@@ -1503,9 +1507,9 @@ impl App {
         let theme_camera_confirmed = theme.camera_enabled().then(|| theme.name.clone());
         let prefs = StudioPrefs::load();
         let mixer = MixerState::new(prefs.input_gain_tenths_db);
-        // The launch flag is the switch's first state; the permissions
-        // page owns it from here on.
-        let csound_at_start = options.session.score_import_access.csound_allowed();
+        // The switch starts on, as the engine's does: an installed library
+        // is the opt-in, and the permissions page owns the switch from here.
+        let csound_at_start = true;
         let mut app = Self {
             output_latency_pending: true,
             cli_output_latency: options.output_buffer_frames.map(OutputLatency::from_frames),

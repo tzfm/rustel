@@ -15,16 +15,15 @@ setup. The Homebrew 6.18 package cannot play named instruments, which shared
 orchestras use. On Ubuntu 24.04, `sudo apt install libcsound64-6.0` provides
 the library.
 
-Enable native orchestra execution when starting Rustel:
+The one-shot commands enable native orchestra execution with a flag:
 
 ```sh
 rustel play song.strudel --allow-csound
-rustel studio --allow-csound
 ```
 
-In Studio you can also press Ctrl+O, go to the Permissions page, and press
-Enter on `native orchestras`. That switch lasts one studio run; Studio does
-not keep it.
+Studio permits native orchestras while a Csound library is installed: open
+the studio and the score plays. Press Ctrl+O and go to the Permissions page
+to turn the `native orchestras` switch off for a run.
 
 An orchestra can read files, run processes, and load native opcodes with your
 account's permissions. Enable Csound only for scores and orchestras you trust.

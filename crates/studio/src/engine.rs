@@ -270,8 +270,10 @@ pub struct StudioConfig {
     /// The origins of the permissions page, which scores import scripts from.
     /// They add to the origins that `session` already trusts.
     pub import_origins: Vec<String>,
-    /// Whether native orchestras run. The launch flag turns them on; the
-    /// permissions page can flip the switch during a run.
+    /// Whether native orchestras run. The studio turns them on at start -
+    /// an installed library is the opt-in - and the permissions page can
+    /// flip the switch during a run. The default is the studio's rule, so
+    /// every way of opening one agrees.
     pub csound_allowed: bool,
 }
 
@@ -292,7 +294,7 @@ impl Default for StudioConfig {
             watch_pads: true,
             open_default_input: true,
             import_origins: Vec::new(),
-            csound_allowed: false,
+            csound_allowed: true,
         }
     }
 }
