@@ -34,25 +34,25 @@ pub(super) struct Seg {
 }
 
 /// A vowel not in the last syllable of its phrase.
-const NOT_PHRASE_FINAL: f32 = 0.489;
+const NOT_PHRASE_FINAL: f32 = 0.499;
 /// A vowel not in the last syllable of its word.
 const NOT_WORD_FINAL: f32 = 0.57;
 /// A vowel in a word of several syllables.
 const POLYSYLLABIC: f32 = 0.769;
 /// The vowel of a phrase's last syllable.
-const PHRASE_FINAL: f32 = 1.336;
+const PHRASE_FINAL: f32 = 1.582;
 /// An unstressed vowel: its factor, and the share of its minimum it keeps.
 const UNSTRESSED: f32 = 0.577;
 const UNSTRESSED_MIN: f32 = 0.673;
 /// A consonant that does not start its word.
 const NOT_WORD_INITIAL: f32 = 0.569;
 /// A consonant after the last vowel of its phrase.
-const PHRASE_FINAL_CONSONANT: f32 = 1.986;
+const PHRASE_FINAL_CONSONANT: f32 = 2.427;
 /// The vowel before a clause break `)` lengthens by this factor.
 const BEFORE_CLAUSE: f32 = 1.6;
 /// Pause lengths in ms at speed 150.
 const COMMA_MS: f32 = 212.0;
-const STOP_MS: f32 = 291.0;
+const STOP_MS: f32 = 326.0;
 
 /// Inherent and minimum length of a sound, ms.
 fn lengths(ph: Ph) -> (f32, f32) {
@@ -62,23 +62,24 @@ fn lengths(ph: Ph) -> (f32, f32) {
         Ih => (147.0, 61.0),
         Eh => (165.0, 86.0),
         Ae => (230.0, 90.0),
-        Aa => (237.0, 107.0),
+        Aa => (255.0, 115.0),
         Ah => (174.0, 88.0),
         Ao => (273.0, 117.0),
         Ow => (240.0, 90.0),
-        Oh => (213.0, 80.0),
+        Oh => (173.0, 65.0),
         Uh => (196.0, 64.0),
         Uw => (241.0, 90.0),
         Er => (175.0, 81.0),
         Ax => (118.0, 35.0),
         Ix => (108.0, 36.0),
         Ey => (195.0, 107.0),
-        Ay => (251.0, 150.0),
+        Ay => (227.0, 135.0),
         Oy => (298.0, 153.0),
         Aw => (208.0, 79.0),
         Ul => (264.0, 119.0),
         In => (210.0, 95.0),
-        Um | Un | Il | Im => (200.0, 90.0),
+        Un => (190.0, 86.0),
+        Um | Il | Im => (200.0, 90.0),
         B => (76.0, 53.0),
         Ch | C => (104.0, 75.0),
         D => (75.0, 50.0),
@@ -88,7 +89,7 @@ fn lengths(ph: Ph) -> (f32, f32) {
         G => (80.0, 60.0),
         H | Hh => (80.0, 20.0),
         Kh => (100.0, 60.0),
-        J => (56.0, 40.0),
+        J => (62.0, 44.0),
         K => (54.0, 40.0),
         L | Lx => (77.0, 38.0),
         M => (70.0, 60.0),
@@ -100,11 +101,11 @@ fn lengths(ph: Ph) -> (f32, f32) {
         R | Rx => (69.0, 26.0),
         S => (81.0, 46.0),
         Sh => (105.0, 80.0),
-        T => (64.0, 43.0),
+        T => (52.0, 35.0),
         Th => (90.0, 60.0),
         V => (73.0, 49.0),
         W | Wh => (76.0, 57.0),
-        Y => (53.0, 27.0),
+        Y => (50.0, 25.0),
         Z => (75.0, 40.0),
         Zh => (70.0, 40.0),
     }

@@ -39,6 +39,9 @@ const VOICE_BAR: f32 = 0.15;
 const BREATH: f32 = 0.93;
 /// The breath of an `h` and of a voiceless stop's release.
 const ASPIRATION: f32 = 1.86;
+/// The sources fade out over this long before the last sound ends, ms at
+/// speed 150.
+const END_FADE_MS: f32 = 40.0;
 
 /// How long the breath after a voiceless stop lasts, ms at speed 150.
 fn aspiration_ms(ph: Ph) -> f32 {
@@ -306,7 +309,7 @@ impl Tracks {
         // Voicing fades out at the end, and every channel goes quiet.
         let end = segs.last().map_or(0.0, |s| s.t1);
         for ch in [AV, AH, AF] {
-            b.set(ch, end, 0.0, 40.0 * scale, 1.0);
+            b.set(ch, end, 0.0, END_FADE_MS * scale, 1.0);
         }
         let mut steps = b.steps;
         for list in &mut steps {
