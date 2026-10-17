@@ -50,8 +50,10 @@ Studio adds folders in Settings, vst tab. These folders count in Studio only.
 
 Studio at its start, and `rustel vst`, scan each new or changed plugin bundle
 one time, in a process of its own. A bundle with a fault at the scan stays
-off, and rustel goes on. The fault stays in the cache with the stamp of the
-bundle, so an unchanged bundle gets no new test. A rescan tries it again.
+off, and rustel goes on. In a bundle with several plugins, a plugin that
+does not start stays off with its reason, and the others stay on. The fault
+stays in the cache with the stamp of the bundle, so an unchanged bundle
+gets no new test. A rescan tries it again.
 Studio scans in the background, so you play and edit during the scan.
 
 The file `~/.rustel/vst/scan.json` keeps the result. `rustel vst --rescan`,
