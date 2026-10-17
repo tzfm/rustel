@@ -9,6 +9,7 @@
 
 use rustel_talkit::lang::Language;
 use rustel_talkit::params::{Effort, Quality};
+use rustel_talkit::personality::Timbre;
 
 use super::*;
 
@@ -23,8 +24,7 @@ pub(super) struct SpeechKey {
     quality: Quality,
     effort: Effort,
     language: Language,
-    /// The timbre, by its bits: three formant factors, vowel length, tone.
-    timbre: [u32; 5],
+    timbre: Timbre,
 }
 
 impl SpeechKey {
@@ -37,16 +37,7 @@ impl SpeechKey {
             quality: params.quality,
             effort: params.effort,
             language: params.language,
-            timbre: {
-                let t = params.timbre;
-                [
-                    t.formants[0].to_bits(),
-                    t.formants[1].to_bits(),
-                    t.formants[2].to_bits(),
-                    t.vowels.to_bits(),
-                    t.tone.to_bits(),
-                ]
-            },
+            timbre: params.timbre,
         }
     }
 }

@@ -532,7 +532,7 @@ const TALKIT_QUALITIES: &[ReferenceChoice] = &[
     },
     ReferenceChoice {
         value: "sung",
-        description: "Walks a scale while speaking.",
+        description: "Holds one pitch the engine picks from the note.",
     },
 ];
 

@@ -1,57 +1,27 @@
 //! Text and settings to finished samples.
 //!
-//! This is the whole pipeline in one place: transcribe, place in time, plan
-//! the pitch, synthesize, then normalize. Each stage lives in its own module.
+//! Text becomes the phonetic notation by the language's rules, and the
+//! narrator speaks the notation. [`render_phonetic`] starts from the
+//! notation itself.
 
 use crate::params::Params;
-use crate::prosody::Plan;
-use crate::synth::synthesize;
-use crate::utterance::build;
+use crate::phonetic::{Item, PhoneticError, parse};
 
-/// The level the loudest sample of an utterance is brought to.
-const PEAK: f32 = 0.75;
-/// Fade at each end, in ms, so playback starts and stops without a click.
-const FADE_MS: f32 = 3.0;
-
-/// Render `text` spoken with `params` as mono f32 samples at
+/// Render `text` spoken with `params` as mono samples from -1 to 1 at
 /// [`crate::RATE`]. Text with no speech sounds in it renders nothing.
 pub fn render(text: &str, params: &Params) -> Vec<f32> {
-    let phones = params.language.transcribe(text);
-    if !phones.iter().any(|p| {
-        matches!(
-            p,
-            crate::lang::Phone::Sound(_) | crate::lang::Phone::Stressed(_)
-        )
-    }) {
-        return Vec::new();
-    }
-    let utterance = build(&phones, params.speed, params.timbre.vowels);
-    let plan = Plan::new(
-        params.pitch,
-        params.quality,
-        &utterance.nuclei(),
-        &utterance.phrases,
-    );
-    let mut samples = synthesize(&utterance, &plan, params.effort, params.timbre);
-    finish(&mut samples);
-    samples
+    // The language rules write only valid notation.
+    render_phonetic(&params.language.transcribe(text), params).unwrap_or_default()
 }
 
-/// Bring the peak to [`PEAK`] and fade both ends. Silence stays silent.
-fn finish(samples: &mut [f32]) {
-    let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
-    if peak < 1e-6 {
-        return;
+/// Render a phonetic string, such as `/HEH5LOW`, spoken with `params`.
+/// The language setting plays no part.
+pub fn render_phonetic(text: &str, params: &Params) -> Result<Vec<f32>, PhoneticError> {
+    let items = parse(text)?;
+    if !items.iter().any(|i| matches!(i, Item::Sound { .. })) {
+        return Ok(Vec::new());
     }
-    let gain = PEAK / peak;
-    let fade = (FADE_MS * crate::RATE as f32 / 1000.0) as usize;
-    let last = samples.len().saturating_sub(1);
-    for (n, s) in samples.iter_mut().enumerate() {
-        // One ramp in, one out, meeting in the middle of a short render.
-        let into = (n as f32 / fade.max(1) as f32).min(1.0);
-        let out_of = ((last - n) as f32 / fade.max(1) as f32).min(1.0);
-        *s *= gain * into.min(out_of);
-    }
+    Ok(crate::narrator::speak(&items, params))
 }
 
 #[cfg(test)]
@@ -69,8 +39,9 @@ mod tests {
         let s = render("hello world", &params());
         assert!(!s.is_empty());
         assert!(s.iter().all(|x| x.abs() <= 1.0));
+        // The original engine's level: the plain voice peaks near half scale.
         let peak = s.iter().fold(0.0f32, |m, x| m.max(x.abs()));
-        assert!(peak > 0.5, "peak {peak}");
+        assert!(peak > 0.25, "peak {peak}");
     }
 
     /// A one-sided pulse leaves the wave on an offset that thumps each time

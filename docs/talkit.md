@@ -43,7 +43,7 @@ A note sets the pitch the voice starts on:
 
 ```javascript
 $: note("c3 e3 g3 c4").talkit('la')
-$: n("0 2 4 7").scale("C3:major").talkit('do', { v: "singing-boy" })
+$: n("0 2 4 7").scale("C3:major").talkit('do', { v: "singing-boy", q: "monotone" })
 ```
 
 `.freq(220)` sets the pitch in Hz, and `.octave(1)` moves a note or a
@@ -54,12 +54,13 @@ Start from the notes, as with a synth. `talkit('la')` makes one event per
 cycle, so `talkit('la').note("c3 e3 g3")` keeps that one event and speaks
 only at C3.
 
-The first syllable sits exactly on the note. After it, the quality decides:
-monotone holds the note, and sung walks a major chord up from it. Natural
-moves like speech: a stressed syllable rises above the note, the voice sinks
-a little across each phrase and starts again after a pause, a final `.`
-falls and a final `?` rises. For a melody that stays on its notes, use
-`quality: "monotone"`.
+The quality decides what the voice does with the note. Monotone holds it.
+Sung holds one pitch for the whole phrase, which the original engine picks
+from the note: the note itself, or a step up to a fifth above or a fourth
+below. Natural moves like speech: it starts just under the note, a stressed
+syllable rises above it, the voice sinks a little after each rise and starts
+again after a pause, a final `.` falls and a final `?` rises. For a melody
+that stays on its notes, use `quality: "monotone"`.
 
 A whispered voice has no pitch: `effort: "whispered"` replaces the voice with
 breath, so a note or a `pitch` setting changes nothing. A breathy voice keeps
@@ -74,8 +75,8 @@ fast. The other controls apply as to a sample: `.gain`, `.pan`, `.cut`,
 sound.
 
 Each phrase, voice and pitch is rendered once, the first time an event asks
-for it, and then plays from memory. A second of speech renders in about a
-millisecond, so the first event sounds. Studio lets go of renderings that no
+for it, and then plays from memory. A second of speech renders in about two
+milliseconds, so the first event sounds. Studio lets go of renderings that no
 playing score uses and renders them again when a score asks.
 
 ## From the command line
@@ -109,7 +110,7 @@ the other keys in any order.
 | `personality`, `voice` or `v` | see voices below | applies a whole preset |
 | `pitch` or `p` | 50 to 500 | the pitch the voice starts on in Hz, default 100 |
 | `speed`, `rate` or `s` | 50 to 400 | whole numbers, 150 is nominal, higher is faster |
-| `quality` or `q` | natural, monotone, sung | monotone holds one pitch, sung walks a chord |
+| `quality` or `q` | natural, monotone, sung | monotone holds the pitch, sung holds a pitch the engine picks from it |
 | `effort` or `e` | normal, breathy, whispered | whispered drops voicing entirely, and with it the pitch |
 | `language`, `lang` or `l` | english, spanish | letter rules and number words per language |
 | `out` or `o` | a `.wav` path | command line only, writes the file instead of playing |
@@ -152,18 +153,30 @@ the same voice.
 Each voice also has a timbre of its own: the shape of its vocal tract, how
 long it holds its vowels, and how soft or buzzy its voice is. Big Robot and
 Little Robot buzz like machines, Child and Fly have short vocal tracts, and
-Singing Boy is soft. The timbres, the vowels, the timing and the natural
-intonation are measured from the original engine's output.
+Singing Boy is soft. The timbres, the sounds, the timing, the intonation and
+the English readings are measured from the original engine's output, and the
+speech has its sound: 8-bit steps at 11.025 kHz.
 
 ## Text handling
 
 Punctuation sets the pauses and the pitch at the end of a sentence: a comma
-pauses briefly, a period or exclamation falls, a question mark rises. Numbers
-are spoken as words: `3.5` becomes `three point five`, `1,500` becomes
-`one thousand five hundred` and `-2` becomes `minus two`. In Spanish the same
-`3.5` becomes `tres coma cinco`. Accented letters fold to their base letter
-before the rules run.
+or a bracket pauses, a period, exclamation, colon or semicolon falls, and a
+question mark rises. A short word such as `for` or `to` takes its full form
+at the end of a phrase, as in `what is it for?`.
+
+English numbers are read as the original engine reads them. Up to three
+digits are a count: `42` is `forty two`. Four digits are a year: `1999` is
+`nineteen ninety nine`, and `2005` is `two thousand five`. Five or more
+digits are read one by one. Thousands commas make a count with a pause at
+each comma: `1,500` is `one thousand, five hundred`. A point reads its digits
+one by one: `3.14` is `three point one four`.
+
+Spanish numbers follow the same engine. Up to four digits are a count:
+`2024` is `dos mil veinte y cuatro`. Five or more digits are read one by
+one, and thousands commas pause as in English. A point reads `y`, the digits
+one by one and `decimal`: `3.5` is `tres y cinco decimal`. Accented letters
+fold to their base letter before the Spanish rules run.
 
 Command line playback uses the default output device and waits until the text
-has sounded. A written file is 16-bit mono WAV at 22.05 kHz. The same text and
+has sounded. A written file is 16-bit mono WAV at 11.025 kHz. The same text and
 settings always render the same samples.

@@ -1,224 +1,79 @@
-//! Spanish letter-to-sound rules.
+//! Spanish text in the phonetic notation.
 //!
 //! Spanish spelling maps to sounds almost one to one, so the rule table is
 //! small. Stress is regular: a written accent wins, else a word ending in a
-//! vowel, n or s stresses the second-to-last syllable and any other ending
-//! stresses the last one. The stressed vowel is handed to the utterance
-//! builder, which stretches it a little.
+//! vowel, `n` or `s` stresses the second-to-last syllable and any other
+//! ending stresses the last one.
 
-use crate::lang::{Phone, Rule, apply_rules};
-use crate::phoneme::Phoneme as P;
+use super::rules::{Rule, rule, sounds};
+use super::{Piece, Sounds, Token};
+use crate::phonetic::Ph;
 
-/// Whole words the rules would get wrong.
-const EXCEPTIONS: &[(&str, &[P])] = &[("y", &[P::Iy])];
-
+#[rustfmt::skip]
 const RULES: &[Rule] = &[
-    (Rule {
-        pattern: "ch",
-        phones: &[P::T, P::Sh],
-    }),
-    (Rule {
-        pattern: "ll",
-        phones: &[P::Y],
-    }),
-    (Rule {
-        pattern: "rr",
-        phones: &[P::Rr],
-    }),
-    (Rule {
-        pattern: "cc",
-        phones: &[P::K, P::S],
-    }),
-    (Rule {
-        pattern: "gue",
-        phones: &[P::G],
-    }),
-    (Rule {
-        pattern: "gui",
-        phones: &[P::G],
-    }),
-    (Rule {
-        pattern: "qu",
-        phones: &[P::K],
-    }),
-    (Rule {
-        pattern: "ge",
-        phones: &[P::X],
-    }),
-    (Rule {
-        pattern: "gi",
-        phones: &[P::X],
-    }),
-    (Rule {
-        pattern: "#r",
-        phones: &[P::Rr],
-    }),
-    (Rule {
-        pattern: "nr",
-        phones: &[P::N, P::Rr],
-    }),
-    (Rule {
-        pattern: "lr",
-        phones: &[P::L, P::Rr],
-    }),
-    (Rule {
-        pattern: "sr",
-        phones: &[P::S, P::Rr],
-    }),
-    (Rule {
-        pattern: "ce",
-        phones: &[P::S, P::Eh],
-    }),
-    (Rule {
-        pattern: "ci",
-        phones: &[P::S, P::Ih],
-    }),
-    (Rule {
-        pattern: "c",
-        phones: &[P::K],
-    }),
-    (Rule {
-        pattern: "g",
-        phones: &[P::G],
-    }),
-    (Rule {
-        pattern: "j",
-        phones: &[P::X],
-    }),
-    (Rule {
-        pattern: "z",
-        phones: &[P::S],
-    }),
-    (Rule {
-        pattern: "h",
-        phones: &[],
-    }),
-    (Rule {
-        pattern: "ñ",
-        phones: &[P::N, P::Y],
-    }),
-    (Rule {
-        pattern: "x",
-        phones: &[P::K, P::S],
-    }),
-    (Rule {
-        pattern: "y#",
-        phones: &[P::Iy],
-    }),
-    (Rule {
-        pattern: "v",
-        phones: &[P::B],
-    }),
-    (Rule {
-        pattern: "w",
-        phones: &[P::W],
-    }),
-    (Rule {
-        pattern: "k",
-        phones: &[P::K],
-    }),
-    (Rule {
-        pattern: "a",
-        phones: &[P::Aa],
-    }),
-    (Rule {
-        pattern: "e",
-        phones: &[P::Eh],
-    }),
-    (Rule {
-        pattern: "i",
-        phones: &[P::Iy],
-    }),
-    (Rule {
-        pattern: "o",
-        phones: &[P::Ao],
-    }),
-    (Rule {
-        pattern: "u",
-        phones: &[P::Uw],
-    }),
-    (Rule {
-        pattern: "b",
-        phones: &[P::B],
-    }),
-    (Rule {
-        pattern: "d",
-        phones: &[P::D],
-    }),
-    (Rule {
-        pattern: "f",
-        phones: &[P::F],
-    }),
-    (Rule {
-        pattern: "l",
-        phones: &[P::L],
-    }),
-    (Rule {
-        pattern: "m",
-        phones: &[P::M],
-    }),
-    (Rule {
-        pattern: "n",
-        phones: &[P::N],
-    }),
-    (Rule {
-        pattern: "p",
-        phones: &[P::P],
-    }),
-    (Rule {
-        pattern: "r",
-        phones: &[P::R],
-    }),
-    (Rule {
-        pattern: "s",
-        phones: &[P::S],
-    }),
-    (Rule {
-        pattern: "t",
-        phones: &[P::T],
-    }),
+    rule("", "ch", "", "CH"),
+    rule("", "ll", "", "Y"),
+    rule("", "rr", "", "RR"),
+    rule("", "cc", "", "KS"),
+    rule("", "gü", "", "GUW"),
+    rule("", "gu", "+", "G"),
+    rule("", "qu", "", "K"),
+    rule("", "g", "+", "HH"),
+    rule("n", "r", "", "RR"),
+    rule("l", "r", "", "RR"),
+    rule("s", "r", "", "RR"),
+    rule("", "c", "+", "S"),
+    rule("", "c", "", "K"),
+    rule("", "g", "", "G"),
+    rule("", "j", "", "HH"),
+    rule("", "z", "", "S"),
+    rule("", "h", "", ""),
+    rule("", "ñ", "", "NY"),
+    rule("", "x", "", "KS"),
+    rule("", "y", " ", "IY"),
+    rule("", "y", "", "Y"),
+    rule("", "v", "", "V"),
+    rule("", "w", "", "W"),
+    rule("", "k", "", "K"),
+    rule("", "ai", "", "AY"),
+    rule("", "ay", "", "AY"),
+    rule("", "ei", "", "EY"),
+    rule("", "ey", " ", "EHY"),
+    rule("", "oi", "", "OY"),
+    rule("", "oy", "", "OY"),
+    rule("n", "u", "#", "UW"),
+    rule("", "u", "#", "W"),
+    rule("", "a", "", "AA"),
+    rule("", "e", "", "EH"),
+    rule("", "i", "", "IY"),
+    rule("", "o", "", "OH"),
+    rule("", "u", "", "UW"),
+    rule("", "ü", "", "UW"),
+    rule("", "b", "", "B"),
+    rule("", "d", "", "D"),
+    rule("", "f", "", "F"),
+    rule("", "l", "", "L"),
+    rule("", "m", "", "M"),
+    rule("", "n", "g", "NX"),
+    rule("", "n", "", "N"),
+    rule("", "p", "", "P"),
+    rule("", "r", "", "R"),
+    rule("", "s", "", "S"),
+    rule("", "t", "", "T"),
 ];
-
-/// One lowercase word to phonemes, with the stressed vowel marked.
-pub(super) fn word_phones(word: &str) -> Vec<Phone> {
-    let (letters, accent) = normalize(word);
-    if let Some((_, phones)) = EXCEPTIONS.iter().find(|(w, _)| *w == letters) {
-        return phones.iter().map(|p| Phone::Sound(*p)).collect();
-    }
-    let stress = accent.or_else(|| default_stress(&letters));
-    let chars: Vec<char> = letters.chars().collect();
-    apply_rules(&chars, RULES)
-        .into_iter()
-        .map(|(p, start, len)| {
-            let is_stressed = stress.is_some_and(|s| start <= s && s < start + len);
-            if is_stressed && is_vowel(p) {
-                Phone::Stressed(p)
-            } else {
-                Phone::Sound(p)
-            }
-        })
-        .collect()
-}
-
-fn is_vowel(p: P) -> bool {
-    matches!(p, P::Aa | P::Eh | P::Iy | P::Ao | P::Uw)
-}
 
 /// Lowercase, accents folded. Returns the letters and the letter index a
 /// written accent sat on, if the word carries one.
 fn normalize(word: &str) -> (String, Option<usize>) {
     let mut out = String::with_capacity(word.len());
     let mut accent = None;
-    for c in word.to_lowercase().chars() {
-        if c == '\'' || c == '\u{0301}' {
-            continue;
-        }
+    for c in word.chars().filter(|&c| c != '\'') {
         let folded = match c {
             'á' | 'à' | 'â' | 'ä' => 'a',
             'é' | 'è' | 'ê' | 'ë' => 'e',
             'í' | 'ì' | 'î' | 'ï' => 'i',
             'ó' | 'ò' | 'ô' | 'ö' => 'o',
-            'ú' | 'ù' | 'û' | 'ü' => 'u',
+            'ú' | 'ù' | 'û' => 'u',
             c => c,
         };
         if folded != c {
@@ -229,204 +84,278 @@ fn normalize(word: &str) -> (String, Option<usize>) {
     (out, accent)
 }
 
-/// The letter index the default stress rule puts the beat on: the first vowel
-/// of the chosen syllable.
-fn default_stress(letters: &str) -> Option<usize> {
-    let chars: Vec<char> = letters.chars().collect();
-    if chars.is_empty() {
-        return None;
-    }
-    let groups: Vec<usize> = chars
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| "aeiou".contains(**c))
-        .map(|(i, _)| i)
-        .collect();
-    if groups.is_empty() {
-        return None;
-    }
-    // Split the vowel indices into runs; each run is one syllable nucleus.
-    let mut runs: Vec<(usize, usize)> = Vec::new();
-    for (n, idx) in groups.iter().enumerate() {
-        let contiguous = n > 0 && *idx == groups[n - 1] + 1;
-        if contiguous {
-            runs.last_mut().expect("first run exists").1 = *idx;
-        } else {
-            runs.push((*idx, *idx));
+/// The syllables of a word by its vowel letters: each run of vowels is one
+/// syllable. The `u` of `que` and `gui` is silent and counts as no vowel.
+fn syllables(chars: &[char]) -> Vec<Vec<usize>> {
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+    for i in 0..chars.len() {
+        let silent_u = chars[i] == 'u'
+            && i > 0
+            && matches!(chars[i - 1], 'q' | 'g')
+            && matches!(chars.get(i + 1), Some('e' | 'i'));
+        if !matches!(chars[i], 'a' | 'e' | 'i' | 'o' | 'u' | 'ü') || silent_u {
+            continue;
+        }
+        match runs.last_mut() {
+            Some(run) if run.last().copied() == i.checked_sub(1) => run.push(i),
+            _ => runs.push(vec![i]),
         }
     }
-    let penult = matches!(chars.last(), Some('a' | 'e' | 'i' | 'o' | 'u' | 'n' | 's'));
-    let pick = if penult && runs.len() >= 2 {
-        runs[runs.len() - 2]
-    } else {
-        runs[runs.len() - 1]
-    };
-    Some(pick.0)
+    runs
 }
 
-pub(super) const DIGITS: [&str; 10] = [
-    "cero", "uno", "dos", "tres", "cuatro", "cinco", "seis", "siete", "ocho", "nueve",
-];
-
-/// Words for 1 to 29, which Spanish names individually.
-const UNDER30: [&str; 29] = [
-    "uno",
-    "dos",
-    "tres",
-    "cuatro",
-    "cinco",
-    "seis",
-    "siete",
-    "ocho",
-    "nueve",
-    "diez",
-    "once",
-    "doce",
-    "trece",
-    "catorce",
-    "quince",
-    "dieciseis",
-    "diecisiete",
-    "dieciocho",
-    "diecinueve",
-    "veinte",
-    "veintiuno",
-    "veintidos",
-    "veintitres",
-    "veinticuatro",
-    "veinticinco",
-    "veintiseis",
-    "veintisiete",
-    "veintiocho",
-    "veintinueve",
-];
-
-const TENS: [&str; 7] = [
-    "treinta",
-    "cuarenta",
-    "cincuenta",
-    "sesenta",
-    "setenta",
-    "ochenta",
-    "noventa",
-];
-
-const HUNDREDS: [&str; 9] = [
-    "ciento",
-    "doscientos",
-    "trescientos",
-    "cuatrocientos",
-    "quinientos",
-    "seiscientos",
-    "setecientos",
-    "ochocientos",
-    "novecientos",
-];
-
-/// Words for `n`. Above 999,999 the digits are named one by one.
-pub(super) fn number_words(n: i64) -> Vec<&'static str> {
-    if n < 0 {
-        return number_words(-n);
+/// The syllable that takes the beat, and the place of the beat in it when
+/// a written accent marks it. Without an accent, a word ending in a vowel,
+/// `n` or `s` stresses its second-to-last syllable and any other its last.
+fn beat(
+    chars: &[char],
+    runs: &[Vec<usize>],
+    accent: Option<usize>,
+) -> Option<(usize, Option<usize>)> {
+    if let Some(a) = accent {
+        return runs
+            .iter()
+            .enumerate()
+            .find_map(|(r, run)| run.iter().position(|&i| i == a).map(|k| (r, Some(k))));
     }
-    if n > 999_999 {
-        return n
-            .to_string()
-            .chars()
-            .map(|c| DIGITS[(c as u8 - b'0') as usize])
-            .collect();
+    let penult = matches!(chars.last(), Some('a' | 'e' | 'i' | 'o' | 'u' | 'n' | 's'));
+    match runs.len() {
+        0 => None,
+        n if penult && n >= 2 => Some((n - 2, None)),
+        n => Some((n - 1, None)),
     }
-    let mut out = Vec::new();
-    if n >= 1000 {
-        let thousands = n / 1000;
-        if thousands > 1 {
-            under_thousand(&mut out, thousands);
+}
+
+/// Short words that take no stress, as the original engine reads them.
+const UNSTRESSED: &[&str] = &[
+    "a", "al", "con", "de", "del", "el", "en", "es", "hay", "la", "las", "lo", "los", "me", "mi",
+    "mis", "ni", "no", "nos", "o", "por", "que", "se", "sin", "su", "sus", "te", "tu", "tus", "un",
+    "y", "ya", "yo",
+];
+
+/// One word's sounds, with the stressed vowel marked. In the stressed
+/// syllable the accented vowel takes the beat, else its open vowel `a`,
+/// `e` or `o`, else its last vowel.
+fn word(word: &str) -> Sounds {
+    let (letters, accent) = normalize(word);
+    let chars: Vec<char> = letters.chars().collect();
+    let beat = beat(&chars, &syllables(&chars), accent);
+    let mut out: Sounds = sounds(&letters, RULES)
+        .into_iter()
+        .map(|ph| (ph, 0))
+        .collect();
+    // The vowel sounds in groups, one group per syllable.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (i, (ph, _)) in out.iter().enumerate() {
+        if !ph.is_vowel() {
+            continue;
         }
-        out.push("mil");
+        match groups.last_mut() {
+            Some(g) if g.last().copied() == i.checked_sub(1) => g.push(i),
+            _ => groups.push(vec![i]),
+        }
     }
-    let rest = n % 1000;
-    if rest == 0 && !out.is_empty() {
-        return out;
+    let open = |ph: Ph| matches!(ph, Ph::Aa | Ph::Eh | Ph::Oh | Ph::Ay | Ph::Ey | Ph::Oy);
+    if let Some((r, at)) = beat
+        && let Some(group) = groups.get(r)
+        && !UNSTRESSED.contains(&letters.as_str())
+    {
+        let pick = at
+            .and_then(|k| group.get(k).copied())
+            .or_else(|| group.iter().copied().find(|&i| open(out[i].0)))
+            .or(group.last().copied());
+        if let Some(i) = pick {
+            out[i].1 = 5;
+        }
     }
-    if n == 0 {
-        out.push("cero");
-        return out;
+    out
+}
+/// The number words of the original engine's Spanish count reading.
+const UNITS: [&str; 10] = [
+    "SEH5ROH",
+    "UW5NOH",
+    "DOH5S",
+    "TREY5S",
+    "KWAA5TROH",
+    "SIY5NXKOH",
+    "SEY5S",
+    "SIYEH5TEH",
+    "OH5CHOH",
+    "NUWEY5VEH",
+];
+const TEENS: [&str; 6] = [
+    "DIYEH5S",
+    "OH5NSEH",
+    "DOH5SEH",
+    "TREH5SEH",
+    "KAATOH5RSEH",
+    "KIY5NSEH",
+];
+/// Twenty to ninety alone, and before `y` and a unit.
+const TENS: [(&str, &str); 8] = [
+    ("VEY5NTEY", "VEY5NTEHIY"),
+    ("TREY5NTAA", "TREY5NTAAIY"),
+    ("KWAAREH5NTAA", "KWAAREH5NTAAIY"),
+    ("SIYNXKWEH5NTAA", "SIYNXKWEH5NTAAIY"),
+    ("SEHSEH5NTAA", "SEHSEH5NTAAIY"),
+    ("SEHTEH5NTAA", "SEHTEH5NTAAIY"),
+    ("OHCHEH5NTAA", "OHCHEH5NTAAIY"),
+    ("NOHVEH5NTAA", "NOHVEH5NTAAIY"),
+];
+
+/// 0 to 99 as words.
+fn under_hundred(n: usize, out: &mut Vec<&'static str>) {
+    match n {
+        0..=9 => out.push(UNITS[n]),
+        10..=15 => out.push(TEENS[n - 10]),
+        16..=19 => out.extend(["DIYEHSIY", UNITS[n - 10]]),
+        _ if n.is_multiple_of(10) => out.push(TENS[n / 10 - 2].0),
+        _ => out.extend([TENS[n / 10 - 2].1, UNITS[n % 10]]),
     }
-    under_thousand(&mut out, rest);
+}
+
+/// 1 to 999 as words.
+fn under_thousand(n: usize, out: &mut Vec<&'static str>) {
+    match n / 100 {
+        0 => {}
+        1 if n == 100 => out.push("SIYEH4N"),
+        1 => out.push("SIYEH4NTOH"),
+        5 => out.push("KIYNIYEH4NTOHS"),
+        7 => out.push("SEH3TEHSIYEH4NTOHS"),
+        9 => out.push("NOH3VEHSIYEH4NTOHS"),
+        h => out.extend([UNITS[h], "SIYEH4NTOHS"]),
+    }
+    if !n.is_multiple_of(100) {
+        under_hundred(n % 100, out);
+    }
+}
+
+/// 0 to 999,999 as a count. A thousand reads `mil`, without `uno`.
+fn count(n: usize, out: &mut Vec<&'static str>) {
+    match n {
+        0 => out.push(UNITS[0]),
+        // A lone one has its own stress.
+        1 => out.push("UW4NOH"),
+        _ => {
+            if n >= 1000 {
+                if n / 1000 > 1 {
+                    under_thousand(n / 1000, out);
+                }
+                out.push("MIY5L");
+            }
+            under_thousand(n % 1000, out);
+        }
+    }
+}
+
+/// A number token as words and marks: up to four digits as a count, more
+/// digits one by one, thousands commas as a count with a pause at each
+/// comma, and a point as `y`, the digits one by one and `decimal`.
+fn number(text: &str) -> Vec<Piece> {
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    let digit = |d: u8| UNITS[usize::from(d - b'0')];
+    let mut out: Vec<Piece> = Vec::new();
+    let mut words: Vec<&'static str> = Vec::new();
+    if whole.contains(',') {
+        let groups: Vec<usize> = whole.split(',').filter_map(|g| g.parse().ok()).collect();
+        for (k, &group) in groups.iter().enumerate() {
+            let scale = groups.len() - 1 - k;
+            if group == 0 {
+                continue;
+            }
+            match scale {
+                0 => under_thousand(group, &mut words),
+                1 => count(group * 1000, &mut words),
+                _ => {
+                    if group > 1 {
+                        under_thousand(group, &mut words);
+                    }
+                    words.push(if group > 1 { "MIYYOH5NEHS" } else { "MIYYOH5N" });
+                }
+            }
+            if scale > 0 && groups[k + 1..].iter().any(|&g| g > 0) {
+                out.extend(words.drain(..).map(|w| Piece::Word(sounds_of(w))));
+                out.push(Piece::Mark(','));
+            }
+        }
+    } else {
+        let digits = whole.trim_start_matches('0');
+        match digits.len() {
+            0 => words.push(UNITS[0]),
+            1..=4 => count(digits.parse().unwrap_or(0), &mut words),
+            _ => words.extend(digits.bytes().map(digit)),
+        }
+    }
+    if !fraction.is_empty() {
+        words.push("IY");
+        words.extend(fraction.bytes().map(digit));
+        words.push("DEH5SIYMAAL");
+    }
+    out.extend(words.into_iter().map(|w| Piece::Word(sounds_of(w))));
     out
 }
 
-fn under_thousand(out: &mut Vec<&'static str>, n: i64) {
-    if n == 100 {
-        out.push("cien");
-        return;
-    }
-    if n > 100 {
-        out.push(HUNDREDS[(n / 100 - 1) as usize]);
-    }
-    let rest = n % 100;
-    if rest == 0 {
-        return;
-    }
-    if rest < 30 {
-        out.push(UNDER30[(rest - 1) as usize]);
-    } else {
-        out.push(TENS[(rest / 10 - 3) as usize]);
-        if rest % 10 > 0 {
-            out.push("y");
-            out.push(DIGITS[(rest % 10) as usize]);
+/// Sounds from the notation. The tables hold only valid notation.
+fn sounds_of(code: &str) -> Sounds {
+    crate::phonetic::parse(code)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|item| match item {
+            crate::phonetic::Item::Sound { ph, stress } => Some((ph, stress)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Read `tokens` as words and marks.
+pub(super) fn read(tokens: &[Token]) -> Vec<Piece> {
+    let mut out = Vec::new();
+    for token in tokens {
+        match token {
+            Token::Word(w) => out.push(Piece::Word(word(w))),
+            Token::Number { text, joined: true } => {
+                for d in text.bytes().filter(u8::is_ascii_digit) {
+                    out.push(Piece::Word(sounds_of(UNITS[usize::from(d - b'0')])));
+                }
+            }
+            Token::Number { text, .. } => {
+                // A time reads its hour and its minutes as two counts.
+                for part in text.split(':') {
+                    out.extend(number(part));
+                }
+            }
+            // The Spanish reader speaks no signs.
+            Token::Sign(_) => {}
+            Token::Mark(':') => out.push(Piece::Mark('.')),
+            Token::Mark(m) => out.push(Piece::Mark(*m)),
         }
     }
+    out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::lang::Language;
 
-    fn phones(word: &str) -> Vec<P> {
-        word_phones(word)
-            .into_iter()
-            .filter_map(|p| match p {
-                Phone::Sound(p) | Phone::Stressed(p) => Some(p),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn stressed(word: &str) -> Vec<bool> {
-        word_phones(word)
-            .into_iter()
-            .map(|p| matches!(p, Phone::Stressed(_)))
-            .collect()
+    fn say(text: &str) -> String {
+        Language::Spanish.transcribe(text)
     }
 
     #[test]
-    fn reads_the_letters() {
-        assert_eq!(phones("hola"), vec![P::Ao, P::L, P::Aa]);
-        assert_eq!(phones("señor"), vec![P::S, P::Eh, P::N, P::Y, P::Ao, P::R]);
-        assert_eq!(phones("perro"), vec![P::P, P::Eh, P::Rr, P::Ao]);
-        assert_eq!(phones("jugo"), vec![P::X, P::Uw, P::G, P::Ao]);
-        assert_eq!(phones("y"), vec![P::Iy]);
+    fn reads_letters_and_stress() {
+        assert_eq!(say("perro"), "PEH5RROH");
+        assert_eq!(say("guerra"), "GEH5RRAA");
+        assert_eq!(say("canción"), "KAANSIYOH5N");
+        assert_eq!(say("ciudad"), "SIYUWDAA5D");
+        assert_eq!(say("quiero"), "KIYEH5ROH");
     }
 
     #[test]
-    fn marks_stress_by_rule_and_accent() {
-        // "canto" ends in a vowel, so the penult vowel "a" carries the beat.
-        assert_eq!(stressed("canto"), vec![false, true, false, false, false]);
-        // "cantar" ends in a consonant, so the last vowel does.
-        assert_eq!(
-            stressed("cantar"),
-            vec![false, false, false, false, true, false]
-        );
-        // A written accent overrides the default.
-        assert_eq!(stressed("cantó"), vec![false, false, false, false, true]);
-    }
-
-    #[test]
-    fn reads_numbers_as_words() {
-        assert_eq!(number_words(0), vec!["cero"]);
-        assert_eq!(number_words(31), vec!["treinta", "y", "uno"]);
-        assert_eq!(number_words(100), vec!["cien"]);
-        assert_eq!(number_words(121), vec!["ciento", "veintiuno"]);
-        assert_eq!(number_words(2000), vec!["dos", "mil"]);
+    fn reads_numbers_as_the_engine_does() {
+        assert_eq!(say("42"), "KWAAREH5NTAAIY DOH5S");
+        assert_eq!(say("16"), "DIYEHSIY SEY5S");
+        assert_eq!(say("2024"), "DOH5S MIY5L VEY5NTEHIY KWAA5TROH");
+        assert_eq!(say("1,500"), "MIY5L, KIYNIYEH4NTOHS");
+        assert_eq!(say("3.5"), "TREY5S IY SIY5NXKOH DEH5SIYMAAL");
     }
 }

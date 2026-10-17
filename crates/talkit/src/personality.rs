@@ -2,42 +2,80 @@
 //!
 //! A personality is a preset of pitch, speed, pitch quality and vocal effort,
 //! as the original application's buttons set them, and a [`Timbre`]: the
-//! original engine took the personality as a voice of its own as well.
+//! rest of the original engine's voice record for that button.
 
 use crate::params::{Effort, Quality};
 
-/// The sound of a voice apart from its settings.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// The sound of a voice apart from its four settings, field for field as the
+/// original engine's voice record holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Timbre {
-    /// The factors on the first three formants, the shape of the vocal
-    /// tract: all above 1 for a short tract, as a child's. F4 and F5 follow
-    /// the third.
-    pub formants: [f32; 3],
-    /// The factor on every vowel's length. A sung voice holds its vowels.
-    pub vowels: f32,
-    /// The brightness of the glottal source, from -1 to 1. Below 0 the
-    /// source is softened, above 0 it buzzes: at 1 each closure snaps and
-    /// the voice reaches up to its third formant at nearly full strength, a
-    /// machine voice.
-    pub tone: f32,
+    /// The vowel and consonant tables the voice speaks with: 0 man,
+    /// 1 woman, 2 child, 3 large man.
+    pub tract: u8,
+    /// The glottal source, 1 to 8.
+    pub glottis: u8,
+    /// The slope of the source: 2 and above is flat, each step below it
+    /// darkens the voice.
+    pub tilt: i8,
+    /// How far natural intonation moves, in percent.
+    pub range: i16,
+    /// How unsteady the pitch is.
+    pub perturb: i16,
+    /// The height of natural accents, in percent.
+    pub accent: [i16; 2],
+    /// The length of the vowels, in percent.
+    pub vowels: i16,
+    /// Level offsets of voicing, aspiration and frication, in dB.
+    pub av: i8,
+    pub ah: i8,
+    pub af: i8,
+    /// F1 to F3 and their bandwidths, in percent of the tables.
+    pub formants: [i16; 3],
+    pub bandwidths: [i16; 3],
+    /// The fixed fourth and fifth resonances: Hz and bandwidth.
+    pub upper: [(i16, i16); 2],
 }
 
 impl Timbre {
-    /// The adult voice the formant tables describe.
-    pub const PLAIN: Self = timbre([1.0, 1.0, 1.0], 1.0, PLAIN_TONE);
+    /// The voice the tables describe as they are: the Man button.
+    pub const PLAIN: Self = Personality::Man.timbre();
 }
 
-const fn timbre(formants: [f32; 3], vowels: f32, tone: f32) -> Timbre {
+/// One voice record in the order the original engine stores it, after
+/// pitch, speed, effort and pitch quality.
+#[allow(clippy::too_many_arguments)]
+const fn record(
+    tract: u8,
+    glottis: u8,
+    tilt: i8,
+    range: i16,
+    perturb: i16,
+    accent: i16,
+    vowels: i16,
+    [av, ah, af]: [i8; 3],
+    formants: [i16; 3],
+    bandwidths: [i16; 3],
+    upper: [i16; 4],
+) -> Timbre {
     Timbre {
-        formants,
+        tract,
+        glottis,
+        tilt,
+        range,
+        perturb,
+        accent: [accent, accent],
         vowels,
-        tone,
+        av,
+        ah,
+        af,
+        formants,
+        bandwidths,
+        upper: [(upper[0], upper[1]), (upper[2], upper[3])],
     }
 }
 
-/// The plain voice's tone.
-const PLAIN_TONE: f32 = 0.35;
-
+const SAME: [i16; 3] = [100, 100, 100];
 /// A named voice preset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Personality {
@@ -279,31 +317,270 @@ impl Personality {
         }
     }
 
-    /// The voice's own sound, measured from the original engine's output:
-    /// each voice speaking the same vowels at the same steady pitch, against
-    /// the plain male voice.
-    pub fn timbre(self) -> Timbre {
+    /// The voice's own sound: the original engine's record for this
+    /// button, read through its public interface.
+    pub const fn timbre(self) -> Timbre {
         match self {
-            Self::Man => Timbre::PLAIN,
-            Self::Woman => timbre([1.24, 1.11, 1.16], 1.02, 0.25),
-            Self::HyperFemale => timbre([1.24, 1.11, 1.16], 1.12, 0.20),
-            Self::Child => timbre([1.69, 1.43, 1.43], 0.99, 0.55),
-            Self::StrongMan => timbre([0.87, 0.91, 0.92], 1.01, 0.15),
-            Self::Mellow => timbre([1.26, 1.11, 1.19], 1.21, 0.10),
-            Self::SingingGirl => timbre([1.39, 1.29, 1.31], 2.46, 0.50),
-            Self::StrongWoman => timbre([1.20, 1.08, 1.12], 1.16, 0.10),
-            Self::Fly => timbre([1.86, 1.84, 1.57], 0.44, 0.25),
-            Self::LittleRobot => timbre([1.45, 1.03, 1.00], 0.96, 1.0),
-            Self::Martian => timbre([1.12, 1.00, 0.99], 1.04, 0.0),
-            Self::BigRobot => timbre([1.05, 0.99, 1.01], 1.14, 1.0),
-            Self::HyperMale => timbre([1.0, 1.0, 1.0], 1.0, 0.15),
-            Self::OldWoman => timbre([1.28, 1.12, 1.16], 0.98, 0.40),
-            Self::LittleMan => timbre([1.48, 1.38, 1.37], 1.00, 0.40),
-            Self::ImaginaryMan => timbre([1.08, 1.10, 1.15], 1.64, 0.50),
-            Self::Nerd => timbre([1.39, 1.00, 1.00], 0.79, 0.65),
-            Self::Whiner => timbre([0.89, 1.20, 1.22], 1.00, 0.75),
-            Self::Wobbly => timbre([1.0, 1.0, 1.0], 2.44, 0.30),
-            Self::SingingBoy => timbre([1.16, 1.04, 1.12], 2.49, -0.85),
+            Self::Man => record(
+                0,
+                1,
+                2,
+                125,
+                0,
+                120,
+                100,
+                [-8, 0, -2],
+                SAME,
+                SAME,
+                [3600, 400, 4300, 150],
+            ),
+            Self::Woman => record(
+                1,
+                2,
+                -2,
+                100,
+                0,
+                120,
+                100,
+                [0, 0, 0],
+                SAME,
+                SAME,
+                [4200, 1200, 4200, 1200],
+            ),
+            Self::HyperFemale => record(
+                1,
+                2,
+                -2,
+                350,
+                0,
+                120,
+                110,
+                [0, 0, 0],
+                SAME,
+                SAME,
+                [4200, 1200, 4200, 1200],
+            ),
+            Self::Child => record(
+                2,
+                3,
+                0,
+                150,
+                0,
+                80,
+                100,
+                [-9, 0, 0],
+                SAME,
+                SAME,
+                [2500, 2000, 4500, 2000],
+            ),
+            Self::StrongMan => record(
+                3,
+                1,
+                4,
+                150,
+                10,
+                80,
+                100,
+                [-3, 0, 0],
+                [97, 95, 95],
+                SAME,
+                [3300, 350, 3850, 300],
+            ),
+            Self::Mellow => record(
+                1,
+                2,
+                0,
+                125,
+                0,
+                75,
+                120,
+                [0, 0, 0],
+                SAME,
+                SAME,
+                [4200, 1200, 4200, 1200],
+            ),
+            Self::SingingGirl => record(
+                0,
+                5,
+                -3,
+                100,
+                15,
+                125,
+                250,
+                [-7, -10, 0],
+                [130, 130, 130],
+                [135, 140, 160],
+                [4200, 1000, 4900, 1000],
+            ),
+            Self::StrongWoman => record(
+                1,
+                2,
+                -4,
+                100,
+                0,
+                120,
+                110,
+                [3, 0, 0],
+                [100, 95, 95],
+                SAME,
+                [4000, 1200, 4200, 1200],
+            ),
+            Self::Fly => record(
+                2,
+                4,
+                -4,
+                180,
+                120,
+                70,
+                140,
+                [-11, 0, 0],
+                [120, 120, 120],
+                [110, 110, 100],
+                [2500, 2000, 4500, 2000],
+            ),
+            Self::LittleRobot => record(
+                0,
+                6,
+                -1,
+                100,
+                0,
+                80,
+                100,
+                [-16, 0, 0],
+                SAME,
+                SAME,
+                [3300, 450, 3850, 400],
+            ),
+            Self::Martian => record(
+                0,
+                7,
+                0,
+                100,
+                30,
+                80,
+                100,
+                [-8, 0, 0],
+                SAME,
+                SAME,
+                [3600, 400, 4300, 150],
+            ),
+            Self::BigRobot => record(
+                0,
+                8,
+                3,
+                100,
+                0,
+                80,
+                110,
+                [-12, 0, 0],
+                SAME,
+                SAME,
+                [3500, 2000, 4500, 2000],
+            ),
+            Self::HyperMale => record(
+                0,
+                1,
+                0,
+                65,
+                0,
+                80,
+                100,
+                [-4, 0, 0],
+                SAME,
+                SAME,
+                [3600, 400, 4300, 150],
+            ),
+            Self::OldWoman => record(
+                1,
+                2,
+                1,
+                160,
+                90,
+                65,
+                100,
+                [-6, 0, 0],
+                SAME,
+                SAME,
+                [4200, 1200, 4200, 1200],
+            ),
+            Self::LittleMan => record(
+                2,
+                1,
+                -2,
+                180,
+                15,
+                80,
+                100,
+                [-1, -4, -3],
+                [100, 95, 95],
+                [120, 130, 140],
+                [4000, 2000, 4500, 2000],
+            ),
+            Self::ImaginaryMan => record(
+                1,
+                1,
+                6,
+                160,
+                0,
+                80,
+                165,
+                [5, 0, 0],
+                SAME,
+                SAME,
+                [4200, 1200, 4200, 1200],
+            ),
+            Self::Nerd => record(
+                0,
+                1,
+                2,
+                200,
+                20,
+                80,
+                80,
+                [-5, 0, 0],
+                [135, 100, 100],
+                [150, 115, 100],
+                [3600, 400, 4300, 300],
+            ),
+            Self::Whiner => record(
+                0,
+                1,
+                -2,
+                160,
+                0,
+                80,
+                100,
+                [-2, 0, 0],
+                [90, 120, 120],
+                [100, 130, 200],
+                [3600, 400, 4300, 400],
+            ),
+            Self::Wobbly => record(
+                0,
+                1,
+                2,
+                100,
+                15,
+                50,
+                250,
+                [-4, 0, 0],
+                SAME,
+                SAME,
+                [3600, 400, 4300, 150],
+            ),
+            Self::SingingBoy => record(
+                0,
+                3,
+                -1,
+                100,
+                15,
+                125,
+                250,
+                [-7, -10, 0],
+                [105, 105, 105],
+                [135, 115, 115],
+                [4100, 600, 4900, 1000],
+            ),
         }
     }
 

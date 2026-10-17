@@ -146,7 +146,7 @@ pub(crate) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
             "$: talkit(\"my name is skrillex\")",
             "$: talkit('hola mundo', { personality: \"little-robot\", language: \"es\" })",
             "$: talkit(['question?', 'answer.'], { effort: \"whispered\" })",
-            "$: note(\"c3 e3 g3 c4\").talkit('la', { v: \"singing-boy\" })",
+            "$: note(\"c3 e3 g3 c4\").talkit('la', { v: \"singing-boy\", q: \"monotone\" })",
         ],
         tags: &["audio", "samples", "experimental"],
         no_autocomplete: false,
