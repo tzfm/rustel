@@ -98,7 +98,7 @@ pub(crate) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         name: "talkit",
         synonyms: &[],
         summary: "Speak the text through the built-in speech synthesizer.",
-        description: "Speak the text instead of playing a sample or a synth. Single quotes speak one phrase per cycle, spaces and punctuation included: `talkit('hello there, how are you?')`. Double quotes are mini-notation, one word per event: `talkit(\"my name is skrillex\")`. An array plays its phrases one after another in the cycle.\n\nThe second argument sets the voice: `talkit('hola', { personality: \"robotoid\", language: \"es\" })`. The keys are personality (`v`), pitch (`p`) 50 to 500 Hz, speed (`s`) 50 to 400, quality (`q`), effort (`e`) and language (`l`), each itself a pattern.\n\nA note sets the pitch the voice starts on: `note(\"c3 e3 g3\").talkit('la')` sings three notes. An explicit `pitch` outranks the note. The ordinary controls apply as to a sample.",
+        description: "Speak the text instead of playing a sample or a synth. Single quotes speak one phrase per cycle, spaces and punctuation included: `talkit('hello there, how are you?')`. Double quotes are mini-notation, one word per event: `talkit(\"my name is skrillex\")`. An array plays its phrases one after another in the cycle.\n\nThe second argument sets the voice: `talkit('hola', { personality: \"little-robot\", language: \"es\" })`. The keys are personality (`v`), pitch (`p`) 50 to 500 Hz, speed (`s`) 50 to 400, quality (`q`), effort (`e`) and language (`l`), each itself a pattern.\n\nA note sets the pitch the voice starts on: `note(\"c3 e3 g3\").talkit('la')` sings three notes. An explicit `pitch` outranks the note. The ordinary controls apply as to a sample.",
         params: &[
             ReferenceParam {
                 name: "text",
@@ -144,9 +144,9 @@ pub(crate) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         examples: &[
             "$: talkit('hello there').slow(2)",
             "$: talkit(\"my name is skrillex\")",
-            "$: talkit('hola mundo', { personality: \"robotoid\", language: \"es\" })",
+            "$: talkit('hola mundo', { personality: \"little-robot\", language: \"es\" })",
             "$: talkit(['question?', 'answer.'], { effort: \"whispered\" })",
-            "$: note(\"c3 e3 g3 c4\").talkit('la', { v: \"choir-boy\" })",
+            "$: note(\"c3 e3 g3 c4\").talkit('la', { v: \"singing-boy\" })",
         ],
         tags: &["audio", "samples", "experimental"],
         no_autocomplete: false,

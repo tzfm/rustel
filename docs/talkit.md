@@ -19,7 +19,7 @@ quotes decide how the text splits into events:
 ```javascript
 $: talkit('hello there').slow(2)
 $: talkit("my name is skrillex")
-$: talkit('hola mundo', { personality: "robotoid", language: "spanish" })
+$: talkit('hola mundo', { personality: "little-robot", language: "spanish" })
 $: talkit(['question?', 'answer.'], { effort: "whispered" })
 ```
 
@@ -33,9 +33,9 @@ Each field of the options object is itself a pattern, so
 `quality: "<natural sung>"` alternates by cycle. The keys are the parameter
 table below, with the short forms `v`, `p`, `s`, `q`, `e` and `l`.
 
-Write a voice name with hyphens: `{ v: "the-fly" }`. An option value is
-mini-notation, where a space separates two events, so `"the fly"` asks for a
-voice called `the`.
+Write a voice name with hyphens: `{ v: "little-robot" }`. An option value is
+mini-notation, where a space separates two events, so `"little robot"` asks
+for a voice called `little`.
 
 ### Melodies
 
@@ -43,7 +43,7 @@ A note sets the pitch the voice starts on:
 
 ```javascript
 $: note("c3 e3 g3 c4").talkit('la')
-$: n("0 2 4 7").scale("C3:major").talkit('do', { v: "choir-boy" })
+$: n("0 2 4 7").scale("C3:major").talkit('do', { v: "singing-boy" })
 ```
 
 `.freq(220)` sets the pitch in Hz, and `.octave(1)` moves a note or a
@@ -90,7 +90,7 @@ Then:
 
 ```sh
 talkit hello world
-talkit personality=robotoid "I am a robot"
+talkit personality=little-robot "I am a robot"
 talkit lang=spanish "hola mundo"
 talkit effort=whispered out=secret.wav "can you keep a secret"
 ```
@@ -119,20 +119,40 @@ one step, so put single overrides after it.
 
 ## Voices
 
-```text
-male  female  large-male  child  giant-male  mellow-female  mellow-male
-crisp-male  the-fly  robotoid  martian  colossus  fast-fred  old-woman
-munchkin  troll  nerd  milk-toast  tipsy  choir-boy
-```
+The 20 voices of the original program, in its button order, with the
+settings each one starts from:
 
-Names match ignoring case and anything that is not a letter, so `the-fly`,
-`TheFly` and, on the command line, `"the fly"` pick the same voice.
+| Voice | Pitch | Speed | Quality | Effort |
+|---|---|---|---|---|
+| `man` | 100 | 150 | natural | normal |
+| `woman` | 200 | 150 | natural | normal |
+| `hyper-female` | 190 | 250 | natural | normal |
+| `child` | 350 | 130 | natural | normal |
+| `strong-man` | 75 | 140 | natural | normal |
+| `mellow` | 190 | 140 | natural | breathy |
+| `singing-girl` | 310 | 90 | sung | normal |
+| `strong-woman` | 200 | 140 | natural | normal |
+| `fly` | 480 | 150 | natural | normal |
+| `little-robot` | 90 | 150 | monotone | normal |
+| `martian` | 80 | 150 | monotone | normal |
+| `big-robot` | 66 | 138 | monotone | normal |
+| `hyper-male` | 135 | 300 | natural | normal |
+| `old-woman` | 270 | 115 | natural | normal |
+| `little-man` | 90 | 150 | natural | normal |
+| `imaginary-man` | 110 | 200 | natural | normal |
+| `nerd` | 140 | 155 | natural | normal |
+| `whiner` | 120 | 165 | natural | normal |
+| `wobbly` | 145 | 115 | sung | normal |
+| `singing-boy` | 310 | 90 | sung | normal |
 
-Each voice starts from the pitch, speed, quality and effort of its original
-preset, and has a timbre of its own: the shape of its vocal tract, how long
-it holds its vowels, and how soft or buzzy its voice is. Colossus and
-Robotoid buzz like machines, Child and The Fly have short vocal tracts, and
-Choir Boy is soft. The timbres, the vowels, the timing and the natural
+Names match ignoring case and anything that is not a letter, so
+`little-robot`, `LittleRobot` and, on the command line, `"little robot"` pick
+the same voice.
+
+Each voice also has a timbre of its own: the shape of its vocal tract, how
+long it holds its vowels, and how soft or buzzy its voice is. Big Robot and
+Little Robot buzz like machines, Child and Fly have short vocal tracts, and
+Singing Boy is soft. The timbres, the vowels, the timing and the natural
 intonation are measured from the original engine's output.
 
 ## Text handling

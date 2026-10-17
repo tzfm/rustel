@@ -71,14 +71,14 @@ pub struct Params {
 
 impl Default for Params {
     fn default() -> Self {
-        let p = Personality::Male.preset();
+        let p = Personality::Man.preset();
         Self {
             pitch: p.pitch as f32,
             speed: p.speed,
             quality: p.quality,
             effort: p.effort,
             language: Language::English,
-            timbre: Personality::Male.timbre(),
+            timbre: Personality::Man.timbre(),
         }
     }
 }
@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn personality_applies_its_whole_preset() {
-        let p = params(&[("personality", "choirboy")]).unwrap();
+        let p = params(&[("personality", "singingboy")]).unwrap();
         assert_eq!((p.pitch, p.speed), (310.0, 90));
         assert_eq!(p.quality, Quality::Sung);
     }
@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn later_pairs_override_a_preset() {
         let p = params(&[
-            ("personality", "robotoid"),
+            ("personality", "little-robot"),
             ("pitch", "250"),
             ("quality", "sung"),
         ])
@@ -267,14 +267,14 @@ mod tests {
             "effort takes normal, breathy or whispered, not `loud`"
         );
         let voice = params(&[("v", "daft")]).unwrap_err().to_string();
-        assert!(voice.contains("large-male"), "{voice}");
-        assert!(voice.contains("choir-boy"), "{voice}");
+        assert!(voice.contains("hyper-female"), "{voice}");
+        assert!(voice.contains("singing-boy"), "{voice}");
     }
 
     #[test]
     fn single_letter_keys_reach_the_same_settings() {
         let p = params(&[
-            ("v", "robotoid"),
+            ("v", "little-robot"),
             ("p", "250"),
             ("s", "90"),
             ("q", "sung"),

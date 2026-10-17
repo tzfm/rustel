@@ -77,7 +77,7 @@ mod tests {
     /// voicing starts or stops.
     #[test]
     fn speech_carries_no_offset() {
-        for voice in ["male", "colossus", "child"] {
+        for voice in ["man", "big-robot", "child"] {
             let mut params = params();
             params.apply("personality", voice).unwrap();
             let s = render("my name is", &params);

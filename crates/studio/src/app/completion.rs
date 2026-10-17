@@ -200,9 +200,9 @@ impl App {
         // and `G^9` becomes `G^Db-7`.
         let role = self.string_role(&callee);
         let chord = role == Some(StringRole::Chord);
-        // A documented choice can be hyphenated - `large-male` - and the
+        // A documented choice can be hyphenated - `little-man` - and the
         // hyphen is part of it, or the chosen name lands inside the old one
-        // and `large-male` becomes `large-the-fly`.
+        // and `little-man` becomes `little-big-robot`.
         let hyphenated = self
             .string_choice_set(&callee)
             .is_some_and(|set| set.choices.iter().any(|choice| choice.value.contains('-')));

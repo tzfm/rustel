@@ -440,15 +440,15 @@ const RNG_MODES: &[ReferenceChoice] = &[
 /// a space separates two events.
 const TALKIT_VOICES: &[ReferenceChoice] = &[
     ReferenceChoice {
-        value: "male",
+        value: "man",
         description: "The default voice: 100 Hz.",
     },
     ReferenceChoice {
-        value: "female",
+        value: "woman",
         description: "200 Hz.",
     },
     ReferenceChoice {
-        value: "large-male",
+        value: "hyper-female",
         description: "190 Hz, fast.",
     },
     ReferenceChoice {
@@ -456,27 +456,27 @@ const TALKIT_VOICES: &[ReferenceChoice] = &[
         description: "350 Hz.",
     },
     ReferenceChoice {
-        value: "giant-male",
+        value: "strong-man",
         description: "75 Hz.",
     },
     ReferenceChoice {
-        value: "mellow-female",
+        value: "mellow",
         description: "190 Hz, breathy.",
     },
     ReferenceChoice {
-        value: "mellow-male",
+        value: "singing-girl",
         description: "310 Hz, sung, slow.",
     },
     ReferenceChoice {
-        value: "crisp-male",
+        value: "strong-woman",
         description: "200 Hz.",
     },
     ReferenceChoice {
-        value: "the-fly",
+        value: "fly",
         description: "480 Hz.",
     },
     ReferenceChoice {
-        value: "robotoid",
+        value: "little-robot",
         description: "90 Hz, monotone.",
     },
     ReferenceChoice {
@@ -484,11 +484,11 @@ const TALKIT_VOICES: &[ReferenceChoice] = &[
         description: "80 Hz, monotone.",
     },
     ReferenceChoice {
-        value: "colossus",
+        value: "big-robot",
         description: "66 Hz, monotone.",
     },
     ReferenceChoice {
-        value: "fast-fred",
+        value: "hyper-male",
         description: "135 Hz, fast.",
     },
     ReferenceChoice {
@@ -496,11 +496,11 @@ const TALKIT_VOICES: &[ReferenceChoice] = &[
         description: "270 Hz.",
     },
     ReferenceChoice {
-        value: "munchkin",
+        value: "little-man",
         description: "90 Hz.",
     },
     ReferenceChoice {
-        value: "troll",
+        value: "imaginary-man",
         description: "110 Hz, fast.",
     },
     ReferenceChoice {
@@ -508,15 +508,15 @@ const TALKIT_VOICES: &[ReferenceChoice] = &[
         description: "140 Hz.",
     },
     ReferenceChoice {
-        value: "milk-toast",
+        value: "whiner",
         description: "120 Hz.",
     },
     ReferenceChoice {
-        value: "tipsy",
+        value: "wobbly",
         description: "145 Hz, sung.",
     },
     ReferenceChoice {
-        value: "choir-boy",
+        value: "singing-boy",
         description: "310 Hz, sung, slow.",
     },
 ];

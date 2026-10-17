@@ -398,7 +398,7 @@ mod tests {
         };
         let asked = || speaks.0.borrow().last().cloned().expect("an ask");
         let spoken = resolve(serde_json::json!({
-            "talkit": { "text": "hello there, nice to meet you", "p": 250, "v": "robotoid",
+            "talkit": { "text": "hello there, nice to meet you", "p": 250, "v": "little-robot",
                         "q": "sung", "l": "es", "s": 160 },
             "s": "sine"
         }))
@@ -420,7 +420,7 @@ mod tests {
                     quality: Quality::Sung,
                     effort: Effort::Normal,
                     language: rustel_talkit::lang::Language::Spanish,
-                    timbre: rustel_talkit::personality::Personality::Robotoid.timbre(),
+                    timbre: rustel_talkit::personality::Personality::LittleRobot.timbre(),
                 }
             )
         );
@@ -486,7 +486,10 @@ mod tests {
                 serde_json::json!({ "text": "hey", "pitch": "high" }),
                 "pitch takes 50 to 500",
             ),
-            (serde_json::json!({ "text": "hey", "v": "the" }), "the-fly"),
+            (
+                serde_json::json!({ "text": "hey", "v": "little" }),
+                "little-robot",
+            ),
         ] {
             let refused = resolve(serde_json::json!({ "talkit": fields }))
                 .expect_err("a bad setting is refused");

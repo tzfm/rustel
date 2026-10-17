@@ -238,7 +238,7 @@ mod tests {
         let runtime = runtime();
         let haps = spoken(
             &runtime,
-            r#"$: talkit('hola mundo', { personality: "robotoid", language: "es", pitch: 250 })"#,
+            r#"$: talkit('hola mundo', { personality: "little-robot", language: "es", pitch: 250 })"#,
         );
         let speech = haps[0]
             .get("talkit")
@@ -250,7 +250,7 @@ mod tests {
         );
         assert_eq!(
             speech.get("personality").and_then(Value::as_str),
-            Some("robotoid")
+            Some("little-robot")
         );
         assert_eq!(speech.get("language").and_then(Value::as_str), Some("es"));
         assert_eq!(speech.get("pitch").and_then(Value::as_f64), Some(250.0));

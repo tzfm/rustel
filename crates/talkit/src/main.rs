@@ -28,7 +28,7 @@ A personality applies its whole preset, so put overrides after it.
 
 examples:
   talkit hello world
-  talkit personality=robotoid quality=monotone \"I am a robot\"
+  talkit personality=little-robot quality=monotone \"I am a robot\"
   talkit lang=spanish out=hola.wav \"hola mundo\"
 ";
 
