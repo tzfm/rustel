@@ -64,7 +64,7 @@ const PREFIXES: &[(&str, Weak, &str)] = &[
     ("un", Weak::Same, ""),
     ("dis", Weak::Same, ""),
     ("ex", Weak::Same, ""),
-    ("eff", Weak::To(Ph::Ah), "o"),
+    ("ef", Weak::To(Ph::Ah), ""),
     ("per", Weak::Same, ""),
     ("sup", Weak::Same, ""),
     ("suc", Weak::Same, ""),

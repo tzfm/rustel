@@ -9,6 +9,7 @@ use crate::lang::rules::{Rule, rule};
 #[rustfmt::skip]
 pub(super) const RULES: &[Rule] = &[
     // a
+    rule("", "alf", "", "AEF"),
     rule(" :", "a", "tive", "EY"),
     rule(" ", "are", " ", "AAR"),
     rule(" ", "ar", "o", "AXR"),
@@ -82,6 +83,8 @@ pub(super) const RULES: &[Rule] = &[
     rule(" ", "doing", "", "DUWIHNX"),
     rule(" ", "dow", "", "DAW"),
     rule("", "du", "a", "JUW"),
+    rule("", "dule", " ", "JUWUL"),
+    rule("", "dules", " ", "JUWULZ"),
     rule("#:", "dded", " ", "DIXD"),
     rule("", "dd", "", "D"),
     rule("", "d", "", "D"),
@@ -223,6 +226,10 @@ pub(super) const RULES: &[Rule] = &[
     rule(" ", "k", "n", ""),
     rule("", "k", "", "K"),
     // l
+    rule("pp", "ly", " ", "LAY"),
+    rule("pp", "lies", " ", "LAYZ"),
+    rule("pp", "lied", " ", "LAYD"),
+    rule("", "lure", "", "LYER"),
     rule("", "lo", "c#", "LOW"),
     rule("l", "l", "", ""),
     rule("#:^", "l", "%", "UL"),
@@ -387,6 +394,8 @@ pub(super) const RULES: &[Rule] = &[
     rule("", "tt", "", "T"),
     rule("", "t", "", "T"),
     // u
+    rule("p", "u", "sh", "UH"),
+    rule("b", "u", "sh", "UH"),
     rule(" ", "un", "i", "YUWN"),
     rule(" ", "un", "#", "UN"),
     rule(" ", "un", "", "AHN"),
