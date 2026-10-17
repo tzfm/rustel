@@ -97,6 +97,19 @@ impl ScoreImportAccess {
         let path = if path.is_absolute() {
             path
         } else {
+            // The root holds a verbatim path on Windows, and joining onto
+            // one resolves `..` against the root itself: `nested/../x`
+            // would reach the root's own `x`, and more `..` climbs out of
+            // the directory. Refuse the traversal while the specifier
+            // still reads as plain components.
+            if path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                return Err(
+                    "local orchestra is outside the trusted directory or cannot be read".to_owned(),
+                );
+            }
             root.path().join(path)
         };
         let (file, _) = root
