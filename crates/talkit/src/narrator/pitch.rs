@@ -416,6 +416,33 @@ impl Pitch {
     }
 }
 
+/// Outside monotone, the voice grows softer as the pitch falls below the
+/// setting, in dB per octave. A rise lifts the voice by a level that it
+/// reaches `LIFT_OCTAVES` above the setting. The level grows with the
+/// setting, from `LIFT_LOW` at `LIFT_FROM` Hz to `LIFT_HIGH` at `LIFT_TO` Hz.
+const FALL_DB: f32 = 9.8;
+const LIFT_LOW: f32 = 1.0;
+const LIFT_HIGH: f32 = 1.6;
+const LIFT_FROM: f32 = 100.0;
+const LIFT_TO: f32 = 150.0;
+const LIFT_OCTAVES: f32 = 0.1;
+
+/// The voicing gain at pitch `f0` for the setting `base`.
+pub(super) fn loudness(f0: f32, base: f32) -> f32 {
+    if f0 <= 0.0 || base <= 0.0 {
+        return 1.0;
+    }
+    let octaves = (f0 / base).log2();
+    let db = if octaves > 0.0 {
+        let span = ((base / LIFT_FROM).log2() / (LIFT_TO / LIFT_FROM).log2()).clamp(0.0, 1.0);
+        let lift = LIFT_LOW + (LIFT_HIGH - LIFT_LOW) * span;
+        lift * (octaves / LIFT_OCTAVES).min(1.0)
+    } else {
+        FALL_DB * octaves
+    };
+    10f32.powf(db / 20.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

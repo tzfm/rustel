@@ -15,7 +15,7 @@ mod timing;
 mod track;
 
 use crate::RATE;
-use crate::params::{Effort, Params};
+use crate::params::{Effort, Params, Quality};
 use crate::phonetic::Item;
 
 /// Silence kept after the last sound, ms, so the voice can ring out.
@@ -74,6 +74,9 @@ pub(crate) fn speak(items: &[Item], params: &Params) -> Vec<f32> {
             }
         }
         fr.av *= tract.voice_gain(fr.f0);
+        if params.quality != Quality::Monotone {
+            fr.av *= pitch::loudness(fr.f0, params.pitch);
+        }
         let silent = fr.av == 0.0 && fr.ah == 0.0 && fr.af == 0.0;
         out.push(synth::to_output(synth.next(&fr), silent));
     }

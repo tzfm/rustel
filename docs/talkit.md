@@ -60,8 +60,9 @@ syllable, from a fourth below to a fifth above. The syllable's first
 consonant picks the step, the way the original engine sings. Natural moves
 like speech: it starts just under the note, a stressed syllable rises above
 it, the voice sinks a little after each rise and starts again after a pause,
-a final `.` falls and a final `?` rises. For a melody that stays on its
-notes, use `quality: "monotone"`.
+a final `.` falls and a final `?` rises. The voice also grows softer where
+the pitch falls. For a melody that stays on its notes, use
+`quality: "monotone"`.
 
 A whispered voice has no pitch: `effort: "whispered"` replaces the voice with
 breath, so a note or a `pitch` setting changes nothing. A breathy voice keeps
