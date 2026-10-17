@@ -55,12 +55,13 @@ cycle, so `talkit('la').note("c3 e3 g3")` keeps that one event and speaks
 only at C3.
 
 The quality decides what the voice does with the note. Monotone holds it.
-Sung holds one pitch for the whole phrase, which the original engine picks
-from the note: the note itself, or a step up to a fifth above or a fourth
-below. Natural moves like speech: it starts just under the note, a stressed
-syllable rises above it, the voice sinks a little after each rise and starts
-again after a pause, a final `.` falls and a final `?` rises. For a melody
-that stays on its notes, use `quality: "monotone"`.
+Sung sings a tune of its own around the note, one step of a scale per
+syllable, from a fourth below to a fifth above. The syllable's first
+consonant picks the step, the way the original engine sings. Natural moves
+like speech: it starts just under the note, a stressed syllable rises above
+it, the voice sinks a little after each rise and starts again after a pause,
+a final `.` falls and a final `?` rises. For a melody that stays on its
+notes, use `quality: "monotone"`.
 
 A whispered voice has no pitch: `effort: "whispered"` replaces the voice with
 breath, so a note or a `pitch` setting changes nothing. A breathy voice keeps
@@ -110,7 +111,7 @@ the other keys in any order.
 | `personality`, `voice` or `v` | see voices below | applies a whole preset |
 | `pitch` or `p` | 50 to 500 | the pitch the voice starts on in Hz, default 100 |
 | `speed`, `rate` or `s` | 50 to 400 | whole numbers, 150 is nominal, higher is faster |
-| `quality` or `q` | natural, monotone, sung | monotone holds the pitch, sung holds a pitch the engine picks from it |
+| `quality` or `q` | natural, monotone, sung | monotone holds the pitch, sung sings a tune around it |
 | `effort` or `e` | normal, breathy, whispered | whispered drops voicing entirely, and with it the pitch |
 | `language`, `lang` or `l` | english, spanish | letter rules and number words per language |
 | `out` or `o` | a `.wav` path | command line only, writes the file instead of playing |

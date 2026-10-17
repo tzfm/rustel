@@ -532,7 +532,7 @@ const TALKIT_QUALITIES: &[ReferenceChoice] = &[
     },
     ReferenceChoice {
         value: "sung",
-        description: "Holds one pitch the engine picks from the note.",
+        description: "Sings a tune around the note, one step per syllable.",
     },
 ];
 

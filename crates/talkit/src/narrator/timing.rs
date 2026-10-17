@@ -29,8 +29,8 @@ pub(super) struct Seg {
     pub t1: f32,
     /// The mark that ends the phrase this segment belongs to, if any.
     pub ends: Option<char>,
-    /// True for the last vowel of its phrase.
-    pub last_vowel: bool,
+    /// True for the first sound of its word.
+    pub word_start: bool,
 }
 
 /// A vowel not in the last syllable of its phrase.
@@ -203,7 +203,7 @@ pub(super) fn build(items: &[Item], speed: u32, vowels: i16) -> Vec<Seg> {
                     t0: t,
                     t1: t + dur,
                     ends: None,
-                    last_vowel: false,
+                    word_start: pl.word_initial,
                 });
                 t += dur;
             }
@@ -241,7 +241,7 @@ pub(super) fn build(items: &[Item], speed: u32, vowels: i16) -> Vec<Seg> {
                         t0: t,
                         t1: t + dur,
                         ends: Some(mark),
-                        last_vowel: false,
+                        word_start: false,
                     });
                     t += dur;
                 }
@@ -249,24 +249,5 @@ pub(super) fn build(items: &[Item], speed: u32, vowels: i16) -> Vec<Seg> {
             Item::Word => {}
         }
     }
-    mark_last_vowels(&mut segs);
     segs
-}
-
-fn mark_last_vowels(segs: &mut [Seg]) {
-    let mut seen_vowel = false;
-    let mut phrase = None;
-    for seg in segs.iter_mut().rev() {
-        if seg.ph.is_none() || seg.ends != phrase {
-            seen_vowel = false;
-            phrase = seg.ends;
-        }
-        if let Some(ph) = seg.ph
-            && ph.is_vowel()
-            && !seen_vowel
-        {
-            seg.last_vowel = true;
-            seen_vowel = true;
-        }
-    }
 }

@@ -29,13 +29,14 @@
 //! Every level is a share of the pitch setting, so the shape moves with the
 //! note. The values are fitted to the original engine's output.
 //!
-//! Monotone holds the pitch setting. Sung holds one note too, the setting
-//! moved by up to a fifth. An unsteady voice wanders slowly around its line
-//! in every quality.
+//! Monotone holds the pitch setting. Sung steps through a scale around it,
+//! one note per syllable, picked by the syllable's first consonant. An
+//! unsteady voice wanders slowly around its line in every quality.
 
 use super::timing::Seg;
 use crate::params::Quality;
 use crate::personality::Timbre;
+use crate::phonetic::Ph;
 
 /// The level before the first accent.
 const START: f32 = 0.985;
@@ -225,10 +226,89 @@ fn anchors(
     }
 }
 
-/// Sung speech holds one note for the whole utterance: the pitch setting
-/// moved by this ratio, chosen by the setting in whole Hz modulo 8, as the
-/// original engine chooses it.
+/// Sung speech steps through this scale, one note per syllable: the pitch
+/// setting in whole Hz plus the step of the syllable's first sound, modulo
+/// 8, picks the ratio. This is how the original engine sings.
 const SUNG: [f32; 8] = [0.833, 0.94, 1.0, 1.112, 1.256, 1.405, 1.49, 0.74];
+/// The voice glides to a new note this long from the start of the sound
+/// that sets it, ms at speed 150.
+const GLIDE_MS: f32 = 50.0;
+
+/// The step a sound adds to the note of the syllable it sets, or None for
+/// the sounds that keep the note: the dark `l`, the `r` after a vowel and
+/// the silent closure.
+fn step(ph: Ph) -> Option<usize> {
+    use Ph::*;
+    Some(match ph {
+        Lx | Rx | Qx => return None,
+        T | Sh | J | Ah => 1,
+        F | H | Hh | Ih | Ao | Oy => 2,
+        Th | M => 3,
+        K | B | Z | N | Wh | Eh | Uh | Aw => 4,
+        D | Zh | R | Nx | Ul => 5,
+        V | L | Dx | Ae | Ow | Ax | Ey | Oh | Um | Un => 6,
+        G | Dh | W | Q | Ix | Il | Im | In => 7,
+        _ => 0,
+    })
+}
+
+/// The notes of sung speech, ms and Hz.
+///
+/// A syllable that starts with a consonant takes its note from the first
+/// consonant of its word when it starts the word, and inside a word from the
+/// second consonant of a cluster, so `sister` takes its second note from
+/// `t`. A syllable that starts with a vowel keeps the note, unless the vowel
+/// before it is unstressed: then that vowel sets the note. After a full stop
+/// the voice starts again from the pitch setting.
+fn sung_points(segs: &[Seg], base: f32, glide: f32) -> Vec<(f32, f32)> {
+    let index = base.round().max(0.0) as usize;
+    let note = |step: usize| base * SUNG[(index + step) % SUNG.len()];
+    let mut out: Vec<(f32, f32)> = vec![(0.0, note(0))];
+    let mut last_vowel: Option<&Seg> = None;
+    for (i, seg) in segs.iter().enumerate() {
+        if seg.ph.is_none() && matches!(seg.ends, Some('.' | '?')) {
+            last_vowel = None;
+        }
+        if !seg.ph.is_some_and(Ph::is_vowel) {
+            continue;
+        }
+        // The consonants before the vowel, back to its word's start, a
+        // vowel or a pause.
+        let mut start = i;
+        while start > 0
+            && !segs[start].word_start
+            && segs[start - 1].ph.is_some_and(|ph| !ph.is_vowel())
+        {
+            start -= 1;
+        }
+        let (at, step) = if start < i {
+            // Inside a word, a cluster gives its first consonant to the
+            // syllable before.
+            let first = if i - start >= 2 && !segs[start].word_start {
+                start + 1
+            } else {
+                start
+            };
+            (segs[first].t0, segs[first].ph.and_then(step))
+        } else {
+            let after_weak = last_vowel.filter(|v| v.stress == 0).and_then(|v| v.ph);
+            let step = match last_vowel {
+                None => Some(0),
+                Some(_) => after_weak.and_then(step),
+            };
+            (seg.t0, step)
+        };
+        if let Some(step) = step {
+            let &(last, prev) = out.last().unwrap_or(&(0.0, base));
+            let at = at.max(last);
+            out.push((at, prev));
+            out.push((at + glide, note(step)));
+        }
+        last_vowel = Some(seg);
+    }
+    out
+}
+
 /// The wander of an unsteady voice: a new random target this often, ms.
 const WANDER_MS: f32 = 250.0;
 /// The wander's depth per unit of the record's perturbation.
@@ -284,20 +364,27 @@ impl Pitch {
         timbre: &Timbre,
     ) -> Self {
         let range = f32::from(timbre.range) / 100.0;
-        let delay = ACCENT_DELAY * 150.0 / (speed & !1).max(2) as f32;
+        let scale = 150.0 / (speed & !1).max(2) as f32;
         let mut points = Vec::new();
-        if quality == Quality::Natural {
-            for (syls, terminal) in phrases(segs) {
-                anchors(&syls, terminal, base, range, delay, &mut points);
+        match quality {
+            Quality::Natural => {
+                for (syls, terminal) in phrases(segs) {
+                    anchors(
+                        &syls,
+                        terminal,
+                        base,
+                        range,
+                        ACCENT_DELAY * scale,
+                        &mut points,
+                    );
+                }
+                points.sort_by(|a, b| a.0.total_cmp(&b.0));
             }
-            points.sort_by(|a, b| a.0.total_cmp(&b.0));
+            Quality::Sung => points = sung_points(segs, base, GLIDE_MS * scale),
+            Quality::Monotone => {}
         }
-        let held = match quality {
-            Quality::Sung => base * SUNG[(base.round() as usize) % SUNG.len()],
-            _ => base,
-        };
         Self {
-            held,
+            held: base,
             points,
             next: 0,
             wander: Wander::new(),
@@ -325,6 +412,31 @@ impl Pitch {
             line * (1.0 + self.depth * self.wander.at(t))
         } else {
             line
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::phonetic::parse;
+
+    /// The original engine sings `SAA TAA KAA` at a setting of 146 Hz on
+    /// three steps of its scale: S adds none, T one and K four.
+    #[test]
+    fn sung_notes_follow_the_first_consonant() {
+        let items = parse("SAA5 TAA5 KAA5.").unwrap();
+        let segs = super::super::timing::build(&items, 150, 100);
+        let timbre = crate::personality::Personality::Man.timbre();
+        let mut pitch = Pitch::plan(&segs, Quality::Sung, 146.0, 150, &timbre);
+        let notes: Vec<f32> = segs
+            .iter()
+            .filter(|s| s.ph.is_some_and(Ph::is_vowel))
+            .map(|s| pitch.at(s.t1 - 5.0))
+            .collect();
+        let want = [146.0, 146.0 * 1.112, 146.0 * 1.49];
+        for (got, want) in notes.iter().zip(want) {
+            assert!((got - want).abs() < 1.0, "{notes:?}");
         }
     }
 }
