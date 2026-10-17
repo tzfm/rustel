@@ -116,6 +116,13 @@ pub fn set_user_folders(folders: Vec<PathBuf>) {
     }
 }
 
+/// Reads all folders again: the scan reads each new bundle, and each
+/// bundle with changed files. The read runs on the plugin thread: see
+/// [`scanning`].
+pub fn scan() {
+    host().scan(&folders());
+}
+
 /// Reads all folders again, with an empty scan cache: the scan reads each
 /// bundle that is not loaded again, a bundle that failed too. The read
 /// runs on the plugin thread: see [`scanning`].

@@ -568,9 +568,10 @@ are at the end of the list. The panel footers show the chord you set.
 
 The vst page lists the folders the plugin host reads for VST3 plugins: your
 folders first, then the standard folders of the system. Press `a` to add a
-folder and `d` to remove one of yours. Enter on `rescan` empties the scan
-cache and tests each plugin again. While the scan runs, the row names the
-plugin in its test. The page shows the number of plugins found and the preset
+folder and `d` to remove one of yours. Enter on `scan` reads every folder and
+tests each new or changed plugin, for example after you install a plugin.
+Enter on `rescan` empties the scan cache and tests each plugin again. While a
+scan runs, the `scan` row names the plugin in its test. The page shows the number of plugins found and the preset
 folder, `<rustel-config>/vst`, with one folder of `.vstpreset` files for each
 plugin. A row for each plugin ends the page, with its state, and with its
 fault when it failed.

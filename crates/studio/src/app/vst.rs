@@ -509,6 +509,13 @@ impl App {
         );
     }
 
+    /// Enter on the scan row. A plugin with an answer in the scan cache
+    /// for the files it has now gets no new test, a failed plugin too.
+    pub(super) fn scan_vst(&mut self) {
+        vst::scan();
+        self.status = "reading the plugin folders".to_owned();
+    }
+
     /// Enter on the rescan row. The scan cache is empty after, so each
     /// plugin gets a new test, a failed plugin too. The host reads the
     /// folders on its own thread, and the page shows the count at the end

@@ -2053,10 +2053,14 @@ pub(super) const SOURCE_CONTROL_COUNT: usize = SOURCES_CONTROLS.len();
 /// The two actions at the top of the vst page, before the folders: the
 /// label and the explanation of each.
 #[cfg(feature = "vst")]
-const VST_CONTROLS: [(&str, &str); 2] = [
+const VST_CONTROLS: [(&str, &str); 3] = [
     (
         "add folder",
         "opens a prompt for a folder with VST3 plugins",
+    ),
+    (
+        "scan",
+        "reads every folder and tests new or changed plugins",
     ),
     (
         "rescan",
@@ -2068,7 +2072,9 @@ pub(super) const VST_CONTROL_COUNT: usize = VST_CONTROLS.len();
 #[cfg(feature = "vst")]
 const VST_ADD_ROW: usize = 0;
 #[cfg(feature = "vst")]
-const VST_RESCAN_ROW: usize = 1;
+const VST_SCAN_ROW: usize = 1;
+#[cfg(feature = "vst")]
+const VST_RESCAN_ROW: usize = 2;
 
 /// The terminal profile belongs with the bindings it determines.
 pub(super) const TERMINAL_PROFILE_ROW: usize = 0;
@@ -2618,7 +2624,12 @@ pub enum SettingsAction {
     /// `d` on a folder the player added: take the folder off the list.
     #[cfg(feature = "vst")]
     RemoveVstFolder(usize),
-    /// Enter on the rescan row: read every plugin folder again.
+    /// Enter on the scan row: read every plugin folder again, and test the
+    /// plugins with no answer in the scan cache.
+    #[cfg(feature = "vst")]
+    ScanVst,
+    /// Enter on the rescan row: empty the scan cache, and test each plugin
+    /// again.
     #[cfg(feature = "vst")]
     RescanVst,
     /// Enter on a keybind row: wait for a chord, and make it this
@@ -2898,6 +2909,7 @@ impl SettingsSheet {
             }
             KeyCode::Char('a' | '+') => SettingsAction::AddVstFolder,
             KeyCode::Enter if at == VST_ADD_ROW => SettingsAction::AddVstFolder,
+            KeyCode::Enter if at == VST_SCAN_ROW => SettingsAction::ScanVst,
             KeyCode::Enter if at == VST_RESCAN_ROW => SettingsAction::RescanVst,
             KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace if on_added => {
                 SettingsAction::RemoveVstFolder(at - VST_CONTROL_COUNT)
@@ -8481,13 +8493,13 @@ mod tests {
             text.contains("scanning · 3 of 124 bundles · Shell › Comp"),
             "{text}"
         );
-        // The rows are part of the walk: five Downs from the first action
+        // The rows are part of the walk: six Downs from the first action
         // reach the last plugin, and the hint under the list says so.
         let mut walked = UiSettings::default();
-        for _ in 0..5 {
+        for _ in 0..6 {
             sheet.key(crossterm::event::KeyCode::Down, &mut walked, &features);
         }
-        assert_eq!(sheet.selected, 5);
+        assert_eq!(sheet.selected, 6);
         let mut buffer = Buffer::empty(frame);
         SettingsSheetView {
             sheet,

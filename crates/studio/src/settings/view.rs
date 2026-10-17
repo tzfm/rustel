@@ -1240,8 +1240,8 @@ fn render_vst(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer: &mu
                 let selected = *index == view.sheet.selected;
                 let (label, explain) = VST_CONTROLS[*index];
                 // The scan is what fills the list, so the row that starts
-                // a rescan also says where the read is.
-                let progress = (*index == VST_RESCAN_ROW)
+                // a scan also says where the read is.
+                let progress = (*index == VST_SCAN_ROW)
                     .then_some(view.vst.scan.as_ref())
                     .flatten()
                     .map(|scan| {
@@ -1319,6 +1319,8 @@ fn render_vst(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer: &mu
     let at = view.sheet.selected;
     let hint = if at == VST_ADD_ROW {
         "Enter opens the folder prompt"
+    } else if at == VST_SCAN_ROW {
+        "Enter tests new or changed plugins, as after an install"
     } else if at == VST_RESCAN_ROW {
         "Enter empties the scan cache and tests each plugin again"
     } else if at < VST_CONTROL_COUNT + added {
