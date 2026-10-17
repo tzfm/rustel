@@ -991,6 +991,8 @@ impl App {
                 sheet.selected = sheet.selected.min(rows - 1);
             }
             #[cfg(feature = "vst")]
+            SettingsAction::ScanVst => self.scan_vst(),
+            #[cfg(feature = "vst")]
             SettingsAction::RescanVst => self.rescan_vst(),
         }
         // The keybind learn belongs to the Keybinds page: Tabbed away

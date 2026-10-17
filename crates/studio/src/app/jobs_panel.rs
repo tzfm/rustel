@@ -124,13 +124,14 @@ impl App {
             });
         }
         // The plugin host works on threads of its own: the scan of the
-        // plugins with no test yet, and each plugin in its load.
+        // plugins with no test yet, by the plugin in its test, and each
+        // plugin in its load.
         #[cfg(feature = "vst")]
         {
-            if let Some((done, total)) = self.plugin_scan {
+            if let Some(scan) = &self.plugin_scan {
                 jobs.push(BackgroundJob {
-                    name: "scan plugins".into(),
-                    percent: Some(super::super::jobs::percent_of(done, total)),
+                    name: format!("scan {}", scan.plugin),
+                    percent: Some(super::super::jobs::percent_of(scan.read, scan.bundles)),
                 });
             }
             let loads = self.plugin_loads.iter();

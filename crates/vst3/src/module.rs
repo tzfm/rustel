@@ -3,6 +3,7 @@
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::path::Path;
+use std::sync::Arc;
 
 use vst3::Steinberg::*;
 use vst3::{ComPtr, Interface};
@@ -51,8 +52,10 @@ pub(crate) struct Module {
     bundle: *const c_void,
 }
 
-// SAFETY: the plugin thread makes every call into a module. Other threads
-// hold a module only to keep the library loaded.
+// SAFETY: the plugin thread makes every call into a module, and on macOS
+// the main thread makes the load, the factory calls and the drop while
+// the plugin thread waits for each step. Other threads hold a module only
+// to keep the library loaded.
 unsafe impl Send for Module {}
 unsafe impl Sync for Module {}
 
@@ -92,7 +95,15 @@ fn start_com() {
 }
 
 impl Module {
+    /// Loads a plugin library. On macOS the load runs on the process's
+    /// main thread, and the calling thread waits for it: the entry call
+    /// and the factory call run plugin code at the library's start.
     pub(crate) fn load(bundle: &Path) -> Result<Self, String> {
+        let bundle = bundle.to_owned();
+        crate::main_thread::run(move || Self::open(&bundle))
+    }
+
+    fn open(bundle: &Path) -> Result<Self, String> {
         let binary = crate::scan::binary_path(bundle)
             .ok_or("the bundle has no plugin library for this system")?;
         #[cfg(windows)]
@@ -203,8 +214,14 @@ impl Module {
         }
     }
 
-    /// The audio classes of the library.
-    pub(crate) fn classes(&self) -> Vec<ClassInfo> {
+    /// The audio classes of the library. On macOS the factory calls run
+    /// on the process's main thread, and the calling thread waits.
+    pub(crate) fn classes(self: &Arc<Self>) -> Vec<ClassInfo> {
+        let module = Arc::clone(self);
+        crate::main_thread::run(move || module.list_classes())
+    }
+
+    fn list_classes(&self) -> Vec<ClassInfo> {
         let factory = &*self.factory;
         let detailed = factory.cast::<IPluginFactory2>();
         let wide = factory.cast::<IPluginFactory3>();
@@ -274,13 +291,30 @@ impl Module {
 
 impl Drop for Module {
     fn drop(&mut self) {
-        // The factory goes first, then the exit call, then the library.
-        unsafe { ManuallyDrop::drop(&mut self.factory) };
-        Self::call_exit(&self.library);
-        #[cfg(target_os = "macos")]
+        // The library ends on the process's main thread on macOS: the
+        // factory release, the exit call and the closing of the library
+        // run plugin code that may need that thread, so the whole value
+        // moves there.
+        //
+        // SAFETY: every field is a `ManuallyDrop` or a plain pointer, so
+        // no field of the shell drops a second time here.
+        let whole = unsafe { std::ptr::read(self) };
+        crate::main_thread::run(move || whole.end());
+    }
+}
+
+impl Module {
+    /// The library's end calls: the factory goes first, then the exit
+    /// call, then the bundle and the library.
+    fn end(mut self) {
         unsafe {
-            CFRelease(self.bundle)
-        };
-        unsafe { ManuallyDrop::drop(&mut self.library) };
+            ManuallyDrop::drop(&mut self.factory);
+            Self::call_exit(&self.library);
+            #[cfg(target_os = "macos")]
+            CFRelease(self.bundle);
+            ManuallyDrop::drop(&mut self.library);
+        }
+        // The fields ended by hand; the shell must not end them again.
+        std::mem::forget(self);
     }
 }

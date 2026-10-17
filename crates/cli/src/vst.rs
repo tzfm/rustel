@@ -32,17 +32,35 @@ pub(super) fn run_vst(
     host.scan_plugins();
     // The first read of the plugin folders runs on the plugin thread.
     host.wait_idle();
-    let mut told = false;
-    while let Some((_, bundles)) = host.scan_progress() {
+    // A terminal gets one line, drawn again for each plugin, so a plugin
+    // that stops the scan has its name on the screen. Other output gets
+    // the count only.
+    let tell = !json && !crate::quiet_asked();
+    let redraw = tell && style::stderr_on();
+    let mut told = None;
+    while let Some(progress) = host.scan_progress() {
         // Ctrl-C ends the wait: the end of the command ends the scan.
         if let Some(signal) = crate::interrupted_by() {
+            if told.is_some() && redraw {
+                eprintln!();
+            }
             return Err(RuntimeError::Interrupted(signal));
         }
-        if !told && !json && !crate::quiet_asked() {
-            eprintln!("scanning {bundles} plugin bundles");
+        if redraw && told.as_ref() != Some(&progress) {
+            // A short line does not wrap, so the next draw covers it.
+            let plugin: String = progress.plugin.chars().take(48).collect();
+            eprint!(
+                "\r\x1b[Kscanning {} of {} bundles · {plugin}",
+                progress.read, progress.bundles
+            );
+        } else if tell && told.is_none() {
+            eprintln!("scanning {} plugin bundles", progress.bundles);
         }
-        told = true;
+        told = Some(progress);
         std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if told.is_some() && redraw {
+        eprint!("\r\x1b[K");
     }
     let on = style::stdout_on();
     let Some(name) = name else {

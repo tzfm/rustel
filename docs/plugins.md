@@ -50,19 +50,36 @@ Studio adds folders in Settings, vst tab. These folders count in Studio only.
 
 Studio at its start, and `rustel vst`, scan each new or changed plugin bundle
 one time, in a process of its own. A bundle with a fault at the scan stays
-off, and rustel goes on. The fault stays in the cache with the stamp of the
-bundle, so an unchanged bundle gets no new test. A rescan tries it again.
+off, and rustel goes on. In a bundle with several plugins, a plugin that
+does not start stays off with its reason, and the others stay on. The fault
+stays in the cache with the stamp of the bundle, so an unchanged bundle
+gets no new test. A rescan tries it again. Each class of a bundle has two
+minutes at the scan, so a bundle with many slow classes scans to its end
+while a class that hangs still fails.
 Studio scans in the background, so you play and edit during the scan.
 
-The file `~/.rustel/vst/scan.json` keeps the result. `rustel vst --rescan`,
-or the rescan row in Settings, scans each bundle again. `rustel play` and
+The scan names the plugin in its test: on the status line of `rustel vst`,
+in the Studio background jobs and on the scan row in Settings. A shell
+bundle holds many plugins. The name then has the bundle first, as
+`Shell › Comp`. A plugin that stops the scan stays on the screen, so you know
+which plugin to update or remove. A bundle that ends the scan process, or
+gives no answer in 2 minutes, stays off. Its fault names the plugin in its
+load, as `the plugin process did not answer while it loaded Comp`. In
+Studio, the plugin row on the vst page of Settings shows the fault.
+
+The file `~/.rustel/vst/scan.json` keeps the result. `rustel vst`, or the
+scan row in Settings, tests only new or changed bundles, for example after you
+install a plugin. `rustel vst --rescan`, or the rescan row in Settings,
+empties the cache and scans each bundle again. `rustel play` and
 `rustel render` run no scan. They load the plugins the score names.
 
 ## Names and values
 
 A name ignores upper case, spaces and punctuation. `"valhalla supermassive"`
 finds `ValhallaSupermassive`. A part of a plugin name finds the plugin with
-the shortest name: `"serum"` finds `Serum 2`.
+the shortest name: `"serum"` finds `Serum 2`. A part that is a whole word of
+a name comes first, then a part at the start of a word, then a part inside a
+word. `"tal"` finds `TAL-NoiseMaker`, not `Talk Box` or `Vital`.
 
 A parameter needs its full name: `predelay` finds `Pre-Delay`. The first
 column of `rustel vst <name>` is the name to write. Each value goes from 0 to
@@ -101,6 +118,24 @@ preset in a DAW, then copy the file to the folder.
 ```js
 note("c2 eb2").vsti("serum 2", { preset: "Dark Bass" })
 ```
+
+The scan makes a folder for each plugin it finds, so the folder names show
+the exact plugin names. The preset name, as the plugin name, ignores upper
+case, spaces and punctuation.
+
+A plugin call with no `preset` plays `default.vstpreset` when the folder of
+the plugin has one. Save the start sound of a plugin there, and each call
+starts with it:
+
+```js
+note("c2 eb2").vsti("serum 2")
+```
+
+In Studio, drop a `.vstpreset` file on the window. Rustel reads the plugin
+class in the file and copies the file to the folder of that plugin. The
+status line says which plugin. A file with the name of a preset already in
+the folder is not copied. The scan cache of an earlier version has no plugin
+classes. After an upgrade, rescan once so a dropped file finds its plugin.
 
 ## Chains
 

@@ -307,6 +307,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The runner image no longer carries the ALSA headers, and the audio
+      # crates fail to build without them.
+      - name: Install Linux audio build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
+            sudo apt-get update
+            sudo apt-get install --yes pkg-config libasound2-dev libudev-dev
+          fi
+
       - name: Run Miri
         run: bash .github/scripts/miri.sh
 

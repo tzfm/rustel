@@ -7,13 +7,17 @@
 //!
 //! One thread, the plugin thread, makes every plugin call except the audio
 //! processing. The audio callback owns a running plugin and gives the plugin
-//! back to the plugin thread at the end.
+//! back to the plugin thread at the end. On macOS the creation and the
+//! release of a plugin run on the process's main thread instead, which
+//! the plugin thread waits for; see [`install_main_service`] for the
+//! contract.
 //!
 //! ```text
 //!   score:   .vst("name", { mix: 0.4 })
 //!                  │ names
 //!   Host ──────────┴─ numbers ──▶ note ──▶ audio callback ──▶ plugin
 //!     └─ plugin thread: load, prepare, end
+//!           └─ macOS: the main thread creates and releases the plugin
 //! ```
 
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -25,12 +29,16 @@ mod cache;
 mod com;
 mod host;
 mod instance;
+mod main_thread;
 mod module;
 mod preset;
 mod scan;
 mod worker;
 
-pub use host::{FoundPreset, Host, Plugin, PluginInfo, Prepared, Resolved, Status, WorkerProgram};
+pub use host::{
+    FoundPreset, Host, Plugin, PluginInfo, Prepared, Resolved, ScanProgress, Status, WorkerProgram,
+};
+pub use main_thread::{install_main_service, needs_the_main_thread, pump_main};
 pub use scan::{default_folders, find_bundles};
 pub use worker::serve;
 

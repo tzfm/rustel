@@ -328,6 +328,7 @@ impl App {
             },
         );
         let mut opened = 0usize;
+        let mut presets = 0usize;
         let mut refused: Vec<String> = Vec::new();
         // Collected rather than adopted one at a time: adopting re-walks
         // every source, and a selection of eight files would otherwise walk
@@ -355,6 +356,8 @@ impl App {
             } else if is_score_path(path) {
                 self.open_dropped_score(path);
                 opened += 1;
+            } else if self.take_dropped_preset(path) {
+                presets += 1;
             } else {
                 refused.push(name);
             }
@@ -372,7 +375,7 @@ impl App {
             }
             many => self.add_sample_sources(many),
         };
-        if imported == 0 && opened == 0 && !refused.is_empty() {
+        if imported == 0 && opened == 0 && presets == 0 && !refused.is_empty() {
             self.status = format!(
                 "nothing to import from {} - audio, a folder of audio, or a score",
                 refused.join(", ")
@@ -394,11 +397,28 @@ impl App {
             LogLevel::Debug,
             "drop",
             format!(
-                "{imported} source(s) imported · {opened} score(s) opened · {} refused",
+                "{imported} source(s) imported · {opened} score(s) opened · {presets} preset(s) \
+                 added · {} refused",
                 refused.len()
             ),
         );
         self.dirty_frame = true;
+    }
+
+    /// A `.vstpreset` file dropped on the window goes to the preset folder
+    /// of its plugin. False for a file of another kind, and in a build with
+    /// no plugin support.
+    fn take_dropped_preset(&mut self, path: &std::path::Path) -> bool {
+        #[cfg(feature = "vst")]
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("vstpreset"))
+        {
+            self.add_dropped_preset(path);
+            return true;
+        }
+        let _ = path;
+        false
     }
 
     /// A score dropped on the window opens as a tab of the current set -

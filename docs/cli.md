@@ -144,7 +144,8 @@ rustel vst --rescan
 
 `rustel vst` lists the VST3 plugins a score reaches with `.vst()` and
 `.vsti()`. A name prints the parameters and presets of one plugin. The first
-run tests each plugin and keeps the result in a scan cache, and `--rescan`
+run tests each plugin and keeps the result in a scan cache. In a terminal,
+the status line names the plugin in its test. `--rescan` empties the cache and
 tests each plugin again. See [Plugins](plugins.md#the-plugin-scan).
 
 ## Csound
