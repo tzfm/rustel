@@ -99,6 +99,13 @@ impl Session {
         self.host_offset = session.host_offset;
     }
 
+    /// Found the session stood in, keeping the grid where it is: the
+    /// tempo, the phase and the clock all stay, under this participant's
+    /// own id, so the session has a founder to measure against again.
+    pub fn refound(&mut self, id: [u8; 8]) {
+        self.id = id;
+    }
+
     /// A ghost time for a host time.
     pub fn ghost_at(&self, host: i64) -> i64 {
         host + self.host_offset
@@ -152,6 +159,17 @@ mod tests {
 
     fn session_at_120() -> Session {
         Session::found([1; 8], 120.0, 0.0, GHOST)
+    }
+
+    #[test]
+    fn refounding_keeps_the_grid_and_the_clock() {
+        let mut session = session_at_120();
+        session.join(&Session::found([2; 8], 90.0, 1.0, GHOST));
+        let (timeline, offset) = (session.timeline, session.host_offset);
+        session.refound([3; 8]);
+        assert_eq!(session.id, [3; 8]);
+        assert_eq!(session.timeline, timeline);
+        assert_eq!(session.host_offset, offset);
     }
 
     #[test]
