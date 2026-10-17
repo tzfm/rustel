@@ -14,6 +14,7 @@
 //! the target table into connected speech.
 
 use crate::params::Effort;
+use crate::personality::Timbre;
 use crate::prosody::Plan;
 use crate::utterance::{Span, Utterance};
 
@@ -21,24 +22,25 @@ use crate::RATE;
 
 /// How long the glide from one span's target to the next takes, in ms.
 const TRANSITION_MS: f32 = 40.0;
-/// Fixed upper formants of the cascade, in Hz with their bandwidths.
-const F4: (f32, f32) = (3350.0, 250.0);
-const F5: (f32, f32) = (3850.0, 340.0);
+/// Fixed upper formants of the cascade, in Hz with their bandwidths, for the
+/// plain voice. F4 sits where the original engine's published samples hold a
+/// steady resonance.
+const F4: (f32, f32) = (3650.0, 250.0);
+const F5: (f32, f32) = (4300.0, 340.0);
 const NASAL: (f32, f32) = (270.0, 120.0);
 /// Open quotient of the glottal pulse: the share of each cycle the folds are
 /// open. Breathy speech holds them open longer.
-const OPEN_QUOTIENT: f32 = 0.62;
+const OPEN_QUOTIENT: f32 = 0.6;
 const OPEN_QUOTIENT_BREATHY: f32 = 0.8;
+/// Brings the buzz, the source's first difference, to the level of the pulse
+/// it comes from.
+const BUZZ_GAIN: f32 = 0.76;
 /// Overall gain before the render pass normalizes the peak.
 const GAIN: f32 = 0.6;
-/// The noise branch against the voiced one. It puts a sibilant about 12 dB
-/// under the vowels around it, as in natural speech, where an equal level
-/// sounds like a hiss on top of the voice.
-const FRICATION_GAIN: f32 = 0.5;
-/// The corner of the high-pass on the voiced branch, in Hz, under the lowest
-/// voice (Colossus, 66 Hz). The glottal pulse is one-sided, so without it the
-/// wave rides on an offset that jumps each time voicing starts or stops.
-const DC_BLOCK_HZ: f32 = 30.0;
+/// The noise branch against the voiced one. It puts a sibilant about 8 dB
+/// under the vowels around it, near the original engine's balance. An equal
+/// level sounds like a hiss on top of the voice.
+const FRICATION_GAIN: f32 = 0.35;
 
 /// One two-pole resonator.
 struct Resonator {
@@ -96,21 +98,21 @@ impl Noise {
 }
 
 /// Render the utterance. Returns mono f32 samples at [`crate::RATE`].
-pub fn synthesize(utterance: &Utterance, plan: &Plan, effort: Effort) -> Vec<f32> {
+pub fn synthesize(utterance: &Utterance, plan: &Plan, effort: Effort, timbre: Timbre) -> Vec<f32> {
     let frames = (utterance.total_ms * RATE as f32 / 1000.0) as usize + 1;
     let mut out = Vec::with_capacity(frames);
     let spans = &utterance.spans;
 
     let mut r: [Resonator; 5] = std::array::from_fn(|_| Resonator::new());
-    r[3].set(F4.0, F4.1);
-    r[4].set(F5.0, F5.1);
+    let tract = timbre.tract;
+    r[3].set(F4.0 * tract, F4.1);
+    r[4].set(F5.0 * tract, F5.1);
     let mut nasal_res = Resonator::new();
     let mut fric_res = Resonator::new();
 
     let mut phase = 0.0f32;
+    let mut last_glottal = 0.0f32;
     let mut noise = Noise(0x5eed);
-    let dc_pole = (-std::f32::consts::TAU * DC_BLOCK_HZ / RATE as f32).exp();
-    let (mut last_voiced, mut last_centered) = (0.0f32, 0.0f32);
 
     for n in 0..frames {
         let ms = n as f32 * 1000.0 / RATE as f32;
@@ -126,29 +128,39 @@ pub fn synthesize(utterance: &Utterance, plan: &Plan, effort: Effort) -> Vec<f32
         // Voiced source.
         let mut source = 0.0;
         if voice > 0.0 {
-            phase += plan.f0_at(ms) / RATE as f32;
+            let f0 = plan.f0_at(ms);
+            phase += f0 / RATE as f32;
             if phase >= 1.0 {
                 phase -= phase.floor();
             }
+            let open = match effort {
+                Effort::Breathy => OPEN_QUOTIENT_BREATHY,
+                _ => OPEN_QUOTIENT,
+            };
+            let glottal = pulse(phase, open);
+            // The buzz is the pulse's first difference: one snap per period.
+            // Scaled by the square root of the period, its level does not
+            // follow the pitch.
+            let buzz = (glottal - last_glottal) * (RATE as f32 / f0).sqrt() * BUZZ_GAIN;
+            last_glottal = glottal;
+            let voiced_source = glottal + (buzz - glottal) * timbre.buzz;
             source = match effort {
-                Effort::Normal => pulse(phase, OPEN_QUOTIENT),
-                Effort::Breathy => {
-                    pulse(phase, OPEN_QUOTIENT_BREATHY) * 0.75 + noise.next_f32() * 0.3
-                }
+                Effort::Normal => voiced_source,
+                Effort::Breathy => voiced_source * 0.75 + noise.next_f32() * 0.3,
                 Effort::Whispered => noise.next_f32() * 0.9,
             } * voice;
         }
 
-        r[0].set(f1, 70.0);
-        r[1].set(f2, 105.0);
-        r[2].set(f3, 160.0);
+        r[0].set(f1 * tract, 70.0);
+        r[1].set(f2 * tract, 105.0);
+        r[2].set(f3 * tract, 160.0);
         let mut voiced = source;
         for res in &mut r {
             voiced = res.run(voiced);
         }
 
         if nasal > 0.0 {
-            nasal_res.set(NASAL.0, NASAL.1);
+            nasal_res.set(NASAL.0 * tract, NASAL.1);
             let nas = nasal_res.run(source);
             voiced = voiced.mul_add(1.0 - 0.65 * nasal, nas * 1.9 * nasal);
         }
@@ -160,21 +172,22 @@ pub fn synthesize(utterance: &Utterance, plan: &Plan, effort: Effort) -> Vec<f32
             0.0
         };
 
-        // One-pole high-pass: y = x - x[n-1] + r * y[n-1].
-        let centered = voiced - last_voiced + dc_pole * last_centered;
-        last_voiced = voiced;
-        last_centered = centered;
-
-        out.push((centered + frication) * GAIN);
+        out.push((voiced + frication) * GAIN);
     }
     out
 }
 
-/// The Rosenberg-style glottal pulse: a sine bump over the open part of each
-/// cycle, silence while the folds are closed.
+/// The glottal source: the derivative of the KLGLOTT88 flow pulse, which
+/// already carries the mouth's radiation. Over the open part of each cycle
+/// the flow rises and falls as `t² - t³`. Its derivative climbs, then drops
+/// to the sharp closure that gives the voice its buzz, and averages to zero,
+/// so the voice carries no offset. The shape is defined over the phase, so
+/// its level does not depend on the pitch. Silence while the folds are
+/// closed.
 fn pulse(phase: f32, open: f32) -> f32 {
     if phase < open {
-        (std::f32::consts::PI * phase / open).sin() * 1.7
+        let t = phase / open;
+        t.mul_add(-3.0 * t, 2.0 * t)
     } else {
         0.0
     }
@@ -257,7 +270,7 @@ mod tests {
             utterance.total_ms,
             Terminal::None,
         );
-        synthesize(&utterance, &plan, effort)
+        synthesize(&utterance, &plan, effort, params.timbre)
     }
 
     #[test]

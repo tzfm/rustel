@@ -23,6 +23,8 @@ pub(super) struct SpeechKey {
     quality: Quality,
     effort: Effort,
     language: Language,
+    /// The timbre's buzz and tract, by their bits.
+    timbre: (u32, u32),
 }
 
 impl SpeechKey {
@@ -35,6 +37,7 @@ impl SpeechKey {
             quality: params.quality,
             effort: params.effort,
             language: params.language,
+            timbre: (params.timbre.buzz.to_bits(), params.timbre.tract.to_bits()),
         }
     }
 }

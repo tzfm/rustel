@@ -114,6 +114,12 @@ munchkin  troll  nerd  milk-toast  tipsy  choir-boy
 Names match ignoring case and anything that is not a letter, so `the-fly`,
 `TheFly` and, on the command line, `"the fly"` pick the same voice.
 
+Each voice starts from the pitch, speed, quality and effort of its original
+preset. Colossus also has a harder buzz, the sound of a machine, and Child a
+shorter vocal tract, which raises every formant. Both are measured from the
+samples the original engine's makers publish. The other voices share one
+timbre.
+
 ## Text handling
 
 Punctuation sets the pauses and the pitch at the end of a sentence: a comma

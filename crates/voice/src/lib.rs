@@ -420,6 +420,7 @@ mod tests {
                     quality: Quality::Sung,
                     effort: Effort::Normal,
                     language: rustel_talkit::lang::Language::Spanish,
+                    timbre: rustel_talkit::personality::Personality::Robotoid.timbre(),
                 }
             )
         );

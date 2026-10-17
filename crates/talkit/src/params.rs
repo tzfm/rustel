@@ -5,7 +5,7 @@
 use std::ops::RangeInclusive;
 
 use crate::lang::Language;
-use crate::personality::Personality;
+use crate::personality::{Personality, Timbre};
 
 /// Pitch contour style. The numbers are the `SVSetF0Style` values the
 /// original engine used for the three buttons.
@@ -57,7 +57,8 @@ pub const SPEED_MAX: u32 = 400;
 pub const NOTE_PITCH: RangeInclusive<f32> = 32.70..=2093.0;
 
 /// One utterance's settings. Pitch is the base F0 in Hz, the pitch the voice
-/// starts on, and speed is a percentage of the nominal 150.
+/// starts on, and speed is a percentage of the nominal 150. The timbre comes
+/// with the personality and no single setting changes it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Params {
     pub pitch: f32,
@@ -65,6 +66,7 @@ pub struct Params {
     pub quality: Quality,
     pub effort: Effort,
     pub language: Language,
+    pub timbre: Timbre,
 }
 
 impl Default for Params {
@@ -76,6 +78,7 @@ impl Default for Params {
             quality: p.quality,
             effort: p.effort,
             language: Language::English,
+            timbre: Personality::Male.timbre(),
         }
     }
 }
@@ -178,11 +181,13 @@ impl Params {
         };
         match setting {
             Setting::Personality => {
-                let preset = Personality::parse(value).ok_or_else(bad)?.preset();
+                let personality = Personality::parse(value).ok_or_else(bad)?;
+                let preset = personality.preset();
                 self.pitch = preset.pitch as f32;
                 self.speed = preset.speed;
                 self.quality = preset.quality;
                 self.effort = preset.effort;
+                self.timbre = personality.timbre();
             }
             Setting::Pitch => {
                 self.pitch = value

@@ -1,10 +1,36 @@
 //! The twenty Talk It! voices and the settings each one starts from.
 //!
-//! Each personality is only a preset of pitch, speed, pitch quality and vocal
-//! effort, exactly as the original application treated them: the engine has no
-//! per-voice timbre of its own.
+//! A personality is a preset of pitch, speed, pitch quality and vocal effort,
+//! as the original application's buttons set them, and a [`Timbre`]: the
+//! original engine took the personality as a voice of its own as well.
 
 use crate::params::{Effort, Quality};
+
+/// The sound of a voice apart from its settings.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Timbre {
+    /// How much of the glottal source is a sharp buzz, from 0 to 1. A buzz
+    /// keeps the snap of each closure and loses the soft slope between them,
+    /// so the voice reaches up to its third formant at nearly full strength:
+    /// a machine voice.
+    pub buzz: f32,
+    /// The factor on every formant: above 1 for a shorter vocal tract, as a
+    /// child's.
+    pub tract: f32,
+}
+
+impl Timbre {
+    /// The adult voice the formant tables describe.
+    pub const PLAIN: Self = Self {
+        buzz: PLAIN_BUZZ,
+        tract: 1.0,
+    };
+}
+
+/// The plain voice's buzz and Colossus's, as the published samples' spectra
+/// put them.
+const PLAIN_BUZZ: f32 = 0.13;
+const COLOSSUS_BUZZ: f32 = 1.0;
 
 /// A named voice preset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,6 +270,24 @@ impl Personality {
                 quality: Quality::Sung,
                 effort: Effort::Normal,
             },
+        }
+    }
+
+    /// The voice's own sound. Each value that differs from [`Timbre::PLAIN`]
+    /// is measured from the original engine's published samples: Colossus
+    /// buzzes about twice as bright as the plain voice, and the child's
+    /// formants sit about a third higher.
+    pub fn timbre(self) -> Timbre {
+        match self {
+            Self::Colossus => Timbre {
+                buzz: COLOSSUS_BUZZ,
+                ..Timbre::PLAIN
+            },
+            Self::Child => Timbre {
+                tract: 1.3,
+                ..Timbre::PLAIN
+            },
+            _ => Timbre::PLAIN,
         }
     }
 

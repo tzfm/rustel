@@ -39,7 +39,7 @@ pub fn render(text: &str, params: &Params) -> Vec<f32> {
         utterance.total_ms,
         utterance.terminal,
     );
-    let mut samples = synthesize(&utterance, &plan, params.effort);
+    let mut samples = synthesize(&utterance, &plan, params.effort, params.timbre);
     finish(&mut samples);
     samples
 }
@@ -78,6 +78,19 @@ mod tests {
         assert!(s.iter().all(|x| x.abs() <= 1.0));
         let peak = s.iter().fold(0.0f32, |m, x| m.max(x.abs()));
         assert!(peak > 0.5, "peak {peak}");
+    }
+
+    /// A one-sided pulse leaves the wave on an offset that thumps each time
+    /// voicing starts or stops.
+    #[test]
+    fn speech_carries_no_offset() {
+        for voice in ["male", "colossus", "child"] {
+            let mut params = params();
+            params.apply("personality", voice).unwrap();
+            let s = render("my name is", &params);
+            let mean = s.iter().sum::<f32>() / s.len() as f32;
+            assert!(mean.abs() < 0.01, "{voice}: mean {mean}");
+        }
     }
 
     #[test]
