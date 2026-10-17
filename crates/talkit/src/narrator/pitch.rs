@@ -6,24 +6,27 @@
 //! - Syllables before the first accent hold the starting level, a little
 //!   under the pitch setting.
 //! - An accent is a stressed vowel with digit 4 or more. The first one
-//!   rises to a height set by its digit and the voice's range, and the voice
-//!   reaches it at the start of the vowel.
-//! - After an accent that is not the last, the voice sinks at a fixed rate
-//!   down to a floor. The next accent rises a share of its height above that
-//!   line.
+//!   rises to a height set by its digit and by how many words its phrase
+//!   has, higher again in a word of several syllables.
+//! - Each later accent rises a smaller share of its height, so the accents
+//!   step down through the phrase.
+//! - After an accent that is not the last, each syllable falls a fixed share
+//!   of the way down to a floor. The floor is higher when more accents
+//!   follow.
 //! - After the last accent, the voice falls in a straight line to the end
 //!   of the phrase: low after a full stop, level before the final rise of a
 //!   question or an open ending.
 //! - A phrase with no accent slides from the starting level down to its end
 //!   after a full stop, and holds before a final rise otherwise.
+//! - A mid vowel lifts its syllable a little and a close vowel more.
 //!
 //! ```text
 //!          accent
 //!         ┌───┐
-//!  start  │   └──╮        last accent
-//! ────────┘       ╰──╮   ┌──┐
-//!                     ╰──┘  └───╮
-//!                                ╰── end
+//!  start  │   └╮        last accent
+//! ────────┘    ╰╮   ┌──┐
+//!               ╰───┘  └───╮
+//!                           ╰── end
 //! ```
 //!
 //! Every level is a share of the pitch setting, so the shape moves with the
@@ -41,32 +44,49 @@ use crate::personality::Timbre;
 use crate::phonetic::Ph;
 
 /// The level before the first accent.
-const START: f32 = 0.99;
-/// Accent height per stress digit 4 to 9, at range 100.
-const HEIGHT: [f32; 6] = [0.177, 0.184, 0.25, 0.346, 0.42, 0.45];
-/// After an accent that is not the last: the floor and the sinking rate per
-/// second at speed 150.
-const FLOOR: f32 = 1.013;
-const SINK: f32 = 0.378;
-/// A later accent rises this share of its height above the line.
-const LATER: f32 = 0.509;
+const START: f32 = 0.955;
+/// Accent height per stress digit 4 to 9, at range 100, in a phrase of one
+/// word, of two to four words, and of five or more.
+const HEIGHT: [[f32; 6]; 3] = [
+    [0.056, 0.106, 0.12, 0.156, 0.195, 0.234],
+    [0.121, 0.156, 0.177, 0.234, 0.247, 0.286],
+    [0.156, 0.249, 0.289, 0.367, 0.425, 0.494],
+];
+/// The extra height of an accent in a word of several syllables, in a phrase
+/// of two to four words and of five or more.
+const SEVERAL: [f32; 2] = [0.045, 0.091];
+/// Later accents rise a share of their height: `LATER` for the second, and
+/// `DECAY` times less for each one after it. The last accent of a phrase
+/// takes `LAST` of that share.
+const LATER: f32 = 0.718;
+const DECAY: f32 = 0.665;
+const LAST: f32 = 0.641;
+/// After an accent that is not the last, each syllable falls `STEP` of the
+/// way from the accent to a floor, `FLOOR` with one accent to come and
+/// `AHEAD` higher for each further one.
+const STEP: f32 = 0.37;
+const FLOOR: f32 = 0.888;
+const AHEAD: f32 = 0.056;
 /// Where a phrase ends after a full stop, with and without accents.
-const FALL_ACCENTED: f32 = 0.711;
+const FALL_ACCENTED: f32 = 0.695;
 const FALL_PLAIN: f32 = 0.767;
 /// The level the line reaches before the final rise of a question or an
 /// open ending.
-const BEFORE_QUESTION: f32 = 1.022;
-const BEFORE_OPEN: f32 = 1.026;
+const BEFORE_QUESTION: f32 = 0.996;
+const BEFORE_OPEN: f32 = 1.022;
 /// The level of a phrase with no accent before a final rise.
 const PLAIN_LEVEL: f32 = 0.97;
 /// The final rise over the last syllable: after an accent, and without one.
-const RISE_QUESTION: f32 = 0.252;
-const RISE_OPEN: f32 = 0.056;
+const RISE_QUESTION: f32 = 0.276;
+const RISE_OPEN: f32 = 0.057;
 const RISE_QUESTION_PLAIN: f32 = 0.15;
 const RISE_OPEN_PLAIN: f32 = 0.198;
 /// An accent reaches its height this long after its syllable starts, ms at
 /// speed 150.
-const ACCENT_DELAY: f32 = 112.0;
+const ACCENT_DELAY: f32 = 138.0;
+/// The lift of the mid and the close vowels.
+const MID_VOWEL: f32 = 0.048;
+const CLOSE_VOWEL: f32 = 0.078;
 
 /// One syllable as the pitch rules see it.
 #[derive(Clone, Copy)]
@@ -75,6 +95,21 @@ struct Syllable {
     v0: f32,
     v1: f32,
     digit: u8,
+    /// The number of the syllable's word in its phrase, from 1.
+    word: usize,
+    /// How far the vowel lifts the syllable.
+    lift: f32,
+}
+
+/// How far a vowel lifts its syllable, as a share of the pitch setting at
+/// range 100: the open vowels not at all, the close ones most.
+fn lift(ph: Ph) -> f32 {
+    use Ph::*;
+    match ph {
+        Aa | Ae | Ao | Ay | Aw => 0.0,
+        Iy | Ih | Uh | Uw => CLOSE_VOWEL,
+        _ => MID_VOWEL,
+    }
 }
 
 impl Syllable {
@@ -97,14 +132,19 @@ pub(super) struct Pitch {
 /// The phrases of a timeline: their syllables and their closing mark.
 fn phrases(segs: &[Seg]) -> Vec<(Vec<Syllable>, char)> {
     let mut out = Vec::new();
-    let mut syls = Vec::new();
+    let mut syls: Vec<Syllable> = Vec::new();
     let mut onset: Option<f32> = None;
+    let mut word = 0;
     for (i, seg) in segs.iter().enumerate() {
+        if seg.word_start {
+            word += 1;
+        }
         match seg.ph {
             None => {
                 onset = None;
                 if !syls.is_empty() {
                     out.push((std::mem::take(&mut syls), seg.ends.unwrap_or(' ')));
+                    word = 0;
                 }
                 continue;
             }
@@ -114,6 +154,8 @@ fn phrases(segs: &[Seg]) -> Vec<(Vec<Syllable>, char)> {
                     v0: seg.t0,
                     v1: seg.t1,
                     digit: seg.stress,
+                    word: word.max(1),
+                    lift: lift(ph),
                 });
                 onset = None;
             }
@@ -127,6 +169,7 @@ fn phrases(segs: &[Seg]) -> Vec<(Vec<Syllable>, char)> {
         if phrase_ends && !syls.is_empty() {
             out.push((std::mem::take(&mut syls), seg.ends.unwrap_or(' ')));
             onset = None;
+            word = 0;
         }
     }
     if !syls.is_empty() {
@@ -135,39 +178,63 @@ fn phrases(segs: &[Seg]) -> Vec<(Vec<Syllable>, char)> {
     out
 }
 
-fn height(digit: u8) -> f32 {
-    HEIGHT[usize::from(digit.clamp(4, 9) - 4)]
+/// The height of the accent on syllable `i` of a phrase.
+fn height(syls: &[Syllable], i: usize) -> f32 {
+    let words = syls.last().map_or(1, |s| s.word);
+    let class = match words {
+        1 => 0,
+        2..=4 => 1,
+        _ => 2,
+    };
+    let digit = usize::from(syls[i].digit.clamp(4, 9) - 4);
+    let several = syls.iter().filter(|s| s.word == syls[i].word).count() > 1;
+    HEIGHT[class][digit]
+        + if several && class > 0 {
+            SEVERAL[class - 1]
+        } else {
+            0.0
+        }
 }
 
 /// The anchor points of one phrase, as shares of the pitch setting at range
-/// 100. `scale` is 150 over the speed.
-fn anchors(syls: &[Syllable], terminal: char, delay: f32, scale: f32, out: &mut Vec<(f32, f32)>) {
+/// 100.
+fn anchors(syls: &[Syllable], terminal: char, delay: f32, out: &mut Vec<(f32, f32)>) {
     let n = syls.len();
     let accents: Vec<usize> = (0..n).filter(|&i| syls[i].digit >= 4).collect();
     let mut vals = vec![0.0; n];
     match (accents.first(), accents.last()) {
         (Some(&first), Some(&last)) => {
             vals[..first].fill(START);
-            let mut from = (syls[first].v1, 1.0 + height(syls[first].digit));
-            vals[first] = from.1;
-            for i in first + 1..n {
-                if i <= last {
-                    let sunk = SINK * (syls[i].mid() - from.0) / 1000.0 / scale;
-                    vals[i] = (from.1 - sunk).max(FLOOR);
-                    if syls[i].digit >= 4 {
-                        vals[i] += height(syls[i].digit) * LATER;
-                        from = (syls[i].v1, vals[i]);
-                    }
+            let m = accents.len();
+            for (j, &a) in accents.iter().enumerate() {
+                let mut share = if j == 0 {
+                    1.0
                 } else {
-                    let end = match terminal {
-                        '.' => FALL_ACCENTED,
-                        '?' => BEFORE_QUESTION,
-                        _ => BEFORE_OPEN,
-                    };
-                    let span = (syls[n - 1].mid() - from.0).max(1.0);
-                    let x = ((syls[i].mid() - from.0) / span).clamp(0.0, 1.0);
-                    vals[i] = from.1 + (end - from.1) * x;
+                    LATER * DECAY.powi(j as i32 - 1)
+                };
+                if j > 0 && j == m - 1 {
+                    share *= LAST;
                 }
+                vals[a] = 1.0 + height(syls, a) * share;
+            }
+            for (j, pair) in accents.windows(2).enumerate() {
+                let (a, b) = (pair[0], pair[1]);
+                let floor = (FLOOR + AHEAD * (m - j - 2) as f32).min(vals[a]);
+                for (k, i) in (a + 1..b).enumerate() {
+                    let w = (1.0 - STEP * (k + 1) as f32).max(0.0);
+                    vals[i] = floor + (vals[a] - floor) * w;
+                }
+            }
+            let from = (syls[last].v1, vals[last]);
+            let end = match terminal {
+                '.' => FALL_ACCENTED,
+                '?' => BEFORE_QUESTION,
+                _ => BEFORE_OPEN,
+            };
+            let span = (syls[n - 1].mid() - from.0).max(1.0);
+            for i in last + 1..n {
+                let x = ((syls[i].mid() - from.0) / span).clamp(0.0, 1.0);
+                vals[i] = from.1 + (end - from.1) * x;
             }
         }
         _ => {
@@ -185,6 +252,9 @@ fn anchors(syls: &[Syllable], terminal: char, delay: f32, scale: f32, out: &mut 
                 };
             }
         }
+    }
+    for (v, syl) in vals.iter_mut().zip(syls) {
+        *v += syl.lift;
     }
     let plain = accents.is_empty();
     for (i, syl) in syls.iter().enumerate() {
@@ -368,7 +438,7 @@ impl Pitch {
         match quality {
             Quality::Natural => {
                 for (syls, terminal) in phrases(segs) {
-                    anchors(&syls, terminal, ACCENT_DELAY * scale, scale, &mut points);
+                    anchors(&syls, terminal, ACCENT_DELAY * scale, &mut points);
                 }
                 for p in &mut points {
                     p.1 = base * stretch(p.1, range);
@@ -490,6 +560,21 @@ mod tests {
         let fast = natural(phon, 100, 300);
         for (a, b) in narrow.iter().zip(&fast) {
             assert!((a - b).abs() < 0.02, "{narrow:?} {fast:?}");
+        }
+    }
+
+    /// In the original engine an accent rises higher in a phrase of more
+    /// words, later accents step down, and a close vowel lifts its syllable.
+    #[test]
+    fn accents_follow_the_phrase_and_close_vowels_lift() {
+        let short = natural("SAA5 SAA SAA.", 100, 150);
+        let long = natural("SAA5 SAA SAA SAA SAA SAA.", 100, 150);
+        assert!(long[0] > short[0] + 0.05, "{short:?} {long:?}");
+        let steps = natural("SAA5 SAA SAA SAA5 SAA SAA SAA5 SAA SAA.", 100, 150);
+        assert!(steps[0] > steps[3] && steps[3] > steps[6], "{steps:?}");
+        let close = natural("SIY5 SIY SIY SIY SIY SIY.", 100, 150);
+        for (open, close) in long.iter().zip(&close) {
+            assert!(close > open, "{long:?} {close:?}");
         }
     }
 }
