@@ -108,7 +108,9 @@ impl App {
                     self.prefs.import_origins.push(origin.clone());
                     self.import_origins_changed();
                 }
-                // The refusal on the footer names an origin that is trusted now.
+                // The refusal on the footer names an origin that is trusted
+                // now, and the update it refused runs again by itself.
+                let mut unblocked = false;
                 for owner in [ErrorOwner::Evaluation, ErrorOwner::Setup] {
                     if self
                         .errors
@@ -116,16 +118,25 @@ impl App {
                         .is_some_and(|message| message.contains(&origin))
                     {
                         self.clear_error(owner);
+                        unblocked = true;
                     }
                 }
-                self.status = format!("{origin} trusted · update the score to load it");
+                if unblocked {
+                    self.refused_update_owed = true;
+                    self.status = format!("{origin} trusted · updating the score");
+                } else {
+                    self.status = format!("{origin} trusted");
+                }
             }
             Some(PermissionRow::Csound { allowed: true }) => {
                 self.status = "Csound is on · Space turns it off".into();
             }
             Some(PermissionRow::Csound { allowed: false }) => {
-                self.set_csound(true);
-                self.status = "Csound on · update the score to load it".into();
+                if self.set_csound(true) {
+                    self.status = "Csound on · updating the score".into();
+                } else {
+                    self.status = "Csound on".into();
+                }
             }
             None => {}
         }
@@ -154,7 +165,7 @@ impl App {
                 self.status = format!("{origin} off · its scripts no longer load");
             }
             Some(PermissionRow::Csound { allowed }) => {
-                self.set_csound(!allowed);
+                let unblocked = self.set_csound(!allowed);
                 if allowed {
                     // The switch went off; the row stays so a second
                     // Space brings it back, as an origin's does.
@@ -162,8 +173,10 @@ impl App {
                 }
                 self.status = if allowed {
                     "Csound off · orchestras no longer run".into()
+                } else if unblocked {
+                    "Csound on · updating the score".into()
                 } else {
-                    "Csound on · update the score to load it".into()
+                    "Csound on".into()
                 };
             }
             None => {}
@@ -200,9 +213,11 @@ impl App {
     }
 
     /// Flip the orchestra switch and tell the engine. The refusal on the
-    /// footer names a permission the score has now.
-    fn set_csound(&mut self, allowed: bool) {
+    /// footer names a permission the score has now, so the update it
+    /// refused runs again: the answer says whether one was unblocked.
+    fn set_csound(&mut self, allowed: bool) -> bool {
         self.csound_allowed = allowed;
+        let mut unblocked = false;
         if allowed {
             self.csound_refused = false;
             for owner in [ErrorOwner::Evaluation, ErrorOwner::Setup] {
@@ -212,11 +227,16 @@ impl App {
                     .is_some_and(|message| message.contains("Csound is not permitted"))
                 {
                     self.clear_error(owner);
+                    unblocked = true;
                 }
+            }
+            if unblocked {
+                self.refused_update_owed = true;
             }
         }
         self.csound_owed = true;
         self.send_csound();
+        unblocked
     }
 
     /// Give the engine the orchestra switch, when it does not have it yet.
@@ -306,6 +326,78 @@ mod tests {
             assert_eq!(
                 app.permission_rows(),
                 vec![PermissionRow::Csound { allowed: false }]
+            );
+        }
+
+        /// Enter on the switch after a refusal re-runs the refused update by
+        /// itself, so permitting is the whole walk. The re-run is owed, not
+        /// fired: the engine must hold the permission first, or the re-run
+        /// would be refused by the state it is running to use.
+        #[test]
+        fn a_permit_that_unblocked_a_refused_update_runs_it_again() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            // Space takes the switch back, as a player does who wants no
+            // native code this run.
+            app.toggle_row(0);
+            assert!(!app.csound_allowed);
+            // The way a refused orchestra leaves the studio: the footer
+            // names the page, and the failed update is remembered against
+            // the text still in the buffer.
+            let scene = app.scenes.current().id;
+            let revision = app.editor().revision();
+            app.set_error(
+                crate::app::transport::ErrorOwner::Evaluation,
+                "Csound is not permitted - Settings → Permissions lets native orchestras run"
+                    .into(),
+            );
+            app.update_failure = Some((scene, revision));
+
+            app.permit_row(0);
+            assert!(app.csound_allowed);
+            assert!(app.refused_update_owed, "the re-run is owed");
+            assert!(app.status.contains("updating the score"), "{}", app.status);
+            assert!(
+                app.pending_evaluation.is_none(),
+                "nothing ran before the engine holds the permission"
+            );
+
+            // The event loop's half: the switch reaches the engine, then the
+            // refused update runs again from its buffer.
+            app.send_csound();
+            assert!(!app.csound_owed);
+            app.retry_refused_update();
+            let rerun = app
+                .inflight
+                .values()
+                .find(|pending| pending.scene == scene)
+                .expect("the refused update re-ran");
+            assert_eq!(rerun.editor_revision, revision);
+        }
+
+        /// An edit after the refusal owns the next run: the re-run touches
+        /// only the text that was refused, still in the buffer.
+        #[test]
+        fn a_permit_does_not_re_run_a_score_edited_since_the_refusal() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.toggle_row(0);
+            let scene = app.scenes.current().id;
+            let revision = app.editor().revision();
+            app.set_error(
+                crate::app::transport::ErrorOwner::Evaluation,
+                "Csound is not permitted - Settings → Permissions lets native orchestras run"
+                    .into(),
+            );
+            app.update_failure = Some((scene, revision));
+
+            // The player edits past the refusal before permitting.
+            app.permit_row(0);
+            type_text(&mut app, "$: s(\"bd, hh\")\n");
+            app.retry_refused_update();
+            assert!(
+                app.pending_evaluation.is_none(),
+                "an edited score waits for its own gesture"
             );
         }
     }

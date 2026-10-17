@@ -1156,6 +1156,10 @@ struct App {
     csound_owed: bool,
     /// The permissions page changed and the engine does not have the list yet.
     import_origins_owed: bool,
+    /// A permit unblocked a refused update and the studio owes its re-run.
+    /// It waits for the engine to hold the permission, so the re-run cannot
+    /// be refused by the state it is running to use.
+    refused_update_owed: bool,
     /// Latest refused revision for each scene with an unresolved log alert.
     evaluation_alerts: HashMap<SceneId, Revision>,
     /// A diagnostic copied into the ordinary status line by the navigation
@@ -1702,6 +1706,7 @@ impl App {
             csound_refused: false,
             csound_owed: false,
             import_origins_owed: false,
+            refused_update_owed: false,
             evaluation_alerts: HashMap::new(),
             lint_status: None,
             pending_evaluation: None,

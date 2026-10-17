@@ -23,7 +23,8 @@ rustel play song.strudel --allow-csound
 
 Studio permits native orchestras while a Csound library is installed: open
 the studio and the score plays. Press Ctrl+O and go to the Permissions page
-to turn the `native orchestras` switch off for a run.
+to turn the `native orchestras` switch off for a run; a score refused while
+it is off runs again by itself when the switch comes back on.
 
 An orchestra can read files, run processes, and load native opcodes with your
 account's permissions. Enable Csound only for scores and orchestras you trust.

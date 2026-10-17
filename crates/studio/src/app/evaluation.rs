@@ -341,6 +341,65 @@ impl App {
         self.queue_evaluation(revision, source);
     }
 
+    /// Run the update a permission just unblocked, without a keypress: the
+    /// score or setup that was refused runs again by itself, so permitting
+    /// is the whole walk, not half of one.
+    ///
+    /// Like the auto apply, it owes no flash - nobody pressed anything. And
+    /// it runs only what is still the refused text, on screen: an edit since
+    /// the refusal owns the next run, and so does a tab the player has
+    /// moved to.
+    pub(super) fn retry_refused_update(&mut self) {
+        if self.current_replay().is_some() {
+            return;
+        }
+        // A refused setup re-runs the way its tab presses Ctrl+S - its own
+        // check, keep, and chain - when the refused text is still the one
+        // in front of the player.
+        if let Some(scope) = self.current_prebake() {
+            let scene = self.scenes.current();
+            let source: Arc<str> = Arc::from(scene.editor.source());
+            let refused = self.prebake_rejected[scope.index()].as_deref()
+                == Some(source_revision(&source).as_str());
+            let revision = scene.editor.revision();
+            if refused {
+                self.update_prebake(scope, revision, source);
+            }
+            return;
+        }
+        let Some((scene, revision)) = self.update_failure else {
+            return;
+        };
+        // The refused score is the buffer, unchanged since, and still in
+        // front of the player. Anything else already has an owner: the next
+        // edit, the next press, or the tab the player moved to.
+        let current = self.scenes.current();
+        let refused =
+            current.id == scene && current.is_score() && current.editor.revision() == revision;
+        if !refused {
+            return;
+        }
+        let source: Arc<str> = Arc::from(current.editor.source());
+        self.refresh_set_samples();
+        if self.refuse_unclean(revision, &source) {
+            return;
+        }
+        self.log.push(
+            LogLevel::Debug,
+            "transport",
+            format!(
+                "re-running the refused update - {} ({} bytes)",
+                self.scenes.current().name(),
+                source.len()
+            ),
+        );
+        self.silence_preview();
+        self.playing_pane = Some(self.focused);
+        // The file is what you hear, whoever asked for the update.
+        self.write_scene(scene, revision, Arc::clone(&source));
+        self.queue_evaluation_for(scene, revision, source, true);
+    }
+
     /// Queue an evaluation against a named scene rather than the focused
     /// one, and say whether it belongs on the tape. Both matter for the
     /// re-install a prebake triggers: it lands on whatever is SOUNDING,

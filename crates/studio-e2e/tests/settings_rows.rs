@@ -813,9 +813,10 @@ fn settings_and_advanced_keep_their_place_until_studio_restarts() {
 }
 
 /// A score that imports a script from an origin nobody trusted is refused,
-/// and the footer names the permissions page. The page offers the origin as a
-/// switch: Enter trusts it, Space turns the trust off where the row stands,
-/// and the next studio still trusts it.
+/// and the footer names the permissions page. The page offers the origin as
+/// a switch: Enter trusts it and the studio re-runs the refused update by
+/// itself, Space turns the trust off where the row stands, and the next
+/// studio still trusts it.
 #[test]
 fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
     let mut studio = hermetic();
@@ -839,7 +840,14 @@ fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();
     assert!(row_with(&mut studio, "https://scripts.invalid").contains("  on"));
-    assert_eq!(studio.errors(), None, "the refusal left with the trust");
+    // The trust re-ran the refused update by itself, so the footer can only
+    // hold the fetch of the newly trusted origin - never the refusal.
+    if let Some(error) = studio.errors() {
+        assert!(
+            !error.contains("is not trusted"),
+            "the refusal left with the trust: {error}"
+        );
+    }
     // Space takes the trust back, and the row stays to give it again.
     studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
     studio.settle();
@@ -878,8 +886,8 @@ fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
 /// An orchestra score plays with no flag and no keypress: an installed
 /// library is the studio's opt-in. Space takes the switch off for the run,
 /// the next save of an edited score stops with the refusal that names the
-/// page, Enter puts the switch back, and the next studio starts with it on
-/// again.
+/// page, Enter puts the switch back and the studio re-runs the refused
+/// update by itself, and the next studio starts with it on again.
 #[test]
 fn the_orchestra_switch_starts_on_and_space_takes_it_back_for_a_run() {
     let mut studio = hermetic();
@@ -902,8 +910,8 @@ fn the_orchestra_switch_starts_on_and_space_takes_it_back_for_a_run() {
 
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     studio.settle();
-    // An edit makes the save a new generation - the first one still plays,
-    // with the library's own absence a recoverable failure - so the press
+    // An edit makes the save a new generation - the first one is still
+    // sounding, whatever the machine's library said about it - so the press
     // must not land as a repeat of it.
     studio.set_score("loadCSound`instr voice\nendin`\n$: note(\"d3\").csound(\"voice\")");
     studio.chord("ctrl+s");
@@ -917,11 +925,19 @@ fn the_orchestra_switch_starts_on_and_space_takes_it_back_for_a_run() {
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();
     assert!(row_with(&mut studio, "native orchestras").contains("  on"));
-    assert_eq!(
-        studio.errors(),
-        None,
-        "the refusal left with the permission"
-    );
+    // The permission re-ran the refused update by itself. A machine with
+    // the native library installs it and says so; a machine without one
+    // reports the library's own absence. The refusal itself is gone either
+    // way.
+    match studio.errors() {
+        None => assert!(
+            studio.status().contains("playing from the top")
+                || studio.status().contains("swaps in on the next cycle"),
+            "the re-run installed: {}",
+            studio.status()
+        ),
+        Some(error) => assert!(error.contains("Csound 6 is not available"), "{error}"),
+    }
 
     studio.quit();
     let mut studio = reopen_over(studio);
