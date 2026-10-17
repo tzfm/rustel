@@ -137,6 +137,9 @@ impl App {
         // The pads: on macOS they are read here, on the main thread.
         #[cfg(feature = "gamepad")]
         rustel_runtime::gamepad::pump();
+        // The plugins: on macOS each one is created and released here.
+        #[cfg(feature = "vst")]
+        rustel_runtime::vst::pump_main();
         self.drive_mapped_faders(Instant::now());
         self.drain_lint();
         self.pump_theme_editor();

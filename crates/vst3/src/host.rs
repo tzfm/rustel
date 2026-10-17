@@ -54,6 +54,9 @@ struct Prepare {
 const WAIT_LIMIT: Duration = Duration::from_secs(120);
 /// The host looks again for a preset file it did not find after this time.
 const PRESET_RETRY: Duration = Duration::from_secs(2);
+/// The preset that plays when a score names no preset: the file
+/// `default.vstpreset` in the preset folder of the plugin.
+const DEFAULT_PRESET: &str = "default";
 
 /// A loaded plugin: its class and its parameters.
 pub struct Plugin {
@@ -77,11 +80,7 @@ impl Plugin {
             .iter()
             .map(|param| (param.key.clone(), param.id))
             .collect();
-        let class = Scanned {
-            name: info.name.clone(),
-            vendor: info.vendor.clone(),
-            categories: info.categories.clone(),
-        };
+        let class = scanned(&info, None);
         Self {
             module,
             info,
@@ -236,6 +235,8 @@ struct Entry {
     /// From the load or the test. Empty before.
     vendor: String,
     categories: String,
+    /// The class id, from the load or the test: see [`Scanned::class`].
+    class: String,
     bundle: PathBuf,
     /// The compare forms of the name and of the bundle name. A note asks
     /// for a plugin by name, so the lookup does not build them each time.
@@ -255,6 +256,7 @@ impl Entry {
             name,
             vendor: String::new(),
             categories: String::new(),
+            class: String::new(),
             bundle,
             present: true,
             stage,
@@ -326,6 +328,36 @@ struct Scan {
     running: bool,
     /// The bundles the thread read since its start.
     done: usize,
+    /// The bundle in its read now, and the class of the bundle in its load.
+    bundle: Option<PathBuf>,
+    class: Option<String>,
+}
+
+/// Where the scan is, while it runs: see [`Host::scan_progress`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanProgress {
+    /// The bundles the scan read.
+    pub read: usize,
+    /// The bundles of the scan in all.
+    pub bundles: usize,
+    /// The plugin in its test now. The name of the bundle goes first when
+    /// the two names are not alike, as for a shell of many plugins:
+    /// `Shell › Comp`.
+    pub plugin: String,
+}
+
+/// The name of the plugin in its test: see [`ScanProgress::plugin`].
+fn name_in_test(bundle: &Path, class: Option<&str>) -> String {
+    let stem = bundle.file_stem().unwrap_or_default().to_string_lossy();
+    let Some(class) = class.filter(|class| !canonical(class).is_empty()) else {
+        return stem.into_owned();
+    };
+    let (outer, inner) = (canonical(&stem), canonical(class));
+    if outer.contains(&inner) || inner.contains(&outer) {
+        class.to_owned()
+    } else {
+        format!("{stem} › {class}")
+    }
 }
 
 impl State {
@@ -397,6 +429,14 @@ impl State {
             entry.key = key;
             entry.vendor = plugin.vendor.clone();
             entry.categories = plugin.categories.clone();
+            entry.class = plugin.class.clone();
+            // A plugin that did not load stays off, as a bundle does, until
+            // its files change or a rescan.
+            if let Some(fault) = &plugin.fault
+                && matches!(entry.stage, Stage::Found | Stage::Loading)
+            {
+                entry.stage = Stage::Failed(fault.clone());
+            }
         }
     }
 
@@ -445,10 +485,23 @@ impl State {
                 .filter(|(_, entry)| entry.present)
         };
         // A part of a name finds the plugin with the shortest name that
-        // has the part.
-        let partial = present()
-            .filter(|(_, entry)| entry.key.contains(&wanted) || entry.stem.contains(&wanted))
-            .min_by_key(|(_, entry)| entry.key.len());
+        // has the part: first as whole words, then at the start of a word,
+        // then anywhere. "tal" finds TAL-NoiseMaker before Talk Box and
+        // Vital.
+        let words = |entry: &Entry| {
+            let stem = entry.bundle.file_stem().unwrap_or_default();
+            let stem = word_match(&stem.to_string_lossy(), &entry.stem, &wanted);
+            word_match(&entry.name, &entry.key, &wanted).max(stem)
+        };
+        let anywhere = |entry: &Entry| entry.key.contains(&wanted) || entry.stem.contains(&wanted);
+        let shortest = |has: &dyn Fn(&Entry) -> bool| {
+            present()
+                .filter(|(_, entry)| has(entry))
+                .min_by_key(|(_, entry)| entry.key.len())
+        };
+        let partial = shortest(&|entry| words(entry) == 2)
+            .or_else(|| shortest(&|entry| words(entry) == 1))
+            .or_else(|| shortest(&anywhere));
         if let Some((index, _)) = partial {
             return Some(index);
         }
@@ -480,15 +533,62 @@ impl State {
     }
 }
 
-/// Reads the preset files of a plugin from the folder with its name under
-/// `root`: name and path, sorted by name. This reads the disk, so the
-/// plugin thread runs it.
-fn read_presets(root: Option<&Path>, plugin: &str) -> Vec<(String, PathBuf)> {
+/// Where `wanted` is in `name`: 2 when it covers whole words, as "tal" in
+/// "TAL-NoiseMaker", 1 when it starts a word, as "tal" in "Talk Box",
+/// and 0 for no part at the start of a word, as "tal" in "Vital". A word
+/// starts after a space or a sign, at a capital after a small letter, and
+/// at a digit after a letter. `key` is the compare form of `name`, and
+/// `wanted` is in compare form too.
+fn word_match(name: &str, key: &str, wanted: &str) -> u8 {
+    let mut rank = 0;
+    // The ends of the parts found so far: a part that ends where a word
+    // starts covers whole words.
+    let mut ends: Vec<usize> = Vec::new();
+    let mut at = 0;
+    let mut before: Option<char> = None;
+    for char in name.chars() {
+        if char.is_alphanumeric() {
+            let head = before.is_none_or(|before| {
+                !before.is_alphanumeric()
+                    || (before.is_lowercase() && char.is_uppercase())
+                    || (before.is_alphabetic() && char.is_numeric())
+            });
+            if head {
+                if ends.contains(&at) {
+                    return 2;
+                }
+                if key.get(at..).is_some_and(|rest| rest.starts_with(wanted)) {
+                    rank = 1;
+                    ends.push(at + wanted.len());
+                }
+            }
+            at += char.to_lowercase().map(char::len_utf8).sum::<usize>();
+        }
+        before = Some(char);
+    }
+    if ends.contains(&at) { 2 } else { rank }
+}
+
+/// A plugin name as a folder name: a sign a file system refuses becomes
+/// `-`, and the name ends with no dot or space.
+fn folder_name(name: &str) -> String {
+    let safe = |char: char| {
+        if char.is_control() || r#"/\:*?"<>|"#.contains(char) {
+            '-'
+        } else {
+            char
+        }
+    };
+    let name: String = name.chars().map(safe).collect();
+    name.trim_end_matches(['.', ' ']).to_owned()
+}
+
+/// The folder of a plugin under `root`: the folder with the name of the
+/// plugin in compare form.
+fn preset_folder(root: &Path, plugin: &str) -> Option<PathBuf> {
     let wanted = canonical(plugin);
-    let folder = root
-        .and_then(|root| std::fs::read_dir(root).ok())
-        .into_iter()
-        .flatten()
+    std::fs::read_dir(root)
+        .ok()?
         .flatten()
         .map(|entry| entry.path())
         .find(|path| {
@@ -496,8 +596,14 @@ fn read_presets(root: Option<&Path>, plugin: &str) -> Vec<(String, PathBuf)> {
                 && path
                     .file_name()
                     .is_some_and(|name| canonical(&name.to_string_lossy()) == wanted)
-        });
-    let Some(folder) = folder else {
+        })
+}
+
+/// Reads the preset files of a plugin from the folder with its name under
+/// `root`: name and path, sorted by name. This reads the disk, so the
+/// plugin thread runs it.
+fn read_presets(root: Option<&Path>, plugin: &str) -> Vec<(String, PathBuf)> {
+    let Some(folder) = root.and_then(|root| preset_folder(root, plugin)) else {
         return Vec::new();
     };
     let mut files: Vec<(String, PathBuf)> = std::fs::read_dir(folder)
@@ -759,6 +865,7 @@ impl Host {
                 .map(|at| at.checked_sub(PRESET_RETRY).unwrap_or(at));
         }
         drop(state);
+        self.make_preset_folders();
         self.scan_soon();
     }
 
@@ -775,15 +882,19 @@ impl Host {
         self.enqueue(move || host.scan_soon());
     }
 
-    /// The bundles the scan read and the bundles of the scan in all, while
-    /// the scan runs.
-    pub fn scan_progress(&self) -> Option<(usize, usize)> {
+    /// Where the scan is, while it runs.
+    pub fn scan_progress(&self) -> Option<ScanProgress> {
         let state = self.state();
-        let done = state.scan.done;
-        state
-            .scan
-            .running
-            .then(|| (done, done + state.unscanned().len()))
+        let scan = &state.scan;
+        scan.running.then(|| ScanProgress {
+            read: scan.done,
+            bundles: scan.done + state.unscanned().len(),
+            plugin: scan
+                .bundle
+                .as_deref()
+                .map(|bundle| name_in_test(bundle, scan.class.as_deref()))
+                .unwrap_or_default(),
+        })
     }
 
     /// Starts the scan thread when a caller asked for the scan and a
@@ -796,6 +907,8 @@ impl Host {
         }
         state.scan.running = true;
         state.scan.done = 0;
+        state.scan.bundle = state.unscanned().into_iter().next();
+        state.scan.class = None;
         let host = self.clone();
         let thread = std::thread::Builder::new().name("rustel-vst3-scan".into());
         if thread.spawn(move || host.run_scan()).is_err() {
@@ -827,6 +940,8 @@ impl Host {
                 let bundle = state.unscanned().into_iter().next().filter(|_| !closed);
                 let next = bundle.zip(state.worker.clone());
                 state.scan.running = next.is_some();
+                state.scan.bundle = next.as_ref().map(|(bundle, _)| bundle.clone());
+                state.scan.class = None;
                 next
             };
             let Some((bundle, program)) = next else {
@@ -834,7 +949,13 @@ impl Host {
                 return;
             };
             let stamp = cache::stamp(&bundle);
-            let read = crate::worker::scan(&program, &bundle, &self.shared.closed);
+            let read = crate::worker::scan(
+                &program,
+                &bundle,
+                crate::worker::WORK_LIMIT,
+                &self.shared.closed,
+                &mut |class| self.state().scan.class = Some(class.to_owned()),
+            );
             // With no scan process, each bundle stays as it is, and loads
             // in this process when a score names it. The next scan tries
             // again.
@@ -867,6 +988,42 @@ impl Host {
             drop(state);
             if stored {
                 self.save_cache();
+                self.make_preset_folders();
+            }
+        }
+    }
+
+    /// Makes a preset folder for each plugin with a known name and no
+    /// folder yet, so the folder names show the exact plugin names. A
+    /// folder counts by the compare form of its name. Runs on a thread of
+    /// the host, as the disk is slow.
+    fn make_preset_folders(&self) {
+        let (root, names) = {
+            let state = self.state();
+            let named = |entry: &&Entry| {
+                entry.present
+                    && state.scanned.contains_key(&entry.bundle)
+                    && !matches!(entry.stage, Stage::Failed(_))
+            };
+            let names: Vec<String> = state
+                .entries
+                .iter()
+                .filter(named)
+                .map(|entry| entry.name.clone())
+                .collect();
+            (state.preset_root.clone(), names)
+        };
+        let Some(root) = root else {
+            return;
+        };
+        let entries = std::fs::read_dir(&root).into_iter().flatten().flatten();
+        let mut have: HashSet<String> = entries
+            .map(|entry| canonical(&entry.file_name().to_string_lossy()))
+            .collect();
+        for name in names {
+            let key = canonical(&name);
+            if !key.is_empty() && have.insert(key) {
+                let _ = std::fs::create_dir_all(root.join(folder_name(&name)));
             }
         }
     }
@@ -924,6 +1081,47 @@ impl Host {
     pub fn presets(&self, plugin: &str) -> Option<Vec<String>> {
         let files = self.preset_list(plugin)?;
         Some(files.into_iter().map(|(name, _)| name).collect())
+    }
+
+    /// Copies a `.vstpreset` file into the preset folder of its plugin: the
+    /// plugin with the class the file names. A score then plays the preset
+    /// by the name of the file. Gives the plugin name and the preset name.
+    pub fn add_preset(&self, file: &Path) -> Result<(String, String), String> {
+        let bytes = std::fs::read(file).map_err(|error| error.to_string())?;
+        let class = crate::preset::parse(&bytes)?.class.to_owned();
+        let (plugin, root) = {
+            let state = self.state();
+            let of_class =
+                |entry: &&Entry| entry.present && entry.class.eq_ignore_ascii_case(&class);
+            let plugin = state.entries.iter().find(of_class);
+            (
+                plugin.map(|entry| entry.name.clone()),
+                state.preset_root.clone(),
+            )
+        };
+        let plugin = plugin.ok_or(
+            "no plugin of the scan has the class of this preset: a rescan reads the class of each plugin",
+        )?;
+        let root = root.ok_or("rustel has no preset folder")?;
+        let preset = file.file_stem().unwrap_or_default().to_string_lossy();
+        let folder =
+            preset_folder(&root, &plugin).unwrap_or_else(|| root.join(folder_name(&plugin)));
+        let target = folder.join(file.file_name().unwrap_or_default());
+        if target.exists() {
+            return Err(format!(
+                "{plugin} has a preset with the name '{preset}' already"
+            ));
+        }
+        std::fs::create_dir_all(&folder)
+            .and_then(|()| std::fs::copy(file, &target))
+            .map_err(|error| error.to_string())?;
+        // The next request reads the folder again.
+        let mut state = self.state();
+        state.preset_lists.remove(&canonical(&plugin));
+        state
+            .known_presets
+            .retain(|_, known| matches!(known, KnownPreset::Number(_)));
+        Ok((plugin, preset.into_owned()))
     }
 
     /// The preset files of a plugin as last read, and a new read on the
@@ -998,16 +1196,16 @@ impl Host {
     fn finish_load(&self, bundle: PathBuf) {
         let start = Instant::now();
         let stamp = cache::stamp(&bundle);
-        let loaded = contained("load", || load_bundle(&bundle));
-        let loaded = loaded.map(|mut plugins: Vec<Plugin>| {
+        let loaded = contained("load", || load_bundle(&bundle, &mut |_| {}));
+        let loaded = loaded.map(|(mut plugins, failed): (Vec<Plugin>, Vec<Scanned>)| {
             for plugin in &mut plugins {
                 plugin.load_time = start.elapsed();
             }
-            plugins
+            (plugins, failed)
         });
         let mut state = self.state();
         match loaded {
-            Ok(plugins) => {
+            Ok((plugins, failed)) => {
                 // A score asks for a preset right after the load, so the
                 // preset folders are read here, on the plugin thread.
                 let root = state.preset_root.clone();
@@ -1027,7 +1225,8 @@ impl Host {
                 }
                 // A plugin keeps its row, and so its number, over an unload
                 // and a new load.
-                let scanned: Vec<Scanned> = plugins.iter().map(Plugin::scanned).collect();
+                let loads = plugins.iter().map(Plugin::scanned);
+                let scanned: Vec<Scanned> = loads.chain(failed).collect();
                 state.name_rows(&bundle, &scanned);
                 // A row that is loaded keeps its plugin: the copies in the
                 // audio engine are copies of that plugin. A plugin with no
@@ -1056,6 +1255,7 @@ impl Host {
                 drop(spare);
                 if stored {
                     self.save_cache();
+                    self.make_preset_folders();
                 }
             }
             // The list shows the reason, and `Host::key` gives the reason
@@ -1333,7 +1533,11 @@ impl Host {
             _ => {}
         }
         let preset = match preset {
-            None => 0,
+            None => match self.preset(plugin, DEFAULT_PRESET) {
+                FoundPreset::Number(number) => number,
+                FoundPreset::Pending => return Ok(None),
+                FoundPreset::Missing => 0,
+            },
             Some(preset) => match self.preset(plugin, preset) {
                 FoundPreset::Number(number) => number,
                 // The host reads the preset folder now.
@@ -1655,21 +1859,46 @@ fn contained<T>(work: &str, run: impl FnOnce() -> Result<T, String>) -> Result<T
     std::panic::catch_unwind(run).unwrap_or_else(|_| Err(format!("the {work} panicked")))
 }
 
+/// A class as the scan cache keeps it, with the fault of a class that did
+/// not load.
+fn scanned(class: &ClassInfo, fault: Option<String>) -> Scanned {
+    Scanned {
+        name: class.name.clone(),
+        vendor: class.vendor.clone(),
+        categories: class.categories.clone(),
+        class: class.id_text(),
+        fault,
+    }
+}
+
 /// Loads a bundle in this process and reads the parameters of each plugin
-/// in the bundle. Runs on the plugin thread.
-pub(crate) fn load_bundle(bundle: &Path) -> Result<Vec<Plugin>, String> {
+/// in the bundle, as the load of a score does. Calls `progress` with the
+/// name of each class before its load, so a caller can report where the
+/// read is. Answers the plugins that load and each class that does not,
+/// with its fault. A bundle with no class that loads fails with the fault
+/// of its first class. Runs on the plugin thread.
+pub(crate) fn load_bundle(
+    bundle: &Path,
+    progress: &mut dyn FnMut(&str),
+) -> Result<(Vec<Plugin>, Vec<Scanned>), String> {
     let module = Arc::new(Module::load(bundle)?);
     let classes = module.classes();
     if classes.is_empty() {
         return Err("the bundle has no audio plugin".into());
     }
-    classes
-        .into_iter()
-        .map(|class| {
-            let params = Loaded::new(Arc::clone(&module), &class)?.params();
-            Ok(Plugin::new(Arc::clone(&module), class, params))
-        })
-        .collect()
+    let mut plugins = Vec::new();
+    let mut failed = Vec::new();
+    for class in classes {
+        progress(&class.name);
+        match Loaded::new(Arc::clone(&module), &class).map(|loaded| loaded.params()) {
+            Ok(params) => plugins.push(Plugin::new(Arc::clone(&module), class, params)),
+            Err(fault) => failed.push(scanned(&class, Some(fault))),
+        }
+    }
+    match failed.first() {
+        Some(first) if plugins.is_empty() => Err(first.fault.clone().unwrap_or_default()),
+        _ => Ok((plugins, failed)),
+    }
 }
 
 /// Makes one running plugin. `preset` is the content of a preset file. Runs
@@ -1693,6 +1922,30 @@ fn build_instance(
 mod tests {
     use super::*;
 
+    /// A part of a name finds the plugin with the part as whole words, then
+    /// at the start of a word, before a shorter name with the part inside a
+    /// word.
+    #[test]
+    fn a_part_of_a_name_finds_whole_words_first() {
+        let mut state = State::default();
+        for name in [
+            "Vital",
+            "Talk Box",
+            "TAL-NoiseMaker",
+            "ValhallaSupermassive",
+        ] {
+            let bundle = PathBuf::from(format!("{name}.vst3"));
+            let entry = Entry::new(name.to_owned(), bundle, Stage::Found);
+            state.entries.push(entry);
+        }
+        let found = |name: &str| state.find(name).map(|row| state.entries[row].name.as_str());
+        assert_eq!(found("TAL"), Some("TAL-NoiseMaker"));
+        assert_eq!(found("talk"), Some("Talk Box"));
+        assert_eq!(found("noise"), Some("TAL-NoiseMaker"));
+        assert_eq!(found("supermassive"), Some("ValhallaSupermassive"));
+        assert_eq!(found("ital"), Some("Vital"));
+    }
+
     /// A panic in a load or a build is a failure with a reason. A panic of
     /// a thread with the locks of the host leaves the host in use.
     #[test]
@@ -1710,5 +1963,32 @@ mod tests {
         assert!(host.shared.state.is_poisoned() && host.shared.gate.is_poisoned());
         assert!(host.plugins().is_empty());
         assert!(host.wait_idle_within(WAIT_LIMIT, || false));
+    }
+
+    /// A class that does not start leaves the other class of its bundle
+    /// loaded, in a load in this process too.
+    #[test]
+    fn a_class_that_fails_its_load_leaves_the_others_of_its_bundle() {
+        let root = std::env::temp_dir().join(format!("rustel-vst3-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("plugin folder");
+        rustel_vst3_fixture::install(&root);
+        // SAFETY: no other test of this binary loads the fixture, and the
+        // host threads start after the variable.
+        unsafe { std::env::set_var(rustel_vst3_fixture::BROKEN_TONE_ENV, "1") };
+        let host = Host::new();
+        host.scan(std::slice::from_ref(&root));
+        host.wait_idle();
+        let effect = host.resolve(rustel_vst3_fixture::NAME, true);
+        let tone = host.resolve(rustel_vst3_fixture::TONE_NAME, true);
+        // SAFETY: the loads are over.
+        unsafe { std::env::remove_var(rustel_vst3_fixture::BROKEN_TONE_ENV) };
+        assert!(matches!(effect, Resolved::Ready(..)));
+        assert!(matches!(
+            &tone,
+            Resolved::Failed(reason) if reason == "the plugin processor did not start"
+        ));
+        drop(host);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

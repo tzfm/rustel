@@ -411,6 +411,14 @@ pub fn run(options: StudioOptions) -> Result<(), RuntimeError> {
         }
     }
     crash::watch_for_panics();
+    // On macOS each plugin is created and released on the process's main
+    // thread. Running there, this registers the service before the engine
+    // worker starts, and the event loop pumps the thread every turn; when
+    // the command line runs the studio on its worker thread, it has
+    // registered already and pumps the main thread itself, so this call
+    // does nothing.
+    #[cfg(feature = "vst")]
+    rustel_runtime::vst::install_main_service();
     let update_check = options.check_updates.then(|| {
         let (sender, receiver) = std::sync::mpsc::channel();
         rustel_runtime::updates::check_for_updates(move |message| {
@@ -707,6 +715,22 @@ fn run_once(options: StudioOptions) -> Result<Session, RuntimeError> {
     }
     app.worker.shutdown();
     let save_shutdown_error = app.shutdown_save_worker();
+    // The plugins end on the process's main thread on macOS: the engine
+    // worker put their copies back for the plugin thread. `pump_main`
+    // serves their end when this thread is that main thread; otherwise the
+    // program that owns the main thread, which still pumps while this
+    // thread runs, serves the steps while this thread waits.
+    #[cfg(feature = "vst")]
+    {
+        let ending = std::thread::spawn(rustel_runtime::vst::shutdown);
+        while !ending.is_finished() {
+            rustel_runtime::vst::pump_main();
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+        ending
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    }
     let Ok(result) = caught else {
         // The scores are what reproduces the fault, and this is the last
         // moment they exist: the App goes out of scope with them.
@@ -810,10 +834,9 @@ struct App {
     /// The plugins in their load at the last turn: see `rustel_runtime::vst::loads`.
     #[cfg(feature = "vst")]
     plugin_loads: Vec<String>,
-    /// The bundles the plugin scan tested and the bundles of the scan in
-    /// all at the last turn, while the scan runs.
+    /// Where the plugin scan was at the last turn, while the scan runs.
     #[cfg(feature = "vst")]
-    plugin_scan: Option<(usize, usize)>,
+    plugin_scan: Option<rustel_runtime::vst::ScanProgress>,
     /// The plugin rows of the memory breakdown, as last measured.
     #[cfg(feature = "vst")]
     plugin_memory: Vec<super::memory::PluginMemory>,

@@ -1785,6 +1785,29 @@ fn exit_code_for(kind: &str) -> u8 {
     }
 }
 
+/// Serves the macOS main thread's pads and plugins while `runs` says the
+/// work is not done: the pads arrive through its run loop, and each plugin
+/// is created and released on the thread itself. Both are no-ops where the
+/// system asks nothing of the main thread.
+#[cfg(any(feature = "gamepad", feature = "vst"))]
+fn pump_the_main_thread(runs: impl Fn() -> bool) {
+    #[cfg(feature = "gamepad")]
+    let pads = rustel_runtime::gamepad::needs_the_main_thread();
+    #[cfg(not(feature = "gamepad"))]
+    let pads = false;
+    #[cfg(feature = "vst")]
+    let plugins = rustel_runtime::vst::needs_the_main_thread();
+    #[cfg(not(feature = "vst"))]
+    let plugins = false;
+    while (pads || plugins) && runs() {
+        #[cfg(feature = "gamepad")]
+        rustel_runtime::gamepad::pump();
+        #[cfg(feature = "vst")]
+        rustel_runtime::vst::pump_main();
+        std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+}
+
 fn main() -> ExitCode {
     // This runs before any thread exists and for every command. Memory
     // that the sample loaders free then returns to the system immediately.
@@ -1806,28 +1829,33 @@ fn main() -> ExitCode {
     // (which the recursion bound admits) overflows the platform default
     // main-thread stack under debug-profile frame sizes. An explicit stack
     // gives every platform and build profile the same headroom.
+    // On macOS the pads arrive and the plugins are created and released
+    // only on the main thread, which would otherwise sit in the join of the
+    // worker. The service is registered before the worker starts, so no
+    // plugin step can run before the main thread serves it.
+    #[cfg(feature = "vst")]
+    rustel_runtime::vst::install_main_service();
     let worker = std::thread::Builder::new()
         .name("rustel".into())
         .stack_size(rustel_runtime::QUERY_WORKER_STACK_BYTES)
         .spawn(run)
         .expect("spawn the rustel worker thread");
-    // On macOS the gamepads are read through a framework that delivers
-    // only through the main thread's run loop, so the main thread, which
-    // would otherwise sit in the join, pumps it until the work is done.
-    #[cfg(feature = "gamepad")]
-    if rustel_runtime::gamepad::needs_the_main_thread() {
-        while !worker.is_finished() {
-            rustel_runtime::gamepad::pump();
-            std::thread::sleep(std::time::Duration::from_millis(4));
-        }
-    }
+    #[cfg(any(feature = "gamepad", feature = "vst"))]
+    pump_the_main_thread(|| !worker.is_finished());
     let outcome = worker
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     // The outputs of the run ended with the worker. The plugins end before
-    // the process does.
+    // the process does, on the main thread on macOS, so the main thread
+    // serves them while a thread of its own waits for their end.
     #[cfg(feature = "vst")]
-    rustel_runtime::vst::shutdown();
+    {
+        let ending = std::thread::spawn(rustel_runtime::vst::shutdown);
+        pump_the_main_thread(|| !ending.is_finished());
+        ending
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    }
     // The run is over; a console handler standing in front of the process
     // exit on our behalf can stand down.
     #[cfg(windows)]
