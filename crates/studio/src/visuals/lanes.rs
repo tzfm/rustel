@@ -13,8 +13,9 @@
 //!            ▲
 //! ```
 //!
-//! A row is one sound of one lane. A lane is a labeled statement of the
-//! score, found from the source ranges an event carries. An event whose
+//! A row is one sound of one lane, and a lane the score named that plays
+//! more than one sound heads its rows with its label. A lane is a labeled
+//! statement of the score, found from the source ranges an event carries. An event whose
 //! ranges all lie outside the labeled statements, as a pattern kept in a
 //! variable does, still gets a row for its sound, without a lane label.
 //! The rows of a lane share its colour, and a sound keeps its mark in every
@@ -64,6 +65,16 @@ struct Row<'e> {
     sound: &'e str,
     /// The lowest and highest pitch, in MIDI notes, when the events have one.
     pitch: Option<(f32, f32)>,
+}
+
+/// What one line of the view holds.
+#[derive(Clone, Copy)]
+enum Line {
+    /// The heading of a lane the score named that plays more than one
+    /// sound, by the index of its first row.
+    Lane(usize),
+    /// A row of events, by its index.
+    Row(usize),
 }
 
 impl Widget for Lanes<'_, '_> {
@@ -119,9 +130,22 @@ impl Widget for Lanes<'_, '_> {
                 rows[index].sound,
             )
         });
-        let mut ranks = vec![0; rows.len()];
+        // The lines, top to bottom: each row, under a heading for a lane the
+        // score named that plays more than one sound.
+        let grouped = |row: &Row<'_>| {
+            lane_name(row, &state.lanes).is_some()
+                && rows.iter().filter(|other| other.lane == row.lane).count() > 1
+        };
+        let mut lines = Vec::with_capacity(rows.len() + 4);
+        let mut line_of = vec![0; rows.len()];
         for (rank, &index) in order.iter().enumerate() {
-            ranks[index] = rank;
+            let row = &rows[index];
+            let first = rank == 0 || rows[order[rank - 1]].lane != row.lane;
+            if first && grouped(row) {
+                lines.push(Line::Lane(index));
+            }
+            line_of[index] = lines.len();
+            lines.push(Line::Row(index));
         }
         // The theme's colours, each once. A theme of one colour keeps it.
         let mut palette: Vec<Color> = Vec::with_capacity(9);
@@ -172,20 +196,20 @@ impl Widget for Lanes<'_, '_> {
         let area = if request.inline {
             area
         } else {
-            let height = (rows.len().max(1) * 2 + 3).min(usize::from(area.height)) as u16;
+            let height = (lines.len().max(1) * 2 + 3).min(usize::from(area.height)) as u16;
             Rect::new(area.x, area.bottom() - height, area.width, height)
         };
 
-        // The caps take the first and last rows when the rows leave room
-        // for them. The rows share what is left, each on the middle line of
+        // The caps take the first and last lines when the lines leave room
+        // for them. The lines share what is left, each on the middle line of
         // its share.
-        let caps = usize::from(area.height) >= rows.len().max(1) + 2;
+        let caps = usize::from(area.height) >= lines.len().max(1) + 2;
         let inner = if caps {
             Rect::new(area.x, area.y + 1, area.width, area.height - 2)
         } else {
             area
         };
-        let shown = rows.len().clamp(1, usize::from(inner.height));
+        let shown = lines.len().clamp(1, usize::from(inner.height));
         let share = inner.height / shown as u16;
         let line = |rank: usize| inner.y + rank as u16 * share + (share - 1) / 2;
         let width = f64::from(area.width);
@@ -198,8 +222,12 @@ impl Widget for Lanes<'_, '_> {
         };
         let playhead_x = area.x + ((self.playhead * width) as u16).min(area.width - 1);
 
-        // A dotted line under each row, with a colon where a cycle starts.
+        // A dotted line under each row, with a colon where a cycle starts. A
+        // view with nothing to show yet still has one.
         for rank in 0..shown {
+            if matches!(lines.get(rank), Some(Line::Lane(_))) {
+                continue;
+            }
             let y = line(rank);
             for x in area.x..area.right() {
                 put(buffer, x, y, '·', theme.grid);
@@ -222,7 +250,7 @@ impl Widget for Lanes<'_, '_> {
         // with.
         for active in [false, true] {
             for (entry, &(index, midi)) in placed.iter().zip(&marks) {
-                let rank = ranks[index];
+                let rank = line_of[index];
                 if entry.active != active || rank >= shown {
                     continue;
                 }
@@ -259,34 +287,65 @@ impl Widget for Lanes<'_, '_> {
             }
         }
 
+        // A heading names its lane, and the lane's rows hang under it by a
+        // branch, each with its sound. A lane of one sound names its row,
+        // and a row of a lane with no name says its sound.
         if self.labels {
             let room = usize::from(playhead_x - area.x)
                 .saturating_sub(1)
                 .min(MAX_LABEL);
-            for (rank, &index) in order.iter().take(shown).enumerate() {
-                let (indent, label) = row_label(&rows, &order, rank, &state.lanes);
-                if label.is_empty() || indent >= room {
+            for (rank, &item) in lines.iter().take(shown).enumerate() {
+                let (Line::Lane(index) | Line::Row(index)) = item;
+                let row = &rows[index];
+                let color = colors[index];
+                let (branch, label) = match item {
+                    Line::Lane(_) => (None, lane_name(row, &state.lanes).unwrap_or_default()),
+                    Line::Row(_) if grouped(row) => {
+                        let last = !matches!(
+                            lines.get(rank + 1),
+                            Some(Line::Row(next)) if rows[*next].lane == row.lane
+                        );
+                        (Some(if last { " └ " } else { " ├ " }), row.sound)
+                    }
+                    Line::Row(_) => (None, lane_name(row, &state.lanes).unwrap_or(row.sound)),
+                };
+                let y = line(rank);
+                let mut x = area.x;
+                let mut left = room;
+                if let Some(branch) = branch {
+                    if left < 3 {
+                        continue;
+                    }
+                    buffer.set_stringn(x, y, branch, 3, Style::default().fg(dim(color, theme)));
+                    x += 3;
+                    left -= 3;
+                }
+                if label.is_empty() || left == 0 {
                     continue;
                 }
-                buffer.set_stringn(
-                    area.x + indent as u16,
-                    line(rank),
-                    format!("{label} "),
-                    room - indent,
-                    Style::default().fg(colors[index]),
-                );
+                buffer.set_stringn(x, y, format!("{label} "), left, Style::default().fg(color));
             }
         }
 
-        // The cycle the playhead is on, beside it, on the free line nearest
-        // half way down.
+        // The cycle the playhead is on, beside it, half way down: on a line
+        // of its own, else on a heading, whose label keeps to the left, else
+        // over the middle row.
         if inner.height >= 3 {
             let middle = inner.y + (inner.height - 1) / 2;
-            let taken = |y: u16| (0..shown).any(|rank| line(rank) == y);
+            let held = |y: u16| {
+                (0..shown).find(|&rank| line(rank) == y).map_or(0, |rank| {
+                    if matches!(lines.get(rank), Some(Line::Lane(_))) {
+                        1
+                    } else {
+                        2
+                    }
+                })
+            };
             let y = (inner.y..inner.bottom())
-                .filter(|&y| !taken(y))
-                .min_by_key(|&y| y.abs_diff(middle))
-                .unwrap_or(middle);
+                .map(|y| (held(y), y.abs_diff(middle), y))
+                .filter(|(held, _, _)| *held < 2)
+                .min()
+                .map_or(middle, |(_, _, y)| y);
             let text = format!("{cycle_now:.1} ");
             let from = playhead_x.saturating_sub(text.len() as u16).max(area.x);
             buffer.set_stringn(
@@ -347,32 +406,10 @@ fn sound_of(event: &UiScheduledEvent) -> &str {
         .map_or("", |sound| sound.split(':').next().unwrap_or(sound))
 }
 
-/// What the row at `rank` is called, and how many cells in it starts. The
-/// first row of a lane the score named carries the lane's label, followed by
-/// its sound when the lane has more than one row. The lane's other rows carry
-/// their sound under the first row's, and the lane's colour holds them
-/// together. Any other row carries its sound, since `$` lanes have no name of
-/// their own.
-fn row_label(
-    rows: &[Row<'_>],
-    order: &[usize],
-    rank: usize,
-    lanes: &[(Range<usize>, Arc<str>)],
-) -> (usize, String) {
-    let row = &rows[order[rank]];
-    let named = row
-        .lane
+/// The label of a row's lane, when the score named the lane. `$` lanes have
+/// no name of their own.
+fn lane_name<'l>(row: &Row<'_>, lanes: &'l [(Range<usize>, Arc<str>)]) -> Option<&'l str> {
+    row.lane
         .map(|lane| &*lanes[lane].1)
-        .filter(|label| !label.contains('$'));
-    let Some(label) = named else {
-        return (0, row.sound.to_owned());
-    };
-    if rows.iter().filter(|other| other.lane == row.lane).count() == 1 {
-        return (0, label.to_owned());
-    }
-    if rank == 0 || rows[order[rank - 1]].lane != row.lane {
-        (0, format!("{label} {}", row.sound).trim_end().to_owned())
-    } else {
-        (label.chars().count() + 1, row.sound.to_owned())
-    }
+        .filter(|label| !label.contains('$'))
 }

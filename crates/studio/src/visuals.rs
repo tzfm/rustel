@@ -3593,7 +3593,7 @@ pub(super) const EXTENSION_ENTRIES: &[ReferenceEntry] = &[ReferenceEntry {
     name: "lanes",
     synonyms: &[],
     summary: "Shows the score's lanes scrolling past a playhead.",
-    description: "Draws one row for each sound of each lane, with time moving right to left past a fixed playhead. The first row of a lane shows the lane's label, such as kick, and each row shows its sound when the lane plays several. What has played fades on the left, and the lookahead shows what is coming on the right. lanes() draws every lane in a strip along the bottom, behind the score, and _lanes() draws the rows of its own pattern under the call. The Lanes panel shows the same view along the top or the bottom of the studio.",
+    description: "Draws one row for each sound of each lane, with time moving right to left past a fixed playhead. A row is named after its lane's label, such as kick, or after its sound. A lane that plays several sounds shows its label on a line of its own, and each sound hangs under it on a branch. What has played fades on the left, and the lookahead shows what is coming on the right. lanes() draws every lane in a strip along the bottom, behind the score, and _lanes() draws the rows of its own pattern under the call. The Lanes panel shows the same view along the top or the bottom of the studio.",
     params: &[
         ReferenceParam {
             name: "config",
