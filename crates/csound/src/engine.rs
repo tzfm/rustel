@@ -1,8 +1,62 @@
 use libloading::Library;
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, OsStr, OsString, c_char, c_int, c_void};
 use std::sync::{Arc, OnceLock};
 
 type Handle = *mut c_void;
+
+/// Where the host's Csound library is looked for, in order: the environment
+/// override, the plain names the system loader resolves, a framework the
+/// machine installed, and a framework under the home directory, which needs
+/// no admin install.
+fn library_paths(override_path: Option<OsString>, home: Option<OsString>) -> Vec<OsString> {
+    if let Some(path) = override_path {
+        return vec![path];
+    }
+    let mut paths: Vec<OsString> = [
+        "libcsound64.so.6.0",
+        "libcsound64.so",
+        "CsoundLib64.framework/CsoundLib64",
+        "/Library/Frameworks/CsoundLib64.framework/CsoundLib64",
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
+    if let Some(home) = home {
+        paths.push(
+            std::path::PathBuf::from(home)
+                .join("Library/Frameworks/CsoundLib64.framework/CsoundLib64")
+                .into(),
+        );
+    }
+    for path in [
+        "/opt/homebrew/lib/libcsound64.dylib",
+        "/usr/local/lib/libcsound64.dylib",
+        "libcsound64.dylib",
+        "csound64.dll",
+        "libcsound64.dll",
+    ] {
+        paths.push(path.into());
+    }
+    paths
+}
+
+/// The plugin folder of the framework a library path sits inside. Csound
+/// keeps its built install path, so a framework copied elsewhere, such as
+/// under the home directory, leaves its plugins behind without it.
+fn opcode_dir(library: &OsStr) -> Option<std::path::PathBuf> {
+    let mut directory = std::path::Path::new(library).parent()?;
+    while !directory.as_os_str().is_empty() {
+        if directory
+            .extension()
+            .is_some_and(|extension| extension == "framework")
+        {
+            let plugins = directory.join("Resources").join("Opcodes64");
+            return plugins.is_dir().then_some(plugins);
+        }
+        directory = directory.parent()?;
+    }
+    None
+}
 
 struct Api {
     _library: Library,
@@ -34,28 +88,27 @@ impl Api {
     }
 
     fn open() -> Result<Arc<Self>, String> {
-        let paths = if let Some(path) = std::env::var_os("RUSTEL_CSOUND_LIBRARY") {
-            vec![path]
-        } else {
-            [
-                "libcsound64.so.6.0",
-                "libcsound64.so",
-                "CsoundLib64.framework/CsoundLib64",
-                "/Library/Frameworks/CsoundLib64.framework/CsoundLib64",
-                "/opt/homebrew/lib/libcsound64.dylib",
-                "/usr/local/lib/libcsound64.dylib",
-                "libcsound64.dylib",
-                "csound64.dll",
-                "libcsound64.dll",
-            ]
-            .into_iter()
-            .map(Into::into)
-            .collect()
-        };
         // The library and its dependencies execute native code. Only the host
         // environment, never a score, supplies its search path.
-        let library = paths.iter().find_map(|path| unsafe { Library::new(path) }.ok())
-            .ok_or("Csound 6 is not available. Install double-precision Csound 6.18 or set RUSTEL_CSOUND_LIBRARY to its shared library")?;
+        let (path, library) = library_paths(
+            std::env::var_os("RUSTEL_CSOUND_LIBRARY"),
+            std::env::var_os("HOME"),
+        )
+        .iter()
+        .find_map(|path| unsafe { Library::new(path) }.ok().map(|library| (path.clone(), library)))
+        .ok_or("Csound 6 is not available. Install double-precision Csound 6.18 or set RUSTEL_CSOUND_LIBRARY to its shared library")?;
+        let opcode_dir = opcode_dir(&path);
+        // Csound loads its plugin opcodes from the process environment, and a
+        // framework outside its built install path leaves them behind. The
+        // host sets the folder of the framework it chose, before any engine
+        // exists that could race the write.
+        if let Some(directory) = &opcode_dir
+            && std::env::var_os("OPCODE6DIR64").is_none()
+        {
+            // SAFETY: written once, before any engine or Csound thread that
+            // could read the variable exists.
+            unsafe { std::env::set_var("OPCODE6DIR64", directory) };
+        }
         // All symbols below use the Csound 6 public C ABI. Check its version and
         // MYFLT width before passing a handle or reading sample memory.
         unsafe {
@@ -246,5 +299,60 @@ impl Drop for Engine {
             (self.api.destroy_buffer)(self.handle);
             (self.api.destroy)(self.handle);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_environment_override_is_the_only_path_looked_at() {
+        let paths = library_paths(Some("/somewhere/libcsound.dylib".into()), None);
+        assert_eq!(paths, ["/somewhere/libcsound.dylib"]);
+    }
+
+    #[test]
+    fn a_home_supplies_a_user_level_framework_after_the_system_one() {
+        let home = "/Users/someone";
+        let with_home = library_paths(None, Some(home.into()));
+        let without_home = library_paths(None, None);
+        assert_eq!(with_home.len(), without_home.len() + 1);
+        let at = with_home
+            .iter()
+            .position(|path| path == "/Library/Frameworks/CsoundLib64.framework/CsoundLib64")
+            .expect("the system framework");
+        assert_eq!(
+            with_home[at + 1],
+            "/Users/someone/Library/Frameworks/CsoundLib64.framework/CsoundLib64"
+        );
+        assert!(
+            without_home
+                .iter()
+                .all(|path| !path.to_string_lossy().contains("someone"))
+        );
+    }
+
+    #[test]
+    fn the_plugin_folder_belongs_to_the_framework_the_library_is_in() {
+        let root = tempfile::tempdir().expect("framework directory");
+        let plugins = root
+            .path()
+            .join("CsoundLib64.framework")
+            .join("Resources")
+            .join("Opcodes64");
+        std::fs::create_dir_all(&plugins).expect("plugins");
+        let library = root
+            .path()
+            .join("CsoundLib64.framework")
+            .join("Versions")
+            .join("6.0")
+            .join("CsoundLib64");
+        assert_eq!(opcode_dir(library.as_os_str()), Some(plugins));
+        assert_eq!(
+            opcode_dir(OsStr::new("/opt/homebrew/lib/libcsnd6.dylib")),
+            None
+        );
+        assert_eq!(opcode_dir(OsStr::new("libcsound64.dylib")), None);
     }
 }

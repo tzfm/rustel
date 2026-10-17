@@ -7,9 +7,13 @@ Studio, and WAV or MP3 export use the same native library.
 ## Install and enable
 
 Install double-precision Csound 6.18 or a later 6.x release from the
-[Csound downloads page](https://csound.com/download.html). On macOS,
-`brew install csound` provides the library. On Ubuntu 24.04,
-`sudo apt install libcsound64-6.0` provides it.
+[Csound downloads page](https://csound.com/download.html). On macOS, run the
+package installer, or copy `CsoundLib64.framework` from the downloaded
+package into `~/Library/Frameworks` for this user alone, or into
+`/Library/Frameworks` for every user; Rustel finds both without further
+setup. The Homebrew 6.18 package cannot play named instruments, which shared
+orchestras use. On Ubuntu 24.04, `sudo apt install libcsound64-6.0` provides
+the library.
 
 Enable native orchestra execution when starting Rustel:
 
@@ -28,7 +32,10 @@ See [score execution security](../SECURITY.md#csound-orchestras).
 
 Rustel searches the usual shared-library locations. For another installation,
 set `RUSTEL_CSOUND_LIBRARY` to its shared library before starting Rustel.
-Csound 7 and single-precision builds are not supported.
+Plugin opcodes such as fluidsynth or the mixer buss need the framework in
+`/Library/Frameworks`; a framework under the home directory plays the core
+opcodes, which shared orchestras use. Csound 7 and single-precision builds
+are not supported.
 
 ## Start with the included instruments
 

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A Csound framework under the home directory plays. `~/Library/Frameworks/CsoundLib64.framework` joins the library search, and the engine points Csound at that framework's plugin folder, so copying `CsoundLib64.framework` out of the macOS package into `~/Library/Frameworks` needs no admin install and no environment variables.
 - Csound instruments play and export with `.csound()` and `.csoundm()`. Load custom orchestras with `loadCSound` or `loadOrc`, and keep the playing score when an orchestra edit fails. Requires native Csound 6.18 and `--allow-csound`, or Enter on the studio's `native orchestras` switch in Settings → Permissions, which lasts one studio run. See [Csound](https://github.com/tzfm/rustel/blob/main/docs/csound.md).
 - Csound instruments play and export with `.csound()` and `.csoundm()`. Load custom orchestras with `loadCSound` or `loadOrc`, and keep the playing score when an orchestra edit fails. Requires native Csound 6.18 and `--allow-csound`. See [Csound](https://github.com/tzfm/rustel/blob/main/docs/csound.md).
 - Studio shows a hint when audio struggles while the CPU is in a power-saving mode: callbacks keep missing their deadline, or the DSP load stays above 70%, for three seconds. That mode keeps the clock low for short, regular work such as the audio callback, so the same score can need two to four times the DSP time. Studio reads the mode on Linux and Windows, and only after the trouble lasts. See [hardware](https://github.com/tzfm/rustel/blob/main/docs/hardware.md#output-latency).
