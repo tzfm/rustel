@@ -52,7 +52,8 @@ pub(crate) fn speak(items: &[Item], params: &Params) -> Vec<f32> {
     let upper = timbre.upper.map(|(hz, bw)| (f32::from(hz), f32::from(bw)));
     let tract = table::tract(timbre.tract);
     let mut synth = synth::Synth::new(timbre.glottis, upper, timbre.tilt, tract.hiss);
-    let (av, ah, af) = (bias(timbre.av), bias(timbre.ah), bias(timbre.af));
+    let (av, ah) = (bias(timbre.av), bias(timbre.ah));
+    let af = bias(timbre.af) * 10f32.powf(tract.af / 20.0);
     let frames = (total_ms * RATE as f32 / 1000.0) as usize;
     let mut out = Vec::with_capacity(frames);
     for n in 0..frames {

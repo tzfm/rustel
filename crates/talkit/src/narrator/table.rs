@@ -355,8 +355,8 @@ pub(super) fn target(ph: Ph) -> Target {
 }
 
 /// How a vocal tract reshapes the targets above: its formant and bandwidth
-/// factors, its factor on the hiss frequencies, and its voicing level in dB
-/// at each of the glottal source anchors.
+/// factors, its factor on the hiss frequencies, its frication level, and its
+/// voicing level in dB at each of the glottal source anchors.
 ///
 /// The voicing level of the woman and child tracts climbs with the pitch:
 /// the woman tract is about 13 dB under the man at 100 Hz and level with
@@ -366,6 +366,8 @@ pub(super) struct Tract {
     pub f: [f32; 3],
     pub b: [f32; 3],
     pub hiss: f32,
+    /// The frication level, dB against the man.
+    pub af: f32,
     pub av: [f32; 13],
 }
 
@@ -391,31 +393,35 @@ impl Tract {
 pub(super) fn tract(n: u8) -> Tract {
     match n {
         1 => Tract {
-            f: [0.98, 1.028, 1.123],
-            b: [1.345, 1.46, 1.516],
-            hiss: 1.171,
+            f: [1.007, 1.031, 1.135],
+            b: [1.145, 1.92, 1.962],
+            hiss: 1.132,
+            af: -7.5,
             av: [
-                -12.3, -12.7, -13.1, -13.5, -13.1, -10.9, -7.9, -4.6, -1.0, 5.6, 4.1, 4.0, 7.2,
+                -12.6, -13.0, -13.4, -13.8, -13.4, -11.2, -8.2, -4.9, -1.3, 5.3, 3.8, 3.7, 6.9,
             ],
         },
         2 => Tract {
-            f: [1.44, 1.411, 1.35],
-            b: [1.701, 0.8, 1.154],
-            hiss: 1.304,
+            f: [1.464, 1.414, 1.368],
+            b: [2.252, 1.106, 1.313],
+            hiss: 1.012,
+            af: -9.0,
             av: [
-                -8.0, -8.9, -8.5, -9.8, -9.0, -8.8, -8.1, -5.3, -1.4, 0.3, 0.9, 4.0, 0.4,
+                -12.4, -12.4, -12.7, -13.6, -12.8, -10.0, -8.0, -4.5, 1.5, 3.7, 2.1, 5.2, 3.9,
             ],
         },
         3 => Tract {
             f: [0.89, 0.949, 0.952],
             b: [1.15, 1.093, 0.767],
             hiss: 1.013,
+            af: -1.2,
             av: [0.0; 13],
         },
         _ => Tract {
             f: [1.0; 3],
             b: [1.0; 3],
             hiss: 1.0,
+            af: 0.0,
             av: [0.0; 13],
         },
     }

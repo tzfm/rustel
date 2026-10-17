@@ -140,7 +140,8 @@ impl Synth {
             let mut sum = fr.hiss.flat * self.noise[4].next();
             for (k, &(hz, bw, level)) in fr.hiss.peaks.iter().enumerate() {
                 if level > 0.0 {
-                    self.hiss[k].tune(hz * self.hiss_scale, bw);
+                    // A scaled peak stays under the Nyquist frequency.
+                    self.hiss[k].tune((hz * self.hiss_scale).min(0.45 * RATE as f32), bw);
                     sum += self.hiss[k].run(self.noise[k + 1].next()) * level;
                 }
             }
