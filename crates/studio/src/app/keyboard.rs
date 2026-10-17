@@ -386,6 +386,18 @@ impl App {
                     self.handle_memory_key(code, primary)
                 }
             }
+            // The same for the Lanes panel.
+            PanelKind::Lanes => {
+                if !self.lanes_unlaid && self.regions.lanes.is_empty() {
+                    if code == KeyCode::Esc {
+                        self.focus = Focus::Editor;
+                        self.dirty_frame = true;
+                    }
+                    code == KeyCode::Esc
+                } else {
+                    self.handle_lanes_key(code, primary)
+                }
+            }
         })
     }
 

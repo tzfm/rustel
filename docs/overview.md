@@ -80,6 +80,10 @@ Default builds include terminal visualizers and native
 or a software renderer. Terminal capabilities determine how frames appear.
 See [Hydra's design](hydra-design.md) for the rendering path and its tests.
 
+`lanes()` and `_lanes()` are Rustel's own visualizer. They show the score's
+lanes scrolling past a playhead, the same view as the Studio's Lanes panel.
+See [Lanes](studio.md#lanes).
+
 ## Embedding and performance
 
 `rustel-engine` provides the pattern core, scheduler, voice preparation, and

@@ -265,8 +265,15 @@ impl Reference {
         }
         // The painters' entries live beside the renderer that owns them.
         for documented in super::super::visuals::REFERENCE_ENTRIES {
+            let mut entry = Entry::from(documented);
+            entry.origin.clear();
+            self.ingest_entry(entry.clone(), known, true);
+            self.ingest_inline_painter(entry, known);
+        }
+        // The painters this engine adds keep their credit, inline twin too.
+        for documented in super::super::visuals::EXTENSION_ENTRIES {
             let entry = Entry::from(documented);
-            self.ingest_native(entry.clone(), known, true);
+            self.ingest_extension(entry.clone(), known);
             self.ingest_inline_painter(entry, known);
         }
         // The native synth sounds' entries live where the sounds resolve.
@@ -297,6 +304,7 @@ impl Reference {
     /// Inline painters share their renderer's documentation, but are separate
     /// calls: completing `_piano` must retain the underscore and its placement.
     /// Only derive spellings the transpiler actually recognizes as widgets.
+    /// The twin keeps the credit of the entry it comes from.
     fn ingest_inline_painter(&mut self, mut entry: Entry, known: &impl Fn(&str) -> bool) {
         let plain = entry.name.clone();
         let inline = format!("_{plain}");
@@ -322,7 +330,7 @@ impl Reference {
             "Displays `{plain}` inline below this call. It uses the same options as `{plain}`.\n\n{}",
             entry.description
         );
-        self.ingest_native(entry, known, true);
+        self.ingest_entry(entry, known, true);
     }
 
     /// One entry from an extension: the same ingest, keeping the credit.

@@ -52,6 +52,7 @@ pub(super) enum RotationStop {
     Mixer,
     Log,
     Memory,
+    Lanes,
     Reference,
 }
 
@@ -70,6 +71,7 @@ impl App {
             PanelKind::Viz => self.viz_docks.iter().any(Option::is_some),
             PanelKind::Mixer => self.mixer_panel.is_some(),
             PanelKind::Memory => self.memory_dock.is_some(),
+            PanelKind::Lanes => self.lanes_dock.is_some(),
         }
     }
 
@@ -110,6 +112,11 @@ impl App {
         !self.ui_settings.zen && self.memory_dock.is_some()
     }
 
+    /// The same for the Lanes panel.
+    pub(super) fn lanes_are_docked(&self) -> bool {
+        !self.ui_settings.zen && self.lanes_dock.is_some()
+    }
+
     /// The panel an Esc from the score puts away: the one on top - the
     /// prompts and the docks' sheets first, then the reference and the
     /// sheets by when they were raised, the latest first. The set panel is
@@ -128,6 +135,7 @@ impl App {
                 PanelKind::Reference,
                 PanelKind::ThemeEditor,
                 PanelKind::Memory,
+                PanelKind::Lanes,
             ])
             .filter(|kind| self.panel_open(*kind))
             // A DOCKED log is furniture, not a sheet: it has its own room
@@ -136,6 +144,7 @@ impl App {
             // on purpose went every time the score was tidied.
             .filter(|kind| !(*kind == PanelKind::Log && self.log_is_docked()))
             .filter(|kind| !(*kind == PanelKind::Memory && self.memory_is_docked()))
+            .filter(|kind| !(*kind == PanelKind::Lanes && self.lanes_are_docked()))
             .collect();
         open.sort_by_key(|kind| std::cmp::Reverse(self.raised_at(*kind)));
         open.first().copied()
@@ -185,6 +194,9 @@ impl App {
         if self.memory_is_docked() && !self.regions.memory.is_empty() {
             stops.push(RotationStop::Memory);
         }
+        if self.lanes_are_docked() && !self.regions.lanes.is_empty() {
+            stops.push(RotationStop::Lanes);
+        }
         if self.reference_panel.is_some() {
             stops.push(RotationStop::Reference);
         }
@@ -201,6 +213,7 @@ impl App {
             Focus::Panel(PanelKind::Mixer) => Some(RotationStop::Mixer),
             Focus::Panel(PanelKind::Log) => Some(RotationStop::Log),
             Focus::Panel(PanelKind::Memory) => Some(RotationStop::Memory),
+            Focus::Panel(PanelKind::Lanes) => Some(RotationStop::Lanes),
             Focus::Panel(PanelKind::Reference) => Some(RotationStop::Reference),
             // A panel outside the rotation - a sheet - has
             // no place in this order; walking from it starts the rotation
@@ -262,6 +275,12 @@ impl App {
                 self.status = "keyboard on the memory breakdown - e top/bottom · -/+ height".into();
                 self.arm_focus_rotation_flash(RotationStop::Memory);
             }
+            RotationStop::Lanes => {
+                self.focus = Focus::Editor;
+                self.focus_panel(PanelKind::Lanes);
+                self.status = "keyboard on the lanes - e top/bottom · -/+ height".into();
+                self.arm_focus_rotation_flash(RotationStop::Lanes);
+            }
             RotationStop::Reference => {
                 self.focus = Focus::Editor;
                 self.focus_panel(PanelKind::Reference);
@@ -304,6 +323,7 @@ impl App {
             RotationStop::Mixer => self.regions.mixer,
             RotationStop::Log => self.regions.log,
             RotationStop::Memory => self.regions.memory,
+            RotationStop::Lanes => self.regions.lanes,
             RotationStop::Reference => self.regions.reference,
         };
         (!room.is_empty()).then_some(room)
@@ -422,6 +442,7 @@ impl App {
             }
             PanelKind::Log => self.log_panel = None,
             PanelKind::Memory => self.close_memory_dock(),
+            PanelKind::Lanes => self.close_lanes_panel(),
             PanelKind::Jobs => self.jobs_panel = None,
             PanelKind::Export => {
                 self.export_sheet = None;

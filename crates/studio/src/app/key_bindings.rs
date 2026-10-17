@@ -79,6 +79,7 @@ impl App {
                     | Do::Docs
                     | Do::SetPanel
                     | Do::Mixer
+                    | Do::Lanes
                     | Do::VisualsOne
                     | Do::VisualsTwo
                     | Do::LogSticky
@@ -155,6 +156,10 @@ impl App {
             }
             Do::Mixer => {
                 self.toggle_mixer_panel();
+                Ok(true)
+            }
+            Do::Lanes => {
+                self.toggle_lanes_panel();
                 Ok(true)
             }
             Do::VisualsOne => {
