@@ -3982,6 +3982,7 @@ mod tests {
             "_spiral",
             "_pitchwheel",
             "_spectrum",
+            "_lanes",
             "scope",
             "tscope",
             "pianoroll",
@@ -3989,6 +3990,7 @@ mod tests {
             "spiral",
             "pitchwheel",
             "spectrum",
+            "lanes",
             "markcss",
         ] {
             let argument = if method == "markcss" {

@@ -11,6 +11,8 @@
 //! score wrote inside its `_visual(...)` call.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::ops::Range;
+use std::sync::Arc;
 use std::time::Instant;
 
 use ratatui::buffer::Buffer;
@@ -26,6 +28,8 @@ use rustel_runtime::ui_events::{
 
 use super::engine::StudioSnapshot;
 use super::theme::{Theme, VisualOptions, hsv, luminance, mix, parse_color, true_rgb};
+
+mod lanes;
 
 const MAX_TIMELINE_EVENTS: usize = 2_048;
 const HISTORY_SECONDS: f64 = 8.0;
@@ -86,6 +90,12 @@ pub struct VisualState {
     audio_sample_rate: u32,
     audio_sequence: u64,
     dropped: u64,
+    /// The labeled statements of the score in play, in source order: each
+    /// one's byte range in that text and its label. The lanes view reads an
+    /// event's lane from them.
+    lanes: Vec<(Range<usize>, Arc<str>)>,
+    /// The text `lanes` was read from.
+    lanes_source: Option<Arc<str>>,
 }
 
 /// The bit the display sets on a preview's onset id, so a preview is told
@@ -262,6 +272,20 @@ impl VisualState {
 
     pub fn layout(&self) -> Option<&UiLayout> {
         self.layout.as_ref()
+    }
+
+    /// Read the lanes of the score in play, once for each text.
+    pub fn install_lanes(&mut self, source: Option<&Arc<str>>) {
+        if self.lanes_source.as_deref() == source.map(|source| &**source) {
+            return;
+        }
+        self.lanes = source
+            .and_then(|source| rustel_transpiler::lane_spans(source))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(span, label)| (span, Arc::from(label)))
+            .collect();
+        self.lanes_source = source.cloned();
     }
 
     /// Whether playback is running: false from a stop until the next start.
@@ -1169,6 +1193,7 @@ pub fn render(request: VisualRequest<'_>, area: Rect, buffer: &mut Buffer) {
             PianoRoll::new(&request, RollPreset::PianoRoll).render(area, buffer)
         }
         "wordfall" => PianoRoll::new(&request, RollPreset::Wordfall).render(area, buffer),
+        "lanes" => lanes::Lanes::new(&request).render(area, buffer),
         "spiral" => Spiral::new(&request).render(area, buffer),
         "pitchwheel" => PitchWheel::new(&request).render(area, buffer),
         "scope" | "tscope" => Scope::new(&request).render(area, buffer),
@@ -1271,6 +1296,28 @@ fn short_value(event: &UiScheduledEvent) -> String {
     value.chars().take(12).collect()
 }
 
+/// An event's pitch in MIDI notes, when it has one.
+fn event_pitch(event: &UiScheduledEvent) -> Option<f32> {
+    // The audio route supplies a synth's default frequency after its
+    // preview was drawn. That is not a pitch written in the pattern:
+    // s("sine") must keep the same named lane before and after onset.
+    if let Some(value) = event.value.as_deref() {
+        let sound = value
+            .split_whitespace()
+            .any(|field| field.starts_with("s:"));
+        let pitch = value
+            .split_whitespace()
+            .any(|field| field.starts_with("note:") || field.starts_with("freq:"));
+        if sound && !pitch {
+            return None;
+        }
+    }
+    event
+        .frequency_hz
+        .filter(|hertz| hertz.is_finite())
+        .map(frequency_to_midi)
+}
+
 /// Row identity for the piano roll: a pitch when the event has one, and the
 /// value text otherwise, so a drum pattern gets one lane per sound.
 #[derive(Clone, Debug, PartialEq)]
@@ -1281,24 +1328,7 @@ enum Lane {
 
 impl Lane {
     fn of(event: &UiScheduledEvent) -> Self {
-        // The audio route supplies a synth's default frequency after its
-        // preview was drawn. That is not a pitch written in the pattern:
-        // s("sine") must keep the same named lane before and after onset.
-        if let Some(value) = event.value.as_deref() {
-            let sound = value
-                .split_whitespace()
-                .any(|field| field.starts_with("s:"));
-            let pitch = value
-                .split_whitespace()
-                .any(|field| field.starts_with("note:") || field.starts_with("freq:"));
-            if sound && !pitch {
-                return Self::Named(short_value(event));
-            }
-        }
-        match event.frequency_hz.filter(|hertz| hertz.is_finite()) {
-            Some(hertz) => Self::Pitch(frequency_to_midi(hertz)),
-            None => Self::Named(short_value(event)),
-        }
+        event_pitch(event).map_or_else(|| Self::Named(short_value(event)), Self::Pitch)
     }
 
     fn label(&self) -> String {
@@ -3079,6 +3109,11 @@ pub(super) const PAINTER_TERMINAL: &[PainterTerminal] = &[
         ],
     },
     PainterTerminal {
+        painter: "lanes",
+        entry: "Each row is one line of text: a dotted line with a colon where a cycle starts, and a mark for each hit. The rows of a lane share a colour, and a sound has the same mark in every lane. A pitched row draws each note as a block whose height follows its pitch within the row. The playhead is a dotted column with the cycle number beside it, a filled diamond while playing and a hollow one when stopped.",
+        options: &[],
+    },
+    PainterTerminal {
         painter: "markcss",
         entry: "Accepted and never drawn: the studio highlights sounding events in its own theme's colours, which a CSS rule cannot describe.",
         options: &[],
@@ -3551,6 +3586,44 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         origin: "rustel",
     },
 ];
+
+/// The painters this engine adds to the language. The reference credits them
+/// as Rustel extensions.
+pub(super) const EXTENSION_ENTRIES: &[ReferenceEntry] = &[ReferenceEntry {
+    name: "lanes",
+    synonyms: &[],
+    summary: "Shows the score's lanes scrolling past a playhead.",
+    description: "Draws one row for each sound of each lane, with time moving right to left past a fixed playhead. A row is named after its lane's label, such as kick, or after its sound. What has played fades on the left, and the lookahead shows what is coming on the right. lanes() draws every lane behind the score, and _lanes() draws the rows of its own pattern under the call. The Lanes panel shows the same view along the top or the bottom of the studio.",
+    params: &[
+        ReferenceParam {
+            name: "config",
+            r#type: "object",
+            description: "optional config with options:",
+        },
+        ReferenceParam {
+            name: "cycles",
+            r#type: "number",
+            description: "cycles across the view (default 3)",
+        },
+        ReferenceParam {
+            name: "playhead",
+            r#type: "number",
+            description: "where the playhead sits, from 0 at the left to 1 at the right (default 0.25)",
+        },
+        ReferenceParam {
+            name: "labels",
+            r#type: "boolean",
+            description: "name each row at its left end (default 1)",
+        },
+    ],
+    examples: &[
+        "kick: s(\"sbd*4\")\nhats: s(\"white*8\").decay(.04).gain(.4)\nbass: note(\"<c2 eb2>*4\").s(\"sawtooth\").lpf(500).lanes()",
+    ],
+    tags: &["visualization"],
+    no_autocomplete: false,
+    deprecated: false,
+    origin: "rustel",
+}];
 
 #[cfg(test)]
 mod tests {

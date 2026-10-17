@@ -334,6 +334,9 @@ impl App {
         if let Some(shape) = self.memory_dock_shape(x, y) {
             return shape;
         }
+        if self.lanes_panel_at(x, y) {
+            return DEFAULT;
+        }
         if self.scene_chip_at(x, y).is_some() || self.orbit_chip_at(x, y).is_some() {
             return POINTER;
         }

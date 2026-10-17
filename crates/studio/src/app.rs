@@ -9,6 +9,7 @@
 //! | On screen | File |
 //! |---|---|
 //! | the mixer desk, master level and limiter | `mixer.rs` |
+//! | the Lanes panel | `lanes_panel.rs` |
 //! | the reference column (Ctrl+D) | `reference_panel.rs` |
 //! | completion lists at the caret (Ctrl+Space, Tab) | `completion.rs`, `string_roles.rs`, `bank_context.rs` |
 //! | hearing a chord, scale, sound or snippet | `previews.rs` |
@@ -161,6 +162,7 @@ mod import_trust;
 mod jobs_panel;
 mod key_bindings;
 mod keyboard;
+mod lanes_panel;
 mod link;
 mod list_keys;
 mod loading_line;
@@ -925,6 +927,10 @@ struct App {
     /// Docked memory breakdown and its pending layout state.
     memory_dock: Option<super::memory::MemoryDock>,
     memory_unlaid: bool,
+    /// The Lanes panel's band while it is open, and whether the next draw
+    /// has yet to lay it.
+    lanes_dock: Option<super::viz_panel::Dock>,
+    lanes_unlaid: bool,
     /// Scores in the set folder with no open tab.
     memory_closed_files: usize,
     /// The set panel, while it is open.
@@ -1606,6 +1612,8 @@ impl App {
             jobs_panel: None,
             memory_dock: None,
             memory_unlaid: false,
+            lanes_dock: None,
+            lanes_unlaid: false,
             memory_closed_files: 0,
             set_panel: None,
             set_prompt: None,
@@ -1992,8 +2000,8 @@ impl App {
     }
 
     /// The panels come back the way they were left: the set panel, the
-    /// visualisation docks and the mixer desk reopen keyless, exactly as
-    /// the previous studio left them. The CLI startup and the test
+    /// visualisation docks, the mixer desk and the Lanes panel reopen
+    /// keyless, exactly as the previous studio left them. The CLI startup and the test
     /// harness share this so the two cannot drift apart.
     pub(super) fn restore_panels_from_prefs(&mut self) {
         if self.prefs.set_panel == Some(true) {
@@ -2006,6 +2014,9 @@ impl App {
         }
         if self.prefs.mixer_panel == Some(true) {
             self.open_mixer_panel(false);
+        }
+        if self.prefs.lanes_docked == Some(true) {
+            self.open_lanes_panel(false);
         }
         self.restore_sticky_log();
     }
@@ -2072,6 +2083,7 @@ impl App {
         mixer: Option<super::viz_panel::Dock>,
         log: Option<super::viz_panel::Dock>,
         memory: Option<super::viz_panel::Dock>,
+        lanes: Option<super::viz_panel::Dock>,
     ) -> StudioRegions {
         view::regions_with_footer(
             self.frame,
@@ -2084,6 +2096,7 @@ impl App {
             mixer,
             log,
             memory,
+            lanes,
             self.footer_notice_rows(),
             self.has_piano_notes(),
         )

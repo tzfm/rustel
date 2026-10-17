@@ -70,6 +70,7 @@ pub enum BindAction {
     PianoMode,
     SetPanel,
     Mixer,
+    Lanes,
     VisualsOne,
     VisualsTwo,
     Log,
@@ -124,7 +125,7 @@ pub enum BindAction {
 
 impl BindAction {
     /// Every action, in the order the Keybinds page lists them.
-    pub const ALL: [BindAction; 54] = [
+    pub const ALL: [BindAction; 55] = [
         // Transport
         Self::Evaluate,
         Self::Stop,
@@ -140,6 +141,7 @@ impl BindAction {
         Self::PianoMode,
         Self::SetPanel,
         Self::Mixer,
+        Self::Lanes,
         Self::VisualsOne,
         Self::VisualsTwo,
         Self::Log,
@@ -204,6 +206,7 @@ impl BindAction {
             Self::PianoMode => "piano-mode",
             Self::SetPanel => "set-panel",
             Self::Mixer => "mixer",
+            Self::Lanes => "lanes",
             Self::VisualsOne => "visuals-one",
             Self::VisualsTwo => "visuals-two",
             Self::Log => "log",
@@ -271,6 +274,7 @@ impl BindAction {
             Self::PianoMode => "piano mode",
             Self::SetPanel => "set panel",
             Self::Mixer => "mixer desk",
+            Self::Lanes => "lanes",
             Self::VisualsOne => "visuals 1",
             Self::VisualsTwo => "visuals 2",
             Self::Log => "log panel",
@@ -370,6 +374,7 @@ impl BindAction {
             Self::FocusPanels => shift(F(10)),
             Self::Jobs => plain(F(12)), // unused: Jobs ships unbound; open from View ▸ Background jobs
             Self::Memory => plain(F(12)), // unused: Memory ships unbound; open from the header
+            Self::Lanes => plain(F(12)), // unused: Lanes ships unbound, open it from View ▸ Lanes
             Self::Export => ctrl_shift(Char('x')),
             Self::SmartAction => ctrl(Char('j')),
             Self::Split => ctrl(Char('e')),
@@ -1048,9 +1053,9 @@ pub enum KeybindCapture {
     },
 }
 
-/// The actions the studio ships with no chord, on purpose. Background jobs
-/// and Memory open from their View menu rows, and the memory breakdown from
-/// the header's figures too. They are looked at now and then, not played, and
+/// The actions the studio ships with no chord, on purpose. Background jobs,
+/// Memory and Lanes open from their View menu rows, and the memory breakdown
+/// from the header's figures too. They are looked at now and then, not played, and
 /// every plain function key and Ctrl letter already means something a set
 /// is performed with; a player who wants one learns it in Settings ▸
 /// Keybinds.
@@ -1060,6 +1065,7 @@ pub enum KeybindCapture {
 pub const SHIPS_UNBOUND: &[BindAction] = &[
     BindAction::Jobs,
     BindAction::Memory,
+    BindAction::Lanes,
     BindAction::ShowFile,
     BindAction::RenameFile,
     BindAction::DeleteSample,

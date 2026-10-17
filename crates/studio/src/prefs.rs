@@ -230,6 +230,15 @@ pub struct StudioPrefs {
     pub memory_edge: Option<super::viz_panel::Edge>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_height: Option<u16>,
+    /// The Lanes panel is open, and comes back open at the next launch.
+    /// `lanes_edge` is `top` or `bottom`, and absent is the bottom.
+    /// `lanes_height` is the height in rows once `-` or `+` set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lanes_docked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lanes_edge: Option<super::viz_panel::Edge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lanes_height: Option<u16>,
     /// The examples tab hands over one `$: stack(...)` rather than a voice
     /// a line.
     #[serde(default, skip_serializing_if = "Option::is_none")]

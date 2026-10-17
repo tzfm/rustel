@@ -481,6 +481,48 @@ Scores can also contain inline visualizers. Visual settings control their
 appearance and opacity. See [Hydra](hydra.md) for shader visuals and backgrounds.
 Visuals stop advancing when playback stops.
 
+### Lanes
+
+View ▸ Lanes opens the Lanes panel along the bottom of the studio. The panel is
+closed until you open it. Each row shows one sound of one lane, and time moves
+from right to left past a fixed playhead. The notes that played fade on the
+left. The right side shows the notes that come next.
+
+```text
+             ▼
+kick  ·▮···▮┊··▮···▮···▮···
+hats  ×·×·×·┊×·×·×·×·×·×·×·
+bass  ▃▃▃·▅▅┊▅▅·▂▂▂▂·▃▃▃·▅▅
+       12.4 ◆
+             ▲
+```
+
+A labeled lane, such as `kick:`, gives its name to its rows. A `$:` lane, and a
+pattern that a variable holds, show the sound name. Each lane has its own
+colour, and a sound has the same mark in every lane. A pitched sound shows each
+note as a block, and the height of the block follows the pitch. The number
+beside the playhead is the current cycle.
+
+When the panel has the keyboard, `e` moves it between the top and the bottom,
+`-` and `+` change its height, and Esc gives the keyboard back to the score.
+The panel stays open, and it opens again at the next launch. The panel has no
+shortcut. To add one, learn a key in Settings ▸ Keybinds.
+
+A score can draw the same view. `_lanes()` draws the rows of its own pattern
+under the call, and `lanes()` draws every lane behind the score:
+
+```js
+kick: s("sbd*4")
+hats: s("white*8").decay(.04).gain(.4)
+bass: note("<c2 eb2>*4").s("sawtooth").lpf(500)._lanes()
+```
+
+The options are `cycles`, the cycles across the view (default 3), `playhead`,
+its place from 0 at the left to 1 at the right (default 0.25), and `labels`
+(default 1). The engine looks 2.5 cycles ahead, so a view that reaches further
+has an empty right edge. `lanes()` and `_lanes()` are Rustel extensions, and a
+score that uses them does not run on strudel.cc.
+
 ## Themes
 
 Press Ctrl+T to choose a theme. Type to search, use arrows to select, and press
