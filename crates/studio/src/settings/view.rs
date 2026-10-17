@@ -1189,15 +1189,16 @@ fn render_sources(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer:
 }
 
 /// The vst page: the two actions, the folders the player added, then the
-/// standard folders, dimmed and tagged. Under the list, the plugin count and
-/// the preset folder.
+/// standard folders, dimmed and tagged, then one row for every plugin the
+/// scan found. Under the list, the plugin count and the preset folder.
 #[cfg(feature = "vst")]
 fn render_vst(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer: &mut Buffer) {
     let theme = view.theme;
     let width = usize::from(rows.width);
     let folders = &view.vst.folders;
     let added = folders.iter().filter(|folder| !folder.standard).count();
-    let lines = vst_lines(added, folders.len() - added);
+    let scanned = &view.vst.scanned;
+    let lines = vst_lines(added, folders.len() - added, scanned.len());
     let shown = usize::from(rows.height).max(1);
     let first = view.sheet.first_choice(shown, &lines);
     let label_width = VST_CONTROLS
@@ -1266,22 +1267,38 @@ fn render_vst(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer: &mu
                 );
             }
             SourceLine::Row(index) => {
-                let folder = &folders[index - VST_CONTROL_COUNT];
+                let at = index - VST_CONTROL_COUNT;
                 let selected = *index == view.sheet.selected;
-                let tag = if folder.standard { " · standard" } else { "" };
-                let text = format!("{} {}{tag}", marker(selected), folder.path);
-                let style = if selected {
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD)
-                } else if folder.standard {
-                    Style::default()
-                        .fg(theme.muted)
-                        .add_modifier(Modifier::ITALIC)
-                } else {
-                    Style::default().fg(theme.foreground)
-                };
-                buffer.set_stringn(content_x, y, &text, content_width, style);
+                if let Some(folder) = folders.get(at) {
+                    let tag = if folder.standard { " · standard" } else { "" };
+                    let text = format!("{} {}{tag}", marker(selected), folder.path);
+                    let style = if selected {
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD)
+                    } else if folder.standard {
+                        Style::default()
+                            .fg(theme.muted)
+                            .add_modifier(Modifier::ITALIC)
+                    } else {
+                        Style::default().fg(theme.foreground)
+                    };
+                    buffer.set_stringn(content_x, y, &text, content_width, style);
+                } else if let Some(plugin) = scanned.get(at - folders.len()) {
+                    // The plugin rows are read-only, as a standard folder
+                    // is: the scan is what changes them.
+                    let text = format!("{} {} · {}", marker(selected), plugin.name, plugin.state);
+                    let style = if selected {
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD)
+                    } else if plugin.state == "found" {
+                        Style::default().fg(theme.foreground)
+                    } else {
+                        Style::default().fg(theme.muted)
+                    };
+                    buffer.set_stringn(content_x, y, &text, content_width, style);
+                }
             }
         }
         buffer.set_stringn(rows.x, y, "│", 1, border);
@@ -1294,8 +1311,10 @@ fn render_vst(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer: &mu
         "Enter reads every folder and tests each plugin again"
     } else if at < VST_CONTROL_COUNT + added {
         "d removes this folder"
-    } else {
+    } else if at < VST_CONTROL_COUNT + folders.len() {
         "a standard folder stays on the list"
+    } else {
+        "the list of every plugin the scan found"
     };
     let footer = [
         plugins_found(view.vst.plugins),
