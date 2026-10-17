@@ -346,7 +346,7 @@ impl OrdinaryStringLiteralRanges {
             .iter()
             .chain(ERROR_MESSAGE_CALLS.iter())
             .map(|(name, _)| *name)
-            .chain(["initImage", "import"])
+            .chain(["initImage", "import", "talkit"])
             .any(|name| source.contains(name))
         {
             return Self::default();
@@ -371,7 +371,7 @@ impl OrdinaryStringLiteralRanges {
 /// `.midi("Pilote IAC Bus 1")` reaches the call as four words: `Pilote`,
 /// `IAC`, `Bus`, `1`. The transpiler leaves the string unchanged, so a
 /// name means the same in single and double quotes.
-const PORT_NAMED_CALLS: [(&str, usize); 11] = [
+const PORT_NAMED_CALLS: [(&str, usize); 10] = [
     ("midi", 0),
     ("midin", 0),
     ("midikeys", 0),
@@ -386,8 +386,6 @@ const PORT_NAMED_CALLS: [(&str, usize); 11] = [
     // A plugin, by the name of its bundle.
     ("vst", 0),
     ("vsti", 0),
-    // A sentence to speak, spaces and punctuation included.
-    ("talkit", 0),
 ];
 
 /// The built-in `Error` family, and the argument position that carries a
@@ -461,27 +459,6 @@ impl HydraImageStringCollector {
                         let span = literal.span();
                         self.ranges.push((span.start as usize, span.end as usize));
                     }
-                }
-            }
-        }
-        // A list of sentences to speak: each string in it is one phrase, as
-        // a lone string is, so `"question?"` keeps its question mark.
-        if name == "talkit"
-            && let Some(Argument::ArrayExpression(phrases)) = arguments.first()
-        {
-            for element in &phrases.elements {
-                match element {
-                    ArrayExpressionElement::StringLiteral(literal) => {
-                        let span = literal.span();
-                        self.ranges.push((span.start as usize, span.end as usize));
-                    }
-                    ArrayExpressionElement::TemplateLiteral(template)
-                        if template.expressions.is_empty() =>
-                    {
-                        let span = template.span();
-                        self.ranges.push((span.start as usize, span.end as usize));
-                    }
-                    _ => {}
                 }
             }
         }
@@ -4400,8 +4377,6 @@ mod tests {
             r#"$: s("bd").serial(38400, 0, 0, "/dev/tty.usbmodem 1")"#,
             r#"$: s("bd").vst("Valhalla Supermassive", { preset: "Warm Pad" })"#,
             r#"$: note("c3").vsti("Serum 2", { preset: "Bass One" })"#,
-            r#"$: talkit("hello there")"#,
-            r#"$: talkit(["question?", `answer one.`])"#,
         ];
         for source in named {
             let output = transpile(
@@ -4426,10 +4401,7 @@ mod tests {
                     && !output.output.contains("m('Valhalla Supermassive'")
                     && !output.output.contains("m('Warm Pad'")
                     && !output.output.contains("m('Serum 2'")
-                    && !output.output.contains("m('Bass One'")
-                    && !output.output.contains("m('hello there'")
-                    && !output.output.contains("m('question?'")
-                    && !output.output.contains("m('answer one.'"),
+                    && !output.output.contains("m('Bass One'"),
                 "a name was parsed as a rhythm: {}",
                 output.output
             );
@@ -4457,9 +4429,10 @@ mod tests {
         );
         assert!(output.output.contains("m('0.2 0.8'"), "{}", output.output);
         assert!(!output.output.contains("m('A B'"), "{}", output.output);
-        // A speech option is a pattern, one setting per event.
+        // Speech text in double quotes is mini-notation, one word per
+        // event, and so is a speech option, one setting per event.
         let output = transpile(
-            r#"$: talkit("hi", { q: "sung monotone" })"#,
+            r#"$: talkit("my name is", { q: "sung monotone" })"#,
             &TranspileOptions {
                 add_return: false,
                 ..TranspileOptions::default()
@@ -4467,6 +4440,11 @@ mod tests {
         );
         assert!(
             output.output.contains("m('sung monotone'"),
+            "{}",
+            output.output
+        );
+        assert!(
+            output.output.contains("m('my name is'"),
             "{}",
             output.output
         );

@@ -9,18 +9,24 @@ Talkit is experimental.
 ## In a score
 
 `talkit(text, options)` speaks text, the way `s("...")` plays a sample. The
-text is one phrase: its spaces and punctuation are spoken as written, and the
-phrase is one event per cycle.
+quotes decide how the text splits into events:
+
+- Single quotes speak one phrase. `talkit('hello there, how are you?')` keeps
+  its spaces and punctuation and is one event per cycle.
+- Double quotes are mini-notation, as everywhere else.
+  `talkit("my name is skrillex")` speaks one word per event.
 
 ```javascript
-$: talkit("hello there").slow(2)
-$: talkit("hola mundo", { personality: "robotoid", language: "spanish" })
-$: talkit(["question?", "answer."], { effort: "whispered" })
+$: talkit('hello there').slow(2)
+$: talkit("my name is skrillex")
+$: talkit('hola mundo', { personality: "robotoid", language: "spanish" })
+$: talkit(['question?', 'answer.'], { effort: "whispered" })
 ```
 
-An array plays its phrases one after another in the cycle. Any pattern works
-as the text too: `talkit(mini("one two three"))` gives one word per event,
-and `s("bd hh").talkit("hello")` speaks on the events of another pattern.
+In double quotes, `?` and `,` are mini-notation operators, so write
+punctuation in single quotes. An array plays its phrases one after another in
+the cycle. Any pattern works as the text too: `s("bd hh").talkit('hello')`
+speaks on the events of another pattern.
 
 Each field of the options object is itself a pattern, so
 `quality: "sung monotone"` gives one quality to each event, and
@@ -36,16 +42,16 @@ voice called `the`.
 A note sets the pitch the voice starts on:
 
 ```javascript
-$: note("c3 e3 g3 c4").talkit("la")
-$: n("0 2 4 7").scale("C3:major").talkit("do", { v: "choir-boy" })
+$: note("c3 e3 g3 c4").talkit('la')
+$: n("0 2 4 7").scale("C3:major").talkit('do', { v: "choir-boy" })
 ```
 
 `.freq(220)` sets the pitch in Hz, and `.octave(1)` moves a note or a
 frequency up one octave. A note can be from C1 to C7. An explicit `pitch`
 option outranks the note.
 
-Start from the notes, as with a synth. `talkit("la")` makes one event per
-cycle, so `talkit("la").note("c3 e3 g3")` keeps that one event and speaks
+Start from the notes, as with a synth. `talkit('la')` makes one event per
+cycle, so `talkit('la').note("c3 e3 g3")` keeps that one event and speaks
 only at C3.
 
 The first syllable sits exactly on the note. After it, the quality decides:

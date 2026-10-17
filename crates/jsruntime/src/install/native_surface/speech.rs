@@ -52,15 +52,15 @@ pub(super) fn speech_method<'js>(
     install_speech(ctx, receiver, sidecars, args)
 }
 
-/// `talkit(text, { ... })` at the start of a chain: one event per cycle,
-/// speaking the text.
+/// `talkit(text, { ... })` at the start of a chain: the text's own events,
+/// each speaking its text.
 pub(super) fn speech_free<'js>(
     ctx: Ctx<'js>,
     args: rquickjs::function::Rest<rquickjs::Value<'js>>,
 ) -> NativeResult<'js> {
     let (text, mut sidecars) = speech_text(&ctx, &args)?;
-    // The text pattern is the pattern: one phrase is one event, and
-    // `talkit(["hello there", "hi"])` plays the phrases in turn.
+    // The text pattern is the pattern: `talkit('hello there')` is one event
+    // per cycle, and `talkit("my name is")` one event per word.
     let mut output = text.fmap_keeping_live(|value| {
         let mut speech = rustel_core::OrderedMap::new();
         speech.insert("text".into(), rustel_core::materialize_js_value(value));
@@ -72,11 +72,12 @@ pub(super) fn speech_free<'js>(
     derive_wrapper(ctx, output, &sidecars)
 }
 
-/// The text argument as a pattern. A plain string stays whole - the
-/// transpiler leaves a talkit string alone, so its spaces are spoken - and
-/// the strings of an array do too: `talkit(["hello there", "hi"])` plays
-/// the whole phrases in turn within the cycle. Anything else reifies, so
-/// `talkit(mini("one two three"))` gives one word per event.
+/// The text argument as a pattern. A plain string, in single quotes, stays
+/// whole with its spaces and punctuation, and so do the plain strings of an
+/// array: `talkit(['hello there', 'hi'])` plays the whole phrases in turn
+/// within the cycle. Anything else reifies: a double-quoted string is
+/// mini-notation, as everywhere else, so `talkit("one two three")` gives one
+/// word per event.
 fn speech_text<'js>(
     ctx: &Ctx<'js>,
     args: &rquickjs::function::Rest<rquickjs::Value<'js>>,
@@ -113,7 +114,7 @@ fn speech_text<'js>(
         }
         _ => Err(rquickjs::Exception::throw_type(
             ctx,
-            "talkit expects the text to speak, as in talkit(\"hello there\")",
+            "talkit expects the text to speak, as in talkit('hello there')",
         )),
     }
 }
@@ -198,20 +199,22 @@ mod tests {
     }
 
     #[test]
-    fn a_spoken_string_keeps_its_spaces() {
+    fn single_quotes_speak_a_phrase_and_double_quotes_a_word_per_event() {
         let runtime = runtime();
-        let haps = spoken(&runtime, r#"$: talkit("hello there, nice to meet you")"#);
+        let haps = spoken(&runtime, r#"$: talkit('hello there, nice to meet you')"#);
         assert_eq!(haps.len(), 1);
         assert_eq!(text_of(&haps[0]), "hello there, nice to meet you");
+        let haps = spoken(&runtime, r#"$: talkit("my name is skrillex")"#);
+        let words: Vec<String> = haps.iter().map(text_of).collect();
+        assert_eq!(words, ["my", "name", "is", "skrillex"]);
     }
 
     #[test]
     fn an_array_plays_whole_phrases_in_turn() {
         let runtime = runtime();
-        // Double quotes, which mark mini-notation everywhere else.
         let haps = spoken(
             &runtime,
-            r#"$: talkit(["hello there", "hi"], { q: "sung monotone" })"#,
+            r#"$: talkit(['hello there', 'hi'], { q: "sung monotone" })"#,
         );
         assert_eq!(haps.len(), 2);
         assert_eq!(text_of(&haps[0]), "hello there");
@@ -235,7 +238,7 @@ mod tests {
         let runtime = runtime();
         let haps = spoken(
             &runtime,
-            r#"$: talkit("hola mundo", { personality: "robotoid", language: "es", pitch: 250 })"#,
+            r#"$: talkit('hola mundo', { personality: "robotoid", language: "es", pitch: 250 })"#,
         );
         let speech = haps[0]
             .get("talkit")
