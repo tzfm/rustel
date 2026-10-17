@@ -444,9 +444,10 @@ Ctrl+J opens the quick action at the caret. On a number, it can create a slider.
 On a slider, it can change or remove the control. These source edits require
 an update before they change playback.
 
-Controller mapping in Settings can bind a MIDI knob or controller axis to a
-slider. See [hardware](hardware.md) for setup. Terminals that report pixel
-positions give finer mouse control; other terminals use cell positions.
+The sliders page in Settings can bind a MIDI knob or controller axis to a
+slider. The keybinds page can bind a button to any studio action, Update and
+Stop included. See [hardware](hardware.md) for setup. Terminals that report
+pixel positions give finer mouse control; other terminals use cell positions.
 
 ## Mixer and limiter
 

@@ -892,6 +892,8 @@ fn key_named(name: &str) -> Option<KeyCode> {
 pub struct KeybindPrefs {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bindings: Vec<KeybindPref>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub midi: Vec<MidiPref>,
 }
 
 impl KeybindPrefs {
@@ -899,8 +901,65 @@ impl KeybindPrefs {
     /// The preferences file skips the whole section when this holds, so
     /// a studio nobody has re-bound writes the file it always did.
     pub fn is_empty(&self) -> bool {
-        self.bindings.is_empty()
+        self.bindings.is_empty() && self.midi.is_empty()
     }
+}
+
+/// A MIDI message a Keybinds page row can answer to beside its chord: a
+/// note or a control change number, on one channel or on any. A button is
+/// the shape that makes sense here - a note pressed, a control change
+/// risen to 64 or above - but nothing refuses a knob: the fire path reads
+/// the rise, so a sweep across the line fires once.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MidiBind {
+    /// The note or control change number, 0-127.
+    pub number: u8,
+    /// A note rather than a control change.
+    pub note: bool,
+    /// `None` answers on every channel.
+    pub channel: Option<u8>,
+}
+
+impl MidiBind {
+    /// The preferences' and the row's spelling, as the sliders page
+    /// spells its knobs: `note93/ch2`, `cc74`.
+    pub fn key(self) -> String {
+        let kind = if self.note { "note" } else { "cc" };
+        match self.channel {
+            Some(channel) => format!("{kind}{}/ch{channel}", self.number),
+            None => format!("{kind}{}", self.number),
+        }
+    }
+
+    /// Anything unreadable is none.
+    pub fn parse(text: &str) -> Option<Self> {
+        let text = text.trim();
+        let (head, channel) = text.split_once('/').unwrap_or((text, ""));
+        let channel = channel
+            .strip_prefix("ch")
+            .and_then(|digits| digits.parse::<u8>().ok());
+        let (note, number) = head
+            .strip_prefix("note")
+            .map(|digits| (true, digits))
+            .or_else(|| head.strip_prefix("cc").map(|digits| (false, digits)))?;
+        Some(Self {
+            number: number.parse::<u8>().ok()?.min(127),
+            note,
+            channel,
+        })
+    }
+
+    pub fn matches(self, note: bool, number: u8, channel: u8) -> bool {
+        self.note == note && self.number == number && self.channel.is_none_or(|own| own == channel)
+    }
+}
+
+/// One midi binding, as `studio.json` keeps it: the action by its key,
+/// the message by its spelling.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MidiPref {
+    pub action: String,
+    pub message: String,
 }
 
 /// One override: the action, by its key, and the chord, by its spelling.
@@ -1072,6 +1131,10 @@ pub const SHIPS_UNBOUND: &[BindAction] = &[
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Keybinds {
     overrides: Vec<(BindAction, KeyCombo)>,
+    /// The rows' midi bindings. A chord and a message are two doors into
+    /// the same action: the message column is kept beside the chords, so
+    /// every surface that asks the table finds both.
+    midi: Vec<(BindAction, MidiBind)>,
     /// Actions told to mean nothing. A chord learnt away from an action
     /// leaves it here - quieter than two actions on one key - and the
     /// preferences file carries it, so a restart does not quietly hand
@@ -1081,6 +1144,8 @@ pub struct Keybinds {
     /// rustel writing the file back does not erase a newer one's bindings.
     /// An unreadable limiter line is kept the same way.
     unknown: Vec<KeybindPref>,
+    /// The same, for midi bindings.
+    unknown_midi: Vec<MidiPref>,
     /// What the terminal can deliver. Empty until the studio has looked,
     /// which reads as "everything arrives" - the right answer for a test
     /// and for the moment before the handshake comes back.
@@ -1095,8 +1160,10 @@ impl Default for Keybinds {
     fn default() -> Self {
         let mut table = Self {
             overrides: Vec::new(),
+            midi: Vec::new(),
             unbound: SHIPS_UNBOUND.to_vec(),
             unknown: Vec::new(),
+            unknown_midi: Vec::new(),
             reach: Reach::default(),
             effective: [None; BindAction::ALL.len()],
             aliases: [None; BindAction::ALL.len()],
@@ -1111,6 +1178,41 @@ impl Keybinds {
     /// user choices have been applied. No reachable candidate means None.
     pub fn binding(&self, action: BindAction) -> Option<KeyCombo> {
         self.effective[action as usize]
+    }
+
+    /// The message a row answers to beside its chord, if any.
+    pub fn midi_binding(&self, action: BindAction) -> Option<MidiBind> {
+        self.midi
+            .iter()
+            .find(|(bound, _)| *bound == action)
+            .map(|(_, bind)| *bind)
+    }
+
+    /// The action a midi message carries, if a row holds it.
+    pub fn midi_action_for(&self, note: bool, number: u8, channel: u8) -> Option<BindAction> {
+        self.midi
+            .iter()
+            .find(|(_, bind)| bind.matches(note, number, channel))
+            .map(|(action, _)| *action)
+    }
+
+    /// Bind a message to an action. One message, one meaning: a message
+    /// another action answers to moves here rather than meaning two
+    /// things, the way a chord moves between actions.
+    pub fn learn_midi(&mut self, action: BindAction, bind: MidiBind) {
+        self.midi
+            .retain(|(bound, held)| *bound != action && *held != bind);
+        self.midi.push((action, bind));
+    }
+
+    /// Drop a row's message, as Del drops its chord.
+    pub fn forget_midi(&mut self, action: BindAction) {
+        self.midi.retain(|(bound, _)| *bound != action);
+    }
+
+    /// Whether any row answers to a midi message.
+    pub fn midi_bound(&self) -> bool {
+        !self.midi.is_empty()
     }
 
     /// A secondary shortcut that really remains available on this terminal.
@@ -1541,7 +1643,8 @@ impl Keybinds {
     }
 
     /// Restore every shortcut to the defaults for the active terminal profile.
-    /// This also clears explicit unbindings and unknown saved action overrides.
+    /// This also clears explicit unbindings, unknown saved action overrides
+    /// and midi bindings, which have no default to return to.
     pub fn reset_all(&mut self) {
         let reach = self.reach.clone();
         *self = Self::default();
@@ -1574,7 +1677,16 @@ impl Keybinds {
                 }),
         );
         bindings.extend(self.unknown.iter().cloned());
-        KeybindPrefs { bindings }
+        let midi = self
+            .midi
+            .iter()
+            .map(|(action, bind)| MidiPref {
+                action: action.key().to_owned(),
+                message: bind.key(),
+            })
+            .chain(self.unknown_midi.iter().cloned())
+            .collect();
+        KeybindPrefs { bindings, midi }
     }
 
     /// Take the overrides the file holds. Unreadable rows are skipped;
@@ -1609,6 +1721,22 @@ impl Keybinds {
                     self.overrides.push((action, combo));
                 }
                 (None, _) => self.unknown.push(row.clone()),
+                _ => {}
+            }
+        }
+        self.midi.clear();
+        self.unknown_midi.clear();
+        for row in &prefs.midi {
+            match (
+                BindAction::parse_key(&row.action),
+                MidiBind::parse(&row.message),
+            ) {
+                (Some(action), Some(bind)) => {
+                    self.midi
+                        .retain(|(bound, held)| *bound != action && *held != bind);
+                    self.midi.push((action, bind));
+                }
+                (None, _) => self.unknown_midi.push(row.clone()),
                 _ => {}
             }
         }
@@ -2227,6 +2355,7 @@ mod tests {
                 action: "undo".to_owned(),
                 chord: "ctrl+z".to_owned(),
             }],
+            ..Default::default()
         });
         assert!(healed.overridden(BindAction::Undo));
         assert_eq!(healed.binding(BindAction::Undo).unwrap().key(), "ctrl+z");
@@ -2807,6 +2936,7 @@ mod tests {
                     action: "redo".into(),
                     chord: spelling.into(),
                 }],
+                ..Default::default()
             };
             for enhanced in [false, true] {
                 let mut binds = Keybinds::default();
@@ -2866,6 +2996,7 @@ mod tests {
                 action: "undo".into(),
                 chord: "ctrl+f11".into(),
             }],
+            ..Default::default()
         };
         binds.restore(&prefs);
         assert_eq!(binds.binding(BindAction::Undo).unwrap().key(), "ctrl+f11");
@@ -2890,6 +3021,7 @@ mod tests {
                     chord: chord.key(),
                 })
                 .collect(),
+            ..Default::default()
         };
         binds.restore(&prefs);
         for action in [BindAction::MasterUp, BindAction::MasterDown] {
@@ -3103,6 +3235,7 @@ mod tests {
                     action: "reference".into(),
                     chord: chord.into(),
                 }],
+                ..Default::default()
             };
             let mut binds = Keybinds::default();
             binds.restore(&prefs);
@@ -3130,6 +3263,7 @@ mod tests {
                 action: "mixer".into(),
                 chord: "ctrl+d".into(),
             }],
+            ..Default::default()
         };
         let mut binds = Keybinds::default();
         binds.restore(&prefs);
@@ -3267,5 +3401,70 @@ mod tests {
         let mut restored = Keybinds::default();
         restored.restore(&binds.prefs());
         assert_eq!(restored.binding(BindAction::Reference), Some(f2));
+    }
+
+    #[test]
+    fn midi_messages_spell_and_parse_as_the_sliders_page_spells_knobs() {
+        let cc = MidiBind::parse("cc74/ch2").unwrap();
+        assert_eq!(
+            cc,
+            MidiBind {
+                number: 74,
+                note: false,
+                channel: Some(2)
+            }
+        );
+        assert_eq!(cc.key(), "cc74/ch2");
+        let note = MidiBind::parse("note93").unwrap();
+        assert_eq!(
+            note,
+            MidiBind {
+                number: 93,
+                note: true,
+                channel: None
+            }
+        );
+        assert_eq!(note.key(), "note93");
+        assert!(MidiBind::parse("pitchbend").is_none());
+        assert!(MidiBind::parse("").is_none());
+    }
+
+    #[test]
+    fn midi_bindings_move_between_actions_and_ride_a_restart() {
+        let mut binds = Keybinds::default();
+        let cc = MidiBind {
+            number: 94,
+            note: false,
+            channel: Some(2),
+        };
+        binds.learn_midi(BindAction::Evaluate, cc);
+        assert_eq!(
+            binds.midi_action_for(false, 94, 2),
+            Some(BindAction::Evaluate)
+        );
+        // A binding on any channel answers on every one.
+        binds.learn_midi(
+            BindAction::Stop,
+            MidiBind {
+                number: 93,
+                note: true,
+                channel: None,
+            },
+        );
+        assert_eq!(binds.midi_action_for(true, 93, 16), Some(BindAction::Stop));
+        // A message another action holds moves rather than meaning two
+        // things.
+        binds.learn_midi(BindAction::NextScene, cc);
+        assert_eq!(
+            binds.midi_action_for(false, 94, 2),
+            Some(BindAction::NextScene)
+        );
+        assert_eq!(binds.midi_binding(BindAction::Evaluate), None);
+        let mut healed = Keybinds::default();
+        healed.restore(&binds.prefs());
+        assert_eq!(healed.midi_binding(BindAction::NextScene), Some(cc));
+        assert_eq!(healed.midi_action_for(true, 93, 16), Some(BindAction::Stop));
+        healed.reset_all();
+        assert!(!healed.midi_bound());
     }
 }
