@@ -204,6 +204,26 @@ pub fn shutdown() {
     }
 }
 
+/// Whether the plugins need the process's main thread: on macOS, yes.
+/// See [`install_main_service`] for the contract.
+pub fn needs_the_main_thread() -> bool {
+    rustel_vst3::needs_the_main_thread()
+}
+
+/// Registers the process's main thread as the server of the plugin
+/// creation and release steps, on macOS. No-op when the service is
+/// already installed or the caller is not the process's main thread.
+pub fn install_main_service() {
+    rustel_vst3::install_main_service();
+}
+
+/// Serves the plugin steps that arrived, on the calling thread: the main
+/// thread of a program with the service installed calls this every few
+/// milliseconds, also while it shuts down.
+pub fn pump_main() {
+    rustel_vst3::pump_main();
+}
+
 /// True while the host reads the plugin folders. The plugin list is not
 /// complete before the end of the read.
 pub fn scanning() -> bool {
