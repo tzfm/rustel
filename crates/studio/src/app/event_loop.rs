@@ -224,6 +224,7 @@ impl App {
         self.sync_live_material(now);
         self.send_sample_memory();
         self.send_import_origins();
+        self.send_csound();
         #[cfg(feature = "hydra")]
         self.warm_selected_snippet();
         self.settle_marks(now);

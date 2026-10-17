@@ -953,6 +953,7 @@ impl App {
                     self.log.push_with(LogLevel::Error, "update", full, alert);
                     let footer = self
                         .note_untrusted_import(&failure)
+                        .or_else(|| self.note_csound_refusal(&failure))
                         .unwrap_or_else(|| player_facing_error(&failure.message));
                     self.errors.set(ErrorOwner::Evaluation, footer);
                     self.update_failure =

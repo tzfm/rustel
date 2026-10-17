@@ -521,17 +521,23 @@ pub struct ExportGlance {
 
 /// Snapshot the host default and any persisted score override for an isolated
 /// export. Re-evaluating source text can then override this inherited value.
-/// The export imports scripts from the origins of the permissions page too.
+/// The export imports scripts from the origins of the permissions page, and
+/// runs orchestras under its switch, too.
 pub(super) fn session_config(
     default: &SessionConfig,
     host_default: usize,
     score_override: Option<usize>,
     import_origins: &[String],
+    csound_allowed: bool,
 ) -> SessionConfig {
     default
         .clone()
         .with_max_polyphony(score_override.unwrap_or(host_default))
-        .with_score_import_access(super::engine::import_access(default, import_origins))
+        .with_score_import_access(super::engine::import_access(
+            default,
+            import_origins,
+            csound_allowed,
+        ))
 }
 
 /// What one bounce plays: the score's source, the flag that says how to
@@ -1551,7 +1557,7 @@ mod tests {
                 mp3: false,
                 ..ExportSettings::default()
             },
-            session_config(&config, config.max_polyphony, None, &[]),
+            session_config(&config, config.max_polyphony, None, &[], true),
             target.clone(),
         )
         .expect("job");
@@ -1644,7 +1650,7 @@ mod tests {
                 "polyphony".into(),
                 plain_score(&format!("{setter} stack(note('c3'), note('e3'), note('g3'), note('c4')).s('sine').gain(0.05).attack(0).decay(0).sustain(1)")),
                 ExportSettings { length: Length::Cycles(0.025), mp3: false, ..ExportSettings::default() },
-                session_config(&SessionConfig::default(), voices, inherited, &[]),
+                session_config(&SessionConfig::default(), voices, inherited, &[], false),
                 target.clone(),
             ).expect("start export job");
             let deadline = Instant::now() + std::time::Duration::from_secs(30);
@@ -1668,7 +1674,7 @@ mod tests {
         );
         // The origins of the permissions page reach the export.
         let origins = ["https://glossing.dev".to_owned()];
-        let config = session_config(&SessionConfig::default(), 192, None, &origins);
+        let config = session_config(&SessionConfig::default(), 192, None, &origins, false);
         assert_eq!(config.max_polyphony, 192);
         assert_eq!(config.score_import_access.origins(), origins);
         let mut live = Session::new().expect("live session");

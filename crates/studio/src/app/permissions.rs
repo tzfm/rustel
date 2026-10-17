@@ -2,11 +2,12 @@
 //! the native orchestra switch.
 //!
 //! The engine refuses `await import('https://...')` from an origin that is
-//! not trusted. The page reads as a switch: Enter permits a refused origin,
-//! and Space flips a row where it stands, so a permission can be taken back
-//! without the origin leaving the page. A refused or turned-off origin
-//! stays listed until the studio closes; an origin trust is kept in the
-//! settings.
+//! not trusted, and an orchestra while native execution is not permitted.
+//! The page reads as a switch: Enter permits a refused row, and Space flips
+//! a row where it stands, so a permission can be taken back without the row
+//! leaving the page. A refused or turned-off origin stays listed until the
+//! studio closes; an origin trust is kept in the settings, while the
+//! orchestra switch lasts one run.
 
 use super::super::settings::PermissionRow;
 use super::super::worker::EngineFailure;
@@ -39,92 +40,189 @@ impl App {
         ))
     }
 
+    /// What a refused orchestra says on the footer. The switch goes on the
+    /// permissions page. `None` for every other failure.
+    pub(super) fn note_csound_refusal(&mut self, failure: &EngineFailure) -> Option<String> {
+        if failure.kind != "csound-permission" {
+            return None;
+        }
+        self.csound_refused = true;
+        Some(
+            "Csound is not permitted - Settings → Permissions lets native orchestras run"
+                .to_owned(),
+        )
+    }
+
     /// The rows of the permissions page: the trusted origins, then the
-    /// refused.
+    /// refused, then the orchestra switch once the studio has a reason to
+    /// show it.
     pub(super) fn permission_rows(&self) -> Vec<PermissionRow> {
-        let row = |allowed| {
-            move |origin: &String| PermissionRow {
-                origin: origin.clone(),
-                allowed,
-            }
-        };
-        self.prefs
+        let mut rows: Vec<PermissionRow> = self
+            .prefs
             .import_origins
             .iter()
-            .map(row(true))
-            .chain(self.blocked_imports.iter().map(row(false)))
-            .collect()
+            .map(|origin| PermissionRow::Origin {
+                origin: origin.clone(),
+                allowed: true,
+            })
+            .chain(
+                self.blocked_imports
+                    .iter()
+                    .map(|origin| PermissionRow::Origin {
+                        origin: origin.clone(),
+                        allowed: false,
+                    }),
+            )
+            .collect();
+        if self.csound_allowed || self.csound_refused {
+            rows.push(PermissionRow::Csound {
+                allowed: self.csound_allowed,
+            });
+        }
+        rows
+    }
+
+    /// How many rows the permissions page is showing. The sheet counts its
+    /// keys by this, and the pointer counts its hits.
+    pub(super) fn permission_row_count(&self) -> usize {
+        self.prefs.import_origins.len()
+            + self.blocked_imports.len()
+            + usize::from(self.csound_allowed || self.csound_refused)
     }
 
     /// Enter on a row of the permissions page.
     pub(super) fn permit_row(&mut self, at: usize) {
-        let Some(row) = self.permission_rows().into_iter().nth(at) else {
-            return;
-        };
-        if row.allowed {
-            self.status = format!("{} is trusted · Space turns it off", row.origin);
-            return;
-        }
-        self.blocked_imports
-            .retain(|blocked| *blocked != row.origin);
-        if !self.prefs.import_origins.contains(&row.origin) {
-            self.prefs.import_origins.push(row.origin.clone());
-            self.import_origins_changed();
-        }
-        // The refusal on the footer names an origin that is trusted now.
-        for owner in [ErrorOwner::Evaluation, ErrorOwner::Setup] {
-            if self
-                .errors
-                .get(owner)
-                .is_some_and(|message| message.contains(&row.origin))
-            {
-                self.clear_error(owner);
+        match self.permission_rows().into_iter().nth(at) {
+            Some(PermissionRow::Origin {
+                origin,
+                allowed: true,
+            }) => {
+                self.status = format!("{origin} is trusted · Space turns it off");
             }
+            Some(PermissionRow::Origin {
+                origin,
+                allowed: false,
+            }) => {
+                self.blocked_imports.retain(|blocked| *blocked != origin);
+                if !self.prefs.import_origins.contains(&origin) {
+                    self.prefs.import_origins.push(origin.clone());
+                    self.import_origins_changed();
+                }
+                // The refusal on the footer names an origin that is trusted now.
+                for owner in [ErrorOwner::Evaluation, ErrorOwner::Setup] {
+                    if self
+                        .errors
+                        .get(owner)
+                        .is_some_and(|message| message.contains(&origin))
+                    {
+                        self.clear_error(owner);
+                    }
+                }
+                self.status = format!("{origin} trusted · update the score to load it");
+            }
+            Some(PermissionRow::Csound { allowed: true }) => {
+                self.status = "Csound is on · Space turns it off".into();
+            }
+            Some(PermissionRow::Csound { allowed: false }) => {
+                self.set_csound(true);
+                self.status = "Csound on · update the score to load it".into();
+            }
+            None => {}
         }
-        self.status = format!("{} trusted · update the score to load it", row.origin);
     }
 
-    /// Space on a row of the permissions page: permit a refused origin, or
-    /// take the permission back where the row stands. The origin stays on
-    /// the page, so the permission can come back with one more Space.
+    /// Space on a row of the permissions page: permit a refused row, or
+    /// take the permission back where the row stands. The row stays on the
+    /// page, so the permission can come back with one more Space.
     pub(super) fn toggle_row(&mut self, at: usize) {
-        let Some(row) = self.permission_rows().into_iter().nth(at) else {
-            return;
-        };
-        if !row.allowed {
-            self.permit_row(at);
-            return;
+        match self.permission_rows().into_iter().nth(at) {
+            Some(PermissionRow::Origin { allowed: false, .. }) => self.permit_row(at),
+            Some(PermissionRow::Origin {
+                origin,
+                allowed: true,
+            }) => {
+                self.prefs.import_origins.retain(|kept| *kept != origin);
+                self.import_origins_changed();
+                // The row stays: it moves to the refused ones, which the
+                // studio keeps until it closes, so a permission taken back
+                // can be given again.
+                self.blocked_imports.retain(|blocked| *blocked != origin);
+                if self.blocked_imports.len() >= MAX_BLOCKED_IMPORTS {
+                    self.blocked_imports.remove(0);
+                }
+                self.blocked_imports.push(origin.clone());
+                self.status = format!("{origin} off · its scripts no longer load");
+            }
+            Some(PermissionRow::Csound { allowed }) => {
+                self.set_csound(!allowed);
+                if allowed {
+                    // The switch went off; the row stays so a second
+                    // Space brings it back, as an origin's does.
+                    self.csound_refused = true;
+                }
+                self.status = if allowed {
+                    "Csound off · orchestras no longer run".into()
+                } else {
+                    "Csound on · update the score to load it".into()
+                };
+            }
+            None => {}
         }
-        self.prefs
-            .import_origins
-            .retain(|origin| *origin != row.origin);
-        self.import_origins_changed();
-        // The row stays: it moves to the refused ones, which the studio
-        // keeps until it closes, so a trust taken back can be given again.
-        self.blocked_imports
-            .retain(|blocked| *blocked != row.origin);
-        if self.blocked_imports.len() >= MAX_BLOCKED_IMPORTS {
-            self.blocked_imports.remove(0);
-        }
-        self.blocked_imports.push(row.origin.clone());
-        self.status = format!("{} off · its scripts no longer load", row.origin);
     }
 
     /// Delete on a row of the permissions page.
     pub(super) fn forget_row(&mut self, at: usize) {
-        let Some(row) = self.permission_rows().into_iter().nth(at) else {
-            return;
-        };
-        if row.allowed {
-            self.prefs
-                .import_origins
-                .retain(|origin| *origin != row.origin);
-            self.import_origins_changed();
-            self.status = format!("{} removed · its scripts no longer load", row.origin);
-        } else {
-            self.blocked_imports
-                .retain(|blocked| *blocked != row.origin);
-            self.status = format!("{} dismissed", row.origin);
+        match self.permission_rows().into_iter().nth(at) {
+            Some(PermissionRow::Origin {
+                origin,
+                allowed: true,
+            }) => {
+                self.prefs.import_origins.retain(|kept| *kept != origin);
+                self.import_origins_changed();
+                self.status = format!("{origin} removed · its scripts no longer load");
+            }
+            Some(PermissionRow::Origin {
+                origin,
+                allowed: false,
+            }) => {
+                self.blocked_imports.retain(|blocked| *blocked != origin);
+                self.status = format!("{origin} dismissed");
+            }
+            Some(PermissionRow::Csound { .. }) => {
+                // The switch leaves the page with its refusal, off either
+                // way: a score brings it back by asking again.
+                self.set_csound(false);
+                self.csound_refused = false;
+                self.status = "Csound off".into();
+            }
+            None => {}
+        }
+    }
+
+    /// Flip the orchestra switch and tell the engine. The refusal on the
+    /// footer names a permission the score has now.
+    fn set_csound(&mut self, allowed: bool) {
+        self.csound_allowed = allowed;
+        if allowed {
+            self.csound_refused = false;
+            for owner in [ErrorOwner::Evaluation, ErrorOwner::Setup] {
+                if self
+                    .errors
+                    .get(owner)
+                    .is_some_and(|message| message.contains("Csound is not permitted"))
+                {
+                    self.clear_error(owner);
+                }
+            }
+        }
+        self.csound_owed = true;
+        self.send_csound();
+    }
+
+    /// Give the engine the orchestra switch, when it does not have it yet.
+    pub(super) fn send_csound(&mut self) {
+        if self.csound_owed && self.worker.try_set_csound(self.csound_allowed) {
+            self.csound_owed = false;
         }
     }
 
@@ -142,6 +240,88 @@ impl App {
                 .try_set_import_origins(self.prefs.import_origins.clone())
         {
             self.import_origins_owed = false;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    mod permissions {
+        //! Tests for `app/permissions.rs`.
+
+        use crate::app::tests::support::*;
+        use crate::settings::PermissionRow;
+
+        fn refusal() -> crate::worker::EngineFailure {
+            crate::worker::EngineFailure {
+                kind: "csound-permission".into(),
+                message: "Csound is not permitted. Permit native orchestras with --allow-csound, only for trusted scores".into(),
+                recoverable: true,
+                playback_stopped: false,
+            }
+        }
+
+        /// A refused orchestra puts the switch on the page, Enter turns it
+        /// on, and the refusal comes down. The studio keeps nothing: a
+        /// fresh studio starts with the switch off and no row.
+        #[test]
+        fn a_refused_orchestra_is_permitted_for_the_run_and_not_kept() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            assert_eq!(app.permission_rows(), Vec::new());
+
+            let footer = app.note_csound_refusal(&refusal()).expect("a footer");
+            assert_eq!(
+                footer,
+                "Csound is not permitted - Settings → Permissions lets native orchestras run"
+            );
+            assert_eq!(
+                app.permission_rows(),
+                vec![PermissionRow::Csound { allowed: false }]
+            );
+
+            app.permit_row(0);
+            assert_eq!(
+                app.permission_rows(),
+                vec![PermissionRow::Csound { allowed: true }]
+            );
+            assert!(app.csound_allowed);
+            // The row never reaches the preferences.
+            assert!(app.prefs.import_origins.is_empty());
+
+            // Space takes the permission back; the row stays for a second
+            // Space, and `d` takes it off the page.
+            app.toggle_row(0);
+            assert_eq!(
+                app.permission_rows(),
+                vec![PermissionRow::Csound { allowed: false }]
+            );
+            app.forget_row(0);
+            assert_eq!(app.permission_rows(), Vec::new());
+            assert!(!app.csound_allowed);
+
+            // A fresh refusal brings one row back, and permitting it
+            // again leaves one row on.
+            assert!(app.note_csound_refusal(&refusal()).is_some());
+            app.permit_row(0);
+            assert_eq!(
+                app.permission_rows(),
+                vec![PermissionRow::Csound { allowed: true }]
+            );
+        }
+
+        /// The launch flag is the switch's first state, so a studio started
+        /// with it shows the row on and can turn it off.
+        #[test]
+        fn a_launch_permission_shows_as_the_switch_on() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            assert!(!app.csound_allowed);
+            app.csound_allowed = true;
+            assert_eq!(
+                app.permission_rows(),
+                vec![PermissionRow::Csound { allowed: true }]
+            );
         }
     }
 }

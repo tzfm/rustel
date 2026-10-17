@@ -171,6 +171,18 @@ Each origin reads `on` or `off`: Space flips a row in place, so you can take
 a trust back without the origin leaving the page. Studio keeps the trusted
 origins in `studio.json`. Press `d` on an origin to remove the origin.
 
+### Native orchestras
+
+The Permissions page also holds the `native orchestras` switch. A score that
+loads an orchestra while native execution is not permitted stops with
+`Csound is not permitted`. Press Ctrl+O, go to the Permissions page, and
+press Enter on `native orchestras`. Then update the score again. See
+[Csound](csound.md) for what an orchestra can do.
+
+The switch reads `on` or `off` and lasts one studio run: Studio does not
+keep it, so the next start asks again. Start with `rustel studio
+--allow-csound` to begin with the switch on.
+
 The first update after you trust an origin fetches the script. The update
 waits for the fetch, 8 seconds at most. Studio fetches each script one time
 per launch, so an import needs the network. For a set you play offline, paste

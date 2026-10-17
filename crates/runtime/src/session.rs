@@ -571,6 +571,9 @@ pub enum RuntimeError {
     UntrustedImport {
         origin: String,
     },
+    /// The text uses a native orchestra while the host does not permit
+    /// one. Nothing ran.
+    CsoundPermission,
     Message(String),
 }
 
@@ -612,6 +615,10 @@ impl std::fmt::Display for RuntimeError {
                 f,
                 "{origin} is not trusted for import(). Trust it with --allow-import-origin {origin}"
             ),
+            Self::CsoundPermission => write!(
+                f,
+                "Csound is not permitted. Permit native orchestras with --allow-csound, only for trusted scores"
+            ),
             Self::Interrupted(signal) => {
                 write!(f, "interrupted by signal {signal} before the work started")
             }
@@ -638,6 +645,7 @@ impl RuntimeError {
             Self::Audio(_) => "audio",
             Self::Unsupported(_) => "unsupported",
             Self::UntrustedImport { .. } => "untrusted-import",
+            Self::CsoundPermission => "csound-permission",
             Self::Interrupted(_) => "interrupted",
             Self::Cancelled => "cancelled",
             Self::Panic(_) => "panic",

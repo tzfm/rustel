@@ -701,7 +701,7 @@ pub(super) fn render_permissions(
         buffer.set_stringn(
             rows.x,
             rows.y,
-            "  none yet · a score that imports a script puts its origin here",
+            "  none yet · a refused import or orchestra puts its row here",
             width,
             Style::default().fg(theme.muted),
         );
@@ -709,7 +709,10 @@ pub(super) fn render_permissions(
     let origin_width = view
         .permissions
         .iter()
-        .map(|row| row.origin.width())
+        .map(|row| match row {
+            PermissionRow::Origin { origin, .. } => origin.width(),
+            PermissionRow::Csound { .. } => "native orchestras".width(),
+        })
         .max()
         .unwrap_or(0);
     for (offset, (index, row)) in view
@@ -726,12 +729,16 @@ pub(super) fn render_permissions(
         } else {
             " "
         };
-        let state = if row.allowed { "on" } else { "off" };
+        let (label, allowed) = match row {
+            PermissionRow::Origin { origin, allowed } => (origin.as_str(), *allowed),
+            PermissionRow::Csound { allowed } => ("native orchestras", *allowed),
+        };
+        let state = if allowed { "on" } else { "off" };
         let style = if selected {
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD)
-        } else if row.allowed {
+        } else if allowed {
             Style::default().fg(theme.foreground)
         } else {
             Style::default().fg(theme.muted)
@@ -739,7 +746,7 @@ pub(super) fn render_permissions(
         buffer.set_stringn(
             rows.x,
             rows.y + offset as u16,
-            format!("{marker} {:<origin_width$}  {state}", row.origin),
+            format!("{marker} {:<origin_width$}  {state}", label),
             width,
             style,
         );
@@ -748,13 +755,19 @@ pub(super) fn render_permissions(
     // for one line, and a player who cannot see "Enter permits" cannot
     // work the page.
     let keys = match view.permissions.get(view.sheet.selected) {
-        Some(row) if row.allowed => "Space off · d removes · Tab pages",
+        Some(row) if row.allowed() => "Space off · d removes · Tab pages",
         Some(_) => "Enter permits · Space on/off · d dismisses · Tab pages",
         None => "Tab pages",
     };
-    let text = format!(
-        "{keys} · a score loads a script with await import('https://...') only from a trusted origin. The script runs as setup code before the score."
-    );
+    let says = match view.permissions.get(view.sheet.selected) {
+        Some(PermissionRow::Csound { .. }) => {
+            "an orchestra runs native code that reads files and starts processes. On lasts this studio run; the studio does not keep it."
+        }
+        _ => {
+            "a score loads a script with await import('https://...') only from a trusted origin. The script runs as setup code before the score."
+        }
+    };
+    let text = format!("{keys} · {says}");
     let lines = wrap_words(&text, width);
     let height = usize::from(
         panel

@@ -157,7 +157,6 @@ mod event_loop;
 mod export_sheet;
 mod focus;
 mod hydra_backdrop;
-mod permissions;
 mod jobs_panel;
 mod key_bindings;
 mod keyboard;
@@ -170,6 +169,7 @@ mod menu_bar;
 mod mixer;
 mod mouse;
 mod panes;
+mod permissions;
 mod persistence;
 mod piano_mode;
 mod pointer_shape;
@@ -612,6 +612,7 @@ fn run_once(options: StudioOptions) -> Result<Session, RuntimeError> {
             preview_budget_bytes: sample_settings.preview_budget.bytes(),
             unused_sample_idle: sample_settings.unused_sample_idle.duration(),
             import_origins: prefs.import_origins.clone(),
+            csound_allowed: options.session.score_import_access.csound_allowed(),
             ..StudioConfig::default()
         },
         #[cfg(feature = "hydra")]
@@ -1139,6 +1140,16 @@ struct App {
     /// The origins whose script imports the engine refused in this studio,
     /// newest last. The permissions page offers them, so nobody types an origin.
     blocked_imports: Vec<String>,
+    /// Whether native orchestras run in this studio. The launch flag can
+    /// turn them on; the permissions page flips the switch for the run.
+    /// The studio does not keep it, so the next start asks again.
+    csound_allowed: bool,
+    /// A score asked for an orchestra and the engine refused it, so the
+    /// permissions page offers the switch.
+    csound_refused: bool,
+    /// The permissions page flipped the switch and the engine does not
+    /// have it yet.
+    csound_owed: bool,
     /// The permissions page changed and the engine does not have the list yet.
     import_origins_owed: bool,
     /// Latest refused revision for each scene with an unresolved log alert.
@@ -1492,6 +1503,9 @@ impl App {
         let theme_camera_confirmed = theme.camera_enabled().then(|| theme.name.clone());
         let prefs = StudioPrefs::load();
         let mixer = MixerState::new(prefs.input_gain_tenths_db);
+        // The launch flag is the switch's first state; the permissions
+        // page owns it from here on.
+        let csound_at_start = options.session.score_import_access.csound_allowed();
         let mut app = Self {
             output_latency_pending: true,
             cli_output_latency: options.output_buffer_frames.map(OutputLatency::from_frames),
@@ -1680,6 +1694,9 @@ impl App {
             inflight: HashMap::new(),
             update_failure: None,
             blocked_imports: Vec::new(),
+            csound_allowed: csound_at_start,
+            csound_refused: false,
+            csound_owed: false,
             import_origins_owed: false,
             evaluation_alerts: HashMap::new(),
             lint_status: None,

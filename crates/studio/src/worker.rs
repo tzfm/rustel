@@ -231,6 +231,9 @@ enum EngineCommand {
     },
     /// The origins of the permissions page, after the player changed them.
     SetImportOrigins(Vec<String>),
+    /// The orchestra switch of the permissions page, after the player
+    /// flipped it.
+    SetCsound(bool),
     /// What the performer can reach without a wait: the tabs whose sounds
     /// no memory policy may drop, and those kept by recency.
     SetLiveMaterial(super::engine::LiveMaterial),
@@ -692,6 +695,14 @@ impl StudioWorker {
             && self
                 .commands
                 .try_send(EngineCommand::SetImportOrigins(origins))
+                .is_ok()
+    }
+
+    pub fn try_set_csound(&self, allowed: bool) -> bool {
+        !self.shutdown_requested.load(Ordering::Acquire)
+            && self
+                .commands
+                .try_send(EngineCommand::SetCsound(allowed))
                 .is_ok()
     }
 
@@ -1698,6 +1709,10 @@ fn process_command(
         }
         EngineCommand::SetImportOrigins(origins) => {
             engine.set_import_origins(&origins);
+            false
+        }
+        EngineCommand::SetCsound(allowed) => {
+            engine.set_csound(allowed);
             false
         }
         EngineCommand::SetLiveMaterial(material) => {

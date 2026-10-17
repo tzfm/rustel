@@ -44,7 +44,13 @@ impl ScoreImportAccess {
 
     /// Allow native orchestra code, including its filesystem and process opcodes.
     pub fn permit_csound(&mut self) {
-        self.csound = true;
+        self.set_csound(true);
+    }
+
+    /// Turn native orchestra permission on or off. The studio's permissions
+    /// page flips it during a run; the launch flag only turns it on.
+    pub fn set_csound(&mut self, allowed: bool) {
+        self.csound = allowed;
     }
 
     pub fn csound_allowed(&self) -> bool {

@@ -270,6 +270,9 @@ pub struct StudioConfig {
     /// The origins of the permissions page, which scores import scripts from.
     /// They add to the origins that `session` already trusts.
     pub import_origins: Vec<String>,
+    /// Whether native orchestras run. The launch flag turns them on; the
+    /// permissions page can flip the switch during a run.
+    pub csound_allowed: bool,
 }
 
 impl Default for StudioConfig {
@@ -289,21 +292,25 @@ impl Default for StudioConfig {
             watch_pads: true,
             open_default_input: true,
             import_origins: Vec::new(),
+            csound_allowed: false,
         }
     }
 }
 
-/// The origins that `session` trusts for script imports, and `origins` of
-/// the permissions page added to them.
+/// The origins that `session` trusts for script imports, `origins` of the
+/// permissions page added to them, and the page's orchestra switch over
+/// whatever the flag set.
 pub(super) fn import_access(
     session: &SessionConfig,
     origins: &[String],
+    csound: bool,
 ) -> rustel_runtime::ScoreImportAccess {
     let mut access = session.score_import_access.clone();
     for origin in origins {
         // The page keeps only origins that the runtime named.
         let _ = access.permit_origin(origin);
     }
+    access.set_csound(csound);
     access
 }
 
@@ -1647,7 +1654,11 @@ impl StudioEngine {
         let preview_budget_bytes = config.preview_budget_bytes;
         let unused_sample_idle = config.unused_sample_idle;
         let mut session = Session::with_config(config.session.clone())?;
-        session.set_score_import_access(import_access(&config.session, &config.import_origins));
+        session.set_score_import_access(import_access(
+            &config.session,
+            &config.import_origins,
+            config.csound_allowed,
+        ));
         session.set_query_hap_budget(STUDIO_QUERY_HAP_BUDGET)?;
         let master = Arc::new(StudioMasterBus::default());
         master.set_max_polyphony(config.session.max_polyphony);

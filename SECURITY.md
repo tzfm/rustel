@@ -213,7 +213,9 @@ offline render routes do not open these external outputs.
 ## Csound orchestras
 
 Native Csound execution is off by default. `--allow-csound` enables it for
-the session, including orchestra compilation and exports. An orchestra runs
+the session, including orchestra compilation and exports. The Studio
+permissions page can flip the same switch during a session; the flip lasts
+until Studio closes and is not written to any file. An orchestra runs
 through the native library in the host process. Its opcodes can read files,
 write files, load native libraries and start processes with the rights of the user.
 QuickJS limits do not contain those operations. Enable it only for scores

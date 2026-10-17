@@ -113,7 +113,7 @@ impl HelpContext {
                 "Fetch imports, cache all remote packs, refresh their lists, and clear the cache; then your folders and the studio's packs. r aliases a bank on a user import; c caches a remote pack."
             }
             Self::SettingsPermissions => {
-                "The origins a score imports scripts from with await import('https://...'). Each row reads on or off, and an origin the studio has seen stays listed until it closes."
+                "The origins a score imports scripts from with await import('https://...'), and the native orchestra switch. Each row reads on or off. The studio keeps origin trusts; the orchestra switch lasts one run."
             }
             #[cfg(feature = "vst")]
             Self::SettingsVst => {

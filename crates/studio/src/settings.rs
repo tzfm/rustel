@@ -3087,7 +3087,9 @@ impl SettingsSheet {
             SettingsPage::Keybinds => (0..self.keybind_count)
                 .map(|index| (index, index))
                 .collect(),
-            SettingsPage::Permissions => (0..self.permissions_count).map(|index| (index, index)).collect(),
+            SettingsPage::Permissions => (0..self.permissions_count)
+                .map(|index| (index, index))
+                .collect(),
             SettingsPage::Mapping => {
                 let columns = usize::from(MAPPING_COLUMNS);
                 let step = (shown / usize::from(SLOT_HEIGHT)).max(1) * columns;
@@ -3295,7 +3297,9 @@ impl SettingsSheet {
         {
             return self.keybind_key(code, settings);
         }
-        if self.shows_permissions() && !matches!(code, KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab) {
+        if self.shows_permissions()
+            && !matches!(code, KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab)
+        {
             return self.permissions_key(code);
         }
         match code {
@@ -4121,14 +4125,30 @@ impl SlotGrid {
     }
 }
 
-/// One origin row of the permissions page.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PermissionRow {
-    /// As the engine names it, such as `https://glossing.dev`.
-    pub origin: String,
-    /// Whether scores import scripts from it. A refused origin is on the
-    /// page until the studio closes, so the player trusts it with one key.
-    pub allowed: bool,
+/// One row of the permissions page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PermissionRow {
+    /// An origin the score imports scripts from, as the engine names it,
+    /// such as `https://glossing.dev`.
+    Origin {
+        origin: String,
+        /// Whether scores import scripts from it. A refused origin is on
+        /// the page until the studio closes, so the player trusts it with
+        /// one key.
+        allowed: bool,
+    },
+    /// The native orchestra switch. It lasts one studio run: the studio
+    /// does not keep it, and the next start asks again.
+    Csound { allowed: bool },
+}
+
+impl PermissionRow {
+    /// Whether the row's permission is on.
+    pub fn allowed(&self) -> bool {
+        match self {
+            Self::Origin { allowed, .. } | Self::Csound { allowed } => *allowed,
+        }
+    }
 }
 
 /// One action's binding, as its row should read.
@@ -7682,9 +7702,13 @@ mod tests {
         assert_eq!(sheet.page, SettingsPage::Permissions);
         // The permissions page walks its rows and names the one a key acts on.
         sheet.permissions_count = 2;
-        let mut permissions_key = |code| sheet.key(code, &mut settings, &TerminalFeatures::default());
+        let mut permissions_key =
+            |code| sheet.key(code, &mut settings, &TerminalFeatures::default());
         assert_eq!(permissions_key(KeyCode::Up), SettingsAction::Nothing);
-        assert_eq!(permissions_key(KeyCode::Enter), SettingsAction::PermitRow(1));
+        assert_eq!(
+            permissions_key(KeyCode::Enter),
+            SettingsAction::PermitRow(1)
+        );
         assert_eq!(
             permissions_key(KeyCode::Char(' ')),
             SettingsAction::ToggleRow(1)
@@ -7797,7 +7821,7 @@ mod tests {
                 sources: Vec::new(),
                 mappings: Default::default(),
                 bindings: Vec::new(),
-                permissions: vec![PermissionRow {
+                permissions: vec![PermissionRow::Origin {
                     origin: "https://example.com".to_owned(),
                     allowed: false,
                 }],

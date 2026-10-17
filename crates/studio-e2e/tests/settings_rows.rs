@@ -800,7 +800,9 @@ fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
     studio.settle();
     assert_eq!(
         studio.errors().as_deref(),
-        Some("https://scripts.invalid is not trusted - Settings → Permissions lets its scripts run"),
+        Some(
+            "https://scripts.invalid is not trusted - Settings → Permissions lets its scripts run"
+        ),
     );
 
     open_sheet(&mut studio);
@@ -843,6 +845,60 @@ fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
     studio.press(KeyCode::Char('d'), KeyModifiers::NONE);
     studio.settle();
     assert!(studio.rows().join("\n").contains("none yet"));
+}
+
+/// A score that loads an orchestra without permission is refused, and the
+/// footer names the permissions page. Enter permits native orchestras for
+/// this run; the next studio asks again, because nothing is kept.
+#[test]
+fn a_refused_orchestra_is_permitted_with_one_key_and_not_kept() {
+    let mut studio = hermetic();
+    studio.set_score("loadCSound`instr voice\nendin`\n$: note(\"c3\").csound(\"voice\")");
+    studio.chord("ctrl+s");
+    studio.settle();
+    assert_eq!(
+        studio.errors().as_deref(),
+        Some("Csound is not permitted - Settings → Permissions lets native orchestras run"),
+    );
+
+    open_sheet(&mut studio);
+    for _ in 0..2 {
+        studio.press(KeyCode::BackTab, KeyModifiers::SHIFT);
+    }
+    studio.settle();
+    let refused = row_with(&mut studio, "native orchestras");
+    assert!(
+        refused.contains("▸") && refused.contains("off"),
+        "{refused}"
+    );
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.settle();
+    assert!(row_with(&mut studio, "native orchestras").contains("  on"));
+    assert_eq!(
+        studio.errors(),
+        None,
+        "the refusal left with the permission"
+    );
+
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.settle();
+    studio.chord("ctrl+s");
+    studio.settle();
+    // With the permission granted, a machine without the native library
+    // reports the library's own absence, never the permission's.
+    match studio.errors() {
+        None => {}
+        Some(error) => assert!(error.contains("Csound 6 is not available"), "{error}"),
+    }
+
+    studio.quit();
+    let mut studio = reopen_over(studio);
+    studio.chord("ctrl+s");
+    studio.settle();
+    assert_eq!(
+        studio.errors().as_deref(),
+        Some("Csound is not permitted - Settings → Permissions lets native orchestras run"),
+    );
 }
 
 /// Tab walks the strip's pages in order and wraps - each page

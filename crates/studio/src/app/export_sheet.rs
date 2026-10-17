@@ -161,6 +161,7 @@ impl App {
                 self.ui_settings.max_polyphony,
                 self.worker.master().max_polyphony_override(),
                 &self.prefs.import_origins,
+                self.csound_allowed,
             ),
             sheet.target.clone(),
         ) {

@@ -98,7 +98,7 @@ impl State {
             .allowed = allowed;
     }
 
-    fn require_permission(&self) -> Result<(), String> {
+    fn require_permission(&self) -> Result<(), RuntimeError> {
         if self
             .0
             .lock()
@@ -107,7 +107,7 @@ impl State {
         {
             Ok(())
         } else {
-            Err("Csound requires native orchestra permission. Enable --allow-csound only for trusted scores".into())
+            Err(RuntimeError::CsoundPermission)
         }
     }
 
@@ -157,7 +157,7 @@ impl State {
 
     pub(crate) fn restore(&self, snapshot: &CsoundSnapshot) -> Result<(), RuntimeError> {
         let program = if snapshot.0.initialized {
-            self.require_permission().map_err(RuntimeError::Message)?;
+            self.require_permission()?;
             Some(Program::compile(&snapshot.0.sources).map_err(RuntimeError::Message)?)
         } else {
             None
@@ -187,7 +187,7 @@ impl State {
         access: &ScoreImportAccess,
     ) -> Result<Option<Candidate>, RuntimeError> {
         if accepted.0.initialized || !effects.is_empty() {
-            self.require_permission().map_err(RuntimeError::Message)?;
+            self.require_permission()?;
         }
         let mut snapshot = accepted.clone();
         let data = Arc::make_mut(&mut snapshot.0);
@@ -392,7 +392,8 @@ impl State {
     }
 
     fn program(&self) -> Result<Program, String> {
-        self.require_permission()?;
+        self.require_permission()
+            .map_err(|error| error.to_string())?;
         let mut store = self.0.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(program) = &store.current {
             return Ok(program.clone());

@@ -3047,6 +3047,41 @@ mod tests {
         }
     }
 
+    /// A score uses a native orchestra only while the host permits one. The
+    /// refusal is typed, so the studio can offer its switch, and a permit
+    /// the host takes back refuses the next score again.
+    #[test]
+    fn an_orchestra_loads_only_while_it_is_permitted() {
+        let load = "loadCSound`instr voice
+endin`";
+        let mut session = Session::new().expect("session");
+        let refused = session.evaluate_prebake(load).expect_err("no permission");
+        assert_eq!(refused.kind(), "csound-permission");
+        assert!(
+            refused.to_string().starts_with("Csound is not permitted"),
+            "{refused}"
+        );
+
+        let mut access = ScoreImportAccess::denied();
+        access.permit_csound();
+        session.set_score_import_access(access);
+        // The gate passed. Without the native library the next refusal is
+        // the library's own, never the permission's.
+        if let Err(error) = session.evaluate_prebake(load) {
+            assert!(
+                std::env::var_os("RUSTEL_CSOUND_LIBRARY").is_none()
+                    && error.to_string().contains("Csound 6 is not available"),
+                "{error}"
+            );
+        }
+
+        session.set_score_import_access(ScoreImportAccess::denied());
+        let refused = session
+            .evaluate_prebake(load)
+            .expect_err("permission taken back");
+        assert_eq!(refused.kind(), "csound-permission");
+    }
+
     /// Two scripts give `sc` two meanings. A score gets the meaning of the
     /// import in its own text, whatever score ran before.
     #[test]

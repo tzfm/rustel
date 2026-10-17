@@ -354,8 +354,22 @@ impl StudioEngine {
     /// Replace the origins of the permissions page. The next evaluation imports
     /// scripts from them and from the origins the session config trusts.
     pub fn set_import_origins(&mut self, origins: &[String]) {
-        self.session
-            .set_score_import_access(import_access(&self.config.session, origins));
+        self.session.set_score_import_access(import_access(
+            &self.config.session,
+            origins,
+            self.config.csound_allowed,
+        ));
+    }
+
+    /// Flip the permissions page's orchestra switch. The next evaluation
+    /// reads it, and a playing orchestra keeps sounding until then.
+    pub fn set_csound(&mut self, allowed: bool) {
+        self.config.csound_allowed = allowed;
+        self.session.set_score_import_access(import_access(
+            &self.config.session,
+            &self.config.import_origins,
+            allowed,
+        ));
     }
 
     /// Preview RAM policy from the settings sheet. Zero budget means no
