@@ -35,6 +35,10 @@ const GAIN: f32 = 0.6;
 /// under the vowels around it, as in natural speech, where an equal level
 /// sounds like a hiss on top of the voice.
 const FRICATION_GAIN: f32 = 0.5;
+/// The corner of the high-pass on the voiced branch, in Hz, under the lowest
+/// voice (Colossus, 66 Hz). The glottal pulse is one-sided, so without it the
+/// wave rides on an offset that jumps each time voicing starts or stops.
+const DC_BLOCK_HZ: f32 = 30.0;
 
 /// One two-pole resonator.
 struct Resonator {
@@ -105,6 +109,8 @@ pub fn synthesize(utterance: &Utterance, plan: &Plan, effort: Effort) -> Vec<f32
 
     let mut phase = 0.0f32;
     let mut noise = Noise(0x5eed);
+    let dc_pole = (-std::f32::consts::TAU * DC_BLOCK_HZ / RATE as f32).exp();
+    let (mut last_voiced, mut last_centered) = (0.0f32, 0.0f32);
 
     for n in 0..frames {
         let ms = n as f32 * 1000.0 / RATE as f32;
@@ -113,7 +119,7 @@ pub fn synthesize(utterance: &Utterance, plan: &Plan, effort: Effort) -> Vec<f32
         let f2 = track(spans, i, ms, |f| f.f2);
         let f3 = track(spans, i, ms, |f| f.f3);
         let voice = track(spans, i, ms, |f| f.voice);
-        let fric_hz = track(spans, i, ms, |f| f.fric_hz);
+        let fric_hz = noise_band(spans, i, ms);
         let fric_amp = track(spans, i, ms, |f| f.fric_amp);
         let nasal = track(spans, i, ms, |f| f.nasal);
 
@@ -154,7 +160,12 @@ pub fn synthesize(utterance: &Utterance, plan: &Plan, effort: Effort) -> Vec<f32
             0.0
         };
 
-        out.push((voiced + frication) * GAIN);
+        // One-pole high-pass: y = x - x[n-1] + r * y[n-1].
+        let centered = voiced - last_voiced + dc_pole * last_centered;
+        last_voiced = voiced;
+        last_centered = centered;
+
+        out.push((centered + frication) * GAIN);
     }
     out
 }
@@ -176,6 +187,27 @@ fn span_at(spans: &[Span], ms: f32) -> usize {
         Ok(i) => i,
         Err(0) => 0,
         Err(i) => (i - 1).min(spans.len() - 1),
+    }
+}
+
+/// The center of the frication noise at `ms`. It glides only between two
+/// sounds that both carry noise. Next to a sound without noise it holds the
+/// noisy sound's own center while the amplitude fades, so an `s` does not
+/// sweep down to 0 Hz as it ends, or up from 0 Hz as it starts.
+fn noise_band(spans: &[Span], i: usize, ms: f32) -> f32 {
+    let here = spans[i].frame;
+    if here.fric_amp > 0.0 {
+        track(spans, i, ms, |f| {
+            if f.fric_amp > 0.0 {
+                f.fric_hz
+            } else {
+                here.fric_hz
+            }
+        })
+    } else if i > 0 {
+        spans[i - 1].frame.fric_hz
+    } else {
+        0.0
     }
 }
 
