@@ -264,15 +264,15 @@ impl Widget for Lanes<'_, '_> {
                 .saturating_sub(1)
                 .min(MAX_LABEL);
             for (rank, &index) in order.iter().take(shown).enumerate() {
-                let label = row_label(&rows, index, &state.lanes);
-                if label.is_empty() || room == 0 {
+                let (indent, label) = row_label(&rows, &order, rank, &state.lanes);
+                if label.is_empty() || indent >= room {
                     continue;
                 }
                 buffer.set_stringn(
-                    area.x,
+                    area.x + indent as u16,
                     line(rank),
                     format!("{label} "),
-                    room,
+                    room - indent,
                     Style::default().fg(colors[index]),
                 );
             }
@@ -347,20 +347,32 @@ fn sound_of(event: &UiScheduledEvent) -> &str {
         .map_or("", |sound| sound.split(':').next().unwrap_or(sound))
 }
 
-/// What a row is called. A row of a lane the score named takes the lane's
-/// label, followed by the sound when the lane has more than one row. Any
-/// other row takes its sound, since `$` lanes have no name of their own.
-fn row_label(rows: &[Row<'_>], index: usize, lanes: &[(Range<usize>, Arc<str>)]) -> String {
-    let row = &rows[index];
+/// What the row at `rank` is called, and how many cells in it starts. The
+/// first row of a lane the score named carries the lane's label, followed by
+/// its sound when the lane has more than one row. The lane's other rows carry
+/// their sound under the first row's, and the lane's colour holds them
+/// together. Any other row carries its sound, since `$` lanes have no name of
+/// their own.
+fn row_label(
+    rows: &[Row<'_>],
+    order: &[usize],
+    rank: usize,
+    lanes: &[(Range<usize>, Arc<str>)],
+) -> (usize, String) {
+    let row = &rows[order[rank]];
     let named = row
         .lane
         .map(|lane| &*lanes[lane].1)
         .filter(|label| !label.contains('$'));
-    match named {
-        Some(label) if rows.iter().filter(|other| other.lane == row.lane).count() > 1 => {
-            format!("{label} {}", row.sound).trim_end().to_owned()
-        }
-        Some(label) => label.to_owned(),
-        None => row.sound.to_owned(),
+    let Some(label) = named else {
+        return (0, row.sound.to_owned());
+    };
+    if rows.iter().filter(|other| other.lane == row.lane).count() == 1 {
+        return (0, label.to_owned());
+    }
+    if rank == 0 || rows[order[rank - 1]].lane != row.lane {
+        (0, format!("{label} {}", row.sound).trim_end().to_owned())
+    } else {
+        (label.chars().count() + 1, row.sound.to_owned())
     }
 }

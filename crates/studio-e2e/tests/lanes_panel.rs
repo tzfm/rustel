@@ -28,7 +28,9 @@ fn rule_row(rows: &[String]) -> Option<usize> {
 #[test]
 fn the_panel_names_each_lane_and_moves_between_the_edges() {
     let mut studio = hermetic();
-    studio.set_score("kick: s(\"sbd*4\")\nhats: s(\"white*8\").gain(.4)\n");
+    studio.set_score(
+        "kick: s(\"sbd*4\")\nhats: s(\"white*8\").gain(.4)\ndrums: s(\"sbd*2, white*4\")\n",
+    );
     studio.chord("ctrl+s");
     studio.settle();
 
@@ -50,6 +52,15 @@ fn the_panel_names_each_lane_and_moves_between_the_edges() {
         );
     }
     assert!(band.iter().any(|row| row.contains('┊')), "the playhead");
+    // A lane of two sounds names itself once and each row names its sound.
+    let drums = band.iter().filter(|row| row.contains("drums")).count();
+    assert_eq!(drums, 1, "the lane's name once:\n{}", band.join("\n"));
+    assert!(
+        band.iter()
+            .any(|row| row.contains("white ") && !row.contains("drums")),
+        "the second sound under the first:\n{}",
+        band.join("\n")
+    );
 
     studio.press(KeyCode::Char('e'), KeyModifiers::NONE);
     assert_eq!(studio.status(), "lanes along the top");

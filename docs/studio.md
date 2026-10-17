@@ -497,11 +497,13 @@ bass  ▃▃▃·▅▅┊▅▅·▂▂▂▂·▃▃▃·▅▅
              ▲
 ```
 
-A labeled lane, such as `kick:`, gives its name to its rows. A `$:` lane, and a
-pattern that a variable holds, show the sound name. Each lane takes its own
-colour from the theme, and a sound has the same mark in every lane. A pitched
-sound shows each note as a block, and the height of the block follows the
-pitch. The number beside the playhead is the current cycle.
+A labeled lane, such as `kick:`, shows its name on its first row. When the lane
+plays several sounds, each row also shows its sound, and the lane's colour
+groups the rows. A `$:` lane, and a pattern that a variable holds, show the
+sound name. Each lane takes its own colour from the theme, and a sound has the
+same mark in every lane. A pitched sound shows each note as a block, and the
+height of the block follows the pitch. The number beside the playhead is the
+current cycle.
 
 When the panel has the keyboard, `e` moves it between the top and the bottom,
 `-` and `+` change its height, and Esc gives the keyboard back to the score.
