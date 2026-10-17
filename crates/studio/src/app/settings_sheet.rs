@@ -440,7 +440,7 @@ impl App {
                     self.status = "learn called off".into();
                 } else {
                     self.keybind_learn = Some(super::super::keybinds::KeybindLearn::arm(action));
-                    self.status = "press the chord - Esc calls it off, and the sheet's own keys stay the sheet's".into();
+                    self.status = "press the chord or the controller button - Esc calls it off, and the sheet's own keys stay the sheet's".into();
                 }
             }
             self.dirty_frame = true;
@@ -841,12 +841,15 @@ impl App {
             SettingsAction::LearnKeybind(action) => {
                 self.keybind_learn = Some(super::super::keybinds::KeybindLearn::arm(action));
                 self.status =
-                    "press the chord - Esc calls it off, and the sheet's own keys stay the sheet's"
+                    "press the chord or the controller button - Esc calls it off, and the sheet's own keys stay the sheet's"
                         .into();
             }
             SettingsAction::ClearKeybind(action) => {
                 self.keybind_learn = None;
                 self.learn_keybind(action, None);
+                self.keybinds.forget_midi(action);
+                self.prefs.set_keybinds(&self.keybinds);
+                self.save_prefs_soon();
             }
             SettingsAction::LearnSlot(slot) => {
                 self.mapping_learn = Some(slot);
@@ -1208,6 +1211,22 @@ impl App {
         self.dirty_frame = true;
     }
 
+    /// Bind the message just pressed or turned to the action the Keybinds
+    /// page is waiting on, and say so. A message already on another action
+    /// moves to this one - one message, one meaning.
+    pub(super) fn learn_keybind_midi(
+        &mut self,
+        action: super::super::keybinds::BindAction,
+        bind: super::super::keybinds::MidiBind,
+    ) {
+        self.keybind_learn = None;
+        self.keybinds.learn_midi(action, bind);
+        self.prefs.set_keybinds(&self.keybinds);
+        self.save_prefs_soon();
+        self.status = format!("{} · {}", action.label(), bind.key());
+        self.dirty_frame = true;
+    }
+
     /// The shortcut rows, for the settings sheet's Keybinds page: the
     /// action, the chord as every surface spells it, and whether it is
     /// the player's or the studio's own.
@@ -1238,6 +1257,16 @@ impl App {
                     super::super::settings::KeybindRow {
                         action: action.label(),
                         chord,
+                        // The message the row also answers to. Empty while
+                        // the learn waits, as the chord is.
+                        midi: if learning {
+                            String::new()
+                        } else {
+                            self.keybinds
+                                .midi_binding(action)
+                                .map(|bind| bind.key())
+                                .unwrap_or_default()
+                        },
                         // The F-key alias the studio also answers to, shown
                         // beside the chord while the default stands. Once the
                         // action is overridden or unbound the alias is gone

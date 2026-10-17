@@ -994,6 +994,21 @@ struct App {
     /// The learnt keyboard shortcuts. Built from the preferences once and
     /// re-learnt from there, so every surface asks the same table.
     keybinds: super::keybinds::Keybinds,
+    /// The value each control change last said and when it said it, keyed
+    /// by number and channel, so a bound row reads the crossings of the
+    /// line at 64 rather than every message: a knob swept across fires
+    /// once each way, and a button that toggles between 127 and 0 - the
+    /// Maschine's transport in MIDI mode - fires on both presses, its
+    /// second held apart from a hand's release by the length of the
+    /// first.
+    midi_cc_last: HashMap<(u8, u8), (u8, Instant)>,
+    /// When each note was last pressed, keyed by note and channel, so a
+    /// button that latches can be told from one that springs back: a note
+    /// that ends long after it began was not released, it was pressed
+    /// again - the Maschine's transport in MIDI mode, whose second press
+    /// is a note-off. An ending with no stamp belongs to a note that began
+    /// before the studio did, and reads as that button's next press too.
+    note_pressed_at: HashMap<(u8, u8), Instant>,
     /// When each slot's control last moved, so a bound slot can say it is
     /// live without a player having to arm a learn to find out.
     mapping_lit: [Option<Instant>; MAPPING_SLOTS],
@@ -1644,6 +1659,8 @@ impl App {
             mapping_learn: None,
             keybind_learn: None,
             keybinds: prefs.keybinds(),
+            midi_cc_last: HashMap::new(),
+            note_pressed_at: HashMap::new(),
             mapping_lit: [None; MAPPING_SLOTS],
             stick_run: [None; MAPPING_SLOTS],
             mapping_knob: [None; MAPPING_SLOTS],

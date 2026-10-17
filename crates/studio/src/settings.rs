@@ -2454,7 +2454,7 @@ pub enum SettingsPage {
 const TABS: &[(SettingsPage, &str, u16)] = &[
     (SettingsPage::Settings, "settings", 2),
     (SettingsPage::Advanced, "advanced", 13),
-    (SettingsPage::Mapping, "mapping", 24),
+    (SettingsPage::Mapping, "sliders", 24),
     (SettingsPage::Keybinds, "keybinds", 34),
     (SettingsPage::Sources, "samples", 45),
     #[cfg(feature = "vst")]
@@ -4170,6 +4170,9 @@ pub struct KeybindRow {
     /// The chord as every surface spells it: `^S`, `F4`. Empty while a
     /// learn waits.
     pub chord: String,
+    /// The midi message the row also answers to, as `cc74/ch2`. Empty
+    /// when the row answers to its chord alone.
+    pub midi: String,
     /// The studio's second chord for the same action - evaluate's `F5`,
     /// stop's `F8` - spelled `also F5` on the row so a shortcut the
     /// studio answers to is never a secret. Empty when there is none,
@@ -4201,7 +4204,7 @@ fn keybinds_footer_hint(
         }
         return format!("Enter: reset all to {profile} defaults · Esc: close");
     }
-    "Enter: rebind · Del: terminal default · Tab: pages · Esc: close".to_owned()
+    "Enter: rebind a key or a control · Del: terminal default · Tab: pages · Esc: close".to_owned()
 }
 
 /// A line on the sources page: a group border, air, a cache control, a
@@ -5131,7 +5134,7 @@ mod tests {
                 .join(" ");
             let footer = footer.split_whitespace().collect::<Vec<_>>().join(" ");
             assert!(
-                footer.contains("Press the shortcut · Esc: cancel"),
+                footer.contains("Press the shortcut or the controller button · Esc: cancel"),
                 "{footer}"
             );
             assert!(footer.contains("No response? Try another key"), "{footer}");
@@ -7986,7 +7989,7 @@ mod tests {
         for (label, page) in [
             ("settings", SettingsPage::Settings),
             ("advanced", SettingsPage::Advanced),
-            ("mapping", SettingsPage::Mapping),
+            ("sliders", SettingsPage::Mapping),
             ("keybinds", SettingsPage::Keybinds),
             ("samples", SettingsPage::Sources),
             #[cfg(feature = "vst")]
@@ -8360,7 +8363,7 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains(" mapping "), "the page has a tab: {text}");
+        assert!(text.contains(" sliders "), "the page has a tab: {text}");
         assert!(text.contains("cc74·2 → lpf"), "{text}");
         assert!(text.contains("move a control…"), "{text}");
         assert!(text.contains("- not assigned"), "{text}");
