@@ -447,6 +447,21 @@ impl App {
         }
     }
 
+    /// A preset file dropped on the window: the host copies it into the
+    /// preset folder of its plugin, and the status line says where.
+    pub(super) fn add_dropped_preset(&mut self, path: &std::path::Path) {
+        let file = path.file_name().unwrap_or_default().to_string_lossy();
+        let (level, said) = match vst::host().add_preset(path) {
+            Ok((plugin, preset)) => (
+                LogLevel::Info,
+                format!("preset '{preset}' added to {plugin}"),
+            ),
+            Err(reason) => (LogLevel::Warn, format!("{file}: {reason}")),
+        };
+        self.log.push(level, "drop", said.clone());
+        self.status = said;
+    }
+
     /// The folder the picker gave goes on the list, and the host reads all
     /// folders again. The cursor goes to the new row.
     pub(super) fn add_vst_folder(&mut self, path: &std::path::Path) {

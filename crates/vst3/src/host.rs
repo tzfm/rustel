@@ -54,6 +54,9 @@ struct Prepare {
 const WAIT_LIMIT: Duration = Duration::from_secs(120);
 /// The host looks again for a preset file it did not find after this time.
 const PRESET_RETRY: Duration = Duration::from_secs(2);
+/// The preset that plays when a score names no preset: the file
+/// `default.vstpreset` in the preset folder of the plugin.
+const DEFAULT_PRESET: &str = "default";
 
 /// A loaded plugin: its class and its parameters.
 pub struct Plugin {
@@ -232,6 +235,8 @@ struct Entry {
     /// From the load or the test. Empty before.
     vendor: String,
     categories: String,
+    /// The class id, from the load or the test: see [`Scanned::class`].
+    class: String,
     bundle: PathBuf,
     /// The compare forms of the name and of the bundle name. A note asks
     /// for a plugin by name, so the lookup does not build them each time.
@@ -251,6 +256,7 @@ impl Entry {
             name,
             vendor: String::new(),
             categories: String::new(),
+            class: String::new(),
             bundle,
             present: true,
             stage,
@@ -423,6 +429,7 @@ impl State {
             entry.key = key;
             entry.vendor = plugin.vendor.clone();
             entry.categories = plugin.categories.clone();
+            entry.class = plugin.class.clone();
             // A plugin that did not load stays off, as a bundle does, until
             // its files change or a rescan.
             if let Some(fault) = &plugin.fault
@@ -562,15 +569,26 @@ fn word_match(name: &str, key: &str, wanted: &str) -> u8 {
     if ends.contains(&at) { 2 } else { rank }
 }
 
-/// Reads the preset files of a plugin from the folder with its name under
-/// `root`: name and path, sorted by name. This reads the disk, so the
-/// plugin thread runs it.
-fn read_presets(root: Option<&Path>, plugin: &str) -> Vec<(String, PathBuf)> {
+/// A plugin name as a folder name: a sign a file system refuses becomes
+/// `-`, and the name ends with no dot or space.
+fn folder_name(name: &str) -> String {
+    let safe = |char: char| {
+        if char.is_control() || r#"/\:*?"<>|"#.contains(char) {
+            '-'
+        } else {
+            char
+        }
+    };
+    let name: String = name.chars().map(safe).collect();
+    name.trim_end_matches(['.', ' ']).to_owned()
+}
+
+/// The folder of a plugin under `root`: the folder with the name of the
+/// plugin in compare form.
+fn preset_folder(root: &Path, plugin: &str) -> Option<PathBuf> {
     let wanted = canonical(plugin);
-    let folder = root
-        .and_then(|root| std::fs::read_dir(root).ok())
-        .into_iter()
-        .flatten()
+    std::fs::read_dir(root)
+        .ok()?
         .flatten()
         .map(|entry| entry.path())
         .find(|path| {
@@ -578,8 +596,14 @@ fn read_presets(root: Option<&Path>, plugin: &str) -> Vec<(String, PathBuf)> {
                 && path
                     .file_name()
                     .is_some_and(|name| canonical(&name.to_string_lossy()) == wanted)
-        });
-    let Some(folder) = folder else {
+        })
+}
+
+/// Reads the preset files of a plugin from the folder with its name under
+/// `root`: name and path, sorted by name. This reads the disk, so the
+/// plugin thread runs it.
+fn read_presets(root: Option<&Path>, plugin: &str) -> Vec<(String, PathBuf)> {
+    let Some(folder) = root.and_then(|root| preset_folder(root, plugin)) else {
         return Vec::new();
     };
     let mut files: Vec<(String, PathBuf)> = std::fs::read_dir(folder)
@@ -841,6 +865,7 @@ impl Host {
                 .map(|at| at.checked_sub(PRESET_RETRY).unwrap_or(at));
         }
         drop(state);
+        self.make_preset_folders();
         self.scan_soon();
     }
 
@@ -963,6 +988,42 @@ impl Host {
             drop(state);
             if stored {
                 self.save_cache();
+                self.make_preset_folders();
+            }
+        }
+    }
+
+    /// Makes a preset folder for each plugin with a known name and no
+    /// folder yet, so the folder names show the exact plugin names. A
+    /// folder counts by the compare form of its name. Runs on a thread of
+    /// the host, as the disk is slow.
+    fn make_preset_folders(&self) {
+        let (root, names) = {
+            let state = self.state();
+            let named = |entry: &&Entry| {
+                entry.present
+                    && state.scanned.contains_key(&entry.bundle)
+                    && !matches!(entry.stage, Stage::Failed(_))
+            };
+            let names: Vec<String> = state
+                .entries
+                .iter()
+                .filter(named)
+                .map(|entry| entry.name.clone())
+                .collect();
+            (state.preset_root.clone(), names)
+        };
+        let Some(root) = root else {
+            return;
+        };
+        let entries = std::fs::read_dir(&root).into_iter().flatten().flatten();
+        let mut have: HashSet<String> = entries
+            .map(|entry| canonical(&entry.file_name().to_string_lossy()))
+            .collect();
+        for name in names {
+            let key = canonical(&name);
+            if !key.is_empty() && have.insert(key) {
+                let _ = std::fs::create_dir_all(root.join(folder_name(&name)));
             }
         }
     }
@@ -1020,6 +1081,47 @@ impl Host {
     pub fn presets(&self, plugin: &str) -> Option<Vec<String>> {
         let files = self.preset_list(plugin)?;
         Some(files.into_iter().map(|(name, _)| name).collect())
+    }
+
+    /// Copies a `.vstpreset` file into the preset folder of its plugin: the
+    /// plugin with the class the file names. A score then plays the preset
+    /// by the name of the file. Gives the plugin name and the preset name.
+    pub fn add_preset(&self, file: &Path) -> Result<(String, String), String> {
+        let bytes = std::fs::read(file).map_err(|error| error.to_string())?;
+        let class = crate::preset::parse(&bytes)?.class.to_owned();
+        let (plugin, root) = {
+            let state = self.state();
+            let of_class =
+                |entry: &&Entry| entry.present && entry.class.eq_ignore_ascii_case(&class);
+            let plugin = state.entries.iter().find(of_class);
+            (
+                plugin.map(|entry| entry.name.clone()),
+                state.preset_root.clone(),
+            )
+        };
+        let plugin = plugin.ok_or(
+            "no plugin of the scan has the class of this preset: a rescan reads the class of each plugin",
+        )?;
+        let root = root.ok_or("rustel has no preset folder")?;
+        let preset = file.file_stem().unwrap_or_default().to_string_lossy();
+        let folder =
+            preset_folder(&root, &plugin).unwrap_or_else(|| root.join(folder_name(&plugin)));
+        let target = folder.join(file.file_name().unwrap_or_default());
+        if target.exists() {
+            return Err(format!(
+                "{plugin} has a preset with the name '{preset}' already"
+            ));
+        }
+        std::fs::create_dir_all(&folder)
+            .and_then(|()| std::fs::copy(file, &target))
+            .map_err(|error| error.to_string())?;
+        // The next request reads the folder again.
+        let mut state = self.state();
+        state.preset_lists.remove(&canonical(&plugin));
+        state
+            .known_presets
+            .retain(|_, known| matches!(known, KnownPreset::Number(_)));
+        Ok((plugin, preset.into_owned()))
     }
 
     /// The preset files of a plugin as last read, and a new read on the
@@ -1153,6 +1255,7 @@ impl Host {
                 drop(spare);
                 if stored {
                     self.save_cache();
+                    self.make_preset_folders();
                 }
             }
             // The list shows the reason, and `Host::key` gives the reason
@@ -1430,7 +1533,11 @@ impl Host {
             _ => {}
         }
         let preset = match preset {
-            None => 0,
+            None => match self.preset(plugin, DEFAULT_PRESET) {
+                FoundPreset::Number(number) => number,
+                FoundPreset::Pending => return Ok(None),
+                FoundPreset::Missing => 0,
+            },
             Some(preset) => match self.preset(plugin, preset) {
                 FoundPreset::Number(number) => number,
                 // The host reads the preset folder now.
@@ -1759,6 +1866,7 @@ fn scanned(class: &ClassInfo, fault: Option<String>) -> Scanned {
         name: class.name.clone(),
         vendor: class.vendor.clone(),
         categories: class.categories.clone(),
+        class: class.id_text(),
         fault,
     }
 }

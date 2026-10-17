@@ -374,6 +374,7 @@ mod tests {
             name: "Tone".into(),
             vendor: "rustel".into(),
             categories: "Instrument|Synth".into(),
+            class: String::new(),
             fault: None,
         }]);
         let mut line = serde_json::to_vec(&answer).expect("answer text");

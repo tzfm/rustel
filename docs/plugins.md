@@ -118,6 +118,24 @@ preset in a DAW, then copy the file to the folder.
 note("c2 eb2").vsti("serum 2", { preset: "Dark Bass" })
 ```
 
+The scan makes a folder for each plugin it finds, so the folder names show
+the exact plugin names. The preset name, as the plugin name, ignores upper
+case, spaces and punctuation.
+
+A plugin call with no `preset` plays `default.vstpreset` when the folder of
+the plugin has one. Save the start sound of a plugin there, and each call
+starts with it:
+
+```js
+note("c2 eb2").vsti("serum 2")
+```
+
+In Studio, drop a `.vstpreset` file on the window. Rustel reads the plugin
+class in the file and copies the file to the folder of that plugin. The
+status line says which plugin. A file with the name of a preset already in
+the folder is not copied. The scan cache of an earlier version has no plugin
+classes. After an upgrade, rescan once so a dropped file finds its plugin.
+
 ## Chains
 
 - `.vsti()` gives the plugin the pitch, the `velocity` and the length of each

@@ -29,6 +29,10 @@ pub(crate) struct Scanned {
     pub vendor: String,
     /// For example "Fx|Reverb" or "Instrument|Synth".
     pub categories: String,
+    /// The class id as a `.vstpreset` file writes it, so a preset file
+    /// finds its plugin. A file of an older version has no such field.
+    #[serde(default)]
+    pub class: String,
     /// The reason the plugin did not load at its test, while other plugins
     /// of its bundle did. A file of an older version has no such field.
     #[serde(default)]
@@ -223,12 +227,14 @@ mod tests {
                 name: "One \"Deluxe\"".into(),
                 vendor: "Maker".into(),
                 categories: "Fx|Delay".into(),
+                class: String::new(),
                 fault: None,
             },
             Scanned {
                 name: "One Synth".into(),
                 vendor: "Maker".into(),
                 categories: "Instrument|Synth".into(),
+                class: String::new(),
                 fault: Some("the plugin processor did not start".into()),
             },
         ];
@@ -276,6 +282,7 @@ mod tests {
             name: "Bad".into(),
             vendor: "Maker".into(),
             categories: "Fx".into(),
+            class: String::new(),
             fault: None,
         }];
         assert!(cache.store(&bundle, first, &plugins));

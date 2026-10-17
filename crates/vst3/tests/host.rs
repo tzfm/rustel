@@ -232,12 +232,13 @@ fn a_preset_file_sets_the_state_of_the_plugin() {
         "Half Level.vstpreset",
         &rustel_vst3_fixture::preset(0.5, 0.0),
     );
+    rig.write_preset("default.vstpreset", &rustel_vst3_fixture::preset(0.5, 0.0));
     let mut other = rustel_vst3_fixture::preset(0.5, 0.0);
     other[8] = b'0';
     rig.write_preset("Other Plugin.vstpreset", &other);
     let plugin = rig.plugin();
     let names = rig.host.presets(NAME).expect("the load read the presets");
-    assert_eq!(names, ["Half Level", "Other Plugin"]);
+    assert_eq!(names, ["Half Level", "Other Plugin", "default"]);
     assert_eq!(rig.host.preset(plugin, "missing"), FoundPreset::Missing);
     assert_eq!(
         rig.host.key(NAME, Some("missing"), false).err(),
@@ -250,6 +251,16 @@ fn a_preset_file_sets_the_state_of_the_plugin() {
     };
     let preset = number("half level");
     assert_eq!(number("HalfLevel"), preset);
+    // A call with no preset plays the file `default`.
+    let default = InsertKey {
+        plugin,
+        preset: number("default"),
+    };
+    let key = rig
+        .host
+        .key(NAME, None, false)
+        .map(|key| key.map(|(key, _)| key));
+    assert_eq!(key, Ok(Some(default)));
     let mut insert = rig.insert(preset).expect("insert");
     assert_eq!(block(insert.as_mut(), 1.0, 64), vec![0.5; 64]);
     // The start values of the copy are the values of the preset.
@@ -314,10 +325,30 @@ fn a_preset_file_sets_the_state_of_the_plugin() {
     );
     assert_eq!(
         rig.host.prepared(NAME, None, false, SAMPLE_RATE, parked),
-        Prepared::Ready(InsertKey { plugin, preset: 0 })
+        Prepared::Ready(default)
     );
     assert!(provider(key, SAMPLE_RATE, InsertSlot::effect(capacity, 0)).is_none());
     assert!(rig.host.take_errors().is_empty());
+
+    // A preset file from elsewhere goes to the folder of the plugin of its
+    // class, one time. A file of a class no plugin has goes nowhere.
+    let dropped = rig.root.join("Drop.vstpreset");
+    std::fs::write(&dropped, rustel_vst3_fixture::preset(0.5, 0.0)).expect("dropped file");
+    let added = rig.host.add_preset(&dropped);
+    assert_eq!(added, Ok((NAME.to_owned(), "Drop".to_owned())));
+    assert!(rig.host.add_preset(&dropped).is_err());
+    rig.host.presets(NAME);
+    rig.host.wait_idle();
+    assert!(matches!(
+        rig.host.preset(plugin, "drop"),
+        FoundPreset::Number(_)
+    ));
+    std::fs::write(&dropped, &other).expect("file of another class");
+    let reason = rig
+        .host
+        .add_preset(&dropped)
+        .expect_err("no plugin has the class");
+    assert!(reason.starts_with("no plugin of the scan"), "{reason}");
 }
 
 #[test]
@@ -818,10 +849,15 @@ fn the_scan_names_the_plugins_and_keeps_a_fault_out_of_the_host() {
         ]
     );
     assert!(rig.root.join("presets").join("scan.json").is_file());
+    // Each plugin the scan names has a preset folder with its name.
+    for name in [NAME, TONE_NAME] {
+        assert!(rig.root.join("presets").join(name).is_dir(), "{name}");
+    }
 
     let rig = Rig::new("scan-fault");
     let plugins = scanned(&rig, Some("load"));
     assert_eq!(plugins.len(), 1);
+    assert!(!rig.root.join("presets").join(&plugins[0].name).exists());
     let Status::Failed(reason) = &plugins[0].status else {
         panic!("the bundle did not fail: {:?}", plugins[0].status);
     };

@@ -410,7 +410,9 @@ selection; check the footer for the current action.
 Drag and drop an audio file or folder into the terminal window running Studio
 to import samples. You can also add folders and packs in Settings ▸ Samples.
 Samples in the set folder are discovered automatically. Use File ▸ Copy
-samples into the set when you need a portable set.
+samples into the set when you need a portable set. A dropped `.vstpreset`
+file goes to the preset folder of its plugin. See
+[Plugins](plugins.md#presets).
 
 The sample view supports alias changes and file deletion. Check the
 confirmation before deleting a file. An alias must not replace an existing
