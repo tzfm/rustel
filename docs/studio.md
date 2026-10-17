@@ -503,8 +503,8 @@ under it on a branch:
 
 ```text
 drums
- ├ sbd   ··▮·····▮·····▮····
- └ white ×···×···×···×···×··
+    └╴ sbd   ··▮·····▮·····▮····
+    └╴ white ×···×···×···×···×··
 ```
 
 A `$:` lane, and a pattern that a variable holds, show the sound name. Each lane

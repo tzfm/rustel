@@ -287,7 +287,7 @@ impl Widget for Lanes<'_, '_> {
             }
         }
 
-        // A heading names its lane, and the lane's rows hang under it by a
+        // A heading names its lane, and the lane's rows hang under it on a
         // branch, each with its sound. A lane of one sound names its row,
         // and a row of a lane with no name says its sound.
         if self.labels {
@@ -301,11 +301,11 @@ impl Widget for Lanes<'_, '_> {
                 let (branch, label) = match item {
                     Line::Lane(_) => (None, lane_name(row, &state.lanes).unwrap_or_default()),
                     Line::Row(_) if grouped(row) => {
-                        let last = !matches!(
-                            lines.get(rank + 1),
-                            Some(Line::Row(next)) if rows[*next].lane == row.lane
-                        );
-                        (Some(if last { " └ " } else { " ├ " }), row.sound)
+                        // The branch hangs from the heading's last letter,
+                        // four cells in at most.
+                        let name = lane_name(row, &state.lanes).unwrap_or_default();
+                        let indent = name.chars().count().saturating_sub(1).min(4);
+                        (Some(format!("{:indent$}└╴ ", "")), row.sound)
                     }
                     Line::Row(_) => (None, lane_name(row, &state.lanes).unwrap_or(row.sound)),
                 };
@@ -313,12 +313,19 @@ impl Widget for Lanes<'_, '_> {
                 let mut x = area.x;
                 let mut left = room;
                 if let Some(branch) = branch {
-                    if left < 3 {
+                    let width = branch.chars().count();
+                    if left <= width {
                         continue;
                     }
-                    buffer.set_stringn(x, y, branch, 3, Style::default().fg(dim(color, theme)));
-                    x += 3;
-                    left -= 3;
+                    buffer.set_stringn(
+                        x,
+                        y,
+                        &branch,
+                        width,
+                        Style::default().fg(dim(color, theme)),
+                    );
+                    x += width as u16;
+                    left -= width;
                 }
                 if label.is_empty() || left == 0 {
                     continue;
