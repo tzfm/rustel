@@ -207,6 +207,7 @@ impl Class for Processor {
 
 impl IPluginBaseTrait for Processor {
     unsafe fn initialize(&self, _context: *mut FUnknown) -> tresult {
+        slow_load(SLOW_CLASS_ENV);
         kResultOk
     }
 
@@ -580,6 +581,7 @@ impl Class for Tone {
 
 impl IPluginBaseTrait for Tone {
     unsafe fn initialize(&self, _context: *mut FUnknown) -> tresult {
+        slow_load(SLOW_CLASS_ENV);
         kResultOk
     }
 
@@ -883,10 +885,24 @@ pub const ABORT_ENV: &str = "RUSTEL_VST3_FIXTURE_ABORT";
 /// many milliseconds more, as the load of a large plugin does.
 pub const SLOW_ENV: &str = "RUSTEL_VST3_FIXTURE_SLOW";
 
+/// With this variable set to a number, the start of each audio class of
+/// the plugin takes that many milliseconds more, as each class of a large
+/// bundle does at its own load. The class of the controller adds none.
+pub const SLOW_CLASS_ENV: &str = "RUSTEL_VST3_FIXTURE_SLOW_CLASS";
+
 /// With this variable set, the plugin prints on the standard output at its
 /// load and in each audio block of the effect, as a plugin with debug text
 /// does.
 pub const PRINT_ENV: &str = "RUSTEL_VST3_FIXTURE_PRINT";
+
+/// Sleeps the number of milliseconds the variable names, when it names a
+/// number: a slow load, of the whole factory or of one class.
+fn slow_load(name: &str) {
+    let Some(millis) = std::env::var(name).ok().and_then(|text| text.parse().ok()) else {
+        return;
+    };
+    std::thread::sleep(std::time::Duration::from_millis(millis));
+}
 
 /// One line through the standard library and one through the C runtime. On
 /// Windows the two have a path of their own to the standard output.
@@ -907,12 +923,7 @@ extern "system" fn GetPluginFactory() -> *mut IPluginFactory {
     if std::env::var_os(PRINT_ENV).is_some() {
         print_line();
     }
-    let slow = std::env::var(SLOW_ENV)
-        .ok()
-        .and_then(|text| text.parse().ok());
-    if let Some(millis) = slow {
-        std::thread::sleep(std::time::Duration::from_millis(millis));
-    }
+    slow_load(SLOW_ENV);
     ComWrapper::new(Factory)
         .to_com_ptr::<IPluginFactory2>()
         .map(|factory| factory.upcast::<IPluginFactory>())

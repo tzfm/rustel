@@ -834,7 +834,12 @@ impl Host {
                 return;
             };
             let stamp = cache::stamp(&bundle);
-            let read = crate::worker::scan(&program, &bundle, &self.shared.closed);
+            let read = crate::worker::scan(
+                &program,
+                &bundle,
+                crate::worker::WORK_LIMIT,
+                &self.shared.closed,
+            );
             // With no scan process, each bundle stays as it is, and loads
             // in this process when a score names it. The next scan tries
             // again.
@@ -998,7 +1003,7 @@ impl Host {
     fn finish_load(&self, bundle: PathBuf) {
         let start = Instant::now();
         let stamp = cache::stamp(&bundle);
-        let loaded = contained("load", || load_bundle(&bundle));
+        let loaded = contained("load", || load_bundle(&bundle, &mut || {}));
         let loaded = loaded.map(|mut plugins: Vec<Plugin>| {
             for plugin in &mut plugins {
                 plugin.load_time = start.elapsed();
@@ -1656,8 +1661,13 @@ fn contained<T>(work: &str, run: impl FnOnce() -> Result<T, String>) -> Result<T
 }
 
 /// Loads a bundle in this process and reads the parameters of each plugin
-/// in the bundle. Runs on the plugin thread.
-pub(crate) fn load_bundle(bundle: &Path) -> Result<Vec<Plugin>, String> {
+/// in the bundle, as the load of a score does. Calls `progress` after each
+/// class, so a caller can report that the read moves. Runs on the plugin
+/// thread.
+pub(crate) fn load_bundle(
+    bundle: &Path,
+    progress: &mut dyn FnMut(),
+) -> Result<Vec<Plugin>, String> {
     let module = Arc::new(Module::load(bundle)?);
     let classes = module.classes();
     if classes.is_empty() {
@@ -1667,7 +1677,9 @@ pub(crate) fn load_bundle(bundle: &Path) -> Result<Vec<Plugin>, String> {
         .into_iter()
         .map(|class| {
             let params = Loaded::new(Arc::clone(&module), &class)?.params();
-            Ok(Plugin::new(Arc::clone(&module), class, params))
+            let plugin = Plugin::new(Arc::clone(&module), class, params);
+            progress();
+            Ok(plugin)
         })
         .collect()
 }
