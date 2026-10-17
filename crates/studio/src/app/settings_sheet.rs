@@ -477,11 +477,11 @@ impl App {
         // An origin of the trust page: the click chooses it. Trust and
         // removal stay the keys' work.
         if let Some(sheet) = self.settings_sheet.as_mut() {
-            sheet.trust_count = self.prefs.import_origins.len() + self.blocked_imports.len();
+            sheet.permissions_count = self.prefs.import_origins.len() + self.blocked_imports.len();
         }
         if let Some(row) = self
             .settings_sheet
-            .and_then(|sheet| sheet.trust_row_at(self.settings_sheet_frame(), x, y))
+            .and_then(|sheet| sheet.permission_row_at(self.settings_sheet_frame(), x, y))
         {
             self.focus_panel(PanelKind::Settings);
             self.pointer = Some(Pointer::Panel);
@@ -628,7 +628,7 @@ impl App {
         // The learnable rows plus the fixed ones past them (the panels'
         // Alt chords, which a learn can neither take nor move).
         sheet.keybind_count = super::super::settings::RESET_KEYBINDS_ROW + 1;
-        sheet.trust_count = self.prefs.import_origins.len() + self.blocked_imports.len();
+        sheet.permissions_count = self.prefs.import_origins.len() + self.blocked_imports.len();
         #[cfg(feature = "vst")]
         self.count_vst_folders(&mut sheet);
         match sheet.key_in_frame(
@@ -935,17 +935,17 @@ impl App {
                 return true;
             }
             SettingsAction::RefreshSource(at) => self.refresh_sample_source(at),
-            SettingsAction::TrustImport(at) => {
+            SettingsAction::PermitRow(at) => {
                 let refused = at >= self.prefs.import_origins.len();
-                self.trust_import(at);
+                self.permit_row(at);
                 if refused {
                     // The origin moved up, to the end of the trusted ones.
                     sheet.selected = self.prefs.import_origins.len().saturating_sub(1);
                 }
             }
-            SettingsAction::ToggleImport(at) => {
+            SettingsAction::ToggleRow(at) => {
                 let refused = at >= self.prefs.import_origins.len();
-                self.toggle_import(at);
+                self.toggle_row(at);
                 // Either way the row moved: a trust taken back lands at the
                 // end of the refused ones, a trust given at the end of the
                 // trusted ones.
@@ -955,8 +955,8 @@ impl App {
                     (self.prefs.import_origins.len() + self.blocked_imports.len()).saturating_sub(1)
                 };
             }
-            SettingsAction::ForgetImport(at) => {
-                self.forget_import(at);
+            SettingsAction::ForgetRow(at) => {
+                self.forget_row(at);
                 let rows = self.prefs.import_origins.len() + self.blocked_imports.len();
                 sheet.selected = at.min(rows.saturating_sub(1));
             }

@@ -1684,7 +1684,7 @@ mod tests {
 
             // Enter on a refused row of the same origin adds nothing.
             app.blocked_imports.push(origin.to_owned());
-            app.trust_import(1);
+            app.permit_row(1);
             assert_eq!(app.prefs.import_origins, [origin]);
             assert!(app.blocked_imports.is_empty());
         }

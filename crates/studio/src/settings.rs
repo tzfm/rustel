@@ -2436,8 +2436,8 @@ pub enum SettingsPage {
     Vst,
     /// Which kinds of entry the reference and the suggestions offer.
     Reference,
-    /// The origins a score imports scripts from, and the ones refused so far.
-    Trust,
+    /// What a score may reach: import origins, and native orchestras.
+    Permissions,
     About,
 }
 
@@ -2455,13 +2455,13 @@ const TABS: &[(SettingsPage, &str, u16)] = &[
     #[cfg(not(feature = "vst"))]
     (SettingsPage::Reference, "reference", 56),
     #[cfg(feature = "vst")]
-    (SettingsPage::Trust, "trust", 73),
+    (SettingsPage::Permissions, "permissions", 73),
     #[cfg(not(feature = "vst"))]
-    (SettingsPage::Trust, "trust", 68),
+    (SettingsPage::Permissions, "permissions", 68),
     #[cfg(feature = "vst")]
-    (SettingsPage::About, "about", 81),
+    (SettingsPage::About, "about", 87),
     #[cfg(not(feature = "vst"))]
-    (SettingsPage::About, "about", 76),
+    (SettingsPage::About, "about", 82),
 ];
 
 /// A narrow title row drops the tab padding and uses one-column gaps.
@@ -2528,9 +2528,9 @@ pub struct SettingsSheet {
     /// How many keybind rows the keybinds page is showing, for the same
     /// reason as `source_count`.
     pub keybind_count: usize,
-    /// How many origins the trust page is showing: the trusted ones, then
-    /// the ones refused in this studio.
-    pub trust_count: usize,
+    /// How many rows the permissions page is showing: the trusted origins,
+    /// then the ones refused in this studio.
+    pub permissions_count: usize,
     /// How many folders the player added on the vst page, for the same
     /// reason as `source_count`.
     #[cfg(feature = "vst")]
@@ -2621,13 +2621,13 @@ pub enum SettingsAction {
     /// back. Space is not among them - it types spaces, and a reflexive
     /// press on a row must not clear a binding.
     ClearKeybind(BindAction),
-    /// Enter on a trust row: trust the origin, if it is a refused one.
-    TrustImport(usize),
-    /// Space on a trust row: trust a refused origin, or turn a trusted one
-    /// off where it stands, so it can be turned back on later.
-    ToggleImport(usize),
-    /// Delete, Backspace or `d` on a trust row: take the origin off the page.
-    ForgetImport(usize),
+    /// Enter on a row: permit it, if it is a refused one.
+    PermitRow(usize),
+    /// Space on a row: permit a refused one, or turn a permitted one off
+    /// where it stands, so it can be turned back on later.
+    ToggleRow(usize),
+    /// Delete, Backspace or `d` on a row: take it off the page.
+    ForgetRow(usize),
     /// Ask before replacing all overrides with this terminal's defaults.
     AskResetKeybinds,
     /// The second Enter on the reset row confirmed replacing all overrides.
@@ -2658,17 +2658,17 @@ impl SettingsSheet {
         matches!(self.page, SettingsPage::Keybinds)
     }
 
-    /// The trust page: a list of origins.
-    pub(super) const fn shows_trust(self) -> bool {
-        matches!(self.page, SettingsPage::Trust)
+    /// The permissions page: a list of rows.
+    pub(super) const fn shows_permissions(self) -> bool {
+        matches!(self.page, SettingsPage::Permissions)
     }
 
-    /// The arrows walk the origins and wrap. Enter trusts, Space flips a
-    /// row's trust where it stands, and Delete, Backspace or `d` takes an
-    /// origin off the page. Esc and Tab stay the sheet's.
-    fn trust_key(&mut self, code: crossterm::event::KeyCode) -> SettingsAction {
+    /// The arrows walk the rows and wrap. Enter permits, Space flips a
+    /// row where it stands, and Delete, Backspace or `d` takes a row
+    /// off the page. Esc and Tab stay the sheet's.
+    fn permissions_key(&mut self, code: crossterm::event::KeyCode) -> SettingsAction {
         use crossterm::event::KeyCode;
-        let len = self.trust_count;
+        let len = self.permissions_count;
         if len == 0 {
             return SettingsAction::Ignored;
         }
@@ -2682,10 +2682,10 @@ impl SettingsSheet {
                 self.select((at + 1) % len);
                 SettingsAction::Nothing
             }
-            KeyCode::Enter => SettingsAction::TrustImport(at),
-            KeyCode::Char(' ') => SettingsAction::ToggleImport(at),
+            KeyCode::Enter => SettingsAction::PermitRow(at),
+            KeyCode::Char(' ') => SettingsAction::ToggleRow(at),
             KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('d' | 'D') => {
-                SettingsAction::ForgetImport(at)
+                SettingsAction::ForgetRow(at)
             }
             _ => SettingsAction::Ignored,
         }
@@ -2977,7 +2977,7 @@ impl SettingsSheet {
             SettingsPage::Mapping
             | SettingsPage::Keybinds
             | SettingsPage::Sources
-            | SettingsPage::Trust
+            | SettingsPage::Permissions
             | SettingsPage::About => &[],
             #[cfg(feature = "vst")]
             SettingsPage::Vst => &[],
@@ -3087,7 +3087,7 @@ impl SettingsSheet {
             SettingsPage::Keybinds => (0..self.keybind_count)
                 .map(|index| (index, index))
                 .collect(),
-            SettingsPage::Trust => (0..self.trust_count).map(|index| (index, index)).collect(),
+            SettingsPage::Permissions => (0..self.permissions_count).map(|index| (index, index)).collect(),
             SettingsPage::Mapping => {
                 let columns = usize::from(MAPPING_COLUMNS);
                 let step = (shown / usize::from(SLOT_HEIGHT)).max(1) * columns;
@@ -3295,8 +3295,8 @@ impl SettingsSheet {
         {
             return self.keybind_key(code, settings);
         }
-        if self.shows_trust() && !matches!(code, KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab) {
-            return self.trust_key(code);
+        if self.shows_permissions() && !matches!(code, KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab) {
+            return self.permissions_key(code);
         }
         match code {
             KeyCode::Esc => {
@@ -3581,7 +3581,7 @@ impl SettingsSheet {
                 self.first_line(shown, &grouped_rows(self.rows()))
             }
             SettingsPage::Keybinds => self.first_row(shown, self.keybind_count),
-            SettingsPage::Trust => self.first_row(shown, self.trust_count),
+            SettingsPage::Permissions => self.first_row(shown, self.permissions_count),
             SettingsPage::Sources => {
                 self.first_sources(shown, self.source_count, self.default_count)
             }
@@ -3641,11 +3641,11 @@ impl SettingsSheet {
                 },
             ));
         }
-        // The trust page's hint wraps to a second line on a wide terminal,
+        // The permissions page's hint wraps to a second line on a wide terminal,
         // and a cut hint loses either its keys or its warning of what a
         // trusted script does. The list is short; one row of it pays for
         // the whole hint.
-        if self.shows_trust() {
+        if self.shows_permissions() {
             return Some((
                 panel,
                 Rect {
@@ -3710,9 +3710,9 @@ impl SettingsSheet {
         (index < self.keybind_count).then_some(index)
     }
 
-    /// The origin under a point, while the trust page is up.
-    pub fn trust_row_at(self, available: Rect, x: u16, y: u16) -> Option<usize> {
-        if !self.shows_trust() {
+    /// The row under a point, while the permissions page is up.
+    pub fn permission_row_at(self, available: Rect, x: u16, y: u16) -> Option<usize> {
+        if !self.shows_permissions() {
             return None;
         }
         let (_, rows) = self.geometry_for(available)?;
@@ -3720,8 +3720,8 @@ impl SettingsSheet {
             return None;
         }
         let shown = usize::from(rows.height).max(1);
-        let index = self.first_row(shown, self.trust_count) + usize::from(y - rows.y);
-        (index < self.trust_count).then_some(index)
+        let index = self.first_row(shown, self.permissions_count) + usize::from(y - rows.y);
+        (index < self.permissions_count).then_some(index)
     }
 
     /// The source under a point, while the sources page is up: an import
@@ -3884,8 +3884,9 @@ pub struct SettingsSheetView<'a> {
     pub mappings: [SlotView; MAPPING_SLOTS],
     /// The shortcut rows, as the keybinds page reads them.
     pub bindings: Vec<KeybindRow>,
-    /// The origins of the trust page: the trusted ones, then the refused.
-    pub trust: Vec<TrustRow>,
+    /// The rows of the permissions page: the trusted origins, then the
+    /// refused, then the orchestra switch.
+    pub permissions: Vec<PermissionRow>,
     /// The plugin folders and the two facts under them, as the vst page
     /// reads them.
     #[cfg(feature = "vst")]
@@ -4120,9 +4121,9 @@ impl SlotGrid {
     }
 }
 
-/// One origin of the trust page.
+/// One origin row of the permissions page.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TrustRow {
+pub struct PermissionRow {
     /// As the engine names it, such as `https://glossing.dev`.
     pub origin: String,
     /// Whether scores import scripts from it. A refused origin is on the
@@ -4810,7 +4811,7 @@ mod tests {
             sources: Vec::new(),
             mappings: Default::default(),
             bindings: Vec::new(),
-            trust: Vec::new(),
+            permissions: Vec::new(),
             #[cfg(feature = "vst")]
             vst: VstPage::default(),
         }
@@ -5050,7 +5051,7 @@ mod tests {
                         ..Default::default()
                     },
                 ],
-                trust: Vec::new(),
+                permissions: Vec::new(),
                 #[cfg(feature = "vst")]
                 vst: VstPage::default(),
             };
@@ -6212,7 +6213,7 @@ mod tests {
             sources: Vec::new(),
             mappings: Default::default(),
             bindings: Vec::new(),
-            trust: Vec::new(),
+            permissions: Vec::new(),
             #[cfg(feature = "vst")]
             vst: VstPage::default(),
             #[cfg(feature = "hydra")]
@@ -6329,7 +6330,7 @@ mod tests {
                     sources: sources.to_vec(),
                     mappings: Default::default(),
                     bindings: Vec::new(),
-                    trust: Vec::new(),
+                    permissions: Vec::new(),
                     #[cfg(feature = "vst")]
                     vst: VstPage::default(),
                 }
@@ -6593,7 +6594,7 @@ mod tests {
             sources: Vec::new(),
             mappings: Default::default(),
             bindings: Vec::new(),
-            trust: Vec::new(),
+            permissions: Vec::new(),
             #[cfg(feature = "vst")]
             vst: VstPage::default(),
         }
@@ -7248,7 +7249,7 @@ mod tests {
                 sources: Vec::new(),
                 mappings: Default::default(),
                 bindings: Vec::new(),
-                trust: Vec::new(),
+                permissions: Vec::new(),
                 #[cfg(feature = "vst")]
                 vst: VstPage::default(),
                 capabilities: KeyboardCapabilities::legacy(),
@@ -7353,7 +7354,7 @@ mod tests {
             sources: Vec::new(),
             mappings: Default::default(),
             bindings: Vec::new(),
-            trust: Vec::new(),
+            permissions: Vec::new(),
             #[cfg(feature = "vst")]
             vst: VstPage::default(),
             theme: &Theme::built_in_default(),
@@ -7678,20 +7679,20 @@ mod tests {
         }
         assert_eq!(sheet.page, SettingsPage::Reference);
         sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default());
-        assert_eq!(sheet.page, SettingsPage::Trust);
-        // The trust page walks its origins and names the one a key acts on.
-        sheet.trust_count = 2;
-        let mut trust_key = |code| sheet.key(code, &mut settings, &TerminalFeatures::default());
-        assert_eq!(trust_key(KeyCode::Up), SettingsAction::Nothing);
-        assert_eq!(trust_key(KeyCode::Enter), SettingsAction::TrustImport(1));
+        assert_eq!(sheet.page, SettingsPage::Permissions);
+        // The permissions page walks its rows and names the one a key acts on.
+        sheet.permissions_count = 2;
+        let mut permissions_key = |code| sheet.key(code, &mut settings, &TerminalFeatures::default());
+        assert_eq!(permissions_key(KeyCode::Up), SettingsAction::Nothing);
+        assert_eq!(permissions_key(KeyCode::Enter), SettingsAction::PermitRow(1));
         assert_eq!(
-            trust_key(KeyCode::Char(' ')),
-            SettingsAction::ToggleImport(1)
+            permissions_key(KeyCode::Char(' ')),
+            SettingsAction::ToggleRow(1)
         );
-        assert_eq!(trust_key(KeyCode::Down), SettingsAction::Nothing);
+        assert_eq!(permissions_key(KeyCode::Down), SettingsAction::Nothing);
         assert_eq!(
-            trust_key(KeyCode::Char('d')),
-            SettingsAction::ForgetImport(0)
+            permissions_key(KeyCode::Char('d')),
+            SettingsAction::ForgetRow(0)
         );
         sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default());
         assert_eq!(sheet.page, SettingsPage::About);
@@ -7706,7 +7707,7 @@ mod tests {
             &mut settings,
             &TerminalFeatures::default(),
         );
-        assert_eq!(sheet.page, SettingsPage::Trust);
+        assert_eq!(sheet.page, SettingsPage::Permissions);
         sheet.key(
             KeyCode::BackTab,
             &mut settings,
@@ -7754,14 +7755,14 @@ mod tests {
         assert_eq!(sheet.page, SettingsPage::Settings);
     }
 
-    /// The trust page's hint leads with its keys and keeps its whole
+    /// The permissions page's hint leads with its keys and keeps its whole
     /// text. The keys closed the hint before, so a terminal narrow
     /// enough to wrap it cut them off the page, and a player who cannot
-    /// see "Enter trusts" cannot work the page.
+    /// see "Enter permits" cannot work the page.
     #[test]
-    fn the_trust_page_hint_leads_with_its_keys_and_stays_whole() {
+    fn the_permissions_page_hint_leads_with_its_keys_and_stays_whole() {
         let sheet = SettingsSheet {
-            page: SettingsPage::Trust,
+            page: SettingsPage::Permissions,
             ..Default::default()
         };
         for (width, height) in [(120, 35), (80, 24), (60, 14)] {
@@ -7775,7 +7776,7 @@ mod tests {
             let mut buffer = Buffer::empty(area);
             SettingsSheetView {
                 sheet: SettingsSheet {
-                    trust_count: 1,
+                    permissions_count: 1,
                     ..sheet
                 },
                 settings: &settings,
@@ -7796,7 +7797,7 @@ mod tests {
                 sources: Vec::new(),
                 mappings: Default::default(),
                 bindings: Vec::new(),
-                trust: vec![TrustRow {
+                permissions: vec![PermissionRow {
                     origin: "https://example.com".to_owned(),
                     allowed: false,
                 }],
@@ -7822,7 +7823,7 @@ mod tests {
                 .join(" ");
             let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
             let keys = flat
-                .find("Enter trusts")
+                .find("Enter permits")
                 .unwrap_or_else(|| panic!("the keys are on the page at {width}x{height}"));
             let explain = flat
                 .find("a score loads a script")
@@ -7880,11 +7881,11 @@ mod tests {
             assert_eq!(at(61), Some(SettingsPage::Reference));
             assert_eq!(at(71), Some(SettingsPage::Reference));
             assert_eq!(at(72), None);
-            assert_eq!(at(73), Some(SettingsPage::Trust));
-            assert_eq!(at(79), Some(SettingsPage::Trust));
-            assert_eq!(at(80), None);
-            assert_eq!(at(81), Some(SettingsPage::About));
+            assert_eq!(at(73), Some(SettingsPage::Permissions));
+            assert_eq!(at(85), Some(SettingsPage::Permissions));
+            assert_eq!(at(86), None);
             assert_eq!(at(87), Some(SettingsPage::About));
+            assert_eq!(at(93), Some(SettingsPage::About));
         }
         #[cfg(not(feature = "vst"))]
         {
@@ -7892,11 +7893,11 @@ mod tests {
             assert_eq!(at(56), Some(SettingsPage::Reference));
             assert_eq!(at(66), Some(SettingsPage::Reference));
             assert_eq!(at(67), None);
-            assert_eq!(at(68), Some(SettingsPage::Trust));
-            assert_eq!(at(74), Some(SettingsPage::Trust));
-            assert_eq!(at(75), None);
-            assert_eq!(at(76), Some(SettingsPage::About));
+            assert_eq!(at(68), Some(SettingsPage::Permissions));
+            assert_eq!(at(80), Some(SettingsPage::Permissions));
+            assert_eq!(at(81), None);
             assert_eq!(at(82), Some(SettingsPage::About));
+            assert_eq!(at(88), Some(SettingsPage::About));
         }
         assert_eq!(at(23), None, "the gap between tabs is nobody's");
         assert_eq!(at(33), None);
@@ -7926,7 +7927,7 @@ mod tests {
             #[cfg(feature = "vst")]
             ("vst", SettingsPage::Vst),
             ("reference", SettingsPage::Reference),
-            ("trust", SettingsPage::Trust),
+            ("permissions", SettingsPage::Permissions),
             ("about", SettingsPage::About),
         ] {
             let column = title[..title.find(label).expect(label)].chars().count() as u16;
@@ -8029,7 +8030,7 @@ mod tests {
             sources: Vec::new(),
             mappings: Default::default(),
             bindings: Vec::new(),
-            trust: Vec::new(),
+            permissions: Vec::new(),
             #[cfg(feature = "vst")]
             vst: VstPage::default(),
             sheet: SettingsSheet {
@@ -8279,7 +8280,7 @@ mod tests {
             sources: Vec::new(),
             mappings,
             bindings: Vec::new(),
-            trust: Vec::new(),
+            permissions: Vec::new(),
             #[cfg(feature = "vst")]
             vst: VstPage::default(),
             capabilities: KeyboardCapabilities::legacy(),

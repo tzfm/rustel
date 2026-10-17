@@ -267,7 +267,7 @@ pub struct StudioConfig {
     /// input does, so a hermetic studio never opens the runner's
     /// microphone (nor, on macOS, asks for permission to).
     pub open_default_input: bool,
-    /// The origins of the Trust page, which scores import scripts from.
+    /// The origins of the permissions page, which scores import scripts from.
     /// They add to the origins that `session` already trusts.
     pub import_origins: Vec<String>,
 }
@@ -294,7 +294,7 @@ impl Default for StudioConfig {
 }
 
 /// The origins that `session` trusts for script imports, and `origins` of
-/// the Trust page added to them.
+/// the permissions page added to them.
 pub(super) fn import_access(
     session: &SessionConfig,
     origins: &[String],

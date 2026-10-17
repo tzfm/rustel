@@ -38,8 +38,8 @@ impl Widget for SettingsSheetView<'_> {
             render_about(&self, panel, rows, buffer);
             return;
         }
-        if self.sheet.page == SettingsPage::Trust {
-            render_trust(&self, panel, rows, buffer);
+        if self.sheet.page == SettingsPage::Permissions {
+            render_permissions(&self, panel, rows, buffer);
             return;
         }
         if self.sheet.page == SettingsPage::Mapping {
@@ -685,8 +685,9 @@ pub(super) fn render_keybinds(
     }
 }
 
-/// The trust page: one origin a row, and what the keys do below the list.
-pub(super) fn render_trust(
+/// The permissions page: one row an origin or a switch, and what the
+/// keys do below the list.
+pub(super) fn render_permissions(
     view: &SettingsSheetView<'_>,
     panel: Rect,
     rows: Rect,
@@ -695,8 +696,8 @@ pub(super) fn render_trust(
     let theme = view.theme;
     let width = usize::from(rows.width);
     let shown = usize::from(rows.height).max(1);
-    let first = view.sheet.first_row(shown, view.trust.len());
-    if view.trust.is_empty() {
+    let first = view.sheet.first_row(shown, view.permissions.len());
+    if view.permissions.is_empty() {
         buffer.set_stringn(
             rows.x,
             rows.y,
@@ -706,13 +707,13 @@ pub(super) fn render_trust(
         );
     }
     let origin_width = view
-        .trust
+        .permissions
         .iter()
         .map(|row| row.origin.width())
         .max()
         .unwrap_or(0);
     for (offset, (index, row)) in view
-        .trust
+        .permissions
         .iter()
         .enumerate()
         .skip(first)
@@ -744,11 +745,11 @@ pub(super) fn render_trust(
         );
     }
     // The keys lead, as on every other page: the footer often has room
-    // for one line, and a player who cannot see "Enter trusts" cannot
+    // for one line, and a player who cannot see "Enter permits" cannot
     // work the page.
-    let keys = match view.trust.get(view.sheet.selected) {
+    let keys = match view.permissions.get(view.sheet.selected) {
         Some(row) if row.allowed => "Space off · d removes · Tab pages",
-        Some(_) => "Enter trusts · Space on/off · d dismisses · Tab pages",
+        Some(_) => "Enter permits · Space on/off · d dismisses · Tab pages",
         None => "Tab pages",
     };
     let text = format!(

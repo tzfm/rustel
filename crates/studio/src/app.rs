@@ -13,7 +13,7 @@
 //! | completion lists at the caret (Ctrl+Space, Tab) | `completion.rs`, `string_roles.rs`, `bank_context.rs` |
 //! | hearing a chord, scale, sound or snippet | `previews.rs` |
 //! | the Settings sheet | `settings_sheet.rs` |
-//! | its Trust page: origins for script imports | `import_trust.rs` |
+//! | its Permissions page: origins and orchestras | `permissions.rs` |
 //! | the theme picker, editor and save sheet | `theme_sheets.rs` |
 //! | the export sheet | `export_sheet.rs` |
 //! | the top menu and help | `menu_bar.rs` |
@@ -157,7 +157,7 @@ mod event_loop;
 mod export_sheet;
 mod focus;
 mod hydra_backdrop;
-mod import_trust;
+mod permissions;
 mod jobs_panel;
 mod key_bindings;
 mod keyboard;
@@ -1137,9 +1137,9 @@ struct App {
     /// the next update to say the same.
     update_failure: Option<(SceneId, Revision)>,
     /// The origins whose script imports the engine refused in this studio,
-    /// newest last. The Trust page offers them, so nobody types an origin.
+    /// newest last. The permissions page offers them, so nobody types an origin.
     blocked_imports: Vec<String>,
-    /// The Trust page changed and the engine does not have the list yet.
+    /// The permissions page changed and the engine does not have the list yet.
     import_origins_owed: bool,
     /// Latest refused revision for each scene with an unresolved log alert.
     evaluation_alerts: HashMap<SceneId, Revision>,

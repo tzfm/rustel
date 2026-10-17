@@ -789,7 +789,7 @@ fn settings_and_advanced_keep_their_place_until_studio_restarts() {
 }
 
 /// A score that imports a script from an origin nobody trusted is refused,
-/// and the footer names the Trust page. The page offers the origin as a
+/// and the footer names the permissions page. The page offers the origin as a
 /// switch: Enter trusts it, Space turns the trust off where the row stands,
 /// and the next studio still trusts it.
 #[test]
@@ -800,7 +800,7 @@ fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
     studio.settle();
     assert_eq!(
         studio.errors().as_deref(),
-        Some("https://scripts.invalid is not trusted - Settings → Trust lets its scripts run"),
+        Some("https://scripts.invalid is not trusted - Settings → Permissions lets its scripts run"),
     );
 
     open_sheet(&mut studio);

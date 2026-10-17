@@ -229,7 +229,7 @@ enum EngineCommand {
         budget_bytes: usize,
         idle: Duration,
     },
-    /// The origins of the Trust page, after the player changed them.
+    /// The origins of the permissions page, after the player changed them.
     SetImportOrigins(Vec<String>),
     /// What the performer can reach without a wait: the tabs whose sounds
     /// no memory policy may drop, and those kept by recency.

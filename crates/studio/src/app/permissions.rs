@@ -1,12 +1,14 @@
-//! The Trust page: the origins a score imports scripts from.
+//! The Permissions page: the origins a score imports scripts from, and
+//! the native orchestra switch.
 //!
 //! The engine refuses `await import('https://...')` from an origin that is
-//! not trusted. The page reads as a switch: Enter trusts a refused origin,
-//! and Space flips a row where it stands, so a trust can be taken back
+//! not trusted. The page reads as a switch: Enter permits a refused origin,
+//! and Space flips a row where it stands, so a permission can be taken back
 //! without the origin leaving the page. A refused or turned-off origin
-//! stays listed until the studio closes; a trust is kept in the settings.
+//! stays listed until the studio closes; an origin trust is kept in the
+//! settings.
 
-use super::super::settings::TrustRow;
+use super::super::settings::PermissionRow;
 use super::super::worker::EngineFailure;
 use super::App;
 use super::transport::ErrorOwner;
@@ -16,7 +18,7 @@ const MAX_BLOCKED_IMPORTS: usize = 16;
 
 impl App {
     /// What a refused import says on the footer. The origin goes on the
-    /// Trust page. `None` for every other failure.
+    /// permissions page. `None` for every other failure.
     pub(super) fn note_untrusted_import(&mut self, failure: &EngineFailure) -> Option<String> {
         if failure.kind != "untrusted-import" {
             return None;
@@ -33,14 +35,15 @@ impl App {
             self.blocked_imports.push(origin.clone());
         }
         Some(format!(
-            "{origin} is not trusted - Settings → Trust lets its scripts run"
+            "{origin} is not trusted - Settings → Permissions lets its scripts run"
         ))
     }
 
-    /// The rows of the Trust page: the trusted origins, then the refused.
-    pub(super) fn trust_rows(&self) -> Vec<TrustRow> {
+    /// The rows of the permissions page: the trusted origins, then the
+    /// refused.
+    pub(super) fn permission_rows(&self) -> Vec<PermissionRow> {
         let row = |allowed| {
-            move |origin: &String| TrustRow {
+            move |origin: &String| PermissionRow {
                 origin: origin.clone(),
                 allowed,
             }
@@ -53,9 +56,9 @@ impl App {
             .collect()
     }
 
-    /// Enter on a row of the Trust page.
-    pub(super) fn trust_import(&mut self, at: usize) {
-        let Some(row) = self.trust_rows().into_iter().nth(at) else {
+    /// Enter on a row of the permissions page.
+    pub(super) fn permit_row(&mut self, at: usize) {
+        let Some(row) = self.permission_rows().into_iter().nth(at) else {
             return;
         };
         if row.allowed {
@@ -81,15 +84,15 @@ impl App {
         self.status = format!("{} trusted · update the score to load it", row.origin);
     }
 
-    /// Space on a row of the Trust page: trust a refused origin, or take
-    /// the trust back where the row stands. The origin stays on the page,
-    /// so the trust can come back with one more Space.
-    pub(super) fn toggle_import(&mut self, at: usize) {
-        let Some(row) = self.trust_rows().into_iter().nth(at) else {
+    /// Space on a row of the permissions page: permit a refused origin, or
+    /// take the permission back where the row stands. The origin stays on
+    /// the page, so the permission can come back with one more Space.
+    pub(super) fn toggle_row(&mut self, at: usize) {
+        let Some(row) = self.permission_rows().into_iter().nth(at) else {
             return;
         };
         if !row.allowed {
-            self.trust_import(at);
+            self.permit_row(at);
             return;
         }
         self.prefs
@@ -107,9 +110,9 @@ impl App {
         self.status = format!("{} off · its scripts no longer load", row.origin);
     }
 
-    /// Delete on a row of the Trust page.
-    pub(super) fn forget_import(&mut self, at: usize) {
-        let Some(row) = self.trust_rows().into_iter().nth(at) else {
+    /// Delete on a row of the permissions page.
+    pub(super) fn forget_row(&mut self, at: usize) {
+        let Some(row) = self.permission_rows().into_iter().nth(at) else {
             return;
         };
         if row.allowed {

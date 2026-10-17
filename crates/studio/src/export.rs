@@ -521,7 +521,7 @@ pub struct ExportGlance {
 
 /// Snapshot the host default and any persisted score override for an isolated
 /// export. Re-evaluating source text can then override this inherited value.
-/// The export imports scripts from the origins of the Trust page too.
+/// The export imports scripts from the origins of the permissions page too.
 pub(super) fn session_config(
     default: &SessionConfig,
     host_default: usize,
@@ -1666,7 +1666,7 @@ mod tests {
             limited, unrestricted,
             "the job must use the passed host budget"
         );
-        // The origins of the Trust page reach the export.
+        // The origins of the permissions page reach the export.
         let origins = ["https://glossing.dev".to_owned()];
         let config = session_config(&SessionConfig::default(), 192, None, &origins);
         assert_eq!(config.max_polyphony, 192);

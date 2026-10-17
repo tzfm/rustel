@@ -351,7 +351,7 @@ impl StudioEngine {
         }
     }
 
-    /// Replace the origins of the Trust page. The next evaluation imports
+    /// Replace the origins of the permissions page. The next evaluation imports
     /// scripts from them and from the origins the session config trusts.
     pub fn set_import_origins(&mut self, origins: &[String]) {
         self.session
