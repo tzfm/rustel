@@ -27,7 +27,9 @@
 //! ```
 //!
 //! Every level is a share of the pitch setting, so the shape moves with the
-//! note. The values are fitted to the original engine's output.
+//! note. The voice's range stretches the line where it runs above the
+//! setting and keeps it as it is below, and the shape is the same at every
+//! speed. The values are fitted to the original engine's output.
 //!
 //! Monotone holds the pitch setting. Sung steps through a scale around it,
 //! one note per syllable, picked by the syllable's first consonant. An
@@ -39,29 +41,29 @@ use crate::personality::Timbre;
 use crate::phonetic::Ph;
 
 /// The level before the first accent.
-const START: f32 = 0.985;
+const START: f32 = 0.99;
 /// Accent height per stress digit 4 to 9, at range 100.
-const HEIGHT: [f32; 6] = [0.17, 0.186, 0.24, 0.333, 0.42, 0.45];
+const HEIGHT: [f32; 6] = [0.177, 0.184, 0.25, 0.346, 0.42, 0.45];
 /// After an accent that is not the last: the floor and the sinking rate per
-/// second.
-const FLOOR: f32 = 1.009;
-const SINK: f32 = 0.456;
+/// second at speed 150.
+const FLOOR: f32 = 1.013;
+const SINK: f32 = 0.378;
 /// A later accent rises this share of its height above the line.
-const LATER: f32 = 0.495;
+const LATER: f32 = 0.509;
 /// Where a phrase ends after a full stop, with and without accents.
-const FALL_ACCENTED: f32 = 0.703;
+const FALL_ACCENTED: f32 = 0.711;
 const FALL_PLAIN: f32 = 0.767;
 /// The level the line reaches before the final rise of a question or an
 /// open ending.
-const BEFORE_QUESTION: f32 = 1.021;
+const BEFORE_QUESTION: f32 = 1.022;
 const BEFORE_OPEN: f32 = 1.026;
 /// The level of a phrase with no accent before a final rise.
 const PLAIN_LEVEL: f32 = 0.97;
 /// The final rise over the last syllable: after an accent, and without one.
-const RISE_QUESTION: f32 = 0.299;
-const RISE_OPEN: f32 = 0.16;
-const RISE_QUESTION_PLAIN: f32 = 0.18;
-const RISE_OPEN_PLAIN: f32 = 0.24;
+const RISE_QUESTION: f32 = 0.252;
+const RISE_OPEN: f32 = 0.056;
+const RISE_QUESTION_PLAIN: f32 = 0.15;
+const RISE_OPEN_PLAIN: f32 = 0.198;
 /// An accent reaches its height this long after its syllable starts, ms at
 /// speed 150.
 const ACCENT_DELAY: f32 = 112.0;
@@ -137,42 +139,31 @@ fn height(digit: u8) -> f32 {
     HEIGHT[usize::from(digit.clamp(4, 9) - 4)]
 }
 
-/// The anchor points of one phrase.
-fn anchors(
-    syls: &[Syllable],
-    terminal: char,
-    base: f32,
-    range: f32,
-    delay: f32,
-    out: &mut Vec<(f32, f32)>,
-) {
+/// The anchor points of one phrase, as shares of the pitch setting at range
+/// 100. `scale` is 150 over the speed.
+fn anchors(syls: &[Syllable], terminal: char, delay: f32, scale: f32, out: &mut Vec<(f32, f32)>) {
     let n = syls.len();
     let accents: Vec<usize> = (0..n).filter(|&i| syls[i].digit >= 4).collect();
     let mut vals = vec![0.0; n];
     match (accents.first(), accents.last()) {
         (Some(&first), Some(&last)) => {
-            vals[..first].fill(base * START);
-            let mut from = (
-                syls[first].v1,
-                base * (1.0 + height(syls[first].digit) * range),
-            );
+            vals[..first].fill(START);
+            let mut from = (syls[first].v1, 1.0 + height(syls[first].digit));
             vals[first] = from.1;
             for i in first + 1..n {
                 if i <= last {
-                    let line = (from.1 - base * SINK * (syls[i].mid() - from.0) / 1000.0)
-                        .max(base * FLOOR);
-                    vals[i] = line;
+                    let sunk = SINK * (syls[i].mid() - from.0) / 1000.0 / scale;
+                    vals[i] = (from.1 - sunk).max(FLOOR);
                     if syls[i].digit >= 4 {
-                        vals[i] += base * height(syls[i].digit) * range * LATER;
+                        vals[i] += height(syls[i].digit) * LATER;
                         from = (syls[i].v1, vals[i]);
                     }
                 } else {
-                    let end = base
-                        * match terminal {
-                            '.' => FALL_ACCENTED,
-                            '?' => BEFORE_QUESTION,
-                            _ => BEFORE_OPEN,
-                        };
+                    let end = match terminal {
+                        '.' => FALL_ACCENTED,
+                        '?' => BEFORE_QUESTION,
+                        _ => BEFORE_OPEN,
+                    };
                     let span = (syls[n - 1].mid() - from.0).max(1.0);
                     let x = ((syls[i].mid() - from.0) / span).clamp(0.0, 1.0);
                     vals[i] = from.1 + (end - from.1) * x;
@@ -181,18 +172,17 @@ fn anchors(
         }
         _ => {
             for (i, v) in vals.iter_mut().enumerate() {
-                *v = base
-                    * if terminal == '.' {
-                        let span = syls[n - 1].mid() - syls[0].mid();
-                        let x = if span > 0.0 {
-                            (syls[i].mid() - syls[0].mid()) / span
-                        } else {
-                            0.0
-                        };
-                        START + (FALL_PLAIN - START) * x
+                *v = if terminal == '.' {
+                    let span = syls[n - 1].mid() - syls[0].mid();
+                    let x = if span > 0.0 {
+                        (syls[i].mid() - syls[0].mid()) / span
                     } else {
-                        PLAIN_LEVEL
+                        0.0
                     };
+                    START + (FALL_PLAIN - START) * x
+                } else {
+                    PLAIN_LEVEL
+                };
             }
         }
     }
@@ -212,17 +202,26 @@ fn anchors(
             let end = if !last {
                 vals[i]
             } else if terminal == '.' {
-                vals[i] + (base * FALL_ACCENTED - vals[i]) * 0.6
+                vals[i] + (FALL_ACCENTED - vals[i]) * 0.6
             } else {
-                vals[i] + base * rise
+                vals[i] + rise
             };
             out.push((syl.v1, end));
         } else if last && terminal != '.' {
             out.push((syl.v0, vals[i]));
-            out.push((syl.v1, vals[i] + base * rise));
+            out.push((syl.v1, vals[i] + rise));
         } else {
             out.push((syl.mid(), vals[i]));
         }
+    }
+}
+
+/// The range stretches a level above the setting and keeps one below it.
+fn stretch(level: f32, range: f32) -> f32 {
+    if level > 1.0 {
+        1.0 + (level - 1.0) * range
+    } else {
+        level
     }
 }
 
@@ -369,14 +368,10 @@ impl Pitch {
         match quality {
             Quality::Natural => {
                 for (syls, terminal) in phrases(segs) {
-                    anchors(
-                        &syls,
-                        terminal,
-                        base,
-                        range,
-                        ACCENT_DELAY * scale,
-                        &mut points,
-                    );
+                    anchors(&syls, terminal, ACCENT_DELAY * scale, scale, &mut points);
+                }
+                for p in &mut points {
+                    p.1 = base * stretch(p.1, range);
                 }
                 points.sort_by(|a, b| a.0.total_cmp(&b.0));
             }
@@ -464,6 +459,37 @@ mod tests {
         let want = [146.0, 146.0 * 1.112, 146.0 * 1.49];
         for (got, want) in notes.iter().zip(want) {
             assert!((got - want).abs() < 1.0, "{notes:?}");
+        }
+    }
+
+    /// Natural pitch at the middle of each vowel, as shares of 100 Hz.
+    fn natural(phon: &str, range: i16, speed: u32) -> Vec<f32> {
+        let items = parse(phon).unwrap();
+        let segs = super::super::timing::build(&items, speed, 100);
+        let mut timbre = crate::personality::Personality::Man.timbre();
+        timbre.range = range;
+        timbre.perturb = 0;
+        let mut pitch = Pitch::plan(&segs, Quality::Natural, 100.0, speed, &timbre);
+        segs.iter()
+            .filter(|s| s.ph.is_some_and(Ph::is_vowel))
+            .map(|s| pitch.at((s.t0 + s.t1) / 2.0) / 100.0)
+            .collect()
+    }
+
+    /// In the original engine a wider range stretches the line above the
+    /// setting and keeps the fall below it, and the line keeps its shape at
+    /// any speed.
+    #[test]
+    fn range_stretches_the_rise_and_speed_keeps_the_shape() {
+        let phon = "SAA SAA5 SAA SAA4 SAA SAA SAA.";
+        let (narrow, wide) = (natural(phon, 100, 150), natural(phon, 350, 150));
+        for (n, w) in narrow.iter().zip(&wide) {
+            let want = if *n > 1.0 { 1.0 + 3.5 * (n - 1.0) } else { *n };
+            assert!((w - want).abs() < 0.01, "{narrow:?} {wide:?}");
+        }
+        let fast = natural(phon, 100, 300);
+        for (a, b) in narrow.iter().zip(&fast) {
+            assert!((a - b).abs() < 0.02, "{narrow:?} {fast:?}");
         }
     }
 }
