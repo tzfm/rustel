@@ -837,7 +837,12 @@ impl Host {
                 return;
             };
             let stamp = cache::stamp(&bundle);
-            let read = crate::worker::scan(&program, &bundle, &self.shared.closed);
+            let read = crate::worker::scan(
+                &program,
+                &bundle,
+                crate::worker::WORK_LIMIT,
+                &self.shared.closed,
+            );
             // With no scan process, each bundle stays as it is, and loads
             // in this process when a score names it. The next scan tries
             // again.
@@ -1001,7 +1006,7 @@ impl Host {
     fn finish_load(&self, bundle: PathBuf) {
         let start = Instant::now();
         let stamp = cache::stamp(&bundle);
-        let loaded = contained("load", || load_bundle(&bundle));
+        let loaded = contained("load", || load_bundle(&bundle, &mut || {}));
         let loaded = loaded.map(|(mut plugins, failed): (Vec<Plugin>, Vec<Scanned>)| {
             for plugin in &mut plugins {
                 plugin.load_time = start.elapsed();
@@ -1671,10 +1676,15 @@ fn scanned(class: &ClassInfo, fault: Option<String>) -> Scanned {
 }
 
 /// Loads a bundle in this process and reads the parameters of each plugin
-/// in the bundle. Runs on the plugin thread. Answers the plugins that load
-/// and each class that does not, with its fault. A bundle with no class
-/// that loads fails with the fault of its first class.
-pub(crate) fn load_bundle(bundle: &Path) -> Result<(Vec<Plugin>, Vec<Scanned>), String> {
+/// in the bundle, as the load of a score does. Calls `progress` after each
+/// class, so a caller can report that the read moves. Answers the plugins
+/// that load and each class that does not, with its fault. A bundle with
+/// no class that loads fails with the fault of its first class. Runs on
+/// the plugin thread.
+pub(crate) fn load_bundle(
+    bundle: &Path,
+    progress: &mut dyn FnMut(),
+) -> Result<(Vec<Plugin>, Vec<Scanned>), String> {
     let module = Arc::new(Module::load(bundle)?);
     let classes = module.classes();
     if classes.is_empty() {
@@ -1687,6 +1697,7 @@ pub(crate) fn load_bundle(bundle: &Path) -> Result<(Vec<Plugin>, Vec<Scanned>), 
             Ok(params) => plugins.push(Plugin::new(Arc::clone(&module), class, params)),
             Err(fault) => failed.push(scanned(&class, Some(fault))),
         }
+        progress();
     }
     match failed.first() {
         Some(first) if plugins.is_empty() => Err(first.fault.clone().unwrap_or_default()),

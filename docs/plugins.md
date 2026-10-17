@@ -53,7 +53,9 @@ one time, in a process of its own. A bundle with a fault at the scan stays
 off, and rustel goes on. In a bundle with several plugins, a plugin that
 does not start stays off with its reason, and the others stay on. The fault
 stays in the cache with the stamp of the bundle, so an unchanged bundle
-gets no new test. A rescan tries it again.
+gets no new test. A rescan tries it again. Each class of a bundle has two
+minutes at the scan, so a bundle with many slow classes scans to its end
+while a class that hangs still fails.
 Studio scans in the background, so you play and edit during the scan.
 
 The file `~/.rustel/vst/scan.json` keeps the result. `rustel vst --rescan`,
