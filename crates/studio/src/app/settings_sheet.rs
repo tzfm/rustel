@@ -6,6 +6,7 @@
 //! engine, the Keybinds page (learning a chord, building its rows), and keeping
 //! the camera open for the Settings webcam preview or a camera theme.
 
+use super::super::settings::PermissionRow;
 use super::*;
 
 impl App {
@@ -474,14 +475,15 @@ impl App {
             self.dirty_frame = true;
             return true;
         }
-        // An origin of the trust page: the click chooses it. Trust and
-        // removal stay the keys' work.
+        // A row of the permissions page: the click chooses it. Permitting
+        // and removal stay the keys' work.
+        let permissions = self.permission_row_count();
         if let Some(sheet) = self.settings_sheet.as_mut() {
-            sheet.trust_count = self.prefs.import_origins.len() + self.blocked_imports.len();
+            sheet.permissions_count = permissions;
         }
         if let Some(row) = self
             .settings_sheet
-            .and_then(|sheet| sheet.trust_row_at(self.settings_sheet_frame(), x, y))
+            .and_then(|sheet| sheet.permission_row_at(self.settings_sheet_frame(), x, y))
         {
             self.focus_panel(PanelKind::Settings);
             self.pointer = Some(Pointer::Panel);
@@ -628,7 +630,7 @@ impl App {
         // The learnable rows plus the fixed ones past them (the panels'
         // Alt chords, which a learn can neither take nor move).
         sheet.keybind_count = super::super::settings::RESET_KEYBINDS_ROW + 1;
-        sheet.trust_count = self.prefs.import_origins.len() + self.blocked_imports.len();
+        sheet.permissions_count = self.permission_row_count();
         #[cfg(feature = "vst")]
         self.count_vst_folders(&mut sheet);
         match sheet.key_in_frame(
@@ -938,29 +940,38 @@ impl App {
                 return true;
             }
             SettingsAction::RefreshSource(at) => self.refresh_sample_source(at),
-            SettingsAction::TrustImport(at) => {
-                let refused = at >= self.prefs.import_origins.len();
-                self.trust_import(at);
-                if refused {
+            SettingsAction::PermitRow(at) => {
+                let refused_origin = matches!(
+                    self.permission_rows().get(at),
+                    Some(PermissionRow::Origin { allowed: false, .. })
+                );
+                self.permit_row(at);
+                if refused_origin {
                     // The origin moved up, to the end of the trusted ones.
                     sheet.selected = self.prefs.import_origins.len().saturating_sub(1);
                 }
             }
-            SettingsAction::ToggleImport(at) => {
-                let refused = at >= self.prefs.import_origins.len();
-                self.toggle_import(at);
-                // Either way the row moved: a trust taken back lands at the
-                // end of the refused ones, a trust given at the end of the
-                // trusted ones.
-                sheet.selected = if refused {
-                    self.prefs.import_origins.len().saturating_sub(1)
-                } else {
-                    (self.prefs.import_origins.len() + self.blocked_imports.len()).saturating_sub(1)
+            SettingsAction::ToggleRow(at) => {
+                // The orchestra switch stays where it stands. Either way an
+                // origin moved: a permission taken back lands at the end of
+                // the refused ones, one given at the end of the trusted.
+                let (origin, refused) = match self.permission_rows().get(at) {
+                    Some(PermissionRow::Origin { allowed, .. }) => (true, !*allowed),
+                    _ => (false, false),
                 };
+                self.toggle_row(at);
+                if origin {
+                    sheet.selected = if refused {
+                        self.prefs.import_origins.len().saturating_sub(1)
+                    } else {
+                        (self.prefs.import_origins.len() + self.blocked_imports.len())
+                            .saturating_sub(1)
+                    };
+                }
             }
-            SettingsAction::ForgetImport(at) => {
-                self.forget_import(at);
-                let rows = self.prefs.import_origins.len() + self.blocked_imports.len();
+            SettingsAction::ForgetRow(at) => {
+                self.forget_row(at);
+                let rows = self.permission_row_count();
                 sheet.selected = at.min(rows.saturating_sub(1));
             }
             // The prompt opens over the page, as the import prompt does.

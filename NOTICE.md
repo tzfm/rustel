@@ -114,6 +114,14 @@ in their own work; this collective credit does not transfer ownership.
   sources' generation details and any separate terms for their inputs have
   not been independently verified.
 
+## Csound
+
+`crates/csound/src/presets.orc` adapts the instruments and `keymap` opcode from
+[Strudel's Csound presets](https://github.com/tidalcycles/strudel/blob/7f02baf93b46b6a5062d5472f9d70887a9c634d0/packages/csound/presets.orc),
+under AGPL-3.0-or-later. The Rust host loads a separately installed
+[Csound](https://github.com/csound/csound) library, under LGPL-2.1-or-later.
+Rustel does not bundle that library.
+
 ## VST3 interfaces
 
 The plugin host in `crates/vst3` talks to plugins through the `vst3` crate.

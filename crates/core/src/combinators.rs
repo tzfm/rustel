@@ -2037,6 +2037,29 @@ pub fn osc<P: PatOps>(pat: &P, port: f64) -> P {
     compose(pat, &P::pat_pure(object), ComposeOp::Keep, Alignment::In)
 }
 
+/// Select a Csound instrument with frequency or MIDI pfields.
+pub fn csound<P: PatOps>(pat: &P, instrument: &Value, midi: bool) -> P {
+    let instrument = if !midi && !instrument.js_truthy() {
+        Value::Str("triangle".to_string())
+    } else {
+        instrument.clone()
+    };
+    pat.fmap(move |value| {
+        let mut controls = match value {
+            Value::Object(controls) => controls.clone(),
+            value => crate::OrderedMap::from_entries([("value".to_string(), value.clone())]),
+        };
+        let (route, previous) = if midi {
+            ("csoundm", "csound")
+        } else {
+            ("csound", "csoundm")
+        };
+        controls.remove(previous);
+        controls.insert(route.to_string(), instrument.clone());
+        Value::Object(controls)
+    })
+}
+
 /// The `[a, b, …]` destructuring these four share: a non-array argument is
 /// wrapped, and missing positions are `undefined`.
 fn slots(value: &Value, n: usize) -> Vec<Value> {

@@ -253,6 +253,8 @@ impl StudioEngine {
         {
             let live = self.live.as_mut().expect("checked live playback");
             let device = &live.device;
+            live.producer
+                .reap_completed_output(device.completed_intake_frames(), device.sample_rate());
             let mut played = PlayedSink {
                 by_score: &mut self.played_by_score,
                 by_text: &mut self.played_by_text,
@@ -663,8 +665,7 @@ impl StudioEngine {
         if let Some(library) = self.session.sample_library() {
             library.set_render_rate(device.sample_rate());
         }
-        #[cfg(feature = "vst")]
-        self.session.attach_plugins(&device);
+        self.session.attach_instruments(&device);
         Ok(device)
     }
 }

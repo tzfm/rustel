@@ -371,7 +371,7 @@ impl OrdinaryStringLiteralRanges {
 /// `.midi("Pilote IAC Bus 1")` reaches the call as four words: `Pilote`,
 /// `IAC`, `Bus`, `1`. The transpiler leaves the string unchanged, so a
 /// name means the same in single and double quotes.
-const PORT_NAMED_CALLS: [(&str, usize); 10] = [
+const PORT_NAMED_CALLS: [(&str, usize); 14] = [
     ("midi", 0),
     ("midin", 0),
     ("midikeys", 0),
@@ -383,6 +383,10 @@ const PORT_NAMED_CALLS: [(&str, usize); 10] = [
     ("samples", 0),
     ("samples", 1),
     ("loadSoundfont", 0),
+    ("loadOrc", 0),
+    ("loadCSound", 0),
+    ("loadCsound", 0),
+    ("loadcsound", 0),
     // A plugin, by the name of its bundle.
     ("vst", 0),
     ("vsti", 0),
@@ -4358,6 +4362,10 @@ mod tests {
             r#"$: s("bd").midimap("my map")"#,
             r#"await samples("github:tidalcycles/dirt-samples")"#,
             r#"await samples({ bd: ["bd.wav"] }, "https://example.test/audio/")"#,
+            r#"await loadOrc("local:custom voices.orc")"#,
+            r#"await loadCSound("instr Bell\nendin")"#,
+            r#"await loadCsound(`instr Bell\nendin`)"#,
+            r#"await loadcsound("instr Bell\nendin")"#,
             r#"$: s("bd").serial(38400, 0, 0, "/dev/tty.usbmodem 1")"#,
             r#"$: s("bd").vst("Valhalla Supermassive", { preset: "Warm Pad" })"#,
             r#"$: note("c3").vsti("Serum 2", { preset: "Bass One" })"#,
@@ -4381,6 +4389,8 @@ mod tests {
                         .output
                         .contains("m('github:tidalcycles/dirt-samples'")
                     && !output.output.contains("m('https://example.test/audio/'")
+                    && !output.output.contains("m('local:custom voices.orc'")
+                    && !output.output.contains("m('instr Bell")
                     && !output.output.contains("m('/dev/tty.usbmodem 1'")
                     && !output.output.contains("m('Valhalla Supermassive'")
                     && !output.output.contains("m('Warm Pad'")

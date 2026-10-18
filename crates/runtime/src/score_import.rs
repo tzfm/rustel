@@ -23,6 +23,8 @@ const IMPORT_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScoreImportAccess {
     origins: Vec<String>,
+    local_root: Option<Arc<crate::sample_server::ServedRoot>>,
+    csound: bool,
 }
 
 /// Why an import does not load.
@@ -38,6 +40,21 @@ pub(crate) enum ImportRefusal {
 impl ScoreImportAccess {
     pub fn denied() -> Self {
         Self::default()
+    }
+
+    /// Allow native orchestra code, including its filesystem and process opcodes.
+    pub fn permit_csound(&mut self) {
+        self.set_csound(true);
+    }
+
+    /// Turn native orchestra permission on or off. The studio's permissions
+    /// page flips it during a run; the launch flag only turns it on.
+    pub fn set_csound(&mut self, allowed: bool) {
+        self.csound = allowed;
+    }
+
+    pub fn csound_allowed(&self) -> bool {
+        self.csound
     }
 
     /// Trust the scripts of one exact origin, such as `https://glossing.dev`.
@@ -56,6 +73,62 @@ impl ScoreImportAccess {
     /// The trusted origins, in the order they were added.
     pub fn origins(&self) -> &[String] {
         &self.origins
+    }
+
+    /// Trust local orchestra files beneath this directory. Symlinks cannot
+    /// leave the directory, and sample access grants do not imply this grant.
+    pub fn permit_local_root(&mut self, root: impl AsRef<std::path::Path>) -> Result<(), String> {
+        self.local_root = Some(Arc::new(crate::sample_server::ServedRoot::open(
+            root.as_ref(),
+        )?));
+        Ok(())
+    }
+
+    pub(crate) fn local_orchestra(&self, specifier: &str) -> Result<String, String> {
+        use std::io::Read;
+
+        let specifier = specifier.strip_prefix("local:").unwrap_or(specifier);
+        let root = self
+            .local_root
+            .as_ref()
+            .ok_or("local orchestra access is not enabled")?;
+        let path = if specifier.starts_with("file:") {
+            Url::parse(specifier)
+                .ok()
+                .and_then(|url| url.to_file_path().ok())
+                .ok_or("invalid local orchestra URL")?
+        } else {
+            std::path::PathBuf::from(specifier)
+        };
+        let path = if path.is_absolute() {
+            path
+        } else {
+            // The root holds a verbatim path on Windows, and joining onto
+            // one resolves `..` against the root itself: `nested/../x`
+            // would reach the root's own `x`, and more `..` climbs out of
+            // the directory. Refuse the traversal while the specifier
+            // still reads as plain components.
+            if path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                return Err(
+                    "local orchestra is outside the trusted directory or cannot be read".to_owned(),
+                );
+            }
+            root.path().join(path)
+        };
+        let (file, _) = root
+            .open_score_file(&path)
+            .map_err(|_| "local orchestra is outside the trusted directory or cannot be read")?;
+        let mut bytes = Vec::new();
+        file.take(MAX_IMPORT_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "cannot read local orchestra")?;
+        if bytes.len() > MAX_IMPORT_BYTES {
+            return Err("local orchestra is larger than 1024 KiB".into());
+        }
+        String::from_utf8(bytes).map_err(|_| "local orchestra is not UTF-8 text".into())
     }
 
     pub(crate) fn approve(&self, specifier: &str) -> Result<Url, ImportRefusal> {
@@ -146,6 +219,73 @@ pub(crate) fn fetch(url: &Url) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orchestra_files_need_a_separate_confined_grant() {
+        let root = tempfile::tempdir().expect("orchestra directory");
+        let source = "instr probe\nendin";
+        std::fs::write(root.path().join("probe.orc"), source).expect("orchestra");
+        let mut access = ScoreImportAccess::denied();
+        assert!(access.local_orchestra("local:probe.orc").is_err());
+        access.permit_local_root(root.path()).expect("grant");
+        assert!(!access.csound_allowed());
+        assert_eq!(access.local_orchestra("local:probe.orc").unwrap(), source);
+        assert_eq!(access.local_orchestra("probe.orc").unwrap(), source);
+        let absolute = root.path().join("probe.orc");
+        assert_eq!(
+            access.local_orchestra(absolute.to_str().unwrap()).unwrap(),
+            source
+        );
+        assert_eq!(
+            access
+                .local_orchestra(Url::from_file_path(&absolute).unwrap().as_str())
+                .unwrap(),
+            source
+        );
+        assert!(access.local_orchestra("../outside.orc").is_err());
+        assert!(access.local_orchestra("nested/../probe.orc").is_err());
+        std::fs::create_dir(root.path().join("directory.orc")).expect("directory");
+        assert!(access.local_orchestra("directory.orc").is_err());
+        let outside = tempfile::NamedTempFile::new().expect("outside file");
+        assert!(
+            access
+                .local_orchestra(outside.path().to_str().unwrap())
+                .is_err()
+        );
+        assert!(
+            access
+                .local_orchestra(Url::from_file_path(outside.path()).unwrap().as_str())
+                .is_err()
+        );
+        std::fs::write(root.path().join("binary.orc"), [0xff]).expect("binary");
+        assert!(
+            access
+                .local_orchestra("binary.orc")
+                .unwrap_err()
+                .contains("UTF-8")
+        );
+        std::fs::write(
+            root.path().join("large.orc"),
+            vec![b'a'; MAX_IMPORT_BYTES + 1],
+        )
+        .expect("large orchestra");
+        assert!(
+            access
+                .local_orchestra("large.orc")
+                .unwrap_err()
+                .contains("larger than")
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path(), root.path().join("escape.orc"))
+                .expect("symlink");
+            assert!(access.local_orchestra("escape.orc").is_err());
+            std::fs::write(root.path().join(".hidden.orc"), source).expect("hidden file");
+            std::os::unix::fs::symlink(".hidden.orc", root.path().join("hidden.orc"))
+                .expect("hidden symlink");
+            assert!(access.local_orchestra("hidden.orc").is_err());
+        }
+    }
 
     #[test]
     fn only_a_trusted_origin_is_approved() {

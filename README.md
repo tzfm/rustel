@@ -29,7 +29,7 @@ Rustel is a native port of [Strudel](https://strudel.cc), written in Rust
 for Linux, macOS, and Windows. It supports command-line use, live coding
 in your preferred editor, and a studio that runs in a terminal.
 
-Play synths, samples, and VST3 instruments and effects. Control MIDI/OSC
+Play synths, samples, Csound orchestras, and VST3 instruments and effects. Control MIDI/OSC
 devices, add live visuals, and export audio. No browser is required.
 
 ## What you get
@@ -198,7 +198,7 @@ against the same goldens. Add that run when you change the DSP kernels.
 
 - [Guides by task](docs/README.md)
 - [Studio guide](docs/studio.md) · [Installation and updates](rustelup/README.md)
-- [VST3 plugins](docs/plugins.md) · [Hardware](docs/hardware.md)
+- [VST3 plugins](docs/plugins.md) · [Csound](docs/csound.md) · [Hardware](docs/hardware.md)
 - [Strudel compatibility](docs/compatibility.md) · [Engine overview](docs/overview.md)
 - [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 

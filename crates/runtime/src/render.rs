@@ -177,6 +177,13 @@ fn whole_begin_cycle(whole_begin: &str) -> Option<f64> {
 /// runs must not pay for a slider that cannot move.
 pub(crate) fn bind_live_controls(event: &mut rustel_audio::OnsetEvent, onset: &OnsetEventJson) {
     event.controls.live_controls = onset.live_controls;
+    if event
+        .controls
+        .instrument
+        .is_some_and(|instrument| instrument.score().is_some())
+    {
+        event.controls.live_controls[0] = 0;
+    }
     // Gain modulation currently normalizes against the onset's base and
     // has its own placement around nonlinear effects. Keep that existing
     // graph unchanged instead of claiming a direct live binding for it.
@@ -352,6 +359,7 @@ pub(crate) fn write_scalar_mp3_with_dispatch(
     library: Option<&crate::samples::SampleLibrary>,
     dispatch: DspDispatch,
     max_polyphony: usize,
+    csound: Option<&crate::csound::State>,
 ) -> io::Result<(usize, Vec<String>)> {
     if !MP3_EXPORT {
         return Err(mp3_unavailable());
@@ -364,6 +372,7 @@ pub(crate) fn write_scalar_mp3_with_dispatch(
         library,
         dispatch,
         max_polyphony,
+        csound,
     )?;
     Ok((encode_mp3(path, sample_rate, &pcm)?, refused))
 }
@@ -463,6 +472,7 @@ fn in_memory_render_frames(sample_rate: u32, duration_secs: f64) -> io::Result<u
 /// `voice_refused` messages the render skipped, which a Session queues as
 /// diagnostics when direct logging is off, so an offline caller is not left
 /// with a silent buffer and no explanation.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_scalar_pcm_with_refusals(
     sample_rate: u32,
     duration_secs: f64,
@@ -471,9 +481,12 @@ pub(crate) fn render_scalar_pcm_with_refusals(
     library: Option<&crate::samples::SampleLibrary>,
     dispatch: DspDispatch,
     max_polyphony: usize,
+    csound: Option<&crate::csound::State>,
 ) -> io::Result<(Vec<f32>, Vec<String>)> {
     // Refuse oversized renders before sample loading or PCM allocation.
     let frames = in_memory_render_frames(sample_rate, duration_secs)?;
+    let render_csound = csound.map(crate::csound::State::for_render);
+    let csound = render_csound.as_ref();
     let bundled = rustel_voice::BundledOnly;
     let lookup: &dyn rustel_voice::SampleLookup = match library {
         Some(library) => library,
@@ -494,40 +507,70 @@ pub(crate) fn render_scalar_pcm_with_refusals(
             library.wait_until_idle(std::time::Duration::from_secs(120));
         }
     }
+    let csound_lookup = csound.map(|state| crate::csound::Lookup {
+        samples: lookup,
+        state,
+    });
+    let lookup = csound_lookup
+        .as_ref()
+        .map_or(lookup, |lookup| lookup as &dyn rustel_voice::SampleLookup);
     let mut notices = notice_tally();
     let mut refused: Vec<String> = Vec::new();
     #[cfg(feature = "vst")]
     let mut chains = crate::vst::RenderChains::new();
-    let events: Vec<rustel_audio::OnsetEvent> = onsets
-        .iter()
-        .filter_map(|onset| {
-            match tallied_scalar_event(onset, sample_rate, cps, lookup, notices.as_mut()) {
-                Ok(event) => {
-                    #[cfg(feature = "vst")]
-                    let event = chains.number(event, &onset.value);
-                    Some(event)
-                }
-                Err(message) => {
-                    if !refused.iter().any(|seen| seen == &message) {
-                        if rustel_voice::direct_diagnostic_logging() {
-                            eprintln!(
-                                "{}",
-                                serde_json::json!({ "voice_refused": { "message": &message } })
-                            );
-                        }
-                        refused.push(message);
-                    }
-                    None
-                }
+    let mut ordered: Vec<_> = onsets.iter().collect();
+    ordered.sort_by_key(|onset| onset_frame_at(onset.target_time, sample_rate));
+    let has_csound = onsets.iter().any(|onset| matches!(&onset.value,
+        crate::ValueJson::Raw(value) if value.get("csound").is_some() || value.get("csoundm").is_some()));
+    if has_csound && let Some(csound) = csound {
+        csound.ensure_ready().map_err(io::Error::other)?;
+    }
+    let events = ordered.into_iter().filter_map(|onset| {
+        match tallied_scalar_event(onset, sample_rate, cps, lookup, notices.as_mut()) {
+            Ok(event) => {
+                #[cfg(feature = "vst")]
+                let event = chains.number(event, &onset.value);
+                Some(event)
             }
-        })
-        .collect();
+            Err(message) => {
+                if !refused.iter().any(|seen| seen == &message) {
+                    if rustel_voice::direct_diagnostic_logging() {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({ "voice_refused": { "message": &message } })
+                        );
+                    }
+                    refused.push(message);
+                }
+                None
+            }
+        }
+    });
+    let mut backend = scalar_backend(dispatch, library, max_polyphony, csound);
+    let pcm = if has_csound {
+        rustel_audio::render_pcm_events(&mut backend, sample_rate, frames, events)
+    } else {
+        rustel_audio::render_pcm(
+            &mut backend,
+            sample_rate,
+            frames,
+            &events.collect::<Vec<_>>(),
+        )
+    }
+    .map_err(io::Error::other)?;
     print_notice_tally(notices);
-    let mut backend = scalar_backend(dispatch, library, max_polyphony);
-    let pcm = rustel_audio::render_pcm(&mut backend, sample_rate, frames, &events)
-        .map_err(io::Error::other)?;
     print_plugin_problems();
+    check_csound_errors(csound)?;
     Ok((pcm, refused))
+}
+
+fn check_csound_errors(csound: Option<&crate::csound::State>) -> io::Result<()> {
+    let errors = csound.map_or_else(Vec::new, crate::csound::State::take_errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(errors.join("\n")))
+    }
 }
 
 /// Prints the problems of the plugin host in a render with direct logging:
@@ -552,8 +595,12 @@ fn scalar_backend(
     dispatch: DspDispatch,
     library: Option<&crate::samples::SampleLibrary>,
     max_polyphony: usize,
+    csound: Option<&crate::csound::State>,
 ) -> rustel_audio::ScalarBackend {
     let mut backend = rustel_audio::ScalarBackend::with_dispatch(dispatch);
+    // A render reads faster than real time, so it waits for an insert
+    // that renders ahead to publish each block before collecting it.
+    backend.render_offline();
     backend.set_max_polyphony(max_polyphony);
     if let Some(library) = library {
         for (id, decoded) in library.take_ready() {
@@ -564,6 +611,9 @@ fn scalar_backend(
     #[cfg(feature = "vst")]
     if let Some(plugins) = crate::vst::started() {
         backend.set_insert_provider(plugins.provider(true));
+    }
+    if let Some(csound) = csound {
+        backend.set_insert_provider(csound.provider(true));
     }
     #[cfg(test)]
     tests::BUILT_DISPATCH.set(Some(backend.dispatch()));
@@ -670,6 +720,7 @@ pub fn write_scalar_wav_controlled(
         format,
         DspDispatch::automatic(),
         rustel_audio::MAX_POLYPHONY,
+        None,
     )
     .map(|(bytes, _)| bytes)
 }
@@ -690,8 +741,11 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
     format: rustel_audio::WavSampleFormat,
     dispatch: DspDispatch,
     max_polyphony: usize,
+    csound: Option<&crate::csound::State>,
 ) -> io::Result<(usize, Vec<String>)> {
     let cancelled = control.cancelled;
+    let render_csound = csound.map(crate::csound::State::for_render);
+    let csound = render_csound.as_ref();
     let stopped = || cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
     let cancelled_now = || io::Error::other(rustel_audio::RENDER_CANCELLED);
     let bundled = rustel_voice::BundledOnly;
@@ -746,6 +800,19 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
             }
         }
     }
+    let csound_lookup = csound.map(|state| crate::csound::Lookup {
+        samples: lookup,
+        state,
+    });
+    let lookup = csound_lookup
+        .as_ref()
+        .map_or(lookup, |lookup| lookup as &dyn rustel_voice::SampleLookup);
+    if onsets.iter().any(|onset| matches!(&onset.value,
+        crate::ValueJson::Raw(value) if value.get("csound").is_some() || value.get("csoundm").is_some()))
+        && let Some(csound) = csound
+    {
+        csound.ensure_ready().map_err(io::Error::other)?;
+    }
     // Same skip-and-log contract as the live batch: an unrenderable event
     // drops only its own voice; the rest still play. One bad onset must never
     // silence an offline render either. A run of one refusal prints once;
@@ -755,34 +822,32 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
     let mut refused: Vec<String> = Vec::new();
     #[cfg(feature = "vst")]
     let mut chains = crate::vst::RenderChains::new();
-    let events: Vec<rustel_audio::OnsetEvent> = onsets
-        .iter()
-        .filter_map(|onset| {
-            match tallied_scalar_event(onset, sample_rate, cps, lookup, notices.as_mut()) {
-                Ok(event) => {
-                    #[cfg(feature = "vst")]
-                    let event = chains.number(event, &onset.value);
-                    Some(event)
-                }
-                Err(message) => {
-                    if last_refused.as_deref() != Some(message.as_str()) {
-                        if rustel_voice::direct_diagnostic_logging() {
-                            eprintln!(
-                                "{}",
-                                serde_json::json!({ "voice_refused": { "message": &message } })
-                            );
-                        }
-                        if !refused.contains(&message) {
-                            refused.push(message.clone());
-                        }
-                        last_refused = Some(message);
-                    }
-                    None
-                }
+    let mut ordered: Vec<_> = onsets.iter().collect();
+    ordered.sort_by_key(|onset| onset_frame_at(onset.target_time, sample_rate));
+    let events = ordered.into_iter().filter_map(|onset| {
+        match tallied_scalar_event(onset, sample_rate, cps, lookup, notices.as_mut()) {
+            Ok(event) => {
+                #[cfg(feature = "vst")]
+                let event = chains.number(event, &onset.value);
+                Some(event)
             }
-        })
-        .collect();
-    print_notice_tally(notices);
+            Err(message) => {
+                if last_refused.as_deref() != Some(message.as_str()) {
+                    if rustel_voice::direct_diagnostic_logging() {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({ "voice_refused": { "message": &message } })
+                        );
+                    }
+                    if !refused.contains(&message) {
+                        refused.push(message.clone());
+                    }
+                    last_refused = Some(message);
+                }
+                None
+            }
+        }
+    });
     let frames = (duration_secs * f64::from(sample_rate)).round();
     if !frames.is_finite() || frames < 0.0 || frames > usize::MAX as f64 {
         return Err(io::Error::new(
@@ -790,7 +855,7 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
             "scalar render frame count is not representable",
         ));
     }
-    let mut backend = scalar_backend(dispatch, library, max_polyphony);
+    let mut backend = scalar_backend(dispatch, library, max_polyphony, csound);
     let rustel_audio::RenderControl {
         mut observer,
         finish,
@@ -822,12 +887,12 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
             observer(tick);
         }
     };
-    let written = rustel_audio::write_wav_controlled(
+    let written = rustel_audio::write_wav_events_controlled(
         path,
         &mut backend,
         sample_rate,
         frames as usize,
-        &events,
+        events,
         rustel_audio::RenderControl {
             observer: Some(&mut observed),
             cancelled,
@@ -837,7 +902,9 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
         },
         format,
     );
+    print_notice_tally(notices);
     print_plugin_problems();
+    check_csound_errors(csound)?;
     written
         .map(|bytes| (bytes, refused))
         .map_err(io::Error::other)
@@ -1427,6 +1494,7 @@ mod tests {
             None,
             DspDispatch::automatic(),
             rustel_audio::MAX_POLYPHONY,
+            None,
         )
         .expect("an ordinary in-memory render still renders");
     }

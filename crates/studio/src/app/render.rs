@@ -1094,7 +1094,7 @@ impl App {
             sources: self.source_rows(),
             mappings: self.mapping_slot_views(),
             keybind_rows: self.keybind_rows(),
-            trust_rows: self.trust_rows(),
+            permission_rows: self.permission_rows(),
             #[cfg(feature = "vst")]
             vst_page: self.vst_page(),
             latency: self.latency_report(),

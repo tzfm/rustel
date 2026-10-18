@@ -1759,14 +1759,29 @@ mod tests {
                         continue;
                     }
                     checked += 1;
-                    let mut session = rustel_runtime::Session::new().expect("a session");
+                    let csound = matches!(
+                        entry.name.as_str(),
+                        "csound" | "csoundm" | "loadCSound" | "loadOrc"
+                    );
+                    let mut config = rustel_runtime::SessionConfig::default();
+                    if csound {
+                        config.score_import_access.permit_csound();
+                    }
+                    let mut session =
+                        rustel_runtime::Session::with_config(config).expect("a session");
                     if let Err(error) = session.evaluate(example) {
-                        broken.push(format!(
-                            "{}: {} - in {example:?}",
-                            entry.name,
-                            format!("{error}").replace('\n', " ")
-                        ));
-                        continue;
+                        let error = error.to_string();
+                        let native_absent = csound
+                            && std::env::var_os("RUSTEL_CSOUND_LIBRARY").is_none()
+                            && error.contains("Csound 6 is not available");
+                        if !native_absent {
+                            broken.push(format!(
+                                "{}: {} - in {example:?}",
+                                entry.name,
+                                error.replace('\n', " ")
+                            ));
+                            continue;
+                        }
                     }
                     if let Some(first) = rustel_runtime::lint::lint(example, false, Some(&library))
                         .into_iter()

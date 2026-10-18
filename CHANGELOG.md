@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Csound instruments play and export with `.csound()` and `.csoundm()`. Load orchestras with `loadCSound` or `loadOrc`. Requires double-precision Csound 6.18 or later 6.x. Studio enables native orchestras at startup, and the command line requires `--allow-csound`. See [Csound](https://github.com/tzfm/rustel/blob/main/docs/csound.md).
 - A note release no longer suppresses a MIDI press that follows within 40 ms. Scene pads and learned action buttons could miss that press.
 
 ## v0.1.4

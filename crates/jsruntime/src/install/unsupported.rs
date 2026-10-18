@@ -88,18 +88,6 @@ pub(crate) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         origin: "rustel",
     },
     ReferenceEntry {
-        name: "loadOrc",
-        synonyms: &[],
-        summary: "Csound orchestra loading is not supported",
-        description: "Rustel does not support loading Csound orchestras. Calling loadOrc() causes a score evaluation error; during live playback, the last successful score keeps playing.",
-        params: &[],
-        examples: &[],
-        tags: &["rustel", "audio"],
-        no_autocomplete: true,
-        deprecated: false,
-        origin: "rustel",
-    },
-    ReferenceEntry {
         name: "getDuration",
         synonyms: &["getDur"],
         summary: "sample duration lookup is not supported",
@@ -118,7 +106,7 @@ fn refuse<'js>(
     _args: Rest<rquickjs::Value<'js>>,
     name: &'static str,
 ) -> rquickjs::Result<rquickjs::Value<'js>> {
-    if matches!(name, "loadOrc" | "getDuration" | "getDur") {
+    if matches!(name, "getDuration" | "getDur") {
         return Err(rquickjs::Exception::throw_message(
             &ctx,
             &format!("{name}() is not supported."),
@@ -203,7 +191,7 @@ pub(super) fn install<'js>(
     #[cfg(feature = "hydra")]
     let _ = runtime;
 
-    for name in ["K", "audioin", "S", "loadOrc", "getDuration", "getDur"] {
+    for name in ["K", "audioin", "S", "getDuration", "getDur"] {
         let current: rquickjs::Value = globals.get(name).map_err(|error| error.to_string())?;
         if !current.is_undefined() {
             continue;
@@ -226,7 +214,7 @@ mod tests {
     fn unsupported_native_calls_are_refused_instead_of_silently_accepted() {
         let runtime = JsRuntime::new().expect("runtime");
         runtime.install_semantic_bindings().expect("bindings");
-        for name in ["loadOrc", "getDuration", "getDur"] {
+        for name in ["getDuration", "getDur"] {
             let error = runtime.ctx.with(|ctx| {
                 let function: Function = ctx.globals().get(name).expect("unsupported binding");
                 let result: rquickjs::Result<rquickjs::Value> = function.call(("value",));

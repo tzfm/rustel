@@ -89,11 +89,14 @@ fn retained_bytes(source: &Option<AudibleSource>, limit: usize) -> Option<usize>
         .len()
         .checked_add(2 * std::mem::size_of::<usize>())?
         .checked_add(std::mem::size_of::<AudibleSource>())?;
-    let remaining = limit.checked_sub(text)?;
-    source
+    let settings = source
         .settings
-        .retained_snapshot_bytes(remaining)?
-        .checked_add(text)
+        .retained_snapshot_bytes(limit.checked_sub(text)?)?;
+    let bytes = text.checked_add(settings)?;
+    source
+        .csound
+        .retained_snapshot_bytes(limit.checked_sub(bytes)?)?
+        .checked_add(bytes)
 }
 
 impl Session {
@@ -256,6 +259,7 @@ impl Session {
         // Select settings once; do not measure one publication then capture a
         // different one. Snapshotting only clones fixed-size ownership handles.
         let settings = self.js.snapshot_published_runtime_settings();
+        let csound = self.csound_snapshot();
         let text_bytes = self.last_source.as_ref().map_or(0, |source| source.len());
         let bytes = if self.last_source.is_none() {
             Some(0)
@@ -268,6 +272,12 @@ impl Session {
                         .checked_sub(text)
                         .and_then(|room| settings.retained_snapshot_bytes(room))
                         .and_then(|native| text.checked_add(native))
+                })
+                .and_then(|bytes| {
+                    MAX_PAYLOAD_BYTES
+                        .checked_sub(bytes)
+                        .and_then(|room| csound.retained_snapshot_bytes(room))
+                        .and_then(|native| bytes.checked_add(native))
                 })
         }
         .ok_or_else(|| {
@@ -323,6 +333,7 @@ impl Session {
             source: source.clone(),
             mini: self.last_path == super::EvaluateSource::MiniRust,
             settings,
+            csound,
             cps: self.scheduler.cps(),
             cycle_zero_time: self
                 .scheduler

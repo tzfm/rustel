@@ -34,6 +34,39 @@ pub fn render_pcm(
     Ok(pcm)
 }
 
+/// Render events in onset order as the output reaches them. The iterator may
+/// prepare instrument data without retaining every note for the whole render.
+pub fn render_pcm_events(
+    backend: &mut dyn AudioBackend,
+    sample_rate: u32,
+    frames: usize,
+    events: impl IntoIterator<Item = OnsetEvent>,
+) -> Result<Vec<f32>, String> {
+    backend.init(sample_rate)?;
+    backend.reset();
+    let mut events = events.into_iter().peekable();
+    let mut pcm = vec![0.0f32; frames * 2];
+    const BLOCK: usize = 128;
+    let mut offset = 0usize;
+    while offset < frames {
+        let admit_before = offset
+            .saturating_add((sample_rate as usize / 10).max(1))
+            .saturating_add(2 * BLOCK) as u64;
+        while events
+            .peek()
+            .is_some_and(|event| event.onset_frame < admit_before)
+        {
+            let event = events.next().expect("peeked event");
+            backend.prepare_note(&event)?;
+            backend.note(event);
+        }
+        let count = (frames - offset).min(BLOCK);
+        backend.process_block(&mut pcm[offset * 2..(offset + count) * 2], count);
+        offset += count;
+    }
+    Ok(pcm)
+}
+
 /// Stream a deterministic 16-bit stereo WAV without holding its PCM body in
 /// memory. The backend is processed in 128-frame blocks.
 pub fn write_pcm16_wav(
@@ -242,6 +275,22 @@ pub fn write_wav_controlled(
     control: RenderControl<'_, '_>,
     format: WavSampleFormat,
 ) -> Result<usize, String> {
+    let mut queued = events.to_vec();
+    queued.sort_by_key(|event| event.onset_frame);
+    write_wav_events_controlled(path, backend, sample_rate, frames, queued, control, format)
+}
+
+/// Stream a WAV from events in onset order. The iterator is read within the
+/// scheduler lookahead window, so native score queues stay bounded.
+pub fn write_wav_events_controlled(
+    path: impl AsRef<Path>,
+    backend: &mut dyn AudioBackend,
+    sample_rate: u32,
+    frames: usize,
+    events: impl IntoIterator<Item = OnsetEvent>,
+    control: RenderControl<'_, '_>,
+    format: WavSampleFormat,
+) -> Result<usize, String> {
     const CHANNELS: u16 = 2;
     const BLOCK: usize = 128;
     let RenderControl {
@@ -295,9 +344,7 @@ pub fn write_wav_controlled(
     // must not grow it without limit. An offline render that queues every
     // onset up front exceeds that bound, and the backend drops the rest
     // without an error.
-    let mut queued: Vec<crate::OnsetEvent> = events.to_vec();
-    queued.sort_by_key(|event| event.onset_frame);
-    let mut next_event = 0usize;
+    let mut queued = events.into_iter().peekable();
 
     let mut file = File::create(path).map_err(|error| error.to_string())?;
     file.write_all(b"RIFF").map_err(|error| error.to_string())?;
@@ -339,8 +386,6 @@ pub fn write_wav_controlled(
             finalise_partial_wav(&mut file, offset, CHANNELS, bytes_per_sample)?;
             return Err(RENDER_CANCELLED.to_owned());
         }
-        let input_count = (frames - offset + skip).min(BLOCK);
-        let render_count = input_count.min(frames.saturating_sub(input_offset));
         // Admit one scheduler lead plus one block so nothing is handed to the
         // backend late. Most sources remain pending until their onset. SBD
         // intentionally becomes active during this window: its connected
@@ -351,11 +396,16 @@ pub fn write_wav_controlled(
         let admit_before = input_offset
             .saturating_add(scheduler_lookahead)
             .saturating_add(2 * BLOCK) as u64;
-        while next_event < queued.len() && queued[next_event].onset_frame < admit_before {
-            backend.prepare_note(&queued[next_event])?;
-            backend.note(queued[next_event].clone());
-            next_event += 1;
+        while queued
+            .peek()
+            .is_some_and(|event| event.onset_frame < admit_before)
+        {
+            let event = queued.next().expect("peeked event");
+            backend.prepare_note(&event)?;
+            backend.note(event);
         }
+        let input_count = (frames - offset + skip).min(BLOCK);
+        let render_count = input_count.min(frames.saturating_sub(input_offset));
         if render_count > 0 {
             backend.process_block(&mut pcm[..render_count * CHANNELS as usize], render_count);
         }
