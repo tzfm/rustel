@@ -351,10 +351,21 @@ pub fn reopen_over(closed: Hermetic) -> Hermetic {
 /// for the suites that lay their own audio on disk (a folder to drop, a
 /// source to import) rather than going through a fixture.
 pub fn wav_bytes() -> Vec<u8> {
+    pcm16_mono_wav(&[0; 8000])
+}
+
+/// A quarter second of a full-scale 500 Hz square wave at 8 kHz, 16-bit
+/// mono: a sample whose bounce is audible wherever it plays.
+pub fn loud_wav_bytes() -> Vec<u8> {
+    let square: Vec<i16> = (0..2000)
+        .map(|frame| if frame % 16 < 8 { i16::MAX } else { -i16::MAX })
+        .collect();
+    pcm16_mono_wav(&square)
+}
+
+fn pcm16_mono_wav(samples: &[i16]) -> Vec<u8> {
     let sample_rate: u32 = 8000;
-    let seconds: u32 = 1;
-    let samples = sample_rate * seconds;
-    let data_len = samples * 2;
+    let data_len = samples.len() as u32 * 2;
     let mut bytes = Vec::with_capacity(44 + data_len as usize);
     bytes.extend_from_slice(b"RIFF");
     bytes.extend_from_slice(&((36 + data_len).to_le_bytes()));
@@ -369,7 +380,9 @@ pub fn wav_bytes() -> Vec<u8> {
     bytes.extend_from_slice(&16u16.to_le_bytes()); // bits
     bytes.extend_from_slice(b"data");
     bytes.extend_from_slice(&data_len.to_le_bytes());
-    bytes.extend_from_slice(&vec![0u8; data_len as usize]);
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
     bytes
 }
 

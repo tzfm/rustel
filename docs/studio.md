@@ -457,9 +457,10 @@ Ctrl+J opens the quick action at the caret. On a number, it can create a slider.
 On a slider, it can change or remove the control. These source edits require
 an update before they change playback.
 
-Controller mapping in Settings can bind a MIDI knob or controller axis to a
-slider. See [hardware](hardware.md) for setup. Terminals that report pixel
-positions give finer mouse control; other terminals use cell positions.
+The sliders page in Settings can bind a MIDI knob or controller axis to a
+slider. The keybinds page can bind a button to any studio action, Update and
+Stop included. See [hardware](hardware.md) for setup. Terminals that report
+pixel positions give finer mouse control; other terminals use cell positions.
 
 ## Mixer and limiter
 
@@ -682,7 +683,9 @@ at the same time.
 Press Ctrl+Shift+X to render the focused score offline. Export uses the text
 currently in the editor, including unsaved changes. The global and local
 prebakes run first, as they do before a score in play, so a name a setup
-defines is there for the bounce. Live playback continues.
+defines is there for the bounce. The bounce also uses the same samples as
+play: the folders and packs in Settings ▸ Samples, the audio in the set
+folder, and your bank renames. Live playback continues.
 Use Tab and arrows to choose the length, WAV or MP3 format, and output path.
 
 Choose a fixed number of cycles or **until silence**. Until-silence export stops

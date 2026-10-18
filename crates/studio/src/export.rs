@@ -4,10 +4,12 @@
 //! An export is always one score - the scene in the focused pane, as
 //! written - because a bounce of "the set" would mean nothing. The two
 //! prebakes run before it, as they do before a score in play, so a name a
-//! set has taught the engine is there for the bounce too. It is the same
-//! offline render `rustel export` performs, in a session of its own on
+//! set has taught the engine is there for the bounce too. Its library holds
+//! the imported sources and the set's own samples that play has. It is the
+//! same offline render `rustel export` performs, in a session of its own on
 //! a thread of its own, so the engine playing the room is never touched.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
@@ -24,6 +26,7 @@ use unicode_width::UnicodeWidthStr;
 use super::devices::draw_border;
 use super::prebake::{self, PrebakeScope};
 use super::theme::Theme;
+use rustel_runtime::samples::{GlobalSource, SampleLibrary, ScoreSampleAccess};
 use rustel_runtime::{MP3_EXPORT, RenderFormat, Session, SessionConfig};
 
 /// The ceiling a silence-ended export can run to.
@@ -541,12 +544,41 @@ pub(super) fn session_config(
 }
 
 /// What one bounce plays: the score's source, the flag that says how to
-/// read it, and the two setup sources that run before it.
+/// read it, the two setup sources that run before it, and the sounds the
+/// studio adds to the default library.
 pub struct ExportScore {
     pub source: String,
     pub mini: bool,
     pub prebakes: [String; 2],
     pub csound: rustel_runtime::CsoundSnapshot,
+    pub samples: ExportSamples,
+}
+
+/// The sounds play has beyond the default library: the player's bank
+/// renames, the sources on Settings > Samples and the set's own folder.
+#[derive(Default)]
+pub struct ExportSamples {
+    pub bank_renames: HashMap<String, String>,
+    pub source_bank_renames: HashMap<(String, String), String>,
+    pub global_sources: Vec<GlobalSource>,
+    pub set_folder: Option<PathBuf>,
+}
+
+impl ExportSamples {
+    /// Give the bounce's library what the studio gives the engine's, in the
+    /// same order: the renames first, so imported banks arrive under the
+    /// names the player chose. The folders are read again here, so a
+    /// source that does not read now is left out of the bounce. The studio
+    /// log already names such a source.
+    fn adopt(&self, library: &SampleLibrary, access: &ScoreSampleAccess) {
+        library.set_import_policy(access.clone());
+        library.set_bank_renames(self.bank_renames.clone());
+        library.set_source_bank_renames(self.source_bank_renames.clone());
+        if let Some(folder) = &self.set_folder {
+            let _ = library.adopt_set_folder(folder);
+        }
+        library.adopt_global_sources(&self.global_sources);
+    }
 }
 
 /// The render, on its own thread.
@@ -683,6 +715,11 @@ fn render(
     // The render does not care what the CLI would print; a library that
     // cannot be reached bounces the synths and says so in the log.
     let _ = session.enable_default_samples();
+    if let Some(library) = session.sample_library() {
+        score
+            .samples
+            .adopt(library, &session.config().score_sample_access);
+    }
     // What play runs, the bounce runs: the two setups first, so a score can
     // call by name what its set taught the heap. A setup the engine refuses
     // stops the bounce naming itself, not the score line that misses it.
@@ -1049,6 +1086,7 @@ mod tests {
             mini: false,
             prebakes: no_prebakes(),
             csound: rustel_runtime::CsoundSnapshot::default(),
+            samples: ExportSamples::default(),
         }
     }
 
@@ -1481,6 +1519,7 @@ mod tests {
                     mini: false,
                     prebakes,
                     csound: rustel_runtime::CsoundSnapshot::default(),
+                    samples: ExportSamples::default(),
                 },
                 ExportSettings {
                     length: Length::Cycles(0.5),

@@ -151,6 +151,12 @@ impl App {
                 .as_ref()
                 .map(|snapshot| snapshot.csound.clone())
                 .unwrap_or_default(),
+            samples: ExportSamples {
+                bank_renames: self.prefs.bank_renames(),
+                source_bank_renames: self.prefs.source_bank_renames(),
+                global_sources: self.prefs.global_sources(),
+                set_folder: Some(self.scenes.directory().to_path_buf()),
+            },
         };
         match ExportJob::start(
             sheet.scene_name.clone(),

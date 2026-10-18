@@ -648,7 +648,7 @@ pub(super) fn render_keybinds(
             "Enter: confirm rebind · Esc: cancel".to_owned()
         }
         Some(row) if row.learning => {
-            "Press the shortcut · Esc: cancel · No response? Try another key or check terminal/system shortcuts."
+            "Press the shortcut or the controller button · Esc: cancel · No response? Try another key or check terminal/system shortcuts."
                 .to_owned()
         }
         _ => keybinds_footer_hint(view.sheet, view.settings, view.features),
@@ -808,7 +808,34 @@ pub(super) fn render_keybind_rows(
         .max()
         .unwrap_or(7)
         .clamp(7, 12);
-    let alternate_x = chord_x + chord_width + 2;
+    // The midi column sits between the chord and the alias, and only
+    // exists once some row answers to a message: a studio that has bound
+    // nothing keeps the layout it always had.
+    let any_midi = bindings
+        .iter()
+        .skip(KEYBIND_ACTION_START)
+        .any(|row| !row.midi.is_empty());
+    let midi_width = if any_midi {
+        bindings
+            .iter()
+            .skip(KEYBIND_ACTION_START)
+            .map(|row| row.midi.width())
+            .max()
+            .unwrap_or(6)
+            .max(6)
+    } else {
+        0
+    };
+    let midi_x = if any_midi {
+        chord_x + chord_width + 2
+    } else {
+        chord_x
+    };
+    let alternate_x = if any_midi {
+        midi_x + midi_width + 2
+    } else {
+        chord_x + chord_width + 2
+    };
     let alternate_width = bindings
         .iter()
         .map(|row| row.also.width())
@@ -876,7 +903,7 @@ pub(super) fn render_keybind_rows(
                 width,
             );
         } else if row.learning {
-            cell(chord_x, "press keys…", width);
+            cell(chord_x, "press keys or a control…", width);
         } else {
             cell(
                 chord_x,
@@ -887,6 +914,9 @@ pub(super) fn render_keybind_rows(
                 },
                 chord_width,
             );
+            if !row.midi.is_empty() {
+                cell(midi_x, &row.midi, midi_width);
+            }
             if !row.also.is_empty() {
                 cell(alternate_x, &format!("also {}", row.also), alternate_width);
             }
