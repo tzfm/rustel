@@ -191,6 +191,37 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # Temporary diagnostics for the --locked resolution failures; remove
+      # once the cause is captured.
+      - name: Diagnose the locked resolve
+        if: runner.os == 'Linux'
+        run: |
+          git status --porcelain || true
+          if cargo metadata --locked --format-version 1 > /dev/null 2>/tmp/locked.err; then
+            echo "METADATA LOCKED OK"
+          else
+            echo "METADATA LOCKED FAIL"
+            cat /tmp/locked.err
+            cargo metadata --format-version 1 > /dev/null 2>/tmp/unlocked.err \
+              || { echo "UNLOCKED ALSO FAIL"; tail -30 /tmp/unlocked.err; }
+            git --no-pager diff --stat -- Cargo.lock || true
+            git --no-pager diff -- Cargo.lock | head -120 || true
+            names=$(git --no-pager diff -- Cargo.lock \
+              | grep '^[-+]name = ' | sort -u \
+              | sed 's/^[-+]name = //' | tr -d '"' | head -5)
+            for name in $names; do
+              n=${#name}
+              if [ "$n" -le 3 ]; then
+                path="$n/${name:0:1}/$name"
+              else
+                path="${name:0:2}/${name:2:2}/$name"
+              fi
+              echo "=== runner index entry $name ==="
+              curl -s --max-time 20 "https://index.crates.io/$path" | tail -6 || true
+            done
+            git checkout -- Cargo.lock || true
+          fi
+
       - name: Check release panic recovery
         if: runner.os == 'Linux'
         run: bash .github/scripts/check-panic-unwind.sh
@@ -364,6 +395,36 @@ jobs:
           if ! pkg-config --exists alsa || ! pkg-config --exists libudev; then
             sudo apt-get update
             sudo apt-get install --yes pkg-config libasound2-dev libudev-dev
+          fi
+
+      # Temporary diagnostics for the --locked resolution failures; remove
+      # once the cause is captured.
+      - name: Diagnose the locked resolve
+        run: |
+          if cargo tree --locked -p rustel \
+              --features device-audio,midi,serial,studio,gamepad \
+              --target ${{ matrix.target }} > /tmp/tree.err 2>&1; then
+            echo "TREE LOCKED OK"
+          else
+            echo "TREE LOCKED FAIL"
+            tail -6 /tmp/tree.err
+            cargo metadata --format-version 1 > /dev/null 2>/tmp/meta.err \
+              || { echo "META ALSO FAIL"; tail -30 /tmp/meta.err; }
+            git --no-pager diff -- Cargo.lock | head -120 || true
+            names=$(git --no-pager diff -- Cargo.lock \
+              | grep '^[-+]name = ' | sort -u \
+              | sed 's/^[-+]name = //' | tr -d '"' | head -5)
+            for name in $names; do
+              n=${#name}
+              if [ "$n" -le 3 ]; then
+                path="$n/${name:0:1}/$name"
+              else
+                path="${name:0:2}/${name:2:2}/$name"
+              fi
+              echo "=== runner index entry $name ==="
+              curl -s --max-time 20 "https://index.crates.io/$path" | tail -6 || true
+            done
+            git checkout -- Cargo.lock || true
           fi
 
       # Check the remaining release targets without optimized builds or publication.
