@@ -146,6 +146,12 @@ impl App {
             mini: self.options.mini,
             prebakes: super::super::prebake::PrebakeScope::ALL
                 .map(|scope| self.stored_prebake(scope).to_owned()),
+            samples: ExportSamples {
+                bank_renames: self.prefs.bank_renames(),
+                source_bank_renames: self.prefs.source_bank_renames(),
+                global_sources: self.prefs.global_sources(),
+                set_folder: Some(self.scenes.directory().to_path_buf()),
+            },
         };
         match ExportJob::start(
             sheet.scene_name.clone(),
