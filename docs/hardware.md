@@ -83,11 +83,23 @@ Pitch bend, aftertouch, program changes, and clock appear in the monitor but
 cannot be read by a score. `midikeys` uses its length argument, not note release.
 
 Studio can use learned pads to launch scenes. A MIDI knob or fader can move
-a [slider](studio.md#sliders). The mapping page of Settings has 12 slots.
+a [slider](studio.md#sliders). The sliders page of Settings has 12 slots.
 Slot N drives slider N of the playing score. No slot has a default control.
 Press Enter on a slot, then move the knob. The slot keeps the CC number and
 channel of that knob. Press `t` to change the knob mode: scaled (the
 default), jump, or relative. Use relative for binary-offset encoders.
+
+A button or pad can also run any studio action. On the keybinds page of
+Settings, press Enter on a row, then press the button. The row answers to
+the message beside its chord: a note with velocity, or a CC crossing the
+line at 64, so a swept knob fires once per crossing. A button that
+latches, sending a note-off for its second press, fires on that press
+too: a note held past the length of a hand's release ends in a new press,
+not a release. A CC button that toggles between 127 and 0 fires on both
+presses the same way. The Maschine transport works this way in MIDI mode.
+Studio listens on every MIDI input that Devices lists, as pads do. A bound
+note never sounds through `midikeys`. Delete on the row clears the message
+along with the chord override.
 
 ## MIDI clock
 
@@ -167,8 +179,8 @@ with the same name retains its slot.
 rustel gamepad-monitor --duration 10
 ```
 
-Studio lists pads in the devices dock. A stick can also drive a mapping slot
-(see [MIDI input](#midi-input)). Press Enter on a slot, then push the stick
+Studio lists pads in the devices dock. A stick can also drive a slot on the
+sliders page (see [MIDI input](#midi-input)). Press Enter on a slot, then push the stick
 fully. The slider moves while you hold the stick. A larger push moves it
 faster. Pattern queries run ahead of playback, so short taps
 can be missed. Hold a button through the notes it should enable.

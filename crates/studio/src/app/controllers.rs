@@ -28,6 +28,13 @@ const KNOB_PUSH_MAX_NOTCHES: f64 = 8.0;
 /// How long a slot's box stays lit after its control moved.
 const MAPPING_LIT: Duration = Duration::from_millis(400);
 
+/// How long a note must be held before its ending reads as a latching
+/// button's next press rather than a hand's release. A hand releases a
+/// press well inside this; a button that latches - the Maschine's
+/// transport in MIDI mode - says its second press as a note-off, a
+/// separate human action that comes after it.
+const LATCH_PRESS_AFTER: Duration = Duration::from_millis(300);
+
 /// A stick's run on one fader: where the push has taken it along the
 /// travel, kept between frames so a slow push adds up to a step rather
 /// than rounding away to nothing every frame.
@@ -129,28 +136,32 @@ impl App {
     }
 
     /// Whether a MIDI message arriving now would do anything: a scene has a
-    /// pad, a knob drives a mapping slot, or a pad or knob is being learnt.
-    /// Otherwise a message only lights the activity light or enters the
-    /// mixer's event feed; the visible feed independently asks the loop for
-    /// the same low-latency polling deadline.
+    /// pad, a knob drives a mapping slot, a message fires a Keybinds row,
+    /// or a pad or knob is being learnt. Otherwise a message only lights
+    /// the activity light or enters the mixer's event feed; the visible
+    /// feed independently asks the loop for the same low-latency polling
+    /// deadline.
     pub(super) fn pad_press_can_act(&self) -> bool {
         self.strip_mode == SceneStripMode::Learning
             || self.mapping_learn.is_some()
+            || self.keybind_learn.is_some()
+            || self.keybinds.midi_bound()
             || self.ui_settings.mappings.iter().any(|source| {
                 matches!(source, Some(super::super::settings::MappingSource::Knob(_)))
             })
             || self.scenes.scenes().iter().any(|scene| scene.pad.is_some())
     }
 
-    /// Tell the engine which notes are bound to scene launch, whenever
-    /// that set changes. A launch pad is a transport button, not a key:
-    /// if its press entered the musical keys ring, the press-count watcher
-    /// would arm an at-once requery milliseconds before the launch's own
-    /// install, and the from-zero flip would chop the fresh placement and
-    /// re-attack it - the pad-rewind glitch. The engine forwards the set
-    /// to the live ports, where the driver thread drops those NoteOns
-    /// before they can count. Cheap on the no-change path: a small scan
-    /// of the scene list, and one compare against the last set sent.
+    /// Tell the engine which notes are bound to scene launch or to a
+    /// Keybinds row, whenever that set changes. Such a note is a transport
+    /// button, not a key: if its press entered the musical keys ring, the
+    /// press-count watcher would arm an at-once requery milliseconds
+    /// before the launch's own install, and the from-zero flip would chop
+    /// the fresh placement and re-attack it - the pad-rewind glitch. The
+    /// engine forwards the set to the live ports, where the driver thread
+    /// drops those NoteOns before they can count. Cheap on the no-change
+    /// path: a small scan of the scene list, and one compare against the
+    /// last set sent.
     fn sync_launch_pads(&mut self) {
         let mut pads: Vec<(u8, u8)> = self
             .scenes
@@ -158,6 +169,15 @@ impl App {
             .iter()
             .filter_map(|scene| scene.pad.map(|pad| (pad.note, pad.channel)))
             .collect();
+        // A note a Keybinds row answers to is the same kind of button.
+        // A binding on any channel is the 0xFF the words read as "every".
+        pads.extend(
+            super::super::keybinds::BindAction::ALL
+                .into_iter()
+                .filter_map(|action| self.keybinds.midi_binding(action))
+                .filter(|bind| bind.note)
+                .map(|bind| (bind.number, bind.channel.unwrap_or(0xFF))),
+        );
         pads.sort_unstable();
         pads.dedup();
         if self.launch_pads_sent.as_ref() == Some(&pads) {
@@ -355,8 +375,10 @@ impl App {
     }
 
     /// A MIDI knob turned. While the settings sheet is waiting on a slot it
-    /// becomes that slot's; otherwise, if a slot holds it, that slot's
-    /// fader goes where the knob points.
+    /// becomes that slot's; while the Keybinds page is waiting on a row it
+    /// becomes that row's message; otherwise, if a row or a slot holds it,
+    /// the row fires on the press - a rise to 64 or above, or a fall from
+    /// one - and the slot's fader goes where the knob points.
     fn handle_knob(&mut self, turn: super::super::pads::CcTurn) {
         self.settle_mapping_learn();
         if let Some(slot) = self.mapping_learn {
@@ -367,6 +389,59 @@ impl App {
                     channel: Some(turn.channel),
                 }),
             );
+            return;
+        }
+        if let Some(super::super::keybinds::KeybindLearn::Armed(action)) = self.keybind_learn {
+            self.learn_keybind_midi(
+                action,
+                super::super::keybinds::MidiBind {
+                    number: turn.controller,
+                    note: false,
+                    channel: Some(turn.channel),
+                },
+            );
+            return;
+        }
+        // A bound row reads the crossings of the line at 64, not every
+        // message: the rise is a press, and a fall from a high that
+        // outlasted a hand's release is the next press of a button that
+        // toggles between 127 and 0. A fall soon after the rise is a
+        // release or a knob sweeping back, and fires nothing; a knob
+        // swept across the line crosses once each way at speed. A
+        // control's first word, whichever side of the line it lands on,
+        // is that control's press - a button that toggled before the
+        // studio did says its next press as a bare 0.
+        let key = (turn.controller, turn.channel);
+        let now = Instant::now();
+        let pressed_again = match self.midi_cc_last.get(&key) {
+            Some(&(value, since)) => {
+                (turn.value >= 64 && value < 64)
+                    || (turn.value < 64
+                        && value >= 64
+                        && now.duration_since(since) >= LATCH_PRESS_AFTER)
+            }
+            None => true,
+        };
+        self.midi_cc_last.insert(key, (turn.value, now));
+        if pressed_again
+            && self.keybind_learn.is_none()
+            && let Some(action) =
+                self.keybinds
+                    .midi_action_for(false, turn.controller, turn.channel)
+        {
+            self.log.push(
+                LogLevel::Debug,
+                "pad",
+                format!(
+                    "cc{}/ch{} fires {}",
+                    turn.controller,
+                    turn.channel,
+                    action.label()
+                ),
+            );
+            if let Err(error) = self.dispatch_bind_action(action, false) {
+                self.set_error(ErrorOwner::Interface, error.to_string());
+            }
             return;
         }
         let Some(slot) = self.mapping_slot(|source| match source {
@@ -461,9 +536,25 @@ impl App {
     }
 
     fn handle_pad(&mut self, press: PadPress) -> Result<(), RuntimeError> {
+        self.settle_mapping_learn();
         let pad = Pad {
             note: press.note,
             channel: press.channel,
+        };
+        // The note's clock: a press stamps when it began, an ending takes
+        // the stamp away and says whether the note outlasted a hand's
+        // release - the ending of a latching button's press, not a
+        // release at all. With no stamp, the note began before the studio
+        // did: the state a latching button is left in across a restart,
+        // and this ending is that button's next press.
+        let key = (press.note, press.channel);
+        let pressed_again = if press.velocity > 0 {
+            self.note_pressed_at.insert(key, Instant::now());
+            false
+        } else {
+            self.note_pressed_at
+                .remove(&key)
+                .is_none_or(|pressed| pressed.elapsed() >= LATCH_PRESS_AFTER)
         };
         if self.strip_mode == SceneStripMode::Learning {
             let learnt = self.scenes.learn_pad(pad);
@@ -484,7 +575,42 @@ impl App {
         if self.strip_mode != SceneStripMode::Idle {
             return Ok(());
         }
-        if let Some(index) = self.scenes.scene_for_pad(pad.note, pad.channel) {
+        if let Some(super::super::keybinds::KeybindLearn::Armed(action)) = self.keybind_learn {
+            self.learn_keybind_midi(
+                action,
+                super::super::keybinds::MidiBind {
+                    number: press.note,
+                    note: true,
+                    channel: Some(press.channel),
+                },
+            );
+            return Ok(());
+        }
+        // A message a Keybinds row holds is that row's, ahead of any pad a
+        // scene was given: one message, one meaning. A row answers to the
+        // press, and to the ending of a note held past a hand's release -
+        // a latching button's next press. A plain release, ending the
+        // note soon after it began, is still nothing.
+        if self.keybind_learn.is_none()
+            && let Some(action) = self
+                .keybinds
+                .midi_action_for(true, press.note, press.channel)
+        {
+            if press.velocity > 0 || pressed_again {
+                self.log.push(
+                    LogLevel::Debug,
+                    "pad",
+                    format!("{} fires {}", pad.label(), action.label()),
+                );
+                self.dispatch_bind_action(action, false)?;
+                self.dirty_frame = true;
+            }
+            return Ok(());
+        }
+        // A pad launches on the press, never on the release.
+        if press.velocity > 0
+            && let Some(index) = self.scenes.scene_for_pad(pad.note, press.channel)
+        {
             self.log.push(
                 LogLevel::Debug,
                 "pad",
@@ -628,6 +754,226 @@ mod tests {
             );
             pad.set_axis(0, 0.0);
             pad.set_connected(false);
+        }
+
+        /// A Keybinds row answers to a latching button's whole vocabulary.
+        /// The press fires it, the release a moment later does nothing, and
+        /// the off-press of a button that latches - the Maschine's
+        /// transport in MIDI mode, held past a hand's release - fires it
+        /// again. The mirror port's copy of that off, arriving with the
+        /// stamp already spent, fires nothing: one press, one fire.
+        #[test]
+        fn a_bound_note_fires_on_the_press_and_on_a_latching_off_press() {
+            use crate::app::controllers::LATCH_PRESS_AFTER;
+            use crate::keybinds::{BindAction, KeybindLearn};
+            use rustel_midi::input::MidiEvent;
+            let _pads = PAD_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene, _call) = slider_app(directory.path());
+            // The learn is the open sheet's, and the button's own press is
+            // the learn: arming by hand stands in for Enter.
+            app.settings_sheet = Some(Default::default());
+            app.keybind_learn = Some(KeybindLearn::arm(BindAction::PianoMode));
+            app.pads.driver_message_for_test(
+                "ctrl",
+                MidiEvent::NoteOn {
+                    channel: 1,
+                    note: 94,
+                    velocity: 100,
+                },
+                1_000,
+            );
+            app.drain_pads();
+            assert!(app.keybind_learn.is_none(), "the press was the learn");
+            assert!(!app.piano.open, "the learn does not fire the row");
+            app.settings_sheet = None;
+
+            app.pads.driver_message_for_test(
+                "ctrl",
+                MidiEvent::NoteOn {
+                    channel: 1,
+                    note: 94,
+                    velocity: 100,
+                },
+                2_000,
+            );
+            app.drain_pads();
+            assert!(app.piano.open, "the press fired the row");
+
+            app.pads.driver_message_for_test(
+                "ctrl",
+                MidiEvent::NoteOff {
+                    channel: 1,
+                    note: 94,
+                    velocity: 0,
+                },
+                2_010,
+            );
+            app.drain_pads();
+            assert!(app.piano.open, "a release fires nothing");
+
+            // The hold is the fixture, not a sleep: the stamp is set back
+            // past a hand's release before the off arrives.
+            app.note_pressed_at.insert(
+                (94, 1),
+                Instant::now() - LATCH_PRESS_AFTER - Duration::from_millis(50),
+            );
+            app.pads.driver_message_for_test(
+                "ctrl",
+                MidiEvent::NoteOff {
+                    channel: 1,
+                    note: 94,
+                    velocity: 0,
+                },
+                3_000,
+            );
+            app.drain_pads();
+            assert!(!app.piano.open, "the latching off-press fired the row");
+
+            app.pads.driver_message_for_test(
+                "mirror",
+                MidiEvent::NoteOff {
+                    channel: 1,
+                    note: 94,
+                    velocity: 0,
+                },
+                3_002,
+            );
+            app.drain_pads();
+            assert!(!app.piano.open, "the mirror's copy fired nothing");
+
+            // A restart leaves a latching button standing on, its next
+            // press an off with no stamp on the clock: that press fires
+            // like any other.
+            app.pads.driver_message_for_test(
+                "ctrl",
+                MidiEvent::NoteOff {
+                    channel: 1,
+                    note: 94,
+                    velocity: 0,
+                },
+                3_100,
+            );
+            app.drain_pads();
+            assert!(app.piano.open, "the stampless off-press fired the row");
+        }
+
+        /// A Keybinds row answers a CC button that toggles - the
+        /// Maschine's transport as this one sends it, one message a
+        /// press, alternating 127 and 0. Both presses fire, whether the
+        /// learn caught the 127 or the 0. A knob swept across the line
+        /// fires once, and its sweep back, soon after, fires nothing.
+        #[test]
+        fn a_bound_row_answers_a_cc_that_toggles_between_127_and_0() {
+            use crate::app::controllers::LATCH_PRESS_AFTER;
+            use crate::keybinds::{BindAction, KeybindLearn};
+            use rustel_midi::input::MidiEvent;
+            let _pads = PAD_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene, _call) = slider_app(directory.path());
+            // The learn is the open sheet's, and the button's own press is
+            // the learn: arming by hand stands in for Enter.
+            app.settings_sheet = Some(Default::default());
+            app.keybind_learn = Some(KeybindLearn::arm(BindAction::PianoMode));
+            app.pads.driver_message_for_test(
+                "ctrl",
+                MidiEvent::ControlChange {
+                    channel: 1,
+                    controller: 59,
+                    value: 127,
+                },
+                1_000,
+            );
+            app.drain_pads();
+            assert!(app.keybind_learn.is_none(), "the press was the learn");
+            assert!(!app.piano.open, "the learn does not fire the row");
+            app.settings_sheet = None;
+
+            // The toggle's next press says 0, with nothing on record for
+            // it: that first word is the press.
+            app.pads.driver_message_for_test(
+                "ctrl",
+                MidiEvent::ControlChange {
+                    channel: 1,
+                    controller: 59,
+                    value: 0,
+                },
+                2_000,
+            );
+            app.drain_pads();
+            assert!(app.piano.open, "the 0-press fired the row");
+
+            // The press after that says 127: the crossing up.
+            app.pads.driver_message_for_test(
+                "ctrl",
+                MidiEvent::ControlChange {
+                    channel: 1,
+                    controller: 59,
+                    value: 127,
+                },
+                3_000,
+            );
+            app.drain_pads();
+            assert!(!app.piano.open, "the 127-press fired the row");
+
+            // The 0 of a momentary press, or the toggle pressed again too
+            // soon: too soon after the 127 to be a press of its own, it
+            // only stands the control low.
+            app.pads.driver_message_for_test(
+                "ctrl",
+                MidiEvent::ControlChange {
+                    channel: 1,
+                    controller: 59,
+                    value: 0,
+                },
+                4_000,
+            );
+            app.drain_pads();
+            assert!(!app.piano.open, "the quick 0 fired nothing");
+
+            // A knob swept up across the line says 64 then 70: one
+            // crossing, one fire. Its sweep back soon after says 0 then
+            // 40: the fall is too soon to be a toggle's next press, and
+            // the rest is the same side of the line.
+            for (value, at) in [(64, 4_010), (70, 4_020), (0, 4_030), (40, 4_040)] {
+                app.pads.driver_message_for_test(
+                    "ctrl",
+                    MidiEvent::ControlChange {
+                        channel: 1,
+                        controller: 59,
+                        value,
+                    },
+                    at,
+                );
+                app.drain_pads();
+            }
+            assert!(app.piano.open, "the sweep fired once, on the way up");
+
+            // The long fall: a high left standing past a hand's release
+            // is the toggle's next press. The hold is the fixture, not a
+            // sleep - the crossing's stamp is set back before the 0.
+            app.midi_cc_last.insert(
+                (59, 1),
+                (
+                    127,
+                    Instant::now() - LATCH_PRESS_AFTER - Duration::from_millis(50),
+                ),
+            );
+            app.pads.driver_message_for_test(
+                "ctrl",
+                MidiEvent::ControlChange {
+                    channel: 1,
+                    controller: 59,
+                    value: 0,
+                },
+                5_000,
+            );
+            app.drain_pads();
+            assert!(!app.piano.open, "the aged 0-press fired the row");
         }
 
         /// A MIDI knob bound to a slot drives that slot's fader, absolutely: the

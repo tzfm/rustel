@@ -143,7 +143,7 @@ fn a_keybind_learns_a_free_chord_and_delete_restores_the_default() {
     studio.settle();
     assert_eq!(
         studio.status(),
-        "press the chord - Esc calls it off, and the sheet's own keys stay the sheet's"
+        "press the chord or the controller button - Esc calls it off, and the sheet's own keys stay the sheet's"
     );
 
     // A bare letter is the score's; the learn says so and stays armed.
