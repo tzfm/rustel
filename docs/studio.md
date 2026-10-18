@@ -675,6 +675,9 @@ prebakes run first, as they do before a score in play, so a name a setup
 defines is there for the bounce. The bounce also uses the same samples as
 play: the folders and packs in Settings ▸ Samples, the audio in the set
 folder, and your bank renames. Live playback continues.
+If the export cannot find or load a sound, or the engine refuses a note, the
+export fails and names the refusal. The file is still written. The check covers
+every note the export schedules, also notes after an early end.
 Use Tab and arrows to choose the length, WAV or MP3 format, and output path.
 
 Choose a fixed number of cycles or **until silence**. Until-silence export stops
