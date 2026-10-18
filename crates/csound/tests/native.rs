@@ -8,6 +8,15 @@ use std::time::{Duration, Instant};
 static ALLOCATOR: TripwireAlloc = TripwireAlloc;
 static SERIAL: Mutex<()> = Mutex::new(());
 
+/// The native engine is one library, so the tests take turns. The guard of
+/// a test that panicked still hands the turn on: a poisoned lock would
+/// fail every test after the first fault.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The schedule lead the live pipeline gives a note: five 128-frame
 /// buffers of device latency and two of buffer.
 const LEAD: u32 = 640;
@@ -72,7 +81,7 @@ fn play_until(insert: &mut dyn OrbitInsert, heard: &dyn Fn(&Recording) -> bool) 
 
 #[test]
 fn native_timing_cut_nested_notes_reset_and_callback_allocation() {
-    let _serial = SERIAL.lock().unwrap();
+    let _serial = serial();
     let Some(program) = program(
         "instr parent\nschedule \"constant\", 0, 1, 440, p5\n\
          schedule \"constant\", 0.002, 1, 440, p5\nturnoff\nendin\n\
@@ -83,6 +92,12 @@ fn native_timing_cut_nested_notes_reset_and_callback_allocation() {
     assert_eq!(program.active_instances(), 0);
     let mut insert = program.instance(48_000).unwrap();
     assert_eq!(program.active_instances(), 1);
+    // A cold worker fills its ring over the first blocks. That warm-up
+    // silence stays out of the counts and the windows below.
+    const WARM: usize = 3;
+    let mut recording = play(insert.as_mut(), WARM);
+    assert!(recording.0.iter().chain(&recording.1).all(|v| *v == 0.0));
+    let starved_before = program.starved_frames();
     let first = program.prepare(event("parent", 1.0)).unwrap();
     let second = program.prepare(event("constant", 1.0)).unwrap();
     let before = Violations::capture();
@@ -92,8 +107,10 @@ fn native_timing_cut_nested_notes_reset_and_callback_allocation() {
         insert.score(first, LEAD + 17);
     });
     assert!(Violations::capture().since(before).clean());
-    let mut recording = play(insert.as_mut(), 8);
-    let onset = LEAD as usize + 17;
+    let played = play(insert.as_mut(), 8);
+    recording.0.extend(&played.0);
+    recording.1.extend(&played.1);
+    let onset = WARM * BLOCK + LEAD as usize + 17;
     // The parent schedules a second nested note 96 frames in, and the two
     // constants sound together until the cut.
     let nested = onset + 96;
@@ -106,10 +123,10 @@ fn native_timing_cut_nested_notes_reset_and_callback_allocation() {
     assert!(recording.0[nested..].iter().all(|v| (v - 0.4).abs() < 1e-6));
     assert_eq!(recording.0, recording.1);
     // The worker held the whole window ready: nothing ran dry.
-    assert_eq!(program.starved_frames(), 0);
+    assert_eq!(program.starved_frames(), starved_before);
     // A cut while the worker is ahead of the reader. The frames the old
     // orchestra rendered past the cut stay silent.
-    let cut = 8 * BLOCK + 64;
+    let cut = (WARM + 8) * BLOCK + 64;
     let before = Violations::capture();
     tripwire::audio_scope(|| {
         insert.cut_notes(64);
@@ -147,7 +164,7 @@ fn native_timing_cut_nested_notes_reset_and_callback_allocation() {
 
 #[test]
 fn a_cut_before_its_onset_drops_a_retired_note() {
-    let _serial = SERIAL.lock().unwrap();
+    let _serial = serial();
     let Some(program) = program("instr constant\naSignal init p5\nouts aSignal, aSignal\nendin")
     else {
         return;
@@ -173,7 +190,7 @@ fn a_cut_before_its_onset_drops_a_retired_note() {
 
 #[test]
 fn reset_suspends_globals_until_the_next_score() {
-    let _serial = SERIAL.lock().unwrap();
+    let _serial = serial();
     let Some(program) = program(
         "instr global\naSignal init 0.125\nouts aSignal, aSignal\nendin\n\
          alwayson \"global\"\ninstr trigger\nendin",
@@ -181,8 +198,14 @@ fn reset_suspends_globals_until_the_next_score() {
         return;
     };
     let mut insert = program.instance(48_000).unwrap();
-    let start = play(insert.as_mut(), 1);
-    assert!(start.0[1..].iter().all(|v| *v == 0.125));
+    // A cold worker fills its ring while the first blocks play, so the
+    // global settles in over a short warm-up instead of the first frame.
+    let warm = play_until(insert.as_mut(), &|recording| {
+        recording.0.iter().any(|v| (v - 0.125).abs() < 1e-6)
+    });
+    assert!(warm.0.iter().any(|v| (v - 0.125).abs() < 1e-6));
+    let steady = play(insert.as_mut(), 1);
+    assert!(steady.0.iter().all(|v| (v - 0.125).abs() < 1e-6));
     let pending = program.prepare(event("trigger", 1.0)).unwrap();
     insert.score(pending, 512);
     for _ in 0..3 {
@@ -209,7 +232,7 @@ fn reset_suspends_globals_until_the_next_score() {
 
 #[test]
 fn bundled_instruments_and_custom_pfields_render_at_host_rates() {
-    let _serial = SERIAL.lock().unwrap();
+    let _serial = serial();
     let Some(program) = program(
         "instr 77\nprint p4\nprints \"custom instrument\\n\"\nSmap strget p6\niCutoff strtod keymap(\"cutoff\", Smap)\naSignal oscili p5 / 127, cpsmidinn(p4)\naSignal tone aSignal, iCutoff\nouts aSignal, aSignal\nendin",
     ) else {
@@ -239,7 +262,7 @@ fn bundled_instruments_and_custom_pfields_render_at_host_rates() {
 
 #[test]
 fn runtime_errors_reach_the_host_and_a_corrected_note_recovers() {
-    let _serial = SERIAL.lock().unwrap();
+    let _serial = serial();
     let Some(program) =
         program("instr broken\naSignal oscili p5, p4, 99999\nouts aSignal, aSignal\nendin")
     else {
