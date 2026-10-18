@@ -173,9 +173,9 @@ pub(super) struct Insert {
     /// Ring frames from here stay silent until the worker's next clean
     /// frame: the orchestra before a cut rendered them ahead already.
     mask_from: Option<u64>,
-    /// The clean frontier when the mask was armed. The worker confirms a
-    /// restart by moving it; until then every frame the mask covers is
-    /// stale, also the ones the worker has not rendered yet.
+    /// The clean frontier when the mask was first armed. The worker
+    /// confirms a restart by moving it; until then every frame the mask
+    /// covers is stale, also the ones the worker has not rendered yet.
     clean_at_post: u64,
     /// The frame of the last reset posted. A stopped output repeats its
     /// reset each block, and one post per frame is the whole ask.
@@ -243,8 +243,14 @@ impl Insert {
     /// Marks ring frames from `due` as stale. The worker renders past the
     /// reader, so the frames a cut ends may already sit in the ring.
     fn arm_mask(&mut self, due: u64) {
+        // A held mask keeps the frontier it was armed with: a restart the
+        // worker confirmed in the meantime still counts for it. A fresh
+        // snapshot could already hold that confirmation, and the mask
+        // would never see the frontier move past it.
+        if self.mask_from.is_none() {
+            self.clean_at_post = self.channel.clean_from.load(Ordering::Acquire);
+        }
         self.mask_from = Some(self.mask_from.map_or(due, |held| held.min(due)));
-        self.clean_at_post = self.channel.clean_from.load(Ordering::Acquire);
     }
 
     fn stopped(&self) -> bool {
@@ -418,10 +424,17 @@ impl State {
                         self.pending.clear();
                         self.pending_bytes = 0;
                         // A stopped output repeats its reset each block.
-                        // With no orchestra running there is nothing to
-                        // end, and the repeated resets cost nothing.
+                        // With an orchestra running, the restart is the
+                        // cut it schedules. Without one the restart
+                        // already holds: nothing but silence can render
+                        // from the reset on, so the frontier moves past
+                        // it and the mask over the reset retires.
                         if self.engine.is_some() {
                             let _ = self.schedule(due, Action::Cut);
+                        } else {
+                            let clean =
+                                self.channel.clean_from.load(Ordering::Relaxed).max(due) + 1;
+                            self.channel.clean_from.store(clean, Ordering::Release);
                         }
                     }
                 }
@@ -625,5 +638,131 @@ mod tests {
         };
         worker.join().unwrap();
         assert!(channel.dead.load(Ordering::Acquire));
+    }
+
+    /// A reader over a shared ring whose worker only answers the stop
+    /// flag. Each test confirms restarts the way the real worker does.
+    fn reader(channel: &Arc<Channel>) -> Insert {
+        let watched = Arc::clone(channel);
+        let worker = thread::Builder::new()
+            .name("mask".into())
+            .spawn(move || {
+                while !watched.stopping.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            })
+            .unwrap();
+        Insert {
+            key: InsertKey::default(),
+            channel: Arc::clone(channel),
+            counters: Arc::new(Counters::default()),
+            worker: Some(worker),
+            frame: 0,
+            mask_from: None,
+            clean_at_post: 0,
+            reset_at: None,
+            failed: false,
+        }
+    }
+
+    /// The confirmation a fired cut gives: every frame from the one the
+    /// worker rendered past belongs after the restart.
+    fn confirm_cut(channel: &Channel, frame: u64) {
+        let clean = frame.max(channel.clean_from.load(Ordering::Relaxed) + 1);
+        channel.clean_from.store(clean, Ordering::Release);
+    }
+
+    /// The confirmation a reset gives when no orchestra is left to cut.
+    fn confirm_reset(channel: &Channel, due: u64) {
+        let clean = channel.clean_from.load(Ordering::Relaxed).max(due) + 1;
+        channel.clean_from.store(clean, Ordering::Release);
+    }
+
+    /// One block of the reader: the left channel collect hands back.
+    fn play_block(insert: &mut Insert) -> Vec<f32> {
+        let mut left = [0.0; CALLBACK_BLOCK as usize];
+        let mut right = [0.0; CALLBACK_BLOCK as usize];
+        insert.process(&mut left, &mut right);
+        left.into()
+    }
+
+    #[test]
+    fn a_reset_with_no_orchestra_left_confirms_its_restart() {
+        let channel = Arc::new(Channel::new());
+        fill_ahead(&channel, 1024);
+        let mut insert = reader(&channel);
+        // The first reset ends the orchestra with a cut the worker
+        // renders far ahead of the reader.
+        insert.reset();
+        assert_eq!(channel.drain(), Some(Command::Reset { due: 0 }));
+        confirm_cut(&channel, 384);
+        for _ in 0..3 {
+            assert!(play_block(&mut insert).iter().all(|v| *v == 0.0));
+        }
+        // The reader passes the frontier and the mask retires.
+        let past = play_block(&mut insert);
+        assert_eq!(past.first(), Some(&384.0));
+        // A reset now meets no orchestra, so it confirms itself. Without
+        // that, its mask never retires and the insert stays silent.
+        insert.reset();
+        assert_eq!(channel.drain(), Some(Command::Reset { due: 512 }));
+        confirm_reset(&channel, 512);
+        play_block(&mut insert);
+        let back = play_block(&mut insert);
+        assert_eq!(back.first(), Some(&640.0));
+        assert!(back.iter().all(|v| *v > 0.0));
+    }
+
+    #[test]
+    fn a_reset_between_a_cut_and_its_retire_still_retires() {
+        let channel = Arc::new(Channel::new());
+        fill_ahead(&channel, 2048);
+        let mut insert = reader(&channel);
+        // Three resets in a row, the way a stopped output posts them.
+        // The cut of the first fires before the reader reaches it, and
+        // the resets after it land on an orchestra already gone.
+        insert.reset();
+        assert_eq!(channel.drain(), Some(Command::Reset { due: 0 }));
+        confirm_cut(&channel, 384);
+        for due in [128, 256] {
+            assert!(play_block(&mut insert).iter().all(|v| *v == 0.0));
+            insert.reset();
+            assert_eq!(channel.drain(), Some(Command::Reset { due }));
+            confirm_reset(&channel, due);
+        }
+        // The mask retires at the frontier and the ring comes back
+        // through: a few stale frames, then the frames past the last
+        // confirmed restart, each with its own number.
+        let mut back = Vec::new();
+        for _ in 0..2 {
+            back.extend(play_block(&mut insert));
+        }
+        let first = back.iter().position(|v| *v > 0.0).expect("ring came back");
+        assert!(first < 2 * CALLBACK_BLOCK as usize);
+        assert!(back[first..].iter().all(|v| *v > 0.0));
+    }
+
+    #[test]
+    fn a_refused_reset_keeps_the_confirmation_its_mask_owes() {
+        let channel = Arc::new(Channel::new());
+        fill_ahead(&channel, 2048);
+        let mut insert = reader(&channel);
+        insert.reset();
+        assert_eq!(channel.drain(), Some(Command::Reset { due: 0 }));
+        confirm_cut(&channel, 384);
+        // The reader enters the mask, then a reset finds the command
+        // queue full. Its arm still ran, so the confirmation the first
+        // reset earned must survive the rearm.
+        assert!(play_block(&mut insert).iter().all(|v| *v == 0.0));
+        for at in 0..COMMAND_CAPACITY {
+            assert!(channel.post(Command::Score { id: at, due: at }));
+        }
+        insert.reset();
+        assert_eq!(insert.counters.refused_commands.load(Ordering::Relaxed), 1);
+        let mut back = Vec::new();
+        for _ in 0..6 {
+            back.extend(play_block(&mut insert));
+        }
+        assert!(back.iter().any(|v| *v > 0.0));
     }
 }

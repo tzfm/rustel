@@ -217,6 +217,13 @@ fn reset_suspends_globals_until_the_next_score() {
         let block = play(insert.as_mut(), 1);
         assert!(block.0.iter().chain(&block.1).all(|v| *v == 0.0));
     }
+    // Those blocks carried the reader past the restart, so this reset
+    // arms a fresh mask over an orchestra already gone. It has no cut to
+    // confirm it: without confirming itself, the mask would outlive it
+    // and the global below would never come back.
+    insert.reset();
+    let block = play(insert.as_mut(), 1);
+    assert!(block.0.iter().chain(&block.1).all(|v| *v == 0.0));
     let id = program.prepare(event("trigger", 1.0)).unwrap();
     insert.score(id, 17);
     // The orchestra compiles on the worker, and the global comes back with
