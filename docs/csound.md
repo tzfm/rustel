@@ -169,9 +169,16 @@ It requires two output channels, `0dbfs = 1`, and `ksmps = 1`. Keep these host
 settings out of imported orchestras. One sample per control block preserves
 onset and cut timing, but costs more CPU than larger Csound control blocks.
 
-Csound runs on a worker thread. Its output must finish before the audio
-callback continues. A costly opcode can therefore cause an audio dropout.
-A cut rebuilds an active engine to stop notes that the orchestra scheduled
-itself. This also resets global state and can interrupt audio while the
-orchestra compiles. Stop clears pending notes. The first note after a reset
-rebuilds the engine. Native opcode crashes are not isolated from Rustel.
+Csound runs on a worker thread that renders into a ring buffer ahead of the
+audio callback. The callback posts its commands and reads finished frames
+from the ring. It never waits for Csound, so a costly opcode cannot stall
+the device output. When an orchestra costs more than the run-ahead allows,
+the ring runs dry, that one insert goes silent for the gap, and the rest of
+the output plays on.
+
+A scheduled note reaches the worker when the engine admits it, one schedule
+lead before the note sounds, so its onset keeps its frame. A cut restarts
+the orchestra on the worker thread, which also resets global state. The
+compile runs in the rest after the cut, so the first note after it can start
+late. Stop clears pending notes and suspends the orchestra until the next
+score. Native opcode crashes are not isolated from Rustel.

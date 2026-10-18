@@ -260,6 +260,86 @@ impl ScalarBackend {
     pub fn missing_insert_events(&self) -> u64 {
         self.missing_insert_events
     }
+
+    /// Gives the inserts that render ahead of the callback their note now,
+    /// when the event is admitted, a schedule lead before the frame it
+    /// sounds. Such an insert has the frame of an onset ready before the
+    /// callback asks for it, so it needs the note that early to place the
+    /// onset on its own frame. The activation of the onset delivers the
+    /// note again to the insert that plays it, and a prepared score plays
+    /// once, so nothing sounds twice. Nothing here claims a bus, swaps an
+    /// insert or builds one: activation does that, and an insert that held
+    /// no matching box receives the note there.
+    pub(crate) fn notify_inserts_early<K>(&mut self, event: &OnsetEvent<K>, start_frame: u64) {
+        self.init_insert_pool();
+        let chain = event.controls.insert_chain();
+        let Some(bus) = self
+            .insert_chains
+            .iter()
+            .position(|held| *held == Some(chain))
+        else {
+            return;
+        };
+        let frames = event
+            .onset_frame
+            .saturating_sub(start_frame)
+            .min(u64::from(u32::MAX)) as u32;
+        for (stage, wanted) in event.controls.effects.iter().enumerate() {
+            if let Some(wanted) = wanted {
+                self.notify_one_insert(
+                    crate::insert::effect_slot(chain, stage),
+                    wanted,
+                    bus,
+                    frames,
+                );
+            }
+        }
+        if let Some(wanted) = &event.controls.instrument {
+            self.notify_one_insert(crate::insert::instrument_slot(chain), wanted, bus, frames);
+        }
+    }
+
+    /// Delivers one note to the box that will play it: the held box when
+    /// it is the wanted one, else the prepared box activation swaps in.
+    fn notify_one_insert(
+        &mut self,
+        logical: crate::insert::InsertSlot,
+        wanted: &crate::insert::InsertControls,
+        bus: usize,
+        frames: u32,
+    ) {
+        let slot = logical.physical(bus);
+        let holds = |inserts: &Vec<Option<Box<dyn crate::insert::OrbitInsert>>>| {
+            inserts
+                .get(slot)
+                .and_then(|insert| insert.as_ref())
+                .is_some_and(|insert| insert.key() == wanted.key && insert.renders_ahead())
+        };
+        let (inserts, matched) = match (holds(&self.orbit_inserts), holds(&self.prepared_inserts)) {
+            (true, _) => (&mut self.orbit_inserts, true),
+            (_, true) => (&mut self.prepared_inserts, true),
+            _ => (&mut self.orbit_inserts, false),
+        };
+        if !matched {
+            return;
+        }
+        let Some(insert) = inserts.get_mut(slot).and_then(|insert| insert.as_mut()) else {
+            return;
+        };
+        insert.restore_params(frames);
+        for param in wanted.params() {
+            insert.set_param(*param, frames);
+        }
+        if let Some((beats, tempo)) = wanted.clock() {
+            insert.sync(beats, tempo, frames);
+        }
+        if let Some(score) = wanted.score() {
+            insert.score(score, frames);
+        }
+        if let Some(note) = wanted.note() {
+            insert.note(note, frames);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2073,6 +2153,113 @@ mod tests {
                 );
                 assert_eq!(backend.missing_insert_events(), 0);
             }
+        }
+
+        /// An insert that renders ahead hears each note at admission, a
+        /// schedule lead before the frame it sounds, and the note names the
+        /// frame of its onset. The box activation will serve gets it: the
+        /// held box when it is the wanted one, else the prepared box. An
+        /// insert that renders in the callback hears nothing here.
+        #[test]
+        fn an_insert_that_renders_ahead_gets_its_note_at_admission() {
+            type Heard = Arc<std::sync::Mutex<Vec<(u64, u64)>>>;
+            struct Recorder {
+                key: InsertKey,
+                ahead: bool,
+                frame: u64,
+                heard: Heard,
+            }
+            impl OrbitInsert for Recorder {
+                fn key(&self) -> InsertKey {
+                    self.key
+                }
+                fn set_param(&mut self, _: InsertParam, _: u32) {}
+                fn score(&mut self, id: u64, frames: u32) {
+                    self.heard
+                        .lock()
+                        .unwrap()
+                        .push((id, self.frame + u64::from(frames)));
+                }
+                fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+                    for (left, right) in left.iter_mut().zip(right) {
+                        (*left, *right) = (1.0, 1.0);
+                        self.frame += 1;
+                    }
+                }
+                fn renders_ahead(&self) -> bool {
+                    self.ahead
+                }
+            }
+            let make = |key, ahead| {
+                // Capacity ahead, so a score heard inside the audio scope
+                // below allocates nothing the scope would report.
+                let heard = Heard::default();
+                heard.lock().unwrap().reserve(4);
+                (
+                    Box::new(Recorder {
+                        key,
+                        ahead,
+                        frame: 0,
+                        heard: Arc::clone(&heard),
+                    }) as Box<dyn OrbitInsert>,
+                    heard,
+                )
+            };
+            let held_key = InsertKey {
+                plugin: u32::MAX,
+                preset: 1,
+            };
+            let next_key = InsertKey {
+                plugin: u32::MAX,
+                preset: 2,
+            };
+            let plain_key = InsertKey {
+                plugin: 5,
+                preset: 0,
+            };
+            let mut backend = ScalarBackend::prepared(48_000, 4).unwrap();
+            let (held, held_heard) = make(held_key, true);
+            let (next, next_heard) = make(next_key, true);
+            let (plain, plain_heard) = make(plain_key, false);
+            assert!(
+                backend
+                    .install_insert(crate::insert::instrument_slot(1), held)
+                    .is_none()
+            );
+            assert!(
+                backend
+                    .prepare_insert(crate::insert::instrument_slot(1), next)
+                    .is_none()
+            );
+            assert!(
+                backend
+                    .install_insert(crate::insert::instrument_slot(2), plain)
+                    .is_none()
+            );
+            let note = |chain: u64, key: InsertKey, onset: u64| {
+                let mut event: OnsetEvent = OnsetEvent::new(onset, 440.0, 1.0, 0.02);
+                event.controls.insert_chain = Some(chain);
+                event.controls.instrument = Some(InsertControls::new(key).with_score(9));
+                event
+            };
+            // The held box of the chain plays the note of its own key, at
+            // the lead the admission gave the onset. The prepared box plays
+            // the note of the next key. An insert that renders in the
+            // callback hears nothing here. The whole walk stays inside the
+            // audio scope's rules, as it runs on the callback thread.
+            let held_note = note(1, held_key, 640);
+            let next_note = note(1, next_key, 896);
+            let plain_note = note(2, plain_key, 384);
+            let before = crate::tripwire::Violations::capture();
+            crate::tripwire::audio_scope(|| {
+                backend.notify_inserts_early(&held_note, 128);
+                backend.notify_inserts_early(&next_note, 128);
+                backend.notify_inserts_early(&plain_note, 128);
+            });
+            assert!(crate::tripwire::Violations::capture().since(before).clean());
+            assert_eq!(*held_heard.lock().unwrap(), [(9, 512)]);
+            assert_eq!(*next_heard.lock().unwrap(), [(9, 768)]);
+            assert!(plain_heard.lock().unwrap().is_empty());
         }
     }
 }

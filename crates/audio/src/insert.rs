@@ -233,6 +233,16 @@ pub trait OrbitInsert: Send {
     /// same frame.
     fn cut_notes(&mut self, _frames: u32) {}
 
+    /// True when the insert renders on its own thread ahead of the
+    /// callback. The engine then hands such an insert each note when the
+    /// event is admitted, a schedule lead before the frame it sounds, so
+    /// the insert has the note ready at its own frame. The activation of
+    /// the onset delivers the note again, and a prepared score plays once,
+    /// so nothing sounds twice.
+    fn renders_ahead(&self) -> bool {
+        false
+    }
+
     /// True while the insert holds a note, or a value for a later frame.
     /// The engine keeps such an insert awake, also when its output is
     /// silent.

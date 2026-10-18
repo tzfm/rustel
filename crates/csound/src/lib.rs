@@ -5,13 +5,23 @@ mod worker;
 
 use rustel_audio::{InsertKey, OrbitInsert};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const PLUGIN_ID: u32 = u32::MAX;
 const MAX_EVENTS: usize = 65_536;
 const MAX_EVENT_BYTES: usize = 64 * 1024 * 1024;
 static NEXT_PROGRAM: AtomicU32 = AtomicU32::new(1);
+
+/// Diagnostics of the synthesis workers, which the host reads between
+/// updates: audio frames the callback read as silence because their worker
+/// had not rendered them yet, and commands dropped because the worker left
+/// its queue full.
+#[derive(Default)]
+pub struct Counters {
+    pub(crate) starved_frames: AtomicU64,
+    pub(crate) refused_commands: AtomicU64,
+}
 
 #[derive(Clone, Debug)]
 pub enum Instrument {
@@ -82,6 +92,7 @@ pub struct Program {
     events: Arc<Mutex<Events>>,
     errors: Arc<Mutex<Vec<String>>>,
     instances: Arc<AtomicUsize>,
+    counters: Arc<Counters>,
 }
 
 impl Program {
@@ -101,6 +112,7 @@ impl Program {
             events: Arc::new(Mutex::new(Events::default())),
             errors: Arc::new(Mutex::new(Vec::new())),
             instances: Arc::new(AtomicUsize::new(0)),
+            counters: Arc::new(Counters::default()),
         })
     }
 
@@ -157,6 +169,19 @@ impl Program {
     /// Counts synthesis workers until their native engines have shut down.
     pub fn active_instances(&self) -> usize {
         self.instances.load(Ordering::Acquire)
+    }
+
+    /// Audio frames the callback read as silence because a worker had not
+    /// rendered them yet. A burst after a heavy orchestra starts, or a
+    /// long gap while it plays, says the orchestra costs more than the
+    /// worker's runway buys.
+    pub fn starved_frames(&self) -> u64 {
+        self.counters.starved_frames.load(Ordering::Relaxed)
+    }
+
+    /// Commands the callback dropped because a worker left its queue full.
+    pub fn refused_commands(&self) -> u64 {
+        self.counters.refused_commands.load(Ordering::Relaxed)
     }
 
     pub fn discard(&self, id: u64) {

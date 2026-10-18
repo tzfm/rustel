@@ -973,24 +973,31 @@ impl LiveScalarBackend {
             if event.target_frame < start_frame {
                 report.late += 1;
             }
+            let onset = OnsetEvent::new(
+                event.target_frame,
+                event.freq_hz,
+                event.gain,
+                event.duration_secs,
+            )
+            .with_onset_lead(event.onset_lead)
+            .with_generation(event.generation)
+            .with_ui_visuals(event.ui_visuals)
+            .with_controls(event.controls)
+            .with_optional_sample(event.sample)
+            .with_optional_wavetable(event.wavetable)
+            .with_optional_synth(event.synth)
+            .with_cut(event.cut);
             if self.scalar.try_note_prepared_with_confirmation(
-                OnsetEvent::new(
-                    event.target_frame,
-                    event.freq_hz,
-                    event.gain,
-                    event.duration_secs,
-                )
-                .with_onset_lead(event.onset_lead)
-                .with_generation(event.generation)
-                .with_ui_visuals(event.ui_visuals)
-                .with_controls(event.controls)
-                .with_optional_sample(event.sample)
-                .with_optional_wavetable(event.wavetable)
-                .with_optional_synth(event.synth)
-                .with_cut(event.cut),
+                onset,
                 event.confirmation,
                 event.expected_sample_identity,
             ) {
+                // An insert that renders ahead of the callback has the
+                // frame of this onset ready before the callback asks for
+                // it, so it needs the note now, at admission, a schedule
+                // lead before it sounds. Every other insert hears the note
+                // at activation and ignores this.
+                self.scalar.notify_inserts_early(&onset, start_frame);
                 report.accepted += 1;
             } else {
                 report.refused += 1;
