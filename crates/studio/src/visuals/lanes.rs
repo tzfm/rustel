@@ -1,8 +1,8 @@
-//! The lanes view: the score's lanes as rows on a time axis that scrolls
-//! past a fixed playhead. What has played runs off to the left, dimmed, and
-//! the engine's lookahead fills the right with what is coming. A Rustel
-//! extension, drawn by `_lanes()` under a pattern, by `lanes()` behind the
-//! score, and by the Lanes panel.
+//! The lanes view: the score's lanes as rows on a time axis, with a
+//! playhead. What has played is dimmed on the left, and the engine's
+//! lookahead fills the right with what is coming. A Rustel extension, drawn
+//! by `_lanes()` under a pattern, by `lanes()` behind the score, and by the
+//! Lanes panel.
 //!
 //! ```text
 //!            ▼
@@ -13,14 +13,21 @@
 //!            ▲
 //! ```
 //!
+//! Every cell that changes is written to the terminal again, so the view
+//! changes as few cells as it can. By default the page holds still and the
+//! playhead crosses its middle half, and then the page turns by half its
+//! width: from one step to the next only the playhead's column changes.
+//! `scroll: 1` moves the page past a fixed playhead instead, every mark at
+//! once. Either moves at most `MAX_STEPS` times a second.
+//!
 //! A row is one sound of one lane, and a lane the score named that plays
 //! more than one sound heads its rows with its label. A lane is a labeled
-//! statement of the score, found from the source ranges an event carries. An event whose
-//! ranges all lie outside the labeled statements, as a pattern kept in a
-//! variable does, still gets a row for its sound, without a lane label.
-//! The rows of a lane share its colour, and a sound keeps its mark in every
-//! lane. Behind the score the rows keep to a strip along the bottom of the
-//! stage.
+//! statement of the score, found from the source ranges an event carries.
+//! An event whose ranges all lie outside the labeled statements, as a
+//! pattern kept in a variable does, still gets a row for its sound, without
+//! a lane label. The rows of a lane share its colour, and a sound keeps its
+//! mark in every lane. Behind the score the rows keep to a strip along the
+//! bottom of the stage.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -34,24 +41,47 @@ const HITS: [char; 4] = ['▮', '¦', '×', '▪'];
 const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 /// The most cells a row's label takes from the past.
 const MAX_LABEL: usize = 16;
+/// The most times a second the playhead or the page moves.
+const MAX_STEPS: f64 = 20.0;
 
 pub(super) struct Lanes<'a, 'b> {
     request: &'a VisualRequest<'b>,
     cycles: f64,
+    scroll: bool,
     playhead: f64,
     labels: bool,
 }
 
 impl<'a, 'b> Lanes<'a, 'b> {
-    /// Three cycles with the playhead a quarter of the way in: the engine
-    /// looks 2.5 cycles ahead, so the right edge stays filled.
+    /// Three cycles: the engine looks 2.5 cycles ahead, so the page has
+    /// what is coming up to its right edge.
     pub(super) fn new(request: &'a VisualRequest<'b>) -> Self {
         let options = request.options;
         Self {
             request,
             cycles: options.number("cycles").unwrap_or(3.0).clamp(0.25, 64.0),
+            scroll: options.flag("scroll").unwrap_or(false),
             playhead: options.number("playhead").unwrap_or(0.25).clamp(0.0, 1.0),
             labels: options.flag("labels").unwrap_or(true),
+        }
+    }
+
+    /// Where the page starts and where its playhead is, in whole cells:
+    /// the page's first cell counted from cycle zero, and the playhead's
+    /// column on the page. Then an event keeps its cell from one frame to
+    /// the next, and the picture moves by whole cells only, at most
+    /// `MAX_STEPS` times a second.
+    fn window(&self, cycle_now: f64, cps: f64, width: f64) -> (f64, f64) {
+        let cell = self.cycles / width;
+        let step = (cps / MAX_STEPS / cell).ceil().max(1.0);
+        let now = (cycle_now / cell / step).floor() * step;
+        if self.scroll {
+            let at = (self.playhead * width).floor().min(width - 1.0);
+            (now - at, at)
+        } else {
+            let half = (width / 2.0).floor();
+            let origin = ((now - (width / 4.0).floor()) / half).floor() * half;
+            (origin, now - origin)
         }
     }
 }
@@ -89,8 +119,13 @@ impl Widget for Lanes<'_, '_> {
         if area.width < 4 || area.height == 0 {
             return;
         }
-        let begin = cycle_now - self.cycles * self.playhead;
+        let width = f64::from(area.width);
+        let cell = self.cycles / width;
+        let (origin, playhead) = self.window(cycle_now, cps, width);
+        let begin = origin * cell;
         let end = begin + self.cycles;
+        // The cycle under the playhead as drawn, which moves only with it.
+        let now = (origin + playhead) * cell;
         let placed = placed_events(state, request.slot, begin, end, now_seconds, cps);
 
         // Each event's row, and its pitch when it has one.
@@ -193,7 +228,8 @@ impl Widget for Lanes<'_, '_> {
 
         // Behind the score the rows keep to a strip along the bottom of the
         // stage, a blank line between them, clear of the code at the top.
-        let area = if request.inline {
+        let stage = !request.inline;
+        let area = if !stage {
             area
         } else {
             let height = (lines.len().max(1) * 2 + 3).min(usize::from(area.height)) as u16;
@@ -212,38 +248,41 @@ impl Widget for Lanes<'_, '_> {
         let shown = lines.len().clamp(1, usize::from(inner.height));
         let share = inner.height / shown as u16;
         let line = |rank: usize| inner.y + rank as u16 * share + (share - 1) / 2;
-        let width = f64::from(area.width);
         // A cell column, one past either edge at most, so an event that
         // started long ago still has a start to draw from.
-        let column = |cycle: f64| {
-            ((cycle - begin) / self.cycles * width)
-                .floor()
-                .clamp(-1.0, width + 1.0) as i64
-        };
-        let playhead_x = area.x + ((self.playhead * width) as u16).min(area.width - 1);
+        let column = |cycle: f64| ((cycle / cell).floor() - origin).clamp(-1.0, width + 1.0) as i64;
+        let playhead_x = area.x + (playhead as u16).min(area.width - 1);
+        // The furthest left the playhead goes. The labels and the cycle
+        // number keep left of it, so they hold still as it moves.
+        let left = if self.scroll { self.playhead } else { 0.25 };
+        let rest = area.x + ((left * width) as u16).min(area.width - 1);
 
-        // A dotted line under each row, with a colon where a cycle starts. A
-        // view with nothing to show yet still has one.
-        for rank in 0..shown {
-            if matches!(lines.get(rank), Some(Line::Lane(_))) {
-                continue;
-            }
-            let y = line(rank);
-            for x in area.x..area.right() {
-                put(buffer, x, y, '·', theme.grid);
-            }
-            let mut cycle = begin.ceil();
-            while cycle < end {
-                if let Ok(x) = u16::try_from(column(cycle))
-                    && x < area.width
-                {
-                    put(buffer, area.x + x, y, ':', theme.grid);
+        // A dotted line under each row, with a colon where a cycle starts,
+        // and the playhead across them. A view with nothing to show yet
+        // still has one. Behind the score they would be a band under every
+        // row and a stripe down the code, so there the marks stand alone.
+        if !stage {
+            for rank in 0..shown {
+                if matches!(lines.get(rank), Some(Line::Lane(_))) {
+                    continue;
                 }
-                cycle += 1.0;
+                let y = line(rank);
+                for x in area.x..area.right() {
+                    put(buffer, x, y, '·', theme.grid);
+                }
+                let mut cycle = begin.ceil();
+                while cycle < end {
+                    if let Ok(x) = u16::try_from(column(cycle))
+                        && x < area.width
+                    {
+                        put(buffer, area.x + x, y, ':', theme.grid);
+                    }
+                    cycle += 1.0;
+                }
             }
-        }
-        for y in area.y..area.bottom() {
-            put(buffer, playhead_x, y, '┊', theme.playhead);
+            for y in area.y..area.bottom() {
+                put(buffer, playhead_x, y, '┊', theme.playhead);
+            }
         }
 
         // What sounds now is drawn last, over anything it shares a cell
@@ -258,7 +297,7 @@ impl Widget for Lanes<'_, '_> {
                 let base = mix(request.background, base, gain_alpha(entry.event));
                 let color = if entry.active {
                     brighten(base)
-                } else if entry.end <= cycle_now {
+                } else if entry.end <= now {
                     dim(base, theme)
                 } else {
                     base
@@ -279,7 +318,8 @@ impl Widget for Lanes<'_, '_> {
                             if to - from >= 3 { to - 1 } else { to },
                         )
                     }
-                    _ => (hits[index], from + 1),
+                    // Behind the score a mark is a tint, as a block is.
+                    _ => (if stage { '█' } else { hits[index] }, from + 1),
                 };
                 for x in from.max(0)..to.min(i64::from(area.width)) {
                     put(buffer, area.x + x as u16, line(rank), glyph, color);
@@ -291,9 +331,7 @@ impl Widget for Lanes<'_, '_> {
         // branch, each with its sound. A lane of one sound names its row,
         // and a row of a lane with no name says its sound.
         if self.labels {
-            let room = usize::from(playhead_x - area.x)
-                .saturating_sub(1)
-                .min(MAX_LABEL);
+            let room = usize::from(rest - area.x).saturating_sub(1).min(MAX_LABEL);
             for (rank, &item) in lines.iter().take(shown).enumerate() {
                 let (Line::Lane(index) | Line::Row(index)) = item;
                 let row = &rows[index];
@@ -334,9 +372,9 @@ impl Widget for Lanes<'_, '_> {
             }
         }
 
-        // The cycle the playhead is on, beside it, half way down: on a line
-        // of its own, else on a heading, whose label keeps to the left, else
-        // over the middle row.
+        // The cycle the playhead is on, half way down, and the playhead's
+        // diamond on the same line: on a line of its own, else on a
+        // heading, whose label keeps to the left, else over the middle row.
         if inner.height >= 3 {
             let middle = inner.y + (inner.height - 1) / 2;
             let held = |y: u16| {
@@ -353,13 +391,13 @@ impl Widget for Lanes<'_, '_> {
                 .filter(|(held, _, _)| *held < 2)
                 .min()
                 .map_or(middle, |(_, _, y)| y);
-            let text = format!("{cycle_now:.1} ");
-            let from = playhead_x.saturating_sub(text.len() as u16).max(area.x);
+            let text = format!("{now:.1} ");
+            let from = rest.saturating_sub(text.len() as u16).max(area.x);
             buffer.set_stringn(
                 from,
                 y,
                 &text,
-                usize::from(playhead_x - from),
+                usize::from(rest - from),
                 Style::default().fg(theme.accent),
             );
             let (diamond, color) = if state.running() {

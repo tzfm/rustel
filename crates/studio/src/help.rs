@@ -152,9 +152,9 @@ impl HelpContext {
                  score. It stays while you work, and the settings sheet stands clear of it."
             }
             Self::Lanes => {
-                "The score's lanes scroll past a playhead, one row for each sound of each \
-                 lane, named after the lane's label. What has played fades on the left, and \
-                 the lookahead shows what is coming on the right. It stays while you edit."
+                "A playhead crosses the score's lanes, one row for each sound of each lane, \
+                 named after the lane's label. What has played fades on the left, and the \
+                 lookahead shows what is coming on the right. It stays while you edit."
             }
         }
     }

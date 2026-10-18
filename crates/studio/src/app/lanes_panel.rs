@@ -1,5 +1,5 @@
-//! The Lanes panel: the score's lanes scrolling past a playhead, docked as
-//! a band along the top or the bottom. `e` moves it to the other edge, `-`
+//! The Lanes panel: the score's lanes with a playhead, docked as a band
+//! along the top or the bottom. `e` moves it to the other edge, `-`
 //! and `+` size it, and Esc gives the keyboard back to the score and leaves
 //! it standing. It comes back at the next launch the way it was left.
 

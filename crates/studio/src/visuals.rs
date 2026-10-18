@@ -3110,7 +3110,7 @@ pub(super) const PAINTER_TERMINAL: &[PainterTerminal] = &[
     },
     PainterTerminal {
         painter: "lanes",
-        entry: "Each row is one line of text: a dotted line with a colon where a cycle starts, and a mark for each hit. The rows of a lane share a colour, and a sound has the same mark in every lane. A pitched row draws each note as a block whose height follows its pitch within the row. The playhead is a dotted column with the cycle number beside it, a filled diamond while playing and a hollow one when stopped.",
+        entry: "A row is a dotted line with a colon where a cycle starts. A hit is a mark, and a note is a block whose height is its pitch.",
         options: &[],
     },
     PainterTerminal {
@@ -3592,8 +3592,8 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
 pub(super) const EXTENSION_ENTRIES: &[ReferenceEntry] = &[ReferenceEntry {
     name: "lanes",
     synonyms: &[],
-    summary: "Shows the score's lanes scrolling past a playhead.",
-    description: "Draws one row for each sound of each lane, with time moving right to left past a fixed playhead. A row is named after its lane's label, such as kick, or after its sound. A lane that plays several sounds shows its label on a line of its own, and each sound hangs under it on a branch. What has played fades on the left, and the lookahead shows what is coming on the right. lanes() draws every lane in a strip along the bottom, behind the score, and _lanes() draws the rows of its own pattern under the call. The Lanes panel shows the same view along the top or the bottom of the studio.",
+    summary: "Shows the score's lanes on a timeline with a playhead.",
+    description: "One row for each sound of each lane, named after the lane's label. The page holds still and the playhead moves across it. _lanes() draws under its pattern, and all(lanes) draws behind the score.",
     params: &[
         ReferenceParam {
             name: "config",
@@ -3606,18 +3606,27 @@ pub(super) const EXTENSION_ENTRIES: &[ReferenceEntry] = &[ReferenceEntry {
             description: "cycles across the view (default 3)",
         },
         ReferenceParam {
+            name: "scroll",
+            r#type: "boolean",
+            description: "move the page past a fixed playhead (default 0)",
+        },
+        ReferenceParam {
             name: "playhead",
             r#type: "number",
-            description: "where the playhead sits, from 0 at the left to 1 at the right (default 0.25)",
+            description: "with scroll, where the playhead stays, 0 to 1 (default 0.25)",
         },
         ReferenceParam {
             name: "labels",
             r#type: "boolean",
-            description: "name each row at its left end (default 1)",
+            description: "name each row (default 1)",
         },
     ],
     examples: &[
-        "kick: s(\"sbd*4\")\nhats: s(\"white*8\").decay(.04).gain(.4)\nbass: note(\"<c2 eb2>*4\").s(\"sawtooth\").lpf(500).lanes()",
+        "kick: s(\"sbd*4\")\nhats: s(\"white*8\").decay(.04).gain(.4)\nbass: note(\"<c2 eb2>*4\").s(\"sawtooth\").lpf(500)\nall(lanes)",
+        "s(\"sbd*4, white*8\").gain(.5)._lanes()",
+        "note(\"c3 eb3 g3 bb3\").s(\"sawtooth\").lpf(800)._lanes({ cycles: 1 })",
+        "s(\"sbd*2, white*8\").gain(.5)._lanes({ scroll: 1, playhead: 0.5 })",
+        "kick: s(\"sbd*4\")\nhats: s(\"white*8\").gain(.4)\nall(lanes({ cycles: 2, labels: 0 }))",
     ],
     tags: &["visualization"],
     no_autocomplete: false,
@@ -4513,6 +4522,29 @@ mod tests {
             !bare.contains("bd"),
             "no labels unless asked, as on strudel.cc: {bare:?}"
         );
+    }
+
+    /// The lanes page holds still while the playhead crosses its middle
+    /// half, so from one frame to the next only the playhead moves. Past
+    /// three quarters of the way the page turns by half its width.
+    #[test]
+    fn the_lanes_page_holds_still_under_the_playhead() {
+        // A cell is a twentieth of a cycle, and the hit is on cycle 2.
+        let columns = |cycle: f64| {
+            let hit = event(1, "2/1", "9/4", 12.0 - cycle);
+            let state = playing("s(\"bd\")", vec![hit], cycle);
+            let buffer = draw("lanes", "", &state, Rect::new(0, 0, 60, 5));
+            let find = |y: u16, found: &dyn Fn(&str) -> bool| {
+                (0..60).find(|&x| buffer.cell((x, y)).is_some_and(|cell| found(cell.symbol())))
+            };
+            (
+                find(0, &|symbol| symbol == "▼"),
+                find(2, &|symbol| ["▮", "¦", "×", "▪"].contains(&symbol)),
+            )
+        };
+        assert_eq!(columns(0.81), (Some(16), Some(40)));
+        assert_eq!(columns(1.21), (Some(24), Some(40)));
+        assert_eq!(columns(2.31), (Some(16), Some(10)));
     }
 
     #[test]
