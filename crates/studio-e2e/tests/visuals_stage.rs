@@ -29,6 +29,7 @@ fn every_canvas_painter_paints_the_stage() {
         "pitchwheel",
         "scope",
         "spectrum",
+        "lanes",
     ] {
         studio.set_score(&format!("$: s(\"bd\")._{kind}()"));
         studio.chord("ctrl+s");

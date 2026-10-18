@@ -3,7 +3,9 @@
 ## Unreleased
 
 - Csound instruments play and export with `.csound()` and `.csoundm()`. Load orchestras with `loadCSound` or `loadOrc`. Requires double-precision Csound 6.18 or later 6.x. Studio enables native orchestras at startup, and the command line requires `--allow-csound`. See [Csound](https://github.com/tzfm/rustel/blob/main/docs/csound.md).
+- The `room` reverb no longer sums its whole coarse convolution step in one audio callback. Every 2048 frames that step made about one 32-frame callback in 64 miss its deadline, and Studio asked for a larger buffer. Rustel now shares the sum over the 2048 frames before it, so 32- and 64-frame buffers play a score with reverb without overloads. The output moves by a few units in the last place of a float.
 - A note release no longer suppresses a MIDI press that follows within 40 ms. Scene pads and learned action buttons could miss that press.
+- Studio has a Lanes panel. A playhead crosses the score's lanes, with one row for each sound of each lane, named after the lane's label. View ▸ Lanes opens it, `e` moves it between the top and the bottom, and it is closed by default. `lanes()` and `_lanes()` draw the same view in a score. See [Studio](https://github.com/tzfm/rustel/blob/main/docs/studio.md#lanes).
 
 ## v0.1.4
 

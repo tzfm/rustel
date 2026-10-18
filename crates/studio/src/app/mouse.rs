@@ -324,6 +324,7 @@ impl App {
         if self.click_set_panel(x, y)
             || self.click_mixer_panel(x, y)
             || self.click_memory_dock(x, y)
+            || self.click_lanes_panel(x, y)
             || self.click_viz_panel(x, y)
         {
             return Ok(true);
@@ -625,6 +626,7 @@ impl App {
             || self.scroll_mixer_fader(x, y, direction)
             || self.scroll_set_panel(x, y, direction)
             || self.memory_dock_at(x, y)
+            || self.lanes_panel_at(x, y)
             || self.scroll_viz_panel(x, y, direction)
         {
             return true;

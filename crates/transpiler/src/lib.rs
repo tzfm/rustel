@@ -1125,6 +1125,8 @@ pub const VISUAL_WIDGET_METHODS: &[&str] = &[
     "_pitchwheel",
     "spectrum",
     "_spectrum",
+    "lanes",
+    "_lanes",
     "markcss",
 ];
 
@@ -4053,6 +4055,29 @@ pub fn lane_statements(source: &str) -> Option<Vec<LaneStatement>> {
         });
     }
     Some(lanes)
+}
+
+/// Where each labeled statement of `source` sits, in source order: the byte
+/// range from its label to the end of its code, and the label as written.
+/// The scan is the one [`lane_statements`] reads, so the two find the same
+/// lanes. A score with no label has no span.
+///
+/// `None` when the scan did not run, as for [`lane_statements`].
+pub fn lane_spans(source: &str) -> Option<Vec<(std::ops::Range<usize>, String)>> {
+    if check_nesting(source).is_err() {
+        return None;
+    }
+    on_parse_stack(|| {
+        let regexes_are_present = !RegexLiteralRanges::parse(source).is_empty();
+        scan_statements(source, regexes_are_present)
+            .into_iter()
+            .filter(|statement| statement.colon.is_some())
+            .map(|statement| {
+                let label = source[statement.start..statement.name_end].to_owned();
+                (statement.start..statement.end, label)
+            })
+            .collect()
+    })
 }
 
 /// The body of `lane_statements`, always called on a parse stack. Empty when

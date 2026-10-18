@@ -11,6 +11,8 @@
 //! score wrote inside its `_visual(...)` call.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::ops::Range;
+use std::sync::Arc;
 use std::time::Instant;
 
 use ratatui::buffer::Buffer;
@@ -26,6 +28,8 @@ use rustel_runtime::ui_events::{
 
 use super::engine::StudioSnapshot;
 use super::theme::{Theme, VisualOptions, hsv, luminance, mix, parse_color, true_rgb};
+
+mod lanes;
 
 const MAX_TIMELINE_EVENTS: usize = 2_048;
 const HISTORY_SECONDS: f64 = 8.0;
@@ -51,13 +55,13 @@ impl ClockAnchor {
 pub struct VisualState {
     layout: Option<UiLayout>,
     running: bool,
-    events: VecDeque<UiScheduledEvent>,
+    events: VecDeque<TimelineEvent>,
     onset_ids: HashSet<u64>,
     /// What the engine has looked ahead to but not queued yet: the notes a
     /// painter shows coming, replaced wholesale by every preview batch and
     /// retired one by one as the real traces arrive. Never a source
     /// highlight, never "sounding".
-    previews: Vec<UiScheduledEvent>,
+    previews: Vec<TimelineEvent>,
     /// The identities of the real events on the timeline, so a preview of
     /// an onset that has since really been queued is not drawn twice.
     real_keys: HashSet<OnsetKey>,
@@ -86,6 +90,12 @@ pub struct VisualState {
     audio_sample_rate: u32,
     audio_sequence: u64,
     dropped: u64,
+    /// The labeled statements of the score in play, in source order: each
+    /// one's byte range in that text and its label. The lanes view reads an
+    /// event's lane from them.
+    lanes: Vec<(Range<usize>, Arc<str>)>,
+    /// The text `lanes` was read from.
+    lanes_source: Option<Arc<str>>,
 }
 
 /// The bit the display sets on a preview's onset id, so a preview is told
@@ -117,6 +127,47 @@ impl OnsetKey {
             value: event.value.clone(),
             context: event.context.clone(),
         }
+    }
+}
+
+/// An event on the timeline, with the cycles, the pitch and the sound the
+/// painters need from its text. They are read once, when the event
+/// arrives, and not again on every frame.
+#[derive(Debug)]
+struct TimelineEvent {
+    event: UiScheduledEvent,
+    /// The cycles it starts and ends on, when its text gives them.
+    begin: Option<f64>,
+    end: Option<f64>,
+    /// See [`event_pitch`].
+    pitch: Option<f32>,
+    /// Where [`sound_of`] finds the sound in the value text.
+    sound: Range<usize>,
+}
+
+impl TimelineEvent {
+    fn new(event: UiScheduledEvent) -> Self {
+        let cycle =
+            |whole: &str, part: &str| parse_fraction(whole).or_else(|| parse_fraction(part));
+        let sound = event
+            .value
+            .as_deref()
+            .and_then(|value| value.substr_range(sound_of(&event)))
+            .map_or(0..0, Into::into);
+        Self {
+            begin: cycle(&event.whole_begin, &event.part_begin),
+            end: cycle(&event.whole_end, &event.part_end),
+            pitch: event_pitch(&event),
+            sound,
+            event,
+        }
+    }
+
+    fn sound(&self) -> &str {
+        self.event
+            .value
+            .as_deref()
+            .map_or("", |value| &value[self.sound.clone()])
     }
 }
 
@@ -240,8 +291,8 @@ impl VisualState {
             // the picture: adopt the timeline and its clock into the new
             // generation rather than blanking the widgets until the next
             // trace batch arrives.
-            for event in self.events.iter_mut().chain(self.previews.iter_mut()) {
-                event.generation = generation;
+            for timed in self.events.iter_mut().chain(self.previews.iter_mut()) {
+                timed.event.generation = generation;
             }
             if let Some(clock) = self.clock.as_mut() {
                 clock.generation = generation;
@@ -262,6 +313,20 @@ impl VisualState {
 
     pub fn layout(&self) -> Option<&UiLayout> {
         self.layout.as_ref()
+    }
+
+    /// Read the lanes of the score in play, once for each text.
+    pub fn install_lanes(&mut self, source: Option<&Arc<str>>) {
+        if self.lanes_source.as_deref() == source.map(|source| &**source) {
+            return;
+        }
+        self.lanes = source
+            .and_then(|source| rustel_transpiler::lane_spans(source))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(span, label)| (span, Arc::from(label)))
+            .collect();
+        self.lanes_source = source.cloned();
     }
 
     /// Whether playback is running: false from a stop until the next start.
@@ -349,7 +414,7 @@ impl VisualState {
             cps: batch.cps,
         });
         self.previews
-            .retain(|event| onset_cycle(event).is_some_and(|cycle| cycle < from_cycle));
+            .retain(|preview| preview.begin.is_some_and(|cycle| cycle < from_cycle));
         let keys = &self.real_keys;
         self.previews.extend(
             batch
@@ -358,7 +423,7 @@ impl VisualState {
                 .filter(|event| !keys.contains(&OnsetKey::of(event)))
                 .map(|mut event| {
                     event.onset_id |= PREVIEW_ONSET_FLAG;
-                    event
+                    TimelineEvent::new(event)
                 }),
         );
         true
@@ -381,7 +446,7 @@ impl VisualState {
         for event in batch.events {
             if self.onset_ids.insert(event.onset_id) {
                 self.real_keys.insert(OnsetKey::of(&event));
-                self.events.push_back(event);
+                self.events.push_back(TimelineEvent::new(event));
             }
         }
         while self.events.len() > MAX_TIMELINE_EVENTS {
@@ -392,15 +457,15 @@ impl VisualState {
         // done its job.
         let keys = &self.real_keys;
         self.previews
-            .retain(|preview| !keys.contains(&OnsetKey::of(preview)));
+            .retain(|preview| !keys.contains(&OnsetKey::of(&preview.event)));
         true
     }
 
     /// Drop the oldest real event from the timeline.
     fn evict_front(&mut self) {
-        if let Some(event) = self.events.pop_front() {
-            self.onset_ids.remove(&event.onset_id);
-            self.real_keys.remove(&OnsetKey::of(&event));
+        if let Some(timed) = self.events.pop_front() {
+            self.onset_ids.remove(&timed.event.onset_id);
+            self.real_keys.remove(&OnsetKey::of(&timed.event));
         }
     }
 
@@ -607,6 +672,7 @@ impl VisualState {
         };
         self.events
             .iter()
+            .map(|timed| &timed.event)
             .filter_map(|event| {
                 let end = event.target_time + event.duration_seconds.max(0.035);
                 if event.generation != layout.generation || event.target_time > now {
@@ -641,7 +707,11 @@ impl VisualState {
     /// Everything on the timeline: the traces of what has been queued to
     /// sound, then the previews of what is coming.
     pub fn events(&self) -> impl Iterator<Item = &UiScheduledEvent> {
-        self.events.iter().chain(self.previews.iter())
+        self.timeline().map(|timed| &timed.event)
+    }
+
+    fn timeline(&self) -> impl Iterator<Item = &TimelineEvent> {
+        self.events.iter().chain(&self.previews)
     }
 
     fn prune(&mut self) {
@@ -652,21 +722,14 @@ impl VisualState {
         let Some((now, _, _)) = self.clock_at(wall) else {
             return;
         };
-        while self
-            .events
-            .front()
-            .is_some_and(|event| event.target_time + event.duration_seconds + HISTORY_SECONDS < now)
-        {
+        let ends = |timed: &TimelineEvent| {
+            timed.event.target_time + timed.event.duration_seconds + HISTORY_SECONDS
+        };
+        while self.events.front().is_some_and(|timed| ends(timed) < now) {
             self.evict_front();
         }
-        self.previews
-            .retain(|event| event.target_time + event.duration_seconds + HISTORY_SECONDS >= now);
+        self.previews.retain(|timed| ends(timed) >= now);
     }
-}
-
-/// The cycle an event starts on.
-fn onset_cycle(event: &UiScheduledEvent) -> Option<f64> {
-    parse_fraction(&event.whole_begin).or_else(|| parse_fraction(&event.part_begin))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1169,6 +1232,7 @@ pub fn render(request: VisualRequest<'_>, area: Rect, buffer: &mut Buffer) {
             PianoRoll::new(&request, RollPreset::PianoRoll).render(area, buffer)
         }
         "wordfall" => PianoRoll::new(&request, RollPreset::Wordfall).render(area, buffer),
+        "lanes" => lanes::Lanes::new(&request).render(area, buffer),
         "spiral" => Spiral::new(&request).render(area, buffer),
         "pitchwheel" => PitchWheel::new(&request).render(area, buffer),
         "scope" | "tscope" => Scope::new(&request).render(area, buffer),
@@ -1205,6 +1269,10 @@ struct PlacedEvent<'a> {
     begin: f64,
     end: f64,
     active: bool,
+    /// See [`event_pitch`].
+    pitch: Option<f32>,
+    /// See [`sound_of`].
+    sound: &'a str,
 }
 
 /// Events overlapping `[begin, end)` on the cycle timeline.
@@ -1217,19 +1285,21 @@ fn placed_events<'a>(
     cps: f64,
 ) -> Vec<PlacedEvent<'a>> {
     state
-        .events()
-        .filter(|event| slot.is_none_or(|slot| event.ui_visuals & (1_u64 << slot) != 0))
-        .filter_map(|event| {
-            let event_begin =
-                parse_fraction(&event.whole_begin).or_else(|| parse_fraction(&event.part_begin))?;
-            let event_end = parse_fraction(&event.whole_end)
-                .or_else(|| parse_fraction(&event.part_end))
+        .timeline()
+        .filter(|timed| slot.is_none_or(|slot| timed.event.ui_visuals & (1_u64 << slot) != 0))
+        .filter_map(|timed| {
+            let event = &timed.event;
+            let event_begin = timed.begin?;
+            let event_end = timed
+                .end
                 .unwrap_or(event_begin + event.duration_seconds * cps);
             (event_end >= begin && event_begin <= end).then(|| PlacedEvent {
                 event,
                 begin: event_begin,
                 end: event_end.max(event_begin),
                 active: is_active(event, now_seconds),
+                pitch: timed.pitch,
+                sound: timed.sound(),
             })
         })
         .collect()
@@ -1271,6 +1341,41 @@ fn short_value(event: &UiScheduledEvent) -> String {
     value.chars().take(12).collect()
 }
 
+/// An event's pitch in MIDI notes, when it has one.
+fn event_pitch(event: &UiScheduledEvent) -> Option<f32> {
+    // The audio route supplies a synth's default frequency after its
+    // preview was drawn. That is not a pitch written in the pattern:
+    // s("sine") must keep the same named lane before and after onset.
+    if let Some(value) = event.value.as_deref() {
+        let sound = value
+            .split_whitespace()
+            .any(|field| field.starts_with("s:"));
+        let pitch = value
+            .split_whitespace()
+            .any(|field| field.starts_with("note:") || field.starts_with("freq:"));
+        if sound && !pitch {
+            return None;
+        }
+    }
+    event
+        .frequency_hz
+        .filter(|hertz| hertz.is_finite())
+        .map(frequency_to_midi)
+}
+
+/// The sound an event names: `bd` for `s:bd n:3` and for `s:bd:3`.
+fn sound_of(event: &UiScheduledEvent) -> &str {
+    event
+        .value
+        .as_deref()
+        .and_then(|value| {
+            value
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("s:"))
+        })
+        .map_or("", |sound| sound.split(':').next().unwrap_or(sound))
+}
+
 /// Row identity for the piano roll: a pitch when the event has one, and the
 /// value text otherwise, so a drum pattern gets one lane per sound.
 #[derive(Clone, Debug, PartialEq)]
@@ -1281,24 +1386,7 @@ enum Lane {
 
 impl Lane {
     fn of(event: &UiScheduledEvent) -> Self {
-        // The audio route supplies a synth's default frequency after its
-        // preview was drawn. That is not a pitch written in the pattern:
-        // s("sine") must keep the same named lane before and after onset.
-        if let Some(value) = event.value.as_deref() {
-            let sound = value
-                .split_whitespace()
-                .any(|field| field.starts_with("s:"));
-            let pitch = value
-                .split_whitespace()
-                .any(|field| field.starts_with("note:") || field.starts_with("freq:"));
-            if sound && !pitch {
-                return Self::Named(short_value(event));
-            }
-        }
-        match event.frequency_hz.filter(|hertz| hertz.is_finite()) {
-            Some(hertz) => Self::Pitch(frequency_to_midi(hertz)),
-            None => Self::Named(short_value(event)),
-        }
+        event_pitch(event).map_or_else(|| Self::Named(short_value(event)), Self::Pitch)
     }
 
     fn label(&self) -> String {
@@ -3079,6 +3167,11 @@ pub(super) const PAINTER_TERMINAL: &[PainterTerminal] = &[
         ],
     },
     PainterTerminal {
+        painter: "lanes",
+        entry: "A row is a dotted line with a colon where a cycle starts. A hit is a mark, and a note is a block whose height is its pitch.",
+        options: &[],
+    },
+    PainterTerminal {
         painter: "markcss",
         entry: "Accepted and never drawn: the studio highlights sounding events in its own theme's colours, which a CSS rule cannot describe.",
         options: &[],
@@ -3551,6 +3644,53 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         origin: "rustel",
     },
 ];
+
+/// The painters this engine adds to the language. The reference credits them
+/// as Rustel extensions.
+pub(super) const EXTENSION_ENTRIES: &[ReferenceEntry] = &[ReferenceEntry {
+    name: "lanes",
+    synonyms: &[],
+    summary: "Shows the score's lanes on a timeline with a playhead.",
+    description: "One row for each sound of each lane, named after the lane's label. The page holds still and the playhead moves across it. _lanes() draws under its pattern, and all(lanes) draws behind the score.",
+    params: &[
+        ReferenceParam {
+            name: "config",
+            r#type: "object",
+            description: "optional config with options:",
+        },
+        ReferenceParam {
+            name: "cycles",
+            r#type: "number",
+            description: "cycles across the view (default 3)",
+        },
+        ReferenceParam {
+            name: "scroll",
+            r#type: "boolean",
+            description: "move the page past a fixed playhead (default 0)",
+        },
+        ReferenceParam {
+            name: "playhead",
+            r#type: "number",
+            description: "with scroll, where the playhead stays, 0 to 1 (default 0.25)",
+        },
+        ReferenceParam {
+            name: "labels",
+            r#type: "boolean",
+            description: "name each row (default 1)",
+        },
+    ],
+    examples: &[
+        "kick: s(\"sbd*4\")\nhats: s(\"white*8\").decay(.04).gain(.4)\nbass: note(\"<c2 eb2>*4\").s(\"sawtooth\").lpf(500)\nall(lanes)",
+        "s(\"sbd*4, white*8\").gain(.5)._lanes()",
+        "note(\"c3 eb3 g3 bb3\").s(\"sawtooth\").lpf(800)._lanes({ cycles: 1 })",
+        "s(\"sbd*2, white*8\").gain(.5)._lanes({ scroll: 1, playhead: 0.5 })",
+        "kick: s(\"sbd*4\")\nhats: s(\"white*8\").gain(.4)\nall(lanes({ cycles: 2, labels: 0 }))",
+    ],
+    tags: &["visualization"],
+    no_autocomplete: false,
+    deprecated: false,
+    origin: "rustel",
+}];
 
 #[cfg(test)]
 mod tests {
@@ -4442,6 +4582,29 @@ mod tests {
         );
     }
 
+    /// The lanes page holds still while the playhead crosses its middle
+    /// half, so from one frame to the next only the playhead moves. Past
+    /// three quarters of the way the page turns by half its width.
+    #[test]
+    fn the_lanes_page_holds_still_under_the_playhead() {
+        // A cell is a twentieth of a cycle, and the hit is on cycle 2.
+        let columns = |cycle: f64| {
+            let hit = event(1, "2/1", "9/4", 12.0 - cycle);
+            let state = playing("s(\"bd\")", vec![hit], cycle);
+            let buffer = draw("lanes", "", &state, Rect::new(0, 0, 60, 5));
+            let find = |y: u16, found: &dyn Fn(&str) -> bool| {
+                (0..60).find(|&x| buffer.cell((x, y)).is_some_and(|cell| found(cell.symbol())))
+            };
+            (
+                find(0, &|symbol| symbol == "▼"),
+                find(2, &|symbol| ["▮", "¦", "×", "▪"].contains(&symbol)),
+            )
+        };
+        assert_eq!(columns(0.81), (Some(16), Some(40)));
+        assert_eq!(columns(1.21), (Some(24), Some(40)));
+        assert_eq!(columns(2.31), (Some(16), Some(10)));
+    }
+
     #[test]
     fn piano_roll_options_move_the_playhead_and_change_the_window() {
         let state = playing(
@@ -5261,7 +5424,7 @@ mod tests {
         }
         let mut red = event(1, "0/1", "1/1", 10.0);
         red.color = Some("red".into());
-        state.events.push_back(red);
+        state.events.push_back(TimelineEvent::new(red));
         let picture = draw("spectrum", "{ color: '#123456' }", &state, area);
         for x in 0..area.width {
             assert_eq!(picture[(x, 3)].fg, parse_color("red").unwrap());
@@ -5675,7 +5838,9 @@ mod tests {
             .expect("a clock");
         assert!((before - 1.0).abs() < 1e-6, "{before}");
 
-        visual.previews.push(event(7, "1/1", "2/1", 11.0));
+        visual
+            .previews
+            .push(TimelineEvent::new(event(7, "1/1", "2/1", 11.0)));
         visual.stop();
         assert_eq!(
             visual.previews.len(),

@@ -25,6 +25,7 @@ pub mod jobs;
 /// The one shortcut table: what every chord means, and the Settings page
 /// that changes it.
 pub mod keybinds;
+mod lanes_panel;
 pub mod lint;
 pub mod log;
 pub mod memory;

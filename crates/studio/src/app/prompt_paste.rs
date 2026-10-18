@@ -123,7 +123,8 @@ impl App {
             | PanelKind::Jobs
             | PanelKind::Settings
             | PanelKind::Mixer
-            | PanelKind::Memory => false,
+            | PanelKind::Memory
+            | PanelKind::Lanes => false,
         };
         if kept {
             self.dirty_frame = true;

@@ -258,6 +258,7 @@ impl UiVisual {
                     | "tscope"
                     | "pitchwheel"
                     | "spectrum"
+                    | "lanes"
                     | "markcss"
             )
         {
@@ -528,10 +529,14 @@ pub fn visual_layout(
                 inline,
                 // A pattern's painter is tagged to that pattern - except a
                 // plain `punchcard()`/`wordfall()`, which on strudel.cc is
-                // fed every hap the highlighter sees, the whole stack. Its
-                // `_` twin is tagged like the rest.
+                // fed every hap the highlighter sees, the whole stack, and
+                // `lanes()` without its underscore, which shows every lane.
+                // Their `_` twins are tagged like the rest.
                 slot: (all_painter.is_none()
-                    && !matches!(widget.widget_type.as_str(), "punchcard" | "wordfall"))
+                    && !matches!(
+                        widget.widget_type.as_str(),
+                        "punchcard" | "wordfall" | "lanes"
+                    ))
                 .then_some(widget.visual_slot)
                 .flatten(),
                 from: widget.from,
