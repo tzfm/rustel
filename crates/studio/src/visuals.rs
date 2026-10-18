@@ -55,13 +55,13 @@ impl ClockAnchor {
 pub struct VisualState {
     layout: Option<UiLayout>,
     running: bool,
-    events: VecDeque<UiScheduledEvent>,
+    events: VecDeque<TimelineEvent>,
     onset_ids: HashSet<u64>,
     /// What the engine has looked ahead to but not queued yet: the notes a
     /// painter shows coming, replaced wholesale by every preview batch and
     /// retired one by one as the real traces arrive. Never a source
     /// highlight, never "sounding".
-    previews: Vec<UiScheduledEvent>,
+    previews: Vec<TimelineEvent>,
     /// The identities of the real events on the timeline, so a preview of
     /// an onset that has since really been queued is not drawn twice.
     real_keys: HashSet<OnsetKey>,
@@ -127,6 +127,47 @@ impl OnsetKey {
             value: event.value.clone(),
             context: event.context.clone(),
         }
+    }
+}
+
+/// An event on the timeline, with the cycles, the pitch and the sound the
+/// painters need from its text. They are read once, when the event
+/// arrives, and not again on every frame.
+#[derive(Debug)]
+struct TimelineEvent {
+    event: UiScheduledEvent,
+    /// The cycles it starts and ends on, when its text gives them.
+    begin: Option<f64>,
+    end: Option<f64>,
+    /// See [`event_pitch`].
+    pitch: Option<f32>,
+    /// Where [`sound_of`] finds the sound in the value text.
+    sound: Range<usize>,
+}
+
+impl TimelineEvent {
+    fn new(event: UiScheduledEvent) -> Self {
+        let cycle =
+            |whole: &str, part: &str| parse_fraction(whole).or_else(|| parse_fraction(part));
+        let sound = event
+            .value
+            .as_deref()
+            .and_then(|value| value.substr_range(sound_of(&event)))
+            .map_or(0..0, Into::into);
+        Self {
+            begin: cycle(&event.whole_begin, &event.part_begin),
+            end: cycle(&event.whole_end, &event.part_end),
+            pitch: event_pitch(&event),
+            sound,
+            event,
+        }
+    }
+
+    fn sound(&self) -> &str {
+        self.event
+            .value
+            .as_deref()
+            .map_or("", |value| &value[self.sound.clone()])
     }
 }
 
@@ -250,8 +291,8 @@ impl VisualState {
             // the picture: adopt the timeline and its clock into the new
             // generation rather than blanking the widgets until the next
             // trace batch arrives.
-            for event in self.events.iter_mut().chain(self.previews.iter_mut()) {
-                event.generation = generation;
+            for timed in self.events.iter_mut().chain(self.previews.iter_mut()) {
+                timed.event.generation = generation;
             }
             if let Some(clock) = self.clock.as_mut() {
                 clock.generation = generation;
@@ -373,7 +414,7 @@ impl VisualState {
             cps: batch.cps,
         });
         self.previews
-            .retain(|event| onset_cycle(event).is_some_and(|cycle| cycle < from_cycle));
+            .retain(|preview| preview.begin.is_some_and(|cycle| cycle < from_cycle));
         let keys = &self.real_keys;
         self.previews.extend(
             batch
@@ -382,7 +423,7 @@ impl VisualState {
                 .filter(|event| !keys.contains(&OnsetKey::of(event)))
                 .map(|mut event| {
                     event.onset_id |= PREVIEW_ONSET_FLAG;
-                    event
+                    TimelineEvent::new(event)
                 }),
         );
         true
@@ -405,7 +446,7 @@ impl VisualState {
         for event in batch.events {
             if self.onset_ids.insert(event.onset_id) {
                 self.real_keys.insert(OnsetKey::of(&event));
-                self.events.push_back(event);
+                self.events.push_back(TimelineEvent::new(event));
             }
         }
         while self.events.len() > MAX_TIMELINE_EVENTS {
@@ -416,15 +457,15 @@ impl VisualState {
         // done its job.
         let keys = &self.real_keys;
         self.previews
-            .retain(|preview| !keys.contains(&OnsetKey::of(preview)));
+            .retain(|preview| !keys.contains(&OnsetKey::of(&preview.event)));
         true
     }
 
     /// Drop the oldest real event from the timeline.
     fn evict_front(&mut self) {
-        if let Some(event) = self.events.pop_front() {
-            self.onset_ids.remove(&event.onset_id);
-            self.real_keys.remove(&OnsetKey::of(&event));
+        if let Some(timed) = self.events.pop_front() {
+            self.onset_ids.remove(&timed.event.onset_id);
+            self.real_keys.remove(&OnsetKey::of(&timed.event));
         }
     }
 
@@ -631,6 +672,7 @@ impl VisualState {
         };
         self.events
             .iter()
+            .map(|timed| &timed.event)
             .filter_map(|event| {
                 let end = event.target_time + event.duration_seconds.max(0.035);
                 if event.generation != layout.generation || event.target_time > now {
@@ -665,7 +707,11 @@ impl VisualState {
     /// Everything on the timeline: the traces of what has been queued to
     /// sound, then the previews of what is coming.
     pub fn events(&self) -> impl Iterator<Item = &UiScheduledEvent> {
-        self.events.iter().chain(self.previews.iter())
+        self.timeline().map(|timed| &timed.event)
+    }
+
+    fn timeline(&self) -> impl Iterator<Item = &TimelineEvent> {
+        self.events.iter().chain(&self.previews)
     }
 
     fn prune(&mut self) {
@@ -676,21 +722,14 @@ impl VisualState {
         let Some((now, _, _)) = self.clock_at(wall) else {
             return;
         };
-        while self
-            .events
-            .front()
-            .is_some_and(|event| event.target_time + event.duration_seconds + HISTORY_SECONDS < now)
-        {
+        let ends = |timed: &TimelineEvent| {
+            timed.event.target_time + timed.event.duration_seconds + HISTORY_SECONDS
+        };
+        while self.events.front().is_some_and(|timed| ends(timed) < now) {
             self.evict_front();
         }
-        self.previews
-            .retain(|event| event.target_time + event.duration_seconds + HISTORY_SECONDS >= now);
+        self.previews.retain(|timed| ends(timed) >= now);
     }
-}
-
-/// The cycle an event starts on.
-fn onset_cycle(event: &UiScheduledEvent) -> Option<f64> {
-    parse_fraction(&event.whole_begin).or_else(|| parse_fraction(&event.part_begin))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1230,6 +1269,10 @@ struct PlacedEvent<'a> {
     begin: f64,
     end: f64,
     active: bool,
+    /// See [`event_pitch`].
+    pitch: Option<f32>,
+    /// See [`sound_of`].
+    sound: &'a str,
 }
 
 /// Events overlapping `[begin, end)` on the cycle timeline.
@@ -1242,19 +1285,21 @@ fn placed_events<'a>(
     cps: f64,
 ) -> Vec<PlacedEvent<'a>> {
     state
-        .events()
-        .filter(|event| slot.is_none_or(|slot| event.ui_visuals & (1_u64 << slot) != 0))
-        .filter_map(|event| {
-            let event_begin =
-                parse_fraction(&event.whole_begin).or_else(|| parse_fraction(&event.part_begin))?;
-            let event_end = parse_fraction(&event.whole_end)
-                .or_else(|| parse_fraction(&event.part_end))
+        .timeline()
+        .filter(|timed| slot.is_none_or(|slot| timed.event.ui_visuals & (1_u64 << slot) != 0))
+        .filter_map(|timed| {
+            let event = &timed.event;
+            let event_begin = timed.begin?;
+            let event_end = timed
+                .end
                 .unwrap_or(event_begin + event.duration_seconds * cps);
             (event_end >= begin && event_begin <= end).then(|| PlacedEvent {
                 event,
                 begin: event_begin,
                 end: event_end.max(event_begin),
                 active: is_active(event, now_seconds),
+                pitch: timed.pitch,
+                sound: timed.sound(),
             })
         })
         .collect()
@@ -1316,6 +1361,19 @@ fn event_pitch(event: &UiScheduledEvent) -> Option<f32> {
         .frequency_hz
         .filter(|hertz| hertz.is_finite())
         .map(frequency_to_midi)
+}
+
+/// The sound an event names: `bd` for `s:bd n:3` and for `s:bd:3`.
+fn sound_of(event: &UiScheduledEvent) -> &str {
+    event
+        .value
+        .as_deref()
+        .and_then(|value| {
+            value
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("s:"))
+        })
+        .map_or("", |sound| sound.split(':').next().unwrap_or(sound))
 }
 
 /// Row identity for the piano roll: a pitch when the event has one, and the
@@ -5366,7 +5424,7 @@ mod tests {
         }
         let mut red = event(1, "0/1", "1/1", 10.0);
         red.color = Some("red".into());
-        state.events.push_back(red);
+        state.events.push_back(TimelineEvent::new(red));
         let picture = draw("spectrum", "{ color: '#123456' }", &state, area);
         for x in 0..area.width {
             assert_eq!(picture[(x, 3)].fg, parse_color("red").unwrap());
@@ -5780,7 +5838,9 @@ mod tests {
             .expect("a clock");
         assert!((before - 1.0).abs() < 1e-6, "{before}");
 
-        visual.previews.push(event(7, "1/1", "2/1", 11.0));
+        visual
+            .previews
+            .push(TimelineEvent::new(event(7, "1/1", "2/1", 11.0)));
         visual.stop();
         assert_eq!(
             visual.previews.len(),

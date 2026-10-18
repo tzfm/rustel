@@ -133,7 +133,7 @@ impl Widget for Lanes<'_, '_> {
         let mut marks = Vec::with_capacity(placed.len());
         for entry in &placed {
             let lane = lane_of(&state.lanes, &entry.event.context);
-            let sound = sound_of(entry.event);
+            let sound = entry.sound;
             let index = rows
                 .iter()
                 .position(|row| row.lane == lane && row.sound == sound)
@@ -145,7 +145,7 @@ impl Widget for Lanes<'_, '_> {
                     });
                     rows.len() - 1
                 });
-            let midi = event_pitch(entry.event);
+            let midi = entry.pitch;
             if let Some(midi) = midi {
                 let row = &mut rows[index];
                 row.pitch = Some(
@@ -436,19 +436,6 @@ fn lane_of(lanes: &[(Range<usize>, Arc<str>)], context: &[(usize, usize)]) -> Op
             .checked_sub(1)?;
         lanes[index].0.contains(&from).then_some(index)
     })
-}
-
-/// The sound an event names: `bd` for `s:bd n:3` and for `s:bd:3`.
-fn sound_of(event: &UiScheduledEvent) -> &str {
-    event
-        .value
-        .as_deref()
-        .and_then(|value| {
-            value
-                .split_whitespace()
-                .find_map(|field| field.strip_prefix("s:"))
-        })
-        .map_or("", |sound| sound.split(':').next().unwrap_or(sound))
 }
 
 /// The label of a row's lane, when the score named the lane. `$` lanes have
