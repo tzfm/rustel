@@ -301,10 +301,10 @@ Studio's arrows offer automatic and 32-2048; other valid values are retained.
 The stream report shows the size the device grants.
 
 A small buffer leaves little time for each callback: 32 frames at 48 kHz is
-0.67 ms. The reverb (`room`) does one larger step every 2048 frames. At 32 or
-64 frames that step can take longer than one callback, and Studio then shows
-the hint to raise the audio out latency. With reverb in the score, use 128
-frames, or 64 on a fast machine.
+0.67 ms. The coarse part of the reverb (`room`) is summed once every 2048
+frames, and rustel shares that sum over the 2048 frames before it, so no
+callback carries the whole step. If the sound still crackles, raise the audio
+out latency.
 
 A laptop in a power-saving mode keeps the CPU clock low for short, regular
 work such as an audio callback, and it changes the clock often. The same

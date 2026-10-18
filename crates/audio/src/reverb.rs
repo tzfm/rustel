@@ -180,6 +180,9 @@ const TAIL_START: usize = 2048;
 const TAIL_BLOCK: usize = TAIL_START;
 const TAIL_FFT: usize = 2 * TAIL_BLOCK;
 
+/// Head hops in one tail block.
+const HOPS_PER_TAIL: usize = TAIL_BLOCK / REVERB_BLOCK;
+
 /// The tail half of a non-uniform partitioned convolution.
 ///
 /// Handles impulse-response offsets `[TAIL_START, end)` only. Because every
@@ -187,6 +190,13 @@ const TAIL_FFT: usize = 2 * TAIL_BLOCK;
 /// block of output from input it already has: partition `k` here is IR block
 /// `k + 1` in tail-block units, and skipping block 0 is exactly what removes
 /// the latency that would otherwise make a coarse partition unusable.
+///
+/// Only partition 0 needs the block being gathered. The products of the
+/// older blocks are summed a share at a time on the head hops before the
+/// block ends, so the callback that ends a tail block does two transforms
+/// and one product, not one product for every partition. Each bin sums the
+/// older partitions in order and partition 0 last, whatever the host's
+/// buffer size.
 struct TailConvolver {
     kernel: ConvolutionKernel,
     fft: Arc<dyn Fft<f32>>,
@@ -198,7 +208,10 @@ struct TailConvolver {
     stage: Vec<f32>,
     stage_fill: usize,
     work: Vec<Complex<f32>>,
+    /// The sum for the hop that ends this tail block, partitions `1..=summed`
+    /// so far.
     accumulator: Vec<Complex<f32>>,
+    summed: usize,
     scratch: Vec<Complex<f32>>,
     /// Output for the block now being played, produced one hop ahead.
     wet: Vec<f32>,
@@ -253,6 +266,7 @@ impl TailConvolver {
             stage_fill: 0,
             work: vec![Complex::default(); TAIL_FFT],
             accumulator: vec![Complex::default(); TAIL_FFT],
+            summed: 0,
             scratch,
             wet: vec![0.0; TAIL_BLOCK],
             wet_read: 0,
@@ -265,6 +279,8 @@ impl TailConvolver {
         }
         self.previous_block.fill(0.0);
         self.stage_fill = 0;
+        self.accumulator.fill(Complex::default());
+        self.summed = 0;
         self.wet.fill(0.0);
         self.wet_read = 0;
         self.head = 0;
@@ -280,8 +296,31 @@ impl TailConvolver {
         if self.stage_fill == TAIL_BLOCK {
             self.run_hop();
             self.wet_read = 0;
+        } else if self.stage_fill.is_multiple_of(REVERB_BLOCK) {
+            self.sum_older(self.stage_fill / REVERB_BLOCK);
         }
         wet
+    }
+
+    /// Add the products of the older partitions that are due after `hops`
+    /// head hops of this tail block. They are spread evenly over all hops
+    /// but the last, which ends the block.
+    fn sum_older(&mut self, hops: usize) {
+        let older = self.partitions.len() - 1;
+        let due = (older * hops).div_ceil(HOPS_PER_TAIL - 1).min(older);
+        let count = self.history.len();
+        while self.summed < due {
+            let lag = self.summed + 1;
+            // `head` is the newest stored block until this tail block ends,
+            // so it is lag 1 of the hop that ends it.
+            let slot = (self.head + 1 + count - lag) % count;
+            self.kernel.multiply_accumulate(
+                &mut self.accumulator,
+                &self.history[slot],
+                &self.partitions[lag],
+            );
+            self.summed = lag;
+        }
     }
 
     /// Advance the tail's staging without transforming anything.
@@ -297,6 +336,8 @@ impl TailConvolver {
             if self.stage_fill == TAIL_BLOCK {
                 self.previous_block.copy_from_slice(&self.stage);
                 self.stage_fill = 0;
+                self.accumulator.fill(Complex::default());
+                self.summed = 0;
                 self.wet.fill(0.0);
                 self.wet_read = 0;
             }
@@ -321,23 +362,23 @@ impl TailConvolver {
 
         self.fft
             .process_with_scratch(&mut self.work, &mut self.scratch);
+        // What the head hops of a short block left undone.
+        self.sum_older(HOPS_PER_TAIL - 1);
         self.head = (self.head + 1) % self.history.len();
         self.history[self.head].copy_from_slice(&self.work);
-
-        self.accumulator.fill(Complex::default());
-        let count = self.history.len();
-        for (lag, partition) in self.partitions.iter().enumerate() {
-            let slot = (self.head + count - lag) % count;
-            let spectrum = &self.history[slot];
-            self.kernel
-                .multiply_accumulate(&mut self.accumulator, spectrum, partition);
-        }
+        self.kernel.multiply_accumulate(
+            &mut self.accumulator,
+            &self.history[self.head],
+            &self.partitions[0],
+        );
         self.ifft
             .process_with_scratch(&mut self.accumulator, &mut self.scratch);
         let scale = 1.0 / TAIL_FFT as f32;
         for (slot, bin) in self.wet.iter_mut().zip(&self.accumulator[TAIL_BLOCK..]) {
             *slot = bin.re * scale;
         }
+        self.accumulator.fill(Complex::default());
+        self.summed = 0;
     }
 }
 
