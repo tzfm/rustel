@@ -170,6 +170,14 @@ pub struct RenderReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_save: Option<String>,
     pub onset_count: usize,
+    /// Each distinct refusal of a note the render dropped: a sound it could
+    /// not find or load, or a control the engine refuses. The file is
+    /// silent where those notes are. The diagnostic policy still reports
+    /// each one as a `voice-refused` diagnostic. [`Self::failure`] leaves
+    /// them out: a Studio export fails on them, and `rustel export` lists
+    /// them and succeeds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub voices_refused: Vec<String>,
 }
 
 impl RenderReport {

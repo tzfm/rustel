@@ -621,7 +621,7 @@ impl Session {
 
         // The mp3 door is the same render; only the container differs, so a
         // tape bounced either way is the same audio.
-        self.render_under_diagnostic_policy(|session| {
+        let (_, voices_refused) = self.render_under_diagnostic_policy(|session| {
             if mp3 {
                 crate::render::write_scalar_mp3_with_dispatch(
                     out_path,
@@ -680,6 +680,7 @@ impl Session {
                 saves.len() - failed_on_replay
             ),
             onset_count: onsets.len(),
+            voices_refused,
         })
     }
 
@@ -750,30 +751,32 @@ impl Session {
             )
             .map_err(RuntimeError::Io)
         })
+        .map(|(pcm, _)| pcm)
     }
 
     /// Run an offline render under this Session's diagnostic policy: with
     /// direct logging on, voice notices and refusals print as they happen;
-    /// otherwise both are queued for [`Self::take_diagnostics`].
+    /// otherwise both are queued for [`Self::take_diagnostics`]. Returns the
+    /// distinct refusals either way.
     fn render_under_diagnostic_policy<T>(
         &mut self,
         render: impl FnOnce(&Self) -> Result<(T, Vec<String>), RuntimeError>,
-    ) -> Result<T, RuntimeError> {
+    ) -> Result<(T, Vec<String>), RuntimeError> {
         let direct = self.direct_diagnostic_logging;
         let (rendered, notices) = rustel_voice::with_diagnostic_policy(direct, || render(self));
         self.report_voice_notices(notices);
         let (rendered, refused) = rendered?;
         // With direct logging the render already printed each refusal.
         if !direct {
-            for message in refused {
+            for message in &refused {
                 self.report_diagnostic(
                     "voice-refused",
                     message.clone(),
-                    serde_json::json!({ "voice_refused": { "message": &message } }),
+                    serde_json::json!({ "voice_refused": { "message": message } }),
                 );
             }
         }
-        Ok(rendered)
+        Ok((rendered, refused))
     }
 
     /// [`Self::render`] watched and steerable: `observer` sees every block
@@ -808,7 +811,7 @@ impl Session {
             },
             ..stop
         });
-        let written_bytes = self.render_under_diagnostic_policy(|session| match format {
+        let rendered = self.render_under_diagnostic_policy(|session| match format {
             RenderFormat::Wav => {
                 // A silent skeleton has no tail to ring out.
                 write_silent_wav(
@@ -916,6 +919,7 @@ impl Session {
                 Ok((None, Vec::new()))
             }
         })?;
+        let (written_bytes, voices_refused) = rendered;
         self.log_sample_failures();
         Ok(RenderReport {
             query_threw: play.query_threw.clone(),
@@ -960,6 +964,7 @@ impl Session {
                 _ => "Offline render without device playback.".into(),
             },
             onset_count: play.onsets.len(),
+            voices_refused,
         })
     }
 }
