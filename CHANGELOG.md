@@ -2,19 +2,19 @@
 
 ## Unreleased
 
+## v0.1.4
+
 - A Studio export fails when it cannot find or load a sound, or when the engine refuses a note. The file is still written, and the log names each refusal. Before, the export reported success with silence in place of those notes. `rustel export --json` lists the same refusals as `voices_refused`.
 - Studio's export uses the same samples as play: the folders and packs in Settings ▸ Samples, the audio in the set folder, and your bank renames. Before, the export used only the default library, so those sounds were silent in the file while the score played them.
 - Any studio action can run from a MIDI button. On the keybinds page of Settings, Enter on a row and a press learn the message: a note with velocity, or a CC crossing the line at 64, so a swept knob fires once per crossing. A button that latches, sending a note-off for its second press, fires on that press too: a note held past a hand's release ends in a new press, not a release, and a CC button that toggles between 127 and 0 fires on both presses, so the Maschine transport works in MIDI mode. Bindings are kept in `studio.json` beside the chord overrides, a message moves between rows rather than meaning two, and a bound note never sounds through `midikeys`. The mapping page is renamed sliders, after what its slots drive. See [hardware](https://github.com/tzfm/rustel/blob/main/docs/hardware.md#midi-input).
 - Studio shows a hint when audio struggles while the CPU is in a power-saving mode: callbacks keep missing their deadline, or the DSP load stays above 70%, for three seconds. That mode keeps the clock low for short, regular work such as the audio callback, so the same score can need two to four times the DSP time. Studio reads the mode on Linux and Windows, and only after the trouble lasts. See [hardware](https://github.com/tzfm/rustel/blob/main/docs/hardware.md#output-latency).
 - Voices with distortion, `crush`, FM or a supersaw render faster. Each voice computed some fixed values again on every sample: the shape terms of `diode`, `asym`, `cubic` and `chebyshev`, the `crush` step count, a copy of the FM routing, and a library remainder for each supersaw lane. Rustel now computes them once or skips them. A supersaw score with `fm`, `crush`, `diode` and a tremolo renders 1.16 times faster on one x86-64 desktop and 1.27 times faster on one x86-64 Linux laptop. The audio stays the same, byte for byte.
-- Distortion curves compute `tanh` in double precision and round once. Each result is within one unit in the last place of the exact value. glibc's `tanhf` was off by up to two units and took 1.5 to 3.4 times longer per call, depending on the input. The `diode` voice above renders 1.08 times faster on the same Linux laptop.
 - A VST3 bundle with several plugins keeps the plugins that start when one of them does not. The whole bundle failed, and all of its plugins stayed off until a rescan.
 - VST3 plugins are created and released on the process's main thread on macOS, in the command line, the studio and the scan process. Some plugin shells stop the process when their objects are created or destroyed on another thread. A library embedder that runs no main thread keeps the previous behavior: the plugin thread does the whole lifecycle.
 - The plugin scan limits the time of one class of a bundle, not of the bundle as a whole. A bundle whose classes together take longer than the limit, such as a large bundle of slow plugins, no longer fails its scan as a whole; a single class that takes longer than two minutes still fails its bundle.
 - Split large source files by concern and consolidate repeated tests. Studio tests now check the callback allocator at runtime.
-- Euclidean rhythms accept negative steps and more pulses than steps. Negative steps switch between regular and legato notes. Extra pulses extend the rhythm across cycles. Legato rotation shifts the rhythm without shifting the source notes.
 - `stackLeft`, `stackRight`, `stackCenter` and `stackRepeat` combine patterns with different step counts. `degradeByWith` uses a signal to choose which events to keep. `open` and `close` provide fades over one cycle.
-- Custom `xen` scales accept ratio strings and patterns. `randL` uses the score's random seed. `getFreq` and `getFrequency` both accept notes and events.
+- Custom `xen` scales accept ratio strings and patterns. `getFreq` and `getFrequency` both accept notes and events.
 - Rustel joins a Link session that is already running and takes its tempo. Before, the running session took the rustel tempo: an app playing at 128 BPM jumped to 90 BPM when `rustel play --link` started at 90 BPM.
 - Stop stops the set when auto evaluate is on. An edit that applied in the 100 ms after the press started the set again.
 - `rustel vst | head -1` and other pipes into a reader that stops early end quietly with exit code 0. Rustel printed a panic when the reader closed the pipe.
@@ -26,6 +26,12 @@
 - A plugin call with no `preset` plays `default.vstpreset` from the preset folder of the plugin, when the folder has one.
 - The plugin scan makes a preset folder for each plugin it finds, with the exact plugin name. In Studio, a `.vstpreset` file dropped on the window goes to the folder of its plugin: rustel reads the plugin class in the file. The scan cache keeps the class of each plugin. A cache of an earlier version has none, so rescan once after the upgrade.
 - Two Link participants that joined each other's sessions at once stayed on two grids forever. Neither session had a founder left, and a member measures its clock against the founder of its session. A member whose founder has been silent for ten seconds now re-founds the session where the grid stands, keeping the tempo, the phase and the clock, so a founder announces the session again and the participants merge. A session whose founder left is re-founded the same way.
+
+### Sound changes
+
+- Euclidean rhythms accept negative steps and more pulses than steps. Negative steps switch between regular and legato notes. Extra pulses extend the rhythm across cycles. Legato rotation shifts the rhythm without shifting the source notes.
+- Distortion curves compute `tanh` in double precision and round once. Each result is within one unit in the last place of the exact value. glibc's `tanhf` was off by up to two units and took 1.5 to 3.4 times longer per call, depending on the input. The `diode` voice above renders 1.08 times faster on the same Linux laptop.
+- `randL` uses the score's random seed.
 
 ## v0.1.3
 
