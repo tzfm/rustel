@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- A note release no longer suppresses a MIDI press that follows within 40 ms. Scene pads and learned action buttons could miss that press.
+
 ## v0.1.4
 
 - A Studio export fails when it cannot find or load a sound, or when the engine refuses a note. The file is still written, and the log names each refusal. Before, the export reported success with silence in place of those notes. `rustel export --json` lists the same refusals as `voices_refused`.

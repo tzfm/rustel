@@ -104,35 +104,34 @@ struct RecentPresses {
     /// `None` until a press fills the slot: an empty slot must never match
     /// (a zeroed one would read as note 0, channel 0, pressed at time 0,
     /// which a monotonic clock that starts at 0 can reach).
-    slots: [Option<(Pad, u64)>; RECENT_PRESSES],
-    /// The slot the next press overwrites (the oldest).
-    next: usize,
+    slots: [[Option<(Pad, u64)>; RECENT_PRESSES]; 2],
+    /// The oldest slot for each edge. Releases cannot evict presses.
+    next: [usize; 2],
 }
 
-/// How many pads the mirror gate remembers at once: more than two hands
-/// have fingers on a launch row at one instant.
+/// How many distinct pads the mirror gate remembers for each edge.
 const RECENT_PRESSES: usize = 8;
 
 impl RecentPresses {
     const fn new() -> Self {
         Self {
-            slots: [None; RECENT_PRESSES],
-            next: 0,
+            slots: [[None; RECENT_PRESSES]; 2],
+            next: [0; 2],
         }
     }
 
-    /// Whether an identical pad arrived inside the window; records this
-    /// press either way (a mirror keeps the original's time, a press takes
-    /// the oldest slot).
-    fn is_mirror(&mut self, pad: Pad, now: u64) -> bool {
-        if self.slots.iter().flatten().any(|(last, at)| {
+    /// Whether the same pad edge arrived inside the window. A mirror keeps
+    /// the original's time, and a new edge takes the oldest slot.
+    fn is_mirror(&mut self, pad: Pad, pressed: bool, now: u64) -> bool {
+        let edge = usize::from(pressed);
+        if self.slots[edge].iter().flatten().any(|(last, at)| {
             now.saturating_sub(*at) <= DOUBLE_PRESS_WINDOW_MILLIS
                 && last.matches(pad.note, pad.channel)
         }) {
             return true;
         }
-        self.slots[self.next] = Some((pad, now));
-        self.next = (self.next + 1) % RECENT_PRESSES;
+        self.slots[edge][self.next[edge]] = Some((pad, now));
+        self.next[edge] = (self.next[edge] + 1) % RECENT_PRESSES;
         false
     }
 }
@@ -286,7 +285,7 @@ fn on_driver_message(
             let mirror = shared
                 .gate
                 .lock()
-                .is_ok_and(|mut gate| gate.is_mirror(Pad { note, channel }, gate_now));
+                .is_ok_and(|mut gate| gate.is_mirror(Pad { note, channel }, true, gate_now));
             if !mirror {
                 let _ = shared.presses.send(PadPress {
                     note,
@@ -310,11 +309,9 @@ fn on_driver_message(
         // many devices send for one, goes on as a press at velocity 0: a
         // button that latches - the Maschine's transport in MIDI mode -
         // says its second press as a note-off, and the studio's clock for
-        // held notes tells that press from a hand's release. The gate
-        // takes the ending as it takes a press, so the mirror port's copy
-        // dies here; a release quick enough to be taken for the press's
-        // own mirror is swallowed with nothing to lose, for the studio
-        // reads no meaning from a release that quick either.
+        // held notes tells that press from a hand's release. Both endings
+        // share a release edge, so the gate drops their mirrored copies
+        // without hiding a later press.
         MidiEvent::NoteOff { channel, note, .. }
         | MidiEvent::NoteOn {
             channel,
@@ -324,7 +321,7 @@ fn on_driver_message(
             let mirror = shared
                 .gate
                 .lock()
-                .is_ok_and(|mut gate| gate.is_mirror(Pad { note, channel }, gate_now));
+                .is_ok_and(|mut gate| gate.is_mirror(Pad { note, channel }, false, gate_now));
             if !mirror {
                 let _ = shared.presses.send(PadPress {
                     note,
@@ -562,8 +559,21 @@ mod tests {
     fn the_same_pad_just_past_the_window_launches_twice() {
         let listener = PadListener::default();
         listener.driver_message_for_test("Maschine", note_on(36), 0);
-        listener.driver_message_for_test("Maschine", note_on(36), DOUBLE_PRESS_WINDOW_MILLIS + 1);
-        assert_eq!(delivered(&listener), vec![36, 36]);
+        listener.driver_message_for_test(
+            "Maschine",
+            MidiEvent::NoteOff {
+                channel: 10,
+                note: 36,
+                velocity: 0,
+            },
+            DOUBLE_PRESS_WINDOW_MILLIS + 1,
+        );
+        listener.driver_message_for_test("Maschine", note_on(36), DOUBLE_PRESS_WINDOW_MILLIS + 2);
+        let launches: Vec<u8> = std::iter::from_fn(|| listener.try_recv().ok())
+            .filter(|press| press.velocity > 0)
+            .map(|press| press.note)
+            .collect();
+        assert_eq!(launches, vec![36, 36]);
     }
 
     /// The gate is per pad, not per port-pair: a mirror of one pad must
@@ -578,17 +588,34 @@ mod tests {
         assert_eq!(delivered(&listener), vec![36, 37, 38]);
     }
 
-    /// Two pads hit together arrive as A, B and then their mirrors A', B'.
-    /// The gate must remember more than the last pad, or B pushes A out
-    /// before A' arrives and both mirrors launch - two scenes restarted
-    /// twice.
+    /// Releases must not evict presses before their mirrored copies arrive.
     #[test]
-    fn interleaved_mirrors_of_two_pads_are_both_dropped() {
+    fn interleaved_mirrors_of_pressed_and_released_pads_are_dropped() {
         let listener = PadListener::default();
-        for (at, note) in [36, 37, 36, 37].into_iter().enumerate() {
-            listener.driver_message_for_test("pads", note_on(note), at as u64);
+        for (port, start) in [("pads", 0), ("pads mirror", 20)] {
+            for note in 36..44 {
+                listener.driver_message_for_test(port, note_on(note), start + u64::from(note - 36));
+            }
+            for note in 36..44 {
+                listener.driver_message_for_test(
+                    port,
+                    MidiEvent::NoteOff {
+                        channel: 10,
+                        note,
+                        velocity: 0,
+                    },
+                    start + 8 + u64::from(note - 36),
+                );
+            }
         }
-        assert_eq!(delivered(&listener), vec![36, 37]);
+        let delivered: Vec<(u8, u8)> = std::iter::from_fn(|| listener.try_recv().ok())
+            .map(|press| (press.note, press.velocity))
+            .collect();
+        let expected: Vec<(u8, u8)> = (36..44)
+            .map(|note| (note, 100))
+            .chain((36..44).map(|note| (note, 0)))
+            .collect();
+        assert_eq!(delivered, expected);
     }
 
     /// A knob on the driver path reaches the slider channel, and every
@@ -655,13 +682,16 @@ mod tests {
             channel: press.channel,
         };
         let mut gate = RecentPresses::new();
-        assert!(!gate.is_mirror(pad, 1_000), "the first press launches");
         assert!(
-            gate.is_mirror(pad, 1_000 + DOUBLE_PRESS_WINDOW_MILLIS),
+            !gate.is_mirror(pad, true, 1_000),
+            "the first press launches"
+        );
+        assert!(
+            gate.is_mirror(pad, true, 1_000 + DOUBLE_PRESS_WINDOW_MILLIS),
             "the same pad at the window's edge is its mirror"
         );
         assert!(
-            !gate.is_mirror(pad, 1_000 + DOUBLE_PRESS_WINDOW_MILLIS + 1),
+            !gate.is_mirror(pad, true, 1_000 + DOUBLE_PRESS_WINDOW_MILLIS + 1),
             "a genuine re-hit after the window launches"
         );
     }
@@ -675,8 +705,11 @@ mod tests {
             note: 0,
             channel: 0,
         };
-        assert!(!gate.is_mirror(zero, 0), "a fresh gate has seen no press");
-        assert!(gate.is_mirror(zero, 0), "and now it has");
+        assert!(
+            !gate.is_mirror(zero, true, 0),
+            "a fresh gate has seen no press"
+        );
+        assert!(gate.is_mirror(zero, true, 0), "and now it has");
     }
 
     /// The messages a musician reads: a note with its velocity and channel,
