@@ -1,0 +1,22 @@
+[package]
+name = "rustel-talkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Talk It! style formant speech synthesizer and talkit command line tool"
+
+[features]
+# Speaking through an output device (the talkit command). The library itself
+# is pure DSP, so a host that only renders keeps the audio stack out.
+default = ["play"]
+play = ["dep:cpal"]
+
+[dependencies]
+cpal = { version = "=0.18.2", optional = true }
+
+[[bin]]
+name = "talkit"
+path = "src/main.rs"
+required-features = ["play"]

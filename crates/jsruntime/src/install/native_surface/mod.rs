@@ -7,6 +7,7 @@ mod controls;
 mod modulation;
 mod patterns;
 mod plugin;
+mod speech;
 mod values;
 
 pub(super) fn install<'js>(

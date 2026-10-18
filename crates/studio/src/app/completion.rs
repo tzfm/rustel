@@ -200,6 +200,12 @@ impl App {
         // and `G^9` becomes `G^Db-7`.
         let role = self.string_role(&callee);
         let chord = role == Some(StringRole::Chord);
+        // A documented choice can be hyphenated - `little-man` - and the
+        // hyphen is part of it, or the chosen name lands inside the old one
+        // and `little-man` becomes `little-big-robot`.
+        let hyphenated = self
+            .string_choice_set(&callee)
+            .is_some_and(|set| set.choices.iter().any(|choice| choice.value.contains('-')));
         let word_byte = move |byte: u8| {
             // An apostrophe belongs to a name - `s("bell'")` - but never
             // when it is the string's own delimiter, or the scan walks
@@ -209,7 +215,8 @@ impl App {
             byte != quote
                 && (byte.is_ascii_alphanumeric()
                     || matches!(byte, b'_' | b'#' | b'\'')
-                    || (chord && matches!(byte, b'^' | b'-' | b'+')))
+                    || (chord && matches!(byte, b'^' | b'-' | b'+'))
+                    || (hyphenated && byte == b'-'))
         };
         // A sound and a scale are each written as one word with a colon
         // in it - `bd:3`, `C:major` - and the whole of it is replaced. A
@@ -1676,12 +1683,23 @@ mod tests {
                 .iter()
                 .filter(|set| set.completes_string)
             {
-                let current = set.choices[set.choices.len() / 2].value;
+                // A hyphenated name, where the list has one, is the case a
+                // word scan most easily cuts short.
+                let current = set
+                    .choices
+                    .iter()
+                    .find(|choice| choice.value.contains('-'))
+                    .unwrap_or(&set.choices[set.choices.len() / 2])
+                    .value;
                 let score = match set.entry {
                     "setDefaultJoin" | "useRNG" => {
                         format!(r#"{}("{current}")\n"#, set.entry)
                     }
                     "lfo" => format!(r#"$: s("sine").lfo({{ shape: "{current}" }})\n"#),
+                    "talkit" => format!(
+                        r#"$: talkit("hello", {{ {}: "{current}" }})\n"#,
+                        set.parameter.trim_start_matches("config.")
+                    ),
                     _ => format!(r#"$: s("sine").{}("{current}")\n"#, set.entry),
                 };
                 let mut app = app_over(directory.path());

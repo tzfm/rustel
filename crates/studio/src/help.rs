@@ -303,7 +303,7 @@ impl HelpContext {
             ],
             Self::SettingsTrust => [
                 (
-                    "Enter · Space",
+                    "Enter · ←/→ · Space",
                     "trust a refused origin · turn its trust on or off",
                 ),
                 (
