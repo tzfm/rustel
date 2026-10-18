@@ -1,0 +1,47 @@
+# Temporary diagnostic: captures what a fresh runner resolves differently
+# from the committed lock. Delete this branch once the cause is known.
+name: Lock probe
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci-lock-probe]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: rustup show && cargo -V && rustc -V
+
+      - name: Reproduce the locked resolution
+        run: |
+          cargo rustc --locked --release -p rustel-fraction --lib -- --print cfg \
+            > /tmp/cfg.txt 2>&1 \
+            && echo "FRACTION LOCKED OK" \
+            || { echo "FRACTION LOCKED FAIL"; tail -4 /tmp/cfg.txt; }
+          cargo tree --locked -p rustel --features device-audio,midi,serial,studio,gamepad \
+            > /tmp/tree.txt 2>&1 \
+            && echo "TREE LOCKED OK" \
+            || { echo "TREE LOCKED FAIL"; tail -4 /tmp/tree.txt; }
+
+      - name: Reveal the lock change a fresh resolve wants
+        if: always()
+        run: |
+          cargo metadata --format-version 1 > /dev/null 2>/tmp/meta.err \
+            || { echo "META FAIL"; cat /tmp/meta.err; }
+          git --no-pager diff --stat -- Cargo.lock || true
+          git --no-pager diff -- Cargo.lock > /tmp/lock.diff || true
+          cat /tmp/lock.diff
+          names=$(grep '^[-+]name = ' /tmp/lock.diff | sort -u | sed 's/^[-+]name = //' | tr -d '"' | head -5)
+          for name in $names; do
+            n=${#name}
+            if [ "$n" -le 3 ]; then path="$n/${name:0:1}/$name"; else path="${name:0:2}/${name:2:2}/$name"; fi
+            echo "=== index entry $name: $path ==="
+            curl -s --max-time 20 "https://index.crates.io/$path" | tail -8 || true
+          done
