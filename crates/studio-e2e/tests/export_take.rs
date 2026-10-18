@@ -10,7 +10,7 @@ static AUDIO_CALLBACK_ALLOCATOR: rustel_audio::tripwire::TripwireAlloc =
     rustel_audio::tripwire::TripwireAlloc;
 
 use crossterm::event::{KeyCode, KeyModifiers};
-use rustel_studio_e2e::{PanelKind, hermetic, row_containing};
+use rustel_studio_e2e::{PanelKind, hermetic, loud_wav_bytes, row_containing};
 
 /// How long an export may run. Generous on purpose: the MP3 flip renders
 /// and encodes sixteen cycles in a debug build, and a loaded runner can
@@ -146,6 +146,49 @@ fn enter_renders_the_scene_into_the_exports_folder() {
     studio.chord("ctrl+shift+d");
     row_containing(&studio.rows(), "export");
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
+}
+
+/// Samples from outside the default library sound in the bounce: a folder
+/// imported as a sample source, then the set's own folder.
+#[test]
+fn imported_and_set_folder_samples_sound_in_the_export() {
+    let mut studio = hermetic();
+    let set = studio.set_directory().to_path_buf();
+    let imported = tempfile::tempdir().expect("imported folder");
+    for bank in [imported.path().join("pack"), set.join("kit")] {
+        std::fs::create_dir_all(&bank).expect("bank folder");
+        std::fs::write(bank.join("hit.wav"), loud_wav_bytes()).expect("sample");
+    }
+    studio.paste(&imported.path().display().to_string());
+    studio.pump_until(EXPORT_BUDGET, "the folder imported", |studio| {
+        studio.status().contains("sound(s) imported")
+    });
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+
+    studio.set_score("$: s(\"pack kit\")");
+    studio.chord("ctrl+shift+x");
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    wait_for_export(&mut studio);
+    let status = studio.status().to_owned();
+    assert!(status.starts_with("exported first - "), "{status}");
+
+    let takes: Vec<_> = std::fs::read_dir(set.join("exports"))
+        .expect("exports directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(takes.len(), 1, "one take: {takes:?}");
+    let pcm = rustel_runtime::test_support::read_pcm16_stereo_wav(&takes[0]).expect("WAV");
+    // Sixteen cycles at 0.5 cps: `pack` starts each two-second cycle and
+    // `kit` its second half.
+    let second = pcm.len() / 32;
+    let peak = |from: usize| {
+        pcm[from * second..(from + 1) * second]
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()))
+    };
+    assert!(peak(0) > 0.1, "the imported pack sounds: {}", peak(0));
+    assert!(peak(1) > 0.1, "the set's kit sounds: {}", peak(1));
 }
 
 /// Ctrl+Shift+X while the render runs ends it early: the take keeps what

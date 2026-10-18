@@ -90,7 +90,9 @@ use super::editor::{
 };
 use super::engine::{DiagnosticAlert, Launch, LiveMaterial, StudioDiagnostic};
 use super::engine::{StudioConfig, StudioDeviceInfo, StudioDiagnosticLevel, StudioSnapshot};
-use super::export::{ExportJob, ExportScore, ExportSettings, ExportSheet, SheetAction};
+use super::export::{
+    ExportJob, ExportSamples, ExportScore, ExportSettings, ExportSheet, SheetAction,
+};
 use super::file_picker::{Candidate, FilePicker, PickerChoice};
 use super::help::{HelpContext, HelpState, HelpView};
 use super::jobs::{BackgroundJob, JobsPanel, JobsPanelView};
