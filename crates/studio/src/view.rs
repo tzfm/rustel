@@ -551,8 +551,8 @@ pub struct StudioView<'a> {
     pub mappings: [super::settings::SlotView; super::settings::MAPPING_SLOTS],
     /// The shortcut rows, for the Keybinds page.
     pub keybind_rows: Vec<super::settings::KeybindRow>,
-    /// The origins of the Trust page.
-    pub trust_rows: Vec<super::settings::TrustRow>,
+    /// The origins of the permissions page.
+    pub permission_rows: Vec<super::settings::PermissionRow>,
     /// The plugin folders, for the vst page. Empty while another page shows.
     #[cfg(feature = "vst")]
     pub vst_page: super::settings::VstPage,
@@ -1182,7 +1182,7 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
                 sources: view.sources,
                 mappings: view.mappings,
                 bindings: view.keybind_rows,
-                trust: view.trust_rows,
+                permissions: view.permission_rows,
                 #[cfg(feature = "vst")]
                 vst: view.vst_page,
                 capabilities: chrome.capabilities,
@@ -2819,7 +2819,7 @@ mod tests {
                         sources: Vec::new(),
                         mappings: Default::default(),
                         keybind_rows: Vec::new(),
-                        trust_rows: Vec::new(),
+                        permission_rows: Vec::new(),
                         #[cfg(feature = "vst")]
                         vst_page: Default::default(),
                         latency: None,
@@ -2942,7 +2942,7 @@ mod tests {
                         sources: Vec::new(),
                         mappings: Default::default(),
                         keybind_rows: Vec::new(),
-                        trust_rows: Vec::new(),
+                        permission_rows: Vec::new(),
                         #[cfg(feature = "vst")]
                         vst_page: Default::default(),
                         latency: None,
@@ -3053,7 +3053,7 @@ mod tests {
                         sources: Vec::new(),
                         mappings: Default::default(),
                         keybind_rows: Vec::new(),
-                        trust_rows: Vec::new(),
+                        permission_rows: Vec::new(),
                         #[cfg(feature = "vst")]
                         vst_page: Default::default(),
                         latency: None,
@@ -3167,7 +3167,7 @@ mod tests {
                         sources: Vec::new(),
                         mappings: Default::default(),
                         keybind_rows: Vec::new(),
-                        trust_rows: Vec::new(),
+                        permission_rows: Vec::new(),
                         #[cfg(feature = "vst")]
                         vst_page: Default::default(),
                         latency: None,

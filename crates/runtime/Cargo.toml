@@ -107,6 +107,7 @@ rustel-jsruntime = { path = "../jsruntime", default-features = false }
 rustel-mini = { path = "../mini" }
 rustel-scheduler = { path = "../scheduler" }
 rustel-audio = { path = "../audio" }
+rustel-csound = { path = "../csound" }
 rustel-voice = { path = "../voice" }
 rustel-serial = { path = "../serial", optional = true }
 rustel-midi = { path = "../midi", optional = true }

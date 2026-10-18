@@ -123,7 +123,7 @@ fn help_follows_the_settings_pages() {
     studio.press(KeyCode::Tab, KeyModifiers::NONE);
     assert_help_page(
         &mut studio,
-        "settings · trust",
+        "settings · permissions",
         "The origins a score imports scripts from",
     );
 

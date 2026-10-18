@@ -737,8 +737,21 @@ impl JsRuntime {
                         } else {
                             evaluated
                         };
-                        rquickjs::Class::<NativePatternWrapper>::from_js(&ctx, finished_value)
-                            .map_err(|error| QueryError::Message(describe_js_error(&ctx, error)))?
+                        if finished_value.is_undefined()
+                            && stage_candidate
+                            && self
+                                .effect_transaction
+                                .borrow()
+                                .as_ref()
+                                .is_some_and(|effects| !effects.csound.is_empty())
+                        {
+                            // Orchestra definitions commit without a sounding pattern.
+                            derive_wrapper(ctx.clone(), rustel_core::silence(), &[])
+                                .map_err(|error| QueryError::Message(error.to_string()))?
+                        } else {
+                            rquickjs::Class::<NativePatternWrapper>::from_js(&ctx, finished_value)
+                                .map_err(|error| QueryError::Message(describe_js_error(&ctx, error)))?
+                        }
                     }
                     Err(error) => {
                         // A score can enqueue a job and then throw before

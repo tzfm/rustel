@@ -283,11 +283,145 @@ impl AudioBackend for ScalarBackend {
     }
 
     fn process_block(&mut self, out: &mut [f32], frames: usize) {
-        enable_denormal_flush();
         assert!(
             out.len() >= frames * 2,
             "stereo interleaved buffer too small"
         );
+        let visual_frames = frames.min(UI_VISUAL_MIX_FRAMES) * 2;
+        let mut visual_slots = self.ui_visual_capture_mask;
+        while visual_slots != 0 {
+            let slot = visual_slots.trailing_zeros() as usize;
+            if let Some(block) = self.ui_visual_mix.get_mut(slot) {
+                block[..visual_frames].fill(0.0);
+            }
+            visual_slots &= visual_slots - 1;
+        }
+        if self.routing_active() {
+            self.clear_orbit_mix(frames);
+        }
+        // Reserve input for the whole callback before any instrument changes
+        // split it into shorter spans.
+        let input_base = self.input.as_ref().map(|ring| {
+            let ring_rate = ring.sample_rate();
+            let ratio = if ring_rate == 0 || self.sample_rate == 0 {
+                1.0
+            } else {
+                f64::from(ring_rate) / f64::from(self.sample_rate)
+            };
+            let wanted = (frames as f64 * ratio).ceil() as u64;
+            let placed = ring.reader_frame(
+                self.input_cursor.map(|cursor| cursor.floor() as u64),
+                wanted,
+            );
+            // The fraction survives while the cursor was not moved.
+            let base = match self.input_cursor {
+                Some(cursor) if cursor.floor() as u64 == placed => cursor,
+                _ => placed as f64,
+            };
+            self.input_cursor = Some(base + frames as f64 * ratio);
+            (base, ratio)
+        });
+        let mut offset = 0;
+        while offset < frames {
+            let count = self.instrument_revision_frames(frames - offset);
+            self.process_segment(
+                &mut out[offset * 2..(offset + count) * 2],
+                count,
+                offset,
+                input_base.map(|(base, ratio)| (base + offset as f64 * ratio, ratio)),
+            );
+            offset += count;
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "scalar"
+    }
+}
+
+impl ScalarBackend {
+    fn instrument_revision_frames(&self, maximum: usize) -> usize {
+        if self.pending.order.is_empty() {
+            return maximum;
+        }
+        let mut chains = [None; crate::insert::MAX_INSERT_BUSES];
+        let mut keys = [None; crate::insert::MAX_INSERT_BUSES];
+        let mut first_onsets = [u64::MAX; crate::insert::MAX_INSERT_BUSES];
+        for (bus, chain) in self.insert_chains.iter().enumerate() {
+            chains[bus] = *chain;
+            if let Some(chain) = chain {
+                keys[bus] = self.orbit_inserts
+                    [crate::insert::instrument_slot(*chain).physical(bus)]
+                .as_ref()
+                .map(|insert| insert.key());
+                if keys[bus].is_some() {
+                    first_onsets[bus] = 0;
+                }
+            }
+        }
+        // A due replacement may change the key before this segment renders.
+        for &slot in &self.pending.order {
+            let event = self.pending.slots[slot]
+                .event
+                .as_ref()
+                .expect("pending event");
+            if event.onset_frame <= self.frame
+                && let Some(instrument) = &event.controls.instrument
+                && let Some(bus) = claim_insert_bus(&mut chains, event.controls.insert_chain())
+            {
+                keys[bus] = Some(instrument.key);
+                first_onsets[bus] = 0;
+            }
+        }
+        let mut end = self.frame.saturating_add(maximum as u64);
+        // A new chain needs no boundary until its first instrument changes.
+        for &slot in &self.pending.order {
+            let event = self.pending.slots[slot]
+                .event
+                .as_ref()
+                .expect("pending event");
+            if event.onset_frame <= self.frame || event.onset_frame >= end {
+                continue;
+            }
+            if let Some(instrument) = &event.controls.instrument
+                && let Some(bus) = claim_insert_bus(&mut chains, event.controls.insert_chain())
+                && event.onset_frame < first_onsets[bus]
+            {
+                keys[bus] = Some(instrument.key);
+                first_onsets[bus] = event.onset_frame;
+            }
+        }
+        for &slot in &self.pending.order {
+            let event = self.pending.slots[slot]
+                .event
+                .as_ref()
+                .expect("pending event");
+            if event.onset_frame <= self.frame || event.onset_frame >= end {
+                continue;
+            }
+            let Some(instrument) = &event.controls.instrument else {
+                continue;
+            };
+            let key = chains
+                .iter()
+                .position(|chain| *chain == Some(event.controls.insert_chain()))
+                .and_then(|bus| keys[bus]);
+            if key != Some(instrument.key) {
+                // Keep the previous instrument until the replacement onset.
+                end = event.onset_frame;
+            }
+        }
+        (end - self.frame) as usize
+    }
+
+    fn process_segment(
+        &mut self,
+        out: &mut [f32],
+        frames: usize,
+        block_offset: usize,
+        input_base: Option<(f64, f64)>,
+    ) {
+        enable_denormal_flush();
         // A takeover cut expires once its block has passed the cut frame:
         // the block that contains it is the last one whose activation pass
         // can see an outgoing-generation onset, and a later flip re-arms or
@@ -298,19 +432,7 @@ impl AudioBackend for ScalarBackend {
         {
             self.armed_takeover_cut = None;
         }
-        let visual_frames = frames.min(UI_VISUAL_MIX_FRAMES) * 2;
-        let mut visual_slots = self.ui_visual_capture_mask;
-        while visual_slots != 0 {
-            let slot = visual_slots.trailing_zeros() as usize;
-            if let Some(block) = self.ui_visual_mix.get_mut(slot) {
-                block[..visual_frames].fill(0.0);
-            }
-            visual_slots &= visual_slots - 1;
-        }
         let routing = self.routing_active();
-        if routing {
-            self.clear_orbit_mix(frames);
-        }
         let sr = self.sample_rate.max(1) as f64;
         let tables = self
             .tables
@@ -355,6 +477,7 @@ impl AudioBackend for ScalarBackend {
         let insert_provider = self.insert_provider.as_deref();
         let missing_insert_events = &mut self.missing_insert_events;
         let allow_inline_reverb = self.allow_inline_reverb;
+        let offline = self.offline;
         let missing_reverb_events = &mut self.missing_reverb_events;
         let voice_ceiling_drops = &mut self.voice_ceiling_drops;
         let pressure = &mut self.pressure;
@@ -873,6 +996,9 @@ impl AudioBackend for ScalarBackend {
                     }
                     if let Some((beats, tempo)) = wanted.clock() {
                         held.sync(beats, tempo, frames);
+                    }
+                    if let Some(score) = wanted.score() {
+                        held.score(score, frames);
                     }
                     if let Some(note) = wanted.note() {
                         held.note(note, frames);
@@ -1462,38 +1588,12 @@ impl AudioBackend for ScalarBackend {
         let visual_capture_generation_floor = self.ui_visual_capture_generation_floor;
         let visual_blocks = &mut self.ui_visual_mix;
         let bus_now = &mut self.bus_now;
-        // Input voices read the ring behind its writer; the cursor is placed
-        // once per block and runs with the frames - at the ratio of the
-        // ring's rate to the output's, when the input could not be opened at
-        // the output's rate.
         let input = self.input.clone();
-        let input_base = input.as_ref().map(|ring| {
-            let ring_rate = ring.sample_rate();
-            let ratio = if ring_rate == 0 || self.sample_rate == 0 {
-                1.0
-            } else {
-                f64::from(ring_rate) / f64::from(self.sample_rate)
-            };
-            // What this block will read, in the ring's own frames: the
-            // ring has no idea how big an output callback is, and that is
-            // the whole of whether a cursor is safe to keep.
-            let wanted = (frames as f64 * ratio).ceil() as u64;
-            let placed = ring.reader_frame(
-                self.input_cursor.map(|cursor| cursor.floor() as u64),
-                wanted,
-            );
-            // The fraction survives while the cursor was not moved.
-            let base = match self.input_cursor {
-                Some(cursor) if cursor.floor() as u64 == placed => cursor,
-                _ => placed as f64,
-            };
-            self.input_cursor = Some(base + frames as f64 * ratio);
-            (base, ratio)
-        });
         let sample_rate = self.sample_rate;
         let sample_resampling_mode = self.sample_resampling_mode;
         let djfs = &mut self.orbit_djf;
         let sends = &mut self.reverb_sends;
+        let mut prepared_block = [[0.0f32; crate::reverb::REVERB_BLOCK]; 2];
         let mut sub_start = 0usize;
         while sub_start < frames {
             let sub_len = (frames - sub_start).min(crate::reverb::REVERB_BLOCK);
@@ -1514,6 +1614,22 @@ impl AudioBackend for ScalarBackend {
                     buffer[0][..sub_len].fill(0.0);
                     buffer[1][..sub_len].fill(0.0);
                 }
+            }
+            // An insert that renders ahead counts its own frames from the
+            // block it is collected in. One that waits prepared would count
+            // its first block at the onset that swaps it in, so a note the
+            // admission delivers early would land that whole wait late.
+            // Collect the wait, and drop what it renders: the frames before
+            // its first note are silence.
+            for insert in prepared_inserts.iter_mut().flatten() {
+                if !insert.renders_ahead() {
+                    continue;
+                }
+                if offline {
+                    insert.flush(sub_len);
+                }
+                let (left, right) = prepared_block.split_at_mut(1);
+                insert.collect(&mut left[0][..sub_len], &mut right[0][..sub_len]);
             }
             // Arm every duck whose 10 ms hold point this sub-block reaches,
             // in arm order and, within one arm frame, in admission order:
@@ -2761,7 +2877,7 @@ impl AudioBackend for ScalarBackend {
                         };
                         while slots != 0 {
                             let slot = slots.trailing_zeros() as usize;
-                            let at = (sub_start + i) * 2;
+                            let at = (block_offset + sub_start + i) * 2;
                             if let Some(block) = visual_blocks.get_mut(slot)
                                 && at + 1 < block.len()
                             {
@@ -2881,7 +2997,7 @@ impl AudioBackend for ScalarBackend {
                         };
                         while slots != 0 {
                             let slot = slots.trailing_zeros() as usize;
-                            let at = (sub_start + i) * 2;
+                            let at = (block_offset + sub_start + i) * 2;
                             if let Some(block) = visual_blocks.get_mut(slot)
                                 && at + 1 < block.len()
                             {
@@ -3069,6 +3185,11 @@ impl AudioBackend for ScalarBackend {
                     collected_instruments |= 1u64 << bus;
                     let (left, right) = instrument_blocks[bus].split_at_mut(1);
                     let (left, right) = (&mut left[0][..sub_len], &mut right[0][..sub_len]);
+                    // An offline render reads faster than real time, so
+                    // it waits for the block before it collects it.
+                    if offline {
+                        instrument.flush(sub_len);
+                    }
                     instrument.collect(left, right);
                     let mut silent = settle(left, right);
                     let key = instrument.key();
@@ -3371,8 +3492,9 @@ impl AudioBackend for ScalarBackend {
                     // An orbit routed to another pair is kept apart for the
                     // device to place; the main pair sums the rest.
                     if routing && orbit_pairs[orbit] != 0 {
-                        if frame < ORBIT_MIX_FRAMES {
-                            let at = (orbit * ORBIT_MIX_FRAMES + frame) * 2;
+                        let capture_frame = block_offset + frame;
+                        if capture_frame < ORBIT_MIX_FRAMES {
+                            let at = (orbit * ORBIT_MIX_FRAMES + capture_frame) * 2;
                             orbit_mix[at] = ol;
                             orbit_mix[at + 1] = or;
                         }
@@ -3425,10 +3547,6 @@ impl AudioBackend for ScalarBackend {
             self.retired_inserts.clear();
         }
         self.reclaim_insert_chains();
-    }
-
-    fn name(&self) -> &'static str {
-        "scalar"
     }
 }
 

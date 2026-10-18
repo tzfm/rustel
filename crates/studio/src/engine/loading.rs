@@ -1381,7 +1381,7 @@ mod tests {
             engine.session.transport().start();
             let device =
                 LiveScalarDevice::start_silent(48_000, engine.generation()).expect("silent output");
-            engine.session.attach_plugins(&device);
+            engine.session.attach_instruments(&device);
             engine
                 .session
                 .bind_audio_confirmations(device.confirmations())

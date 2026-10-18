@@ -430,6 +430,7 @@ pub(super) fn install_combinator<'js>(
             // ("with no argument the port is 57120"): nothing said is an
             // answer here, not a sequence of nothing.
             let bare_osc = method_name.as_ref() == "osc" && args.0.is_empty();
+            let bare_csound = method_name.as_ref() == "csound" && args.0.is_empty();
             if midi && args.0.len() > 2 {
                 return Err(throw_type_error(
                     &ctx,
@@ -493,10 +494,9 @@ pub(super) fn install_combinator<'js>(
                 publish_owner_cells(&sidecars)?;
                 return derive_wrapper(ctx, pattern, &sidecars);
             }
-            let (arg_pats, arg_sidecars) = if midi || serial || bare_osc {
-                // A bare `.midi()` - or `.osc()` - deliberately stays
-                // argument-free so the native body selects its default
-                // port. Sequencing zero arguments would create silence,
+            let (arg_pats, arg_sidecars) = if midi || serial || bare_osc || bare_csound {
+                // Bare routes stay argument-free so the native body
+                // selects its default. Sequencing zero arguments creates silence,
                 // then silently filter it out.
                 reify_registered_args(&ctx, &args.0, method_indexed_transformer)?
             } else if expected == 1 && args.0.len() != 1 {

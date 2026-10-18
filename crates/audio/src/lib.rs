@@ -97,8 +97,9 @@ pub use pressure::{RealtimePool, RealtimePressureSnapshot};
 pub use realtime::RealtimeLoadSnapshot;
 pub use render::{
     RENDER_CANCELLED, RenderControl, RenderLimiter, RenderTick, SilenceStop, WavSampleFormat,
-    render_pcm, write_pcm16_wav, write_pcm16_wav_controlled, write_pcm16_wav_reporting,
-    write_wav_controlled, write_wav_reporting,
+    render_pcm, render_pcm_events, write_pcm16_wav, write_pcm16_wav_controlled,
+    write_pcm16_wav_reporting, write_wav_controlled, write_wav_events_controlled,
+    write_wav_reporting,
 };
 pub use ring::{AudioEvent, QueuedAudioEvent, Ring};
 pub use sample::{

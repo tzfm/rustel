@@ -111,6 +111,7 @@ pub struct InsertControls {
     /// The note for an insert that makes the sound. 0 frames means the
     /// insert gets no note.
     note: InsertNote,
+    score: Option<u64>,
 }
 
 impl InsertControls {
@@ -126,6 +127,7 @@ impl InsertControls {
                 velocity: 0.0,
                 frames: 0,
             },
+            score: None,
         }
     }
 
@@ -139,6 +141,16 @@ impl InsertControls {
     /// The note for the insert, if the insert makes the sound.
     pub fn note(&self) -> Option<InsertNote> {
         (self.note.frames > 0).then_some(self.note)
+    }
+
+    /// Selects a score event prepared by the host outside the callback.
+    pub fn with_score(mut self, score: u64) -> Self {
+        self.score = Some(score);
+        self
+    }
+
+    pub fn score(&self) -> Option<u64> {
+        self.score
     }
 
     /// Gives the note its place in the music, so an effect with a tempo
@@ -205,6 +217,17 @@ pub trait OrbitInsert: Send {
     /// Completes the submitted block. Synchronous inserts need no work.
     fn collect(&mut self, _left: &mut [f32], _right: &mut [f32]) {}
 
+    /// Waits until the next `frames` frames are ready to collect. An
+    /// offline render calls this before `collect`: it reads as fast as
+    /// the host can, and an insert that renders ahead on its own thread
+    /// would starve. The audio callback never calls it.
+    fn flush(&mut self, _frames: usize) {}
+
+    /// Prepares the first `frames` frames before device playback starts.
+    /// Initial notes arrive first. This may wait on the caller, but keeps
+    /// the playback position at zero and returns to live rendering.
+    fn prime(&mut self, _frames: usize) {}
+
     /// Sets the musical clock: `frames` from now, the position is `beats`
     /// quarter notes and the tempo is `tempo` quarter notes in one minute.
     fn sync(&mut self, _beats: f64, _tempo: f32, _frames: u32) {}
@@ -213,10 +236,23 @@ pub trait OrbitInsert: Send {
     /// length of the note.
     fn note(&mut self, _note: InsertNote, _frames: u32) {}
 
+    /// Starts a prepared score event `frames` from now.
+    fn score(&mut self, _score: u64, _frames: u32) {}
+
     /// Ends each note `frames` from now: a note that sounds then, and a
     /// note that starts before then. A rewind cuts the engine voices at the
     /// same frame.
     fn cut_notes(&mut self, _frames: u32) {}
+
+    /// True when the insert renders on its own thread ahead of the
+    /// callback. The engine then hands such an insert each note when the
+    /// event is admitted, a schedule lead before the frame it sounds, so
+    /// the insert has the note ready at its own frame. The activation of
+    /// the onset delivers the note again, and a prepared score plays once,
+    /// so nothing sounds twice.
+    fn renders_ahead(&self) -> bool {
+        false
+    }
 
     /// True while the insert holds a note, or a value for a later frame.
     /// The engine keeps such an insert awake, also when its output is
