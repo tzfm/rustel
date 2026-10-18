@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A score that stretches every voice no longer overruns the audio device. The stretch vocoder slid its input and output windows one sample at a time, two 8 KiB moves per sample per channel, so a set of stretched voices spent most of its callback moving memory. The vocoder now keeps both as rings and reads each output slot once per overlap cycle. A score of about thirty stretched voices runs under half the callback budget where it overran before, with byte-identical audio.
 - Csound instruments play and export with `.csound()` and `.csoundm()`. Load orchestras with `loadCSound` or `loadOrc`. Requires double-precision Csound 6.18 or later 6.x. Studio enables native orchestras at startup, and the command line requires `--allow-csound`. See [Csound](https://github.com/tzfm/rustel/blob/main/docs/csound.md).
 - A note release no longer suppresses a MIDI press that follows within 40 ms. Scene pads and learned action buttons could miss that press.
 

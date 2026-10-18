@@ -6,6 +6,13 @@
 //! surrounding bins ride along, and the overlapping results summed and
 //! divided by the overlap count.
 //!
+//! Input and output live in ring buffers the size of the analysis block.
+//! Every analysis adds one windowed result into every output slot, so a slot
+//! is read and cleared exactly once per overlap cycle, between the last of
+//! the sixteen sums that fill it and the first of the next cycle. Sliding
+//! the buffers a sample at a time would cost two 8 KiB moves per sample per
+//! channel, which a full pattern of stretched voices cannot afford.
+//!
 //! The window carries a deliberate 1.62 amplitude factor, applied twice -
 //! that scaling is part of the effect's sound. Do not normalize it away.
 
@@ -24,6 +31,13 @@ const HOP: usize = 128;
 /// therefore what the summed result is divided by.
 const OVERLAPS: usize = BLOCK / HOP;
 
+/// Ring index mask for BLOCK-sized rings, which are powers of two.
+const MASK: usize = BLOCK - 1;
+
+/// The rings wrap on a power of two, and a window fills a ring exactly, so
+/// every analysis lands on every slot once and each hop starts a new cycle.
+const _: () = assert!(BLOCK.is_power_of_two() && BLOCK.is_multiple_of(HOP));
+
 /// Frames by which this vocoder's output trails that of one run a render
 /// quantum at a time. That one analyses a window when the quantum completing
 /// it arrives and emits the window's first frame at once, `BLOCK - HOP`
@@ -41,15 +55,19 @@ pub struct Stretch {
     forward: Arc<dyn Fft<f32>>,
     inverse: Arc<dyn Fft<f32>>,
     window: Vec<f32>,
-    /// The last BLOCK samples of input, oldest first.
+    /// The last BLOCK input samples as a ring. `in_write` names the oldest
+    /// sample, the one the next call overwrites.
     input: Vec<f32>,
-    /// Output waiting to be emitted, summed across overlapping windows.
+    in_write: usize,
+    /// Output waiting to be emitted, summed across overlapping windows, as a
+    /// ring. `out_read` names the slot the next call returns and clears; an
+    /// analysis adds its window starting at that same slot.
     output: Vec<f32>,
+    out_read: usize,
     /// Samples taken in since the last analysis.
     filled: usize,
     spectrum: Vec<Complex32>,
     shifted: Vec<Complex32>,
-    scratch: Vec<Complex32>,
     /// Working space rustfft needs for an in-place transform.
     ///
     /// Without it, `Fft::process` allocates this buffer on every call: once
@@ -62,6 +80,14 @@ pub struct Stretch {
     time_cursor: f32,
 }
 
+/// Where a fresh vocoder's output read cursor starts. Call `t` reads slot
+/// `(t - HOP + 1) mod BLOCK`, which at call zero is `BLOCK + 1 - HOP`: the
+/// first analysis fires at call `HOP - 1` and writes its window from the
+/// slot being read at that call.
+fn initial_out_read() -> usize {
+    (BLOCK + 1 - HOP) & MASK
+}
+
 impl Clone for Stretch {
     fn clone(&self) -> Self {
         Self {
@@ -70,11 +96,12 @@ impl Clone for Stretch {
             fft_scratch: vec![Complex32::default(); self.fft_scratch.len()],
             window: self.window.clone(),
             input: vec![0.0; BLOCK],
+            in_write: 0,
             output: vec![0.0; BLOCK],
+            out_read: initial_out_read(),
             filled: 0,
             spectrum: vec![Complex32::default(); BLOCK],
             shifted: vec![Complex32::default(); BLOCK],
-            scratch: vec![Complex32::default(); BLOCK],
             magnitudes: vec![0.0; BLOCK / 2 + 1],
             peaks: Vec::with_capacity(BLOCK / 2 + 1),
             time_cursor: 0.0,
@@ -112,11 +139,12 @@ impl Stretch {
                 })
                 .collect(),
             input: vec![0.0; BLOCK],
+            in_write: 0,
             output: vec![0.0; BLOCK],
+            out_read: initial_out_read(),
             filled: 0,
             spectrum: vec![Complex32::default(); BLOCK],
             shifted: vec![Complex32::default(); BLOCK],
-            scratch: vec![Complex32::default(); BLOCK],
             magnitudes: vec![0.0; BLOCK / 2 + 1],
             peaks: Vec::with_capacity(BLOCK / 2 + 1),
             time_cursor: 0.0,
@@ -132,10 +160,7 @@ impl Stretch {
             + self.output.capacity()
             + self.magnitudes.capacity())
             * size_of::<f32>()
-            + (self.spectrum.capacity()
-                + self.shifted.capacity()
-                + self.scratch.capacity()
-                + self.fft_scratch.capacity())
+            + (self.spectrum.capacity() + self.shifted.capacity() + self.fft_scratch.capacity())
                 * size_of::<Complex32>()
             + self.peaks.capacity() * size_of::<usize>()
     }
@@ -145,17 +170,19 @@ impl Stretch {
     /// is wiped. Called when a voice retires, never while it is sounding.
     pub fn reset(&mut self) {
         self.input.fill(0.0);
+        self.in_write = 0;
         self.output.fill(0.0);
+        self.out_read = initial_out_read();
         self.filled = 0;
         self.time_cursor = 0.0;
         self.peaks.clear();
     }
 
     /// Take one sample and return one. The transform runs once per hop, so
-    /// most calls only move a sample through the buffers.
+    /// most calls only move a sample through the rings.
     pub fn process(&mut self, sample: f32, pitch_factor: f32) -> f32 {
-        self.input.copy_within(1.., 0);
-        self.input[BLOCK - 1] = sample;
+        self.input[self.in_write] = sample;
+        self.in_write = (self.in_write + 1) & MASK;
 
         // Analyse and THEN emit: the block going out must already carry the
         // window just transformed. Emitting first would put the output a
@@ -166,10 +193,9 @@ impl Stretch {
             self.analyse(pitch_factor);
         }
 
-        let out = self.output[0];
-        self.output.copy_within(1.., 0);
-        self.output[BLOCK - 1] = 0.0;
-        out
+        let slot = self.out_read;
+        self.out_read = (self.out_read + 1) & MASK;
+        std::mem::replace(&mut self.output[slot], 0.0)
     }
 
     fn analyse(&mut self, pitch_factor: f32) {
@@ -182,10 +208,15 @@ impl Stretch {
         };
         let factor = (factor + 1.0).max(0.0);
 
-        for (bin, (sample, window)) in self.input.iter().zip(&self.window).enumerate() {
-            self.scratch[bin] = Complex32::new(sample * window * 1.62, 0.0);
+        // The analysis window is the whole input ring, oldest sample first:
+        // the two contiguous halves of the ring, in order. Same values and
+        // order as indexing around the ring, but as slices the compiler can
+        // vectorize the windowing.
+        let start = self.in_write;
+        let oldest_first = self.input[start..].iter().chain(self.input[..start].iter());
+        for (bin, (sample, window)) in oldest_first.zip(&self.window).enumerate() {
+            self.spectrum[bin] = Complex32::new(sample * window * 1.62, 0.0);
         }
-        self.spectrum.copy_from_slice(&self.scratch);
         self.forward
             .process_with_scratch(&mut self.spectrum, &mut self.fft_scratch);
 
@@ -205,10 +236,16 @@ impl Stretch {
         self.inverse
             .process_with_scratch(&mut self.shifted, &mut self.fft_scratch);
 
+        // An analysis window spans the whole output ring, so its first
+        // sample lands on the slot about to be read and its last on the slot
+        // the next BLOCK - 1 reads return. The two contiguous halves carry
+        // the window in order, as vectorizable slices.
         let scale = 1.0 / BLOCK as f32;
-        for (i, (out, window)) in self.output.iter_mut().zip(&self.window).enumerate() {
-            let _ = i;
-            *out += self.shifted[i].re * scale * window * 1.62 / OVERLAPS as f32;
+        let base = self.out_read;
+        let (wrapped, from_base) = self.output.split_at_mut(base);
+        let slots = from_base.iter_mut().chain(wrapped.iter_mut());
+        for ((out, bin), window) in slots.zip(&self.shifted).zip(&self.window) {
+            *out += bin.re * scale * window * 1.62 / OVERLAPS as f32;
         }
         self.time_cursor += HOP as f32;
     }
