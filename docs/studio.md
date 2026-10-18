@@ -410,7 +410,9 @@ selection; check the footer for the current action.
 Drag and drop an audio file or folder into the terminal window running Studio
 to import samples. You can also add folders and packs in Settings ▸ Samples.
 Samples in the set folder are discovered automatically. Use File ▸ Copy
-samples into the set when you need a portable set.
+samples into the set when you need a portable set. A dropped `.vstpreset`
+file goes to the preset folder of its plugin. See
+[Plugins](plugins.md#presets).
 
 The sample view supports alias changes and file deletion. Check the
 confirmation before deleting a file. An alias must not replace an existing
@@ -444,9 +446,10 @@ Ctrl+J opens the quick action at the caret. On a number, it can create a slider.
 On a slider, it can change or remove the control. These source edits require
 an update before they change playback.
 
-Controller mapping in Settings can bind a MIDI knob or controller axis to a
-slider. See [hardware](hardware.md) for setup. Terminals that report pixel
-positions give finer mouse control; other terminals use cell positions.
+The sliders page in Settings can bind a MIDI knob or controller axis to a
+slider. The keybinds page can bind a button to any studio action, Update and
+Stop included. See [hardware](hardware.md) for setup. Terminals that report
+pixel positions give finer mouse control; other terminals use cell positions.
 
 ## Mixer and limiter
 
@@ -566,10 +569,13 @@ are at the end of the list. The panel footers show the chord you set.
 
 The vst page lists the folders the plugin host reads for VST3 plugins: your
 folders first, then the standard folders of the system. Press `a` to add a
-folder and `d` to remove one of yours. Enter on `rescan` reads every folder
-again, for example after you install a plugin. The page shows the number of
-plugins found and the preset folder, `<rustel-config>/vst`, with one folder of
-`.vstpreset` files for each plugin.
+folder and `d` to remove one of yours. Enter on `scan` reads every folder and
+tests each new or changed plugin, for example after you install a plugin.
+Enter on `rescan` empties the scan cache and tests each plugin again. While a
+scan runs, the `scan` row names the plugin in its test. The page shows the number of plugins found and the preset
+folder, `<rustel-config>/vst`, with one folder of `.vstpreset` files for each
+plugin. A row for each plugin ends the page, with its state, and with its
+fault when it failed.
 
 Studio saves preferences in `<rustel-config>/studio.json`. The default config
 folder is `~/.rustel`, including `%USERPROFILE%\.rustel` on Windows.

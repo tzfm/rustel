@@ -306,6 +306,33 @@ fn on_driver_message(
                 value,
             });
         }
+        // A note's ending, a real note-off or the zero-velocity note-on
+        // many devices send for one, goes on as a press at velocity 0: a
+        // button that latches - the Maschine's transport in MIDI mode -
+        // says its second press as a note-off, and the studio's clock for
+        // held notes tells that press from a hand's release. The gate
+        // takes the ending as it takes a press, so the mirror port's copy
+        // dies here; a release quick enough to be taken for the press's
+        // own mirror is swallowed with nothing to lose, for the studio
+        // reads no meaning from a release that quick either.
+        MidiEvent::NoteOff { channel, note, .. }
+        | MidiEvent::NoteOn {
+            channel,
+            note,
+            velocity: 0,
+        } => {
+            let mirror = shared
+                .gate
+                .lock()
+                .is_ok_and(|mut gate| gate.is_mirror(Pad { note, channel }, gate_now));
+            if !mirror {
+                let _ = shared.presses.send(PadPress {
+                    note,
+                    channel,
+                    velocity: 0,
+                });
+            }
+        }
         _ => {}
     }
 }
@@ -491,6 +518,43 @@ mod tests {
         listener.driver_message_for_test("Maschine", note_on(36), 0);
         listener.driver_message_for_test("Maschine Virtual Input", note_on(36), 5);
         assert_eq!(delivered(&listener), vec![36], "the mirror is dropped");
+    }
+
+    /// A note's ending - a real note-off, or the zero-velocity note-on many
+    /// devices send for one - goes on as a press at velocity 0, so a
+    /// Keybinds row can read a latching button's off-press. The gate
+    /// treats an ending as it treats a press: the mirror port's copy of
+    /// it dies there, one ending one delivery.
+    #[test]
+    fn a_notes_ending_is_delivered_once_as_a_press_at_velocity_zero() {
+        let listener = PadListener::default();
+        listener.driver_message_for_test(
+            "pads",
+            MidiEvent::NoteOff {
+                channel: 10,
+                note: 36,
+                velocity: 0,
+            },
+            1_000,
+        );
+        listener.driver_message_for_test(
+            "pads",
+            MidiEvent::NoteOn {
+                channel: 10,
+                note: 36,
+                velocity: 0,
+            },
+            1_001,
+        );
+        let delivered: Vec<PadPress> = std::iter::from_fn(|| listener.try_recv().ok()).collect();
+        assert_eq!(
+            delivered,
+            vec![PadPress {
+                note: 36,
+                channel: 10,
+                velocity: 0
+            }]
+        );
     }
 
     /// Past the window the same pad is a musician hitting it again.

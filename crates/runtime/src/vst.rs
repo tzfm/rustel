@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 use rustel_audio::{InsertControls, InsertSlot};
 use rustel_transpiler::LaneStatement;
-pub use rustel_vst3::{Host, ParamInfo, PluginInfo, Resolved, Status, canonical, serve};
+pub use rustel_vst3::{
+    Host, ParamInfo, PluginInfo, Resolved, ScanProgress, Status, canonical, serve,
+};
 
 /// Folders with plugins, in place of the standard VST3 folders of the
 /// system. The form is the form of `PATH`.
@@ -114,6 +116,13 @@ pub fn set_user_folders(folders: Vec<PathBuf>) {
     }
 }
 
+/// Reads all folders again: the scan reads each new bundle, and each
+/// bundle with changed files. The read runs on the plugin thread: see
+/// [`scanning`].
+pub fn scan() {
+    host().scan(&folders());
+}
+
 /// Reads all folders again, with an empty scan cache: the scan reads each
 /// bundle that is not loaded again, a bundle that failed too. The read
 /// runs on the plugin thread: see [`scanning`].
@@ -202,6 +211,26 @@ pub fn shutdown() {
     if let Some(host) = started() {
         host.shutdown(EXIT_LIMIT);
     }
+}
+
+/// Whether the plugins need the process's main thread: on macOS, yes.
+/// See [`install_main_service`] for the contract.
+pub fn needs_the_main_thread() -> bool {
+    rustel_vst3::needs_the_main_thread()
+}
+
+/// Registers the process's main thread as the server of the plugin
+/// creation and release steps, on macOS. No-op when the service is
+/// already installed or the caller is not the process's main thread.
+pub fn install_main_service() {
+    rustel_vst3::install_main_service();
+}
+
+/// Serves the plugin steps that arrived, on the calling thread: the main
+/// thread of a program with the service installed calls this every few
+/// milliseconds, also while it shuts down.
+pub fn pump_main() {
+    rustel_vst3::pump_main();
 }
 
 /// True while the host reads the plugin folders. The plugin list is not
@@ -1255,9 +1284,8 @@ pub fn scan_in_background() {
     host().scan_plugins();
 }
 
-/// The bundles the scan read and the bundles of the scan in all, while
-/// the scan runs: see [`scan_in_background`].
-pub fn scan_progress() -> Option<(usize, usize)> {
+/// Where the scan is, while it runs: see [`scan_in_background`].
+pub fn scan_progress() -> Option<ScanProgress> {
     started().and_then(Host::scan_progress)
 }
 
