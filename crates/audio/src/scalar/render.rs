@@ -477,6 +477,7 @@ impl ScalarBackend {
         let insert_provider = self.insert_provider.as_deref();
         let missing_insert_events = &mut self.missing_insert_events;
         let allow_inline_reverb = self.allow_inline_reverb;
+        let offline = self.offline;
         let missing_reverb_events = &mut self.missing_reverb_events;
         let voice_ceiling_drops = &mut self.voice_ceiling_drops;
         let pressure = &mut self.pressure;
@@ -1592,6 +1593,7 @@ impl ScalarBackend {
         let sample_resampling_mode = self.sample_resampling_mode;
         let djfs = &mut self.orbit_djf;
         let sends = &mut self.reverb_sends;
+        let mut prepared_block = [[0.0f32; crate::reverb::REVERB_BLOCK]; 2];
         let mut sub_start = 0usize;
         while sub_start < frames {
             let sub_len = (frames - sub_start).min(crate::reverb::REVERB_BLOCK);
@@ -1612,6 +1614,22 @@ impl ScalarBackend {
                     buffer[0][..sub_len].fill(0.0);
                     buffer[1][..sub_len].fill(0.0);
                 }
+            }
+            // An insert that renders ahead counts its own frames from the
+            // block it is collected in. One that waits prepared would count
+            // its first block at the onset that swaps it in, so a note the
+            // admission delivers early would land that whole wait late.
+            // Collect the wait, and drop what it renders: the frames before
+            // its first note are silence.
+            for insert in prepared_inserts.iter_mut().flatten() {
+                if !insert.renders_ahead() {
+                    continue;
+                }
+                if offline {
+                    insert.flush(sub_len);
+                }
+                let (left, right) = prepared_block.split_at_mut(1);
+                insert.collect(&mut left[0][..sub_len], &mut right[0][..sub_len]);
             }
             // Arm every duck whose 10 ms hold point this sub-block reaches,
             // in arm order and, within one arm frame, in admission order:
@@ -3167,6 +3185,11 @@ impl ScalarBackend {
                     collected_instruments |= 1u64 << bus;
                     let (left, right) = instrument_blocks[bus].split_at_mut(1);
                     let (left, right) = (&mut left[0][..sub_len], &mut right[0][..sub_len]);
+                    // An offline render reads faster than real time, so
+                    // it waits for the block before it collects it.
+                    if offline {
+                        instrument.flush(sub_len);
+                    }
                     instrument.collect(left, right);
                     let mut silent = settle(left, right);
                     let key = instrument.key();

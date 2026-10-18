@@ -8,6 +8,13 @@
 //! the worker falls behind anyway - a first wavetable build, an orchestra
 //! that costs more than the runway buys - the ring runs dry, that one
 //! insert falls silent for the gap, and the rest of the output plays on.
+//!
+//! An offline render pulls instead. It has no callback to keep fed, and a
+//! runway would cost it exactness: a note the scheduler admits inside its
+//! own block lands behind the frontier the runway holds. So the render
+//! asks for each block's frames after it delivered the block's notes, the
+//! worker renders that far and no further, and every note lands on its
+//! own frame the way it did when the engine ran on the render thread.
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -27,10 +34,11 @@ const CALLBACK_BLOCK: u64 = 128;
 /// The lead at a 128-frame buffer is five to six buffers, so the runway
 /// takes four of them and leaves the rest for the wake.
 const RUNWAY_FRAMES: u64 = 512;
-/// The runway before any note has said its lead: two blocks keep the ring
-/// ahead of the callback from the first frame. A lead shorter than this,
-/// which only a very small host buffer gives, can arrive after the worker
-/// passed its frame by the difference, and the note starts that late.
+/// The runway before any note has said its lead: two blocks, so the frames
+/// of a note the activation posts with no lead of its own are ready before
+/// the callback asks. A lead shorter than this, which only a very small
+/// host buffer gives, can arrive after the worker passed its frame by the
+/// difference, and the note starts that late.
 const MIN_RUNWAY_FRAMES: u64 = 256;
 /// Ring capacity in frames: the runway, the block in flight, and room for a
 /// stop between publishes. A power of two keeps the wrap cheap.
@@ -66,6 +74,13 @@ struct Channel {
     clean_from: AtomicU64,
     /// The largest note lead the callback has posted.
     lead: AtomicU64,
+    /// The frame an offline render asked for last. The worker renders to
+    /// it and no further, so its frontier never passes a frame a note can
+    /// still land on.
+    wanted: AtomicU64,
+    /// True once an offline render pulls the worker. Live, the worker runs
+    /// ahead of the callback by a runway instead.
+    offline: AtomicBool,
     stopping: AtomicBool,
     dead: AtomicBool,
 }
@@ -89,6 +104,8 @@ impl Channel {
             read: AtomicU64::new(0),
             clean_from: AtomicU64::new(0),
             lead: AtomicU64::new(0),
+            wanted: AtomicU64::new(0),
+            offline: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             dead: AtomicBool::new(false),
         }
@@ -367,6 +384,25 @@ impl OrbitInsert for Insert {
             self.failed = true;
         }
     }
+
+    fn flush(&mut self, frames: usize) {
+        // An offline render reads faster than real time, and it cannot
+        // afford a runway either: a note the scheduler admits inside its
+        // own block would land behind the frontier a runway holds. So the
+        // render pulls the worker. It delivers a block's notes first, then
+        // asks for the block's frames, and the worker renders exactly that
+        // far and no further. A worker that stopped ends the wait: the
+        // frames it still owes read as the silence of a dropped insert.
+        self.channel.offline.store(true, Ordering::Release);
+        let ready = self.frame.saturating_add(frames as u64);
+        self.channel.wanted.store(ready, Ordering::Release);
+        while self.channel.written.load(Ordering::Acquire) < ready {
+            if self.stopped() {
+                return;
+            }
+            thread::sleep(Duration::from_micros(50));
+        }
+    }
 }
 
 impl Drop for Insert {
@@ -443,11 +479,22 @@ impl State {
             let runway = lead
                 .saturating_sub(CALLBACK_BLOCK)
                 .clamp(MIN_RUNWAY_FRAMES, RUNWAY_FRAMES);
-            let target = self
-                .channel
-                .read
-                .load(Ordering::Acquire)
-                .saturating_add(runway);
+            let read = self.channel.read.load(Ordering::Acquire);
+            let target = if self.channel.offline.load(Ordering::Acquire) {
+                // The offline render delivers a block's notes before it
+                // asks for the block's frames, so the frontier the worker
+                // holds at that ask never passes a due the block carries.
+                self.channel.wanted.load(Ordering::Acquire)
+            } else if read == 0 {
+                // Nothing has been read yet. The activation posts an
+                // insert's first note before the insert's first collect,
+                // so the frontier stays under whatever due that note
+                // carries. Frames before it are silence the reader reads
+                // for free, also when an always-on instrument plays.
+                self.write
+            } else {
+                read.saturating_add(runway)
+            };
             let mut rendered = false;
             while self.write < target {
                 self.step();

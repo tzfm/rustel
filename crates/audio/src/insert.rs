@@ -217,6 +217,12 @@ pub trait OrbitInsert: Send {
     /// Completes the submitted block. Synchronous inserts need no work.
     fn collect(&mut self, _left: &mut [f32], _right: &mut [f32]) {}
 
+    /// Waits until the next `frames` frames are ready to collect. An
+    /// offline render calls this before `collect`: it reads as fast as
+    /// the host can, and an insert that renders ahead on its own thread
+    /// would starve. The audio callback never calls it.
+    fn flush(&mut self, _frames: usize) {}
+
     /// Sets the musical clock: `frames` from now, the position is `beats`
     /// quarter notes and the tempo is `tempo` quarter notes in one minute.
     fn sync(&mut self, _beats: f64, _tempo: f32, _frames: u32) {}

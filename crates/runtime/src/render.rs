@@ -601,6 +601,9 @@ fn scalar_backend(
     csound: Option<&crate::csound::State>,
 ) -> rustel_audio::ScalarBackend {
     let mut backend = rustel_audio::ScalarBackend::with_dispatch(dispatch);
+    // A render reads faster than real time, so it waits for an insert
+    // that renders ahead to publish each block before collecting it.
+    backend.render_offline();
     backend.set_max_polyphony(max_polyphony);
     if let Some(library) = library {
         for (id, decoded) in library.take_ready() {
