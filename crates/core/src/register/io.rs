@@ -1,4 +1,4 @@
-//! The wire: MIDI, OSC, serial and sysex. Configuration, not pattern.
+//! Instrument and device routing for Csound, MIDI, OSC, serial and sysex.
 //!
 //! Documentation text from the Strudel project (AGPL-3.0-or-later),
 //! https://strudel.cc, where an entry carries upstream's words; entries this
@@ -111,7 +111,68 @@ const SYSEX: crate::reference::ReferenceEntry = crate::reference::ReferenceEntry
     origin: "rustel",
 };
 
+const CSOUND: crate::reference::ReferenceEntry = crate::reference::ReferenceEntry {
+    name: "csound",
+    synonyms: &[],
+    summary: "play a Csound instrument with frequency and gain",
+    description: "Sends each note to a Csound instrument. Requires double-precision Csound 6.18 or a later 6.x release and --allow-csound. p3 is duration in seconds, p4 is rounded frequency in Hz, p5 is gain times 0.2 with a default of 0.16, and p6 contains slash-separated controls. The default instrument is triangle. Instrument names can be patterned.",
+    params: &[crate::reference::ReferenceParam {
+        name: "instrument",
+        r#type: "string | Pattern",
+        description: "Csound instrument name. Defaults to triangle.",
+    }],
+    examples: &["note(\"c3 e3 g3\").csound('triangle')"],
+    tags: &["csound", "audio"],
+    no_autocomplete: false,
+    deprecated: false,
+    origin: "rustel",
+};
+
+const CSOUNDM: crate::reference::ReferenceEntry = crate::reference::ReferenceEntry {
+    name: "csoundm",
+    synonyms: &[],
+    summary: "play a Csound instrument with MIDI pitch and velocity",
+    description: "Sends each note to a named or numbered Csound instrument. Requires double-precision Csound 6.18 or a later 6.x release and --allow-csound. p3 is duration in seconds, p4 is fractional MIDI pitch, p5 is 127 times gain times velocity, and p6 contains slash-separated controls. Gain defaults to 1 and velocity to 0.9. Fractional instrument numbers are supported.",
+    params: &[crate::reference::ReferenceParam {
+        name: "instrument",
+        r#type: "string | number | Pattern",
+        description: "Csound instrument name or number.",
+    }],
+    examples: &[
+        "loadCSound(`instr MidiTone\n aout oscili p5 / 127, cpsmidinn(p4)\n outs aout, aout\nendin`)\nnote(\"c3 e3 g3\").csoundm('MidiTone')",
+    ],
+    tags: &["csound", "audio"],
+    no_autocomplete: false,
+    deprecated: false,
+    origin: "rustel",
+};
+
 pub(super) fn register(r: &mut Registry) {
+    add(
+        r,
+        &["csound"],
+        CSOUND,
+        2,
+        false,
+        crate::native_combinator!(|args, pat| c::csound(
+            &pat,
+            args.first().unwrap_or(&Value::Undefined),
+            false
+        )),
+    );
+    add(
+        r,
+        &["csoundm"],
+        CSOUNDM,
+        2,
+        false,
+        crate::native_combinator!(|args, pat| c::csound(
+            &pat,
+            args.first().unwrap_or(&Value::Undefined),
+            true
+        )),
+    );
+
     // Configuration, not a pattern: the same reasoning as `.midi()`.
     r.register(Registration {
         names: vec![Arc::from("serial")],

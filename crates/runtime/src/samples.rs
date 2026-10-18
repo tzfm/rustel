@@ -2091,6 +2091,7 @@ pub(crate) mod wait_tests {
                     rustel_audio::WavSampleFormat::Pcm16,
                     rustel_audio::DspDispatch::portable(),
                     128,
+                    None,
                 );
                 let _ = finished.send(rendered);
             });

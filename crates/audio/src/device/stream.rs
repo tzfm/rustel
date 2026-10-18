@@ -1391,6 +1391,68 @@ fn disambiguate_device_names(list: &mut [AudioDeviceInfo]) {
     }
 }
 
+fn prepare_finite_inserts(
+    backend: &mut ScalarBackend,
+    events: &[OnsetEvent],
+    sample_rate: u32,
+    provider: Option<&crate::InsertProvider>,
+) -> Result<(), DevicePlaybackError> {
+    for event in events {
+        let chain = event.controls.insert_chain();
+        let slots =
+            event
+                .controls
+                .instrument
+                .iter()
+                .map(|controls| (crate::instrument_slot(chain), controls))
+                .chain(event.controls.effects.iter().enumerate().filter_map(
+                    |(stage, controls)| {
+                        controls
+                            .as_ref()
+                            .map(|controls| (crate::effect_slot(chain, stage), controls))
+                    },
+                ));
+        for (slot, controls) in slots {
+            if let Some(key) = backend.orbit_insert_key(slot) {
+                if key == controls.key {
+                    continue;
+                }
+                return Err(DevicePlaybackError::ResourceLimit(
+                    "finite playback needs one instrument or effect revision per chain slot".into(),
+                ));
+            }
+            let insert = provider
+                .and_then(|build| build(controls.key, sample_rate, slot))
+                .filter(|insert| insert.key() == controls.key)
+                .ok_or_else(|| {
+                    DevicePlaybackError::ResourceLimit(
+                        "cannot prepare a finite playback instrument or effect".into(),
+                    )
+                })?;
+            if backend.install_insert(slot, insert).is_some() {
+                return Err(DevicePlaybackError::ResourceLimit(
+                    "finite playback exceeds the instrument and effect chain limit".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn queue_finite_events(
+    backend: &mut ScalarBackend,
+    events: &[OnsetEvent],
+) -> Result<(), DevicePlaybackError> {
+    for event in events {
+        backend
+            .prepare_kabel_event(event)
+            .map_err(DevicePlaybackError::ResourceLimit)?;
+        backend.note(event.clone());
+    }
+    backend.prime_finite_inserts();
+    Ok(())
+}
+
 impl ScalarDevice {
     pub fn open_default() -> Result<Self, DevicePlaybackError> {
         Self::open_output(None)
@@ -1525,6 +1587,29 @@ impl ScalarDevice {
         dispatch: DspDispatch,
         max_polyphony: usize,
     ) -> Result<(), DevicePlaybackError> {
+        self.play_with_samples_dispatch_polyphony_and_inserts(
+            events,
+            duration_secs,
+            stopped,
+            samples,
+            dispatch,
+            max_polyphony,
+            None,
+        )
+    }
+
+    /// Finite playback with instruments and effects prepared before streaming.
+    #[allow(clippy::too_many_arguments)]
+    pub fn play_with_samples_dispatch_polyphony_and_inserts(
+        &self,
+        events: &[OnsetEvent],
+        duration_secs: f64,
+        stopped: &AtomicBool,
+        samples: Vec<(crate::sample::SampleId, Box<crate::sample::DecodedSample>)>,
+        dispatch: DspDispatch,
+        max_polyphony: usize,
+        provider: Option<Arc<crate::InsertProvider>>,
+    ) -> Result<(), DevicePlaybackError> {
         let total_frames = checked_frames(duration_secs, self.sample_rate())?;
         if total_frames == 0 {
             return Ok(());
@@ -1541,6 +1626,12 @@ impl ScalarDevice {
         for (id, decoded) in samples {
             let _ = backend.install_sample(id, decoded);
         }
+        prepare_finite_inserts(
+            &mut backend,
+            events,
+            self.sample_rate(),
+            provider.as_deref(),
+        )?;
         // The event list is complete up front: synthesise every needed orbit
         // reverb HERE, off the callback, so activation never generates.
         let mut stage_reverbs: Vec<crate::reverb::ReverbParams> = Vec::new();
@@ -1592,12 +1683,7 @@ impl ScalarDevice {
             }
         }
         backend.forbid_inline_reverb();
-        for event in events {
-            backend
-                .prepare_kabel_event(event)
-                .map_err(DevicePlaybackError::ResourceLimit)?;
-            backend.note(event.clone());
-        }
+        queue_finite_events(&mut backend, events)?;
 
         let written = Arc::new(AtomicU64::new(0));
         let failed = Arc::new(AtomicBool::new(false));
@@ -1911,6 +1997,179 @@ where
 mod tests {
     use super::super::tests::*;
     use super::*;
+
+    #[test]
+    fn finite_playback_keeps_worker_and_scalar_notes_on_the_original_timeline() {
+        struct Insert {
+            key: crate::InsertKey,
+            ahead: bool,
+            frame: u64,
+            frontier: u64,
+            due: [u64; 3],
+        }
+        impl crate::OrbitInsert for Insert {
+            fn key(&self) -> crate::InsertKey {
+                self.key
+            }
+            fn set_param(&mut self, _: crate::InsertParam, _: u32) {}
+            fn renders_ahead(&self) -> bool {
+                self.ahead
+            }
+            fn busy(&self) -> bool {
+                true
+            }
+            fn prime(&mut self, frames: usize) {
+                self.frontier = frames as u64;
+            }
+            fn score(&mut self, id: u64, frames: u32) {
+                let due = &mut self.due[id as usize - 1];
+                if *due == u64::MAX {
+                    // A worker cannot change frames it has rendered ahead.
+                    *due = (self.frame + u64::from(frames)).max(self.frontier);
+                }
+            }
+            fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+                for (left, right) in left.iter_mut().zip(right) {
+                    let sounding = self
+                        .due
+                        .iter()
+                        .any(|due| self.frame >= *due && self.frame.saturating_sub(*due) < 64);
+                    *left = if sounding { 0.5 } else { 0.0 };
+                    *right = *left;
+                    self.frame += 1;
+                }
+                if self.ahead {
+                    self.frontier = self.frontier.max(self.frame + 512);
+                }
+            }
+        }
+        let _guard = tripwire_assertion_guard();
+        let key = crate::InsertKey {
+            plugin: 3,
+            preset: 1,
+        };
+        let mut events: Vec<_> = [0, 128, 2048]
+            .into_iter()
+            .enumerate()
+            .map(|(index, onset)| {
+                let mut event = OnsetEvent::new(onset, 440.0, 1.0, 0.001);
+                event.controls.insert_chain = Some(1);
+                event.controls.instrument =
+                    Some(crate::InsertControls::new(key).with_score(index as u64 + 1));
+                event
+            })
+            .collect();
+        events.push(OnsetEvent::new(64, 220.0, 0.1, 0.001));
+        let mut kabel = OnsetEvent::new(256, 440.0, 0.2, 0.004);
+        kabel.controls.kabel = Some(crate::KabelControls {
+            program: rustel_kabel::Program::from_json(
+                r#"{"nodes":[{"type":"n","value":0.25},{"type":"output","inputs":[0]}]}"#,
+            )
+            .unwrap()
+            .into(),
+            start_secs: 256.0 / 48_000.0,
+            gate_end_secs: 448.0 / 48_000.0,
+            end_secs: 448.0 / 48_000.0,
+        });
+        events.push(kabel);
+        let total = 2304;
+        let render = |ahead| {
+            let mut backend = ScalarBackend::prepared(48_000, 8).unwrap();
+            assert!(
+                backend
+                    .install_insert(
+                        crate::instrument_slot(1),
+                        Box::new(Insert {
+                            key,
+                            ahead,
+                            frame: 0,
+                            frontier: 0,
+                            due: [u64::MAX; 3],
+                        })
+                    )
+                    .is_none()
+            );
+            queue_finite_events(&mut backend, &events).unwrap();
+            let written = AtomicU64::new(0);
+            let mut output = vec![0.0f32; total as usize * 2];
+            let before = crate::tripwire::Violations::capture();
+            crate::tripwire::audio_scope(|| {
+                super::super::callback::write_output(&mut backend, &mut output, 2, total, &written);
+            });
+            assert!(crate::tripwire::Violations::capture().since(before).clean());
+            assert_eq!(written.load(Ordering::Acquire), total);
+            output
+        };
+        let expected = render(false);
+        let actual = render(true);
+        assert_eq!(actual, expected);
+        for onset in [0, 128, 256, 2048] {
+            assert!(
+                actual[onset * 2..(onset + 64) * 2]
+                    .iter()
+                    .any(|v| v.abs() > 0.01)
+            );
+        }
+    }
+
+    #[test]
+    fn finite_inserts_prepare_each_slot_once_and_refuse_unavailable_revisions() {
+        struct Insert(crate::InsertKey);
+        impl crate::OrbitInsert for Insert {
+            fn key(&self) -> crate::InsertKey {
+                self.0
+            }
+            fn set_param(&mut self, _: crate::InsertParam, _: u32) {}
+            fn process(&mut self, _: &mut [f32], _: &mut [f32]) {}
+        }
+
+        let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = built.clone();
+        let provider = move |key, rate, _| -> Option<Box<dyn crate::OrbitInsert>> {
+            assert_eq!(rate, 48_000);
+            count.fetch_add(1, Ordering::Relaxed);
+            Some(Box::new(Insert(key)))
+        };
+        let key = crate::InsertKey {
+            plugin: 3,
+            preset: 1,
+        };
+        let mut event = OnsetEvent::new(0, 440.0, 1.0, 0.1);
+        event.controls.instrument = Some(crate::InsertControls::new(key).with_score(7));
+        event.controls.effects[0] = Some(crate::InsertControls::new(key));
+        let mut backend = ScalarBackend::new();
+        backend.init(48_000).unwrap();
+        assert!(matches!(
+            prepare_finite_inserts(&mut backend, &[event.clone()], 48_000, None),
+            Err(DevicePlaybackError::ResourceLimit(_))
+        ));
+        prepare_finite_inserts(
+            &mut backend,
+            &[event.clone(), event.clone()],
+            48_000,
+            Some(&provider),
+        )
+        .unwrap();
+        assert_eq!(built.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            backend.orbit_insert_key(crate::instrument_slot(event.controls.insert_chain())),
+            Some(key)
+        );
+        assert_eq!(
+            backend.orbit_insert_key(crate::effect_slot(event.controls.insert_chain(), 0)),
+            Some(key)
+        );
+        event.controls.instrument = Some(crate::InsertControls::new(crate::InsertKey {
+            preset: 2,
+            ..key
+        }));
+        assert!(matches!(
+            prepare_finite_inserts(&mut backend, &[event], 48_000, Some(&provider)),
+            Err(DevicePlaybackError::ResourceLimit(_))
+        ));
+        assert_eq!(built.load(Ordering::Relaxed), 2);
+    }
+
     mod host_cache {
         use super::*;
         use std::rc::Rc;

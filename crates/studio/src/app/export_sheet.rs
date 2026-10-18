@@ -146,6 +146,11 @@ impl App {
             mini: self.options.mini,
             prebakes: super::super::prebake::PrebakeScope::ALL
                 .map(|scope| self.stored_prebake(scope).to_owned()),
+            csound: self
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.csound.clone())
+                .unwrap_or_default(),
             samples: ExportSamples {
                 bank_renames: self.prefs.bank_renames(),
                 source_bank_renames: self.prefs.source_bank_renames(),
@@ -162,6 +167,7 @@ impl App {
                 self.ui_settings.max_polyphony,
                 self.worker.master().max_polyphony_override(),
                 &self.prefs.import_origins,
+                self.csound_allowed,
             ),
             sheet.target.clone(),
         ) {

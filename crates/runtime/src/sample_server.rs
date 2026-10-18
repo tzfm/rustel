@@ -1136,6 +1136,73 @@ impl ServedRoot {
         &self.path
     }
 
+    pub(crate) fn open_score_file(&self, absolute: &Path) -> Result<(File, u64), String> {
+        let refused = || "local file is unavailable beneath the permitted root".to_owned();
+        if absolute
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(refused());
+        }
+        let root = with_verbatim_prefix(&self.path);
+        let absolute = with_verbatim_prefix(absolute);
+        let relative = absolute
+            .strip_prefix(root.as_ref())
+            .ok()
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                // Resolve a root alias without normalizing the child components.
+                absolute.ancestors().skip(1).find_map(|ancestor| {
+                    let canonical = ancestor.canonicalize().ok()?;
+                    (with_verbatim_prefix(&canonical).as_ref() == root.as_ref())
+                        .then(|| absolute.strip_prefix(ancestor).ok().map(Path::to_path_buf))
+                        .flatten()
+                })
+            })
+            .filter(|relative| relative_sample_path_allowed(relative))
+            .ok_or_else(refused)?;
+        #[cfg(unix)]
+        let file = {
+            let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK;
+            #[cfg(target_os = "linux")]
+            {
+                match openat2_beneath(&self.directory, &relative, flags) {
+                    Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => {
+                        openat_no_symlinks(&self.directory, &relative, flags)
+                    }
+                    result => result,
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            openat_no_symlinks(&self.directory, &relative, flags)
+        }
+        .map_err(|_| refused())?;
+        #[cfg(windows)]
+        let file = open_windows_file(&self.path.join(&relative)).map_err(|_| refused())?;
+        #[cfg(any(unix, windows))]
+        {
+            let metadata = file.metadata().map_err(|_| refused())?;
+            if !metadata.is_file() {
+                return Err(refused());
+            }
+            #[cfg(target_os = "linux")]
+            let opened_path = path_for_open_file(&file).ok_or_else(refused)?;
+            #[cfg(windows)]
+            let opened_path = windows_final_path(&file).map_err(|_| refused())?;
+            #[cfg(any(target_os = "linux", windows))]
+            if !opened_path
+                .strip_prefix(root.as_ref())
+                .ok()
+                .is_some_and(relative_sample_path_allowed)
+            {
+                return Err(refused());
+            }
+            Ok((file, metadata.len()))
+        }
+        #[cfg(not(any(unix, windows)))]
+        Err(refused())
+    }
+
     pub(crate) fn open_score_sample_with(
         &self,
         absolute: &Path,

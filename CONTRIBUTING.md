@@ -69,6 +69,12 @@ test. Keep it an optional normal dependency, which integration tests can also
 use. Gate the tests that use it on the feature, as `tests/semantic/hydra.rs`
 does.
 
+Csound integration tests use double-precision Csound 6.18 from the system.
+Set `RUSTEL_CSOUND_LIBRARY` to its shared library to require these tests.
+Without that variable, they skip only when Csound is absent. The Linux CI job
+installs the library and requires the tests. A Csound change needs a local run
+with the variable set, including the Studio export and runtime tests.
+
 ## Where code lives
 
 ### The studio

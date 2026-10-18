@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rustel_core::{QueryLimit, Value, pure};
 use rustel_fraction::Fraction;
-use rustel_jsruntime::{JsRuntime, QueryError, ScoreEffects, Slot};
+use rustel_jsruntime::{CsoundSource, JsRuntime, QueryError, ScoreEffects, Slot};
 use rustel_transpiler::TranspileOptions;
 
 static NOT_CANCELLED: AtomicBool = AtomicBool::new(false);
@@ -104,6 +104,13 @@ fn successful_score_returns_one_ordered_effect_transaction() {
           preload('alpha:1', ['beta', 'gamma:2']);
           samples({ delta: ['two.wav'] });
           preload('delta');
+          loadCSound`instr ${'Bell'}\nendin`;
+          loadOrc("github:example/orchestra/revision/voices.orc");
+          loadcsound(`instr 2\nendin`);
+          const savedPromise = Promise;
+          globalThis.Promise = { resolve() { throw new Error('mutable promise') } };
+          loadCsound();
+          globalThis.Promise = savedPromise;
           setCps(1.25);
           pure('accepted')
         "#,
@@ -122,6 +129,15 @@ fn successful_score_returns_one_ordered_effect_transaction() {
         ]
     );
     assert_eq!(effects.preload, ["alpha:1 beta gamma:2", "delta"]);
+    assert_eq!(
+        effects.csound,
+        [
+            CsoundSource::Code("instr Bell\nendin".to_string()),
+            CsoundSource::Url("github:example/orchestra/revision/voices.orc".to_string()),
+            CsoundSource::Code("instr 2\nendin".to_string()),
+            CsoundSource::Code(String::new()),
+        ]
+    );
 
     assert_eq!(
         evaluate(&runtime, "pure('next')").expect("next score"),
@@ -148,6 +164,12 @@ fn host_effect_collections_are_bounded_before_vector_growth() {
           }
           globalThis.sampleLimitCaught = sampleLimitCaught;
           globalThis.preloadLimitCaught = preloadLimitCaught;
+          let csoundLimitCaught = 0;
+          for (let i = 0; i < 65; i++) {
+            try { loadCSound(); }
+            catch (_) { csoundLimitCaught++; }
+          }
+          globalThis.csoundLimitCaught = csoundLimitCaught;
           pure('accepted')
         "#,
     )
@@ -156,6 +178,8 @@ fn host_effect_collections_are_bounded_before_vector_growth() {
     assert_eq!(counted.preload.len(), 256);
     assert_eq!(runtime.get_number("sampleLimitCaught"), Some(1.0));
     assert_eq!(runtime.get_number("preloadLimitCaught"), Some(1.0));
+    assert_eq!(counted.csound.len(), 64);
+    assert_eq!(runtime.get_number("csoundLimitCaught"), Some(1.0));
 
     let bytes = evaluate(
         &runtime,
@@ -168,6 +192,10 @@ fn host_effect_collections_are_bounded_before_vector_growth() {
           catch (_) { preloadBytesCaught++; }
           globalThis.sampleBytesCaught = sampleBytesCaught;
           globalThis.preloadBytesCaught = preloadBytesCaught;
+          let csoundBytesCaught = 0;
+          try { loadCSound('x'.repeat(4 * 1024 * 1024 + 1)); }
+          catch (_) { csoundBytesCaught++; }
+          globalThis.csoundBytesCaught = csoundBytesCaught;
           pure('accepted')
         "#,
     )
@@ -175,17 +203,19 @@ fn host_effect_collections_are_bounded_before_vector_growth() {
     assert_eq!(bytes, ScoreEffects::default());
     assert_eq!(runtime.get_number("sampleBytesCaught"), Some(1.0));
     assert_eq!(runtime.get_number("preloadBytesCaught"), Some(1.0));
+    assert_eq!(runtime.get_number("csoundBytesCaught"), Some(1.0));
 }
 
 #[test]
 fn every_failed_score_exit_discards_all_staged_effects() {
     let runtime = runtime();
     runtime
-        .eval("globalThis.effectSamples = globalThis.samples; globalThis.effectPreload = globalThis.preload;")
+        .eval("globalThis.effectSamples = globalThis.samples; globalThis.effectPreload = globalThis.preload; globalThis.effectCsound = globalThis.loadCSound;")
         .expect("save synchronous effect bindings");
     let prefix = r#"
       effectSamples({ leaked: ['leaked.wav'] }, 'https://samples.example/');
       effectPreload('leaked');
+      effectCsound('instr Leaked\nendin');
       setCps(3);
     "#;
 
@@ -284,7 +314,7 @@ fn setup_effects_commit_only_after_the_whole_setup_succeeds() {
     let options = TranspileOptions::default();
     let (_, effects) = runtime
         .evaluate_prelude_with_effects(
-            "samples({ setup: ['setup.wav'] }); preload('setup:0'); globalThis.setupKept = 1;",
+            "samples({ setup: ['setup.wav'] }); preload('setup:0'); loadCSound('instr Setup\\nendin'); globalThis.setupKept = 1;",
             &options,
             Duration::from_secs(1),
         )
@@ -292,11 +322,15 @@ fn setup_effects_commit_only_after_the_whole_setup_succeeds() {
     assert_eq!(effects.cps, None);
     assert_eq!(effects.samples.len(), 1);
     assert_eq!(effects.preload, ["setup:0"]);
+    assert_eq!(
+        effects.csound,
+        [CsoundSource::Code("instr Setup\nendin".to_string())]
+    );
     assert_eq!(runtime.get_number("setupKept"), Some(1.0));
 
     let error = runtime
         .evaluate_prelude_with_effects(
-            "samples({ rejected: ['rejected.wav'] }); preload('rejected'); globalThis.setupBeforeThrow = 1; throw new Error('setup-boom');",
+            "samples({ rejected: ['rejected.wav'] }); preload('rejected'); loadCSound(); globalThis.setupBeforeThrow = 1; throw new Error('setup-boom');",
             &options,
             Duration::from_secs(1),
         )
@@ -315,7 +349,7 @@ fn setup_effects_commit_only_after_the_whole_setup_succeeds() {
 
     let policy = runtime
         .evaluate_prelude_with_effects(
-            "samples({ discarded: ['discarded.wav'] }); preload('discarded'); try { setCps(2); } catch (_) {}",
+            "samples({ discarded: ['discarded.wav'] }); preload('discarded'); loadCSound(); try { setCps(2); } catch (_) {}",
             &options,
             Duration::from_secs(1),
         )

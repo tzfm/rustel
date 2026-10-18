@@ -39,7 +39,7 @@ pub enum HelpContext {
     Settings,
     SettingsAbout,
     SettingsSources,
-    SettingsTrust,
+    SettingsPermissions,
     #[cfg(feature = "vst")]
     SettingsVst,
     Log,
@@ -72,7 +72,7 @@ impl HelpContext {
             Self::Settings => "settings",
             Self::SettingsAbout => "settings · about",
             Self::SettingsSources => "settings · samples",
-            Self::SettingsTrust => "settings · trust",
+            Self::SettingsPermissions => "settings · permissions",
             #[cfg(feature = "vst")]
             Self::SettingsVst => "settings · vst",
             Self::Log => "log",
@@ -112,8 +112,8 @@ impl HelpContext {
             Self::SettingsSources => {
                 "Fetch imports, cache all remote packs, refresh their lists, and clear the cache; then your folders and the studio's packs. r aliases a bank on a user import; c caches a remote pack."
             }
-            Self::SettingsTrust => {
-                "The origins a score imports scripts from with await import('https://...'). Each row reads on or off, and an origin the studio has seen stays listed until it closes."
+            Self::SettingsPermissions => {
+                "The origins a score imports scripts from with await import('https://...'), and the native orchestra switch. Each row reads on or off. The studio keeps origin trusts; the orchestra switch lasts one run."
             }
             #[cfg(feature = "vst")]
             Self::SettingsVst => {
@@ -301,10 +301,10 @@ impl HelpContext {
                     "cache this remote pack · other pages · close",
                 ),
             ],
-            Self::SettingsTrust => [
+            Self::SettingsPermissions => [
                 (
                     "Enter · Space",
-                    "trust a refused origin · turn its trust on or off",
+                    "permit a refused origin · turn a row on or off",
                 ),
                 (
                     "d · Delete",

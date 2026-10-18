@@ -1228,6 +1228,10 @@ pub struct ScalarBackend {
     /// Offline renders may synthesise a missing orbit reverb at activation
     /// time; the LIVE path must never (producer installs instead).
     allow_inline_reverb: bool,
+    /// An offline render drives the blocks, and waits for an insert that
+    /// renders ahead to publish each block before collecting it. The
+    /// live callback paces itself in real time and never waits.
+    offline: bool,
     /// Onsets whose orbit reverb was not installed yet: the voice plays DRY
     /// this time, like a still-loading skip.
     missing_reverb_events: u64,

@@ -368,8 +368,9 @@ pub(crate) enum LiveQueryBudgetMode {
 enum EvaluatedScore {
     JavaScript {
         pattern: Pattern,
-        effects: ScoreEffects,
+        effects: Box<ScoreEffects>,
         settings: RuntimeSettings,
+        csound: Option<crate::csound::Candidate>,
     },
     MiniFallback(Pattern),
 }
@@ -422,6 +423,7 @@ struct AudibleSource {
     source: Arc<str>,
     mini: bool,
     settings: RuntimeSettings,
+    csound: crate::CsoundSnapshot,
     cps: f64,
     cycle_zero_time: f64,
 }
@@ -569,6 +571,9 @@ pub enum RuntimeError {
     UntrustedImport {
         origin: String,
     },
+    /// The text uses a native orchestra while the host does not permit
+    /// one. Nothing ran.
+    CsoundPermission,
     Message(String),
 }
 
@@ -610,6 +615,10 @@ impl std::fmt::Display for RuntimeError {
                 f,
                 "{origin} is not trusted for import(). Trust it with --allow-import-origin {origin}"
             ),
+            Self::CsoundPermission => write!(
+                f,
+                "Csound is not permitted. Permit native orchestras with --allow-csound, only for trusted scores"
+            ),
             Self::Interrupted(signal) => {
                 write!(f, "interrupted by signal {signal} before the work started")
             }
@@ -636,6 +645,7 @@ impl RuntimeError {
             Self::Audio(_) => "audio",
             Self::Unsupported(_) => "unsupported",
             Self::UntrustedImport { .. } => "untrusted-import",
+            Self::CsoundPermission => "csound-permission",
             Self::Interrupted(_) => "interrupted",
             Self::Cancelled => "cancelled",
             Self::Panic(_) => "panic",
@@ -900,6 +910,7 @@ pub struct Session {
     /// The default sample banks. `None` until enabled;
     /// resolution then falls back to the bundled `bd` alone.
     samples: Option<std::sync::Arc<crate::samples::SampleLibrary>>,
+    pub(crate) csound: crate::csound::State,
     /// The text of each imported script, by the specifier that names it. A
     /// script is fetched once and runs again in a rebuilt realm.
     import_sources: std::collections::BTreeMap<String, Arc<str>>,
@@ -1046,6 +1057,7 @@ impl Session {
             .map_err(|e| RuntimeError::Js(e.to_string()))?;
         let transport = Arc::new(Transport::default());
         let scheduler = Scheduler::new(transport.clone(), config.cps, config.horizon);
+        let csound = crate::csound::State::new(config.score_import_access.csound_allowed());
         Ok(Self {
             js,
             panic_guard_active: false,
@@ -1127,6 +1139,7 @@ impl Session {
             last_path: EvaluateSource::Pattern,
             last_play_iterations: 0,
             samples: None,
+            csound,
             import_sources: std::collections::BTreeMap::new(),
             import_errors: std::collections::BTreeMap::new(),
             direct_diagnostic_logging: rustel_voice::default_direct_diagnostic_logging(),
@@ -1186,7 +1199,16 @@ impl Session {
     /// Replace the origins that text may import scripts from. The next
     /// evaluation reads the new list.
     pub fn set_score_import_access(&mut self, access: ScoreImportAccess) {
+        self.csound.set_allowed(access.csound_allowed());
         self.config.score_import_access = access;
+    }
+
+    pub fn csound_snapshot(&self) -> crate::CsoundSnapshot {
+        self.csound.snapshot()
+    }
+
+    pub fn restore_csound_snapshot(&mut self, snapshot: &crate::CsoundSnapshot) {
+        self.csound.restore(snapshot)
     }
 
     pub fn last_evaluate_source(&self) -> EvaluateSource {
@@ -1210,11 +1232,32 @@ impl Session {
     /// too.
     #[cfg(all(feature = "vst", feature = "device-audio"))]
     pub fn attach_plugins(&self, device: &rustel_audio::LiveScalarDevice) {
-        self.plugin_rate
-            .store(device.sample_rate(), std::sync::atomic::Ordering::Relaxed);
-        self.plugins_live
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        crate::vst::attach(device, &self.chains);
+        self.attach_instruments(device);
+    }
+
+    /// Connects this session's instruments to a live output.
+    #[cfg(feature = "device-audio")]
+    pub fn attach_instruments(&self, device: &rustel_audio::LiveScalarDevice) {
+        #[cfg(feature = "vst")]
+        {
+            self.plugin_rate
+                .store(device.sample_rate(), std::sync::atomic::Ordering::Relaxed);
+            self.plugins_live
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::vst::attach(device, &self.chains);
+        }
+        device.set_insert_provider(self.csound.provider(false));
+        let csound = self.csound.clone();
+        #[cfg(feature = "vst")]
+        let chains = self.chains.clone();
+        device.set_insert_names(Arc::new(move || {
+            let mut named = csound.named_chains();
+            #[cfg(feature = "vst")]
+            named.extend(crate::vst::named_chains(&chains));
+            named.sort_unstable();
+            named.dedup();
+            named
+        }));
     }
 
     /// Gives the plugins the sample rate of the live output after a reopen
@@ -1242,7 +1285,11 @@ impl Session {
         cps: f64,
         samples: &dyn rustel_voice::SampleLookup,
     ) -> Result<rustel_audio::AudioEvent, rustel_voice::VoiceError> {
-        crate::render::live_audio_event(onset, sample_rate, cps, samples, |value| {
+        let lookup = crate::csound::Lookup {
+            samples,
+            state: &self.csound,
+        };
+        let event = crate::render::live_audio_event(onset, sample_rate, cps, &lookup, |value| {
             #[cfg(feature = "vst")]
             if let ValueJson::Raw(value) = value {
                 return crate::vst::live_chain(&self.chains, value);
@@ -1250,7 +1297,9 @@ impl Session {
             #[cfg(not(feature = "vst"))]
             let _ = value;
             None
-        })
+        })?;
+        self.csound.record_chain(&event.controls);
+        Ok(event)
     }
 
     /// Plugin calls named in a candidate source. Evaluated haps supply the
