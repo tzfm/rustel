@@ -701,8 +701,9 @@ fn render(
     }
     let mut session = Session::with_config(config).map_err(|error| error.to_string())?;
     session.set_export_limiter(settings.limiter_enabled.then_some(settings.limiter));
-    // The render does not care what the CLI would print; a library that
-    // cannot be reached bounces the synths and says so in the log.
+    // The render does not care what the CLI would print. A library that
+    // cannot be reached leaves the synths sounding, and the export fails on
+    // each sample it lacks.
     let _ = session.enable_default_samples();
     if let Some(library) = session.sample_library() {
         score
@@ -790,6 +791,11 @@ fn render(
     // Written, but not the score: see `RenderReport::failure`.
     if let Some(message) = report.failure() {
         return Err(message);
+    }
+    // A refused note is silent in the file. Play logs it and goes on, but a
+    // bounce with a missing note is not the score either.
+    if !report.voices_refused.is_empty() {
+        return Err(report.voices_refused.join(" · "));
     }
     Ok(report.duration_secs)
 }
@@ -1599,6 +1605,30 @@ mod tests {
                 && error.contains("boom-in-query"),
             "{error}"
         );
+        assert!(target.exists(), "the file is written either way");
+    }
+
+    /// A sound the export cannot find leaves a hole in the bounce. The file
+    /// is written, but the job fails and names the sound.
+    #[test]
+    fn a_job_with_a_sound_it_cannot_find_fails_and_names_it() {
+        let dir = tempfile::tempdir().expect("export dir");
+        let target = dir.path().join("missing.wav");
+        let job = ExportJob::start(
+            "missing".into(),
+            plain_score(r#"s("sine nosuchsound")"#),
+            ExportSettings {
+                length: Length::Cycles(0.5),
+                mp3: false,
+                ..ExportSettings::default()
+            },
+            SessionConfig::default(),
+            target.clone(),
+        )
+        .expect("job");
+        let error = await_outcome(&job, std::time::Duration::from_secs(120))
+            .expect_err("a bounce with a missing sound is not a finished export");
+        assert!(error.starts_with("nosuchsound is not loaded"), "{error}");
         assert!(target.exists(), "the file is written either way");
     }
 
