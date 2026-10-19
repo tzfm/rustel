@@ -129,7 +129,13 @@ pub(super) fn handle_text_key(app: &mut App, key: &KeyEvent) -> Result<bool, Run
                 // Insert takes every key, including the list letters.
                 TextAction::Nothing
             }
-        } else if !key.modifiers.is_empty() {
+        } else if key.modifiers.intersects(
+            KeyModifiers::CONTROL
+                | KeyModifiers::SUPER
+                | KeyModifiers::ALT
+                | KeyModifiers::HYPER
+                | KeyModifiers::META,
+        ) {
             TextAction::Nothing
         } else {
             match key.code {
@@ -249,6 +255,9 @@ mod tests {
         press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
         assert_eq!(query(&app), "", "a letter waits for Insert");
         assert!(app.status.contains("press i or a"), "{}", app.status);
+
+        press(&mut app, KeyCode::Char('X'), KeyModifiers::SHIFT);
+        assert_eq!(query(&app), "", "a shifted letter waits for Insert");
 
         press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
         press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
