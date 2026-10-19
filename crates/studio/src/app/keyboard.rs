@@ -755,8 +755,13 @@ impl App {
             self.close_panel(kind);
             return Ok(true);
         }
-        if super::vim_keys::handle_text_key(self, key)? {
-            return Ok(true);
+        match super::vim_keys::handle_text_key(self, key) {
+            super::vim_keys::VimTextKey::Ignored => {}
+            super::vim_keys::VimTextKey::Consumed => return Ok(true),
+            super::vim_keys::VimTextKey::Arrow(kind, code) => {
+                let _ = self.dispatch_panel_key(kind, code, false, false, false)?;
+                return Ok(true);
+            }
         }
         if self.focused_panel_key(
             key,
@@ -1346,8 +1351,13 @@ impl App {
             return Ok(true);
         }
         if let Focus::Panel(kind) = self.focus {
-            if super::vim_keys::handle_text_key(self, key)? {
-                return Ok(true);
+            match super::vim_keys::handle_text_key(self, key) {
+                super::vim_keys::VimTextKey::Ignored => {}
+                super::vim_keys::VimTextKey::Consumed => return Ok(true),
+                super::vim_keys::VimTextKey::Arrow(kind, code) => {
+                    let _ = self.dispatch_panel_key(kind, code, false, false, false)?;
+                    return Ok(true);
+                }
             }
             // Space auditions the reference row even on tabs with a
             // search box. A held preview key must not toggle it off.
