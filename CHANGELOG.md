@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.1.5
+
 - A score that stretches every voice no longer overruns the audio device. The stretch vocoder slid its input and output windows one sample at a time, two 8 KiB moves per sample per channel, so a set of stretched voices spent most of its callback moving memory. The vocoder now keeps both as rings and reads each output slot once per overlap cycle. A score of about thirty stretched voices runs under half the callback budget where it overran before, with byte-identical audio.
 - A popup opened from Settings closes when the sheet closes, or when a click lands outside it. Before, a click on the page behind moved the keys to the page, and Esc closed the sheet while the popup stayed up with no key to close it.
 - Csound instruments play and export with `.csound()` and `.csoundm()`. Load orchestras with `loadCSound` or `loadOrc`. Requires double-precision Csound 6.18 or later 6.x. Studio enables native orchestras at startup, and the command line requires `--allow-csound`. See [Csound](https://github.com/tzfm/rustel/blob/main/docs/csound.md).
