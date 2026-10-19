@@ -198,5 +198,18 @@ mod tests {
             );
             assert_eq!(app.editor().source(), score);
         }
+
+        #[test]
+        fn composed_text_types_in_the_find_bar() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "one two one\n");
+            chord(&mut app);
+            app.handle_terminal_event(Event::KeyWithText {
+                key: KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT),
+                text: "t".into(),
+            })
+            .expect("composed text");
+            assert_eq!(app.editor().find_footer_label().as_deref(), Some("FIND t"));
+        }
     }
 }

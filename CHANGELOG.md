@@ -4,6 +4,7 @@
 
 - The global and local prebakes open from the Options menu. Learn a key for either on Settings > Keybinds.
 - With Vim editor keys on, j k h l move lists, menus, and help as the arrows do. Turn Vim list keys off in the Vim section of Settings > Keybinds to use the letters as text.
+- Composed keys type their character. Option+4 on a Mac ISO layout now types `$` in every text field and in Vim. Before, Studio typed `4`.
 
 ## v0.1.5
 

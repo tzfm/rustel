@@ -1764,6 +1764,7 @@ fn queue_terminal_entry(
                     | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
                     | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
                     | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | KeyboardEnhancementFlags::REPORT_ASSOCIATED_TEXT
             )
         )?;
     }
@@ -2773,8 +2774,9 @@ mod tests {
         queue_terminal_entry(&mut bytes, true, true).expect("queue terminal entry");
         let output = String::from_utf8(bytes).expect("terminal sequences are ASCII");
         // Alternate characters are required for shifted text in iTerm2;
-        // event types retain piano releases. Test the actual wire request.
-        assert!(output.contains("\x1b[>15u"));
+        // event types retain piano releases. Associated text keeps composed
+        // characters such as Option+4. Test the actual wire request.
+        assert!(output.contains("\x1b[>31u"));
         let alternate = output.find("\x1b[?1049h").expect("alternate screen");
         let keyboard = output.find("\x1b[>").expect("keyboard enhancement");
         let paste = output.find("\x1b[?2004h").expect("bracketed paste");

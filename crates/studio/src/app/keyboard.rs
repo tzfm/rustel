@@ -411,6 +411,7 @@ impl App {
         &mut self,
         terminal_event: Event,
     ) -> Result<(), RuntimeError> {
+        let terminal_event = composed_text_event(terminal_event);
         let result = self.route_terminal_event(terminal_event, true);
         self.refresh_editor_shortcut_hints();
         result
@@ -2508,6 +2509,90 @@ mod tests {
             press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
             assert!(app.caret_visible);
             assert!(app.caret_activity >= before);
+        }
+
+        #[test]
+        fn a_composed_option_character_types_in_every_editor_mode() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "ax\n");
+            let composed = || Event::KeyWithText {
+                key: KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT),
+                text: "$".into(),
+            };
+            app.handle_terminal_event(composed())
+                .expect("composed text");
+            assert!(
+                app.editor().source().starts_with('$'),
+                "Default typing takes it"
+            );
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "ax\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            precision_key(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            app.handle_terminal_event(composed())
+                .expect("composed text");
+            assert!(
+                app.editor().source().starts_with('$'),
+                "Vim Insert takes it"
+            );
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "ax\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            let source = app.editor().source();
+            app.handle_terminal_event(composed())
+                .expect("composed text");
+            assert_eq!(app.editor().source(), source, "Vim Normal does not type it");
+            assert_ne!(
+                app.editor().primary_selection().head.0,
+                0,
+                "Vim Normal moves the caret"
+            );
+        }
+
+        #[test]
+        fn composed_text_with_many_characters_pastes() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "ax\n");
+            app.handle_terminal_event(Event::KeyWithText {
+                key: KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT),
+                text: "ab".into(),
+            })
+            .expect("composed text");
+            assert!(app.editor().source().contains("ab"));
+        }
+
+        #[test]
+        fn composed_text_on_a_lock_key_does_not_type() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "ax\n");
+            let source = app.editor().source();
+            app.handle_terminal_event(Event::KeyWithText {
+                key: KeyEvent::new(KeyCode::CapsLock, KeyModifiers::NONE),
+                text: "A".into(),
+            })
+            .expect("composed lock key");
+            assert_eq!(app.editor().source(), source);
+        }
+
+        #[test]
+        fn a_composed_release_does_not_type() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "ax\n");
+            let source = app.editor().source();
+            app.handle_terminal_event(Event::KeyWithText {
+                key: KeyEvent::new_with_kind(
+                    KeyCode::Char('4'),
+                    KeyModifiers::ALT,
+                    KeyEventKind::Release,
+                ),
+                text: "$".into(),
+            })
+            .expect("composed release");
+            assert_eq!(app.editor().source(), source);
         }
     }
 

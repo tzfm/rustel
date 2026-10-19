@@ -653,6 +653,54 @@ fn a_space_prefixed_vim_mapping_fires_in_a_real_terminal() {
     );
 }
 
+/// A composed key carries its text in the kitty sequence. The real terminal
+/// stream turns Option+4 into `$` in the editor and into the saved scene.
+#[test]
+fn a_composed_key_types_its_text_in_a_real_terminal() {
+    let binary = rustel_binary().expect("build `rustel` before the feature=pty suite");
+    let home = set_directory();
+    let path = home.path().join("live.strudel");
+    std::fs::write(&path, "// first\n").expect("score");
+    let mut terminal = Terminal::open(&binary, 24, 80, home.path());
+    let query = b"\x1b[?u";
+    let stop = Instant::now() + BOOT_BUDGET;
+    loop {
+        let answered = terminal
+            .buffer
+            .lock()
+            .expect("drain buffer")
+            .windows(query.len())
+            .any(|window| window == query);
+        if answered {
+            break;
+        }
+        assert!(
+            Instant::now() < stop,
+            "the keyboard query never arrived:\n{}",
+            terminal.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    terminal.write(b"\x1b[?31u\x1b[?62;c");
+    assert!(
+        terminal.wait_for(" ready", BOOT_BUDGET),
+        "the studio did not load:\n{}",
+        terminal.diagnostics()
+    );
+
+    // Two Rights put the caret after `//`. The composed key types there,
+    // inside the comment, and Ctrl+S writes the result.
+    terminal.write(b"\x1b[C\x1b[C");
+    terminal.write(b"\x1b[52;3;36u");
+    terminal.write(&[0x13]);
+    assert!(
+        wait_for_source(&path, "//$ first\n", REPAINT_BUDGET),
+        "the composed key did not reach the scene; got {:?}; terminal:\n{}",
+        std::fs::read_to_string(&path),
+        terminal.diagnostics()
+    );
+}
+
 /// Raw SGR pointer reports must bring keyboard focus back from the set panel
 /// and place the caret in the visible editor line. Focus in/out reports are
 /// part of the same real terminal stream.
