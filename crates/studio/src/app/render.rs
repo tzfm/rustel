@@ -21,6 +21,8 @@ struct NativeVisual {
 /// studio in one pass before any of them is put together.
 struct FrameInputs {
     status: String,
+    vim_label: Option<String>,
+    find_label: Option<String>,
     piano_notes: Option<String>,
     error: Option<String>,
     stopping: bool,
@@ -243,7 +245,8 @@ impl App {
         // pictures painted for it - so it is never seen half-drawn.
         let _ = super::super::graphics::take_images();
         terminal.set_cursor_color(self.theme.caret())?;
-        terminal.set_cursor_shape(self.theme.caret_shape(self.ui_settings.caret_shape))?;
+        self.sync_editor_keybindings();
+        terminal.set_cursor_shape(self.editor_cursor_shape())?;
         terminal.begin_frame();
         // The paint callback always runs - `draw` renders the buffer, then
         // flushes - so its verdict comes back through the cell, and a compose
@@ -322,6 +325,7 @@ impl App {
         out: &mut ratatui::Frame<'_>,
         started: Instant,
     ) -> Result<(), RuntimeError> {
+        self.sync_editor_keybindings();
         // Per-frame state the paint reads. It is computed here and not in
         // `draw`, because the test backend enters at this function and never
         // runs `draw`. The contract in this function's doc needs both the
@@ -767,6 +771,8 @@ impl App {
         (
             FrameInputs {
                 status,
+                vim_label: self.editor().vim_label(),
+                find_label: self.editor().find_footer_label(),
                 piano_notes,
                 error,
                 stopping,
@@ -857,6 +863,8 @@ impl App {
                 .map(|since| started.saturating_duration_since(since)),
             dirty: scene.dirty,
             status: &inputs.status,
+            vim_label: inputs.vim_label.as_deref(),
+            find_label: inputs.find_label.as_deref(),
             remote_control: {
                 #[cfg(feature = "remote-control")]
                 {
@@ -1028,6 +1036,11 @@ impl App {
             .enumerate()
             .filter_map(|(index, (pane, map))| {
                 let scene = self.scenes.get(pane.scene)?;
+                let caret_shape = if scene.editor.vim_is_insert() {
+                    self.ui_settings.caret_shape
+                } else {
+                    super::super::terminal::CaretShape::SteadyBlock
+                };
                 let decorations = if Some(pane.scene) == audible && settings::highlights() {
                     Decorations {
                         active: &self.marks,
@@ -1035,7 +1048,7 @@ impl App {
                         sliders: &chip_sets[index],
                         errors: &inputs.lint_ranges[index],
                         brackets: &inputs.bracket_ranges[index],
-                        caret_shape: self.ui_settings.caret_shape,
+                        caret_shape,
                         overridden: &inputs.overridden_ranges[index],
                     }
                 } else {
@@ -1043,7 +1056,7 @@ impl App {
                         sliders: &chip_sets[index],
                         errors: &inputs.lint_ranges[index],
                         brackets: &inputs.bracket_ranges[index],
-                        caret_shape: self.ui_settings.caret_shape,
+                        caret_shape,
                         overridden: &inputs.overridden_ranges[index],
                         ..Decorations::default()
                     }

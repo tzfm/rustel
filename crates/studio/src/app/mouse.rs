@@ -156,6 +156,31 @@ impl App {
                 theme.code.cancel_drag();
             }
         }
+        // A prompt is a popover: it owns the pointer until it is gone. A
+        // press outside it is the press that puts it away, and the wheel
+        // stays with it. Letting either reach the page behind moved the
+        // focus there while the prompt stayed up, and Esc then closed the
+        // page instead of the prompt. A drag in the prompt's field still
+        // needs the routing below.
+        if self.menu.is_none() && self.set_prompt.is_some() {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let extend = super::super::editor::click_extends(mouse.modifiers);
+                    if !self.click_set_prompt(x, y, extend) {
+                        self.close_set_prompt();
+                        self.status = "set prompt closed".into();
+                        self.dirty_frame = true;
+                    }
+                    return Ok(());
+                }
+                MouseEventKind::Down(_)
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight => return Ok(()),
+                _ => {}
+            }
+        }
         if self.handle_horizontal_scrollbar_pointer(mouse, x, y) {
             return Ok(());
         }
@@ -809,11 +834,12 @@ impl App {
                     .flatten()
                     .find_map(|panel| panel.prompt.as_mut())
             });
-        if let Some(picker) = picker
-            && let Some(at) = picker.field_at(frame, x, y)
-        {
-            picker.caret_to(at, true);
-            self.dirty_frame = true;
+        if let Some(picker) = picker {
+            picker.cancel_click();
+            if let Some(at) = picker.field_at(frame, x, y) {
+                picker.caret_to(at, true);
+                self.dirty_frame = true;
+            }
         }
     }
 }
@@ -890,7 +916,7 @@ mod tests {
 
         use crate::app::tests::support::app_over;
         use crate::app::*;
-        use crate::keybinds::{KeybindLearn, Keybinds};
+        use crate::keybinds::KeybindLearn;
         use crate::settings::{
             KEYBIND_ACTION_START, SettingsPage, SettingsSheet, SettingsSheetView,
             TERMINAL_PROFILE_ROW,
@@ -933,18 +959,28 @@ mod tests {
             }
         }
 
-        /// The screen point of a keybind row, found through the page's own
-        /// geometry - a test that clicks where the page says a row is breaks
-        /// exactly when the geometry breaks.
-        fn row_point(app: &App, index: usize) -> (u16, u16) {
+        /// Find the row's label in the painted sheet before clicking it.
+        fn row_point(app: &mut App, index: usize) -> (u16, u16) {
+            let label = app.keybind_rows()[index].action;
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+                app.frame.width,
+                app.frame.height,
+            ))
+            .expect("test terminal");
+            let painted = terminal
+                .draw(|frame| app.paint_into(frame, Instant::now()).expect("frame paints"))
+                .expect("draw");
             let (_, rows) =
-                SettingsSheetView::geometry(app.frame).expect("the sheet fits the frame");
-            let shown = usize::from(rows.height).max(1);
-            assert!(
-                index < shown,
-                "row {index} is on screen at 140x40; keep the test on a visible row"
-            );
-            (rows.x + 2, rows.y + index as u16)
+                SettingsSheetView::geometry(app.settings_sheet_frame()).expect("the sheet fits");
+            let y = (rows.y..rows.bottom())
+                .find(|&y| {
+                    (rows.x..rows.right())
+                        .map(|x| painted.buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        .contains(label)
+                })
+                .expect("the row label is visible");
+            (rows.x + 2, y)
         }
 
         /// A click on a row arms the learn on its action, exactly as Enter does.
@@ -952,7 +988,7 @@ mod tests {
         fn clicking_a_keybind_row_arms_the_learn() {
             let directory = tempfile::tempdir().unwrap();
             let mut app = keybinds_page_app(directory.path());
-            let (x, y) = row_point(&app, KEYBIND_ACTION_START); // the first binding is update / play
+            let (x, y) = row_point(&mut app, KEYBIND_ACTION_START); // the first binding is update / play
 
             click(&mut app, x, y);
 
@@ -975,7 +1011,7 @@ mod tests {
             app.ui_settings.terminal_profile = None;
             app.keybind_learn = Some(KeybindLearn::arm(BindAction::Evaluate));
             let custom = app.keybinds.prefs();
-            let (x, y) = row_point(&app, TERMINAL_PROFILE_ROW);
+            let (x, y) = row_point(&mut app, TERMINAL_PROFILE_ROW);
 
             click(&mut app, x, y);
 
@@ -1007,7 +1043,7 @@ mod tests {
         fn a_second_click_on_the_armed_row_calls_the_learn_off() {
             let directory = tempfile::tempdir().unwrap();
             let mut app = keybinds_page_app(directory.path());
-            let (x, y) = row_point(&app, KEYBIND_ACTION_START + 1); // stop all sound
+            let (x, y) = row_point(&mut app, KEYBIND_ACTION_START + 1); // stop all sound
 
             app.keybind_learn = Some(KeybindLearn::arm(BindAction::Stop));
             click(&mut app, x, y);
@@ -1029,15 +1065,17 @@ mod tests {
         fn a_click_cannot_confirm_a_take() {
             let directory = tempfile::tempdir().unwrap();
             let mut app = keybinds_page_app(directory.path());
+            app.keybinds.learn(
+                BindAction::RenameScene,
+                crate::keybinds::KeyCombo::parse("ctrl+r"),
+            );
             // The ask is up for undo onto ^R, rename-scene's chord.
             app.keybind_learn = Some(KeybindLearn::Confirm {
                 action: BindAction::Undo,
-                chord: Keybinds::default()
-                    .binding(BindAction::RenameScene)
-                    .unwrap(),
+                chord: app.keybinds.binding(BindAction::RenameScene).unwrap(),
                 held_by: BindAction::RenameScene,
             });
-            let (x, y) = row_point(&app, KEYBIND_ACTION_START);
+            let (x, y) = row_point(&mut app, KEYBIND_ACTION_START);
 
             click(&mut app, x, y);
 
@@ -1116,12 +1154,7 @@ mod tests {
             assert_eq!(app.keybind_learn, armed);
             app.keybind_learn = None;
 
-            let sheet = *app.settings_sheet.as_ref().expect("the sheet is up");
-            let (_, rows) = SettingsSheetView::geometry(app.frame).expect("the sheet fits");
-            let point = (rows.y..rows.bottom())
-                .map(|y| (rows.x + 2, y))
-                .find(|&(x, y)| sheet.keybind_row_at(app.frame, x, y) == Some(SHOW_FILE_ROW))
-                .expect("the selected row is on screen after the scroll");
+            let point = row_point(&mut app, SHOW_FILE_ROW);
             click(&mut app, point.0, point.1);
             assert_eq!(app.keybind_learn, armed);
         }
@@ -1388,12 +1421,7 @@ mod tests {
             let custom = app.keybinds.prefs();
             let at = crate::settings::RESET_KEYBINDS_ROW;
             app.settings_sheet.as_mut().unwrap().select(at);
-            let sheet = app.settings_sheet.unwrap();
-            let (_, rows) = SettingsSheetView::geometry(app.frame).unwrap();
-            let (x, y) = (rows.y..rows.bottom())
-                .map(|y| (rows.x + 2, y))
-                .find(|&(x, y)| sheet.keybind_row_at(app.frame, x, y) == Some(at))
-                .unwrap();
+            let (x, y) = row_point(&mut app, at);
             click(&mut app, x, y);
             assert!(app.settings_sheet.unwrap().confirm_reset_keybinds);
             assert!(app.keybind_learn.is_none());
@@ -1764,11 +1792,8 @@ mod tests {
             assert!(!selection.is_empty(), "a score drag is live");
 
             app.set_prompt = Some((SetPrompt::OpenSet, FilePicker::naming("new set", "create")));
-            app.set_prompt
-                .as_mut()
-                .unwrap()
-                .1
-                .offer("a longer set name");
+            let prompt_text = "a longer set name 🎛️ café";
+            app.set_prompt.as_mut().unwrap().1.offer(prompt_text);
             draw(&mut app);
             let picker = &app.set_prompt.as_ref().unwrap().1;
             let (area, list) = picker.geometry(app.frame).expect("the prompt fits");
@@ -1801,6 +1826,43 @@ mod tests {
                 Some(0..4),
                 "the drag selected in the prompt's field"
             );
+            let copy = |app: &mut App| {
+                app.handle_terminal_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char('c'),
+                    KeyModifiers::CONTROL,
+                )))
+                .expect("copy handled");
+            };
+            copy(&mut app);
+            assert_eq!(app.clipboard.get_text().unwrap(), "a lo");
+
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Drag(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                let jitter = u16::from(matches!(kind, MouseEventKind::Drag(_)));
+                mouse(&mut app, kind, start + 4 + jitter, row);
+            }
+            assert_eq!(
+                app.set_prompt.as_ref().unwrap().1.selection(),
+                Some(0..prompt_text.chars().count()),
+                "a double click selects the whole field through pointer jitter"
+            );
+            copy(&mut app);
+            assert_eq!(app.clipboard.get_text().unwrap(), prompt_text);
+
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                mouse(&mut app, kind, start + 4, row);
+            }
+            assert!(app.set_prompt.as_ref().unwrap().1.selection().is_none());
+            copy(&mut app);
+            assert_eq!(app.clipboard.get_text().unwrap(), prompt_text);
             assert_eq!(
                 app.editor().primary_selection(),
                 selection,

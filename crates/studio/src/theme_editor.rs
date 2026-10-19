@@ -1062,7 +1062,7 @@ impl ThemeEditorView<'_> {
 
         let copy = self
             .keybinds
-            .binding(super::keybinds::BindAction::Copy)
+            .hint_binding(super::keybinds::BindAction::Copy)
             .map(|binding| format!(" · {} copies", binding.hint()))
             .unwrap_or_default();
         let code_hint = format!("type · drag selects{copy} · Tab form · Esc themes");

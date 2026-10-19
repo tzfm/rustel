@@ -157,6 +157,7 @@ mod evaluation;
 mod evaluation_flash;
 mod event_loop;
 mod export_sheet;
+mod find;
 mod focus;
 mod hydra_backdrop;
 mod jobs_panel;
@@ -204,6 +205,7 @@ mod stage_pixels;
 mod string_roles;
 mod theme_sheets;
 mod transport;
+mod vim_config;
 mod viz_panel;
 #[cfg(feature = "vst")]
 mod vst;
@@ -1000,6 +1002,7 @@ struct App {
     /// The learnt keyboard shortcuts. Built from the preferences once and
     /// re-learnt from there, so every surface asks the same table.
     keybinds: super::keybinds::Keybinds,
+    vim_config: crate::vim_config::VimConfig,
     /// The value each control change last said and when it said it, keyed
     /// by number and channel, so a bound row reads the crossings of the
     /// line at 64 rather than every message: a knob swept across fires
@@ -1683,6 +1686,7 @@ impl App {
             mapping_learn: None,
             keybind_learn: None,
             keybinds: prefs.keybinds(),
+            vim_config: crate::vim_config::VimConfig::default(),
             midi_cc_last: HashMap::new(),
             note_pressed_at: HashMap::new(),
             mapping_lit: [None; MAPPING_SLOTS],
@@ -1939,6 +1943,10 @@ impl App {
     }
 
     fn editor_accepts_raw_paste(&self) -> bool {
+        #[cfg(feature = "remote-control")]
+        if self.remote_panel_open {
+            return false;
+        }
         // A paste batches into the document exactly when the document
         // receives the typed text. An open panel does not prevent this. A
         // focused panel does, because the paste belongs to its search box.

@@ -248,13 +248,16 @@ impl App {
             keybinds: &self.keybinds,
             can_undo: editor.can_undo(),
             can_redo: editor.can_redo(),
-            // Mirror the editor's own guard, which joins every non-empty
-            // range rather than looking only at the primary caret.
-            has_selection: editor
-                .selections()
-                .ranges()
-                .iter()
-                .any(|range| !range.is_empty()),
+            has_selection: self
+                .focused_file_picker()
+                .map(|picker| picker.typing && picker.selection().is_some())
+                .unwrap_or_else(|| {
+                    editor
+                        .selections()
+                        .ranges()
+                        .iter()
+                        .any(|range| !range.is_empty())
+                }),
             can_smart_action: self.smart_action_offers(),
             scene_rewinds: self.scenes.current_rewinds(),
             can_add_scene: self.scenes.score_count() < super::super::scenes::MAX_SCENES,
@@ -271,6 +274,7 @@ impl App {
             can_record_session: self.options.recording.is_some(),
             set_panel: self.set_panel.is_some(),
             viz_panels: [self.viz_docks[0].is_some(), self.viz_docks[1].is_some()],
+            visualizers: self.ui_settings.animation,
             split: self.panes.len() > 1,
             zen: self.ui_settings.zen,
             mixer: self.mixer_panel.is_some(),
@@ -414,6 +418,7 @@ impl App {
             Do::PianoMode => self.toggle_piano_mode(),
             Do::VizPanel => self.toggle_viz_dock(0),
             Do::VizPanelTwo => self.toggle_viz_dock(1),
+            Do::Visualizers => self.toggle_visualizers(),
             Do::Mixer => self.toggle_mixer_panel(),
             Do::SetLimiter => self.set_limiter_slot(!self.has_limiter_slot()),
             Do::NewSet => self.new_set(),
@@ -443,11 +448,22 @@ impl App {
             }
             Do::Undo => self.dispatch_editor(Command::Undo)?,
             Do::Redo => self.dispatch_editor(Command::Redo)?,
-            Do::Cut => self.dispatch_editor(Command::Cut)?,
-            Do::Copy => self.dispatch_editor(Command::Copy)?,
-            Do::Paste => self.dispatch_editor(Command::Paste)?,
-            Do::SelectAll => self.dispatch_editor(Command::SelectAll)?,
+            Do::Cut => {
+                self.dispatch_bind_action(BindAction::Cut, false)?;
+            }
+            Do::Copy => {
+                self.dispatch_bind_action(BindAction::Copy, false)?;
+            }
+            Do::Paste => {
+                self.dispatch_bind_action(BindAction::Paste, false)?;
+            }
+            Do::SelectAll => {
+                self.dispatch_bind_action(BindAction::SelectAll, false)?;
+            }
             Do::ToggleComment => self.dispatch_editor(Command::ToggleComment)?,
+            Do::Find => {
+                self.dispatch_bind_action(BindAction::Find, false)?;
+            }
             Do::FirstError => self.jump_to_first_error(),
             Do::SmartAction => self.open_smart_action(),
             Do::Update => self.dispatch_editor(Command::Evaluate)?,

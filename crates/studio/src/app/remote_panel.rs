@@ -1043,6 +1043,8 @@ mod tests {
         fn remote_fields_accept_keyboard_edits_and_apply_them_on_enable() {
             let directory = tempfile::tempdir().expect("score directory");
             let mut app = app_over(directory.path());
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            assert_eq!(app.focus, Focus::Editor);
             let before = app.editor().source();
             let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve port");
             let address = reserved.local_addr().expect("reserved address");
@@ -1083,6 +1085,9 @@ mod tests {
             assert_eq!(remote.address(), address);
             assert_eq!(remote.token(), token);
             assert!(remote.token_path().is_none());
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(!app.remote_panel_open);
+            assert_eq!(app.editor().source(), before);
         }
 
         #[test]

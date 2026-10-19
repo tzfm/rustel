@@ -49,6 +49,10 @@ pub struct StudioPrefs {
     /// Shortcut conflict profile override; absent means automatic detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_keybindings: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vim_mappings_path: Option<String>,
     /// How often the screen repaints while a set plays: `60`, `30`, `15`
     /// or `8`. Absent is sixty, which is what a machine with cores to
     /// spare should have.
@@ -619,6 +623,12 @@ impl StudioPrefs {
                 .as_deref()
                 .and_then(super::terminal::conflicts::canonical_profile)
                 .map(str::to_owned),
+            editor_keybindings: self
+                .editor_keybindings
+                .as_deref()
+                .and_then(super::editor::EditorKeybindings::from_key)
+                .unwrap_or(defaults.editor_keybindings),
+            vim_mappings_path: self.vim_mappings_path.clone(),
             show_full_paths: self.show_full_paths.unwrap_or(defaults.show_full_paths),
             rendering: self
                 .rendering
@@ -818,6 +828,8 @@ impl StudioPrefs {
             .as_deref()
             .and_then(super::terminal::conflicts::canonical_profile)
             .map(str::to_owned);
+        self.editor_keybindings = Some(settings.editor_keybindings.key().to_owned());
+        self.vim_mappings_path = settings.vim_mappings_path.clone();
         self.frame_rate = Some(settings.frame_rate.key().to_owned());
         self.clock_out = settings.clock_out.clone();
         self.clock_in = settings.clock_in.clone();

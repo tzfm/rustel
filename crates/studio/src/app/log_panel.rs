@@ -271,7 +271,8 @@ impl App {
             code == KeyCode::Esc || (matches!(code, KeyCode::Char('d' | 'D')) && primary && shift);
         if panel.sticky && closes && !self.ui_settings.zen {
             self.focus = Focus::Editor;
-            self.status = if let Some(chord) = self.keybinds.binding(BindAction::LogSticky) {
+            self.refresh_editor_shortcut_hints();
+            self.status = if let Some(chord) = self.keybinds.hint_binding(BindAction::LogSticky) {
                 format!(
                     "back to the score - the log stays docked; {} un-docks it",
                     chord.hint()

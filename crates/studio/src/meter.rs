@@ -428,7 +428,7 @@ impl Widget for MasterDock<'_> {
             super::keybinds::BindAction::MasterDown,
         ]
         .into_iter()
-        .filter_map(|action| self.keybinds.binding(action))
+        .filter_map(|action| self.keybinds.hint_binding(action))
         .map(|binding| binding.hint())
         .collect::<Vec<_>>()
         .join("/");

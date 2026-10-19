@@ -528,13 +528,13 @@ impl App {
         let frame = self.frame;
         if let Some((prompt, picker)) = self.set_prompt.as_mut() {
             if let Some(at) = picker.field_at(frame, x, y) {
-                picker.cancel_click();
-                if !picker.typing {
-                    picker.start_typing();
-                }
-                picker.caret_to(at, shift);
+                let double = picker.click_field(at, (x, y), shift, Instant::now());
                 self.focus_panel(PanelKind::Set);
-                self.pointer = Some(Pointer::PromptField);
+                self.pointer = Some(if double {
+                    Pointer::Panel
+                } else {
+                    Pointer::PromptField
+                });
                 self.dirty_frame = true;
                 return true;
             }
@@ -710,6 +710,7 @@ impl App {
                 prompt,
                 SetPrompt::SetsFolder
                     | SetPrompt::RecordingsFolder
+                    | SetPrompt::VimMappingsPath
                     | SetPrompt::AddSampleSource
                     | SetPrompt::EditSampleSource(_)
             );
@@ -729,6 +730,7 @@ impl App {
             prompt,
             SetPrompt::SetsFolder
                 | SetPrompt::RecordingsFolder
+                | SetPrompt::VimMappingsPath
                 | SetPrompt::AddSampleSource
                 | SetPrompt::EditSampleSource(_)
                 | SetPrompt::PickBankToRename
@@ -790,6 +792,13 @@ impl App {
                 picker.offer(&shorten_home(&recordings));
                 picker
             }
+            SetPrompt::VimMappingsPath => {
+                let mut picker =
+                    FilePicker::text("Vim mappings path", "read Vim mappings from this file");
+                picker.label = "path";
+                picker.offer(&self.vim_mappings_path_label());
+                picker
+            }
             SetPrompt::RenameBank => {
                 FilePicker::naming("bank alias", "changes the bank's playable name")
             }
@@ -844,6 +853,9 @@ impl App {
             }
             SetPrompt::RecordingsFolder => {
                 "recordings folder - type a path, or Tab to browse and Enter on . · Esc back".into()
+            }
+            SetPrompt::VimMappingsPath => {
+                "Vim mappings path - type a full path · Enter keeps · Esc back".into()
             }
             SetPrompt::AddSampleSource => {
                 "import samples - a folder, a URL, or github:user/repo · Enter imports · Esc back"
@@ -909,6 +921,14 @@ impl App {
                 }
                 SetPrompt::SetsFolder => self.choose_sets_folder(&path),
                 SetPrompt::RecordingsFolder => self.choose_recordings_folder(&path),
+                SetPrompt::VimMappingsPath => {
+                    if path.is_absolute() {
+                        self.close_set_prompt();
+                        self.set_vim_mappings_path(Some(path.to_string_lossy().into_owned()));
+                    } else if let Some((_, picker)) = self.set_prompt.as_mut() {
+                        picker.error = Some("enter a full file path".into());
+                    }
+                }
                 SetPrompt::AddSampleSource => {
                     let spec = path.to_string_lossy().trim().to_owned();
                     self.return_from_source_prompt();
@@ -1482,6 +1502,7 @@ pub(super) enum SetPrompt {
     RenameSet,
     SetsFolder,
     RecordingsFolder,
+    VimMappingsPath,
     /// A folder of samples, or a pack's address, to import for every set.
     AddSampleSource,
     /// Replace one existing source while keeping its row and enabled state.
@@ -2226,7 +2247,7 @@ mod tests {
                 old,
                 "newest first"
             );
-            // Alt+R renames the selected tape. Ctrl+R keeps the global scene command.
+            // Alt+R renames the selected tape.
             press(&mut app, KeyCode::Char('r'), KeyModifiers::ALT);
             assert!(matches!(
                 app.set_prompt,

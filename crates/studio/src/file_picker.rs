@@ -337,6 +337,7 @@ pub struct FilePicker {
     pub hold_scroll: bool,
     /// The last row click, for the second press of a double click.
     last_click: Option<(usize, Instant)>,
+    last_field_click: Option<((u16, u16), Instant)>,
 }
 
 impl FilePicker {
@@ -360,6 +361,7 @@ impl FilePicker {
             scroll: std::cell::Cell::new(0),
             hold_scroll: false,
             last_click: None,
+            last_field_click: None,
         }
     }
 
@@ -482,6 +484,11 @@ impl FilePicker {
     pub fn selection(&self) -> Option<std::ops::Range<usize>> {
         (self.caret != self.anchor)
             .then(|| self.caret.min(self.anchor)..self.caret.max(self.anchor))
+    }
+
+    pub fn selected_text(&self) -> Option<&str> {
+        let span = self.selection()?;
+        Some(&self.path[self.byte_at(span.start)..self.byte_at(span.end)])
     }
 
     pub fn select_all(&mut self) {
@@ -607,6 +614,31 @@ impl FilePicker {
         Some(display.at_column(column + scrolled, first))
     }
 
+    /// A second press at the same cell selects the whole field.
+    pub fn click_field(
+        &mut self,
+        at: usize,
+        position: (u16, u16),
+        shift: bool,
+        now: Instant,
+    ) -> bool {
+        let double = !shift
+            && self.last_field_click.is_some_and(|(last, time)| {
+                last == position && now.duration_since(time).as_millis() <= 500
+            });
+        self.start_typing();
+        self.browser = None;
+        if double {
+            self.select_all();
+        } else {
+            self.caret_to(at, shift);
+            if !shift {
+                self.last_field_click = Some((position, now));
+            }
+        }
+        double
+    }
+
     #[cfg(test)]
     fn field_column(&self, index: usize) -> usize {
         FieldDisplay::new(&self.path).column(index)
@@ -667,9 +699,10 @@ impl FilePicker {
         double
     }
 
-    /// A key or a click away from the list breaks a pending double click.
+    /// A key, drag or click elsewhere breaks a pending double click.
     pub fn cancel_click(&mut self) {
         self.last_click = None;
+        self.last_field_click = None;
     }
 
     /// How many rows the list up now has.
@@ -770,6 +803,7 @@ fn expand_home(typed: &str) -> PathBuf {
 pub struct FilePickerView<'a> {
     pub picker: &'a FilePicker,
     pub theme: &'a Theme,
+    pub copy_hint: Option<&'a str>,
 }
 
 impl ratatui::widgets::Widget for FilePickerView<'_> {
@@ -943,7 +977,15 @@ impl ratatui::widgets::Widget for FilePickerView<'_> {
                 Style::default().fg(theme.error),
             );
         }
-        let hint = if self.picker.browsing() {
+        let hint = if self.picker.typing
+            && self.picker.selection().is_some()
+            && let Some(copy) = self.copy_hint
+        {
+            format!(
+                "{copy} copy selection · Enter {} · Esc back",
+                self.picker.verb
+            )
+        } else if self.picker.browsing() {
             format!(
                 "Enter opens a folder / {} · Backspace up · Tab back · Esc back",
                 self.picker.verb
@@ -985,6 +1027,7 @@ mod tests {
         FilePickerView {
             picker: &picker,
             theme: &theme,
+            copy_hint: None,
         }
         .render(frame, &mut buffer);
         assert_eq!(picker.path, text, "the preview cannot rewrite the artwork");
@@ -1023,6 +1066,7 @@ mod tests {
         FilePickerView {
             picker: &picker,
             theme: &theme,
+            copy_hint: None,
         }
         .render(frame, &mut buffer);
         let caret = start + (picker.field_column(picker.caret) - scrolled) as u16;
@@ -1060,6 +1104,7 @@ mod tests {
         FilePickerView {
             picker: &picker,
             theme: &theme,
+            copy_hint: Some("F4"),
         }
         .render(frame, &mut buffer);
         assert_eq!(buffer[(start, panel.y + 1)].symbol(), "👩‍💻");
@@ -1069,17 +1114,30 @@ mod tests {
                 .modifier
                 .contains(Modifier::REVERSED)
         );
+        let rendered: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(!rendered.contains("copy selection"));
         picker.caret_to(0, false);
         picker.caret_to(3, true);
         FilePickerView {
             picker: &picker,
             theme: &theme,
+            copy_hint: Some("F4"),
         }
         .render(frame, &mut buffer);
         assert_eq!(buffer[(start, panel.y + 1)].bg, theme.selection);
         assert_eq!(buffer[(start + 1, panel.y + 1)].bg, theme.selection);
         assert_ne!(buffer[(start + 2, panel.y + 1)].bg, theme.selection);
         assert_eq!(picker.path, text);
+        let rendered: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(rendered.contains("F4 copy selection"));
+        FilePickerView {
+            picker: &picker,
+            theme: &theme,
+            copy_hint: None,
+        }
+        .render(frame, &mut buffer);
+        let rendered: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(!rendered.contains("copy selection"));
         let long = format!("{}x", "👩‍💻".repeat(60));
         picker.set_path(&long);
         let room = usize::from(list.right() - start);
@@ -1091,6 +1149,7 @@ mod tests {
         FilePickerView {
             picker: &picker,
             theme: &theme,
+            copy_hint: None,
         }
         .render(frame, &mut buffer);
         assert_eq!(buffer[(start, panel.y + 1)].symbol(), "👩‍💻");
@@ -1113,6 +1172,7 @@ mod tests {
             FilePickerView {
                 picker: &picker,
                 theme: &theme,
+                copy_hint: None,
             }
             .render(frame, &mut buffer);
         });

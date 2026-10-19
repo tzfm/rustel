@@ -96,7 +96,7 @@ pub(super) fn sample_source_line(panel: &ReferencePanel) -> String {
 impl ReferenceView<'_> {
     fn return_hint(&self) -> String {
         self.keybinds
-            .binding(super::super::keybinds::BindAction::Reference)
+            .hint_binding(super::super::keybinds::BindAction::Reference)
             .map_or_else(
                 || "click returns".to_owned(),
                 |binding| format!("{} returns", binding.hint()),

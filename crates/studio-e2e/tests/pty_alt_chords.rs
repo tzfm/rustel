@@ -466,7 +466,7 @@ fn probe_alt_chords_through_a_real_pty() {
     // Walk by what the page shows rather than by Alt+O's position. More
     // rows may be added around it, and that must not turn this
     // terminal-input probe into a count of today's settings list.
-    let rows = rustel_studio::keybinds::BindAction::ALL.len() + 2; // terminal profile and reset-all rows
+    let rows = rustel_studio::keybinds::BindAction::ALL.len() + 3;
     // The input bytes are the same across platforms, but macOS displays
     // the Option symbol while Linux and Windows display Alt.
     let reveal_shortcut = if cfg!(target_os = "macos") {

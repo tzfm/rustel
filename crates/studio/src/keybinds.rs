@@ -23,6 +23,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, ModifierKeyCode};
 use serde::{Deserialize, Serialize};
 
+use super::editor::EditorKeybindings;
+
 /// Compact, platform-appropriate modifier labels for every shortcut hint.
 /// Stored key names (such as `ctrl+shift+s`) stay unchanged.
 pub fn shortcut_label(text: &str) -> std::borrow::Cow<'_, str> {
@@ -72,6 +74,8 @@ pub enum BindAction {
     Mixer,
     VisualsOne,
     VisualsTwo,
+    /// The inline visualizers under their calls in the score.
+    Visualizers,
     Log,
     LogSticky,
     FocusPanels,
@@ -89,6 +93,8 @@ pub enum BindAction {
     Paste,
     SelectAll,
     ToggleComment,
+    /// Find text in the focused score.
+    Find,
     FirstError,
     // Scenes
     NewScene,
@@ -124,7 +130,7 @@ pub enum BindAction {
 
 impl BindAction {
     /// Every action, in the order the Keybinds page lists them.
-    pub const ALL: [BindAction; 54] = [
+    pub const ALL: [BindAction; 56] = [
         // Transport
         Self::Evaluate,
         Self::Stop,
@@ -142,6 +148,7 @@ impl BindAction {
         Self::Mixer,
         Self::VisualsOne,
         Self::VisualsTwo,
+        Self::Visualizers,
         Self::Log,
         Self::LogSticky,
         Self::FocusPanels,
@@ -159,6 +166,7 @@ impl BindAction {
         Self::Paste,
         Self::SelectAll,
         Self::ToggleComment,
+        Self::Find,
         Self::FirstError,
         // Scenes
         Self::NewScene,
@@ -206,6 +214,7 @@ impl BindAction {
             Self::Mixer => "mixer",
             Self::VisualsOne => "visuals-one",
             Self::VisualsTwo => "visuals-two",
+            Self::Visualizers => "visualizers",
             Self::Log => "log",
             Self::LogSticky => "log-sticky",
             Self::FocusPanels => "focus-panels",
@@ -222,6 +231,7 @@ impl BindAction {
             Self::Paste => "paste",
             Self::SelectAll => "select-all",
             Self::ToggleComment => "comment",
+            Self::Find => "find",
             Self::FirstError => "first-error",
             Self::NewScene => "new-scene",
             Self::DuplicateScene => "duplicate-scene",
@@ -271,8 +281,9 @@ impl BindAction {
             Self::PianoMode => "piano mode",
             Self::SetPanel => "set panel",
             Self::Mixer => "mixer desk",
-            Self::VisualsOne => "visuals 1",
-            Self::VisualsTwo => "visuals 2",
+            Self::VisualsOne => "toggle visuals 1",
+            Self::VisualsTwo => "toggle visuals 2",
+            Self::Visualizers => "toggle inline visualizers",
             Self::Log => "log panel",
             Self::LogSticky => "keep the log on screen",
             Self::FocusPanels => "next panel",
@@ -289,6 +300,7 @@ impl BindAction {
             Self::Paste => "paste",
             Self::SelectAll => "select all",
             Self::ToggleComment => "comment or uncomment",
+            Self::Find => "find text",
             Self::FirstError => "first error / locate cursor",
             Self::NewScene => "new scene",
             Self::DuplicateScene => "duplicate scene",
@@ -370,6 +382,7 @@ impl BindAction {
             Self::FocusPanels => shift(F(10)),
             Self::Jobs => plain(F(12)), // unused: Jobs ships unbound; open from View ▸ Background jobs
             Self::Memory => plain(F(12)), // unused: Memory ships unbound; open from the header
+            Self::Visualizers => plain(F(12)), // unused: ships unbound; learn a key on the Keybinds page
             Self::Export => ctrl_shift(Char('x')),
             Self::SmartAction => ctrl(Char('j')),
             Self::Split => ctrl(Char('e')),
@@ -381,6 +394,9 @@ impl BindAction {
             Self::Paste => ctrl(Char('v')),
             Self::SelectAll => ctrl(Char('a')),
             Self::ToggleComment => ctrl(Char('/')),
+            // Ctrl+Shift+F is the familiar find chord, but nearly every
+            // terminal keeps it. Y is free on all shipped profiles but Hyper.
+            Self::Find => ctrl_shift(Char('y')),
             Self::FirstError => shift(F(3)),
             Self::NewScene => ctrl(Char('n')),
             Self::DuplicateScene => plain(F(3)),
@@ -491,6 +507,13 @@ impl BindAction {
                 code: KeyCode::Char('7'),
                 control: true,
                 shift: false,
+            },
+            // Legacy input cannot send Ctrl+Shift+letter, and Hyper keeps
+            // Ctrl+Shift+Y. Modified function keys carry Shift.
+            Self::Find => KeyCombo {
+                code: KeyCode::F(2),
+                control: true,
+                shift: true,
             },
             // F11 is left of F12, so Ctrl+F11 lowers and Ctrl+F12 raises,
             // as minus is left of plus.
@@ -701,6 +724,13 @@ pub struct KeyCombo {
 }
 
 impl KeyCombo {
+    pub(crate) fn event(self) -> KeyEvent {
+        let mut modifiers = KeyModifiers::NONE;
+        modifiers.set(KeyModifiers::CONTROL, self.control);
+        modifiers.set(KeyModifiers::SHIFT, self.shift);
+        KeyEvent::new(self.code, modifiers)
+    }
+
     /// The chord as `studio.json` keeps it: crossterm's own key names
     /// with explicit modifiers, which round-trips without a parser of its
     /// own and is editable by hand.
@@ -1119,6 +1149,7 @@ pub enum KeybindCapture {
 pub const SHIPS_UNBOUND: &[BindAction] = &[
     BindAction::Jobs,
     BindAction::Memory,
+    BindAction::Visualizers,
     BindAction::ShowFile,
     BindAction::RenameFile,
     BindAction::DeleteSample,
@@ -1150,6 +1181,8 @@ pub struct Keybinds {
     /// which reads as "everything arrives" - the right answer for a test
     /// and for the moment before the handshake comes back.
     reach: Reach,
+    editor_keybindings: EditorKeybindings,
+    suppressed_hints: Vec<(KeyCode, KeyModifiers)>,
     /// Resolved once whenever preferences or terminal capabilities change.
     /// Every lookup and hint reads these same collision-free assignments.
     effective: [Option<KeyCombo>; BindAction::ALL.len()],
@@ -1165,6 +1198,8 @@ impl Default for Keybinds {
             unknown: Vec::new(),
             unknown_midi: Vec::new(),
             reach: Reach::default(),
+            editor_keybindings: EditorKeybindings::Default,
+            suppressed_hints: Vec::new(),
             effective: [None; BindAction::ALL.len()],
             aliases: [None; BindAction::ALL.len()],
         };
@@ -1178,6 +1213,62 @@ impl Keybinds {
     /// user choices have been applied. No reachable candidate means None.
     pub fn binding(&self, action: BindAction) -> Option<KeyCombo> {
         self.effective[action as usize]
+    }
+
+    pub(crate) fn editor_keybindings(&self) -> EditorKeybindings {
+        self.editor_keybindings
+    }
+
+    pub(crate) fn set_editor_keybindings(&mut self, keybindings: EditorKeybindings) {
+        if self.editor_keybindings == keybindings {
+            return;
+        }
+        self.editor_keybindings = keybindings;
+        self.resolve();
+    }
+
+    pub(crate) fn filter_editor_hints(&mut self, mut claimed: impl FnMut(&KeyEvent) -> bool) {
+        self.suppressed_hints.clear();
+        for action in BindAction::ALL {
+            let candidates = self
+                .binding(action)
+                .into_iter()
+                .chain(self.effective_alias(action))
+                .chain(action.legacy_aliases())
+                .map(KeyCombo::event)
+                .chain(
+                    action
+                        .panel_letter()
+                        .map(|letter| KeyEvent::new(KeyCode::Char(letter), KeyModifiers::ALT)),
+                );
+            for key in candidates {
+                let mut delivered = key;
+                self.normalize_terminal_key(&mut delivered);
+                if claimed(&delivered) {
+                    self.suppressed_hints.push((key.code, key.modifiers));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn hint_available(&self, key: KeyEvent) -> bool {
+        !self.suppressed_hints.contains(&(key.code, key.modifiers))
+    }
+
+    /// A shortcut that also works while the score has the keyboard.
+    pub(crate) fn hint_binding(&self, action: BindAction) -> Option<KeyCombo> {
+        let binding = self.binding(action)?;
+        if self.hint_available(binding.event()) {
+            return Some(binding);
+        }
+        self.effective_alias(action)
+            .filter(|alias| self.hint_available(alias.event()))
+            .or_else(|| {
+                action.legacy_aliases().find(|alias| {
+                    self.hint_available(alias.event())
+                        && self.accepts_legacy_alias(action, &alias.event())
+                })
+            })
     }
 
     /// The message a row answers to beside its chord, if any.
@@ -1227,20 +1318,24 @@ impl Keybinds {
     /// editors use it for completion. The terminal profile decides whether
     /// it arrives, so a system that takes it does not show it.
     pub fn advertised_alias(&self, action: BindAction) -> Option<KeyCombo> {
-        self.effective_alias(action).or_else(|| {
-            let space = KeyCombo {
-                code: KeyCode::Null,
-                control: true,
-                shift: false,
-            };
-            (action == BindAction::Reference
-                && self.binding(action) != Some(space)
-                && self.accepts_legacy_alias(
-                    action,
-                    &KeyEvent::new(KeyCode::Null, KeyModifiers::CONTROL),
-                ))
-            .then_some(space)
-        })
+        self.effective_alias(action)
+            .filter(|alias| self.hint_available(alias.event()))
+            .filter(|alias| Some(*alias) != self.hint_binding(action))
+            .or_else(|| {
+                let space = KeyCombo {
+                    code: KeyCode::Null,
+                    control: true,
+                    shift: false,
+                };
+                (action == BindAction::Reference
+                    && self.hint_binding(action) != Some(space)
+                    && self.hint_available(space.event())
+                    && self.accepts_legacy_alias(
+                        action,
+                        &KeyEvent::new(KeyCode::Null, KeyModifiers::CONTROL),
+                    ))
+                .then_some(space)
+            })
     }
 
     /// Explicit user choices survive capability changes verbatim.
@@ -1306,6 +1401,11 @@ impl Keybinds {
         // Shipped with no key: its placeholder default is nobody's chord,
         // so a chord learnt onto it is always the player's, and saved.
         if Self::ships_unbound(action) {
+            return None;
+        }
+        // Vim holds Ctrl+R for redo, so the rename chord is not on offer.
+        // Learning it anyway records the player's choice.
+        if self.editor_keybindings == EditorKeybindings::Vim && action == BindAction::RenameScene {
             return None;
         }
         std::iter::once(action.default_binding())
@@ -1435,18 +1535,33 @@ impl Keybinds {
                 self.aliases[action as usize] = Some(alias);
             }
         }
+        // Vim owns Ctrl+R for redo while the editor uses Vim keys. The
+        // rename chord waits for Default keys, unless another chord was
+        // learnt for it.
+        if self.editor_keybindings == EditorKeybindings::Vim
+            && !self.is_unbound(BindAction::RenameScene)
+            && !self.overridden(BindAction::RenameScene)
+        {
+            self.effective[BindAction::RenameScene as usize] = None;
+        }
     }
 
     /// The chord as every surface spells it: `^S`, `F4` - or nothing for
     /// an unbound action, which every surface reads as no shortcut. A
     /// panel action with no learnt chord is spelled as its Alt letter.
     pub fn hint(&self, action: BindAction) -> String {
-        match (self.binding(action), action.panel_letter()) {
+        match (self.hint_binding(action), action.panel_letter()) {
             (Some(combo), _) => combo.hint(),
-            (None, Some(letter)) => {
+            (None, Some(letter))
+                if self.binding(action).is_none()
+                    && self.hint_available(KeyEvent::new(
+                        KeyCode::Char(letter),
+                        KeyModifiers::ALT,
+                    )) =>
+            {
                 shortcut_label(&format!("Alt+{}", letter.to_ascii_uppercase())).into_owned()
             }
-            (None, None) => String::new(),
+            (None, _) => String::new(),
         }
     }
 
@@ -1647,7 +1762,10 @@ impl Keybinds {
     /// and midi bindings, which have no default to return to.
     pub fn reset_all(&mut self) {
         let reach = self.reach.clone();
+        let editor_keybindings = self.editor_keybindings;
         *self = Self::default();
+        // Set the editor keys before resolving, so Vim keeps Ctrl+R.
+        self.editor_keybindings = editor_keybindings;
         self.set_reach(reach);
     }
 
@@ -1805,6 +1923,48 @@ mod tests {
         );
         assert_eq!(binds.hint(BindAction::RewindEvaluate), "^\u{21e7}S");
         assert_eq!(binds.hint(BindAction::Quit), "^Q");
+    }
+
+    #[test]
+    fn rename_scene_keeps_ctrl_r_outside_vim_and_gives_it_up_in_vim() {
+        let mut binds = Keybinds::default();
+        assert_eq!(
+            binds
+                .binding(BindAction::RenameScene)
+                .map(|combo| combo.key()),
+            Some("ctrl+r".to_owned())
+        );
+        binds.set_editor_keybindings(EditorKeybindings::Vim);
+        assert_eq!(
+            binds.binding(BindAction::RenameScene),
+            None,
+            "Ctrl+R is redo while Vim owns the editor"
+        );
+        binds.learn(
+            BindAction::RenameScene,
+            Some(KeyCombo::parse("ctrl+r").expect("chord")),
+        );
+        assert_eq!(
+            binds
+                .binding(BindAction::RenameScene)
+                .map(|combo| combo.key()),
+            Some("ctrl+r".to_owned()),
+            "learning Ctrl+R in Vim records the player's choice"
+        );
+        binds.reset_all();
+        assert_eq!(
+            binds.binding(BindAction::RenameScene),
+            None,
+            "reset keeps Vim's redo"
+        );
+        binds.set_editor_keybindings(EditorKeybindings::Default);
+        assert_eq!(
+            binds
+                .binding(BindAction::RenameScene)
+                .map(|combo| combo.key()),
+            Some("ctrl+r".to_owned()),
+            "Default keys bring rename scene back"
+        );
     }
 
     /// A terminal that folds ^Enter into Enter and ^. into `.` gets the
@@ -2051,10 +2211,11 @@ mod tests {
             // Whichever plain binding eats the byte instead - on a legacy
             // terminal that is the fallback where the default cannot arrive.
             if let Some(thief) = BindAction::ALL.into_iter().find(|other| {
-                other.default_binding().matches(&press)
-                    || other
-                        .fallback_binding()
-                        .is_some_and(|fallback| fallback.matches(&press))
+                !SHIPS_UNBOUND.contains(other)
+                    && (other.default_binding().matches(&press)
+                        || other
+                            .fallback_binding()
+                            .is_some_and(|fallback| fallback.matches(&press)))
             }) {
                 lost.push((action.key(), thief.key()));
             }
@@ -2064,6 +2225,7 @@ mod tests {
             lost,
             [
                 ("export", "cut"),
+                ("find", "redo"),
                 ("forget-pad", "learn-pad"),
                 ("open-set", "settings"),
                 ("record-take", "rename-scene"),
@@ -2114,6 +2276,7 @@ mod tests {
             {
                 let mut expected = [
                     ("export", "\u{21e7}F12".to_owned()),
+                    ("find", "^⇧F2".to_owned()),
                     ("first-error", "\u{21e7}F4".to_owned()),
                     ("forget-pad", "\u{21e7}F8".to_owned()),
                     ("next-scene", "F7".to_owned()),

@@ -147,14 +147,12 @@ fn without_stray_controls(terminal_event: Event) -> Option<Event> {
 
 /// Update and stop, in every spelling the terminal might send them in.
 ///
-/// These two are the keys a set cannot afford to lose. Whatever is on screen -
-/// the reference column, a picker, the settings sheet - the player has to be
-/// able to push a change out and to cut the transport, so they are recognised
-/// before any panel is offered the key.
+/// The focused Vim editor claims its keys first. Otherwise, update and stop
+/// are recognised before panels, pickers and settings receive the key.
 ///
 /// The keybinding table rides along: a chord learnt onto update or stop
 /// claims the press exactly as the built-in spelling would, so a moved
-/// transport keeps working from anywhere. The table is asked for the two
+/// transport keeps the same priority. The table is asked for the two
 /// transport actions alone - never for the whole table, whose other
 /// chords belong to the surfaces they serve.
 pub(super) fn transport_key(
@@ -395,10 +393,25 @@ impl App {
     /// it go, and the first to claim it ends the turn.
     pub(super) fn handle_terminal_event(
         &mut self,
+        terminal_event: Event,
+    ) -> Result<(), RuntimeError> {
+        let result = self.route_terminal_event(terminal_event, true);
+        self.refresh_editor_shortcut_hints();
+        result
+    }
+
+    pub(super) fn route_terminal_event(
+        &mut self,
         mut terminal_event: Event,
+        allow_vim: bool,
     ) -> Result<(), RuntimeError> {
         if let Event::Key(key) = &mut terminal_event {
             self.keybinds.normalize_terminal_key(key);
+        }
+        self.sync_editor_keybindings();
+        self.latch_keyboard_capabilities(&terminal_event);
+        if is_stray_control_key(&terminal_event) {
+            return Ok(());
         }
         self.cancel_sample_delete_for_event(&terminal_event);
         if matches!(&terminal_event,
@@ -412,9 +425,53 @@ impl App {
             self.caret_visible = true;
         }
         self.note_pointer_shape_event(&terminal_event);
-        // Ctrl+Q is the one unconditional way out. Claim it before keybind
-        // learning and every modal surface so no menu, prompt or remapped
-        // action can make the studio impossible to quit from the keyboard.
+        // A find prompt owns the keys before Vim mappings and every editor
+        // command: a typed pattern is never a motion or an edit.
+        if allow_vim && self.route_find_event(&terminal_event)? {
+            return Ok(());
+        }
+        // Quit and the transport outrank even Vim, so they must not be
+        // handed to the prompt's Vim branch.
+        let find_global = matches!(&terminal_event, Event::Key(key)
+            if self.editor_accepts_raw_paste()
+                && self.editor().find_open()
+                && self.find_global_chord(key));
+        let quit_was_armed = self.quit_armed;
+        if !find_global
+            && allow_vim
+            && self.editor_accepts_raw_paste()
+            && let Event::Key(key) = &terminal_event
+            && self.dispatch_vim_key(*key)?
+        {
+            // A mapping that calls Quit just armed it; any other key is
+            // the "another key calls it off" press.
+            if quit_was_armed && self.quit_armed && key.kind == KeyEventKind::Press {
+                self.quit_armed = false;
+                self.status = "quit cancelled".into();
+                self.dirty_frame = true;
+            }
+            return Ok(());
+        }
+        let non_key_interrupt = matches!(&terminal_event, Event::Paste(_) | Event::FocusLost)
+            || matches!(&terminal_event, Event::Mouse(mouse) if mouse.kind != MouseEventKind::Moved);
+        if non_key_interrupt {
+            self.flush_vim_mapping_pending()?;
+        }
+        let interrupts_vim = non_key_interrupt
+            || matches!(&terminal_event, Event::Key(key)
+                if key.kind != KeyEventKind::Release
+                    && (key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER
+                            | KeyModifiers::HYPER | KeyModifiers::META,
+                    ) || matches!(key.code, KeyCode::F(_) | KeyCode::Tab | KeyCode::BackTab)
+                        || self.keybinds.override_action_for(key).is_some()));
+        if interrupts_vim {
+            for scene in self.scenes.scenes_mut() {
+                scene.editor.vim_interrupt();
+            }
+        }
+        // A Vim mapping has first use of the focused editor's keys.
+        // Otherwise quit still precedes every modal surface.
         if self.quit_key(&terminal_event) {
             return Ok(());
         }
@@ -441,13 +498,9 @@ impl App {
             self.stop_precision_drag();
             self.stop_replay_drag();
         }
-        if is_stray_control_key(&terminal_event) {
-            return Ok(());
-        }
         let Some(terminal_event) = without_stray_controls(terminal_event) else {
             return Ok(());
         };
-        self.latch_keyboard_capabilities(&terminal_event);
         if let Event::Key(key) = &terminal_event
             && key.kind == KeyEventKind::Press
         {
@@ -649,7 +702,7 @@ impl App {
         if !changes_scene && self.smart_action_key(&contextual) {
             return Ok(true);
         }
-        if self.paste_shortcut(key, alt) {
+        if self.prompt_copy_shortcut(key, alt) || self.paste_shortcut(key, alt) {
             return Ok(true);
         }
         if self.replay_edit_key(&contextual) {
@@ -956,9 +1009,6 @@ impl App {
                 _ => {}
             }
         }
-        // The visuals docks have no chord, only View ▸ Visuals 1 and 2:
-        // nobody shows and hides one mid-set, and the chord the second
-        // had, Ctrl+Shift+V, is Windows Terminal's paste.
         // The set panel, as an editor's file tree: shown and hidden by
         // the one chord.
         if primary
@@ -1007,6 +1057,14 @@ impl App {
             && !self.settings_hold_the_keys()
         {
             self.toggle_reference_browse();
+            return true;
+        }
+        if self.keybinds.action_for(key) == Some(BindAction::Find)
+            && !alt
+            && !self.key_is_a_learnt_chord(key)
+            && !self.settings_hold_the_keys()
+        {
+            self.open_find();
             return true;
         }
         if primary && !shift && letter == Some('u') && !self.key_is_a_learnt_chord(key) {
@@ -1347,6 +1405,12 @@ impl App {
             &|key| self.keybinds.overrules(key),
         ) {
             Some(EditorInput::Command(command)) => {
+                if self.focus == Focus::Editor
+                    && matches!(command, Command::InsertText(_))
+                    && !self.editor().vim_is_insert()
+                {
+                    return Ok(());
+                }
                 // Typing into the score is a claim on it: after an edit the
                 // arrows follow the caret again without anyone having to say
                 // so. Motion, copying and the transport steal nothing - a
@@ -2255,11 +2319,11 @@ mod tests {
             let source = app.editor().source();
             let caret = app.editor().primary_selection();
             page(&mut app, KeyCode::PageDown, KeyEventKind::Press);
-            assert_eq!(app.settings_sheet.as_ref().unwrap().selected, rows);
+            assert_eq!(app.settings_sheet.as_ref().unwrap().selected, rows - 1);
             page(&mut app, KeyCode::PageDown, KeyEventKind::Repeat);
             assert_eq!(
                 app.settings_sheet.as_ref().unwrap().selected,
-                (rows * 2).min(crate::settings::RESET_KEYBINDS_ROW)
+                (rows * 2 - 1).min(crate::settings::RESET_KEYBINDS_ROW)
             );
             for _ in 0..10 {
                 page(&mut app, KeyCode::PageDown, KeyEventKind::Press);

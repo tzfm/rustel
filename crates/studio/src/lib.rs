@@ -56,6 +56,7 @@ pub mod theme;
 pub mod theme_editor;
 mod theme_visuals;
 pub mod view;
+mod vim_config;
 pub mod visuals;
 pub mod viz_panel;
 pub mod wav;

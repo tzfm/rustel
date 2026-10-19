@@ -74,6 +74,7 @@ tachyonfx = { version = "=0.25.1", default-features = false, features = [
   "std",
 ] }
 ropey = "1.6"
+regex = "1"
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
 

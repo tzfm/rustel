@@ -1,4 +1,4 @@
-//! Paste ownership for text fields outside the score, and the reader that
+//! Clipboard ownership for text fields outside the score, and the reader that
 //! gathers a paste a legacy terminal sends as ordinary keys into one chunk
 //! before its Enter reaches a prompt.
 
@@ -7,6 +7,26 @@ use super::super::theme_editor::EditorTab;
 use super::*;
 
 impl App {
+    pub(super) fn accepts_raw_paste_burst(&self) -> bool {
+        // The find prompt takes a pasted pattern whole, including any Enter
+        // the terminal sends as part of it.
+        if self.editor_accepts_raw_paste() && self.editor().find_open() {
+            return true;
+        }
+        // Normal-mode command bursts must reach Vim one key at a time.
+        if !self.editor().vim_is_insert()
+            && (self.editor_accepts_raw_paste()
+                || (self.focus == Focus::Panel(PanelKind::Reference)
+                    && self
+                        .reference_panel
+                        .as_ref()
+                        .is_some_and(super::super::reference::ReferencePanel::types_through)))
+        {
+            return false;
+        }
+        self.accepts_raw_paste()
+    }
+
     /// Legacy terminals (including Windows key records) can send a paste
     /// as ordinary keys. Collect it before Enter reaches a prompt handler.
     pub(super) fn accepts_raw_paste(&self) -> bool {
@@ -131,6 +151,63 @@ impl App {
         kept
     }
 
+    pub(super) fn prompt_copy_shortcut(&mut self, key: &KeyEvent, alt: bool) -> bool {
+        if alt {
+            return false;
+        }
+        match self.keybinds.action_for(key) {
+            Some(action @ (BindAction::Copy | BindAction::Cut)) => self.prompt_edit_action(action),
+            _ => false,
+        }
+    }
+
+    pub(super) fn focused_file_picker(&self) -> Option<&FilePicker> {
+        match self.focus {
+            Focus::Panel(PanelKind::Set) => self.set_prompt.as_ref().map(|(_, picker)| picker),
+            Focus::Panel(PanelKind::Viz) => self.viz_docks[self.viz_focus]
+                .as_ref()
+                .and_then(|panel| panel.prompt.as_ref()),
+            _ => None,
+        }
+    }
+
+    pub(super) fn prompt_edit_action(&mut self, action: BindAction) -> bool {
+        if action == BindAction::Paste {
+            return self.focused_file_picker().is_some() && self.paste_prompt_clipboard();
+        }
+        if !matches!(
+            action,
+            BindAction::Copy | BindAction::Cut | BindAction::SelectAll
+        ) {
+            return false;
+        }
+        let picker = match self.focus {
+            Focus::Panel(PanelKind::Set) => self.set_prompt.as_mut().map(|(_, picker)| picker),
+            Focus::Panel(PanelKind::Viz) => self.viz_docks[self.viz_focus]
+                .as_mut()
+                .and_then(|panel| panel.prompt.as_mut()),
+            _ => None,
+        };
+        let Some(picker) = picker else {
+            return false;
+        };
+        picker.cancel_click();
+        if picker.typing && action == BindAction::SelectAll {
+            picker.select_all();
+            self.dirty_frame = true;
+        } else if picker.typing
+            && let Some(text) = picker.selected_text()
+        {
+            match self.clipboard.set_text(text.to_owned()) {
+                Ok(()) if action == BindAction::Cut => picker.delete_forward(),
+                Ok(()) => {}
+                Err(error) => self.status = format!("could not copy: {error}"),
+            }
+            self.dirty_frame = true;
+        }
+        true
+    }
+
     /// The paste chord, for the text field that has the keyboard. `true`
     /// when a prompt took the clipboard, or the clipboard could not be read
     /// and the score takes no paste to fall back on.
@@ -139,20 +216,23 @@ impl App {
         // the keyboard.  Bracketed terminal paste already takes this
         // route in `route_paste`; the internal clipboard shortcut must do the same
         // instead of falling through to the hidden score editor.
-        if !alt && self.keybinds.action_for(key) == Some(BindAction::Paste) {
-            match self.clipboard.get_text() {
-                Ok(text) if self.paste_to_prompt(&text) => {
-                    self.dirty_frame = true;
-                    return true;
-                }
-                Ok(_) => {}
-                Err(error) if !self.editor_accepts_raw_paste() => {
-                    self.status = format!("could not paste: {error}");
-                    self.dirty_frame = true;
-                    return true;
-                }
-                Err(_) => {}
+        !alt && self.keybinds.action_for(key) == Some(BindAction::Paste)
+            && self.paste_prompt_clipboard()
+    }
+
+    fn paste_prompt_clipboard(&mut self) -> bool {
+        match self.clipboard.get_text() {
+            Ok(text) if self.paste_to_prompt(&text) => {
+                self.dirty_frame = true;
+                return true;
             }
+            Ok(_) => {}
+            Err(error) if !self.editor_accepts_raw_paste() => {
+                self.status = format!("could not paste: {error}");
+                self.dirty_frame = true;
+                return true;
+            }
+            Err(_) => {}
         }
         false
     }
@@ -275,6 +355,172 @@ mod tests {
         use crate::app::tests::support::*;
         use crate::editor::{MemoryClipboard, Selection, event_to_input};
         use std::cell::RefCell;
+
+        #[test]
+        fn mappings_path_selection_owns_clipboard_shortcuts_and_menu_actions() {
+            fn edit_menu(app: &mut App, mnemonic: char) {
+                press(app, KeyCode::F(1), KeyModifiers::NONE);
+                press(app, KeyCode::Char('e'), KeyModifiers::NONE);
+                press(app, KeyCode::Char(mnemonic), KeyModifiers::NONE);
+                assert!(app.menu.is_none(), "the menu action ran");
+            }
+
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            let score = app.editor().source();
+            let score_selection = Selection::range(ByteOffset(0), ByteOffset(score.len()));
+            app.editor_mut().set_selection(score_selection).unwrap();
+            app.settings_sheet = Some(SettingsSheet::default());
+            app.focus = Focus::Panel(PanelKind::Settings);
+            app.open_set_prompt(SetPrompt::VimMappingsPath);
+            let path = "maps/λ猫/keys.json";
+            app.set_prompt.as_mut().unwrap().1.set_path(path);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+            terminal
+                .draw(|frame| app.paint_into(frame, Instant::now()).unwrap())
+                .unwrap();
+            let picker = &app.set_prompt.as_ref().unwrap().1;
+            let (area, list) = picker.geometry(app.frame).unwrap();
+            let start = list.x + picker.label.len() as u16 + 2;
+            for (kind, offset) in [
+                (MouseEventKind::Down(MouseButton::Left), 5),
+                (MouseEventKind::Drag(MouseButton::Left), 8),
+                (MouseEventKind::Up(MouseButton::Left), 8),
+            ] {
+                app.handle_terminal_event(Event::Mouse(MouseEvent {
+                    kind,
+                    column: start + offset,
+                    row: area.y + 1,
+                    modifiers: KeyModifiers::NONE,
+                }))
+                .unwrap();
+            }
+            for modifiers in [KeyModifiers::CONTROL, KeyModifiers::SUPER] {
+                app.clipboard.set_text("kept".into()).unwrap();
+                press(&mut app, KeyCode::Char('c'), modifiers);
+                assert_eq!(app.clipboard.get_text().unwrap(), "λ猫");
+            }
+            app.clipboard.set_text("kept".into()).unwrap();
+            edit_menu(&mut app, 'o');
+            assert_eq!(app.clipboard.get_text().unwrap(), "λ猫");
+            edit_menu(&mut app, 'c');
+            assert_eq!(app.set_prompt.as_ref().unwrap().1.path, "maps//keys.json");
+            let menus = app.menus();
+            let edit = menus.iter().find(|menu| menu.title == "Edit").unwrap();
+            for label in ["Copy", "Cut"] {
+                assert!(
+                    !edit
+                        .items
+                        .iter()
+                        .find(|item| item.label == label)
+                        .unwrap()
+                        .enabled
+                );
+            }
+            edit_menu(&mut app, 'p');
+            assert_eq!(app.set_prompt.as_ref().unwrap().1.path, path);
+            edit_menu(&mut app, 's');
+            edit_menu(&mut app, 'o');
+            assert_eq!(app.clipboard.get_text().unwrap(), path);
+            assert_eq!(app.editor().source(), score);
+            assert_eq!(app.editor().primary_selection(), score_selection);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Set));
+            assert!(app.settings_sheet.is_some());
+        }
+
+        #[test]
+        fn file_picker_clipboard_shortcuts_stay_with_the_focused_field() {
+            fn field(app: &App) -> &str {
+                match app.focus {
+                    Focus::Panel(PanelKind::Set) => &app.set_prompt.as_ref().unwrap().1.path,
+                    Focus::Panel(PanelKind::Viz) => {
+                        &app.viz_docks[app.viz_focus]
+                            .as_ref()
+                            .unwrap()
+                            .prompt
+                            .as_ref()
+                            .unwrap()
+                            .path
+                    }
+                    _ => panic!("picker has focus"),
+                }
+            }
+
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            let score = app.editor().source();
+            app.editor_mut()
+                .set_selection(Selection::range(ByteOffset(0), ByteOffset(score.len())))
+                .unwrap();
+            for (kind, text, copy, cut) in [
+                (
+                    PanelKind::Set,
+                    "keep λ猫",
+                    KeyCode::Char('c'),
+                    KeyCode::Char('x'),
+                ),
+                (PanelKind::Viz, "keep\nλ猫", KeyCode::F(2), KeyCode::F(3)),
+            ] {
+                if kind == PanelKind::Set {
+                    app.open_set_prompt(SetPrompt::RenameSet);
+                    app.set_prompt.as_mut().unwrap().1.set_path(text);
+                } else {
+                    app.set_prompt = None;
+                    art_prompt(&mut app);
+                    app.viz_docks[app.viz_focus]
+                        .as_mut()
+                        .unwrap()
+                        .prompt
+                        .as_mut()
+                        .unwrap()
+                        .set_path(text);
+                    for (action, chord) in
+                        [(BindAction::Copy, "ctrl+f2"), (BindAction::Cut, "ctrl+f3")]
+                    {
+                        app.keybinds
+                            .learn(action, crate::keybinds::KeyCombo::parse(chord));
+                    }
+                }
+                press(&mut app, KeyCode::End, KeyModifiers::NONE);
+                for _ in 0..2 {
+                    press(&mut app, KeyCode::Left, KeyModifiers::SHIFT);
+                }
+                app.clipboard.set_text("kept".into()).unwrap();
+                if kind == PanelKind::Viz {
+                    for code in [KeyCode::Char('c'), KeyCode::Char('x')] {
+                        press(&mut app, code, KeyModifiers::CONTROL);
+                    }
+                    assert_eq!(app.clipboard.get_text().unwrap(), "kept");
+                    assert_eq!(field(&app), text);
+                }
+                press(&mut app, copy, KeyModifiers::CONTROL);
+                assert_eq!(app.clipboard.get_text().unwrap(), "λ猫");
+                assert_eq!(field(&app), text);
+                press(&mut app, cut, KeyModifiers::CONTROL);
+                assert_eq!(app.clipboard.get_text().unwrap(), "λ猫");
+                assert_eq!(field(&app), &text[..text.len() - "λ猫".len()]);
+                app.clipboard.set_text("kept".into()).unwrap();
+                for code in [copy, cut] {
+                    press(&mut app, code, KeyModifiers::CONTROL);
+                }
+                assert_eq!(app.clipboard.get_text().unwrap(), "kept");
+                assert_eq!(field(&app), &text[..text.len() - "λ猫".len()]);
+                assert_eq!(app.editor().source(), score);
+                assert_eq!(app.focus, Focus::Panel(kind));
+            }
+
+            app.open_set_prompt(SetPrompt::OpenSet);
+            app.set_prompt.as_mut().unwrap().1.offer("λ猫");
+            press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+            assert!(app.set_prompt.as_ref().unwrap().1.browsing());
+            for code in [KeyCode::F(2), KeyCode::F(3)] {
+                press(&mut app, code, KeyModifiers::CONTROL);
+            }
+            assert_eq!(app.clipboard.get_text().unwrap(), "kept");
+            assert_eq!(field(&app), "λ猫");
+            assert_eq!(app.editor().source(), score);
+        }
 
         #[test]
         fn settings_source_prompt_pastes_the_internal_clipboard() {
@@ -1136,9 +1382,11 @@ mod tests {
             assert!(app.status.contains("engine busy"), "{}", app.status);
             assert!(app.set_prompt.is_none());
             assert_eq!(app.pending_recording, Some(42));
-            // Ctrl+R is the scene's rename everywhere now: the bank's own
-            // alias lives on Sources (`r` on a user import), so a chord that
-            // must reach the scene rename is what this test pins.
+            // An assigned scene shortcut still works over the browser.
+            app.keybinds.learn(
+                BindAction::RenameScene,
+                crate::keybinds::KeyCombo::parse("ctrl+r"),
+            );
             app.handle_terminal_event(Event::Key(KeyEvent::new(
                 KeyCode::Char('r'),
                 KeyModifiers::CONTROL,

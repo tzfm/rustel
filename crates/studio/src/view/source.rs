@@ -79,7 +79,10 @@ impl Widget for PaneTitle<'_> {
         if self.focused {
             return;
         }
-        let Some(binding) = self.keybinds.binding(crate::keybinds::BindAction::HopPane) else {
+        let Some(binding) = self
+            .keybinds
+            .hint_binding(crate::keybinds::BindAction::HopPane)
+        else {
             return;
         };
         let switch = format!("{} switches", binding.hint());

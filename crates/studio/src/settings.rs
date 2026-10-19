@@ -25,7 +25,7 @@ use rustel_runtime::{
 use super::keybinds::BindAction;
 
 use super::devices::draw_border;
-use super::editor::KeyboardCapabilities;
+use super::editor::{EditorKeybindings, KeyboardCapabilities};
 use super::engine::StudioDeviceInfo;
 use super::graphics::{RenderingMode, Tier};
 use super::prebake::{PrebakeRow, PrebakeScope};
@@ -1460,6 +1460,8 @@ pub struct UiSettings {
     /// Shortcut conflict profile. None follows the detected terminal; an
     /// override changes shortcut defaults without claiming extra capabilities.
     pub terminal_profile: Option<String>,
+    pub editor_keybindings: EditorKeybindings,
+    pub vim_mappings_path: Option<String>,
     pub rendering: RenderingMode,
     /// How often the screen is repainted while something moves.
     pub frame_rate: FrameRate,
@@ -1637,6 +1639,8 @@ impl Default for UiSettings {
     fn default() -> Self {
         Self {
             terminal_profile: None,
+            editor_keybindings: EditorKeybindings::Default,
+            vim_mappings_path: None,
             rendering: RenderingMode::Automatic,
             frame_rate: FrameRate::default(),
             show_full_paths: false,
@@ -2078,9 +2082,15 @@ const VST_RESCAN_ROW: usize = 2;
 
 /// The terminal profile belongs with the bindings it determines.
 pub(super) const TERMINAL_PROFILE_ROW: usize = 0;
-pub(super) const KEYBIND_ACTION_START: usize = 1;
+pub(super) const EDITOR_KEYBINDINGS_ROW: usize = 1;
+pub(super) const KEYBIND_ACTION_START: usize = 2;
 /// The final keybind row is an action, after every binding.
 pub(super) const RESET_KEYBINDS_ROW: usize = KEYBIND_ACTION_START + BindAction::ALL.len();
+pub(super) const VIM_MAPPINGS_PATH_ROW: usize = RESET_KEYBINDS_ROW + 1;
+
+pub(super) fn keybind_count(settings: &UiSettings) -> usize {
+    RESET_KEYBINDS_ROW + 1 + usize::from(settings.editor_keybindings == EditorKeybindings::Vim)
+}
 
 pub(super) fn keybind_action_at(row: usize) -> Option<BindAction> {
     row.checked_sub(KEYBIND_ACTION_START)
@@ -2429,6 +2439,22 @@ fn grouped_rows(rows: &[Row]) -> Vec<DisplayRow> {
     display
 }
 
+fn keybind_lines(count: usize) -> Vec<DisplayRow> {
+    let mut lines = Vec::with_capacity(count + 1);
+    for index in 0..count {
+        if index == KEYBIND_ACTION_START {
+            if count > VIM_MAPPINGS_PATH_ROW {
+                lines.push(DisplayRow::Control(VIM_MAPPINGS_PATH_ROW));
+            }
+            lines.push(DisplayRow::Gap);
+        }
+        if index != VIM_MAPPINGS_PATH_ROW {
+            lines.push(DisplayRow::Control(index));
+        }
+    }
+    lines
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SettingsPage {
     #[default]
@@ -2584,6 +2610,8 @@ pub enum SettingsAction {
     ChooseSetsFolder,
     /// Enter on the recordings folder row: the sheet hands over to a picker.
     ChooseRecordingsFolder,
+    EditVimMappingsPath,
+    ResetVimMappingsPath,
     /// Enter on the sample cache row: empty it. Armed by a first Enter;
     /// the second Enter is the one that empties.
     ClearSampleCache,
@@ -2944,12 +2972,21 @@ impl SettingsSheet {
             self.confirm_reset_keybinds = false;
         }
         match code {
-            KeyCode::Up if len > 0 => {
-                self.selected = (at + len - 1) % len;
-                SettingsAction::Nothing
-            }
-            KeyCode::Down if len > 0 => {
-                self.selected = (at + 1) % len;
+            KeyCode::Up | KeyCode::Down if len > 0 => {
+                let order: Vec<_> = keybind_lines(len)
+                    .into_iter()
+                    .filter_map(|line| match line {
+                        DisplayRow::Control(row) => Some(row),
+                        _ => None,
+                    })
+                    .collect();
+                let position = order.iter().position(|row| *row == at).unwrap_or(0);
+                let next = if code == KeyCode::Up {
+                    (position + order.len() - 1) % order.len()
+                } else {
+                    (position + 1) % order.len()
+                };
+                self.selected = order[next];
                 SettingsAction::Nothing
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Enter
@@ -2968,6 +3005,20 @@ impl SettingsSheet {
                     SettingsAction::Nothing
                 }
             }
+            KeyCode::Left | KeyCode::Right | KeyCode::Enter
+                if len > 0 && at == EDITOR_KEYBINDINGS_ROW =>
+            {
+                settings.editor_keybindings.cycle();
+                SettingsAction::Changed
+            }
+            KeyCode::Delete | KeyCode::Backspace if len > 0 && at == EDITOR_KEYBINDINGS_ROW => {
+                if settings.editor_keybindings != EditorKeybindings::Default {
+                    settings.editor_keybindings = EditorKeybindings::Default;
+                    SettingsAction::Changed
+                } else {
+                    SettingsAction::Nothing
+                }
+            }
             KeyCode::Enter if len > 0 && at == RESET_KEYBINDS_ROW => {
                 if self.confirm_reset_keybinds {
                     self.confirm_reset_keybinds = false;
@@ -2976,6 +3027,12 @@ impl SettingsSheet {
                     self.confirm_reset_keybinds = true;
                     SettingsAction::AskResetKeybinds
                 }
+            }
+            KeyCode::Enter if at == VIM_MAPPINGS_PATH_ROW && len > at => {
+                SettingsAction::EditVimMappingsPath
+            }
+            KeyCode::Delete | KeyCode::Backspace if at == VIM_MAPPINGS_PATH_ROW && len > at => {
+                SettingsAction::ResetVimMappingsPath
             }
             KeyCode::Enter if len > 0 => match action {
                 Some(action) => SettingsAction::LearnKeybind(action),
@@ -3108,8 +3165,13 @@ impl SettingsSheet {
                 _ => None,
             })
             .collect(),
-            SettingsPage::Keybinds => (0..self.keybind_count)
-                .map(|index| (index, index))
+            SettingsPage::Keybinds => keybind_lines(self.keybind_count)
+                .iter()
+                .enumerate()
+                .filter_map(|(line, row)| match row {
+                    DisplayRow::Control(index) => Some((line, *index)),
+                    _ => None,
+                })
                 .collect(),
             SettingsPage::Permissions => (0..self.permissions_count)
                 .map(|index| (index, index))
@@ -3608,7 +3670,7 @@ impl SettingsSheet {
             SettingsPage::Settings | SettingsPage::Advanced | SettingsPage::Reference => {
                 self.first_line(shown, &grouped_rows(self.rows()))
             }
-            SettingsPage::Keybinds => self.first_row(shown, self.keybind_count),
+            SettingsPage::Keybinds => self.first_line(shown, &keybind_lines(self.keybind_count)),
             SettingsPage::Permissions => self.first_row(shown, self.permissions_count),
             SettingsPage::Sources => {
                 self.first_sources(shown, self.source_count, self.default_count)
@@ -3737,9 +3799,12 @@ impl SettingsSheet {
             return None;
         }
         let shown = usize::from(rows.height).max(1);
-        let first = self.first_row(shown, self.keybind_count);
-        let index = first + usize::from(y - rows.y);
-        (index < self.keybind_count).then_some(index)
+        let lines = keybind_lines(self.keybind_count);
+        let first = self.first_line(shown, &lines);
+        match lines.get(first + usize::from(y - rows.y)) {
+            Some(DisplayRow::Control(index)) => Some(*index),
+            _ => None,
+        }
     }
 
     /// The row under a point, while the permissions page is up.
@@ -4217,6 +4282,12 @@ fn keybinds_footer_hint(
 ) -> String {
     if sheet.selected == TERMINAL_PROFILE_ROW {
         return "Left/Right: choose · Enter: next · Del: automatic".to_owned();
+    }
+    if sheet.selected == EDITOR_KEYBINDINGS_ROW {
+        return "Left/Right: choose · Enter: next · Del: default".to_owned();
+    }
+    if sheet.selected == VIM_MAPPINGS_PATH_ROW {
+        return "Enter: change path · Del: use default · Esc: close".to_owned();
     }
     if sheet.selected == RESET_KEYBINDS_ROW {
         let profile = terminal_profile_label(settings, features);
@@ -5134,6 +5205,7 @@ mod tests {
                 mappings: Default::default(),
                 bindings: vec![
                     KeybindRow::default(),
+                    KeybindRow::default(),
                     KeybindRow {
                         action: "First error",
                         learning: true,
@@ -5187,7 +5259,7 @@ mod tests {
             sheet.key(KeyCode::Delete, &mut settings, &features),
             SettingsAction::Nothing
         );
-        sheet.key(KeyCode::Down, &mut settings, &features);
+        sheet.select(KEYBIND_ACTION_START);
         assert_eq!(
             sheet.key(KeyCode::Enter, &mut settings, &features),
             SettingsAction::LearnKeybind(BindAction::ALL[0])
@@ -5286,8 +5358,8 @@ mod tests {
     fn keybind_pages_follow_the_visible_height_and_clamp_at_each_end() {
         let mut settings = UiSettings::default();
         let features = TerminalFeatures::default();
-        for height in [18, 35] {
-            let area = Rect::new(0, 0, 100, height);
+        for (width, height) in [(60, 14), (100, 18), (100, 35)] {
+            let area = Rect::new(0, 0, width, height);
             let mut sheet = SettingsSheet {
                 page: SettingsPage::Keybinds,
                 keybind_count: RESET_KEYBINDS_ROW + 1,
@@ -5295,18 +5367,29 @@ mod tests {
             };
             let (_, rows) = sheet.geometry_for(area).unwrap();
             let shown = usize::from(rows.height);
+            assert_eq!(sheet.keybind_row_at(area, rows.x, rows.y), Some(0));
+            assert_eq!(sheet.keybind_row_at(area, rows.x, rows.y + 1), Some(1));
+            assert_eq!(sheet.keybind_row_at(area, rows.x, rows.y + 2), None);
+            assert_eq!(sheet.keybind_row_at(area, rows.x, rows.y + 3), Some(2));
             assert_eq!(
                 sheet.key_in_frame(KeyCode::PageDown, &mut settings, &features, area),
                 SettingsAction::Nothing
             );
-            assert_eq!(sheet.selected, shown);
-            assert!((sheet.first..sheet.first + shown).contains(&sheet.selected));
+            assert_eq!(sheet.selected, shown - 1);
+            assert!(
+                (rows.y..rows.bottom())
+                    .any(|y| sheet.keybind_row_at(area, rows.x, y) == Some(sheet.selected))
+            );
             sheet.key_in_frame(KeyCode::PageUp, &mut settings, &features, area);
             assert_eq!(sheet.selected, 0);
             sheet.key_in_frame(KeyCode::PageUp, &mut settings, &features, area);
             assert_eq!(sheet.selected, 0, "PageUp cannot wrap to the bottom");
             sheet.key_in_frame(KeyCode::End, &mut settings, &features, area);
             assert_eq!(sheet.selected, RESET_KEYBINDS_ROW);
+            assert!(
+                (rows.y..rows.bottom())
+                    .any(|y| sheet.keybind_row_at(area, rows.x, y) == Some(RESET_KEYBINDS_ROW))
+            );
             sheet.confirm_reset_keybinds = true;
             sheet.hold_scroll = true;
             sheet.key_in_frame(KeyCode::PageDown, &mut settings, &features, area);
@@ -5469,6 +5552,11 @@ mod tests {
                 ..Default::default()
             },
             KeybindRow {
+                action: "Editor keybindings",
+                chord: "Default".into(),
+                ..Default::default()
+            },
+            KeybindRow {
                 action: "Evaluate",
                 chord: "^Enter".into(),
                 also: "F5".into(),
@@ -5497,7 +5585,7 @@ mod tests {
             },
         ];
         for width in [35, 70, 100] {
-            let area = Rect::new(3, 2, width, bindings.len() as u16);
+            let area = Rect::new(3, 2, width, bindings.len() as u16 + 1);
             let mut buffer = Buffer::empty(area);
             render_keybind_rows(&bindings, 0, 0, area, &Theme::default(), &mut buffer);
             let lines: Vec<String> = (area.y..area.bottom())
@@ -5507,7 +5595,14 @@ mod tests {
                         .collect()
                 })
                 .collect();
-            let chord = lines[1][..lines[1].find("^Enter").unwrap()].width();
+            assert!(lines[KEYBIND_ACTION_START].trim().is_empty());
+            let lines: Vec<_> = lines
+                .into_iter()
+                .filter(|line| !line.trim().is_empty())
+                .collect();
+            let evaluate = &lines[KEYBIND_ACTION_START];
+            let overridden = &lines[KEYBIND_ACTION_START + 1];
+            let chord = evaluate[..evaluate.find("^Enter").unwrap()].width();
             for (line, row) in lines.iter().zip(&bindings).skip(KEYBIND_ACTION_START) {
                 assert_eq!(
                     line[..line.find(&row.chord).unwrap()].width(),
@@ -5517,10 +5612,10 @@ mod tests {
             }
             if width >= 70 {
                 assert_eq!(
-                    lines[1][..lines[1].find("default").unwrap()].width(),
-                    lines[2][..lines[2].find("overridden").unwrap()].width()
+                    evaluate[..evaluate.find("default").unwrap()].width(),
+                    overridden[..overridden.find("overridden").unwrap()].width()
                 );
-                assert!(lines[1].contains("also F5"));
+                assert!(evaluate.contains("also F5"));
             }
         }
     }
