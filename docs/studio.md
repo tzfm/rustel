@@ -40,6 +40,7 @@ Use these alternatives if the terminal or operating system takes a shortcut.
 | Stop | ^.; ^G or F8 |
 | Undo / redo | ^Z / ^⇧Z or ^Y |
 | Comment / uncomment | ^/ or ^7 |
+| Find in the score | ^⇧Y; Ctrl+Shift+F2 where the terminal keeps it |
 | Devices | ^P |
 | Master volume | ^⇧↑ / ^⇧↓; Ctrl+F12 / Ctrl+F11 |
 | Slider under the caret | Alt+↑ / Alt+↓ |
@@ -48,7 +49,8 @@ Use these alternatives if the terminal or operating system takes a shortcut.
 | Word wrap | ^U |
 | Previous / next scene | ^[ / ^]; F6 / F7 |
 | New scene / duplicate | ^N / F3 |
-| Rename / close scene | ^R / ^W |
+| Rename scene | ^R; Scene > Rename scene |
+| Close scene | ^W |
 | Record a take | ^⇧R or Shift+F11 |
 | Record an input sample | ^H |
 | Log | F9; Shift+F9 docks it |
@@ -65,6 +67,15 @@ Use these alternatives if the terminal or operating system takes a shortcut.
 | Split / close the split | ^E |
 | Focus the other pane | F10 or ^⇧E |
 | Quit | ^Q twice |
+
+Ctrl+Shift+Y opens a find bar for the score. It starts empty. Type a
+regular expression; the bar selects the first match as you type. Enter moves
+to the next match and keeps the bar open. Backspace on an empty bar leaves it
+open. Esc or a click elsewhere closes it. Some terminals keep this chord for
+themselves; Settings > Keybinds shows the fallback.
+
+Vim changes Ctrl+R and Ctrl+[ in the score editor. See [Settings](#settings)
+for Vim controls.
 
 In a split view, use **Ctrl+Shift+[ / Ctrl+Shift+]** to change scenes. F6 and F7
 also work. Each pane has its own caret and scroll position. A scene shows in one
@@ -109,8 +120,9 @@ selected scene to play it. The scene strip marks the playing scene with `▶`
 and unsaved edits with `●`.
 
 Use Ctrl+N for a new scene or F3 to duplicate the current scene. These actions
-create files. Ctrl+R renames the scene and its file. Ctrl+W closes the tab and
-saves its edits. It does not delete the file. If Studio cannot save the edits,
+create files. Scene > Rename scene renames the scene and its file. Rename has
+no default shortcut. You can assign one in Settings > Keybinds. Ctrl+W closes
+the tab and saves its edits. It does not delete the file. If Studio cannot save the edits,
 the tab stays open. Closing a scene also forgets its pad assignment and rewind
 setting.
 
@@ -134,6 +146,12 @@ until you update a score or stop it.
 
 New sets go in `<rustel-config>/sets/` by default. Change the default folder in
 Settings. This affects new sets; it does not move existing sets.
+
+In file picker and artwork popups, drag or hold Shift with movement keys to
+select text. Double-click selects the whole field. Copy, Cut, Paste, and
+Select all use your configured shortcuts.
+The selected field shows its Copy shortcut. A terminal's native Copy command
+uses the terminal's own selection.
 
 ### The set panel
 
@@ -493,9 +511,11 @@ The View menu opens the two visuals docks. Use `e` to change a dock's edge and
 `+` or `-` to resize it. Use its controls to choose a scope, spectrum, events,
 mixer, or another visual. Follow the footer for actions in the selected view.
 
-Scores can also contain inline visualizers. Visual settings control their
-appearance and opacity. See [Hydra](hydra.md) for shader visuals and backgrounds.
-Visuals stop advancing when playback stops.
+Scores can also contain inline visualizers. Use the visualizers switch in
+Settings, or View > Inline visualizers, to show or hide them. Bind a key for
+Inline visualizers on the Settings > Keybinds page. Visual settings control
+their appearance and opacity. See [Hydra](hydra.md) for shader visuals and
+backgrounds. Visuals stop advancing when playback stops.
 
 ## Themes
 
@@ -600,6 +620,129 @@ depend on terminal glyphs, colors, image support, and reported dimensions.
 An unsupported choice falls back to Automatic. Image rendering can cost more
 than text cells. Reduce the frame rate in Advanced settings if visuals use
 too much CPU. Check the Log for device or render errors.
+
+### Vim editor keys
+
+The Editor keybindings row selects Default or Vim. Default keeps the usual
+editor controls. Vim starts in Normal mode. Press `i` to insert text and Esc,
+Ctrl+[ or Ctrl+C to return to Normal mode. The status line shows the mode
+beside warnings and errors. Studio saves this choice in `studio.json`.
+
+Vim supports `hjkl`, word motions (`w`, `b`, `e`), `0`, `^`, `$`, `gg`, and `G`.
+Use `dd` to delete a line or `:42` then Enter to go to line 42. Counts work
+with motions and edits, such as `3j` and `2dd`. Use `a`, `I`, `A`, `o`, and `O`
+to enter Insert mode, `d`, `c`, and `y` with a motion to delete, change, or
+copy text, and `p` or `P` to put it back. `D` deletes to the end of the line.
+`C` changes that text. `v` selects characters and `V` selects lines.
+`u` undoes an edit. Ctrl+R in Normal or Visual mode redoes it.
+`:redo` then Enter also redoes an edit.
+
+`/` searches forward and `?` backward. Type a regular expression and press
+Enter. `n` repeats the search and `N` repeats it in the other direction; both
+take counts, such as `2n`. A count on the search also works: `3/foo` lands on
+the third match. An empty pattern repeats the last search. The search wraps
+and is case-sensitive. It uses the Rust regex syntax in
+[regex](https://docs.rs/regex/latest/regex/#syntax), so `\$` finds a literal
+dollar sign and `\d+` finds digits. Backreferences and look-around are not
+supported. Zero-width matches are skipped.
+
+Text objects select or edit text between separators. `vi(` selects inside
+parentheses, and `vi"` selects inside double quotes. Use `a` instead of `i`
+to include the separators, such as `va(`. These objects also work with `d`,
+`c`, and `y`, such as `ci"` to replace a string. Supported separators are
+`()`, `[]`, `{}`, `<>`, single quotes, double quotes, and backticks.
+
+Vim keys take priority while the editor has focus, including keys you assign
+to Studio actions. Unclaimed keys keep their Studio action. A pending Vim
+command or mapping owns the next key. Settings, prompts, and other panels
+keep their usual controls. Menus show the shortcuts available in the current
+context. In Insert mode, Ctrl+R is reserved for register entry, which is not
+supported. Pasted text stays literal. On terminals without bracketed paste,
+enter Insert mode before pasting.
+
+### Custom Vim mappings
+
+The first time you enable Vim, Studio creates `~/.rustel/vimrc` if it does not
+exist. `RUSTEL_CONFIG_DIR` changes that folder. Built-in bindings remain active
+until a map line overrides them.
+
+Edit the file in your own editor. The Vim mappings path row appears below
+Editor keybindings when Vim is enabled. Press Enter to set a full file path,
+or Del to restore the default path. Studio saves the path in `studio.json`
+and keeps it when you switch between Default and Vim. The file can be a
+dedicated Vimscript file or a copy of your Vim or Neovim mappings. The file
+name and extension do not matter; Studio reads map lines from the file.
+
+For example, this file searches the score with `J` and `K`, types an
+underscore with `M`, toggles the inline visualizers with Space V, and leaves
+Insert mode with `jk`:
+
+```vim
+nnoremap U <Action:update>
+nnoremap Q <Action:stop>
+nnoremap <Space>V <Action:visualizers>
+nnoremap J /\$<CR>
+nnoremap K ?\$<CR>
+nnoremap M i_<C-c>l
+nnoremap X hx
+inoremap jk <Esc>
+```
+
+Studio reads these map commands: `noremap`, `map`, `nnoremap`, `inoremap`,
+`vnoremap`, `xnoremap`, and `onoremap`. `noremap` and `map` apply to Normal,
+Visual, and Operator-pending mode. Before the left-hand side, Studio ignores
+the flags `<silent>`, `<nowait>`, `<buffer>`, `<unique>`, `<special>`, and
+`<script>`.
+
+Each map takes a key sequence and a replacement. Replacement keys use the
+built-in commands and do not expand other mappings. Use uppercase letters for
+Shift, `<C-r>` for Ctrl+R, `<A-x>` for Alt+X, and `<S-Tab>` for Shift+Tab.
+Named keys include `<Esc>`, `<CR>`, `<Enter>`, `<Tab>`, `<BS>`, `<Del>`,
+`<Space>`, `<lt>`, arrow keys, `<Home>`, `<End>`, `<PageUp>`, `<PageDown>`,
+and `<F1>` through `<F24>`. Use `<lt>` for a literal `<`. `<Nop>` disables
+the input sequence in that mode. Your terminal must send the keys to Studio
+for a mapping to work.
+
+Studio skips a line it cannot use: Ex commands (`:...`), plugin commands,
+function callbacks, `<leader>`, `<Plug>`, and unknown key notation. Write
+your actual leader key, such as `<Space>V`, instead of `<leader>V`.
+
+A replacement can call a Studio action: `<Action:update>`, `<Action:stop>`,
+`<Action:visualizers>`, `<Action:find>`, or a label from the Keybinds page
+such as `<Action:toggle inline visualizers>`. The action follows its binding,
+so a rebind moves the mapping with it. Pointing the map at the action's key
+also works, but it stops following if the key changes. An unknown action name
+skips the line.
+
+The stable names for `<Action:...>` are:
+
+- Transport: `update`, `stop`, `rewind-update`
+- Menus and surfaces: `menu-bar`, `help`, `settings`, `devices`, `theme`,
+  `reference`, `docs`, `piano-mode`, `set-panel`, `mixer`, `visuals-one`,
+  `visuals-two`, `visualizers`, `log`, `log-sticky`, `focus-panels`, `jobs`,
+  `memory`, `export`, `smart-action`, `split`, `hop-pane`
+- Editor: `undo`, `redo`, `copy`, `cut`, `paste`, `select-all`, `comment`,
+  `find`, `first-error`
+- Scenes: `new-scene`, `duplicate-scene`, `record-take`, `record-sample`,
+  `rename-scene`, `close-scene`, `learn-pad`, `forget-pad`, `scene-rewind`,
+  `previous-scene`, `next-scene`
+- View: `word-wrap`, `zen-mode`, `master-up`, `master-down`, `open-set`, `quit`
+- Panels: `show-file`, `rename-file`, `delete-sample`, `trim-sample`,
+  `focus-timeline`
+
+Names are case-insensitive. The label shown on the Keybinds page also works.
+
+Studio does not run the file as Vimscript; it only reads map lines.
+Conditions and function bodies are not evaluated: a map line inside `if` or
+`function` is read the same way. Comments start with `"` on their own line.
+
+Studio reloads external edits automatically between commands. An incomplete
+key sequence waits up to one second, then uses the matching shorter mapping
+or the original keys. A missing file uses built-in bindings. Studio never
+overwrites an existing mapping file.
+
+This is a native subset of Vim. It does not load plugins or run Vimscript, and
+named registers are not supported.
 
 ### On a bare Linux console
 

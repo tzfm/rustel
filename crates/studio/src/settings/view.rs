@@ -626,7 +626,8 @@ pub(super) fn render_keybinds(
     let theme = view.theme;
     let width = usize::from(rows.width);
     let shown = usize::from(rows.height).max(1);
-    let first = view.sheet.first_row(shown, view.bindings.len());
+    let lines = keybind_lines(view.bindings.len());
+    let first = view.sheet.first_line(shown, &lines);
     render_keybind_rows(
         &view.bindings,
         view.sheet.selected,
@@ -637,7 +638,11 @@ pub(super) fn render_keybinds(
     );
     // The count of what is off screen, said rather than left to be found
     // by reaching for it.
-    let hidden_below = view.bindings.len().saturating_sub(first + shown);
+    let hidden_below = lines
+        .iter()
+        .skip(first + shown)
+        .filter(|line| matches!(line, DisplayRow::Control(_)))
+        .count();
     let more = if hidden_below > 0 {
         format!(" · ↓ {hidden_below} more")
     } else {
@@ -804,6 +809,7 @@ pub(super) fn render_keybind_rows(
     let chord_width = bindings
         .iter()
         .skip(KEYBIND_ACTION_START)
+        .take(super::super::keybinds::BindAction::ALL.len())
         .map(|row| row.chord.width())
         .max()
         .unwrap_or(7)
@@ -844,13 +850,16 @@ pub(super) fn render_keybind_rows(
         .max(6)
         + 5;
     let state_x = alternate_x + alternate_width + 2;
-    for (offset, (index, row)) in bindings
-        .iter()
-        .enumerate()
+    for (offset, line) in keybind_lines(bindings.len())
+        .into_iter()
         .skip(first)
         .take(usize::from(rows.height))
         .enumerate()
     {
+        let DisplayRow::Control(index) = line else {
+            continue;
+        };
+        let row = &bindings[index];
         let y = rows.y + offset as u16;
         let selected = index == selected_row;
         let style = if row.confirm || row.learning {
@@ -862,7 +871,7 @@ pub(super) fn render_keybind_rows(
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD)
-        } else if row.learnt {
+        } else if index < KEYBIND_ACTION_START || index == VIM_MAPPINGS_PATH_ROW || row.learnt {
             Style::default().fg(theme.foreground)
         } else {
             Style::default().fg(theme.muted)
@@ -887,9 +896,8 @@ pub(super) fn render_keybind_rows(
             },
             1,
         );
-        // The terminal name is the setting's value, not a short key chord.
-        // Give it the whole row instead of clipping it to the chord column.
-        if index == TERMINAL_PROFILE_ROW {
+        // Settings values use the whole row instead of the chord column.
+        if index < KEYBIND_ACTION_START || index == VIM_MAPPINGS_PATH_ROW {
             cell(2, &format!("{}: {}", row.action, row.chord), width);
             continue;
         }

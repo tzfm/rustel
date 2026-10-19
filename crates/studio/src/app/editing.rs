@@ -7,6 +7,141 @@
 use super::*;
 
 impl App {
+    pub(super) fn sync_editor_keybindings(&mut self) {
+        self.keybinds
+            .set_editor_keybindings(self.ui_settings.editor_keybindings);
+        let mappings = self.vim_config.mappings();
+        for scene in self.scenes.scenes_mut() {
+            scene
+                .editor
+                .set_keybindings(self.ui_settings.editor_keybindings);
+            scene.editor.set_vim_mappings(Arc::clone(&mappings));
+        }
+        self.refresh_editor_shortcut_hints();
+    }
+
+    pub(super) fn editor_cursor_shape(&self) -> super::super::terminal::CaretShape {
+        if self.editor_accepts_raw_paste() && !self.editor().vim_is_insert() {
+            super::super::terminal::CaretShape::SteadyBlock
+        } else {
+            self.theme.caret_shape(self.ui_settings.caret_shape)
+        }
+    }
+
+    pub(super) fn dispatch_vim_key(&mut self, key: KeyEvent) -> Result<bool, RuntimeError> {
+        let moment = self.moment();
+        if self
+            .scenes
+            .current_mut()
+            .editor
+            .vim_queue_mapped_key(key, moment)
+        {
+            self.drain_vim_mappings(false)?;
+            self.dirty_frame = true;
+            return Ok(true);
+        }
+        self.dispatch_vim_builtin(key)
+    }
+
+    pub(super) fn flush_vim_mapping_timeout(&mut self) -> Result<(), RuntimeError> {
+        if self.editor().vim_mapping_timed_out(self.moment()) {
+            self.flush_vim_mapping_pending()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn flush_vim_mapping_pending(&mut self) -> Result<(), RuntimeError> {
+        self.drain_vim_mappings(true)
+    }
+
+    fn drain_vim_mappings(&mut self, force: bool) -> Result<(), RuntimeError> {
+        while let Some((mapped, remaining)) =
+            self.scenes.current_mut().editor.vim_take_mapped_keys(force)
+        {
+            for step in mapped {
+                match step {
+                    crate::vim_config::VimMappedKey::Key(key) => {
+                        if self.editor_accepts_raw_paste() && self.dispatch_vim_builtin(key)? {
+                            if self.editor().vim_motion_blocked() {
+                                break;
+                            }
+                        } else {
+                            self.route_terminal_event(Event::Key(key), false)?;
+                        }
+                    }
+                    crate::vim_config::VimMappedKey::Action(action) => {
+                        // A Studio action is not a Vim motion. A pending
+                        // operator must not wait for the next key.
+                        self.editor_mut().vim_cancel_pending();
+                        self.dispatch_bind_action(action, false)?;
+                    }
+                }
+            }
+            for key in remaining {
+                self.handle_terminal_event(Event::Key(key))?;
+            }
+        }
+        self.refresh_editor_shortcut_hints();
+        Ok(())
+    }
+
+    fn dispatch_vim_builtin(&mut self, key: KeyEvent) -> Result<bool, RuntimeError> {
+        let kind = key.kind;
+        let mut key = crate::vim_config::canonical_key(key);
+        key.kind = kind;
+        let pending = self.editor().vim_has_pending_command();
+        let before = self.editor().revision();
+        let previous_caret = self.editor().primary_selection().head.0;
+        let moment = self.moment();
+        let atomic_delete_range = if !self.editor().vim_is_insert()
+            && matches!(key.code, KeyCode::Char('x') | KeyCode::Delete)
+        {
+            self.slider_delete_range(&Command::DeleteForward)
+        } else {
+            None
+        };
+        let outcome = self
+            .scenes
+            .current_mut()
+            .editor
+            .vim_key(key, moment, atomic_delete_range);
+        let mut handled = match outcome {
+            Ok(handled) => {
+                if handled {
+                    self.clear_error(ErrorOwner::Editor);
+                }
+                handled
+            }
+            Err(error) => {
+                self.set_error(ErrorOwner::Editor, error.to_string());
+                true
+            }
+        };
+        if !handled && pending {
+            self.scenes.current_mut().editor.vim_cancel_pending();
+            handled = true;
+        }
+        if !handled && let Some(command) = self.editor().vim_insert_command(key) {
+            self.dispatch_editor(command)?;
+            return Ok(true);
+        }
+        if handled {
+            if self.editor().revision() != before || self.editor().vim_needs_escape() {
+                self.focus = Focus::Editor;
+            }
+            if self.editor().revision() != before {
+                #[cfg(feature = "hydra")]
+                self.sync_settings_webcam_preview();
+                self.armed_slider = None;
+                self.drop_pane_selection();
+            }
+            self.after_document_change(before, true);
+            self.warp_caret_over_sliders(previous_caret);
+            self.dirty_frame = true;
+        }
+        Ok(handled)
+    }
+
     pub(super) fn forward_mouse_to_editor(
         &mut self,
         mouse: MouseEvent,
@@ -28,6 +163,13 @@ impl App {
                 .editor
                 .mouse_event(mouse, map, moment)
         };
+        let outcome = outcome.and_then(|changed| {
+            self.scenes
+                .current_mut()
+                .editor
+                .vim_normalize_after_input()?;
+            Ok(changed)
+        });
         match outcome {
             Ok(changed) => {
                 self.clear_error(ErrorOwner::Editor);
@@ -59,6 +201,13 @@ impl App {
                 .current_mut()
                 .editor
                 .dispatch(command, moment, &mut *self.clipboard);
+        let outcome = outcome.and_then(|effects| {
+            self.scenes
+                .current_mut()
+                .editor
+                .vim_normalize_after_input()?;
+            Ok(effects)
+        });
         match outcome {
             Ok(effects) => {
                 self.clear_error(ErrorOwner::Editor);

@@ -66,6 +66,8 @@ pub enum MenuAction {
     Paste,
     SelectAll,
     ToggleComment,
+    /// Search the focused score with a regular expression.
+    Find,
     FirstError,
     /// The caret's number, turned into a fader.
     SmartAction,
@@ -94,6 +96,8 @@ pub enum MenuAction {
     SetPanel,
     VizPanel,
     VizPanelTwo,
+    /// The inline visualizers under their calls in the score.
+    Visualizers,
     Split,
     HopPane,
     SwitchPanel,
@@ -1222,6 +1226,8 @@ pub struct MenuContext<'a> {
     pub set_panel: bool,
     /// Which visuals docks are open.
     pub viz_panels: [bool; 2],
+    /// The inline visualizers under their calls are shown.
+    pub visualizers: bool,
     pub split: bool,
     pub zen: bool,
     /// The mixer panel is open.
@@ -1278,7 +1284,7 @@ pub(super) fn scene_shortcut_hint(
     action: super::keybinds::BindAction,
     split: bool,
 ) -> String {
-    let Some(binding) = keybinds.binding(action) else {
+    let Some(binding) = keybinds.hint_binding(action) else {
         return String::new();
     };
     if keybinds.overridden(action) || binding != action.default_binding() {
@@ -1293,12 +1299,13 @@ pub(super) fn scene_shortcut_hint(
             ..binding
         };
         let event = KeyEvent::new(shifted.code, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
-        if keybinds.accepts_legacy_alias(action, &event) {
+        if keybinds.hint_available(event) && keybinds.accepts_legacy_alias(action, &event) {
             return shifted.hint();
         }
     }
     keybinds
         .effective_alias(action)
+        .filter(|alias| keybinds.hint_available(alias.event()))
         .map(|alias| alias.hint())
         .unwrap_or_default()
 }
@@ -1467,6 +1474,12 @@ pub fn menus(cx: &MenuContext) -> Vec<Menu> {
                 'm',
                 hint(BindAction::ToggleComment),
             ),
+            MenuItem::action(
+                MenuAction::Find,
+                "Find\u{2026}",
+                'n',
+                hint(BindAction::Find),
+            ),
             MenuItem::separator(),
             // The one row that turns a number into a fader, or pastes
             // the latest recorded sample - greyed where there is
@@ -1633,6 +1646,15 @@ pub fn menus(cx: &MenuContext) -> Vec<Menu> {
                 "Visuals 2",
                 'v',
                 hint(BindAction::VisualsTwo),
+            ),
+            MenuItem::new(
+                MenuItemKind::Toggle {
+                    id: MenuAction::Visualizers,
+                    on: cx.visualizers,
+                },
+                "Inline visualizers",
+                'e',
+                hint(BindAction::Visualizers),
             ),
             MenuItem::action(
                 MenuAction::Split,
@@ -1828,6 +1850,7 @@ mod tests {
             can_record_session: true,
             set_panel: false,
             viz_panels: [false, false],
+            visualizers: true,
             split: false,
             zen: false,
             mixer: false,
@@ -2121,6 +2144,8 @@ mod tests {
             (BindAction::MasterDown, MenuAction::MasterDown),
             (BindAction::Reference, MenuAction::Reference),
             (BindAction::Docs, MenuAction::Docs),
+            (BindAction::Find, MenuAction::Find),
+            (BindAction::Visualizers, MenuAction::Visualizers),
             (BindAction::PianoMode, MenuAction::PianoMode),
             (BindAction::SetPanel, MenuAction::SetPanel),
             (BindAction::HopPane, MenuAction::HopPane),

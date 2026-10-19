@@ -265,6 +265,15 @@ impl Studio {
         self.handle(Event::Key(crossterm::event::KeyEvent::new(code, modifiers)));
     }
 
+    /// Send a held key reported by an enhanced keyboard protocol.
+    pub fn repeat(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        self.handle(Event::Key(crossterm::event::KeyEvent::new_with_kind(
+            code,
+            modifiers,
+            crossterm::event::KeyEventKind::Repeat,
+        )));
+    }
+
     /// Send a chord by name: `"ctrl+s"`, `"ctrl+shift+x"`, `"f5"`. A typo is
     /// a panic - a test that names a chord that does not exist is broken,
     /// not merely unsuccessful.
@@ -713,6 +722,17 @@ impl Studio {
             )))
             .expect("caret moved");
         self.snapshot();
+    }
+
+    /// The focused scene's caret byte offset - where a search or a motion
+    /// landed, without reading it back off the screen.
+    pub fn caret(&self) -> usize {
+        self.app.editor().primary_selection().head.0
+    }
+
+    /// Whether the score's inline visualizers are switched on.
+    pub fn inline_visualizers(&self) -> bool {
+        self.app.ui_settings.animation
     }
 
     /// The reference panel's tab, when the panel is open - what Tab walks

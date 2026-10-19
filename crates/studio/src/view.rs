@@ -365,6 +365,10 @@ pub struct StudioChrome<'a> {
     pub evaluating_for: Option<Duration>,
     pub dirty: bool,
     pub status: &'a str,
+    /// Editor mode or pending command, kept visible beside diagnostics.
+    pub vim_label: Option<&'a str>,
+    /// The find bar outside Vim: `FIND /pattern`.
+    pub find_label: Option<&'a str>,
     /// A remote-control listener is active; the status line shows a
     /// clickable `<>` icon.
     pub remote_control: bool,
@@ -1224,8 +1228,22 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
     if view.reference_on_top {
         draw_reference(frame, &mut cursor);
     }
+    let copy_hint = chrome
+        .keybinds
+        .binding(super::keybinds::BindAction::Copy)
+        .map(|key| key.hint());
+    let prompt_active = !view.help_open && chrome.menu.is_none();
     if let Some(picker) = view.set_prompt {
-        frame.render_widget(super::file_picker::FilePickerView { picker, theme }, area);
+        frame.render_widget(
+            super::file_picker::FilePickerView {
+                picker,
+                theme,
+                copy_hint: copy_hint
+                    .as_deref()
+                    .filter(|_| prompt_active && view.focused_panel == Some(PanelKind::Set)),
+            },
+            area,
+        );
     }
     if let Some(viz) = view
         .viz
@@ -1241,13 +1259,24 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
             area,
         );
     }
-    if let Some(picker) = view
+    if let Some((index, picker)) = view
         .viz
         .iter()
-        .flatten()
-        .find_map(|viz| viz.panel.prompt.as_ref())
+        .enumerate()
+        .find_map(|(index, viz)| Some((index, viz.as_ref()?.panel.prompt.as_ref()?)))
     {
-        frame.render_widget(super::file_picker::FilePickerView { picker, theme }, area);
+        frame.render_widget(
+            super::file_picker::FilePickerView {
+                picker,
+                theme,
+                copy_hint: copy_hint.as_deref().filter(|_| {
+                    prompt_active
+                        && view.focused_panel == Some(PanelKind::Viz)
+                        && view.viz_focus == index
+                }),
+            },
+            area,
+        );
     }
     // Error navigation and panel rotation share this one restrained landing
     // accent. The terminal keeps drawing its ordinary caret inside the score.
@@ -1388,6 +1417,8 @@ mod tests {
             evaluating_for: None,
             dirty: false,
             status: "ready",
+            vim_label: None,
+            find_label: None,
             remote_control: false,
             remote_receiving: false,
             piano: None,

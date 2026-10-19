@@ -97,6 +97,8 @@ impl App {
         // theme's own look is what a fresh install starts with.
         self.ui_settings = self.prefs.ui_settings_for(&self.theme);
         self.apply_shortcut_profile();
+        self.refresh_vim_config();
+        self.sync_editor_keybindings();
         // The command line wins over the kept preference: the worker was
         // started with the flag's size, and what is applied below must
         // agree with it rather than put the kept size (or Automatic) back.
@@ -162,6 +164,23 @@ impl App {
             "this terminal is {detected}, but shortcut profile {} is selected - Del on Settings > Keybinds > Terminal returns to automatic; until then Studio does not avoid the keys this terminal takes",
             self.shortcut_profile_label()
         ))
+    }
+
+    /// Flip the inline visualizers switch, as the Settings row does.
+    pub(super) fn toggle_visualizers(&mut self) {
+        self.ui_settings.animation = !self.ui_settings.animation;
+        self.apply_ui_settings();
+        if let Some(revision) = self.visual_revision {
+            self.install_virtual_rows(revision);
+        }
+        self.prefs.set_ui_settings(&self.ui_settings);
+        self.save_prefs_soon();
+        self.status = if self.ui_settings.animation {
+            "visualizers on - inline visuals show under their calls".into()
+        } else {
+            "visualizers off - the code takes their rows".into()
+        };
+        self.dirty_frame = true;
     }
 
     pub(super) fn apply_ui_settings(&mut self) {
@@ -306,6 +325,12 @@ impl App {
         if let Some(sheet) = self.settings_sheet.take() {
             self.settings_navigation = sheet.remembered_navigation();
         }
+        // A picker the sheet opened belongs to it. Leaving the picker up
+        // would leave a popup whose page is gone, and no key would return
+        // to it.
+        if self.set_prompt_return_focus == Some(Focus::Panel(PanelKind::Settings)) {
+            self.close_set_prompt();
+        }
     }
 
     /// Open or close the settings sheet using its current shortcut.
@@ -402,7 +427,7 @@ impl App {
         // tab clicked, never a key pressed - must still find its
         // rows, or the page reads fine and clicks like a wall.
         if let Some(sheet) = self.settings_sheet.as_mut() {
-            sheet.keybind_count = super::super::settings::RESET_KEYBINDS_ROW + 1;
+            sheet.keybind_count = super::super::settings::keybind_count(&self.ui_settings);
         }
         if let Some(row) = self
             .settings_sheet
@@ -419,7 +444,9 @@ impl App {
                 sheet.select(row);
                 sheet.hold_scroll = true;
             }
-            if row == super::super::settings::TERMINAL_PROFILE_ROW {
+            if row < super::super::settings::KEYBIND_ACTION_START
+                || row == super::super::settings::VIM_MAPPINGS_PATH_ROW
+            {
                 self.keybind_learn = None;
                 self.handle_settings_key(KeyCode::Enter, false, false);
             } else if row == super::super::settings::RESET_KEYBINDS_ROW {
@@ -629,7 +656,7 @@ impl App {
         sheet.default_count = self.shipped_sources.len();
         // The learnable rows plus the fixed ones past them (the panels'
         // Alt chords, which a learn can neither take nor move).
-        sheet.keybind_count = super::super::settings::RESET_KEYBINDS_ROW + 1;
+        sheet.keybind_count = super::super::settings::keybind_count(&self.ui_settings);
         sheet.permissions_count = self.permission_row_count();
         #[cfg(feature = "vst")]
         self.count_vst_folders(&mut sheet);
@@ -660,6 +687,8 @@ impl App {
                 let polyphony_changed = settings.max_polyphony != self.ui_settings.max_polyphony;
                 let terminal_profile_changed =
                     settings.terminal_profile != self.ui_settings.terminal_profile;
+                let editor_keybindings_changed =
+                    settings.editor_keybindings != self.ui_settings.editor_keybindings;
                 let precache_changed =
                     settings.precache_sources != self.ui_settings.precache_sources;
                 let zen_changed = settings.zen != self.ui_settings.zen;
@@ -697,6 +726,11 @@ impl App {
                 self.ui_settings = settings;
                 if terminal_profile_changed {
                     self.apply_shortcut_profile();
+                }
+                if editor_keybindings_changed {
+                    self.refresh_vim_config();
+                    self.sync_editor_keybindings();
+                    sheet.keybind_count = super::super::settings::keybind_count(&self.ui_settings);
                 }
                 self.apply_ui_settings();
                 if opacity_changed {
@@ -736,6 +770,17 @@ impl App {
                             self.shortcut_profile_label()
                         )
                     });
+                } else if editor_keybindings_changed {
+                    self.status = self
+                        .vim_config
+                        .error()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| {
+                            format!(
+                                "editor keybindings: {}",
+                                self.ui_settings.editor_keybindings.label()
+                            )
+                        });
                 } else if polyphony_changed {
                     self.status =
                         if let Some(voices) = self.worker.master().max_polyphony_override() {
@@ -818,6 +863,14 @@ impl App {
                 self.sync_settings_webcam_preview();
                 return true;
             }
+            SettingsAction::EditVimMappingsPath => {
+                self.settings_sheet = Some(sheet);
+                self.open_set_prompt(SetPrompt::VimMappingsPath);
+                #[cfg(feature = "hydra")]
+                self.sync_settings_webcam_preview();
+                return true;
+            }
+            SettingsAction::ResetVimMappingsPath => self.set_vim_mappings_path(None),
             SettingsAction::AskClearSampleCache => {
                 self.status = "Enter again clears the cache · Esc cancels".into();
             }
@@ -1238,15 +1291,24 @@ impl App {
         self.dirty_frame = true;
     }
 
-    /// The shortcut rows, for the settings sheet's Keybinds page: the
-    /// action, the chord as every surface spells it, and whether it is
-    /// the player's or the studio's own.
+    /// Keep assigned shortcuts visible here even when the editor owns them.
     pub(super) fn keybind_rows(&self) -> Vec<super::super::settings::KeybindRow> {
-        std::iter::once(super::super::settings::KeybindRow {
-            action: "Terminal",
-            chord: super::super::settings::terminal_row_label(&self.ui_settings, &self.features),
-            ..Default::default()
-        })
+        [
+            super::super::settings::KeybindRow {
+                action: "Terminal",
+                chord: super::super::settings::terminal_row_label(
+                    &self.ui_settings,
+                    &self.features,
+                ),
+                ..Default::default()
+            },
+            super::super::settings::KeybindRow {
+                action: "Editor keybindings",
+                chord: self.ui_settings.editor_keybindings.label().to_owned(),
+                ..Default::default()
+            },
+        ]
+        .into_iter()
         .chain(
             super::super::keybinds::BindAction::ALL
                 .into_iter()
@@ -1263,7 +1325,22 @@ impl App {
                             ..
                         }) if learning == action => (chord.hint(), true),
                         _ if learning => (String::new(), false),
-                        _ => (self.keybinds.hint(action), false),
+                        _ => (
+                            self.keybinds
+                                .binding(action)
+                                .map(|binding| binding.hint())
+                                .or_else(|| {
+                                    action.panel_letter().map(|letter| {
+                                        super::super::keybinds::shortcut_label(&format!(
+                                            "Alt+{}",
+                                            letter.to_ascii_uppercase()
+                                        ))
+                                        .into_owned()
+                                    })
+                                })
+                                .unwrap_or_default(),
+                            false,
+                        ),
                     };
                     super::super::settings::KeybindRow {
                         action: action.label(),
@@ -1302,6 +1379,15 @@ impl App {
                 .is_some_and(|sheet| sheet.confirm_reset_keybinds),
             ..Default::default()
         }))
+        .chain(
+            (self.ui_settings.editor_keybindings == crate::editor::EditorKeybindings::Vim).then(
+                || super::super::settings::KeybindRow {
+                    action: "Vim mappings path",
+                    chord: self.vim_mappings_path_label(),
+                    ..Default::default()
+                },
+            ),
+        )
         .collect()
     }
 }
@@ -1313,6 +1399,22 @@ mod tests {
 
         use crate::app::tests::support::*;
         use crate::app::*;
+
+        #[test]
+        fn the_visualizers_chord_toggles_the_inline_visualizers() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.keybinds.learn(
+                crate::keybinds::BindAction::Visualizers,
+                Some(crate::keybinds::KeyCombo::parse("ctrl+shift+g").expect("chord")),
+            );
+            let before = app.ui_settings.animation;
+            let chord = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+            press(&mut app, KeyCode::Char('g'), chord);
+            assert_eq!(app.ui_settings.animation, !before);
+            press(&mut app, KeyCode::Char('g'), chord);
+            assert_eq!(app.ui_settings.animation, before);
+        }
 
         #[test]
         fn samples_reveal_shortcut_targets_only_the_selected_local_import() {
@@ -1429,6 +1531,50 @@ mod tests {
                     "wheel did not move {page:?}"
                 );
             }
+        }
+
+        #[test]
+        fn a_press_behind_a_settings_picker_puts_it_away_before_esc_closes_the_sheet() {
+            use crate::settings::{SettingsPage, VIM_MAPPINGS_PATH_ROW};
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            app.regions = view::regions(app.frame, false, 1, false, true, None, None);
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            let mut sheet = SettingsSheet::default();
+            sheet.show_page(SettingsPage::Keybinds);
+            sheet.selected = VIM_MAPPINGS_PATH_ROW;
+            sheet.keybind_count = crate::settings::keybind_count(&app.ui_settings);
+            app.settings_sheet = Some(sheet);
+            app.focus = Focus::Panel(PanelKind::Settings);
+
+            assert!(app.handle_settings_key(KeyCode::Enter, false, false));
+            assert!(app.set_prompt.is_some(), "the path picker is open");
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Set));
+
+            // A press on a tab of the page behind the picker.
+            let (panel, _) =
+                crate::settings::SettingsSheetView::geometry(app.settings_sheet_frame())
+                    .expect("settings geometry");
+            let tab = (panel.x..panel.right())
+                .find(|x| SettingsSheet::tab_at(app.settings_sheet_frame(), *x, panel.y).is_some())
+                .expect("a settings tab");
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                tab,
+                panel.y,
+            );
+
+            assert!(app.set_prompt.is_none(), "the press puts the picker away");
+            assert!(app.settings_sheet.is_some(), "the sheet stays");
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Settings));
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(
+                app.settings_sheet.is_none(),
+                "Esc closes the sheet, not the picker behind it"
+            );
         }
 
         /// The natively drawn camera theme opens a camera on the same terms

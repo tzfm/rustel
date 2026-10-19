@@ -534,7 +534,7 @@ impl MixerPanelView<'_> {
         });
         let hide = self
             .keybinds
-            .binding(super::keybinds::BindAction::Mixer)
+            .hint_binding(super::keybinds::BindAction::Mixer)
             .map(|binding| format!("{} hides the mixer · ", binding.hint()))
             .unwrap_or_default();
         let unfocused_hint =

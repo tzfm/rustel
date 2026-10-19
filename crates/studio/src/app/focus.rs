@@ -374,6 +374,7 @@ impl App {
         self.slider_precision = None;
         self.smart_action = None;
         self.replay_edit = None;
+        self.editor_mut().find_cancel();
         if !keep.contains(&PanelKind::Set) && self.set_prompt.is_some() {
             self.close_set_prompt();
         }

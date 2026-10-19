@@ -551,16 +551,18 @@ impl App {
     /// way back to the switch, so the status names that chord, or the
     /// preferences file when Settings has none.
     pub(super) fn toggle_show_menu(&mut self) {
-        self.status = if self.toggle_chrome_row(|settings| &mut settings.show_menu) {
+        let shown = self.toggle_chrome_row(|settings| &mut settings.show_menu);
+        self.refresh_editor_shortcut_hints();
+        self.status = if shown {
             "menu bar shown".into()
-        } else if let Some(chord) = self.keybinds.binding(BindAction::Settings) {
+        } else if let Some(chord) = self.keybinds.hint_binding(BindAction::Settings) {
             format!(
                 "menu bar hidden - {} opens settings to bring it back",
                 chord.hint()
             )
         } else {
             format!(
-                "menu bar hidden - settings has no chord; show_menu in {} brings it back",
+                "menu bar hidden - settings has no available chord; show_menu in {} brings it back",
                 super::super::prefs::PREFS_FILE_NAME
             )
         };

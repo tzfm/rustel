@@ -389,7 +389,7 @@ impl Widget for Footer<'_, '_> {
         // the dock.
         let remote_indicator = remote_indicator_rect(hits.status, self.chrome.remote_control);
         let right_edge = hits.status.right();
-        let message_left = if remote_indicator.is_empty() {
+        let mut message_left = if remote_indicator.is_empty() {
             content.x.saturating_add(1)
         } else {
             remote_indicator.right().saturating_add(1)
@@ -429,6 +429,38 @@ impl Widget for Footer<'_, '_> {
             (_, _, _, _, Some(lint)) => (format!("✗ {lint}"), theme.warn),
             _ => (self.chrome.status.to_owned(), theme.foreground),
         };
+        let label = self
+            .chrome
+            .find_label
+            .map(str::to_owned)
+            .or_else(|| self.chrome.vim_label.map(|label| format!("VIM {label}")));
+        if self.chrome.piano.is_none()
+            && let Some(label) = label
+        {
+            let label = crate::terminal::safe_text(&label);
+            let label = ellipsize(&label, right_edge.saturating_sub(message_left));
+            buffer.set_stringn(
+                message_left,
+                content.y,
+                &label,
+                usize::from(right_edge.saturating_sub(message_left)),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            );
+            message_left += UnicodeWidthStr::width(label.as_str()) as u16;
+            if right_edge.saturating_sub(message_left) >= 3 {
+                buffer.set_string(
+                    message_left,
+                    content.y,
+                    " · ",
+                    Style::default().fg(theme.muted),
+                );
+                message_left += 3;
+            } else {
+                message_left = right_edge;
+            }
+        }
         // The caret's line and column, a vim-style ruler (`2,4`), shown the
         // way vim's own ruler always is. The gutter can be turned off and
         // the column is shown nowhere else, so it stays put right of the
@@ -1050,6 +1082,7 @@ mod tests {
         let mut chrome = chrome(&theme, &master, Path::new("live.strudel"));
         chrome.status = "PIANO  C4 + E4 + G4";
         chrome.piano = Some(0.5);
+        chrome.vim_label = Some("NORMAL");
         chrome.piano_notes = Some("Notes  C4 + E4 + G4");
         chrome.device = Some("Speakers");
         chrome.audio_warning =
@@ -1066,6 +1099,7 @@ mod tests {
         assert!(text.contains(chrome.audio_warning.unwrap()));
         assert!(text.contains("Notes  C4 + E4 + G4"));
         assert!(text.contains("PIANO  C4 + E4 + G4"));
+        assert!(!text.contains("VIM"));
         assert!(row(&buffer, 0).contains("Notes  C4 + E4 + G4"));
         assert!(row(&buffer, 1).contains(chrome.audio_warning.unwrap()));
         assert!(row(&buffer, 2).contains("PIANO"));
@@ -1138,6 +1172,39 @@ mod tests {
                 assert!(row.contains(hint), "{width}x{height}: {row}");
                 assert_eq!(buffer.cell((1, 0)).unwrap().fg, theme.warn);
                 assert!(!text_of(&buffer).contains("ready"), "{width}x{height}");
+            }
+        }
+    }
+
+    #[test]
+    fn vim_commands_stay_visible_beside_inline_notices() {
+        UiSettings::default().apply();
+        let theme = theme();
+        let master = MasterState::new(Instant::now());
+        let mut chrome = chrome(&theme, &master, Path::new("live.strudel"));
+        chrome.vim_label = Some(":32");
+        chrome.caret = Some((2, 4));
+        chrome.audio_warning = Some("Audio struggling");
+        for show_footer in [true, false] {
+            chrome.show_footer = show_footer;
+            for error in [None, Some("evaluation failed")] {
+                chrome.error = error;
+                let area = Rect::new(0, 0, 80, 1);
+                let mut buffer = Buffer::empty(area);
+                Footer { chrome: &chrome }.render(area, &mut buffer);
+                let text = text_of(&buffer);
+                assert!(text.contains("VIM :32 · "), "{text}");
+                assert!(text.contains(error.unwrap_or("Audio struggling")), "{text}");
+                assert!(text.contains("2,4"), "{text}");
+                assert_eq!(buffer.cell((1, 0)).unwrap().fg, theme.accent);
+                assert_eq!(
+                    buffer.cell((11, 0)).unwrap().fg,
+                    if error.is_some() {
+                        theme.error
+                    } else {
+                        theme.warn
+                    }
+                );
             }
         }
     }

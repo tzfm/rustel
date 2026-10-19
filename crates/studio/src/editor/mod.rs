@@ -1,4 +1,4 @@
-//! Modeless terminal editor core.
+//! Terminal editor core.
 //!
 //! The document, history and screen map are independent of the renderer.  A
 //! Ratatui pane can draw [`ScreenMap::rows`] and route Crossterm input through
@@ -8,10 +8,12 @@
 pub mod brackets;
 mod clipboard;
 mod document;
+mod find;
 mod history;
 mod input;
 mod layout;
 mod selection;
+mod vim;
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, VecDeque};
@@ -37,6 +39,9 @@ pub use layout::{
     WrapIndex,
 };
 pub use selection::{Selection, SelectionSet};
+pub use vim::EditorKeybindings;
+
+pub(crate) use find::FindDirection;
 
 use document::EditShape;
 use history::{History, HistoryEntry};
@@ -314,9 +319,7 @@ struct LastClick {
     count: u8,
 }
 
-/// Canonical editor state. There is no mode switch: printable input always
-/// inserts, pointer input always places/extends a caret, and commands operate
-/// on the current selection exactly as in a graphical code editor.
+/// Canonical document, selection, history, and editor keybinding state.
 #[derive(Clone, Debug)]
 pub struct Editor {
     document: Document,
@@ -334,6 +337,9 @@ pub struct Editor {
     last_click: Option<LastClick>,
     edits_since: EditTrail,
     config: EditorConfig,
+    vim: vim::VimState,
+    vim_remap: vim::remap::RemapState,
+    find: find::FindState,
 }
 
 impl Editor {
@@ -360,6 +366,9 @@ impl Editor {
             last_click: None,
             edits_since: EditTrail::default(),
             config,
+            vim: vim::VimState::default(),
+            vim_remap: vim::remap::RemapState::default(),
+            find: find::FindState::default(),
         })
     }
 
@@ -774,6 +783,7 @@ impl Editor {
         mut transaction: Transaction,
         moment: HistoryMoment,
     ) -> Result<(), EditorError> {
+        let moment = self.vim_history_transaction(&mut transaction, moment);
         transaction
             .edits
             .sort_by_key(|edit| (edit.range.start, edit.range.end));

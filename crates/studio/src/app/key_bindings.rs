@@ -8,6 +8,13 @@
 use super::*;
 
 impl App {
+    pub(super) fn refresh_editor_shortcut_hints(&mut self) {
+        let editor_focused = self.editor_accepts_raw_paste();
+        let editor = &self.scenes.current().editor;
+        self.keybinds
+            .filter_editor_hints(|key| editor_focused && editor.vim_claims_key(key));
+    }
+
     /// What this press means to the chord table, as an editor command, for
     /// the chord reader: a learnt chord whose action the editor can carry
     /// dispatches as that command, and everything else resolves to nothing
@@ -49,6 +56,9 @@ impl App {
         if alt {
             return Ok(false);
         }
+        if self.prompt_edit_action(action) {
+            return Ok(true);
+        }
         // The chords that would open something beside the sheet and take
         // the keyboard with them, swallowed rather than obeyed while the
         // sheet holds it. Obeyed, they would strand the sheet: it would
@@ -77,6 +87,7 @@ impl App {
                 // no route back. The docs open the same panel.
                 Do::Reference
                     | Do::Docs
+                    | Do::Find
                     | Do::SetPanel
                     | Do::Mixer
                     | Do::VisualsOne
@@ -165,6 +176,10 @@ impl App {
                 self.toggle_viz_dock(1);
                 Ok(true)
             }
+            Do::Visualizers => {
+                self.toggle_visualizers();
+                Ok(true)
+            }
             Do::Log => {
                 self.toggle_log_panel();
                 Ok(true)
@@ -231,6 +246,10 @@ impl App {
             }
             Do::ToggleComment => {
                 self.dispatch_editor(Command::ToggleComment)?;
+                Ok(true)
+            }
+            Do::Find => {
+                self.open_find();
                 Ok(true)
             }
             Do::RecordTake => {
@@ -430,7 +449,7 @@ impl App {
     /// A status message still offers a route when its action is unbound.
     pub(super) fn shortcut_or_menu(&self, action: BindAction, menu: &str) -> String {
         self.keybinds
-            .binding(action)
+            .hint_binding(action)
             .map_or_else(|| menu.to_owned(), |key| key.hint())
     }
 }
@@ -726,6 +745,10 @@ mod tests {
         fn an_armed_learn_asks_before_taking_a_chord_somebody_holds() {
             let directory = tempfile::tempdir().unwrap();
             let mut app = cascade_app(directory.path());
+            app.keybinds.learn(
+                BindAction::RenameScene,
+                crate::keybinds::KeyCombo::parse("ctrl+r"),
+            );
             app.settings_sheet = Some(SettingsSheet::default());
             app.focus = Focus::Panel(PanelKind::Settings);
             app.keybind_learn = Some(crate::keybinds::KeybindLearn::arm(BindAction::Undo));
@@ -769,6 +792,10 @@ mod tests {
         fn esc_on_a_take_keeps_the_other_action_s_chord() {
             let directory = tempfile::tempdir().unwrap();
             let mut app = cascade_app(directory.path());
+            app.keybinds.learn(
+                BindAction::RenameScene,
+                crate::keybinds::KeyCombo::parse("ctrl+r"),
+            );
             app.settings_sheet = Some(SettingsSheet::default());
             app.focus = Focus::Panel(PanelKind::Settings);
             app.keybind_learn = Some(crate::keybinds::KeybindLearn::arm(BindAction::Undo));

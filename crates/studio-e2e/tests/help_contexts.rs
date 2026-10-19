@@ -234,7 +234,8 @@ fn help_names_the_visuals_dock_and_the_strip_states() {
     );
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
 
-    studio.chord("ctrl+r");
+    studio.press(KeyCode::F(1), KeyModifiers::NONE);
+    studio.type_text("sr");
     assert_help_page(
         &mut studio,
         "scene rename",

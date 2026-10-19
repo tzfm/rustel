@@ -12,7 +12,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::widgets::Widget;
 use unicode_width::UnicodeWidthStr;
 
-use super::editor::KeyboardCapabilities;
+use super::editor::{EditorKeybindings, KeyboardCapabilities};
 use super::keybinds::{BindAction, KeyCombo, Keybinds};
 use super::theme::Theme;
 
@@ -88,8 +88,11 @@ impl HelpContext {
 
     /// A summary names a panel chord as `{timeline}`, `{rename}` or
     /// `{show}`. The sheet fills in the chord the table holds.
-    fn summary(self) -> &'static str {
+    fn summary(self, keybinds: &Keybinds) -> &'static str {
         match self {
+            Self::Editor if keybinds.editor_keybindings() == EditorKeybindings::Vim => {
+                "Built-in Vim bindings. Custom mappings can override these keys."
+            }
             Self::Editor => "Type normally; this is a modeless source editor.",
             Self::SceneRename => "The scene name is being edited; the score stays untouched.",
             Self::SceneLearn => "The current scene is waiting for a MIDI pad press.",
@@ -357,6 +360,16 @@ impl HelpContext {
         let hint = |action| shortcut_with_alias(keybinds, action);
         let append = |prefix: &str, action| join_hints([prefix.to_owned(), hint(action)], " · ");
         match self {
+            Self::Editor if keybinds.editor_keybindings() == EditorKeybindings::Vim => {
+                rows = [
+                    ("i · Esc".to_owned(), "Insert mode / Normal mode"),
+                    (
+                        "hjkl · dd".to_owned(),
+                        "move / delete a line in Normal mode",
+                    ),
+                    (":42 Enter".to_owned(), "go to line 42 in Normal mode"),
+                ];
+            }
             Self::Editor => {
                 rows[0].0 = hint(BindAction::Evaluate);
                 rows[1].0 = hint(BindAction::Stop);
@@ -476,6 +489,10 @@ fn shortcut_rows_with_keybinds(
             hint(BindAction::ToggleComment),
             "comment or uncomment lines",
         ),
+        HelpRow::new(
+            hint(BindAction::Find),
+            "find text: a regular expression; Enter next, Esc closes",
+        ),
         HelpRow::new(hint(BindAction::Docs), "docs for the function at the caret"),
         HelpRow::new(
             shortcut_with_alias(keybinds, BindAction::Reference),
@@ -527,7 +544,17 @@ fn shortcut_rows_with_keybinds(
             shortcut_with_alias(keybinds, BindAction::DuplicateScene),
             "duplicate the current scene",
         ),
-        HelpRow::new(hint(BindAction::RenameScene), "rename the current scene"),
+        HelpRow::new(
+            {
+                let rename = hint(BindAction::RenameScene);
+                if rename.is_empty() {
+                    "Scene > Rename scene".to_owned()
+                } else {
+                    rename
+                }
+            },
+            "rename the current scene",
+        ),
         HelpRow::new(
             hint(BindAction::CloseScene),
             "write and close the current scene",
@@ -813,7 +840,7 @@ impl Widget for HelpView<'_> {
             inner.y + 2,
             format!(
                 "NOW  {}",
-                super::keybinds::shortcut_label(self.context.summary())
+                super::keybinds::shortcut_label(self.context.summary(self.keybinds))
                     .replace("{timeline}", &self.keybinds.hint(BindAction::FocusTimeline))
                     .replace("{rename}", &self.keybinds.hint(BindAction::RenameFile))
                     .replace("{show}", &self.keybinds.hint(BindAction::ShowFile))
@@ -1057,7 +1084,7 @@ mod tests {
     }
 
     #[test]
-    fn the_global_list_does_not_advertise_the_unimplemented_find_prompt() {
+    fn the_global_list_advertises_the_find_prompt() {
         for capabilities in [
             KeyboardCapabilities::legacy(),
             KeyboardCapabilities::enhanced(),
@@ -1065,7 +1092,8 @@ mod tests {
             assert!(
                 shortcut_rows(capabilities)
                     .iter()
-                    .all(|row| !row.action.contains("find in"))
+                    .any(|row| row.action.contains("find text")),
+                "the find prompt is missing from the shortcut list"
             );
         }
     }

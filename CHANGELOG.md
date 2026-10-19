@@ -3,8 +3,14 @@
 ## Unreleased
 
 - A score that stretches every voice no longer overruns the audio device. The stretch vocoder slid its input and output windows one sample at a time, two 8 KiB moves per sample per channel, so a set of stretched voices spent most of its callback moving memory. The vocoder now keeps both as rings and reads each output slot once per overlap cycle. A score of about thirty stretched voices runs under half the callback budget where it overran before, with byte-identical audio.
+- A popup opened from Settings closes when the sheet closes, or when a click lands outside it. Before, a click on the page behind moved the keys to the page, and Esc closed the sheet while the popup stayed up with no key to close it.
 - Csound instruments play and export with `.csound()` and `.csoundm()`. Load orchestras with `loadCSound` or `loadOrc`. Requires double-precision Csound 6.18 or later 6.x. Studio enables native orchestras at startup, and the command line requires `--allow-csound`. See [Csound](https://github.com/tzfm/rustel/blob/main/docs/csound.md).
 - A note release no longer suppresses a MIDI press that follows within 40 ms. Scene pads and learned action buttons could miss that press.
+- Vim mapping replacements can name a Studio action, as `<Action:visualizers>`, so a rebind moves the mapping with it.
+- Inline visualizers in the score can be toggled from View > Inline visualizers, or from a key learned on the Keybinds page.
+- Studio can find text in the focused score with a regular expression. Outside Vim, Ctrl+Shift+Y opens a find bar that searches as you type; Enter walks the matches. In Vim, `/` and `?` search, `n` and `N` repeat with counts, and Ctrl+C leaves Insert mode. See [Vim editor keys](https://github.com/tzfm/rustel/blob/main/docs/studio.md#vim-editor-keys).
+- Studio has optional Vim editor keybindings and external Vim mappings in Settings > Keybinds. Preferences are saved in `studio.json`.
+- File picker and artwork popups support Copy and Cut for selected text. Double-click selects the whole field.
 
 ## v0.1.4
 

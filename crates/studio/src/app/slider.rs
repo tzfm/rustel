@@ -240,9 +240,22 @@ impl App {
     /// caret inside the call, deleting stays character-wise: mid-edit the
     /// numbers are the interface.
     pub(super) fn delete_slider_call(&mut self, command: &Command) -> Result<bool, RuntimeError> {
+        let Some(range) = self.slider_delete_range(command) else {
+            return Ok(false);
+        };
+        self.dispatch_editor(Command::ReplaceRange {
+            from: range.start,
+            to: range.end,
+            text: String::new(),
+        })?;
+        self.status = "slider removed - undo brings it back whole".to_owned();
+        Ok(true)
+    }
+
+    pub(super) fn slider_delete_range(&self, command: &Command) -> Option<Range<ByteOffset>> {
         let selection = self.editor().primary_selection();
         if !selection.is_empty() {
-            return Ok(false);
+            return None;
         }
         let caret = selection.head.0;
         let scene = self.scenes.current().id;
@@ -258,18 +271,9 @@ impl App {
                 .live_chips(scene)
                 .into_iter()
                 .find(|chip| chip.call.start == caret),
-            _ => return Ok(false),
+            _ => return None,
         };
-        let Some(chip) = target else {
-            return Ok(false);
-        };
-        self.dispatch_editor(Command::ReplaceRange {
-            from: ByteOffset(chip.call.start),
-            to: ByteOffset(chip.call.end),
-            text: String::new(),
-        })?;
-        self.status = "slider removed - undo brings it back whole".to_owned();
-        Ok(true)
+        target.map(|chip| ByteOffset(chip.call.start)..ByteOffset(chip.call.end))
     }
 
     /// A scene's live controls, resolved into its current text.

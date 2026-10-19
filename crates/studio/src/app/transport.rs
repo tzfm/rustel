@@ -1,5 +1,5 @@
 //! Quitting and play state: the two-press Ctrl+Q quit (the chord itself,
-//! claimed ahead of every other key, and the press that calls an armed quit
+//! claimed after the focused editor's Vim keys, and the press that calls an armed quit
 //! off) and the immediate quit that stops audio and flushes scenes, the set
 //! and prefs, plus the playing / stopping / evaluating checks, arming,
 //! clean-up after playback stops, and the check that skips reinstalling an
@@ -187,7 +187,7 @@ impl App {
         self.dirty_frame = true;
     }
 
-    /// Ctrl+Q quits from anywhere - except while a keybind learn holds the
+    /// Unclaimed Ctrl+Q quits - except while a keybind learn holds the
     /// Settings sheet, where the chord is refused as a shortcut instead.
     /// `true` when the press was Ctrl+Q.
     pub(super) fn quit_key(&mut self, terminal_event: &Event) -> bool {

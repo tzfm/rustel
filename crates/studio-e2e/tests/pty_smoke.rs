@@ -539,6 +539,120 @@ fn bracketed_paste_normalizes_line_endings_in_the_saved_scene() {
     );
 }
 
+#[test]
+fn a_vim_command_burst_edits_instead_of_pasting_into_the_score() {
+    let binary = rustel_binary().expect("build `rustel` before the feature=pty suite");
+    let home = set_directory();
+    let path = home.path().join("live.strudel");
+    std::fs::write(
+        home.path().join("studio.json"),
+        r#"{"editor_keybindings":"vim"}"#,
+    )
+    .expect("Vim preferences");
+    std::fs::write(
+        &path,
+        "// first\n// second\n$: note(\"c4 e4\").s(\"sine\")\n",
+    )
+    .expect("score with three lines");
+    let mut terminal = Terminal::open(&binary, 24, 80, home.path());
+    assert!(
+        terminal.wait_for(" ready", BOOT_BUDGET),
+        "the studio did not load:\n{}",
+        terminal.diagnostics()
+    );
+
+    terminal.write(b"jjkkjjkk:2\rdd\x13");
+    let expected = "// first\n$: note(\"c4 e4\").s(\"sine\")\n";
+    assert!(
+        wait_for_source(&path, expected, REPAINT_BUDGET),
+        "the command burst did not delete the second line; got {:?}; terminal:\n{}",
+        std::fs::read_to_string(&path),
+        terminal.diagnostics()
+    );
+}
+
+/// A mapped sequence whose first key is Space must wait for its second
+/// key. Space alone is a motion, so a mapping that loses its prefix would
+/// move the caret and let `V` select the line instead. The keyboard
+/// enhancement handshake is a Unix protocol.
+#[cfg(unix)]
+#[test]
+fn a_space_prefixed_vim_mapping_fires_in_a_real_terminal() {
+    let binary = rustel_binary().expect("build `rustel` before the feature=pty suite");
+    let home = set_directory();
+    let path = home.path().join("live.strudel");
+    std::fs::write(
+        home.path().join("studio.json"),
+        r#"{"editor_keybindings":"vim","animation":false}"#,
+    )
+    .expect("Vim preferences");
+    std::fs::write(
+        home.path().join("vimrc"),
+        "nnoremap <Space>V <Action:visualizers>\n",
+    )
+    .expect("Vim mapping");
+    std::fs::write(&path, "// first\n").expect("score");
+    let mut terminal = Terminal::open(&binary, 24, 80, home.path());
+    // Answer the keyboard protocol handshake the way iTerm2 does, so the
+    // studio runs with enhanced keys and the test sends CSI u encodings.
+    let query = b"\x1b[?u";
+    let stop = Instant::now() + BOOT_BUDGET;
+    loop {
+        let answered = terminal
+            .buffer
+            .lock()
+            .expect("drain buffer")
+            .windows(query.len())
+            .any(|window| window == query);
+        if answered {
+            break;
+        }
+        assert!(
+            Instant::now() < stop,
+            "the keyboard query never arrived:\n{}",
+            terminal.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    terminal.write(b"\x1b[?1u\x1b[?62;c");
+    assert!(
+        terminal.wait_for(" ready", BOOT_BUDGET),
+        "the studio did not load:\n{}",
+        terminal.diagnostics()
+    );
+
+    // Space press and release, then Shift+V press, as a terminal using the
+    // kitty keyboard protocol sends them. The gap is a fast human press,
+    // inside the one-second mapping window.
+    terminal.write(b"\x1b[32:32;1:1u\x1b[32:32;1:3u");
+    std::thread::sleep(Duration::from_millis(150));
+    // The kitty protocol reports the Shift key itself when every key is
+    // reported as an escape code, as this studio asks it to.
+    terminal.write(b"\x1b[57441;2:1u");
+    terminal.write(b"\x1b[118:86;2:1u\x1b[118:86;2:3u");
+    terminal.write(b"\x1b[57441;2:3u");
+    let saved = home.path().join("studio.json");
+    let stop = Instant::now() + REPAINT_BUDGET;
+    let toggled = loop {
+        if let Ok(bytes) = std::fs::read(&saved)
+            && let Ok(prefs) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && prefs["animation"] == true
+        {
+            break true;
+        }
+        if Instant::now() >= stop {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        toggled,
+        "Space V did not fire the mapping; preferences:\n{:?}\nterminal:\n{}",
+        std::fs::read_to_string(&saved),
+        terminal.diagnostics()
+    );
+}
+
 /// Raw SGR pointer reports must bring keyboard focus back from the set panel
 /// and place the caret in the visible editor line. Focus in/out reports are
 /// part of the same real terminal stream.
