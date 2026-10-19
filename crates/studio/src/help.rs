@@ -424,6 +424,17 @@ fn shortcut_with_alias(keybinds: &Keybinds, action: BindAction) -> String {
     join_hints(hints, " / ")
 }
 
+/// The learned chord when the action has one, else the menu path that
+/// reaches it. A shipped-unbound action still reads as reachable.
+fn shortcut_or_menu(keybinds: &Keybinds, action: BindAction, menu: &str) -> String {
+    let shortcut = shortcut_with_alias(keybinds, action);
+    if shortcut.is_empty() {
+        menu.to_owned()
+    } else {
+        shortcut
+    }
+}
+
 fn join_hints(hints: impl IntoIterator<Item = String>, separator: &str) -> String {
     hints
         .into_iter()
@@ -510,8 +521,20 @@ fn shortcut_rows_with_keybinds(
         ),
         HelpRow::new(hint(BindAction::Settings), "open settings"),
         HelpRow::new(
-            "Options > Settings > prebakes",
-            "open the selected global/local prebake",
+            shortcut_or_menu(
+                keybinds,
+                BindAction::OpenGlobalPrebake,
+                "Options > Global prebake",
+            ),
+            "open the global prebake",
+        ),
+        HelpRow::new(
+            shortcut_or_menu(
+                keybinds,
+                BindAction::OpenLocalPrebake,
+                "Options > Local prebake",
+            ),
+            "open the local prebake",
         ),
         HelpRow::new(hint(BindAction::ThemePicker), "open the theme picker"),
         HelpRow::new(hint(BindAction::SetPanel), "show or hide the set panel"),

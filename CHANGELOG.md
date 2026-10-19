@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The global and local prebakes open from the Options menu. Learn a key for either on Settings > Keybinds.
+- With Vim editor keys on, j k h l move lists, menus, and help as the arrows do. Turn Vim list keys off in the Vim section of Settings > Keybinds to use the letters as text.
+
 ## v0.1.5
 
 - A score that stretches every voice no longer overruns the audio device. The stretch vocoder slid its input and output windows one sample at a time, two 8 KiB moves per sample per channel, so a set of stretched voices spent most of its callback moving memory. The vocoder now keeps both as rings and reads each output slot once per overlap cycle. A score of about thirty stretched voices runs under half the callback budget where it overran before, with byte-identical audio.

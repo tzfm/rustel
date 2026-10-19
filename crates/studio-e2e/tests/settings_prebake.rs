@@ -589,3 +589,36 @@ fn the_shipped_packs_are_listed_under_the_imports() {
 
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
 }
+
+/// The Options menu opens both prebakes, and a menu row replaces the
+/// surface under it.
+#[test]
+fn the_options_menu_opens_both_prebakes() {
+    let mut studio = hermetic();
+    studio.press(KeyCode::F(1), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('o'), KeyModifiers::NONE);
+    let rows = studio.rows();
+    row_containing(&rows, "Global prebake");
+    row_containing(&rows, "Local prebake");
+
+    studio.press(KeyCode::Char('g'), KeyModifiers::NONE);
+    studio.settle();
+    assert!(!studio.menu_open(), "the menu closed on the choice");
+    assert!(
+        studio.status().contains("prebake (global)"),
+        "the global tab opened: {}",
+        studio.status()
+    );
+    assert_eq!(studio.focus(), None, "the global prebake has the keyboard");
+
+    studio.press(KeyCode::F(1), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('o'), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('l'), KeyModifiers::NONE);
+    studio.settle();
+    assert!(
+        studio.status().contains("prebake (local)"),
+        "the local tab opened: {}",
+        studio.status()
+    );
+    assert_eq!(studio.focus(), None, "the local prebake has the keyboard");
+}

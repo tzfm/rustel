@@ -62,6 +62,10 @@ pub enum BindAction {
     MenuBar,
     Help,
     Settings,
+    /// Open the global prebake in the score editor.
+    OpenGlobalPrebake,
+    /// Open the set's local prebake in the score editor.
+    OpenLocalPrebake,
     Devices,
     ThemePicker,
     /// The list for the place at the caret: the values an argument takes, or
@@ -130,7 +134,7 @@ pub enum BindAction {
 
 impl BindAction {
     /// Every action, in the order the Keybinds page lists them.
-    pub const ALL: [BindAction; 56] = [
+    pub const ALL: [BindAction; 58] = [
         // Transport
         Self::Evaluate,
         Self::Stop,
@@ -139,6 +143,8 @@ impl BindAction {
         Self::MenuBar,
         Self::Help,
         Self::Settings,
+        Self::OpenGlobalPrebake,
+        Self::OpenLocalPrebake,
         Self::Devices,
         Self::ThemePicker,
         Self::Reference,
@@ -204,6 +210,8 @@ impl BindAction {
             Self::MenuBar => "menu-bar",
             Self::Help => "help",
             Self::Settings => "settings",
+            Self::OpenGlobalPrebake => "global-prebake",
+            Self::OpenLocalPrebake => "local-prebake",
             Self::Devices => "devices",
             Self::ThemePicker => "theme",
             // The name older preference files hold. It keeps the Ctrl+F action.
@@ -274,6 +282,8 @@ impl BindAction {
             Self::MenuBar => "open the menu bar",
             Self::Help => "keyboard reference",
             Self::Settings => "settings",
+            Self::OpenGlobalPrebake => "open global prebake",
+            Self::OpenLocalPrebake => "open local prebake",
             Self::Devices => "devices",
             Self::ThemePicker => "theme picker",
             Self::Reference => "argument values, reference",
@@ -383,6 +393,8 @@ impl BindAction {
             Self::Jobs => plain(F(12)), // unused: Jobs ships unbound; open from View ▸ Background jobs
             Self::Memory => plain(F(12)), // unused: Memory ships unbound; open from the header
             Self::Visualizers => plain(F(12)), // unused: ships unbound; learn a key on the Keybinds page
+            Self::OpenGlobalPrebake => plain(F(12)), // unused: ships unbound; open from Options or learn a key
+            Self::OpenLocalPrebake => plain(F(12)), // unused: ships unbound; open from Options or learn a key
             Self::Export => ctrl_shift(Char('x')),
             Self::SmartAction => ctrl(Char('j')),
             Self::Split => ctrl(Char('e')),
@@ -1139,10 +1151,10 @@ pub enum KeybindCapture {
 
 /// The actions the studio ships with no chord, on purpose. Background jobs
 /// and Memory open from their View menu rows, and the memory breakdown from
-/// the header's figures too. They are looked at now and then, not played, and
-/// every plain function key and Ctrl letter already means something a set
-/// is performed with; a player who wants one learns it in Settings ▸
-/// Keybinds.
+/// the header's figures too. The prebakes open from the Options menu. They
+/// are looked at now and then, not played, and every plain function key and
+/// Ctrl letter already means something a set is performed with; a player
+/// who wants one learns it in Settings ▸ Keybinds.
 ///
 /// The panel actions ship with no chord in the table too. Each one answers
 /// to its [`BindAction::panel_letter`] with Alt until a chord is learnt.
@@ -1150,6 +1162,8 @@ pub const SHIPS_UNBOUND: &[BindAction] = &[
     BindAction::Jobs,
     BindAction::Memory,
     BindAction::Visualizers,
+    BindAction::OpenGlobalPrebake,
+    BindAction::OpenLocalPrebake,
     BindAction::ShowFile,
     BindAction::RenameFile,
     BindAction::DeleteSample,

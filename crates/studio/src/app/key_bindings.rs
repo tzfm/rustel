@@ -144,6 +144,14 @@ impl App {
                 self.toggle_settings_sheet();
                 Ok(true)
             }
+            Do::OpenGlobalPrebake => {
+                self.open_prebake(PrebakeScope::Global);
+                Ok(true)
+            }
+            Do::OpenLocalPrebake => {
+                self.open_prebake(PrebakeScope::Local);
+                Ok(true)
+            }
             Do::Devices => {
                 self.toggle_device_panel();
                 Ok(true)

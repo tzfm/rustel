@@ -339,7 +339,7 @@ fn studio_shortcuts_and_panel_focus_keep_their_meaning() {
 
     studio.chord("ctrl+o");
     assert_eq!(studio.focus(), Some(PanelKind::Settings));
-    studio.type_text("hjkl");
+    studio.type_text("zq");
     assert_eq!(studio.source(), source);
     studio.chord("ctrl+s");
     studio.settle();

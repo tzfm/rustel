@@ -166,7 +166,9 @@ tape. Keep a separate backup of sets you want to preserve.
 ### Prebakes
 
 A prebake runs setup code before scores. Open the global or local prebake from
-Settings. The global file is `<rustel-config>/prebake.strudel`. The local prebake
+Options > Global prebake or Options > Local prebake, or from Settings. Learn a
+key for either on Settings > Keybinds. The global file is
+`<rustel-config>/prebake.strudel`. The local prebake
 is stored in the set. Studio runs the global code first, then the local code.
 
 Update checks and saves the prebake, then applies it to the playing score. It
@@ -655,10 +657,18 @@ to include the separators, such as `va(`. These objects also work with `d`,
 Vim keys take priority while the editor has focus, including keys you assign
 to Studio actions. Unclaimed keys keep their Studio action. A pending Vim
 command or mapping owns the next key. Settings, prompts, and other panels
-keep their usual controls. Menus show the shortcuts available in the current
-context. In Insert mode, Ctrl+R is reserved for register entry, which is not
-supported. Pasted text stays literal. On terminals without bracketed paste,
-enter Insert mode before pasting.
+keep their usual controls, except the list keys below. Menus show the
+shortcuts available in the current context. In Insert mode, Ctrl+R is
+reserved for register entry, which is not supported. Pasted text stays
+literal. On terminals without bracketed paste, enter Insert mode before
+pasting.
+
+The Vim list keys row in the Vim section of Settings > Keybinds is on by
+default. Plain `j`, `k`, `h`, and `l` move lists, menus, and help as the
+arrows do. A panel command keeps its meaning. The other menu letters do too.
+While the row is on, these four letters navigate menus even when they spell a
+menu mnemonic. Turn the row off to keep them for text fields and menu
+mnemonics. The arrows always work.
 
 ### Custom Vim mappings
 
@@ -717,7 +727,8 @@ skips the line.
 The stable names for `<Action:...>` are:
 
 - Transport: `update`, `stop`, `rewind-update`
-- Menus and surfaces: `menu-bar`, `help`, `settings`, `devices`, `theme`,
+- Menus and surfaces: `menu-bar`, `help`, `settings`, `global-prebake`,
+  `local-prebake`, `devices`, `theme`,
   `reference`, `docs`, `piano-mode`, `set-panel`, `mixer`, `visuals-one`,
   `visuals-two`, `visualizers`, `log`, `log-sticky`, `focus-panels`, `jobs`,
   `memory`, `export`, `smart-action`, `split`, `hop-pane`

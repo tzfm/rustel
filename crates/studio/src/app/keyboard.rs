@@ -88,6 +88,22 @@ pub(super) fn panel_repeat_is_safe(kind: PanelKind, code: KeyCode) -> bool {
         && !(kind == PanelKind::Reference && matches!(code, KeyCode::Left | KeyCode::Right))
 }
 
+/// Panels where a held j, k, h, or l stands in for an arrow once the panel
+/// has declined the letter. Panels that bind the letters themselves, or
+/// move controls with the arrows, keep their own reading.
+fn panel_takes_list_navigation(kind: PanelKind) -> bool {
+    matches!(
+        kind,
+        PanelKind::Settings
+            | PanelKind::Set
+            | PanelKind::Devices
+            | PanelKind::Log
+            | PanelKind::Jobs
+            | PanelKind::Reference
+            | PanelKind::Memory
+    )
+}
+
 /// Whether this key WALKS rather than types: what a column being read
 /// beside the score still hands to the caret.
 fn moves_the_caret(code: KeyCode) -> bool {
@@ -872,6 +888,27 @@ impl App {
         (adapted, contextual)
     }
 
+    /// The arrow a plain j, k, h, or l means in a list while Vim editor
+    /// keys and list navigation are on. Surfaces try the letter first, so
+    /// their own commands and menu mnemonics win.
+    pub(super) fn list_navigation_alias(&self, key: &KeyEvent) -> Option<KeyEvent> {
+        if !self.ui_settings.vim_list_navigation
+            || self.ui_settings.editor_keybindings != crate::editor::EditorKeybindings::Vim
+            || key.kind == KeyEventKind::Release
+            || !key.modifiers.is_empty()
+        {
+            return None;
+        }
+        let code = match key.code {
+            KeyCode::Char('j') => KeyCode::Down,
+            KeyCode::Char('k') => KeyCode::Up,
+            KeyCode::Char('h') => KeyCode::Left,
+            KeyCode::Char('l') => KeyCode::Right,
+            _ => return None,
+        };
+        Some(KeyEvent::new_with_kind(code, KeyModifiers::NONE, key.kind))
+    }
+
     /// The focused panel's turn. It takes what it has a use for, and what
     /// it declines is swallowed and said out loud rather than typed into a
     /// score the eye is not on. `true` when the key stops here.
@@ -920,6 +957,16 @@ impl App {
             let indents = matches!(key.code, KeyCode::Tab | KeyCode::BackTab);
             let passes = self.panel_types_through(kind)
                 || (self.panel_reads_beside_score(kind) && moves_the_caret(key.code));
+            // A plain j, k, h, or l the panel had no use for is the arrow
+            // it stands in for. Surfaces that pass the letter to the score
+            // keep it: those are typing, not list navigation.
+            if !passes
+                && panel_takes_list_navigation(kind)
+                && let Some(alias) = self.list_navigation_alias(key)
+                && self.dispatch_panel_key(kind, alias.code, false, false, false)?
+            {
+                return Ok(true);
+            }
             if !primary
                 && !alt
                 // `Null` is what a legacy terminal sends for Ctrl+Space,
@@ -1339,6 +1386,14 @@ impl App {
                 || (text_key(key.code) && self.panel_is_typing(kind))
             {
                 self.dispatch_panel_key(kind, key.code, primary, shift, alt)?;
+            } else if panel_takes_list_navigation(kind)
+                && !self.panel_is_typing(kind)
+                && !self.panel_types_through(kind)
+                && let Some(alias) = self.list_navigation_alias(key)
+                && (panel_repeat_is_safe(kind, alias.code)
+                    || self.generator_control_repeats(kind, alias.code))
+            {
+                self.dispatch_panel_key(kind, alias.code, false, false, false)?;
             }
             return Ok(true);
         }
@@ -1726,6 +1781,183 @@ mod tests {
 
         use crate::app::keyboard::*;
         use crate::app::tests::support::*;
+
+        #[test]
+        fn vim_list_keys_move_panels_and_follow_the_toggle() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.toggle_settings_sheet();
+            let selected = |app: &App| {
+                app.settings_sheet
+                    .as_ref()
+                    .expect("the settings sheet")
+                    .selected
+            };
+
+            let before = selected(&app);
+            precision_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert_eq!(selected(&app), before + 1, "j is Down");
+            precision_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            assert_eq!(selected(&app), before, "k is Up");
+
+            let quantise = app.ui_settings.quantise;
+            precision_key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+            assert_ne!(app.ui_settings.quantise, quantise, "l is Right");
+            precision_key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            assert_eq!(app.ui_settings.quantise, quantise, "h is Left");
+
+            let before = selected(&app);
+            precision_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            assert_eq!(selected(&app), before + 1, "the arrows still work");
+
+            app.ui_settings.vim_list_navigation = false;
+            let before = selected(&app);
+            let source = app.editor().source();
+            precision_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert_eq!(selected(&app), before, "the toggle is off");
+            assert_eq!(app.editor().source(), source);
+
+            app.ui_settings.vim_list_navigation = true;
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Default;
+            let before = selected(&app);
+            precision_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert_eq!(
+                selected(&app),
+                before,
+                "Default editor keys keep j for text"
+            );
+        }
+
+        #[test]
+        fn a_held_vim_list_key_keeps_moving_the_rows() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.toggle_settings_sheet();
+            let before = app
+                .settings_sheet
+                .as_ref()
+                .expect("the settings sheet")
+                .selected;
+            app.handle_terminal_event(Event::Key(crossterm::event::KeyEvent::new_with_kind(
+                KeyCode::Char('j'),
+                KeyModifiers::NONE,
+                crossterm::event::KeyEventKind::Repeat,
+            )))
+            .expect("repeat handled");
+            assert_eq!(
+                app.settings_sheet
+                    .as_ref()
+                    .expect("the settings sheet")
+                    .selected,
+                before + 1,
+                "a held j keeps stepping"
+            );
+        }
+
+        #[test]
+        fn vim_list_keys_leave_mixer_faders_to_the_arrows() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "$: s(\"bd\")\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.prefs.audio_input = Some("Mic".into());
+            app.open_mixer_panel(true);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Mixer));
+            app.mixer.selected = crate::app::mixer::MixerTarget::Input;
+            let before = app.mixer.input_gain_db;
+
+            precision_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert_eq!(app.mixer.input_gain_db, before, "j is not a fader nudge");
+            precision_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            assert_ne!(app.mixer.input_gain_db, before, "the arrow still nudges");
+        }
+
+        #[test]
+        fn vim_list_keys_walk_menus_and_other_letters_keep_their_meaning() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.menu = Some(crate::menu::MenuState::opened());
+
+            precision_key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+            assert_eq!(
+                app.menu.as_ref().expect("menu").open_title(),
+                1,
+                "l moves to the next menu"
+            );
+            // A held l with no press behind it is still the arrow.
+            app.menu = Some(crate::menu::MenuState::opened());
+            app.handle_terminal_event(Event::Key(crossterm::event::KeyEvent::new_with_kind(
+                KeyCode::Char('l'),
+                KeyModifiers::NONE,
+                crossterm::event::KeyEventKind::Repeat,
+            )))
+            .expect("repeat handled");
+            assert_eq!(
+                app.menu.as_ref().expect("menu").open_title(),
+                1,
+                "a held l walks the bar"
+            );
+            // h is the Help title mnemonic, but the list keys own it
+            // while the mode is on: h moves left.
+            precision_key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            assert_eq!(
+                app.menu.as_ref().expect("menu").open_title(),
+                0,
+                "h moves back to the previous menu"
+            );
+            // A held title mnemonic stays that menu instead of firing a
+            // row mnemonic in the level it opened.
+            app.menu = Some(crate::menu::MenuState::opened());
+            precision_key(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+            assert_eq!(
+                app.menu.as_ref().expect("menu").open_title(),
+                4,
+                "v opened View"
+            );
+            app.handle_terminal_event(Event::Key(crossterm::event::KeyEvent::new_with_kind(
+                KeyCode::Char('v'),
+                KeyModifiers::NONE,
+                crossterm::event::KeyEventKind::Repeat,
+            )))
+            .expect("repeat handled");
+            assert!(
+                app.menu.as_ref().is_some_and(|menu| menu.is_dropped()),
+                "the held v did not fire a View row"
+            );
+            assert_eq!(app.menu.as_ref().expect("menu").open_title(), 4);
+
+            app.menu = Some(crate::menu::MenuState::opened());
+            app.ui_settings.vim_list_navigation = false;
+            precision_key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+            assert_eq!(app.menu.as_ref().expect("menu").open_title(), 0);
+            // With the mode off, the menu letters are mnemonics again.
+            precision_key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            assert_eq!(
+                app.menu.as_ref().expect("menu").open_title(),
+                6,
+                "h opens Help when Vim list keys are off"
+            );
+        }
+
+        #[test]
+        fn vim_list_keys_scroll_help_and_follow_the_toggle() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.toggle_help();
+            app.help.as_mut().expect("help").scroll = 0;
+            precision_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert_eq!(app.help.as_ref().expect("help").scroll, 1, "j scrolls");
+
+            app.help.as_mut().expect("help").scroll = 0;
+            app.ui_settings.vim_list_navigation = false;
+            precision_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert_eq!(app.help.as_ref().expect("help").scroll, 0);
+        }
 
         #[test]
         fn a_focused_panel_never_leaks_typing_into_the_score() {
