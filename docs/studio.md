@@ -74,6 +74,9 @@ to the next match and keeps the bar open. Backspace on an empty bar leaves it
 open. Esc or a click elsewhere closes it. Some terminals keep this chord for
 themselves; Settings > Keybinds shows the fallback.
 
+With Vim editor keys on, Ctrl+Shift+Y and Edit > Find open the Vim search
+prompt. Enter searches once and closes it. `n` and `N` walk the matches.
+
 Vim changes Ctrl+R and Ctrl+[ in the score editor. See [Settings](#settings)
 for Vim controls.
 
@@ -639,12 +642,12 @@ copy text, and `p` or `P` to put it back. `D` deletes to the end of the line.
 `u` undoes an edit. Ctrl+R in Normal or Visual mode redoes it.
 `:redo` then Enter also redoes an edit.
 
-`/` searches forward and `?` backward. Type a regular expression and press
-Enter. `n` repeats the search and `N` repeats it in the other direction; both
-take counts, such as `2n`. A count on the search also works: `3/foo` lands on
-the third match. An empty pattern repeats the last search. The search wraps
-and is case-sensitive. It uses the Rust regex syntax in
-[regex](https://docs.rs/regex/latest/regex/#syntax), so `\$` finds a literal
+`/` searches forward and `?` backward. Edit > Find opens `/`. Type a regular
+expression and press Enter. `n` repeats the search and `N` repeats it in the
+other direction; both take counts, such as `2n`. A count on the search also
+works: `3/foo` lands on the third match. An empty pattern repeats the last
+search. The search wraps and is case-sensitive. It uses the Rust regex syntax
+in [regex](https://docs.rs/regex/latest/regex/#syntax), so `\$` finds a literal
 dollar sign and `\d+` finds digits. Backreferences and look-around are not
 supported. Zero-width matches are skipped.
 
@@ -669,6 +672,12 @@ arrows do. A panel command keeps its meaning. The other menu letters do too.
 While the row is on, these four letters navigate menus even when they spell a
 menu mnemonic. Turn the row off to keep them for text fields and menu
 mnemonics. The arrows always work.
+
+A search box in the reference column starts in Command mode while the list
+keys are on. `j`, `k`, `h`, and `l` walk the list, and the other letters stay
+out of the search. Press `i` or `a` to type in the search, then Esc to return
+to Command. Space still auditions the selected row. An anchored completion
+starts in Insert mode.
 
 ### Custom Vim mappings
 

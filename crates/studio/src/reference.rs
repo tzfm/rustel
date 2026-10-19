@@ -466,6 +466,9 @@ pub struct ReferencePanel {
     pub selection: Option<PaneSelection>,
     pub tab: Tab,
     pub mode: ReferenceMode,
+    /// Vim command mode for the search box: true when `i` or `a` entered
+    /// Insert. The box takes letters only in Insert.
+    pub(crate) vim_insert: bool,
     pub query: String,
     pub results: Vec<usize>,
     /// The caret is not on a blank line, so a snippet cannot go where it
@@ -5057,6 +5060,30 @@ mod tests {
             );
             let inner = inner_area(area);
             assert_eq!(panel.search_cursor(inner), Some((inner.x + 9, inner.y + 1)));
+        }
+
+        #[test]
+        fn the_search_cursor_follows_the_chords_and_scales_queries() {
+            let reference = Reference::load(engine_knows());
+            let mut panel = ReferencePanel::browse(&reference);
+            let area = Rect::new(0, 0, 80, 26);
+            let inner = inner_area(area);
+
+            // A stale reference query must not place the chords caret.
+            panel.query = "stale".into();
+            panel.select_tab(Tab::Chords);
+            panel.chord_query = "maj".into();
+            assert_eq!(
+                panel.search_cursor(inner),
+                Some((inner.x + "search: ".len() as u16 + 3, inner.y + 1))
+            );
+
+            panel.select_tab(Tab::Scales);
+            panel.scale_query = "minor".into();
+            assert_eq!(
+                panel.search_cursor(inner),
+                Some((inner.x + "search: ".len() as u16 + 5, inner.y + 1))
+            );
         }
 
         #[test]

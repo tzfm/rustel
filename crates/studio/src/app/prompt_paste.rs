@@ -102,6 +102,7 @@ impl App {
                 })
             }
             PanelKind::Reference => {
+                super::vim_keys::enter_insert(self);
                 let Some(panel) = self.reference_panel.as_mut() else {
                     return false;
                 };

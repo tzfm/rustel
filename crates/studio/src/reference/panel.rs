@@ -172,6 +172,7 @@ impl ReferencePanel {
             selection: None,
             tab: Tab::Reference,
             mode: ReferenceMode::Browse,
+            vim_insert: false,
             query: String::new(),
             results: Vec::new(),
             snippets_last: false,
@@ -304,6 +305,7 @@ impl ReferencePanel {
         if self.tab != tab {
             self.snippet_code_scroll.set(0);
         }
+        self.vim_insert = false;
         self.tab = tab;
     }
 
@@ -444,6 +446,8 @@ impl ReferencePanel {
         } else {
             match self.tab {
                 Tab::Samples => &self.sound_query,
+                Tab::Chords => &self.chord_query,
+                Tab::Scales => &self.scale_query,
                 #[cfg(feature = "vst")]
                 Tab::Vst => self.vst.query(),
                 _ => &self.query,
@@ -454,6 +458,16 @@ impl ReferencePanel {
             inner.x + (column as u16).min(inner.width.saturating_sub(1)),
             inner.y + 1,
         ))
+    }
+
+    /// Whether the search box is in Vim Insert mode.
+    pub(crate) fn vim_insert(&self) -> bool {
+        self.vim_insert
+    }
+
+    /// Enter or leave Vim Insert mode for the search box.
+    pub(crate) fn set_vim_insert(&mut self, insert: bool) {
+        self.vim_insert = insert;
     }
 
     /// Whether this view has a search box, and so a use for letters.

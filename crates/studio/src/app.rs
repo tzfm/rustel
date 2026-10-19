@@ -206,6 +206,7 @@ mod string_roles;
 mod theme_sheets;
 mod transport;
 mod vim_config;
+mod vim_keys;
 mod viz_panel;
 #[cfg(feature = "vst")]
 mod vst;

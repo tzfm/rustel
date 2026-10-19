@@ -4,14 +4,20 @@ use super::*;
 use crate::editor::FindDirection;
 
 impl App {
-    /// Open the find bar for the focused score. The chord and Edit > Find
-    /// both arrive here.
+    /// Open the find prompt for the focused score. The chord and Edit > Find
+    /// both arrive here. Vim gets its `/` prompt, which closes on Enter and
+    /// repeats with `n` and `N`.
     pub(super) fn open_find(&mut self) {
         self.focus_editor_for_locator();
         self.editor_mut().vim_interrupt();
+        let vim = self.editor().vim_enabled();
         self.editor_mut()
-            .begin_find(FindDirection::Forward, true, 0);
-        self.status = "find - type a regular expression \u{b7} Enter next \u{b7} Esc closes".into();
+            .begin_find(FindDirection::Forward, !vim, 0);
+        self.status = if vim {
+            "find - type a regular expression \u{b7} Enter searches \u{b7} Esc cancels".into()
+        } else {
+            "find - type a regular expression \u{b7} Enter next \u{b7} Esc closes".into()
+        };
         self.dirty_frame = true;
     }
 
@@ -150,6 +156,28 @@ mod tests {
             assert!(app.editor().find_open(), "a bad pattern is not a crash");
             press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
             assert!(!app.editor().find_open(), "Ctrl+C closes the find bar");
+        }
+
+        #[test]
+        fn vim_edit_find_closes_on_enter_and_n_walks_matches() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "one two one three one\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            let head = |app: &App| app.editor().primary_selection().head.0;
+
+            chord(&mut app);
+            assert!(app.editor().find_open());
+            for character in "one".chars() {
+                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(!app.editor().find_open(), "Enter searches once and closes");
+            let first = head(&app);
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+            assert_ne!(head(&app), first, "n walks forward");
+            press(&mut app, KeyCode::Char('N'), KeyModifiers::NONE);
+            assert_eq!(head(&app), first, "N walks back");
         }
 
         #[test]

@@ -91,19 +91,6 @@ pub(super) fn panel_repeat_is_safe(kind: PanelKind, code: KeyCode) -> bool {
 /// Panels where a held j, k, h, or l stands in for an arrow once the panel
 /// has declined the letter. Panels that bind the letters themselves, or
 /// move controls with the arrows, keep their own reading.
-fn panel_takes_list_navigation(kind: PanelKind) -> bool {
-    matches!(
-        kind,
-        PanelKind::Settings
-            | PanelKind::Set
-            | PanelKind::Devices
-            | PanelKind::Log
-            | PanelKind::Jobs
-            | PanelKind::Reference
-            | PanelKind::Memory
-    )
-}
-
 /// Whether this key WALKS rather than types: what a column being read
 /// beside the score still hands to the caret.
 fn moves_the_caret(code: KeyCode) -> bool {
@@ -240,6 +227,9 @@ impl App {
 
     /// Whether the panel has a text field that owns held typing keys.
     fn panel_is_typing(&self, kind: PanelKind) -> bool {
+        if let Some(typing) = super::vim_keys::surface_typing(self, kind) {
+            return typing;
+        }
         match kind {
             PanelKind::Set => self.set_prompt.is_some(),
             PanelKind::Viz => self.viz_docks[self.viz_focus]
@@ -765,6 +755,9 @@ impl App {
             self.close_panel(kind);
             return Ok(true);
         }
+        if super::vim_keys::handle_text_key(self, key)? {
+            return Ok(true);
+        }
         if self.focused_panel_key(
             key,
             &contextual,
@@ -892,24 +885,6 @@ impl App {
     /// The arrow a plain j, k, h, or l means in a list while Vim editor
     /// keys and list navigation are on. Surfaces try the letter first, so
     /// their own commands and menu mnemonics win.
-    pub(super) fn list_navigation_alias(&self, key: &KeyEvent) -> Option<KeyEvent> {
-        if !self.ui_settings.vim_list_navigation
-            || self.ui_settings.editor_keybindings != crate::editor::EditorKeybindings::Vim
-            || key.kind == KeyEventKind::Release
-            || !key.modifiers.is_empty()
-        {
-            return None;
-        }
-        let code = match key.code {
-            KeyCode::Char('j') => KeyCode::Down,
-            KeyCode::Char('k') => KeyCode::Up,
-            KeyCode::Char('h') => KeyCode::Left,
-            KeyCode::Char('l') => KeyCode::Right,
-            _ => return None,
-        };
-        Some(KeyEvent::new_with_kind(code, KeyModifiers::NONE, key.kind))
-    }
-
     /// The focused panel's turn. It takes what it has a use for, and what
     /// it declines is swallowed and said out loud rather than typed into a
     /// score the eye is not on. `true` when the key stops here.
@@ -962,7 +937,7 @@ impl App {
             // it stands in for. Surfaces that pass the letter to the score
             // keep it: those are typing, not list navigation.
             if !passes
-                && panel_takes_list_navigation(kind)
+                && super::vim_keys::panel_takes_list_navigation(kind)
                 && let Some(alias) = self.list_navigation_alias(key)
                 && self.dispatch_panel_key(kind, alias.code, false, false, false)?
             {
@@ -1371,6 +1346,9 @@ impl App {
             return Ok(true);
         }
         if let Focus::Panel(kind) = self.focus {
+            if super::vim_keys::handle_text_key(self, key)? {
+                return Ok(true);
+            }
             // Space auditions the reference row even on tabs with a
             // search box. A held preview key must not toggle it off.
             if kind == PanelKind::Reference
@@ -1387,7 +1365,7 @@ impl App {
                 || (text_key(key.code) && self.panel_is_typing(kind))
             {
                 self.dispatch_panel_key(kind, key.code, primary, shift, alt)?;
-            } else if panel_takes_list_navigation(kind)
+            } else if super::vim_keys::panel_takes_list_navigation(kind)
                 && !self.panel_is_typing(kind)
                 && !self.panel_types_through(kind)
                 && let Some(alias) = self.list_navigation_alias(key)
