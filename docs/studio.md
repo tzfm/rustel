@@ -443,7 +443,9 @@ to import samples. You can also add folders and packs in Settings ▸ Samples.
 Samples in the set folder are discovered automatically. Use File ▸ Copy
 samples into the set when you need a portable set. A dropped `.vstpreset`
 file goes to the preset folder of its plugin. See
-[Plugins](plugins.md#presets).
+[Plugins](plugins.md#presets). A dropped `.mid` or `.midi` file becomes a new
+score scene. The MIDI file is not changed. The import writes JavaScript, so it
+needs JavaScript mode.
 
 The sample view supports alias changes and file deletion. Check the
 confirmation before deleting a file. An alias must not replace an existing
@@ -834,7 +836,12 @@ folder, and your bank renames. Live playback continues.
 If the export cannot find or load a sound, or the engine refuses a note, the
 export fails and names the refusal. The file is still written. The check covers
 every note the export schedules, also notes after an early end.
-Use Tab and arrows to choose the length, WAV or MP3 format, and output path.
+Use Tab and arrows to choose the length, WAV, MP3, or MIDI format, and output
+path. Space moves to the next format. Left selects WAV and Right selects MIDI.
+
+A MIDI export writes a Type 1 file with 480 ticks per quarter note and a 4/4
+meter. It needs a fixed cycle length. Until-silence and the limiter apply to
+audio only.
 
 Choose a fixed number of cycles or **until silence**. Until-silence export stops
 when audio stays below the threshold for the hold time. The defaults are
@@ -851,8 +858,8 @@ the export dialog affects that export only. CLI exports do not inherit the set
 limiter. Match limiter, duration, sample rate, and voice limit when comparing
 an export with another render.
 
-Press Ctrl+Shift+X again to end an export early. Studio adds a fade and keeps
-the audio already rendered. Use Transport ▸ Reveal last export or take to
+For an audio export, press Ctrl+Shift+X again to end early. Studio adds a fade
+and keeps the audio already rendered. Use Transport ▸ Reveal last export or take to
 locate it.
 See [CLI export](cli.md#export) for command-line options.
 

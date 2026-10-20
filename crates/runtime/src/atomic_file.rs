@@ -67,6 +67,13 @@ pub(crate) fn replace_file(
     Ok(())
 }
 
+/// Replace `path` with `bytes` in one rename.
+pub fn replace_file_bytes(path: &Path, prefix: &str, bytes: &[u8]) -> std::io::Result<()> {
+    replace_file(path, prefix, bytes, |pending, target| {
+        std::fs::rename(pending, target)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

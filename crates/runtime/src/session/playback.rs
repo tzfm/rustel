@@ -695,6 +695,7 @@ impl Session {
                 "wav-scalar-pcm".into()
             },
             path: out_path.display().to_string(),
+            midi: None,
             audio_backend: "scalar-rust".into(),
             device_audio: "not-requested".into(),
             note: format!(
@@ -748,6 +749,18 @@ impl Session {
     ) -> Result<RenderReport, RuntimeError> {
         let report = self.direct_diagnostic_logging;
         self.render_controlled(duration_secs, out_path, format, report, None, None)
+    }
+
+    /// Set the tick resolution and meter for a MIDI file render.
+    pub fn set_midi_export_options(
+        &mut self,
+        options: rustel_smf::SmfOptions,
+    ) -> Result<(), RuntimeError> {
+        options
+            .validate()
+            .map_err(|error| RuntimeError::Message(error.to_string()))?;
+        self.midi_export_options = options;
+        Ok(())
     }
 
     /// Render `duration_secs` of the evaluated score as interleaved stereo
@@ -836,6 +849,7 @@ impl Session {
             },
             ..stop
         });
+        let mut midi_report = None;
         let rendered = self.render_under_diagnostic_policy(|session| match format {
             RenderFormat::Wav => {
                 // A silent skeleton has no tail to ring out.
@@ -946,6 +960,21 @@ impl Session {
                 write_onset_dump(out_path, &play.onsets)?;
                 Ok((None, Vec::new()))
             }
+            RenderFormat::Midi => {
+                let options = session.midi_export_options;
+                let (timeline, report) = session
+                    .js
+                    .with_runtime_settings(|| {
+                        crate::midi_export::timeline(&play.onsets, duration_secs, play.cps, options)
+                    })
+                    .map_err(RuntimeError::Message)?;
+                let bytes = timeline
+                    .to_bytes()
+                    .map_err(|error| RuntimeError::Message(error.to_string()))?;
+                crate::replace_file_bytes(out_path, ".mid-", &bytes).map_err(RuntimeError::Io)?;
+                midi_report = Some(report);
+                Ok((None, Vec::new()))
+            }
         })?;
         let (written_bytes, voices_refused) = rendered;
         self.log_sample_failures();
@@ -967,16 +996,26 @@ impl Session {
                 None => duration_secs,
             },
             cps: self.config.cps,
-            sample_rate: self.config.sample_rate,
-            channels: self.config.channels,
+            sample_rate: if format == RenderFormat::Midi {
+                0
+            } else {
+                self.config.sample_rate
+            },
+            channels: if format == RenderFormat::Midi {
+                0
+            } else {
+                self.config.channels
+            },
             format: match format {
                 RenderFormat::Wav => "wav-silent-pcm".into(),
                 RenderFormat::ScalarWav => "wav-scalar-pcm".into(),
                 RenderFormat::ScalarF32Wav => "wav-scalar-f32".into(),
                 RenderFormat::OnsetJson => "onset-json".into(),
                 RenderFormat::ScalarMp3 => "mp3-scalar-320k".into(),
+                RenderFormat::Midi => "midi".into(),
             },
             path: out_path.display().to_string(),
+            midi: midi_report,
             audio_backend: match format {
                 RenderFormat::ScalarWav | RenderFormat::ScalarF32Wav | RenderFormat::ScalarMp3 => {
                     "scalar-rust".into()
@@ -989,6 +1028,7 @@ impl Session {
                 RenderFormat::ScalarF32Wav => {
                     "Deterministic scalar render, 32-bit float and unclamped.".into()
                 }
+                RenderFormat::Midi => "Type 1 MIDI file.".into(),
                 _ => "Offline render without device playback.".into(),
             },
             onset_count: play.onsets.len(),

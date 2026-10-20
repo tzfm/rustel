@@ -52,6 +52,7 @@ use replay_plan::{ReplayOpening, ReplayPlan};
 mod completions;
 mod devices;
 mod live;
+mod midi_import;
 mod replay;
 mod sample_cache;
 mod vst;
@@ -1304,13 +1305,35 @@ enum Command {
         #[arg(short, long, value_name = "FILE")]
         output: Option<PathBuf>,
         /// The file's format; read off --output's extension when absent
-        /// (.mp3 is mp3, .json is onset-json, anything else the normal WAV).
+        /// (.mp3 is mp3, .json is onset-json, .mid is MIDI, anything else the
+        /// normal WAV).
         #[arg(long, value_enum)]
         format: Option<RenderCliFormat>,
+        /// Ticks per quarter note for a MIDI file. [default: 480]
+        #[arg(long, value_name = "PPQ")]
+        ppq: Option<u16>,
+        /// Meter for a MIDI file, N/D. [default: 4/4]
+        #[arg(long, value_name = "N/D")]
+        meter: Option<String>,
         /// The sample rate in Hz.
         #[arg(long, default_value_t = 48000, value_name = "HZ")]
         sample_rate: u32,
         /// Print the report as JSON - only JSON - instead of a line of text.
+        #[arg(short = 'j', long)]
+        json: bool,
+    },
+    /// Convert a Standard MIDI File into a Rustel score.
+    #[command(name = "import-midi")]
+    ImportMidi {
+        /// The MIDI file to read.
+        input: PathBuf,
+        /// Where to write the score. [default: the input name with .strudel]
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// Replace an existing score.
+        #[arg(long)]
+        force: bool,
+        /// Print the report as JSON - only JSON.
         #[arg(short = 'j', long)]
         json: bool,
     },
@@ -1465,7 +1488,7 @@ struct LoadedLiveSources {
     prebake: Option<(PathBuf, String)>,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum RenderCliFormat {
     Wav,
     ScalarWav,
@@ -1477,6 +1500,8 @@ enum RenderCliFormat {
     OnsetJson,
     /// The scalar render LAME-encoded at 320 kbps.
     Mp3,
+    /// A Type 1 Standard MIDI File.
+    Midi,
 }
 
 impl From<RenderCliFormat> for RenderFormat {
@@ -1487,6 +1512,7 @@ impl From<RenderCliFormat> for RenderFormat {
             RenderCliFormat::ScalarF32 => RenderFormat::ScalarF32Wav,
             RenderCliFormat::OnsetJson => RenderFormat::OnsetJson,
             RenderCliFormat::Mp3 => RenderFormat::ScalarMp3,
+            RenderCliFormat::Midi => RenderFormat::Midi,
         }
     }
 }
@@ -2613,6 +2639,8 @@ fn run_command(
             cps,
             output,
             format,
+            ppq,
+            meter,
             sample_rate,
             // Folded into the run's one JSON switch at parse time.
             json: _,
@@ -2623,9 +2651,51 @@ fn run_command(
                     .as_deref()
                     .map_or(RenderCliFormat::ScalarWav, format_for_output)
             });
+            if format != RenderCliFormat::Midi && (ppq.is_some() || meter.is_some()) {
+                return Err(RuntimeError::Message(
+                    "--ppq and --meter are only for MIDI output".into(),
+                ));
+            }
+            if until_silence && format == RenderCliFormat::Midi {
+                return Err(RuntimeError::Message(
+                    "--until-silence needs audio output; a MIDI file ends at the requested length"
+                        .into(),
+                ));
+            }
             let output = match output {
                 Some(output) => output,
                 None => default_render_output(input.file.as_deref(), format),
+            };
+            if format == RenderCliFormat::Midi {
+                let extension = output
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(str::to_ascii_lowercase);
+                if !matches!(extension.as_deref(), None | Some("mid" | "midi")) {
+                    notice(
+                        serde_json::json!({
+                            "midi_output_extension": { "path": output.display().to_string() }
+                        }),
+                        || {
+                            format!(
+                                "warning: {} does not end in .mid; writing MIDI as asked",
+                                output.display()
+                            )
+                        },
+                    );
+                }
+            }
+            let midi_options = if format == RenderCliFormat::Midi {
+                let meter = match meter.as_deref() {
+                    Some(text) => parse_meter(text)?,
+                    None => rustel_smf::Meter::FOUR_FOUR,
+                };
+                Some(rustel_smf::SmfOptions {
+                    ppq: ppq.unwrap_or(rustel_smf::DEFAULT_PPQ),
+                    meter,
+                })
+            } else {
+                None
             };
             let length = match (cycles, duration.as_deref()) {
                 (Some(cycles), _) => {
@@ -2646,7 +2716,9 @@ fn run_command(
                 session.evaluate_prebake_cancellable(&source, &EVALUATION_CANCELLED)?;
             }
             load_source(&mut session, &input, &EVALUATION_CANCELLED)?;
-            if let Err(error) = session.enable_default_samples() {
+            if let Some(options) = midi_options {
+                session.set_midi_export_options(options)?;
+            } else if let Err(error) = session.enable_default_samples() {
                 notice(
                     serde_json::json!({
                         "sample_library": { "status": "unavailable", "message": error.to_string() }
@@ -2676,36 +2748,60 @@ fn run_command(
                 );
             } else {
                 let on = style::stdout_on();
-                let seconds = report.duration_secs;
-                let format_text = match format {
-                    RenderCliFormat::ScalarWav => "16-bit stereo WAV",
-                    RenderCliFormat::ScalarF32 => "32-bit float stereo WAV",
-                    RenderCliFormat::Mp3 => "320 kbps MP3",
-                    RenderCliFormat::OnsetJson => "onset JSON",
-                    RenderCliFormat::Wav => "silent WAV",
-                };
-                outln!(
-                    "{} {} - {:.1} s, {} cycles{}, {} at {} Hz, {} onset{}",
-                    style::green(on, "wrote"),
-                    style::bold(on, &report.path),
-                    seconds,
-                    format_cycles(seconds * score_cps),
-                    if whole_cycles { "" } else { " (as asked)" },
-                    format_text,
-                    report.sample_rate,
-                    report.onset_count,
-                    if report.onset_count == 1 { "" } else { "s" },
-                );
-                if until_silence {
+                if format == RenderCliFormat::Midi {
+                    let midi = report.midi.as_ref();
+                    let tracks = midi.map_or(0, |midi| midi.tracks);
+                    let notes = midi.map_or(0, |midi| midi.notes);
+                    let skipped = midi.map_or(0, |midi| midi.skipped_unsupported);
                     outln!(
-                        "{}",
-                        style::dim(
-                            on,
-                            &format!(
-                                "the tail ran until the music stayed under {silence_floor} dBFS for {silence_hold} s"
-                            )
-                        )
+                        "{} {} - {} bpm, {}, {} track{}, {} note{}{}",
+                        style::green(on, "wrote"),
+                        style::bold(on, &report.path),
+                        midi.map_or_else(|| "?".to_owned(), |midi| format_tempo(midi.tempo_bpm)),
+                        midi.map_or("-", |midi| midi.meter.as_str()),
+                        tracks,
+                        if tracks == 1 { "" } else { "s" },
+                        notes,
+                        if notes == 1 { "" } else { "s" },
+                        if skipped > 0 {
+                            format!(", {skipped} skipped")
+                        } else {
+                            String::new()
+                        },
                     );
+                } else {
+                    let seconds = report.duration_secs;
+                    let format_text = match format {
+                        RenderCliFormat::ScalarWav => "16-bit stereo WAV",
+                        RenderCliFormat::ScalarF32 => "32-bit float stereo WAV",
+                        RenderCliFormat::Mp3 => "320 kbps MP3",
+                        RenderCliFormat::OnsetJson => "onset JSON",
+                        RenderCliFormat::Wav => "silent WAV",
+                        RenderCliFormat::Midi => "Type 1 MIDI file",
+                    };
+                    outln!(
+                        "{} {} - {:.1} s, {} cycles{}, {} at {} Hz, {} onset{}",
+                        style::green(on, "wrote"),
+                        style::bold(on, &report.path),
+                        seconds,
+                        format_cycles(seconds * score_cps),
+                        if whole_cycles { "" } else { " (as asked)" },
+                        format_text,
+                        report.sample_rate,
+                        report.onset_count,
+                        if report.onset_count == 1 { "" } else { "s" },
+                    );
+                    if until_silence {
+                        outln!(
+                            "{}",
+                            style::dim(
+                                on,
+                                &format!(
+                                    "the tail ran until the music stayed under {silence_floor} dBFS for {silence_hold} s"
+                                )
+                            )
+                        );
+                    }
                 }
             }
             // Written, but not the score: see `RenderReport::failure`.
@@ -2714,6 +2810,12 @@ fn run_command(
             }
             Ok(())
         }
+        Command::ImportMidi {
+            input,
+            output,
+            force,
+            json,
+        } => midi_import::import_midi(input, output, force, json),
         Command::Bench {
             input,
             begin,
@@ -3460,8 +3562,31 @@ fn parse_render_length(text: &str) -> Result<RenderLength, RuntimeError> {
     }
 }
 
+/// Parse a MIDI meter in N/D form.
+fn parse_meter(text: &str) -> Result<rustel_smf::Meter, RuntimeError> {
+    let Some((numerator, denominator)) = text.split_once('/') else {
+        return Err(RuntimeError::Message(format!(
+            "--meter must be N/D, got {text:?}"
+        )));
+    };
+    let numerator = numerator.trim().parse::<u8>().map_err(|_| {
+        RuntimeError::Message(format!(
+            "--meter numerator must be 1 to 64, got {:?}",
+            numerator.trim()
+        ))
+    })?;
+    let denominator = denominator.trim().parse::<u8>().map_err(|_| {
+        RuntimeError::Message(format!(
+            "--meter denominator must be a power of two from 1 to 64, got {:?}",
+            denominator.trim()
+        ))
+    })?;
+    rustel_smf::Meter::new(numerator, denominator)
+        .map_err(|error| RuntimeError::Message(error.to_string()))
+}
+
 /// The format an output name asks for: `.mp3` is mp3, `.json` the onset
-/// dump, anything else the normal bounce.
+/// dump, `.mid`/`.midi` MIDI, anything else the normal bounce.
 fn format_for_output(output: &std::path::Path) -> RenderCliFormat {
     match output
         .extension()
@@ -3471,6 +3596,7 @@ fn format_for_output(output: &std::path::Path) -> RenderCliFormat {
     {
         Some("mp3") => RenderCliFormat::Mp3,
         Some("json") => RenderCliFormat::OnsetJson,
+        Some("mid" | "midi") => RenderCliFormat::Midi,
         _ => RenderCliFormat::ScalarWav,
     }
 }
@@ -3482,6 +3608,7 @@ fn default_render_output(score: Option<&std::path::Path>, format: RenderCliForma
     let extension = match format {
         RenderCliFormat::Mp3 => "mp3",
         RenderCliFormat::OnsetJson => "json",
+        RenderCliFormat::Midi => "mid",
         _ => "wav",
     };
     match score {
@@ -3497,6 +3624,11 @@ fn format_cycles(cycles: f64) -> String {
     } else {
         format!("{cycles:.2}")
     }
+}
+
+fn format_tempo(bpm: f64) -> String {
+    let text = format!("{bpm:.1}");
+    text.trim_end_matches('0').trim_end_matches('.').to_owned()
 }
 
 fn parse_positive_seconds(what: &str, value: f64) -> Result<f64, RuntimeError> {

@@ -281,7 +281,10 @@ fn an_unresolved_warning_leaves_the_badge_on_its_own() {
     // What left the header is still in the log.
     studio.chord("ctrl+shift+d");
     assert_eq!(studio.focus(), Some(PanelKind::Log));
-    row_containing(&studio.rows(), "not audio, a folder of audio, or a score");
+    row_containing(
+        &studio.rows(),
+        "not audio, a folder of audio, a score, or a MIDI file",
+    );
     let _ = std::fs::remove_file(note);
 }
 

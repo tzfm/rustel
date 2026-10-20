@@ -34,7 +34,7 @@ test-support = []
 # Serial output. A minimal/headless build may omit its platform stack.
 serial = ["dep:rustel-serial"]
 # MIDI output. A minimal/headless build may omit its platform MIDI stack.
-midi = ["dep:rustel-midi", "dep:midir", "dep:coremidi", "dep:objc2-core-foundation"]
+midi = ["rustel-midi/device", "dep:midir", "dep:coremidi", "dep:objc2-core-foundation"]
 # Gamepad input for `gamepad()`. The score-side object is always there;
 # this is the thread that reads the pads through gilrs.
 gamepad = ["dep:gilrs", "dep:log", "dep:objc2", "dep:objc2-foundation", "dep:objc2-core-foundation", "dep:objc2-game-controller"]
@@ -110,7 +110,10 @@ rustel-audio = { path = "../audio" }
 rustel-csound = { path = "../csound" }
 rustel-voice = { path = "../voice" }
 rustel-serial = { path = "../serial", optional = true }
-rustel-midi = { path = "../midi", optional = true }
+# The wire planner and encoder are always available. The `midi` feature adds
+# the platform device stack through `rustel-midi/device`.
+rustel-midi = { path = "../midi", default-features = false }
+rustel-smf = { path = "../smf" }
 # Only for `midir::Ignore` on the input path; the MIDI stack itself is behind
 # the `midi` feature via rustel-midi.
 midir = { version = "0.11", optional = true }

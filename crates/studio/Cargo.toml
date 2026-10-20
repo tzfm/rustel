@@ -44,6 +44,7 @@ rustel-jsruntime = { path = "../jsruntime", default-features = false }
 rustel-midi = { path = "../midi" }
 rustel-osc = { path = "../osc", optional = true }
 rustel-scheduler = { path = "../scheduler" }
+rustel-smf = { path = "../smf" }
 rustel-serial = { path = "../serial", optional = true }
 rustel-transpiler = { path = "../transpiler" }
 rustel-voice = { path = "../voice" }

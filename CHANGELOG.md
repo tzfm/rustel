@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add MIDI file export. `rustel export --format midi` writes a Type 1 file. Studio adds a MIDI format to the export sheet.
+- Add MIDI file import. `rustel import-midi` writes a score. A dropped `.mid` file opens as a new Studio scene.
+
 ## v0.1.5
 
 - A score that stretches every voice no longer overruns the audio device. The stretch vocoder slid its input and output windows one sample at a time, two 8 KiB moves per sample per channel, so a set of stretched voices spent most of its callback moving memory. The vocoder now keeps both as rings and reads each output slot once per overlap cycle. A score of about thirty stretched voices runs under half the callback budget where it overran before, with byte-identical audio.
