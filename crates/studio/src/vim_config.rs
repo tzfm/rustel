@@ -454,6 +454,11 @@ impl VimConfig {
         Arc::clone(&self.mappings)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_mappings_for_test(&mut self, mappings: VimMappings) {
+        self.mappings = Arc::new(mappings);
+    }
+
     pub(crate) fn error(&self) -> Option<&str> {
         self.error.as_deref().filter(|_| self.enabled)
     }

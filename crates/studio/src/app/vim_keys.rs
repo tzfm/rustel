@@ -138,32 +138,48 @@ pub(super) fn surface_typing(app: &App) -> Option<bool> {
     if !surface.text_wanted() {
         return Some(false);
     }
-    Some(anchored(app) || surface.anchored() || surface.insert())
+    Some(surface.anchored() || surface.insert())
 }
 
-/// A newly focused surface rests in Command mode. One hook serves every
-/// registered surface, so focus handling does not grow a match of its own.
+/// A newly focused surface rests in Command mode, except an anchored
+/// completion, which opens ready to type into the word it was opened on.
+/// One hook serves every registered surface, so focus handling does not
+/// grow a match of its own.
 pub(super) fn focus_changed(app: &mut App) {
     if !enabled(app) {
         return;
     }
+    super::vim_mappings::reset(app);
+    let insert = anchored(app);
     if let Some(surface) = surface_mut(app) {
-        surface.set_insert(false);
+        surface.set_insert(insert);
     }
 }
 
 /// A paste into a Vim text surface enters Insert first, so a pasted word
 /// lands in the box that is waiting for it.
 pub(super) fn enter_insert(app: &mut App) {
-    if !enabled(app) || anchored(app) {
+    if !enabled(app) {
         return;
     }
+    super::vim_mappings::reset(app);
     if let Some(surface) = surface_mut(app)
         && surface.text_wanted()
         && !surface.anchored()
     {
         surface.set_insert(true);
     }
+}
+
+/// Leave Insert on the focused surface. A mapping prefix is dropped here
+/// because the caller flushes it first.
+pub(super) fn leave_insert(app: &mut App) {
+    if let Some(surface) = surface_mut(app) {
+        surface.set_insert(false);
+    }
+    super::vim_mappings::reset(app);
+    app.status = "command mode - i or a types".into();
+    app.dirty_frame = true;
 }
 
 /// What the modal keys decided. An arrow is dispatched by the routing code;
@@ -179,31 +195,50 @@ enum TextAction {
     Message(&'static str),
     Paste,
     Arrow(PanelKind, KeyCode),
+    EnterInsert,
+    /// Feed a plain character to the insert mapping table.
+    InsertKey,
+    /// A mapping prefix waited for a key this field cannot map.
+    FlushThenIgnored,
+    /// Flush a mapping prefix, then leave Insert for Command.
+    FlushThenCommand,
 }
 
 /// The modal keys of a search box. `i` and `a` enter Insert, `p` pastes the
 /// clipboard, Esc returns to Command, and Command keeps j k h l for the
 /// list and every other letter out of the query.
 pub(super) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
-    if key.kind == KeyEventKind::Release || !enabled(app) {
+    if key.kind == KeyEventKind::Release
+        || matches!(key.code, KeyCode::Modifier(_))
+        || !enabled(app)
+    {
         return VimTextKey::Ignored;
     }
     let alias = app.list_navigation_alias(key);
-    let app_anchored = anchored(app);
     let action = {
         let Some(surface) = surface_mut(app) else {
             return VimTextKey::Ignored;
         };
-        if !surface.text_wanted() || app_anchored || surface.anchored() {
+        if !surface.text_wanted() || surface.anchored() {
             return VimTextKey::Ignored;
         }
         if surface.insert() {
             if key.code == KeyCode::Esc && key.modifiers.is_empty() {
-                surface.set_insert(false);
-                TextAction::Message("command mode - i or a types")
+                TextAction::FlushThenCommand
+            } else if let KeyCode::Char(character) = key.code
+                && !character.is_control()
+                && !key.modifiers.intersects(
+                    KeyModifiers::CONTROL
+                        | KeyModifiers::SUPER
+                        | KeyModifiers::ALT
+                        | KeyModifiers::HYPER
+                        | KeyModifiers::META,
+                )
+            {
+                // Insert text, or a mapping first, through one table.
+                TextAction::InsertKey
             } else {
-                // Insert takes every key, including the list letters.
-                TextAction::Ignored
+                TextAction::FlushThenIgnored
             }
         } else if key.modifiers.intersects(
             KeyModifiers::CONTROL
@@ -215,10 +250,7 @@ pub(super) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
             TextAction::Ignored
         } else {
             match key.code {
-                KeyCode::Char('i' | 'a') => {
-                    surface.set_insert(true);
-                    TextAction::Message("insert mode - Esc returns to command")
-                }
+                KeyCode::Char('i' | 'a') => TextAction::EnterInsert,
                 // Vim's paste, into the search or the field the form edits.
                 KeyCode::Char('p') => TextAction::Paste,
                 // Space keeps its surface meaning, such as auditioning
@@ -240,13 +272,18 @@ pub(super) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
         }
     };
     match action {
-        TextAction::Ignored => VimTextKey::Ignored,
+        TextAction::Ignored => {
+            super::vim_mappings::reset(app);
+            VimTextKey::Ignored
+        }
         TextAction::Message(message) => {
+            super::vim_mappings::reset(app);
             app.status = message.into();
             app.dirty_frame = true;
             VimTextKey::Consumed
         }
         TextAction::Paste => {
+            super::vim_mappings::reset(app);
             let text = app.clipboard.get_text().unwrap_or_default();
             if text.is_empty() {
                 app.status = "the clipboard has no text".into();
@@ -256,7 +293,29 @@ pub(super) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
             app.dirty_frame = true;
             VimTextKey::Consumed
         }
-        TextAction::Arrow(kind, code) => VimTextKey::Arrow(kind, code),
+        TextAction::Arrow(kind, code) => {
+            super::vim_mappings::reset(app);
+            VimTextKey::Arrow(kind, code)
+        }
+        TextAction::EnterInsert => {
+            enter_insert(app);
+            app.status = "insert mode - Esc returns to command".into();
+            app.dirty_frame = true;
+            VimTextKey::Consumed
+        }
+        TextAction::InsertKey => {
+            let _ = super::vim_mappings::insert_key(app, key);
+            VimTextKey::Consumed
+        }
+        TextAction::FlushThenIgnored => {
+            super::vim_mappings::flush(app);
+            VimTextKey::Ignored
+        }
+        TextAction::FlushThenCommand => {
+            super::vim_mappings::flush(app);
+            leave_insert(app);
+            VimTextKey::Consumed
+        }
     }
 }
 
@@ -466,6 +525,44 @@ mod tests {
             app.status.contains("clipboard has no text"),
             "{}",
             app.status
+        );
+    }
+
+    #[test]
+    fn an_insert_mapping_leaves_the_search_in_command() {
+        let (_directory, mut app) = vim_app();
+        app.vim_config.set_mappings_for_test(
+            crate::vim_config::VimMappings::parse("inoremap jk <Esc>\n").expect("mapping"),
+        );
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        let panel = app.reference_panel.as_ref().expect("panel");
+        assert_eq!(panel.chord_query, "", "j waits for the mapping");
+        assert!(panel.vim_insert(), "still Insert while it waits");
+
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        let panel = app.reference_panel.as_ref().expect("panel");
+        assert!(!panel.vim_insert(), "jk leaves Insert");
+        assert_eq!(panel.chord_query, "", "jk never reached the query");
+        assert!(app.status.contains("command mode"), "{}", app.status);
+
+        // A replacement with text types it and stays in Insert.
+        app.vim_config.set_mappings_for_test(
+            crate::vim_config::VimMappings::parse("inoremap ,, ()\n").expect("mapping"),
+        );
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char(','), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char(','), KeyModifiers::NONE);
+        let panel = app.reference_panel.as_ref().expect("panel");
+        assert_eq!(panel.chord_query, "()", "the replacement typed");
+        assert!(panel.vim_insert(), "text mappings stay in Insert");
+
+        // A prefix that starts nothing types once it is settled.
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(
+            app.reference_panel.as_ref().expect("panel").chord_query,
+            "()jx"
         );
     }
 
@@ -695,7 +792,7 @@ mod tests {
     }
 
     #[test]
-    fn an_anchored_completion_types_without_insert() {
+    fn an_anchored_completion_types_then_esc_commands() {
         let directory = tempfile::tempdir().expect("temp dir");
         let (mut app, _scene) = plain_app(directory.path(), "$: s(\"bd\")\n");
         app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
@@ -712,14 +809,33 @@ mod tests {
             .expect("panel")
             .sound_query
             .clone();
+        assert!(
+            app.reference_panel.as_ref().expect("panel").vim_insert(),
+            "an anchored completion opens in Insert"
+        );
         press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
         press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
         let panel = app.reference_panel.as_ref().expect("panel");
-        assert!(!panel.vim_insert(), "anchored typing needs no Insert");
         assert_eq!(
             panel.sound_query,
             format!("{before}xi"),
             "the letters typed, i included"
+        );
+
+        // Esc leaves Insert without closing, so the list can be walked.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        let panel = app.reference_panel.as_ref().expect("still open");
+        assert!(!panel.vim_insert(), "Esc returns to Command");
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        assert!(
+            app.reference_panel.as_ref().expect("panel").vim_insert(),
+            "i returns to Insert"
+        );
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(
+            app.reference_panel.is_none(),
+            "the second Command Esc closes"
         );
     }
 }

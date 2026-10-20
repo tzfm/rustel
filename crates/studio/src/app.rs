@@ -207,6 +207,7 @@ mod theme_sheets;
 mod transport;
 mod vim_config;
 mod vim_keys;
+mod vim_mappings;
 mod viz_panel;
 #[cfg(feature = "vst")]
 mod vst;
@@ -1012,6 +1013,8 @@ struct App {
     /// re-learnt from there, so every surface asks the same table.
     keybinds: super::keybinds::Keybinds,
     vim_config: crate::vim_config::VimConfig,
+    /// Plain keys waiting for an insert mapping in a Vim text surface.
+    vim_insert_pending: String,
     /// The value each control change last said and when it said it, keyed
     /// by number and channel, so a bound row reads the crossings of the
     /// line at 64 rather than every message: a knob swept across fires
@@ -1696,6 +1699,7 @@ impl App {
             keybind_learn: None,
             keybinds: prefs.keybinds(),
             vim_config: crate::vim_config::VimConfig::default(),
+            vim_insert_pending: String::new(),
             midi_cc_last: HashMap::new(),
             note_pressed_at: HashMap::new(),
             mapping_lit: [None; MAPPING_SLOTS],
