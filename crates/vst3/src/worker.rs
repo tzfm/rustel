@@ -198,6 +198,9 @@ struct Look {
 }
 
 impl AnswerFile {
+    // The temp file name must be unguessable, so this is the one place that
+    // needs a randomly seeded hasher. No audio or event order depends on it.
+    #[allow(clippy::disallowed_types)]
     fn new() -> std::io::Result<Self> {
         use std::hash::{BuildHasher, Hasher};
         static SERIAL: AtomicU64 = AtomicU64::new(0);

@@ -9,6 +9,8 @@
 - Vim `p` and `P` paste the system clipboard. A yank or delete fills the clipboard too, so a copied score or the last yank lands in the score.
 - The iTerm2 profile knows the characters its Option key composes. Studio recovers the Option panel shortcuts where they apply, such as Option+T for the tape timeline. Elsewhere the composed character types normally.
 - Composed keys type their character. Option+4 on a Mac ISO layout now types `$` in every text field and in Vim. Before, Studio typed `4`.
+- Pattern queries allocate less. Time and value changes reuse a hap, and a shared object map stays shared until a write. A 4-cycle query with five controls drops from 3,297 to 2,353 allocations.
+- The Studio Chords tab sorts the chord symbols it has no name for. Their order changed on each run before.
 
 ## v0.1.5
 

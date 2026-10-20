@@ -1044,19 +1044,21 @@ pub fn voicing<P: crate::ops::PatOps>(pat: &P) -> P {
     voiced.mark_volatile()
 }
 
-/// Every chord symbol a dictionary knows, in the order it was written.
+/// Every chord symbol a dictionary knows, sorted by name.
 pub fn dictionary_symbols(dictionary: Option<&str>) -> Vec<String> {
     let name = dictionary.map(str::to_owned).unwrap_or_else(|| {
         crate::settings::default_voicings().unwrap_or_else(|| dictionaries().pinned_default.clone())
     });
-    if let Some(dict) = crate::settings::user_voicing_dict(&name) {
-        return dict.keys().cloned().collect();
-    }
-    dictionaries()
-        .dicts
-        .get(&name)
-        .map(|dict| dict.keys().cloned().collect())
-        .unwrap_or_default()
+    let mut symbols: Vec<String> = match crate::settings::user_voicing_dict(&name) {
+        Some(dict) => dict.keys().cloned().collect(),
+        None => dictionaries()
+            .dicts
+            .get(&name)
+            .map(|dict| dict.keys().cloned().collect())
+            .unwrap_or_default(),
+    };
+    symbols.sort();
+    symbols
 }
 
 // ---------------------------------------------------------------------------
@@ -2097,6 +2099,12 @@ pub static CHORD_REFERENCE: &[ReferenceEntry] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dictionary_symbols_are_sorted() {
+        let symbols = dictionary_symbols(None);
+        assert!(symbols.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
 
     fn controls(chord: &str, anchor: &str, mode: &str) -> OrderedMap {
         OrderedMap::from_entries([

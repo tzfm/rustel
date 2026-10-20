@@ -496,6 +496,15 @@ impl Hap {
         }
     }
 
+    /// Changes the spans in place. The caller owns the hap, so no value or
+    /// context is cloned.
+    fn update_span(&mut self, f: impl Fn(&TimeSpan) -> TimeSpan) {
+        if let Some(whole) = self.whole.as_mut() {
+            *whole = f(whole);
+        }
+        self.part = f(&self.part);
+    }
+
     /// Replace only the visible part of a hap, retaining its notional whole.
     ///
     /// Native extension nodes use this for the same intersected-child shape
@@ -553,24 +562,45 @@ impl Hap {
         }
     }
 
-    /// The hap with a new value and the same live control bindings: for a
-    /// change of a key that no slider moves.
-    fn with_value_keeping_live(&self, value: Value) -> Hap {
+    /// Changes the value of an owned hap. The context moves instead of
+    /// cloning. The lookup shape survives only when the value is unchanged.
+    fn map_value(self, f: impl FnOnce(&Value) -> Value) -> Hap {
+        let value = f(&self.value);
+        let keep_lookup = value == self.value;
+        Hap {
+            whole: self.whole,
+            part: self.part,
+            pick_lookup: if keep_lookup { self.pick_lookup } else { None },
+            value,
+            context: self.context,
+            live_controls: [0; 3],
+            slider_binding: 0,
+            ui_visuals: self.ui_visuals,
+            scale: self.scale,
+            tags: self.tags,
+            log_line: self.log_line,
+            edo_size: self.edo_size,
+            scale_definition: self.scale_definition,
+        }
+    }
+
+    /// The owned hap with a new value and the same live control bindings.
+    fn into_value_keeping_live(self, value: Value) -> Hap {
         Hap {
             whole: self.whole,
             part: self.part,
             // The lookup shape was of the value before the change.
             pick_lookup: None,
             value,
-            context: self.context.clone(),
+            context: self.context,
             live_controls: self.live_controls,
             slider_binding: self.slider_binding,
             ui_visuals: self.ui_visuals,
-            scale: self.scale.clone(),
-            tags: self.tags.clone(),
-            log_line: self.log_line.clone(),
+            scale: self.scale,
+            tags: self.tags,
+            log_line: self.log_line,
             edo_size: self.edo_size,
-            scale_definition: self.scale_definition.clone(),
+            scale_definition: self.scale_definition,
         }
     }
 
@@ -1831,6 +1861,7 @@ type ValuePredicate = Arc<dyn Fn(&Value) -> bool + Send + Sync>;
 /// value. `discreteOnly`/`onsetsOnly` are the two uses the joins need.
 type HapPredicate = Arc<dyn Fn(&Hap) -> bool + Send + Sync>;
 type HapMapFn = Arc<dyn Fn(&Hap) -> Option<Hap> + Send + Sync>;
+type OwnedHapMapFn = Arc<dyn Fn(Hap) -> Option<Hap> + Send + Sync>;
 type StateHapMapFn = Arc<dyn Fn(&State, &Hap) -> Option<Hap> + Send + Sync>;
 type HapExpandFn = Arc<dyn Fn(&Hap) -> Vec<Hap> + Send + Sync>;
 /// A native continuous signal sampled once per query.
@@ -4174,6 +4205,9 @@ enum Node {
     /// through `signal_query_error` and returns `None`; the flag surfaces at
     /// the query boundary like every other query-time error.
     MapHapsNative(Pattern, HapMapFn),
+    /// A native per-hap map that takes ownership of the incoming hap, so a
+    /// value or context change does not clone them.
+    MapHapsOwned(Pattern, OwnedHapMapFn),
     MapHapsWithState(Pattern, StateHapMapFn),
     /// One hap expands to N haps sharing its span - `voicing()`'s
     /// `stack(...notes).note().set(rest)` + outerJoin collapses to exactly
@@ -4313,6 +4347,7 @@ fn inherited_runtime_settings(node: &Node) -> Option<settings::RuntimeSettings> 
         | Node::FilterWhenJs(pattern, _)
         | Node::SortHapsByPart(pattern)
         | Node::MapHapsNative(pattern, _)
+        | Node::MapHapsOwned(pattern, _)
         | Node::MapHapsWithState(pattern, _)
         | Node::ExpandHapsNative(pattern, _)
         | Node::Collect(pattern)
@@ -4640,7 +4675,10 @@ impl Pattern {
             Node::WithHapTime(pat, f) => pat
                 .query(state)
                 .into_iter()
-                .map(|h| h.with_span(|sp| sp.with_time(|t| f(t))))
+                .map(|mut h| {
+                    h.update_span(|sp| sp.with_time(|t| f(t)));
+                    h
+                })
                 .collect(),
 
             Node::WithQuerySpan(pat, f) => pat.query(&state.with_span(|sp| f(sp))),
@@ -4657,7 +4695,10 @@ impl Pattern {
             Node::WithHapSpan(pat, f) => pat
                 .query(state)
                 .into_iter()
-                .map(|h| h.with_span(|sp| f(sp)))
+                .map(|mut h| {
+                    h.update_span(|sp| f(sp));
+                    h
+                })
                 .collect(),
 
             // Mirror the query span within its cycle, query, mirror the haps
@@ -4675,14 +4716,17 @@ impl Pattern {
                 };
                 pat.query(&state.set_span(reflect(&state.span)))
                     .into_iter()
-                    .map(|h| h.with_span(reflect))
+                    .map(|mut h| {
+                        h.update_span(reflect);
+                        h
+                    })
                     .collect()
             }
 
             Node::FmapNative(pat, f) => pat
                 .query(state)
                 .into_iter()
-                .map(|h| h.with_value(|v| f(v)))
+                .map(|h| h.map_value(|v| f(v)))
                 .collect(),
 
             Node::FilterValues(pat, predicate) => pat
@@ -4753,6 +4797,10 @@ impl Pattern {
 
             Node::MapHapsNative(pat, f) => {
                 pat.query(state).into_iter().filter_map(|h| f(&h)).collect()
+            }
+
+            Node::MapHapsOwned(pat, f) => {
+                pat.query(state).into_iter().filter_map(|h| f(h)).collect()
             }
 
             Node::MapHapsWithState(pat, f) => pat
@@ -5067,7 +5115,10 @@ impl Pattern {
                 pattern
                     .query(&shifted)
                     .into_iter()
-                    .map(|hap| hap.with_span(|span| span.with_time(|time| time.add(delta))))
+                    .map(|mut hap| {
+                        hap.update_span(|span| span.with_time(|time| time.add(delta)));
+                        hap
+                    })
                     .collect()
             }
 
@@ -6792,10 +6843,10 @@ impl Pattern {
         f: impl Fn(&Value) -> Option<Value> + Send + Sync + 'static,
     ) -> Self {
         let steps = self.steps;
-        self.map_haps_preserving_live(move |hap| {
+        self.map_haps_owned(move |hap| {
             Some(match f(&hap.value) {
-                Some(value) => hap.with_value_keeping_live(value),
-                None => hap.clone(),
+                Some(value) => hap.into_value_keeping_live(value),
+                None => hap,
             })
         })
         .with_steps(steps)
@@ -6804,8 +6855,8 @@ impl Pattern {
     /// Host-only provenance for a native query-time slider. Arbitrary value
     /// maps discard this tag before it can become an audio parameter binding.
     pub fn with_slider_binding(&self, binding: u64) -> Self {
-        self.map_haps_preserving_live(move |hap| {
-            let mut hap = hap.clone().without_live_controls();
+        self.map_haps_owned(move |hap| {
+            let mut hap = hap.without_live_controls();
             hap.slider_binding = binding;
             Some(hap)
         })
@@ -6813,7 +6864,7 @@ impl Pattern {
     }
 
     fn map_control(&self, spec: controls::ControlSpec, unnamed_only: bool) -> Self {
-        self.map_haps_preserving_live(move |hap| {
+        self.map_haps_owned(move |hap| {
             let already_controls = unnamed_only
                 && match &hap.value {
                     Value::Object(object) => !object.contains_key("value"),
@@ -6824,14 +6875,16 @@ impl Pattern {
                     _ => false,
                 };
             if already_controls {
-                return Some(hap.clone());
+                return Some(hap);
             }
-            let mut mapped = hap.with_value(|value| spec.with_value(value.clone()));
-            if hap.slider_binding != 0 && matches!(hap.value, Value::F64(_)) {
+            let slider_binding = hap.slider_binding;
+            let scalar = matches!(hap.value, Value::F64(_));
+            let mut mapped = hap.map_value(|value| spec.with_value(value.clone()));
+            if slider_binding != 0 && scalar {
                 match spec.name() {
-                    "gain" => mapped.live_controls[0] = hap.slider_binding,
-                    "cutoff" => mapped.live_controls[1] = hap.slider_binding,
-                    "resonance" => mapped.live_controls[2] = hap.slider_binding,
+                    "gain" => mapped.live_controls[0] = slider_binding,
+                    "cutoff" => mapped.live_controls[1] = slider_binding,
+                    "resonance" => mapped.live_controls[2] = slider_binding,
                     _ => {}
                 }
             }
@@ -6885,6 +6938,12 @@ impl Pattern {
         f: impl Fn(&Hap) -> Option<Hap> + Send + Sync + 'static,
     ) -> Self {
         Pattern::of(Node::MapHapsNative(self.clone(), Arc::new(f)))
+    }
+
+    /// Maps each hap and gives the closure ownership of it. Use this when the
+    /// change can move the value or context instead of cloning them.
+    fn map_haps_owned(&self, f: impl Fn(Hap) -> Option<Hap> + Send + Sync + 'static) -> Self {
+        Pattern::of(Node::MapHapsOwned(self.clone(), Arc::new(f)))
     }
 
     fn map_pitch_haps_native(
@@ -7370,6 +7429,7 @@ fn drain_pattern_children(node: &mut Node, out: &mut Vec<Pattern>) {
         | Node::FilterWhenJs(pattern, _)
         | Node::SortHapsByPart(pattern)
         | Node::MapHapsNative(pattern, _)
+        | Node::MapHapsOwned(pattern, _)
         | Node::MapHapsWithState(pattern, _)
         | Node::ExpandHapsNative(pattern, _)
         | Node::Collect(pattern)
@@ -7600,6 +7660,7 @@ fn compute_purity(node: &Node) -> purity::Purity {
         | Node::FilterHaps(p, _)
         | Node::SortHapsByPart(p)
         | Node::MapHapsNative(p, _)
+        | Node::MapHapsOwned(p, _)
         | Node::MapHapsWithState(p, _)
         | Node::ExpandHapsNative(p, _)
         | Node::Collect(p)

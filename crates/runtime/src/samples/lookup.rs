@@ -1,12 +1,13 @@
 use super::*;
 
 /// Which file of a bank an onset plays, and how far it is transposed.
-pub(super) fn pick_from_bank(bank: &Bank, n: f64, midi: f64) -> (Arc<str>, f64) {
+/// An empty bank selects nothing.
+pub(super) fn pick_from_bank(bank: &Bank, n: f64, midi: f64) -> Option<(Arc<str>, f64)> {
     match bank {
         Bank::Array(urls) => {
-            let url = urls[sound_index(n, urls.len())].clone();
+            let url = urls.get(sound_index(n, urls.len()))?.clone();
             // Array banks: `transpose = midi - 36` (C3 anchors).
-            (url, midi - 36.0)
+            Some((url, midi - 36.0))
         }
         Bank::Notes(notes) => {
             // Closest key wins; strict `<` keeps the FIRST of equals.
@@ -20,10 +21,10 @@ pub(super) fn pick_from_bank(bank: &Bank, n: f64, midi: f64) -> (Arc<str>, f64) 
                     closest = Some(candidate);
                 }
             }
-            let (key_midi, urls) = closest.expect("note banks are non-empty");
-            let url = urls[sound_index(n, urls.len())].clone();
+            let (key_midi, urls) = closest?;
+            let url = urls.get(sound_index(n, urls.len()))?.clone();
             // `transpose = -(noteToMidi(key) - midi)`.
-            (url, midi - key_midi)
+            Some((url, midi - key_midi))
         }
     }
 }
@@ -404,7 +405,7 @@ pub(super) mod tests {
 
         /// Midi 44 is a semitone from both G2 (43) and A2 (45).
         fn assert_the_tie_plays_g2(bank: &Bank) {
-            let (url, transpose) = pick_from_bank(bank, 0.0, 44.0);
+            let (url, transpose) = pick_from_bank(bank, 0.0, 44.0).expect("non-empty bank");
             assert_eq!(&*url, "https://samples.example/strumstick/g2.wav");
             assert_eq!(transpose, 1.0);
         }

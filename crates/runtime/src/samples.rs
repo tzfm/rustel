@@ -1958,6 +1958,7 @@ impl SampleLibrary {
         enum Chosen {
             Font(SampleResolution),
             Sample(Arc<str>, f64),
+            Empty,
         }
         let chosen = self.look_up(s, |named| {
             let bank = match named {
@@ -1966,12 +1967,15 @@ impl SampleLibrary {
                 }
                 Named::Bank(bank) => bank,
             };
-            let (url, transpose) = pick_from_bank(bank, n, midi);
+            let Some((url, transpose)) = pick_from_bank(bank, n, midi) else {
+                return Chosen::Empty;
+            };
             Chosen::Sample(url, transpose)
         });
         let (url, transpose) = match chosen {
             Some(Chosen::Font(resolution)) => return resolution,
             Some(Chosen::Sample(url, transpose)) => (url, transpose),
+            Some(Chosen::Empty) => return SampleResolution::Failed,
             None => {
                 return if self.shared.manifest_pending.load(Ordering::Acquire) != 0 {
                     SampleResolution::Loading
