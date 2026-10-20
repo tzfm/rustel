@@ -1825,6 +1825,62 @@ mod tests {
         use crate::app::tests::support::*;
 
         #[test]
+        fn vim_p_pastes_the_clipboard_once() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.focus = Focus::Editor;
+            app.clipboard
+                .set_text("// two\n".into())
+                .expect("clipboard holds text");
+
+            precision_key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            let source = app.editor().source();
+            assert_eq!(source.matches("// two").count(), 1, "{source:?}");
+
+            // A release is not a second press.
+            app.handle_terminal_event(Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('p'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            )))
+            .unwrap();
+            assert_eq!(
+                app.editor().source().matches("// two").count(),
+                1,
+                "a release pasted again"
+            );
+        }
+
+        #[test]
+        fn vim_yank_fills_the_clipboard_and_p_takes_the_newest_copy() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "one two\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.focus = Focus::Editor;
+
+            for key in ['v', 'e', 'y'] {
+                precision_key(&mut app, KeyCode::Char(key), KeyModifiers::NONE);
+            }
+            assert_eq!(
+                app.clipboard.get_text().expect("yank in clipboard"),
+                "one",
+                "the visual yank filled the clipboard"
+            );
+
+            // A newer copy from another surface beats the old register.
+            app.clipboard
+                .set_text("generated\n".into())
+                .expect("newer copy");
+            precision_key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            let source = app.editor().source();
+            assert!(source.contains("generated"), "{source:?}");
+            assert_eq!(source.matches("generated").count(), 1, "{source:?}");
+        }
+
+        #[test]
         fn vim_list_keys_move_panels_and_follow_the_toggle() {
             let directory = tempfile::tempdir().expect("temp dir");
             let (mut app, _scene) = plain_app(directory.path(), "// one\n");

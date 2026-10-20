@@ -131,6 +131,17 @@ impl Editor {
         self.vim.keybindings == EditorKeybindings::Vim
     }
 
+    /// A mode where `p` puts text: Normal or Visual.
+    pub(crate) fn vim_accepts_put(&self) -> bool {
+        self.vim.keybindings == EditorKeybindings::Vim
+            && matches!(self.vim.mode, Mode::Normal | Mode::Visual { .. })
+    }
+
+    /// The unnamed register, when it holds text.
+    pub(crate) fn vim_register(&self) -> Option<&str> {
+        (!self.vim.register.is_empty()).then_some(self.vim.register.as_str())
+    }
+
     /// Show a short Vim message in the footer's editor label.
     pub(crate) fn vim_say(&mut self, message: &'static str) {
         if self.vim.keybindings == EditorKeybindings::Vim {

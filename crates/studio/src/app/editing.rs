@@ -97,6 +97,35 @@ impl App {
         let mut key = crate::vim_config::canonical_key(key);
         key.kind = kind;
         let pending = self.editor().vim_has_pending_command();
+        // Vim p puts what was copied last. The clipboard answers the key,
+        // and a yank or delete writes the register there (below), so a
+        // copied score and a yanked line take the same road.
+        if !pending
+            && key.kind == KeyEventKind::Press
+            && key.modifiers.is_empty()
+            && matches!(key.code, KeyCode::Char('p' | 'P'))
+            && self.editor().vim_accepts_put()
+        {
+            let register = self.editor().vim_register().map(str::to_owned);
+            let clipboard = self
+                .clipboard
+                .get_text()
+                .ok()
+                .filter(|text| !text.is_empty());
+            // A copy from another surface is newer than the register. When
+            // the two agree, Vim's own put keeps its linewise and visual
+            // rules.
+            if clipboard
+                .as_deref()
+                .is_some_and(|text| register.as_deref() != Some(text))
+            {
+                self.dispatch_editor(Command::Paste)?;
+                self.focus = Focus::Editor;
+                self.dirty_frame = true;
+                return Ok(true);
+            }
+        }
+        let register = self.editor().vim_register().map(str::to_owned);
         let before = self.editor().revision();
         let previous_caret = self.editor().primary_selection().head.0;
         let moment = self.moment();
@@ -133,6 +162,14 @@ impl App {
             return Ok(true);
         }
         if handled {
+            // A yank or delete fills the register. Keep the clipboard in
+            // step, so p pastes the newest copy from any surface.
+            let register_now = self.editor().vim_register().map(str::to_owned);
+            if register_now.as_deref() != register.as_deref()
+                && let Some(text) = register_now
+            {
+                let _ = self.clipboard.set_text(text);
+            }
             if self.editor().revision() != before || self.editor().vim_needs_escape() {
                 self.focus = Focus::Editor;
             }
