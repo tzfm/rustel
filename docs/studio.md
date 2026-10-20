@@ -605,6 +605,10 @@ To change a shortcut, select its row, press Enter, then press the new chord.
 Del restores the default. The panel shortcuts Alt+O, Alt+R, Alt+D and Alt+T
 are at the end of the list. The panel footers show the chord you set.
 
+In iTerm2, Option set to Normal composes a character. The Option panel
+shortcuts then do not arrive, and Studio does not show them. Set Option to
+Esc+ in the profile, or learn another chord for the action.
+
 The vst page lists the folders the plugin host reads for VST3 plugins: your
 folders first, then the standard folders of the system. Press `a` to add a
 folder and `d` to remove one of yours. Enter on `scan` reads every folder and
@@ -678,6 +682,11 @@ keys are on. `j`, `k`, `h`, and `l` walk the list, and the other letters stay
 out of the search. Press `i` or `a` to type in the search, then Esc to return
 to Command. Space still auditions the selected row. An anchored completion
 starts in Insert mode.
+
+The theme picker and the export sheet use the same modes. `j` and `k` move
+the list or the form, `i` or `a` type, and Esc returns to Command. On the
+export sheet, `h` and `l` change a choice or a number, and Space toggles a
+choice.
 
 ### Custom Vim mappings
 
