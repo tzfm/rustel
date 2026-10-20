@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Output};
 
 mod function_score;
+mod midi;
 
 fn rustel() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rustel"));

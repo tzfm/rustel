@@ -47,10 +47,11 @@ rustel export song.strudel -o take.wav --duration 30s
 rustel export song.strudel -o take.mp3 --cycles 32
 rustel export song.strudel -o take.wav --duration 30s \
   --until-silence --silence-floor -60 --silence-hold 2
+rustel export song.strudel --format midi -o take.mid
 ```
 
-The last command renders for about 30 seconds, then waits for audio to stay
-below **−60 dBFS for 2 seconds**. Silence detection starts only after audio
+The `--until-silence` command renders for about 30 seconds, then waits for
+audio to stay below **−60 dBFS for 2 seconds**. Silence detection starts only after audio
 has reached the threshold. The extra time is limited to 60 seconds, including
 for a score that never reaches the threshold. These are the default floor
 and hold values.
@@ -68,9 +69,36 @@ loads helpers before the score, as for `play`.
 | `mp3` | 320 kbps MP3 |
 | `onset-json` | Scheduled events |
 | `wav` | Silent timing file |
+| `midi` | Type 1 MIDI file |
 
-The output extension selects MP3 or JSON. Use `--format` to choose explicitly.
+The output extension selects MP3, JSON, or MIDI. Use `--format` to choose explicitly.
 Ctrl+C stops a WAV export and finalizes a partial file if writing has started.
+
+A MIDI export writes a Type 1 MIDI file. `--ppq` sets the ticks per quarter note
+(default 480). `--meter N/D` sets the meter (default 4/4). MIDI carries notes,
+controllers, programs, pitch bend, and channel aftertouch. It has no audio, so
+`--until-silence` is refused. Haps with no note and no drum or General MIDI
+sound are skipped and counted.
+
+## Import MIDI
+
+```sh
+rustel import-midi song.mid
+rustel import-midi song.mid -o song.strudel --force
+```
+
+`import-midi` reads a format 0 or 1 Standard MIDI File and writes a Rustel
+score. The default output is the input name with `.strudel`. It refuses to
+replace the input or an existing score without `--force`. `--json` prints one
+JSON report.
+
+The import keeps the first tempo and first meter. Later changes are reported.
+Notes pair first in, first out for each channel and key. Channel 10 becomes
+drums. The importer picks a grid from 4 to 64 steps per bar and reports when it
+must quantize. A file longer than one bar appends `.slow(bars)` to each lane.
+Note velocity, controllers, pitch bend, aftertouch, ports, and sysex are not
+imported. The report lists warnings. Limits are 16 MiB, 1,000,000 events, 4096
+bars, and 4 MiB of generated score.
 
 CLI export has no master limiter. Its voice limit is 128 unless the score
 calls `setMaxPolyphony`. Score-level `.limit()` still applies.

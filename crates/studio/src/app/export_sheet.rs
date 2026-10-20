@@ -38,9 +38,14 @@ impl App {
             return;
         }
         if let Some(job) = self.export_job.as_mut() {
-            // The tail is long enough: fade over a tenth of a second and
-            // keep everything rendered so far.
-            if !job.finished_early() {
+            if !job.is_audio() {
+                self.status = format!(
+                    "exporting {} - a MIDI file finishes on its own",
+                    job.scene_name
+                );
+            } else if !job.finished_early() {
+                // The tail is long enough: fade over a tenth of a second and
+                // keep everything rendered so far.
                 job.finish();
                 self.status = format!("ending the export of {} - fading out", job.scene_name);
             }
@@ -172,12 +177,19 @@ impl App {
             sheet.target.clone(),
         ) {
             Ok(job) => {
+                let early = if settings.format.is_audio() {
+                    format!(
+                        " - {} ends it early and keeps the file",
+                        self.keybinds.hint(BindAction::Export)
+                    )
+                } else {
+                    String::new()
+                };
                 self.status = format!(
-                    "exporting {} ({}) → {} - {} ends it early and keeps the file",
+                    "exporting {} ({}) → {}{early}",
                     job.scene_name,
                     settings.describe_length(),
                     status_file_path(&job.target, self.ui_settings.show_full_paths),
-                    self.keybinds.hint(BindAction::Export)
                 );
                 self.log.push(
                     LogLevel::Info,
@@ -262,6 +274,7 @@ mod tests {
 
         use crate::app::tests::support::*;
         use crate::app::*;
+        use crate::export::ExportFormat;
 
         #[test]
         fn a_click_on_the_export_sheet_chooses_what_it_lands_on() {
@@ -297,7 +310,7 @@ mod tests {
             if rustel_runtime::MP3_EXPORT {
                 click(&mut app, layout.mp3.x, layout.mp3.y);
                 let sheet = app.export_sheet.as_ref().expect("still open");
-                assert!(sheet.settings.mp3);
+                assert_eq!(sheet.settings.format, ExportFormat::Mp3);
             }
             click(&mut app, layout.limiter_on.x, layout.limiter_on.y);
             let sheet = app.export_sheet.as_ref().expect("still open");

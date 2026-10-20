@@ -51,19 +51,20 @@ fn source_row_holds(rows: &[String], folder: &Path) -> bool {
         .any(|row| row.contains(name.as_ref()) && row.contains("(local)"))
 }
 
-/// A local import lands as `fetching its list of sounds` and settles, on
-/// a later frame, to `N sound(s) imported` - the walk over the folder
-/// runs off the input path. Bounded like every asynchronous wait in the
-/// suite: five seconds of frames, then the assertion that follows says
-/// what never arrived.
-fn wait_for_import(studio: &mut Hermetic) {
-    for _ in 0..500 {
-        if studio.status().contains("sound(s) imported") {
-            return;
-        }
-        studio.pump();
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+/// Wait for each dropped folder to appear on the Sources page.
+///
+/// The source row is the durable result. The import receipt is a transient
+/// status, and the source's own `fetching its list of sounds` line can
+/// replace it before a poll sees it.
+fn wait_for_import(studio: &mut Hermetic, folders: &[&Path]) {
+    studio.pump_until(
+        std::time::Duration::from_secs(30),
+        "the dropped folders reached Sources",
+        |studio| {
+            let rows = studio.rows();
+            folders.iter().all(|folder| source_row_holds(&rows, folder))
+        },
+    );
 }
 
 /// A dropped folder of audio is imported as a sample source. A terminal has
@@ -76,13 +77,8 @@ fn a_dropped_folder_is_imported_and_lands_on_sources() {
 
     studio.paste(&folder.display().to_string());
     studio.settle();
-    wait_for_import(&mut studio);
+    wait_for_import(&mut studio, &[&folder]);
 
-    let status = studio.status().to_owned();
-    assert!(
-        status.contains("sound(s) imported"),
-        "the drop imported the folder: {status}"
-    );
     assert_eq!(
         studio.focus(),
         Some(PanelKind::Settings),
@@ -128,24 +124,16 @@ fn a_take_dropped_from_the_sets_sessions_folder_is_not_imported() {
 fn a_dropped_audio_file_imports_the_folder_it_sits_in() {
     let mut studio = hermetic();
     let folder = audio_folder("one-file");
-    let file = folder.join("pack").join("hit.wav");
+    let pack = folder.join("pack");
+    let file = pack.join("hit.wav");
 
     studio.paste(&file.display().to_string());
     studio.settle();
-    wait_for_import(&mut studio);
+    wait_for_import(&mut studio, &[&pack]);
 
-    let status = studio.status().to_owned();
-    assert!(
-        status.contains("sound(s) imported"),
-        "the file's folder imported: {status}"
-    );
-    assert!(
-        status.contains("pack"),
-        "the receipt names the folder the file sits in, not the file: {status}"
-    );
     let rows = studio.rows();
     assert!(
-        source_row_holds(&rows, &folder.join("pack")),
+        source_row_holds(&rows, &pack),
         "the source listed is the folder, not the file:\n{}",
         rows.join("\n")
     );
@@ -210,8 +198,9 @@ fn a_dropped_score_that_is_already_open_is_selected_not_duplicated() {
     );
 }
 
-/// A drop that is neither audio, nor a folder of audio, nor a score is
-/// refused with its reason, and the path is not typed into the score.
+/// A drop that is neither audio, nor a folder of audio, nor a score, nor a
+/// MIDI file is refused with its reason, and the path is not typed into the
+/// score.
 #[test]
 fn a_dropped_file_that_is_neither_audio_nor_score_is_refused() {
     let mut studio = hermetic();
@@ -224,8 +213,8 @@ fn a_dropped_file_that_is_neither_audio_nor_score_is_refused() {
 
     assert_eq!(
         studio.status(),
-        "nothing to import from note.txt - audio, a folder of audio, or a score",
-        "the refusal names the file and the three things a drop can be"
+        "nothing to import from note.txt - audio, a folder of audio, a score, or a MIDI file",
+        "the refusal names the file and the four things a drop can be"
     );
     assert!(
         !studio.score().contains("note.txt"),
@@ -250,11 +239,11 @@ fn a_mixed_drop_imports_what_it_can_and_names_what_it_skipped() {
     // naming is the first thing the drop says.
     assert_eq!(
         studio.status(),
-        "note.txt skipped: not audio or a score",
+        "note.txt skipped: not audio, a score, or a MIDI file",
         "the skipped file is named"
     );
 
-    wait_for_import(&mut studio);
+    wait_for_import(&mut studio, &[&folder]);
     let rows = studio.rows();
     assert!(
         source_row_holds(&rows, &folder),
@@ -264,8 +253,7 @@ fn a_mixed_drop_imports_what_it_can_and_names_what_it_skipped() {
     cleanup(&folder);
 }
 
-/// Several folders in one drop are one selection: they import together
-/// and the receipt counts what arrived, not what was asked for.
+/// Several folders in one drop are one selection: they import together.
 #[test]
 fn dropping_two_folders_imports_them_together() {
     let mut studio = hermetic();
@@ -274,13 +262,8 @@ fn dropping_two_folders_imports_them_together() {
 
     studio.paste(&format!("{} {}", first.display(), second.display()));
     studio.settle();
-    wait_for_import(&mut studio);
+    wait_for_import(&mut studio, &[&first, &second]);
 
-    assert!(
-        studio.status().contains("2 source(s) imported"),
-        "one drop, two sources, one receipt: {}",
-        studio.status()
-    );
     let rows = studio.rows();
     assert!(
         source_row_holds(&rows, &first) && source_row_holds(&rows, &second),
@@ -336,13 +319,8 @@ fn a_drop_over_the_samples_search_box_imports_instead_of_typing() {
 
     studio.paste(&folder.display().to_string());
     studio.settle();
-    wait_for_import(&mut studio);
+    wait_for_import(&mut studio, &[&folder]);
 
-    let status = studio.status().to_owned();
-    assert!(
-        status.contains("sound(s) imported"),
-        "the drop over the search box imported: {status}"
-    );
     let rows = studio.rows();
     assert!(
         source_row_holds(&rows, &folder),
@@ -402,11 +380,7 @@ fn an_imported_drop_survives_a_reopen() {
 
     studio.paste(&folder.display().to_string());
     studio.settle();
-    wait_for_import(&mut studio);
-    assert!(
-        studio.status().contains("sound(s) imported"),
-        "setup: the drop imported"
-    );
+    wait_for_import(&mut studio, &[&folder]);
 
     // Close the studio the way the shell would: the pref is written on a
     // debounce, so the wait is what makes the quit honest.

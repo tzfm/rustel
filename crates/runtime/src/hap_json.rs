@@ -147,6 +147,20 @@ pub struct PlayReport {
     pub onsets: Vec<OnsetEventJson>,
 }
 
+/// What a MIDI render wrote.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct MidiExportReport {
+    pub ppq: u16,
+    pub tempo_bpm: f64,
+    pub meter: String,
+    pub tracks: usize,
+    pub notes: usize,
+    pub messages: usize,
+    pub skipped_unsupported: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_names: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RenderReport {
     pub duration_secs: f64,
@@ -155,6 +169,9 @@ pub struct RenderReport {
     pub channels: u16,
     pub format: String,
     pub path: String,
+    /// Present only for a MIDI file render.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub midi: Option<MidiExportReport>,
     pub audio_backend: String,
     pub device_audio: String,
     pub note: String,
