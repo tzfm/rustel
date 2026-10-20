@@ -192,6 +192,16 @@ impl Widget for ReferenceView<'_> {
 }
 
 impl ReferenceView<'_> {
+    /// The search row. In Vim Command an empty row says how to type, so the
+    /// eye is not left with a bare label and a blinking caret.
+    fn search_row(&self, query: &str) -> String {
+        if self.vim && !self.panel.vim_insert() && !self.anchored && query.is_empty() {
+            "search: i or a types".to_owned()
+        } else {
+            format!("search: {query}")
+        }
+    }
+
     /// The example tree and the highlighted code that is about to be copied.
     #[cfg(feature = "hydra")]
     fn render_snippets(&self, inner: Rect, buffer: &mut Buffer) {
@@ -676,7 +686,7 @@ impl ReferenceView<'_> {
         buffer.set_stringn(
             inner.x,
             inner.y + 1,
-            format!("search: {}", self.panel.chord_query),
+            self.search_row(&self.panel.chord_query),
             usize::from(inner.width),
             Style::default().fg(theme.foreground),
         );
@@ -800,7 +810,7 @@ impl ReferenceView<'_> {
         buffer.set_stringn(
             inner.x,
             inner.y + 1,
-            format!("search: {}", self.panel.scale_query),
+            self.search_row(&self.panel.scale_query),
             usize::from(inner.width),
             Style::default().fg(theme.foreground),
         );
@@ -918,7 +928,7 @@ impl ReferenceView<'_> {
         buffer.set_stringn(
             inner.x,
             inner.y + 1,
-            format!("search: {}", tab.query()),
+            self.search_row(tab.query()),
             usize::from(inner.width),
             Style::default().fg(theme.foreground),
         );
@@ -1065,7 +1075,7 @@ impl ReferenceView<'_> {
     /// the count.
     fn render_samples(&self, inner: Rect, buffer: &mut Buffer) {
         let theme = self.theme;
-        let query = format!("search: {}", self.panel.sound_query);
+        let query = self.search_row(&self.panel.sound_query);
         buffer.set_stringn(
             inner.x,
             inner.y + 1,
@@ -1385,18 +1395,21 @@ impl ReferenceView<'_> {
                 );
                 return;
             }
-            let mut hints = vec![
-                "↑↓ move",
-                "→ expand or preview",
-                "← folds",
-                "Space plays/stops",
-                "Esc stops too",
-            ];
-            if self.keybinds.alt_hint_available('a') {
-                hints.push("Alt+A auto-play");
-            }
-            hints.push("Alt+± volume");
-            render_footer(buffer, inner, inner.bottom() - 2, &hints, theme);
+            render_footer(
+                buffer,
+                inner,
+                inner.bottom() - 2,
+                &[
+                    "↑↓ move",
+                    "→ expand or preview",
+                    "← folds",
+                    "Space plays/stops",
+                    "Esc stops too",
+                    "Alt+A auto-play",
+                    "Alt+± volume",
+                ],
+                theme,
+            );
             let source_line = sample_source_line(self.panel);
             buffer.set_stringn(
                 inner.x,
@@ -1456,7 +1469,7 @@ impl ReferenceView<'_> {
 
     fn render_browse(&self, inner: Rect, buffer: &mut Buffer) {
         let theme = self.theme;
-        let query = format!("search: {}", self.panel.query);
+        let query = self.search_row(&self.panel.query);
         buffer.set_stringn(
             inner.x,
             inner.y + 1,

@@ -586,7 +586,9 @@ pub struct StudioView<'a> {
     pub library_loading: bool,
     pub strip_mode: &'a SceneStripMode,
     /// The reference column, when it is open.
-    pub reference: Option<(&'a Reference, &'a ReferencePanel)>,
+    /// The open column, and whether an anchored completion is typing into
+    /// it without Insert.
+    pub reference: Option<(&'a Reference, &'a ReferencePanel, bool)>,
     /// Which panel holds the keyboard, if any. It decides where the one lit
     /// caret goes and which footer says the way back.
     pub focused_panel: Option<PanelKind>,
@@ -986,7 +988,7 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
     // were raised - the one raised last on top - and the menu, the theme
     // editor and the help paint over those in turn.
     let draw_reference = |frame: &mut Frame<'_>, cursor: &mut Option<CellPoint>| {
-        let Some((reference, panel)) = view.reference else {
+        let Some((reference, panel, anchored)) = view.reference else {
             return;
         };
         if layout.reference.is_empty() {
@@ -1000,6 +1002,8 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
                 panel,
                 theme,
                 focused,
+                vim: chrome.vim_text_modes,
+                anchored,
                 pulse: Some(super::reference::SamplesPulse {
                     // The preview's own tap, not the mix: the meter shows
                     // what the browser is sounding.
@@ -1032,7 +1036,8 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
             },
             layout.reference,
         );
-        if focused {
+        // Command rests with no caret; typing states keep it up.
+        if focused && (!chrome.vim_text_modes || panel.vim_insert() || anchored) {
             *cursor = panel
                 .search_cursor(super::reference::inner_area(layout.reference))
                 .map(|(x, y)| CellPoint::new(x, y));
@@ -3268,7 +3273,7 @@ mod tests {
                         panel: None,
                         scenes: &[],
                         strip_mode: &SceneStripMode::Idle,
-                        reference: Some((&reference, &panel)),
+                        reference: Some((&reference, &panel, false)),
                         log: None,
                         jobs: None,
                         memory: None,

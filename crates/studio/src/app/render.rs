@@ -1197,7 +1197,7 @@ impl App {
             reference: self
                 .reference_panel
                 .as_ref()
-                .map(|panel| (&self.reference, panel)),
+                .map(|panel| (&self.reference, panel, self.reference_anchor.is_some())),
             #[cfg(feature = "hydra")]
             snippet_picture: self.hydra_shelf_last.is_some(),
             #[cfg(not(feature = "hydra"))]
