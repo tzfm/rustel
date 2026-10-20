@@ -170,13 +170,15 @@ pub struct Ring {
 unsafe impl Sync for Ring {}
 unsafe impl Send for Ring {}
 
-/// Hash of the current thread's id - `ThreadId` has no stable integer form.
+/// A token for the current thread, taken from a counter on first use.
+/// `ThreadId` has no stable integer form.
 fn this_thread() -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::thread::current().id().hash(&mut hasher);
-    // Never zero, so the slot's "unclaimed" value stays distinguishable.
-    hasher.finish() | 1
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    thread_local! {
+        // Never zero, so the slot's "unclaimed" value stays distinguishable.
+        static TOKEN: u64 = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    TOKEN.with(|token| *token)
 }
 
 /// Claim a role for this thread. `false` means another thread already holds
