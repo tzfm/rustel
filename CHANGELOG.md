@@ -4,6 +4,7 @@
 
 - Pattern queries allocate less. Time and value changes reuse a hap, and a shared object map stays shared until a write. A 4-cycle query with five controls drops from 3,297 to 2,353 allocations.
 - The Studio Chords tab sorts the chord symbols it has no name for. Their order changed on each run before.
+- The Studio Chords tab no longer leaks memory while it is open. Each draw leaked 336 small strings with the default dictionary.
 
 ## v0.1.5
 
