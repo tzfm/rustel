@@ -47,6 +47,17 @@ impl App {
             self.dirty_frame = true;
             return Ok(true);
         }
+        // Vim Normal does not eat the Esc that puts an open panel away. A
+        // sheet left behind the editor is otherwise impossible to close.
+        if key.code == KeyCode::Esc
+            && key.modifiers.is_empty()
+            && self.focus == Focus::Editor
+            && self.front_panel().is_some()
+            && self.editor().vim_is_normal()
+            && !self.editor().vim_has_pending_command()
+        {
+            return Ok(false);
+        }
         self.dispatch_vim_builtin(key)
     }
 

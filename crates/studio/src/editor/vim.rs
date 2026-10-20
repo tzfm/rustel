@@ -129,6 +129,11 @@ impl Editor {
         self.vim.keybindings == EditorKeybindings::Default || self.vim.mode == Mode::Insert
     }
 
+    /// Vim is on and rests in Normal, with no motion or command waiting.
+    pub(crate) fn vim_is_normal(&self) -> bool {
+        self.vim.keybindings == EditorKeybindings::Vim && self.vim.mode == Mode::Normal
+    }
+
     pub(crate) fn vim_enabled(&self) -> bool {
         self.vim.keybindings == EditorKeybindings::Vim
     }

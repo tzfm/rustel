@@ -1825,6 +1825,30 @@ mod tests {
         use crate::app::tests::support::*;
 
         #[test]
+        fn esc_closes_an_open_sheet_from_vim_normal_behind_the_editor() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.toggle_settings_sheet();
+            assert!(app.settings_sheet.is_some());
+            // The editor takes the keyboard while the sheet stays open.
+            app.focus = Focus::Editor;
+
+            precision_key(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            assert!(app.editor().vim_is_insert(), "i enters Insert");
+            precision_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(!app.editor().vim_is_insert(), "Esc leaves Insert");
+            assert!(app.settings_sheet.is_some(), "the sheet waits for Normal");
+
+            precision_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(
+                app.settings_sheet.is_none(),
+                "Esc in Normal closes the sheet"
+            );
+        }
+
+        #[test]
         fn vim_p_pastes_the_clipboard_once() {
             let directory = tempfile::tempdir().expect("temp dir");
             let (mut app, _scene) = plain_app(directory.path(), "// one\n");
