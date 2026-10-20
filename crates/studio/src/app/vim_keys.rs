@@ -177,12 +177,13 @@ pub(super) enum VimTextKey {
 enum TextAction {
     Ignored,
     Message(&'static str),
+    Paste,
     Arrow(PanelKind, KeyCode),
 }
 
-/// The modal keys of a search box. `i` and `a` enter Insert, Esc returns to
-/// Command, and Command keeps j k h l for the list and every other letter
-/// out of the query.
+/// The modal keys of a search box. `i` and `a` enter Insert, `p` pastes the
+/// clipboard, Esc returns to Command, and Command keeps j k h l for the
+/// list and every other letter out of the query.
 pub(super) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
     if key.kind == KeyEventKind::Release || !enabled(app) {
         return VimTextKey::Ignored;
@@ -218,6 +219,8 @@ pub(super) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
                     surface.set_insert(true);
                     TextAction::Message("insert mode - Esc returns to command")
                 }
+                // Vim's paste, into the search or the field the form edits.
+                KeyCode::Char('p') => TextAction::Paste,
                 // Space keeps its surface meaning, such as auditioning
                 // the selected row or toggling a choice. Where it has
                 // none, it is text and Command keeps it out.
@@ -240,6 +243,16 @@ pub(super) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
         TextAction::Ignored => VimTextKey::Ignored,
         TextAction::Message(message) => {
             app.status = message.into();
+            app.dirty_frame = true;
+            VimTextKey::Consumed
+        }
+        TextAction::Paste => {
+            let text = app.clipboard.get_text().unwrap_or_default();
+            if text.is_empty() {
+                app.status = "the clipboard has no text".into();
+            } else if !app.paste_to_prompt(&text) {
+                app.status = "nothing to paste here".into();
+            }
             app.dirty_frame = true;
             VimTextKey::Consumed
         }
@@ -389,6 +402,17 @@ mod tests {
         ));
         let caret = app.editor().primary_selection().head.0;
 
+        // An entry has nothing to open to the right. It still keeps the key.
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+        assert!(
+            matches!(
+                app.reference_panel.as_ref().expect("panel").mode,
+                crate::reference::ReferenceMode::Entry { .. }
+            ),
+            "l did not leave the entry"
+        );
+        assert_eq!(app.editor().primary_selection().head.0, caret);
+
         press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
         assert!(
             matches!(
@@ -401,6 +425,47 @@ mod tests {
             app.editor().primary_selection().head.0,
             caret,
             "h did not move the editor caret"
+        );
+
+        // At the top of the list h has nothing to fold. It still keeps the
+        // key instead of walking the caret under the panel.
+        press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+        assert!(
+            matches!(
+                app.reference_panel.as_ref().expect("panel").mode,
+                crate::reference::ReferenceMode::Browse
+            ),
+            "h stayed in the browse list"
+        );
+        assert_eq!(
+            app.editor().primary_selection().head.0,
+            caret,
+            "a fold with nothing to close kept the editor caret"
+        );
+    }
+
+    #[test]
+    fn p_pastes_the_clipboard_into_the_search() {
+        let (_directory, mut app) = vim_app();
+        let source = app.editor().source();
+        app.clipboard
+            .set_text("maj".into())
+            .expect("clipboard holds text");
+        press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+        let panel = app.reference_panel.as_ref().expect("panel");
+        assert_eq!(panel.chord_query, "maj", "p pasted the search");
+        assert!(panel.vim_insert(), "a paste enters Insert");
+        assert_eq!(app.editor().source(), source, "the score did not take it");
+
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        app.clipboard
+            .set_text(String::new())
+            .expect("empty clipboard");
+        press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+        assert!(
+            app.status.contains("clipboard has no text"),
+            "{}",
+            app.status
         );
     }
 

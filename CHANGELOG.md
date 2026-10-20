@@ -4,7 +4,7 @@
 
 - The global and local prebakes open from the Options menu. Learn a key for either on Settings > Keybinds.
 - With Vim editor keys on, j k h l move lists, menus, and help as the arrows do. Turn Vim list keys off in the Vim section of Settings > Keybinds to use the letters as text.
-- Reference searches, the theme picker, and the export sheet rest in Vim Command mode. j k h l walk the list or form, i or a type, and Esc returns to Command. The caret follows the active reference tab's query.
+- Reference searches, the theme picker, and the export sheet rest in Vim Command mode. j k h l walk the list or form, p pastes the clipboard, i or a type, and Esc returns to Command. The caret follows the active reference tab's query.
 - Edit > Find opens the Vim search prompt when Vim editor keys are on. Enter searches once, and `n` and `N` walk the matches.
 - The iTerm2 profile knows the characters its Option key composes. Studio recovers the Option panel shortcuts where they apply, such as Option+T for the tape timeline. Elsewhere the composed character types normally.
 - Composed keys type their character. Option+4 on a Mac ISO layout now types `$` in every text field and in Vim. Before, Studio typed `4`.

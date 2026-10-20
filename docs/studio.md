@@ -688,7 +688,8 @@ starts in Insert mode.
 The theme picker and the export sheet use the same modes. `j` and `k` move
 the list or the form, `i` or `a` type, and Esc returns to Command. On the
 export sheet, `h` and `l` change a choice or a number, and Space toggles a
-choice.
+choice. In Command mode, `p` pastes the clipboard into the search or form
+and enters Insert.
 
 ### Custom Vim mappings
 

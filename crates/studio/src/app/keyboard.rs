@@ -993,11 +993,13 @@ impl App {
             // A plain j, k, h, or l the panel had no use for is the arrow
             // it stands in for. The four letters navigate even where the
             // panel otherwise passes letters to the score: with Vim list
-            // keys on they are list keys, not typing.
+            // keys on they are list keys, not typing. An arrow with no
+            // target still belongs to the panel: letting it through would
+            // move a caret the reader cannot see.
             if super::vim_keys::panel_takes_list_navigation(kind)
                 && let Some(alias) = self.list_navigation_alias(key)
-                && self.dispatch_panel_key(kind, alias.code, false, false, false)?
             {
+                let _ = self.dispatch_panel_key(kind, alias.code, false, false, false)?;
                 return Ok(true);
             }
             if !primary
