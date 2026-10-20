@@ -29,6 +29,13 @@ impl App {
     }
 
     pub(super) fn dispatch_vim_key(&mut self, key: KeyEvent) -> Result<bool, RuntimeError> {
+        // The remote sheet has the keyboard while it is open: its address
+        // and token are typed into, and its rows answer to j/k. Vim waits
+        // until it closes.
+        #[cfg(feature = "remote-control")]
+        if self.remote_panel_open {
+            return Ok(false);
+        }
         let moment = self.moment();
         if self
             .scenes

@@ -467,28 +467,31 @@ impl App {
             return true;
         }
         match event {
-            Event::Key(key) => match panel_key_action(key) {
-                Some(PanelKeyAction::Close) => self.close_remote_panel(),
-                Some(PanelKeyAction::Reveal) => self.reveal_remote_token(),
-                Some(PanelKeyAction::Copy) => self.copy_remote_token(),
-                Some(PanelKeyAction::Previous) => {
-                    self.remote_panel_selected = self.remote_panel_selected.saturating_sub(1);
-                    self.dirty_frame = true;
+            Event::Key(key) => {
+                let alias = self.list_navigation_alias(key);
+                match panel_key_action(alias.as_ref().unwrap_or(key)) {
+                    Some(PanelKeyAction::Close) => self.close_remote_panel(),
+                    Some(PanelKeyAction::Reveal) => self.reveal_remote_token(),
+                    Some(PanelKeyAction::Copy) => self.copy_remote_token(),
+                    Some(PanelKeyAction::Previous) => {
+                        self.remote_panel_selected = self.remote_panel_selected.saturating_sub(1);
+                        self.dirty_frame = true;
+                    }
+                    Some(PanelKeyAction::Next) => {
+                        let last = if self.remote_panel_token().is_some() {
+                            4
+                        } else {
+                            2
+                        };
+                        self.remote_panel_selected = (self.remote_panel_selected + 1).min(last);
+                        self.dirty_frame = true;
+                    }
+                    Some(PanelKeyAction::Activate) => {
+                        self.activate_remote_panel_row(self.remote_panel_selected);
+                    }
+                    _ => {}
                 }
-                Some(PanelKeyAction::Next) => {
-                    let last = if self.remote_panel_token().is_some() {
-                        4
-                    } else {
-                        2
-                    };
-                    self.remote_panel_selected = (self.remote_panel_selected + 1).min(last);
-                    self.dirty_frame = true;
-                }
-                Some(PanelKeyAction::Activate) => {
-                    self.activate_remote_panel_row(self.remote_panel_selected);
-                }
-                _ => {}
-            },
+            }
             Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
                 let Some(geometry) = RemotePanelView::geometry(self.frame) else {
                     self.close_remote_panel();
@@ -697,6 +700,38 @@ mod tests {
         use crate::app::*;
         use std::io::{BufRead, BufReader, Write};
         use std::net::TcpStream;
+
+        #[test]
+        fn vim_list_keys_do_not_steal_the_remote_sheet() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 100, 30);
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.ui_settings.vim_list_navigation = true;
+            app.sync_editor_keybindings();
+            app.open_remote_panel();
+            assert!(app.remote_panel_open, "the sheet opens");
+
+            let before = app.remote_panel_selected;
+            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert_eq!(
+                app.remote_panel_selected,
+                before + 1,
+                "j moves the remote rows"
+            );
+
+            app.activate_remote_panel_row(1);
+            assert!(app.remote_edit.is_some(), "the address row edits");
+            press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+            assert_eq!(
+                app.remote_edit
+                    .as_ref()
+                    .expect("edit")
+                    .visible_text(64, true),
+                "x",
+                "the edit takes the letter, not a Vim command"
+            );
+        }
 
         #[test]
         fn remote_commands_light_the_indicator_and_expire_with_one_repaint() {
