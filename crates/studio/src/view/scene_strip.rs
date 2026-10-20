@@ -223,15 +223,15 @@ impl Widget for SceneStrip<'_> {
             // glance at the strip never mistakes it for a scene.
             let style = match (chip.current, chip.prebake.is_some(), chip.replay) {
                 (true, true, _) => Style::default()
-                    .fg(theme.background)
+                    .fg(theme.fill_text())
                     .bg(theme.mini)
                     .add_modifier(Modifier::BOLD),
                 (true, false, true) => Style::default()
-                    .fg(theme.background)
+                    .fg(theme.fill_text())
                     .bg(theme.replay_colour())
                     .add_modifier(Modifier::BOLD),
                 (true, false, false) => Style::default()
-                    .fg(theme.background)
+                    .fg(theme.fill_text())
                     .bg(theme.accent)
                     .add_modifier(Modifier::BOLD),
                 (false, true, _) => Style::default().fg(theme.mini),

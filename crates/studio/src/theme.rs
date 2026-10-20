@@ -430,6 +430,9 @@ const BUILT_INS: &[(&str, &str)] = &[
     ("forest", include_str!("themes/forest.json")),
     ("bear", include_str!("themes/bear.json")),
     ("mono", include_str!("themes/mono.json")),
+    // No palette of its own: `reset` and the terminal's 16 colours, so the
+    // studio wears whatever palette the terminal already carries.
+    ("terminal", include_str!("themes/terminal.json")),
     ("solarized", include_str!("themes/solarized.json")),
     ("ember", include_str!("themes/ember.json")),
     ("hell", include_str!("themes/hell.json")),
@@ -1129,6 +1132,19 @@ impl Theme {
     /// The colour a replay tab wears.
     pub fn replay_colour(&self) -> Color {
         self.replay.unwrap_or(self.warn)
+    }
+
+    /// The text that reads on a filled chip: the background, where the
+    /// theme owns one, and the palette's black where the terminal owns
+    /// the ground. A palette keeps every accent readable on its black -
+    /// its own filled tabs use the same pair - so a fill drawn from its
+    /// slots reads with the same black.
+    pub fn fill_text(&self) -> Color {
+        if true_rgb(self.background).is_some() {
+            self.background
+        } else {
+            Color::Indexed(0)
+        }
     }
 
     /// What this theme asks the global opacity settings to be.
@@ -2974,6 +2990,49 @@ fn split_top_level(body: &str) -> Vec<&str> {
     fields
 }
 
+/// Test-only helpers for the process-wide theme directory variable.
+///
+/// The theme directory is environment state, and the lib test binary runs
+/// its tests on parallel threads: the variable one test sets is the one
+/// another reads. Every test that sets or reads it holds
+/// [`THEME_DIR_LOCK`] for its whole body, so a scoped directory is the
+/// only directory any of them can see while it runs.
+#[cfg(test)]
+pub(crate) mod test_env {
+    /// Held for the whole body of any test that sets or reads
+    /// `RUSTEL_THEME_DIR`. Take it before [`ScopedThemeDir::set`].
+    pub(crate) static THEME_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Holds `RUSTEL_THEME_DIR` for the scope of one test and puts back
+    /// whatever was there before.
+    ///
+    /// The restore also runs when the test panics, so later tests keep the
+    /// theme directory that the suite started with. Take
+    /// [`THEME_DIR_LOCK`] first: the variable is process-wide, so two
+    /// tests scoping it at once would each read the other's directory.
+    pub(crate) struct ScopedThemeDir(Option<std::ffi::OsString>);
+
+    impl ScopedThemeDir {
+        pub(crate) fn set(directory: &std::path::Path) -> Self {
+            let previous = std::env::var_os("RUSTEL_THEME_DIR");
+            // SAFETY: `THEME_DIR_LOCK` holds every other setter and reader
+            // out for the life of this value; read on this thread only.
+            unsafe { std::env::set_var("RUSTEL_THEME_DIR", directory) };
+            Self(previous)
+        }
+    }
+
+    impl Drop for ScopedThemeDir {
+        fn drop(&mut self) {
+            match self.0.take() {
+                // SAFETY: as above.
+                Some(previous) => unsafe { std::env::set_var("RUSTEL_THEME_DIR", previous) },
+                None => unsafe { std::env::remove_var("RUSTEL_THEME_DIR") },
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3600,10 +3659,17 @@ mod tests {
     }
 
     #[test]
-    fn every_bundled_theme_tints_sounding_syntax_without_losing_contrast() {
+    fn every_bundled_theme_marks_sounding_syntax_without_losing_contrast() {
         for (name, document) in BUILT_INS.iter().chain(SHOWROOM_THEMES) {
             let theme = Theme::from_json(document).unwrap();
-            assert_eq!(theme.event_mark, MarkStyle::Tint, "{name}");
+            if theme.event_mark != MarkStyle::Tint {
+                // A theme whose ground only the terminal knows cannot mix a
+                // tint into it. Underlining in the event colour is the one
+                // marking that invents no colour.
+                assert_eq!(theme.event_mark, MarkStyle::Underline, "{name}");
+                assert!(true_rgb(theme.background).is_none(), "{name}");
+                continue;
+            }
             let syntax_colors = [
                 theme.syntax.text,
                 theme.syntax.comment,
@@ -3646,6 +3712,22 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Every filled chip asks the theme for the text that reads on it. A
+    /// theme that owns its ground answers the ground; a theme that defers
+    /// to the terminal answers the palette's black, the one colour every
+    /// palette keeps its accents readable on.
+    #[test]
+    fn filled_chip_text_follows_who_owns_the_ground() {
+        for (name, document) in BUILT_INS.iter().chain(SHOWROOM_THEMES) {
+            let theme = Theme::from_json(document).unwrap();
+            if true_rgb(theme.background).is_some() {
+                assert_eq!(theme.fill_text(), theme.background, "{name}");
+            } else {
+                assert_eq!(theme.fill_text(), Color::Indexed(0), "{name}");
             }
         }
     }
@@ -3711,6 +3793,9 @@ mod tests {
     /// the theme editor's code tab honest.
     #[test]
     fn every_built_in_round_trips_through_its_own_file_format() {
+        let _theme_dir = test_env::THEME_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         for name in Theme::available_names() {
             let Some(theme) = Theme::built_in(&name) else {
                 continue;
@@ -3909,18 +3994,19 @@ mod confinement_tests {
     fn a_remembered_selector_cannot_name_a_file_outside_the_theme_directory() {
         // studio.json is synced and hand-edited. A path in it is held to the
         // theme directory so it cannot turn into an arbitrary read.
+        let _theme_dir = test_env::THEME_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let directory = tempfile::tempdir().expect("tempdir");
         let themes = directory.path().join("themes");
         std::fs::create_dir_all(&themes).expect("theme directory");
         let outside = directory.path().join("outside.json");
         std::fs::write(&outside, include_str!("themes/synthwave.json")).expect("write");
 
-        // SAFETY: single-threaded test; the variable is read on this thread.
-        unsafe { std::env::set_var("RUSTEL_THEME_DIR", &themes) };
+        let _scoped = test_env::ScopedThemeDir::set(&themes);
         let escape = format!("{}", outside.display());
         let refused = Theme::resolve_remembered(&escape);
         let traversal = Theme::resolve_remembered("../outside.json");
-        unsafe { std::env::remove_var("RUSTEL_THEME_DIR") };
 
         assert!(refused.is_err(), "an absolute escape must be refused");
         assert!(traversal.is_err(), "a `..` escape must be refused");
