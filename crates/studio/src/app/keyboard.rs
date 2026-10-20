@@ -991,10 +991,10 @@ impl App {
             let passes = self.panel_types_through(kind)
                 || (self.panel_reads_beside_score(kind) && moves_the_caret(key.code));
             // A plain j, k, h, or l the panel had no use for is the arrow
-            // it stands in for. Surfaces that pass the letter to the score
-            // keep it: those are typing, not list navigation.
-            if !passes
-                && super::vim_keys::panel_takes_list_navigation(kind)
+            // it stands in for. The four letters navigate even where the
+            // panel otherwise passes letters to the score: with Vim list
+            // keys on they are list keys, not typing.
+            if super::vim_keys::panel_takes_list_navigation(kind)
                 && let Some(alias) = self.list_navigation_alias(key)
                 && self.dispatch_panel_key(kind, alias.code, false, false, false)?
             {
@@ -1429,7 +1429,6 @@ impl App {
                 self.dispatch_panel_key(kind, key.code, primary, shift, alt)?;
             } else if super::vim_keys::panel_takes_list_navigation(kind)
                 && !self.panel_is_typing(kind)
-                && !self.panel_types_through(kind)
                 && let Some(alias) = self.list_navigation_alias(key)
                 && (panel_repeat_is_safe(kind, alias.code)
                     || self.generator_control_repeats(kind, alias.code))

@@ -374,6 +374,37 @@ mod tests {
     }
 
     #[test]
+    fn h_goes_back_from_a_reference_entry() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+        app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+        app.ui_settings.vim_list_navigation = true;
+        app.sync_editor_keybindings();
+        app.toggle_reference_browse();
+        let panel = app.reference_panel.as_mut().expect("panel");
+        assert!(panel.expand(), "a result opens its entry");
+        assert!(matches!(
+            panel.mode,
+            crate::reference::ReferenceMode::Entry { .. }
+        ));
+        let caret = app.editor().primary_selection().head.0;
+
+        press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+        assert!(
+            matches!(
+                app.reference_panel.as_ref().expect("panel").mode,
+                crate::reference::ReferenceMode::Browse
+            ),
+            "h steps out of the entry"
+        );
+        assert_eq!(
+            app.editor().primary_selection().head.0,
+            caret,
+            "h did not move the editor caret"
+        );
+    }
+
+    #[test]
     fn the_theme_picker_walks_in_command_and_types_in_insert() {
         let directory = tempfile::tempdir().expect("temp dir");
         let (mut app, _scene) = plain_app(directory.path(), "// one\n");
