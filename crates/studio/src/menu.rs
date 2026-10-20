@@ -1026,7 +1026,7 @@ pub fn render_bar(
         let style = if selected {
             Style::default()
                 .bg(theme.accent)
-                .fg(theme.background)
+                .fg(theme.fill_text())
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.foreground)
@@ -1099,7 +1099,7 @@ pub fn render_dropdowns(
             }
             let highlighted = deepest && scroll + row == state.path[depth].index;
             let style = if highlighted {
-                Style::default().bg(theme.accent).fg(theme.background)
+                Style::default().bg(theme.accent).fg(theme.fill_text())
             } else if item.enabled {
                 Style::default().fg(theme.foreground)
             } else {

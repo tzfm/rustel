@@ -64,7 +64,7 @@ impl Widget for PaneTitle<'_> {
         );
         let style = if self.focused {
             Style::default()
-                .fg(theme.background)
+                .fg(theme.fill_text())
                 .bg(theme.accent)
                 .add_modifier(Modifier::BOLD)
         } else if self.playing {
