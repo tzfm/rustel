@@ -352,11 +352,7 @@ impl App {
             // the panel.
             self.armed_slider = None;
             self.focus = Focus::Panel(kind);
-            if kind == PanelKind::Reference
-                && let Some(panel) = self.reference_panel.as_mut()
-            {
-                panel.set_vim_insert(false);
-            }
+            super::vim_keys::focus_changed(self);
             self.dirty_frame = true;
             #[cfg(feature = "hydra")]
             self.sync_settings_webcam_preview();

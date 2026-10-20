@@ -227,7 +227,7 @@ impl App {
 
     /// Whether the panel has a text field that owns held typing keys.
     fn panel_is_typing(&self, kind: PanelKind) -> bool {
-        if let Some(typing) = super::vim_keys::surface_typing(self, kind) {
+        if let Some(typing) = super::vim_keys::surface_typing(self) {
             return typing;
         }
         match kind {

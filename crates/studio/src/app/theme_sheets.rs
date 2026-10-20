@@ -87,7 +87,11 @@ impl App {
         self.dismiss_dialogs(Some(PanelKind::Theme));
         self.theme_picker = Some(ThemePicker::open(&self.theme));
         self.focus_panel(PanelKind::Theme);
-        self.status = "theme - type to search · ←/→/↑/↓ preview · Enter keep · Esc back".into();
+        self.status = if super::vim_keys::enabled(self) {
+            "theme - j/k browse · i types · Enter keep · Esc back".into()
+        } else {
+            "theme - type to search · ←/→/↑/↓ preview · Enter keep · Esc back".into()
+        };
         self.dirty_frame = true;
     }
 
@@ -1587,6 +1591,7 @@ mod tests {
                 rolled: false,
                 scroll: std::cell::Cell::new(0),
                 hold_scroll: false,
+                vim_insert: false,
             });
             app.focus = Focus::Panel(PanelKind::Theme);
             press(&mut app, KeyCode::Down, KeyModifiers::NONE);
@@ -1637,6 +1642,7 @@ mod tests {
                 rolled: false,
                 scroll: std::cell::Cell::new(0),
                 hold_scroll: false,
+                vim_insert: false,
             });
             let (_, list) = mouse_app
                 .theme_picker
@@ -1684,6 +1690,7 @@ mod tests {
                 rolled: false,
                 scroll: std::cell::Cell::new(0),
                 hold_scroll: false,
+                vim_insert: false,
             });
             app.focus = Focus::Panel(PanelKind::Theme);
             press(&mut app, KeyCode::Down, KeyModifiers::NONE);

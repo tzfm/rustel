@@ -959,6 +959,110 @@ fn vim_find_takes_typed_text_and_walks_with_n() {
     );
 }
 
+/// Vim key modes cover the theme picker and the export sheet. j and k walk
+/// the list or form, i types, Esc returns to Command, and a second Esc
+/// closes.
+#[cfg(unix)]
+#[test]
+fn vim_key_modes_cover_the_theme_picker_and_export_sheet() {
+    let binary = rustel_binary().expect("build `rustel` before the feature=pty suite");
+    let home = set_directory();
+    std::fs::write(
+        home.path().join("studio.json"),
+        r#"{"editor_keybindings":"vim","vim_list_navigation":true,"animation":false}"#,
+    )
+    .expect("Vim preferences");
+    std::fs::write(home.path().join("live.strudel"), "// first\n\n").expect("score");
+    let mut terminal = Terminal::open(&binary, 24, 80, home.path());
+    answer_keyboard_query(&mut terminal);
+    assert!(
+        terminal.wait_for(" ready", BOOT_BUDGET),
+        "the studio did not load:\n{}",
+        terminal.diagnostics()
+    );
+
+    // Ctrl+T opens the picker. j and x go out together: if j typed, x
+    // would type after it and the query would read jx.
+    terminal.write(b"\x1b[116;5u");
+    assert!(
+        terminal.wait_for("search: i or a types", REPAINT_BUDGET),
+        "the theme picker did not open in Command:\n{}",
+        terminal.diagnostics()
+    );
+    terminal.write(b"jx");
+    assert!(
+        !contains_plain(&terminal.text(), "search: jx"),
+        "a Command-mode key reached the theme search:\n{}",
+        terminal.diagnostics()
+    );
+
+    let mark = terminal.mark();
+    terminal.write(b"i");
+    assert!(
+        terminal.wait_for_new(mark, "VIM INSERT", REPAINT_BUDGET),
+        "i did not enter Insert:\n{}",
+        terminal.diagnostics()
+    );
+    terminal.write(b"x");
+    assert!(
+        terminal.wait_for("search: x", REPAINT_BUDGET),
+        "Insert did not type in the theme search:\n{}",
+        terminal.diagnostics()
+    );
+    let mark = terminal.mark();
+    terminal.write(&[0x1b]);
+    assert!(
+        terminal.wait_for_new(mark, "j/k browse", REPAINT_BUDGET),
+        "Esc did not return the picker to Command:\n{}",
+        terminal.diagnostics()
+    );
+
+    // A second Esc closes the picker. Let the lone Esc leave the parser
+    // before the next escape sequence arrives. Ctrl+Shift+X on an enhanced
+    // terminal is x (120) with Shift and Ctrl.
+    terminal.write(&[0x1b]);
+    std::thread::sleep(Duration::from_millis(150));
+    terminal.write(b"\x1b[120;6u");
+    assert!(
+        terminal.wait_for("export -", REPAINT_BUDGET),
+        "the export sheet did not open:\n{}",
+        terminal.diagnostics()
+    );
+
+    // j walks to the cycles field. A Command-mode 2 would stay pending and
+    // make the value 232. The sheet covers the footer, so its visible hint
+    // is the mode witness.
+    terminal.write(b"j");
+    terminal.write(b"2");
+    let mark = terminal.mark();
+    terminal.write(b"i");
+    assert!(
+        terminal.wait_for_new(mark, "returns to Command", REPAINT_BUDGET),
+        "i did not enter Insert in the export sheet:\n{}",
+        terminal.diagnostics()
+    );
+    terminal.write(b"32");
+    assert!(
+        terminal.wait_for("cycles   32", REPAINT_BUDGET),
+        "Insert did not type the cycles:\n{}",
+        terminal.diagnostics()
+    );
+    let mark = terminal.mark();
+    terminal.write(&[0x1b]);
+    assert!(
+        terminal.wait_for_new(mark, "j/k moves", REPAINT_BUDGET),
+        "Esc did not return the export sheet to Command:\n{}",
+        terminal.diagnostics()
+    );
+    let mark = terminal.mark();
+    terminal.write(&[0x1b]);
+    assert!(
+        terminal.wait_for_new(mark, "export close", REPAINT_BUDGET),
+        "the second Esc did not close the export sheet:\n{}",
+        terminal.diagnostics()
+    );
+}
+
 /// Raw SGR pointer reports must bring keyboard focus back from the set panel
 /// and place the caret in the visible editor line. Focus in/out reports are
 /// part of the same real terminal stream.

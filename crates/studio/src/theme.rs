@@ -1950,6 +1950,8 @@ pub struct ThemePicker {
     /// wheel moves it the list keeps no margin, so the clicked row stays
     /// under the pointer.
     pub hold_scroll: bool,
+    /// Vim Command mode until `i` or `a` asks to type in the search.
+    pub(crate) vim_insert: bool,
 }
 
 impl ThemePicker {
@@ -1969,7 +1971,16 @@ impl ThemePicker {
             rolled: false,
             scroll: std::cell::Cell::new(0),
             hold_scroll: false,
+            vim_insert: false,
         }
+    }
+
+    pub(crate) fn vim_insert(&self) -> bool {
+        self.vim_insert
+    }
+
+    pub(crate) fn set_vim_insert(&mut self, insert: bool) {
+        self.vim_insert = insert;
     }
 
     /// Whether the row under the cursor is the one that rolls a new theme.
@@ -2117,6 +2128,8 @@ pub struct ThemePickerView<'a> {
     pub theme: &'a Theme,
     /// Under a camera theme: what the reader needs to know to see it.
     pub camera: Option<CameraNote>,
+    /// Vim text modes own the search and the list keys.
+    pub vim: bool,
 }
 
 impl ratatui::widgets::Widget for ThemePickerView<'_> {
@@ -2159,8 +2172,15 @@ impl ratatui::widgets::Widget for ThemePickerView<'_> {
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         );
+        let command = self.vim && !self.picker.vim_insert();
         let prompt = if self.picker.query.is_empty() {
-            "search: type a theme".to_owned()
+            if command {
+                "search: i or a types".to_owned()
+            } else {
+                "search: type a theme".to_owned()
+            }
+        } else if command {
+            format!("search: {}", self.picker.query)
         } else {
             format!("search: {}_", self.picker.query)
         };
@@ -2252,6 +2272,17 @@ impl ratatui::widgets::Widget for ThemePickerView<'_> {
             Some(note @ (CameraNote::Off | CameraNote::Failed)) => (note.lines(), theme.warn),
             Some(note @ CameraNote::Starting) => (note.lines(), theme.accent),
             Some(note @ CameraNote::Live) => (note.lines(), theme.ok),
+            None if self.vim && self.picker.vim_insert() => (
+                ["VIM INSERT · Esc returns to Command", "Enter keep · ^n/e/d"],
+                theme.muted,
+            ),
+            None if self.vim => (
+                [
+                    "VIM NORMAL · j/k browse · i types",
+                    "Enter keep · Esc back · ^n/e/d",
+                ],
+                theme.muted,
+            ),
             None => (
                 ["↑/↓ browse · Enter keep", "Esc back · ^n/e/d"],
                 theme.muted,
@@ -2995,6 +3026,7 @@ mod tests {
                 picker,
                 theme: &theme,
                 camera: None,
+                vim: false,
             }
             .render(area, &mut buffer);
             (0..area.height)
@@ -3144,6 +3176,7 @@ mod tests {
             rolled: false,
             scroll: std::cell::Cell::new(0),
             hold_scroll: false,
+            vim_insert: false,
         };
         assert!(picker.on_randomize());
         let start = picker.randomize_seed;
@@ -3462,6 +3495,7 @@ mod tests {
                 picker: &picker,
                 theme: &theme,
                 camera,
+                vim: false,
             }
             .render(area, &mut buffer);
             let (panel, list) = picker.geometry(area).expect("room");
@@ -3498,14 +3532,16 @@ mod tests {
             rolled: false,
             scroll: std::cell::Cell::new(0),
             hold_scroll: false,
+            vim_insert: false,
         };
         let area = Rect::new(0, 0, 80, 30);
-        let render = |picker: &ThemePicker| {
+        let render = |picker: &ThemePicker, vim: bool| {
             let mut buffer = Buffer::empty(area);
             ThemePickerView {
                 picker,
                 theme: &theme,
                 camera: None,
+                vim,
             }
             .render(area, &mut buffer);
             buffer
@@ -3515,12 +3551,21 @@ mod tests {
                 .collect::<String>()
         };
 
-        let fourth = render(&picker);
+        let fourth = render(&picker, false);
         assert!(fourth.contains(" 4/30 "), "{fourth}");
 
         picker.move_by(1);
-        let fifth = render(&picker);
+        let fifth = render(&picker, false);
         assert!(fifth.contains(" 5/30 "), "{fifth}");
+
+        let command = render(&picker, true);
+        assert!(command.contains("VIM NORMAL"), "{command}");
+        assert!(command.contains("j/k browse"), "{command}");
+        assert!(command.contains("search: i or a types"), "{command}");
+        picker.set_vim_insert(true);
+        let insert = render(&picker, true);
+        assert!(insert.contains("VIM INSERT"), "{insert}");
+        assert!(insert.contains("returns to Co"), "{insert}");
     }
 
     #[test]
@@ -3541,6 +3586,7 @@ mod tests {
             rolled: false,
             scroll: std::cell::Cell::new(0),
             hold_scroll: false,
+            vim_insert: false,
         };
         for character in "RUSTEL".chars() {
             picker.push_query(character);
@@ -3560,6 +3606,7 @@ mod tests {
             picker: &picker,
             theme: &theme,
             camera: None,
+            vim: false,
         }
         .render(area, &mut buffer);
         let text = buffer
@@ -3940,6 +3987,7 @@ mod confinement_tests {
             rolled: false,
             scroll: std::cell::Cell::new(0),
             hold_scroll: false,
+            vim_insert: false,
         };
         let shown = 12;
         let margin = crate::scroll::margin(shown);

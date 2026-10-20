@@ -4,6 +4,9 @@
 //! asks this module for one answer. A new text surface implements
 //! [`VimTextSurface`] and adds one arm to [`surface_mut`]; the key rules do
 //! not change.
+//!
+//! [`enabled`] is the one switch. It off, no alias, modal key, hint, paste
+//! or focus reset in this file applies anywhere.
 
 use super::*;
 
@@ -13,7 +16,12 @@ pub(super) trait VimTextSurface {
     fn text_wanted(&self) -> bool;
     fn insert(&self) -> bool;
     fn set_insert(&mut self, insert: bool);
-    fn has_preview(&self) -> bool;
+    /// Space has a meaning of its own here, so Command leaves it to the
+    /// surface. A search that previews a row and a form that toggles a
+    /// choice both say yes; a search that only types says no.
+    fn space_command(&self) -> bool {
+        false
+    }
     /// The surface's own anchored completion, if it has one.
     fn anchored(&self) -> bool {
         false
@@ -37,8 +45,48 @@ impl VimTextSurface for ReferencePanel {
         self.set_vim_insert(insert);
     }
 
-    fn has_preview(&self) -> bool {
+    fn space_command(&self) -> bool {
         !matches!(self.preview(), PanelAction::Nothing)
+    }
+}
+
+impl VimTextSurface for ThemePicker {
+    fn panel_kind(&self) -> PanelKind {
+        PanelKind::Theme
+    }
+
+    fn text_wanted(&self) -> bool {
+        true
+    }
+
+    fn insert(&self) -> bool {
+        self.vim_insert()
+    }
+
+    fn set_insert(&mut self, insert: bool) {
+        self.set_vim_insert(insert);
+    }
+}
+
+impl VimTextSurface for ExportSheet {
+    fn panel_kind(&self) -> PanelKind {
+        PanelKind::Export
+    }
+
+    fn text_wanted(&self) -> bool {
+        true
+    }
+
+    fn insert(&self) -> bool {
+        self.vim_insert()
+    }
+
+    fn set_insert(&mut self, insert: bool) {
+        self.set_vim_insert(insert);
+    }
+
+    fn space_command(&self) -> bool {
+        self.space_changes_a_choice()
     }
 }
 
@@ -64,10 +112,12 @@ macro_rules! text_surfaces {
 
 text_surfaces! {
     PanelKind::Reference => reference_panel,
+    PanelKind::Theme => theme_picker,
+    PanelKind::Export => export_sheet,
 }
 
 /// Vim list keys are on, and the editor uses Vim keys.
-fn enabled(app: &App) -> bool {
+pub(super) fn enabled(app: &App) -> bool {
     app.ui_settings.vim_list_navigation
         && app.ui_settings.editor_keybindings == crate::editor::EditorKeybindings::Vim
 }
@@ -78,21 +128,27 @@ fn anchored(app: &App) -> bool {
     app.focus == Focus::Panel(PanelKind::Reference) && app.reference_anchor.is_some()
 }
 
-/// Whether the panel's text field is typing. `None` when Vim text modes do
-/// not apply, so the caller keeps the ordinary answer.
-pub(super) fn surface_typing(app: &App, kind: PanelKind) -> Option<bool> {
+/// Whether the focused panel's text field is typing. `None` when Vim text
+/// modes do not apply, so the caller keeps the ordinary answer.
+pub(super) fn surface_typing(app: &App) -> Option<bool> {
     if !enabled(app) {
         return None;
     }
-    match kind {
-        PanelKind::Reference => {
-            let surface = surface_ref(app)?;
-            if !surface.text_wanted() {
-                return Some(false);
-            }
-            Some(anchored(app) || surface.anchored() || surface.insert())
-        }
-        _ => None,
+    let surface = surface_ref(app)?;
+    if !surface.text_wanted() {
+        return Some(false);
+    }
+    Some(anchored(app) || surface.anchored() || surface.insert())
+}
+
+/// A newly focused surface rests in Command mode. One hook serves every
+/// registered surface, so focus handling does not grow a match of its own.
+pub(super) fn focus_changed(app: &mut App) {
+    if !enabled(app) {
+        return;
+    }
+    if let Some(surface) = surface_mut(app) {
+        surface.set_insert(false);
     }
 }
 
@@ -162,10 +218,10 @@ pub(super) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
                     surface.set_insert(true);
                     TextAction::Message("insert mode - Esc returns to command")
                 }
-                // Space auditions the selected row. With nothing to hear,
-                // it is text like every other letter, and Command keeps it
-                // out.
-                KeyCode::Char(' ') if surface.has_preview() => TextAction::Ignored,
+                // Space keeps its surface meaning, such as auditioning
+                // the selected row or toggling a choice. Where it has
+                // none, it is text and Command keeps it out.
+                KeyCode::Char(' ') if surface.space_command() => TextAction::Ignored,
                 KeyCode::Char(' ') | KeyCode::Backspace | KeyCode::Delete => {
                     TextAction::Message("press i or a to type")
                 }
@@ -195,11 +251,7 @@ impl App {
     /// The arrow a plain j, k, h, or l stands in for while Vim list keys
     /// are on.
     pub(super) fn list_navigation_alias(&self, key: &KeyEvent) -> Option<KeyEvent> {
-        if !self.ui_settings.vim_list_navigation
-            || self.ui_settings.editor_keybindings != crate::editor::EditorKeybindings::Vim
-            || key.kind == KeyEventKind::Release
-            || !key.modifiers.is_empty()
-        {
+        if !enabled(self) || key.kind == KeyEventKind::Release || !key.modifiers.is_empty() {
             return None;
         }
         let code = match key.code {
@@ -223,6 +275,8 @@ pub(super) fn panel_takes_list_navigation(kind: PanelKind) -> bool {
             | PanelKind::Log
             | PanelKind::Jobs
             | PanelKind::Reference
+            | PanelKind::Theme
+            | PanelKind::Export
             | PanelKind::Memory
     )
 }
@@ -293,6 +347,122 @@ mod tests {
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
         assert_ne!(selected(&app), before, "Esc returns to Command");
         assert_eq!(query(&app), "", "Command still does not type");
+    }
+
+    #[test]
+    fn the_sample_search_keeps_hjkl_out_of_the_query() {
+        let (_directory, mut app) = vim_app();
+        app.reference_panel
+            .as_mut()
+            .expect("panel")
+            .select_tab(Tab::Samples);
+        app.focus_panel(PanelKind::Reference);
+        let query = |app: &App| {
+            app.reference_panel
+                .as_ref()
+                .expect("panel")
+                .sound_query
+                .clone()
+        };
+        for key in ['j', 'k', 'h', 'l'] {
+            press(&mut app, KeyCode::Char(key), KeyModifiers::NONE);
+        }
+        assert_eq!(query(&app), "", "hjkl never reach the sample search");
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(query(&app), "x", "Insert types in the sample search");
+    }
+
+    #[test]
+    fn the_theme_picker_walks_in_command_and_types_in_insert() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+        app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+        app.ui_settings.vim_list_navigation = true;
+        app.sync_editor_keybindings();
+        app.theme_picker = Some(ThemePicker::open(&app.theme));
+        app.focus_panel(PanelKind::Theme);
+        fn picker(app: &App) -> &ThemePicker {
+            app.theme_picker.as_ref().expect("picker")
+        }
+        let before = picker(&app).selected;
+
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_ne!(picker(&app).selected, before, "j walks the theme list");
+        assert_eq!(picker(&app).query, "", "j did not type");
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(picker(&app).query, "", "a letter waits for Insert");
+        assert!(app.status.contains("press i or a"), "{}", app.status);
+
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        assert!(picker(&app).vim_insert());
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(picker(&app).query, "x", "Insert types the search");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!picker(&app).vim_insert(), "Esc returns to Command");
+
+        app.theme_picker.as_mut().expect("picker").query.clear();
+        let before = picker(&app).selected;
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_ne!(picker(&app).selected, before, "Command walks again");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.theme_picker.is_none(), "a second Esc closes the picker");
+    }
+
+    #[test]
+    fn the_export_sheet_walks_in_command_and_types_in_insert() {
+        use crate::export::{Field, Length};
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+        app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+        app.ui_settings.vim_list_navigation = true;
+        app.sync_editor_keybindings();
+        app.toggle_export_sheet();
+        fn sheet(app: &App) -> &ExportSheet {
+            app.export_sheet.as_ref().expect("sheet")
+        }
+        assert_eq!(sheet(&app).field, Field::Length);
+
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(sheet(&app).field, Field::First, "j moves down a field");
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+        assert_eq!(sheet(&app).settings.length, Length::Cycles(20.0));
+        press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+        assert_eq!(sheet(&app).settings.length, Length::Cycles(16.0));
+        press(&mut app, KeyCode::Char('2'), KeyModifiers::NONE);
+        assert!(app.status.contains("press i or a"), "{}", app.status);
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(app.status.contains("press i or a"), "{}", app.status);
+
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        assert!(sheet(&app).vim_insert(), "i enters Insert");
+        press(&mut app, KeyCode::Char('3'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('2'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!sheet(&app).vim_insert(), "Esc returns to Command");
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(sheet(&app).field, Field::Format, "Tab moves on");
+        assert_eq!(
+            app.export_sheet.as_mut().expect("sheet").settings().length,
+            Length::Cycles(32.0),
+            "the typed cycles were taken"
+        );
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(sheet(&app).field, Field::Limiter);
+        let limiter = sheet(&app).settings.limiter_enabled;
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_ne!(
+            sheet(&app).settings.limiter_enabled,
+            limiter,
+            "Space toggles the limiter"
+        );
+
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(
+            app.export_sheet.is_none(),
+            "Esc in Command closes the sheet"
+        );
     }
 
     #[test]

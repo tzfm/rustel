@@ -864,6 +864,7 @@ impl App {
             dirty: scene.dirty,
             status: &inputs.status,
             vim_label: inputs.vim_label.as_deref(),
+            vim_text_modes: super::vim_keys::enabled(self),
             find_label: inputs.find_label.as_deref(),
             remote_control: {
                 #[cfg(feature = "remote-control")]

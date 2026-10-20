@@ -367,6 +367,8 @@ pub struct StudioChrome<'a> {
     pub status: &'a str,
     /// Editor mode or pending command, kept visible beside diagnostics.
     pub vim_label: Option<&'a str>,
+    /// Vim text modes own the list keys and the text fields.
+    pub vim_text_modes: bool,
     /// The find bar outside Vim: `FIND /pattern`.
     pub find_label: Option<&'a str>,
     /// A remote-control listener is active; the status line shows a
@@ -1160,7 +1162,14 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
         );
     }
     if let Some(sheet) = view.export {
-        frame.render_widget(ExportSheetView { sheet, theme }, area);
+        frame.render_widget(
+            ExportSheetView {
+                sheet,
+                theme,
+                vim: chrome.vim_text_modes,
+            },
+            area,
+        );
     }
     if let Some((sheet, settings, features)) = view.settings {
         let settings_room = settings_room(area, layout.footer, layout.memory);
@@ -1221,6 +1230,7 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
                 picker,
                 theme,
                 camera: view.theme_camera,
+                vim: chrome.vim_text_modes,
             },
             area,
         );
@@ -1418,6 +1428,7 @@ mod tests {
             dirty: false,
             status: "ready",
             vim_label: None,
+            vim_text_modes: false,
             find_label: None,
             remote_control: false,
             remote_receiving: false,
