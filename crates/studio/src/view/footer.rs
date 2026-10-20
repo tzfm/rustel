@@ -628,7 +628,7 @@ pub(super) fn render_toast(buffer: &mut Buffer, area: Rect, top: u16, text: &str
     clear_surface(
         buffer,
         box_area,
-        Style::default().bg(theme.accent).fg(theme.background),
+        Style::default().bg(theme.accent).fg(theme.fill_text()),
     );
     buffer.set_stringn(
         x + 2,
@@ -637,7 +637,7 @@ pub(super) fn render_toast(buffer: &mut Buffer, area: Rect, top: u16, text: &str
         usize::from(width.saturating_sub(3)),
         Style::default()
             .bg(theme.accent)
-            .fg(theme.background)
+            .fg(theme.fill_text())
             .add_modifier(Modifier::BOLD),
     );
 }
