@@ -1304,7 +1304,7 @@ impl ReferenceView<'_> {
             };
             let style = if selected {
                 Style::default()
-                    .fg(theme.background)
+                    .fg(theme.fill_text())
                     .bg(theme.accent)
                     .add_modifier(Modifier::BOLD)
             } else if matches!(sound_row, SoundRow::Variant(..)) {
@@ -1615,7 +1615,7 @@ impl ReferenceView<'_> {
             let selected = geometry.first_row + row == self.panel.selected;
             let name_style = if selected {
                 Style::default()
-                    .fg(theme.background)
+                    .fg(theme.fill_text())
                     .bg(theme.accent)
                     .add_modifier(Modifier::BOLD)
             } else {

@@ -454,6 +454,23 @@ pub fn scale_notes(scale: &str) -> Vec<f64> {
     notes
 }
 
+/// The `'static` spelling of a chord symbol that [`CHORD_ORDER`] does not
+/// name. Each spelling is leaked once and then reused, so drawing the
+/// Chords tab does not grow memory.
+fn symbol_spelling(symbol: &str) -> &'static str {
+    use std::collections::BTreeSet;
+    use std::sync::{Mutex, PoisonError};
+
+    static SPELLINGS: Mutex<BTreeSet<&'static str>> = Mutex::new(BTreeSet::new());
+    let mut spellings = SPELLINGS.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(&spelling) = spellings.get(symbol) {
+        return spelling;
+    }
+    let spelling: &'static str = Box::leak(symbol.to_owned().into_boxed_str());
+    spellings.insert(spelling);
+    spelling
+}
+
 impl ReferencePanel {
     /// The chord qualities on offer, in order: the named ones the
     /// dictionary actually has, then anything else it knows, so nothing is
@@ -473,13 +490,13 @@ impl ReferencePanel {
             }
             // A symbol this list does not name keeps its own spelling: the
             // dictionary is the authority on what can be played.
-            let leaked: &'static str = Box::leak(symbol.clone().into_boxed_str());
+            let spelling = symbol_spelling(symbol);
             qualities.push(ChordQuality {
-                symbol: leaked,
-                name: leaked,
+                symbol: spelling,
+                name: spelling,
                 // Nothing to teach a reader about a symbol this list does
                 // not name: the dictionary's spelling is all there is.
-                common: leaked,
+                common: spelling,
             });
         }
         let query = self.chord_query.trim();

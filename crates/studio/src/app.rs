@@ -283,14 +283,22 @@ struct LiveTextMark {
     saved: u64,
 }
 
+/// FNV-1a over the saved revision text. The mark holds this hash instead of
+/// a copy of the text.
+fn stable_hash(text: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 impl LiveTextMark {
     fn of(scene: &super::scenes::Scene) -> Self {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        scene.saved_source_revision.hash(&mut hasher);
         Self {
             edits: scene.editor.revision(),
-            saved: hasher.finish(),
+            saved: stable_hash(&scene.saved_source_revision),
         }
     }
 }

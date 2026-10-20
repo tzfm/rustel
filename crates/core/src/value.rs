@@ -8,7 +8,10 @@ Software Foundation, either version 3 of the License, or (at your option) any
 later version.
 */
 
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::{Arc, LazyLock},
+};
 
 /// An insertion-ordered JavaScript object.
 ///
@@ -16,9 +19,21 @@ use std::{fmt, sync::Arc};
 /// matching ordinary JavaScript objects. Enumeration additionally applies the
 /// ECMAScript integer-index rule: canonical array-index keys precede string
 /// keys and are ordered numerically.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OrderedMap {
-    entries: Vec<(String, Value)>,
+    /// Shared until a write. A clone of a map is a reference count step.
+    entries: Arc<Vec<(String, Value)>>,
+}
+
+/// One shared empty allocation, so a fresh map allocates nothing.
+static EMPTY: LazyLock<Arc<Vec<(String, Value)>>> = LazyLock::new(|| Arc::new(Vec::new()));
+
+impl Default for OrderedMap {
+    fn default() -> Self {
+        Self {
+            entries: Arc::clone(&EMPTY),
+        }
+    }
 }
 
 impl OrderedMap {
@@ -35,10 +50,11 @@ impl OrderedMap {
     }
 
     pub fn insert(&mut self, key: String, value: Value) -> Option<Value> {
-        if let Some((_, current)) = self.entries.iter_mut().find(|(name, _)| name == &key) {
+        let entries = Arc::make_mut(&mut self.entries);
+        if let Some((_, current)) = entries.iter_mut().find(|(name, _)| name == &key) {
             return Some(std::mem::replace(current, value));
         }
-        self.entries.push((key, value));
+        entries.push((key, value));
         None
     }
 
@@ -54,14 +70,21 @@ impl OrderedMap {
     }
 
     pub fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
-        self.entries
+        if !self.contains_key(key) {
+            return None;
+        }
+        Arc::make_mut(&mut self.entries)
             .iter_mut()
             .find_map(|(name, value)| (name == key).then_some(value))
     }
 
     pub fn remove(&mut self, key: &str) -> Option<Value> {
-        let index = self.entries.iter().position(|(name, _)| name == key)?;
-        Some(self.entries.remove(index).1)
+        if !self.contains_key(key) {
+            return None;
+        }
+        let entries = Arc::make_mut(&mut self.entries);
+        let index = entries.iter().position(|(name, _)| name == key)?;
+        Some(entries.remove(index).1)
     }
 
     pub fn contains_key(&self, key: &str) -> bool {
@@ -652,6 +675,34 @@ pub enum Value {
     Haps(HapList),
 }
 
+/// Whether a value contains metadata that [`Value::attach_runtime_settings`]
+/// would change. A primitive object does not need a copy-on-write fork.
+fn needs_runtime_settings(value: &Value, depth: u32) -> bool {
+    if depth > crate::MAX_PATTERN_DEPTH {
+        // Let the attach pass report the depth refusal.
+        return true;
+    }
+    match value {
+        Value::Pattern(_) | Value::Function(_) => true,
+        Value::List(values) => values
+            .iter()
+            .any(|value| needs_runtime_settings(value, depth.saturating_add(1))),
+        Value::Object(values) => values
+            .iter()
+            .any(|(_, value)| needs_runtime_settings(value, depth.saturating_add(1))),
+        Value::Haps(haps) => haps
+            .as_slice()
+            .iter()
+            .any(|hap| needs_runtime_settings(&hap.value, depth.saturating_add(1))),
+        Value::Undefined
+        | Value::Null
+        | Value::Bool(_)
+        | Value::F64(_)
+        | Value::Str(_)
+        | Value::JsValue(_) => false,
+    }
+}
+
 impl Value {
     pub fn object(entries: impl IntoIterator<Item = (String, Value)>) -> Self {
         Self::Object(OrderedMap::from_entries(entries))
@@ -794,6 +845,12 @@ impl Value {
         }
         match self {
             Self::List(values) => {
+                if !values
+                    .iter()
+                    .any(|value| needs_runtime_settings(value, depth + 1))
+                {
+                    return true;
+                }
                 for value in values {
                     if !value.attach_runtime_settings(settings, depth + 1) {
                         return false;
@@ -801,7 +858,13 @@ impl Value {
                 }
             }
             Self::Object(values) => {
-                for (_, value) in &mut values.entries {
+                if !values
+                    .iter()
+                    .any(|(_, value)| needs_runtime_settings(value, depth + 1))
+                {
+                    return true;
+                }
+                for (_, value) in Arc::make_mut(&mut values.entries) {
                     if !value.attach_runtime_settings(settings, depth + 1) {
                         return false;
                     }
@@ -814,6 +877,13 @@ impl Value {
                 function.attach_runtime_settings(settings.clone());
             }
             Self::Haps(haps) => {
+                if !haps
+                    .as_slice()
+                    .iter()
+                    .any(|hap| needs_runtime_settings(&hap.value, depth.saturating_add(1)))
+                {
+                    return true;
+                }
                 for hap in Arc::make_mut(&mut haps.0) {
                     if !hap
                         .value

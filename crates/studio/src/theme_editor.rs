@@ -1214,7 +1214,7 @@ fn render_save_sheet(editor: &ThemeEditor, area: Rect, buffer: &mut Buffer, them
     let button = |armed: bool| {
         if armed {
             Style::default()
-                .fg(theme.background)
+                .fg(theme.fill_text())
                 .bg(theme.accent)
                 .add_modifier(Modifier::BOLD)
         } else {

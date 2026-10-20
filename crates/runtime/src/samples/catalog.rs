@@ -1385,7 +1385,7 @@ impl SampleLibrary {
             // ordinary MIDI 36 default. This must choose the same key as the
             // voice: MIDI 60 can be another file in a note-keyed bank, whose
             // shape was never decoded by the preview we just heard.
-            Named::Bank(bank) => Some(pick_from_bank(bank, n, 36.0).0),
+            Named::Bank(bank) => pick_from_bank(bank, n, 36.0).map(|(url, _)| url),
             Named::Font(_) => None,
         })??;
         let shape = self
