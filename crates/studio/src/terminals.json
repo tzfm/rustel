@@ -538,11 +538,11 @@
         {"chord": "shift+pagedown", "does": "scrolls terminal history"}
       ],
       "alt_input": [
-        {"chord": "alt+a", "reason": "Option as Normal sends a composed character, not Alt+A"},
-        {"chord": "alt+d", "reason": "Option as Normal sends a composed character, not Alt+D"},
-        {"chord": "alt+o", "reason": "Option as Normal sends a composed character, not Alt+O"},
-        {"chord": "alt+r", "reason": "Option as Normal sends a composed character, not Alt+R"},
-        {"chord": "alt+t", "reason": "Option as Normal sends a composed character, not Alt+T"}
+        {"chord": "alt+a", "received": "å", "reason": "Option as Normal sends å; Studio recovers Alt+A where the focus uses it"},
+        {"chord": "alt+d", "received": "∂", "reason": "Option as Normal sends ∂; Studio recovers Alt+D where the focus uses it"},
+        {"chord": "alt+o", "received": "ø", "reason": "Option as Normal sends ø; Studio recovers Alt+O where the focus uses it"},
+        {"chord": "alt+r", "received": "®", "reason": "Option as Normal sends ®; Studio recovers Alt+R where the focus uses it"},
+        {"chord": "alt+t", "received": "†", "reason": "Option as Normal sends †; Studio recovers Alt+T where the focus uses it"}
       ]
     },
     {

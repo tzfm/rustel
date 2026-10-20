@@ -1269,15 +1269,23 @@ impl Keybinds {
         !self.suppressed_hints.contains(&(key.code, key.modifiers))
     }
 
-    /// Whether this terminal sends an Option letter as Alt. A terminal
-    /// whose Option composes text would only type the character.
-    pub(crate) fn alt_hint_available(&self, letter: char) -> bool {
-        self.reach.terminal.is_empty()
-            || super::terminal::profiles::alt_input_limitation(
+    /// Whether this terminal's Option composes the letter into text, and
+    /// the panel recovers the Alt chord from it.
+    pub(crate) fn composes_option(&self, letter: char) -> bool {
+        !self.reach.terminal.is_empty()
+            && super::terminal::profiles::alt_input_limitation(
                 &self.reach.terminal,
                 &format!("alt+{letter}"),
             )
-            .is_none()
+            .is_some()
+    }
+
+    /// The Option letter a composed character stands for on this terminal.
+    pub(crate) fn option_letter_for(&self, character: char) -> Option<char> {
+        if self.reach.terminal.is_empty() {
+            return None;
+        }
+        super::terminal::profiles::alt_input_letter(&self.reach.terminal, character)
     }
 
     /// A shortcut that also works while the score has the keyboard.
@@ -1579,7 +1587,6 @@ impl Keybinds {
             (Some(combo), _) => combo.hint(),
             (None, Some(letter))
                 if self.binding(action).is_none()
-                    && self.alt_hint_available(letter)
                     && self.hint_available(KeyEvent::new(
                         KeyCode::Char(letter),
                         KeyModifiers::ALT,
@@ -2812,21 +2819,26 @@ mod tests {
     }
 
     #[test]
-    fn a_terminal_that_composes_option_does_not_hint_the_alt_letter() {
+    fn a_composed_option_letter_recovers_its_alt_chord() {
         let mut binds = Keybinds::default();
         binds.set_reach(Reach {
             enhanced: false,
             terminal: "iTerm2".into(),
         });
-        assert_eq!(binds.hint(BindAction::TrimSample), "");
-        assert_eq!(binds.hint(BindAction::FocusTimeline), "");
-        assert!(!binds.alt_hint_available('t'));
+        assert!(binds.composes_option('t'));
+        assert_eq!(binds.option_letter_for('†'), Some('t'));
+        assert_eq!(binds.hint(BindAction::TrimSample), shortcut_label("Alt+T"));
+        assert_eq!(
+            binds.hint(BindAction::FocusTimeline),
+            shortcut_label("Alt+T")
+        );
 
         binds.set_reach(Reach {
             enhanced: false,
             terminal: "Ghostty".into(),
         });
-        assert_eq!(binds.hint(BindAction::TrimSample), shortcut_label("Alt+T"));
+        assert!(!binds.composes_option('t'));
+        assert_eq!(binds.option_letter_for('†'), None);
     }
 
     /// Delete on the row of an action shipped with no key puts back its

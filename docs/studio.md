@@ -605,9 +605,11 @@ To change a shortcut, select its row, press Enter, then press the new chord.
 Del restores the default. The panel shortcuts Alt+O, Alt+R, Alt+D and Alt+T
 are at the end of the list. The panel footers show the chord you set.
 
-In iTerm2, Option set to Normal composes a character. The Option panel
-shortcuts then do not arrive, and Studio does not show them. Set Option to
-Esc+ in the profile, or learn another chord for the action.
+In iTerm2, Option set to Normal composes a character. Studio knows the
+characters the profile sends and recovers the Option panel shortcut where
+the focused surface uses it. Option+T then focuses the tape timeline, and
+the composed character types normally everywhere else. Set Option to Esc+
+if you want the raw Alt key instead.
 
 The vst page lists the folders the plugin host reads for VST3 plugins: your
 folders first, then the standard folders of the system. Press `a` to add a

@@ -401,10 +401,62 @@ impl App {
         &mut self,
         terminal_event: Event,
     ) -> Result<(), RuntimeError> {
+        let terminal_event = self.option_panel_spelling(terminal_event);
         let terminal_event = composed_text_event(terminal_event);
         let result = self.route_terminal_event(terminal_event, true);
         self.refresh_editor_shortcut_hints();
         result
+    }
+
+    /// Recover an Option panel chord from the composed character a terminal
+    /// sends. Only where the focused surface answers to that Option letter,
+    /// so the same character types normally everywhere else.
+    fn option_panel_spelling(&self, event: Event) -> Event {
+        match &event {
+            Event::KeyWithText { key, .. }
+                if key.modifiers == KeyModifiers::ALT
+                    && let KeyCode::Char(letter) = key.code =>
+            {
+                let letter = letter.to_ascii_lowercase();
+                if self.alt_panel_action_applies(letter) && self.keybinds.composes_option(letter) {
+                    return Event::Key(KeyEvent::new_with_kind_and_state(
+                        KeyCode::Char(letter),
+                        KeyModifiers::ALT,
+                        key.kind,
+                        key.state,
+                    ));
+                }
+            }
+            Event::Key(key) if key.modifiers.is_empty() => {
+                if let KeyCode::Char(character) = key.code
+                    && let Some(letter) = self.keybinds.option_letter_for(character)
+                    && self.alt_panel_action_applies(letter)
+                {
+                    return Event::Key(KeyEvent::new_with_kind_and_state(
+                        KeyCode::Char(letter),
+                        KeyModifiers::ALT,
+                        key.kind,
+                        key.state,
+                    ));
+                }
+            }
+            _ => {}
+        }
+        event
+    }
+
+    /// Whether the focused surface has a use for an Option letter. A chord
+    /// learnt over the action retires the letter, so it is not recovered.
+    fn alt_panel_action_applies(&self, letter: char) -> bool {
+        if let Some(action) = self.panel_action_at(letter) {
+            return !self.keybinds.overridden(action);
+        }
+        letter == 'a'
+            && self.focus == Focus::Panel(PanelKind::Reference)
+            && self
+                .reference_panel
+                .as_ref()
+                .is_some_and(|panel| matches!(panel.tab, crate::reference::Tab::Samples))
     }
 
     pub(super) fn route_terminal_event(

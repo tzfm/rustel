@@ -808,6 +808,21 @@ pub mod profiles {
             .map(|row| row.reason.as_str())
     }
 
+    /// The Option letter a composed character stands for, where the
+    /// terminal profile names one. This is how iTerm2's Option+T, which
+    /// arrives as `†`, still reaches the panel that answers to Alt+T.
+    pub fn alt_input_letter(terminal: &str, received: char) -> Option<char> {
+        let wanted = received.to_string();
+        table()
+            .terminals
+            .iter()
+            .filter(|known| matches_profile(terminal, &known.terminal))
+            .flat_map(|known| &known.alt_input)
+            .find(|row| row.received.as_deref() == Some(wanted.as_str()))
+            .and_then(|row| row.chord.strip_prefix("alt+"))
+            .and_then(|letter| letter.chars().next())
+    }
+
     /// Recover physical chord names from a terminal's legacy keymap. This
     /// keeps shortcut hints and learned keys consistent with actual input.
     pub fn legacy_key(terminal: &str, received: &KeyCombo) -> Option<KeyCombo> {
@@ -998,14 +1013,21 @@ pub mod profiles {
         }
 
         #[test]
-        fn iterm2_option_letters_do_not_advertise_alt_hints() {
-            for letter in ['t', 'o', 'r', 'd', 'a'] {
+        fn iterm2_option_letters_compose_and_recover() {
+            for (letter, composed) in [('t', '†'), ('o', 'ø'), ('r', '®'), ('d', '∂'), ('a', 'å')]
+            {
                 assert!(
                     super::alt_input_limitation("iTerm2", &format!("alt+{letter}")).is_some(),
                     "alt+{letter} is missing from the iTerm2 profile"
                 );
+                assert_eq!(
+                    super::alt_input_letter("iTerm2", composed),
+                    Some(letter),
+                    "{composed} does not recover alt+{letter}"
+                );
             }
             assert!(super::alt_input_limitation("Ghostty", "alt+t").is_none());
+            assert_eq!(super::alt_input_letter("Ghostty", '†'), None);
         }
 
         #[test]

@@ -339,7 +339,7 @@ impl App {
     }
 
     /// The panel action an Alt letter means where the keyboard is now.
-    fn panel_action_at(&self, letter: char) -> Option<BindAction> {
+    pub(super) fn panel_action_at(&self, letter: char) -> Option<BindAction> {
         use PanelKind::{Reference, Set, Settings};
         let score = matches!(self.focus, Focus::Editor | Focus::Timeline);
         let tape = score && self.current_replay().is_some();
