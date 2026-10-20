@@ -645,7 +645,8 @@ with motions and edits, such as `3j` and `2dd`. Use `a`, `I`, `A`, `o`, and `O`
 to enter Insert mode, `d`, `c`, and `y` with a motion to delete, change, or
 copy text, and `p` or `P` to put it back. A yank or delete fills the
 register and the system clipboard, so `p` pastes the newest copy from any
-surface. `D` deletes to the end of the line.
+surface. `r` then a character replaces the character under the cursor, and
+a count replaces that many. `D` deletes to the end of the line.
 `C` changes that text. `v` selects characters and `V` selects lines.
 `u` undoes an edit. Ctrl+R in Normal or Visual mode redoes it.
 `:redo` then Enter also redoes an edit.

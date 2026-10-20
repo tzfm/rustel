@@ -95,6 +95,8 @@ pub(super) struct VimState {
     mode: Mode,
     count: usize,
     operator: Option<(Operator, usize)>,
+    /// `r` waits for its replacement character, and how many to replace.
+    replace: Option<usize>,
     text_object: Option<TextObjectKind>,
     g: bool,
     command: Option<String>,
@@ -219,6 +221,7 @@ impl Editor {
         }
         self.vim.count = 0;
         self.vim.operator = None;
+        self.vim.replace = None;
         self.vim.text_object = None;
         self.vim.g = false;
         self.vim.command = None;
@@ -301,6 +304,11 @@ impl Editor {
             || (key.code == KeyCode::Char('[') && key.modifiers == KeyModifiers::CONTROL)
         {
             self.vim_escape()?;
+            return Ok(true);
+        }
+        // r waits for its replacement character. Esc above cancels it.
+        if let Some(count) = self.vim.replace.take() {
+            self.vim_replace(count, key, moment)?;
             return Ok(true);
         }
         // Ctrl+C leaves Insert mode, as it does in Vim. Elsewhere it keeps
@@ -496,6 +504,9 @@ impl Editor {
                 self.vim_apply_operator(operator, range, linewise, moment)?;
             }
             'p' | 'P' => self.vim_put(character == 'P', count, moment)?,
+            'r' if self.vim.mode == Mode::Normal => {
+                self.vim.replace = Some(count);
+            }
             'u' => {
                 self.vim_escape()?;
                 for _ in 0..count.min(self.undo_depth()) {
@@ -775,6 +786,54 @@ impl Editor {
                 .with_selection(SelectionSet::single(target)),
             moment,
         )
+    }
+
+    /// `r{char}`: replace one character, or a count of them, without
+    /// entering Insert. A count that runs past the line changes nothing,
+    /// as Vim does.
+    fn vim_replace(
+        &mut self,
+        count: usize,
+        key: KeyEvent,
+        moment: HistoryMoment,
+    ) -> Result<(), EditorError> {
+        let character = match key.code {
+            KeyCode::Char(character)
+                if !character.is_control()
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
+                character
+            }
+            _ => {
+                self.vim_cancel_pending();
+                return Ok(());
+            }
+        };
+        self.vim_cancel_pending();
+        let head = self.vim_head();
+        let line_end = self
+            .document
+            .line_content_range(self.document.line_of(head)?)
+            .end;
+        let mut end = head;
+        for _ in 0..count {
+            if end >= line_end {
+                return Ok(());
+            }
+            end = self.document.next_grapheme_boundary(end)?;
+        }
+        let text = character.to_string().repeat(count);
+        let target = ByteOffset(head.0 + (count - 1) * character.len_utf8());
+        self.apply_transaction(
+            Transaction::new(EditOrigin::Typing)
+                .replace(Edit::new(head..end, text))
+                .with_selection(SelectionSet::single(target)),
+            moment,
+        )?;
+        self.vim_normalize_caret()?;
+        Ok(())
     }
 
     fn vim_put(

@@ -35,6 +35,7 @@ impl Editor {
         self.find_open()
             || self.vim.count != 0
             || self.vim.operator.is_some()
+            || self.vim.replace.is_some()
             || self.vim.g
             || self.vim.command.is_some()
             || self.vim.text_object.is_some()

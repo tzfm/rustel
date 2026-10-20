@@ -7,6 +7,7 @@
 - Reference searches, the theme picker, and the export sheet rest in Vim Command mode. j k h l walk the list or form, p pastes the clipboard, i or a type, and Esc returns to Command. The caret follows the active reference tab's query.
 - Edit > Find opens the Vim search prompt when Vim editor keys are on. Enter searches once, and `n` and `N` walk the matches.
 - Vim `p` and `P` paste the system clipboard. A yank or delete fills the clipboard too, so a copied score or the last yank lands in the score.
+- Vim `r` replaces the character under the cursor. A count replaces several.
 - The iTerm2 profile knows the characters its Option key composes. Studio recovers the Option panel shortcuts where they apply, such as Option+T for the tape timeline. Elsewhere the composed character types normally.
 - Composed keys type their character. Option+4 on a Mac ISO layout now types `$` in every text field and in Vim. Before, Studio typed `4`.
 - Pattern queries allocate less. Time and value changes reuse a hap, and a shared object map stays shared until a write. A 4-cycle query with five controls drops from 3,297 to 2,353 allocations.
