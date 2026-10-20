@@ -592,7 +592,9 @@ rest of your terminal, Kitty scheme or Noctalia template included. Two things
 follow from a colour the studio cannot measure. A theme that keeps `reset` as
 its ground should set `event_mark` to `underline`, as `terminal` does, because
 a tint has no ground to tint. And the filled chips write the palette's black,
-slot 0, so they read best on a palette whose black is dark.
+slot 0, so they read best on a palette whose black is dark. A painter that
+fades a colour toward such a ground keeps the colour whole, since a fade with
+nothing to blend into would otherwise land on the ground itself.
 
 ## Settings
 

@@ -1400,7 +1400,7 @@ impl<'a, 'b> PianoRoll<'a, 'b> {
         if alpha >= 0.999 {
             colour
         } else {
-            mix(self.background, colour, alpha)
+            wash(colour, self.background, 1.0 - alpha)
         }
     }
 }
@@ -1881,7 +1881,7 @@ impl Widget for Spiral<'_, '_> {
             let color = if opacity >= 0.999 {
                 color
             } else {
-                mix(self.request.background, color, opacity)
+                wash(color, self.request.background, 1.0 - opacity)
             };
             // The arc runs to where the note stops sounding, not to the
             // end of its whole span.
@@ -2114,7 +2114,7 @@ impl Widget for PitchWheel<'_, '_> {
         }
         // The hour marks, one per division of the octave - faint for the
         // divisions the event's scale leaves out, as on strudel.cc.
-        let faint = mix(self.request.background, theme.grid, 0.15);
+        let faint = wash(theme.grid, self.request.background, 0.85);
         for division in 0..edo {
             let (x, y) = point_at(angle_of(division as f64 / edo as f64), radius);
             if x >= 0 && y >= 0 {
@@ -2148,7 +2148,7 @@ impl Widget for PitchWheel<'_, '_> {
             let color = if alpha >= 0.999 {
                 own
             } else {
-                mix(self.request.background, own, alpha)
+                wash(own, self.request.background, 1.0 - alpha)
             };
             // The scale's name for the note's degree, beside its name.
             let interval = scale.and_then(|scale| {
@@ -2790,7 +2790,7 @@ impl<'a, 'b> Spectrum<'a, 'b> {
         let bars = usize::from(bars_area.width);
         for bar in 0..bars {
             let color = color_override.unwrap_or_else(|| spectrum_color(theme, bar, bars));
-            let peak_color = mix(self.request.background, color, 0.6);
+            let peak_color = wash(color, self.request.background, 0.4);
             let crest = brighten(color);
             let level = self.level(spectrum_level(&bands.levels, bar, bars));
             let peak = self.level(spectrum_level(&bands.peaks, bar, bars));
@@ -2921,8 +2921,21 @@ fn note_to_midi(name: &str) -> Option<f64> {
     Some(f64::from((base + accidental).rem_euclid(12)))
 }
 
+/// `ground_amount` of `ground` washed into `color`, when there is a
+/// ground to wash in. A theme that defers its ground to the terminal has
+/// no colour to blend, and `mix` would snap to the ground itself - which
+/// the pixel raster paints as plain black. The colour stays whole
+/// instead, so a silent note keeps its grey rather than disappearing.
+fn wash(color: Color, ground: Color, ground_amount: f32) -> Color {
+    if true_rgb(ground).is_none() {
+        color
+    } else {
+        mix(color, ground, ground_amount)
+    }
+}
+
 fn dim(color: Color, theme: &Theme) -> Color {
-    mix(color, theme.background, 0.55)
+    wash(color, theme.background, 0.55)
 }
 
 fn brighten(color: Color) -> Color {
@@ -5199,6 +5212,27 @@ mod tests {
                 rows(&picture)
             );
         }
+    }
+
+    #[test]
+    fn fades_keep_their_colour_on_a_ground_the_terminal_owns() {
+        let terminal = Theme::built_in("terminal").unwrap();
+        assert_eq!(terminal.background, Color::Reset);
+        // A dim toward a ground that is not a colour would snap to the
+        // ground and paint black on the pixel raster: the colour stands.
+        assert_eq!(
+            dim(terminal.event_inactive, &terminal),
+            terminal.event_inactive
+        );
+        assert_eq!(
+            wash(Color::Rgb(255, 0, 0), Color::Reset, 0.5),
+            Color::Rgb(255, 0, 0)
+        );
+        // A ground that is a colour still takes its share.
+        assert_eq!(
+            wash(Color::Rgb(255, 0, 0), Color::Rgb(0, 0, 0), 0.5),
+            Color::Rgb(128, 0, 0)
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@
 - The Studio Chords tab no longer leaks memory while it is open. Each draw leaked 336 small strings with the default dictionary.
 - `rustelup --branch` and `--commit` check for the ALSA and libudev development files before a Linux build and print the install command for the detected distribution. A missing `alsa.pc` stopped the `alsa-sys` build script with a panic that named the package but not how to install it. The build guide now lists the packages for Fedora, Arch, openSUSE and Alpine, and says why a PipeWire system still needs the ALSA headers.
 - Alt+A turns on auto preview in the sample, chord and scale lists of the Reference browser. The up and down arrows then play each row the cursor lands on. The choice is kept in `studio.json`. Before, only the samples list had the shortcut, and the choice was lost on quit.
+- Painter colours no longer turn black under the `terminal` theme. A silent note or a faint mark faded toward the theme's ground, and a ground the theme leaves to the terminal has no colour to blend with, so the fade painted plain black on the pixel raster. The colour now stands whole when the ground cannot take its share.
 
 ## v0.1.5
 
