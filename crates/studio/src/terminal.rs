@@ -519,6 +519,10 @@ pub mod profiles {
         pub steals: Vec<Stolen>,
         #[serde(default)]
         legacy_input: Vec<InputLimitation>,
+        /// Option chords the terminal spends on composed text. Alt is not
+        /// a [`KeyCombo`] modifier, so these rows are listed apart.
+        #[serde(default)]
+        alt_input: Vec<InputLimitation>,
         /// The name stands for a family of emulators and identifies none.
         #[serde(default)]
         generic: bool,
@@ -792,6 +796,18 @@ pub mod profiles {
             .map(|row| row.reason.as_str())
     }
 
+    /// An Option chord this terminal composes into text instead of sending
+    /// as Alt. The physical chord is still named, such as `alt+t`.
+    pub fn alt_input_limitation(terminal: &str, chord: &str) -> Option<&'static str> {
+        table()
+            .terminals
+            .iter()
+            .filter(|known| matches_profile(terminal, &known.terminal))
+            .flat_map(|known| &known.alt_input)
+            .find(|row| row.chord.eq_ignore_ascii_case(chord))
+            .map(|row| row.reason.as_str())
+    }
+
     /// Recover physical chord names from a terminal's legacy keymap. This
     /// keeps shortcut hints and learned keys consistent with actual input.
     pub fn legacy_key(terminal: &str, received: &KeyCombo) -> Option<KeyCombo> {
@@ -962,6 +978,34 @@ pub mod profiles {
                     assert_eq!(KeyCombo::parse(received).unwrap().key(), *received);
                 }
             }
+            for limitation in super::table()
+                .terminals
+                .iter()
+                .flat_map(|known| &known.alt_input)
+            {
+                let letter = limitation
+                    .chord
+                    .strip_prefix("alt+")
+                    .unwrap_or_else(|| panic!("{:?} is not an Option chord", limitation.chord));
+                assert_eq!(
+                    letter.chars().count(),
+                    1,
+                    "{} names more than one key",
+                    limitation.chord
+                );
+                assert!(!limitation.reason.is_empty());
+            }
+        }
+
+        #[test]
+        fn iterm2_option_letters_do_not_advertise_alt_hints() {
+            for letter in ['t', 'o', 'r', 'd', 'a'] {
+                assert!(
+                    super::alt_input_limitation("iTerm2", &format!("alt+{letter}")).is_some(),
+                    "alt+{letter} is missing from the iTerm2 profile"
+                );
+            }
+            assert!(super::alt_input_limitation("Ghostty", "alt+t").is_none());
         }
 
         #[test]

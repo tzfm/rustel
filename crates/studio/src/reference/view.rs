@@ -1385,21 +1385,18 @@ impl ReferenceView<'_> {
                 );
                 return;
             }
-            render_footer(
-                buffer,
-                inner,
-                inner.bottom() - 2,
-                &[
-                    "↑↓ move",
-                    "→ expand or preview",
-                    "← folds",
-                    "Space plays/stops",
-                    "Esc stops too",
-                    "Alt+A auto-play",
-                    "Alt+± volume",
-                ],
-                theme,
-            );
+            let mut hints = vec![
+                "↑↓ move",
+                "→ expand or preview",
+                "← folds",
+                "Space plays/stops",
+                "Esc stops too",
+            ];
+            if self.keybinds.alt_hint_available('a') {
+                hints.push("Alt+A auto-play");
+            }
+            hints.push("Alt+± volume");
+            render_footer(buffer, inner, inner.bottom() - 2, &hints, theme);
             let source_line = sample_source_line(self.panel);
             buffer.set_stringn(
                 inner.x,
@@ -1409,22 +1406,40 @@ impl ReferenceView<'_> {
                 Style::default().fg(theme.muted),
             );
             use super::super::keybinds::BindAction;
-            let hint = |action, does: &str| format!("{} {does}", self.keybinds.hint(action));
+            let hint = |action, does: &str| {
+                let label = self.keybinds.hint(action);
+                (!label.is_empty()).then(|| format!("{label} {does}"))
+            };
             let show = hint(BindAction::ShowFile, "shows file");
             let rename_file = hint(BindAction::RenameFile, "renames file");
             let rename_bank = hint(BindAction::RenameFile, "bank alias");
             let trim = hint(BindAction::TrimSample, "trims");
             let delete = hint(BindAction::DeleteSample, "deletes file");
-            let mut actions = vec![show.as_str()];
+            let mut actions: Vec<&str> = Vec::new();
+            if let Some(text) = show.as_deref() {
+                actions.push(text);
+            }
             if self.panel.selected_bank_is_editable() {
                 match self.panel.rename() {
-                    PanelAction::RenameSample { .. } => actions.push(&rename_file),
-                    PanelAction::RenameBank { .. } => actions.push(&rename_bank),
+                    PanelAction::RenameSample { .. } => {
+                        if let Some(text) = rename_file.as_deref() {
+                            actions.push(text);
+                        }
+                    }
+                    PanelAction::RenameBank { .. } => {
+                        if let Some(text) = rename_bank.as_deref() {
+                            actions.push(text);
+                        }
+                    }
                     _ => {}
                 }
-                actions.push(&trim);
-                if self.panel.selected_sample_file().is_some() {
-                    actions.push(&delete);
+                if let Some(text) = trim.as_deref() {
+                    actions.push(text);
+                }
+                if self.panel.selected_sample_file().is_some()
+                    && let Some(text) = delete.as_deref()
+                {
+                    actions.push(text);
                 }
             }
             actions.extend([

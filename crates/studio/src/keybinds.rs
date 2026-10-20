@@ -1269,6 +1269,17 @@ impl Keybinds {
         !self.suppressed_hints.contains(&(key.code, key.modifiers))
     }
 
+    /// Whether this terminal sends an Option letter as Alt. A terminal
+    /// whose Option composes text would only type the character.
+    pub(crate) fn alt_hint_available(&self, letter: char) -> bool {
+        self.reach.terminal.is_empty()
+            || super::terminal::profiles::alt_input_limitation(
+                &self.reach.terminal,
+                &format!("alt+{letter}"),
+            )
+            .is_none()
+    }
+
     /// A shortcut that also works while the score has the keyboard.
     pub(crate) fn hint_binding(&self, action: BindAction) -> Option<KeyCombo> {
         let binding = self.binding(action)?;
@@ -1568,6 +1579,7 @@ impl Keybinds {
             (Some(combo), _) => combo.hint(),
             (None, Some(letter))
                 if self.binding(action).is_none()
+                    && self.alt_hint_available(letter)
                     && self.hint_available(KeyEvent::new(
                         KeyCode::Char(letter),
                         KeyModifiers::ALT,
@@ -2797,6 +2809,24 @@ mod tests {
         binds.learn(BindAction::TrimSample, None);
         assert_eq!(binds.hint(BindAction::TrimSample), shortcut_label("Alt+T"));
         assert!(binds.prefs().is_empty());
+    }
+
+    #[test]
+    fn a_terminal_that_composes_option_does_not_hint_the_alt_letter() {
+        let mut binds = Keybinds::default();
+        binds.set_reach(Reach {
+            enhanced: false,
+            terminal: "iTerm2".into(),
+        });
+        assert_eq!(binds.hint(BindAction::TrimSample), "");
+        assert_eq!(binds.hint(BindAction::FocusTimeline), "");
+        assert!(!binds.alt_hint_available('t'));
+
+        binds.set_reach(Reach {
+            enhanced: false,
+            terminal: "Ghostty".into(),
+        });
+        assert_eq!(binds.hint(BindAction::TrimSample), shortcut_label("Alt+T"));
     }
 
     /// Delete on the row of an action shipped with no key puts back its

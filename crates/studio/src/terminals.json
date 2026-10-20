@@ -529,13 +529,20 @@
     {
       "terminal": "iTerm2",
       "capabilities": {"truecolor": true},
-      "source": "https://github.com/gnachman/iTerm2/blob/master/plists/DefaultGlobalKeyMap.plist",
-      "unbind": "Settings > Keys > Key Bindings: remove the conflicting global shortcut.",
+      "source": "https://github.com/gnachman/iTerm2/blob/master/plists/DefaultGlobalKeyMap.plist ; https://iterm2.com/documentation-preferences-profiles-keys.html",
+      "unbind": "Settings > Keys > Key Bindings: remove the conflicting global shortcut. Profiles > Keys: set Option to Esc+ for the panel Option shortcuts, or learn another chord in Studio Settings > Keybinds.",
       "steals": [
         {"chord": "ctrl+tab", "does": "switches terminal tab"},
         {"chord": "ctrl+shift+tab", "does": "switches terminal tab"},
         {"chord": "shift+pageup", "does": "scrolls terminal history"},
         {"chord": "shift+pagedown", "does": "scrolls terminal history"}
+      ],
+      "alt_input": [
+        {"chord": "alt+a", "reason": "Option as Normal sends a composed character, not Alt+A"},
+        {"chord": "alt+d", "reason": "Option as Normal sends a composed character, not Alt+D"},
+        {"chord": "alt+o", "reason": "Option as Normal sends a composed character, not Alt+O"},
+        {"chord": "alt+r", "reason": "Option as Normal sends a composed character, not Alt+R"},
+        {"chord": "alt+t", "reason": "Option as Normal sends a composed character, not Alt+T"}
       ]
     },
     {
