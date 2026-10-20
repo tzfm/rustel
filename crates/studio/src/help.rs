@@ -52,6 +52,8 @@ pub enum HelpContext {
     Mixer,
     /// The memory breakdown, docked along the top or the bottom.
     Memory,
+    /// The knobs column beside the score.
+    Knobs,
 }
 
 impl HelpContext {
@@ -83,6 +85,7 @@ impl HelpContext {
             Self::Viz => "visuals panel",
             Self::Mixer => "mixer",
             Self::Memory => "memory breakdown",
+            Self::Knobs => "knobs",
         }
     }
 
@@ -150,6 +153,11 @@ impl HelpContext {
                 "Where the header's mem goes: the parts that add up to it, each against \
                  the limit that holds it, docked along the bottom or the top beside the \
                  score. It stays while you work, and the settings sheet stands clear of it."
+            }
+            Self::Knobs => {
+                "The numbers of the call under the caret, as sliders. The arrows write \
+                 the score as they move, and the far left takes an optional entry out. \
+                 Press Enter to type an exact value. A plugin keeps the knobs you add to it."
             }
         }
     }
@@ -220,6 +228,17 @@ impl HelpContext {
                 (
                     "e · +/- · Esc · F4",
                     "top or bottom / taller or shorter / back to the score / hide",
+                ),
+            ],
+            Self::Knobs => [
+                ("↑/↓ · ←/→", "choose a knob / move it, Shift for one step"),
+                (
+                    "Enter · a · r · ⌫",
+                    "type a value / add a knob / suggested knobs back / take a knob out",
+                ),
+                (
+                    "Home · End · Esc",
+                    "bottom or off / top / back to the score",
                 ),
             ],
             Self::Set => [

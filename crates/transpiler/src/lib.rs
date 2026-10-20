@@ -38,6 +38,7 @@ pub use callback_ir::{
     MAX_CALLBACK_IR_SOURCE_BYTES, PatternTransformCandidate, PatternTransformFallbackReason,
     lower_pattern_transform_callback,
 };
+pub use frequency_sliders::is_frequency_control;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseDiagnostic {

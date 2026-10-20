@@ -16,6 +16,12 @@ const CONTROLS: &[&str] = &[
     "cutoff", "ctf", "lpf", "lp", "hcutoff", "hpf", "hp", "bandf", "bpf", "bp", "freq",
 ];
 
+/// Whether a control name is one the ear hears on a log scale, so a
+/// control surface can give it logarithmic travel.
+pub fn is_frequency_control(name: &str) -> bool {
+    CONTROLS.contains(&name)
+}
+
 /// Mark which sliders travel logarithmically, and name the call each one
 /// sits inside.
 ///

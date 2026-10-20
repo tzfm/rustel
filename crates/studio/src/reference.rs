@@ -88,7 +88,22 @@ pub use vocabulary::{
     tuning_vocabulary,
 };
 #[cfg(feature = "vst")]
-pub use vst::{PluginRow, PluginWords, VstTab, key_words};
+pub use vst::{PluginRow, PluginWords, VstTab, key_words, rank_names};
+
+/// A parameter key in the form a score writes in the object of a call:
+/// a name or a number as is, each other key in single quotes. A score
+/// reads a key in double quotes as mini-notation.
+pub(crate) fn score_key(key: &str) -> String {
+    let word = |char: char| char.is_ascii_alphanumeric() || char == '_';
+    let name = key.starts_with(|char: char| char.is_ascii_alphabetic() || char == '_')
+        && key.chars().all(word);
+    let number = !key.is_empty() && key.chars().all(|char| char.is_ascii_digit());
+    if name || number {
+        key.to_owned()
+    } else {
+        format!("'{}'", key.replace('\\', "\\\\").replace('\'', "\\'"))
+    }
+}
 
 /// Variant rows an expanded bank shows at most; a soundfont with hundreds
 /// of files is still one sound to a score.

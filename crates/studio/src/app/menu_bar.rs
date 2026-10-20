@@ -55,6 +55,7 @@ impl App {
             Focus::Panel(PanelKind::Set) => HelpContext::Set,
             Focus::Panel(PanelKind::Viz) => HelpContext::Viz,
             Focus::Panel(PanelKind::Mixer) => HelpContext::Mixer,
+            Focus::Panel(PanelKind::Knobs) => HelpContext::Knobs,
             Focus::Editor => HelpContext::Editor,
             Focus::Timeline => HelpContext::Timeline,
         }
@@ -314,6 +315,7 @@ impl App {
             split: self.panes.len() > 1,
             zen: self.ui_settings.zen,
             mixer: self.mixer_panel.is_some(),
+            knobs: self.knobs_panel.is_some(),
             log: self.log_panel.is_some(),
             memory: self.memory_dock.is_some(),
             jobs: self.jobs_panel.is_some(),
@@ -456,6 +458,7 @@ impl App {
             Do::VizPanelTwo => self.toggle_viz_dock(1),
             Do::Visualizers => self.toggle_visualizers(),
             Do::Mixer => self.toggle_mixer_panel(),
+            Do::Knobs => self.toggle_knobs_panel(),
             Do::SetLimiter => self.set_limiter_slot(!self.has_limiter_slot()),
             Do::NewSet => self.new_set(),
             Do::NewSession => self.new_session(),

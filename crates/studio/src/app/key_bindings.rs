@@ -208,6 +208,10 @@ impl App {
                 self.open_log_from_memory();
                 Ok(true)
             }
+            Do::Knobs => {
+                self.toggle_knobs_panel();
+                Ok(true)
+            }
             Do::Export => {
                 self.toggle_export_sheet();
                 Ok(true)

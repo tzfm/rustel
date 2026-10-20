@@ -150,6 +150,28 @@ impl App {
                 }
                 true
             }
+            // Paste lands wherever the knobs panel would take the keys:
+            // the add list's query when it is open, the number form when
+            // it is, and nowhere - not the score - otherwise.
+            PanelKind::Knobs => {
+                let Some(panel) = self.knobs_panel.as_mut() else {
+                    return false;
+                };
+                if let Some(adding) = panel.adding.as_mut() {
+                    for character in single_line_paste(text).chars() {
+                        adding.query.push(character);
+                    }
+                    adding.rank();
+                    true
+                } else if let Some(editing) = panel.editing.as_mut() {
+                    for character in single_line_paste(text).chars() {
+                        editing.form.insert(&character.to_string());
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
             PanelKind::Devices
             | PanelKind::Log
             | PanelKind::Jobs

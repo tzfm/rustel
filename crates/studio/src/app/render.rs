@@ -7,6 +7,7 @@
 
 use super::focus::FOCUS_ROTATION_FLASH_DURATION;
 use super::*;
+use crate::knobs_panel;
 
 /// How a TachyonFX theme draws this frame - over the finished cells or as a
 /// picture behind them - and how strongly it may show through the score and
@@ -508,6 +509,7 @@ impl App {
                 .as_ref()
                 .and_then(|panel| view::log_dock(panel, terminal_area)),
             self.memory_dock.map(|dock| dock.dock(terminal_area)),
+            self.knobs_panel.is_some(),
             self.footer_notice_rows(),
             self.has_piano_notes(),
         );
@@ -517,6 +519,10 @@ impl App {
             Focus::Panel(PanelKind::Set) => regions.sidebar_hidden && self.set_prompt.is_none(),
             Focus::Panel(PanelKind::Viz) => regions.viz[self.viz_focus].is_empty(),
             Focus::Panel(PanelKind::Log) => self.log_is_docked() && regions.log.is_empty(),
+            // A terminal too narrow for the column leaves its region empty:
+            // the keyboard goes back to the score rather than to rails that
+            // are not on screen.
+            Focus::Panel(PanelKind::Knobs) => regions.knobs.is_empty(),
             _ => false,
         };
         if hidden_focus {
@@ -538,6 +544,11 @@ impl App {
         // the room it got, and its key claim rests on it.
         self.mixer_unlaid = false;
         self.memory_unlaid = false;
+        // The knobs column as well, and its rows are read for the room it
+        // got: the scroll follows the selection into whatever height the
+        // body left the column.
+        self.knobs_unlaid = false;
+        self.refresh_knobs(regions.knobs);
         if let Some(panel) = self.set_panel.as_mut() {
             panel.sync_marks(&self.scenes);
             if !regions.sidebar_hidden
@@ -1236,6 +1247,16 @@ impl App {
             viz_focus: self.viz_focus,
             mixer: self.mixer_facts(),
             mixer_panel: self.mixer_panel,
+            knobs: self
+                .knobs_panel
+                .as_ref()
+                .zip(self.knobs_rows.as_ref())
+                .map(|(panel, rows)| crate::knobs_panel::KnobsData {
+                    name: rows.name.as_deref(),
+                    listed: rows.listed,
+                    knobs: &rows.knobs,
+                    panel,
+                }),
             mixer_selection: self.mixer_selection.as_ref(),
             reference_on_top: self.reference_on_top(),
             #[cfg(feature = "hydra")]
@@ -1677,6 +1698,21 @@ impl App {
         }
         if let Some((anchor, rows, caret)) = &overlays.smart {
             smart_action::render(frame, &self.theme, *anchor, rows, *caret);
+        }
+        // The knobs column's edit form draws its caret the way the quick
+        // action's does: over the panel, in place of the score's caret,
+        // which the keyboard is not on while the form is up. The form
+        // draws only while the column has the keyboard, so a keyboard
+        // that has moved away takes its caret with it.
+        if overlays.help.is_none()
+            && self.menu.is_none()
+            && self.focus == Focus::Panel(PanelKind::Knobs)
+            && let Some((x, y)) = self
+                .knobs_panel
+                .as_ref()
+                .and_then(|panel| knobs_panel::edit_caret(panel, self.regions.knobs))
+        {
+            frame.set_cursor_position((x, y));
         }
         // Absolutely last: help covers the theme editor, every other
         // panel, toasts, the cell-Hydra wash, and stage pictures alike.

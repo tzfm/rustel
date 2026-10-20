@@ -87,6 +87,7 @@ mod vstruct;
 mod zap;
 
 use rustel_core::reference::ReferenceEntry;
+use rustel_core::reference::numbers::{ReferenceNumber, count, number, share};
 use rustel_core::register::{Origin, Registry};
 
 use crate::{Extension, PatternCallable, PatternState, ValueCallable};
@@ -205,6 +206,52 @@ const PATTERN_CALLABLES: &[PatternCallable] = &[
 
 const VALUE_CALLABLES: &[ValueCallable] = &[to_major_key::CALLABLE];
 
+const REFERENCE_NUMBERS: &[ReferenceNumber] = &[
+    share("acidenv", "x"),
+    // A negative amount strums downward.
+    number("strum", "amount", -0.25, 0.25, 0.005),
+    number("pg", "value", 0.0, 2.0, 0.01),
+    number("accent", "amount", 0.0, 2.0, 0.01),
+    share("trancegate", "density"),
+    count("trancegate", "seed", 0.0, 64.0),
+    count("trancegate", "length", 1.0, 16.0),
+    share("tgate", "amount"),
+    count("tgate", "cycle", 0.0, 37.0),
+    count("tgate", "length", 1.0, 16.0),
+    share("dly", "amount"),
+    share("colorparty", "amount"),
+    share("mpan", "amount"),
+    share("rlpf", "amount"),
+    share("rhpf", "amount"),
+    number("fmtime", "start", 0.0, 16.0, 0.25),
+    number("fmtime", "length", 0.25, 16.0, 0.25),
+    share("sb", "probability"),
+    count("ifit", "cycles", 1.0, 16.0),
+    share("flood", "amount"),
+    share("glitch", "amount"),
+    share("humanize", "amount"),
+    share("glide", "time"),
+    number("DX", "env", 0.0, 16.0, 0.1),
+    number("DX", "fm", 0.0, 16.0, 0.1),
+    number("DX", "harm", 0.0, 8.0, 0.125),
+    count("col", "selector", 0.0, 6.0),
+    count("irando", "n", 1.0, 16.0),
+    count("randm", "division", 1.0, 16.0),
+    count("sf", "cycles", 1.0, 16.0),
+    count("sf", "segments", 1.0, 64.0),
+    count("nsc", "degrees", -7.0, 14.0),
+    count("nsc", "octaves", 0.0, 8.0),
+    count("trancearp", "reset", 0.0, 5.0),
+    count("trancearp", "rhythm", 0.0, 2.0),
+    count("noisehat", "segments", 1.0, 64.0),
+    number("noisehat", "min", 0.0, 0.5, 0.01),
+    number("noisehat", "max", 0.0, 0.5, 0.01),
+    share("zap", "amount"),
+    share("zap", "speed"),
+    share("roller", "wt"),
+    share("roller2", "envelope"),
+];
+
 pub(crate) const EXTENSION: Extension = Extension {
     origin: ORIGIN,
     install_patterns: install,
@@ -212,6 +259,7 @@ pub(crate) const EXTENSION: Extension = Extension {
     pattern_callables: PATTERN_CALLABLES,
     value_callables: VALUE_CALLABLES,
     reference_groups: &[SURFACE_REFERENCES, PREBAKE_REFERENCES],
+    reference_numbers: REFERENCE_NUMBERS,
 };
 
 fn install(registry: &mut Registry) {

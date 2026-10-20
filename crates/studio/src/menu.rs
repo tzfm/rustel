@@ -37,6 +37,8 @@ const ACCEL_GAP: u16 = 3;
 pub enum MenuAction {
     /// The mixer along the bottom.
     Mixer,
+    /// The knobs column beside the score.
+    Knobs,
     // File - the set is the file: a folder of scores.
     NewSet,
     NewSession,
@@ -1281,6 +1283,9 @@ pub struct MenuContext<'a> {
     /// The memory breakdown is docked, whether or not the terminal has
     /// room to draw it just now.
     pub memory: bool,
+    /// The knobs column is open, whether or not the terminal has room to
+    /// draw it just now.
+    pub knobs: bool,
     /// The numbers down the left edge of the score.
     pub line_numbers: bool,
     /// Long lines continue on the next row.
@@ -1766,6 +1771,15 @@ pub fn menus(cx: &MenuContext) -> Vec<Menu> {
             ),
             MenuItem::new(
                 MenuItemKind::Toggle {
+                    id: MenuAction::Knobs,
+                    on: cx.knobs,
+                },
+                "Knobs",
+                'k',
+                hint(BindAction::Knobs),
+            ),
+            MenuItem::new(
+                MenuItemKind::Toggle {
                     id: MenuAction::Zen,
                     on: cx.zen,
                 },
@@ -1909,6 +1923,7 @@ mod tests {
             log: false,
             jobs: false,
             memory: false,
+            knobs: false,
             line_numbers: true,
             wrap: false,
             show_menu: true,

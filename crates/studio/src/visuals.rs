@@ -2978,6 +2978,28 @@ pub(super) struct PainterTerminal {
     pub entry: &'static str,
     /// `(option, note)` pairs for the options that behave differently here.
     pub options: &'static [(&'static str, &'static str)],
+    /// The options the terminal reads as numbers where the documentation
+    /// gives another default or no bounds.
+    pub numbers: &'static [TerminalNumber],
+}
+
+/// A number option as the terminal reads it: the value it takes when the
+/// score leaves the option out, and the bounds it holds the value to. A
+/// switch is 0 or 1.
+pub(super) struct TerminalNumber {
+    pub option: &'static str,
+    pub default: f64,
+    pub min: f64,
+    pub max: f64,
+}
+
+const fn number(option: &'static str, default: f64, min: f64, max: f64) -> TerminalNumber {
+    TerminalNumber {
+        option,
+        default,
+        min,
+        max,
+    }
 }
 
 /// Terminal behaviour of every painter that differs from the documentation.
@@ -3020,16 +3042,24 @@ pub(super) const PAINTER_TERMINAL: &[PainterTerminal] = &[
                 "ignored: the terminal's font is the terminal's",
             ),
         ],
+        // Folded unless told not to: eight rows cannot spread 10..90. And
+        // the range follows the notes until it is pinned.
+        numbers: &[
+            number("fold", 1.0, 0.0, 1.0),
+            number("autorange", 1.0, 0.0, 1.0),
+        ],
     },
     PainterTerminal {
         painter: "punchcard",
         entry: "The same painter as pianoroll here, fed by the highlighter: a plain punchcard() shows every event the highlighter sees, the whole stack, while _punchcard() is tagged to its own pattern. Every pianoroll option applies, with the same exceptions.",
         options: &[],
+        numbers: &[],
     },
     PainterTerminal {
         painter: "wordfall",
         entry: "A punchcard on its side with labels on: time falls from the top, one lane per value across. Every pianoroll option applies, with the same exceptions.",
         options: &[],
+        numbers: &[],
     },
     PainterTerminal {
         painter: "spiral",
@@ -3051,6 +3081,12 @@ pub(super) const PAINTER_TERMINAL: &[PainterTerminal] = &[
             ("playheadThickness", "ignored: see playheadLength"),
             ("logSpiral", "ignored, as on strudel.cc"),
         ],
+        numbers: &[
+            number("stretch", 1.0, 0.1, 4.0),
+            number("inset", 3.0, 0.5, 12.0),
+            number("steady", 1.0, -4.0, 4.0),
+            number("padding", 0.0, 0.0, 1.0),
+        ],
     },
     PainterTerminal {
         painter: "pitchwheel",
@@ -3068,6 +3104,7 @@ pub(super) const PAINTER_TERMINAL: &[PainterTerminal] = &[
             ),
             ("margin", "ignored: the wheel is fitted to its rows"),
         ],
+        numbers: &[],
     },
     PainterTerminal {
         painter: "scope",
@@ -3080,6 +3117,13 @@ pub(super) const PAINTER_TERMINAL: &[PainterTerminal] = &[
                 "the level the trace starts at, not a switch - align is the switch",
             ),
         ],
+        // A scope that names no scale is fitted to its pane at a scale of
+        // 1. Naming one, even 1, ends the fit.
+        numbers: &[
+            number("scale", 1.0, 0.01, 8.0),
+            number("pos", 0.5, 0.0, 1.0),
+            number("trigger", 0.0, -1.0, 1.0),
+        ],
     },
     PainterTerminal {
         painter: "spectrum",
@@ -3090,11 +3134,16 @@ pub(super) const PAINTER_TERMINAL: &[PainterTerminal] = &[
             ("scroll", "only here"),
             ("color", "only here"),
         ],
+        numbers: &[
+            number("min", -80.0, -120.0, 0.0),
+            number("max", 0.0, -120.0, 0.0),
+        ],
     },
     PainterTerminal {
         painter: "markcss",
         entry: "Accepted and never drawn: the studio highlights sounding events in its own theme's colours, which a CSS rule cannot describe.",
         options: &[],
+        numbers: &[],
     },
 ];
 
@@ -3124,6 +3173,21 @@ pub(super) fn painter_terminal_option(painter: &str, option: &str) -> &'static s
                 .map(|(_, note)| *note)
         })
         .unwrap_or("")
+}
+
+/// How the terminal reads one of a painter's options as a number, when it
+/// differs from the documentation.
+pub(super) fn painter_terminal_number(
+    painter: &str,
+    option: &str,
+) -> Option<&'static TerminalNumber> {
+    let painter = painter.strip_prefix('_').unwrap_or(painter);
+    PAINTER_TERMINAL
+        .iter()
+        .find(|painter_terminal| painter_terminal.painter == painter)?
+        .numbers
+        .iter()
+        .find(|number| number.option.eq_ignore_ascii_case(option))
 }
 
 /// The painters' entries, in the order the renderer dispatches them.
@@ -3332,7 +3396,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
             },
             ReferenceParam {
                 name: "inset",
-                r#type: "string",
+                r#type: "number",
                 description: "number of rotations before spiral starts (default 3)",
             },
             ReferenceParam {
@@ -6091,5 +6155,76 @@ mod tests {
             visual.clock_at(cutover_wall + std::time::Duration::from_secs(3)),
             Some((23.0, 46.0, 2.0))
         );
+    }
+
+    /// The terminal's own defaults are the values its painters take: an
+    /// option written at its terminal default draws what no option draws,
+    /// so a knob that comes on at it changes nothing on the screen. A scope
+    /// that names its scale is no longer fitted to its pane, which is the
+    /// one difference the picture shows.
+    #[test]
+    fn a_terminal_default_draws_what_no_option_draws() {
+        let area = Rect::new(0, 0, 32, 10);
+        let notes = || {
+            vec![
+                pitched(1, "0/1", "1/2", 261.6, 10.0),
+                pitched(2, "1/2", "1/1", 523.2, 20.0),
+            ]
+        };
+        let mut checked = 0;
+        for painter in PAINTER_TERMINAL {
+            for number in painter.numbers {
+                if (painter.painter, number.option) == ("scope", "scale") {
+                    continue;
+                }
+                let source = format!("$: note(\"c4 c5\")._{}()", painter.painter);
+                let mut state = playing(&source, notes(), 0.2);
+                let mut scope = [0.0f32; UI_SCOPE_SAMPLES];
+                for (index, sample) in scope.iter_mut().enumerate() {
+                    *sample = (std::f32::consts::TAU * 3.0 * index as f32
+                        / UI_SCOPE_SAMPLES as f32)
+                        .sin();
+                }
+                let mut spectrum = [0.0f32; UI_SPECTRUM_BINS];
+                for (index, bin) in spectrum.iter_mut().enumerate() {
+                    *bin = -110.0 + 100.0 * index as f32 / UI_SPECTRUM_BINS as f32;
+                }
+                assert!(state.install_audio(
+                    UiAudioMetadata {
+                        sequence: 1,
+                        generation: 1,
+                        device_time: 0.5,
+                        stream_id: 1,
+                        epoch: 1,
+                        end_frame: 24_000,
+                        sample_rate: 48_000,
+                    },
+                    UiAudioAnalysisSet {
+                        master: UiAudioAnalysisFrame { scope, spectrum },
+                        visuals: Vec::new(),
+                        sides: Vec::new(),
+                    },
+                ));
+                // A stopped clock holds the picture still between the
+                // two draws.
+                state.stop();
+                let written = format!("{{{}: {}}}", number.option, number.default);
+                let plain = draw(painter.painter, "", &state, area);
+                assert!(painted(&plain) > 0, "{} draws", painter.painter);
+                assert_eq!(
+                    rows(&plain),
+                    rows(&draw(painter.painter, &written, &state, area)),
+                    "{} {written}",
+                    painter.painter
+                );
+                assert!(
+                    (number.min..=number.max).contains(&number.default),
+                    "{} {written} is inside its bounds",
+                    painter.painter
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 8, "every terminal number is drawn");
     }
 }

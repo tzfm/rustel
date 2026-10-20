@@ -29,6 +29,7 @@ pub(crate) const EXTENSION: Extension = Extension {
     pattern_callables: &[],
     value_callables: &[],
     reference_groups: &[REFERENCE_ENTRIES],
+    reference_numbers: &[],
 };
 
 fn install(_registry: &mut Registry) {}
