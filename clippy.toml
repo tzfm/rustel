@@ -1,0 +1,9 @@
+disallowed-types = [
+    { path = "std::collections::hash_map::DefaultHasher", reason = "Do not hash on every event. Use a cached stable token or a deterministic hash." },
+    { path = "std::collections::hash_map::RandomState", reason = "A random seed makes iteration order differ between runs. Use a deterministic hasher." },
+]
+
+disallowed-methods = [
+    { path = "f32::mul_add", reason = "A fused multiply-add can change the last bits of audio. Use separate multiplication and addition." },
+    { path = "f64::mul_add", reason = "A fused multiply-add can change the last bits of audio. Use separate multiplication and addition." },
+]
