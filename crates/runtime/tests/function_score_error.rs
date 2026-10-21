@@ -67,6 +67,31 @@ fn a_function_valued_live_reload_keeps_the_playing_pattern() {
 }
 
 #[test]
+fn an_all_callback_that_returns_undefined_keeps_the_playing_pattern() {
+    let mut session = Session::new().unwrap();
+    let stopped = AtomicBool::new(false);
+    session
+        .reload_at_cancellable("pure('playing')", false, 0.0, &stopped)
+        .unwrap();
+    let message = session
+        .reload_at_cancellable(
+            "$: pure('next')\nall(x => x.fast(2).ross)",
+            false,
+            0.1,
+            &stopped,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("all transform returned undefined"),
+        "{message}"
+    );
+    let events = session.query(Fraction::ZERO, Fraction::ONE).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].value, rustel_core::Value::Str("playing".into()));
+}
+
+#[test]
 fn trailing_register_is_still_valid_definition_only_setup() {
     let mut session = Session::new().unwrap();
     session

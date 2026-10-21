@@ -147,6 +147,13 @@ fn finish<'js>(
             .into_function()
             .ok_or_else(|| throw_type_error(&ctx, "all transform is not a function"))?;
         result = transform.call((result,))?;
+        // Undefined would read as a score with no pattern and play silence.
+        if result.is_undefined() {
+            return Err(throw_type_error(
+                &ctx,
+                "all transform returned undefined, not a pattern",
+            ));
+        }
     }
     // Install the gain curve after lane composition so it covers the full
     // result. The value transform includes the default gain of 0.8 and any
