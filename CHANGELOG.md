@@ -7,6 +7,7 @@
 - The new `terminal` theme follows the terminal's own palette: `reset` and the 16 `ansiN` colours, so a custom scheme such as a Kitty or Noctalia one shows through the studio.
 - The theme picker's delete key refuses a theme the studio ships on the first press. Before, the second press went looking for a file a built-in theme does not have and answered with an error that listed every theme name.
 - The Studio Chords tab no longer leaks memory while it is open. Each draw leaked 336 small strings with the default dictionary.
+- An `all()` callback that returns `undefined` stops the update with an error. Before, a typo at the end of its chain, such as `.ross`, played silence and `rustel check` found no issue.
 
 ## v0.1.5
 
