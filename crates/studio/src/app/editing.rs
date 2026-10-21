@@ -25,6 +25,12 @@ impl App {
         self.remote_key_event || self.editor().accepts_typed_text()
     }
 
+    /// Leave any pending key mode before an action from outside the
+    /// keyboard. The Vim package owns how a mode is left.
+    pub(super) fn interrupt_key_input(&mut self) -> Result<(), RuntimeError> {
+        super::vim::interrupt(self)
+    }
+
     pub(super) fn forward_mouse_to_editor(
         &mut self,
         mouse: MouseEvent,
