@@ -140,8 +140,13 @@ impl Editor {
         self.vim.keybindings == EditorKeybindings::Vim && self.vim.mode == Mode::Normal
     }
 
-    pub(crate) fn vim_enabled(&self) -> bool {
+    pub(crate) fn uses_modal_keys(&self) -> bool {
         self.vim.keybindings == EditorKeybindings::Vim
+    }
+
+    /// The find bar outside a modal profile stays open after Enter.
+    pub(crate) fn find_bar_keeps_open(&self) -> bool {
+        !self.uses_modal_keys()
     }
 
     /// A mode where `p` puts text: Normal or Visual.
@@ -240,7 +245,7 @@ impl Editor {
         self.close_history_group();
     }
 
-    pub(crate) fn vim_interrupt(&mut self) {
+    pub(crate) fn interrupt_key_mode(&mut self) {
         self.find_cancel();
         self.vim_remap.clear_pending();
         self.vim_cancel_pending();
@@ -386,7 +391,7 @@ impl Editor {
             }
             KeyCode::Tab | KeyCode::BackTab => return Ok(true),
             _ => {
-                self.vim_interrupt();
+                self.interrupt_key_mode();
                 return Ok(false);
             }
         };

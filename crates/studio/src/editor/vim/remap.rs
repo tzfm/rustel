@@ -152,7 +152,7 @@ impl Editor {
         key_to_command(key, KeyboardCapabilities::enhanced())
     }
 
-    pub(crate) fn vim_claims_key(&self, key: &KeyEvent) -> bool {
+    pub(crate) fn claims_key(&self, key: &KeyEvent) -> bool {
         if self.vim.keybindings != EditorKeybindings::Vim || key.kind == KeyEventKind::Release {
             return false;
         }

@@ -462,7 +462,7 @@ impl App {
     pub(super) fn route_terminal_event(
         &mut self,
         mut terminal_event: Event,
-        allow_vim: bool,
+        allow_modal_keys: bool,
     ) -> Result<(), RuntimeError> {
         if let Event::Key(key) = &mut terminal_event {
             self.keybinds.normalize_terminal_key(key);
@@ -486,7 +486,7 @@ impl App {
         self.note_pointer_shape_event(&terminal_event);
         // A find prompt owns the keys before Vim mappings and every editor
         // command: a typed pattern is never a motion or an edit.
-        if allow_vim && self.route_find_event(&terminal_event)? {
+        if allow_modal_keys && self.route_find_event(&terminal_event)? {
             return Ok(());
         }
         // Quit and the transport outrank even Vim, so they must not be
@@ -497,7 +497,7 @@ impl App {
                 && self.find_global_chord(key));
         let quit_was_armed = self.quit_armed;
         if !find_global
-            && allow_vim
+            && allow_modal_keys
             && self.editor_accepts_raw_paste()
             && let Event::Key(key) = &terminal_event
             && super::vim::dispatch(self, *key)?
@@ -516,7 +516,7 @@ impl App {
         if non_key_interrupt {
             super::vim::flush_pending(self)?;
         }
-        let interrupts_vim = non_key_interrupt
+        let interrupts_key_mode = non_key_interrupt
             || matches!(&terminal_event, Event::Key(key)
                 if key.kind != KeyEventKind::Release
                     && (key.modifiers.intersects(
@@ -524,9 +524,9 @@ impl App {
                             | KeyModifiers::HYPER | KeyModifiers::META,
                     ) || matches!(key.code, KeyCode::F(_) | KeyCode::Tab | KeyCode::BackTab)
                         || self.keybinds.override_action_for(key).is_some()));
-        if interrupts_vim {
+        if interrupts_key_mode {
             for scene in self.scenes.scenes_mut() {
-                scene.editor.vim_interrupt();
+                scene.editor.interrupt_key_mode();
             }
         }
         // A Vim mapping has first use of the focused editor's keys.

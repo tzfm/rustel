@@ -81,6 +81,16 @@ pub(crate) fn flush_pending(app: &mut App) -> Result<(), RuntimeError> {
     drain_mappings(app, true)
 }
 
+/// Leave Vim before an action that did not come from the keyboard. A held
+/// mapping prefix or Insert must not change what a pad or knob does.
+pub(crate) fn interrupt(app: &mut App) -> Result<(), RuntimeError> {
+    flush_pending(app)?;
+    for scene in app.scenes.scenes_mut() {
+        scene.editor.interrupt_key_mode();
+    }
+    Ok(())
+}
+
 fn drain_mappings(app: &mut App, force: bool) -> Result<(), RuntimeError> {
     while let Some((mapped, remaining)) =
         app.scenes.current_mut().editor.vim_take_mapped_keys(force)

@@ -135,14 +135,6 @@ impl App {
         }
     }
 
-    fn interrupt_vim_for_controller(&mut self) -> Result<(), RuntimeError> {
-        super::vim::flush_pending(self)?;
-        for scene in self.scenes.scenes_mut() {
-            scene.editor.vim_interrupt();
-        }
-        Ok(())
-    }
-
     /// Whether a MIDI message arriving now would do anything: a scene has a
     /// pad, a knob drives a mapping slot, a message fires a Keybinds row,
     /// or a pad or knob is being learnt. Otherwise a message only lights
@@ -447,9 +439,8 @@ impl App {
                     action.label()
                 ),
             );
-            let result = self
-                .interrupt_vim_for_controller()
-                .and_then(|()| self.dispatch_bind_action(action, false));
+            let result =
+                super::vim::interrupt(self).and_then(|()| self.dispatch_bind_action(action, false));
             self.refresh_editor_shortcut_hints();
             if let Err(error) = result {
                 self.set_error(ErrorOwner::Interface, error.to_string());
@@ -614,7 +605,7 @@ impl App {
                     "pad",
                     format!("{} fires {}", pad.label(), action.label()),
                 );
-                self.interrupt_vim_for_controller()?;
+                super::vim::interrupt(self)?;
                 let result = self.dispatch_bind_action(action, false);
                 self.refresh_editor_shortcut_hints();
                 result?;
@@ -635,7 +626,7 @@ impl App {
                     self.scenes.scenes()[index].name()
                 ),
             );
-            self.interrupt_vim_for_controller()?;
+            super::vim::interrupt(self)?;
             let result = self.launch_scene(index);
             self.refresh_editor_shortcut_hints();
             result?;

@@ -5,18 +5,18 @@ use crate::editor::FindDirection;
 
 impl App {
     /// Open the find prompt for the focused score. The chord and Edit > Find
-    /// both arrive here. Vim gets its `/` prompt, which closes on Enter and
-    /// repeats with `n` and `N`.
+    /// both arrive here. The editor says whether its profile keeps the bar
+    /// open, so a modal profile closes it on Enter and repeats with `n`.
     pub(super) fn open_find(&mut self) {
         self.focus_editor_for_locator();
-        self.editor_mut().vim_interrupt();
-        let vim = self.editor().vim_enabled();
+        self.editor_mut().interrupt_key_mode();
+        let keeps_open = self.editor().find_bar_keeps_open();
         self.editor_mut()
-            .begin_find(FindDirection::Forward, !vim, 0);
-        self.status = if vim {
-            "find - type a regular expression \u{b7} Enter searches \u{b7} Esc cancels".into()
-        } else {
+            .begin_find(FindDirection::Forward, keeps_open, 0);
+        self.status = if keeps_open {
             "find - type a regular expression \u{b7} Enter next \u{b7} Esc closes".into()
+        } else {
+            "find - type a regular expression \u{b7} Enter searches \u{b7} Esc cancels".into()
         };
         self.dirty_frame = true;
     }

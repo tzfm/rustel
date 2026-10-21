@@ -12,7 +12,7 @@ impl App {
         let editor_focused = self.editor_accepts_raw_paste();
         let editor = &self.scenes.current().editor;
         self.keybinds
-            .filter_editor_hints(|key| editor_focused && editor.vim_claims_key(key));
+            .filter_editor_hints(|key| editor_focused && editor.claims_key(key));
     }
 
     /// What this press means to the chord table, as an editor command, for
