@@ -1435,9 +1435,6 @@ struct App {
     /// while it is still `None`: a sound heard for the first time is being
     /// decoded at the moment it is asked for.
     preview_shape: Option<(std::sync::Arc<[u8]>, f64)>,
-    /// Whether walking the samples list auditions each sound as the cursor
-    /// lands on it.
-    preview_autoplay: bool,
     /// How long the studio has had sound, in seconds, and when that was
     /// last counted.
     ///
@@ -1880,7 +1877,6 @@ impl App {
             #[cfg(feature = "hydra")]
             snippet_under_cursor: None,
             stop_requested: false,
-            preview_autoplay: false,
             marks: Vec::new(),
             #[cfg(feature = "hydra")]
             snippet_marks: Vec::new(),

@@ -8,6 +8,7 @@
 - The theme picker's delete key refuses a theme the studio ships on the first press. Before, the second press went looking for a file a built-in theme does not have and answered with an error that listed every theme name.
 - The Studio Chords tab no longer leaks memory while it is open. Each draw leaked 336 small strings with the default dictionary.
 - `rustelup --branch` and `--commit` check for the ALSA and libudev development files before a Linux build and print the install command for the detected distribution. A missing `alsa.pc` stopped the `alsa-sys` build script with a panic that named the package but not how to install it. The build guide now lists the packages for Fedora, Arch, openSUSE and Alpine, and says why a PipeWire system still needs the ALSA headers.
+- Alt+A turns on auto preview in the sample, chord and scale lists of the Reference browser. The up and down arrows then play each row the cursor lands on. The choice is kept in `studio.json`. Before, only the samples list had the shortcut, and the choice was lost on quit.
 - An `all()` callback that returns `undefined` stops the update with an error. Before, a typo at the end of its chain, such as `.ross`, played silence and `rustel check` found no issue.
 
 ## v0.1.5

@@ -162,6 +162,7 @@ fn a_complete_frame_draws_every_surface_in_solid_blocks() {
                     focused_panel: None,
                     help_open: false,
                     preview_gain: 1.0,
+                    auto_preview: false,
                     sounding_note: None,
                     audition_loading: None,
                     panes: vec![PaneView {
@@ -500,6 +501,7 @@ fn a_sheet_paints_over_a_visuals_dock() {
                     focused_panel: None,
                     help_open: false,
                     preview_gain: 1.0,
+                    auto_preview: false,
                     sounding_note: None,
                     audition_loading: None,
                     panes: vec![PaneView {
