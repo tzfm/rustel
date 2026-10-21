@@ -1504,8 +1504,7 @@ impl App {
             Some(EditorInput::Command(command)) => {
                 if self.focus == Focus::Editor
                     && matches!(command, Command::InsertText(_))
-                    && !self.editor().accepts_typed_text()
-                    && !self.remote_key_event
+                    && !self.editor_takes_typed_text()
                 {
                     return Ok(());
                 }

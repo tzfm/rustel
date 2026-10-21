@@ -19,6 +19,12 @@ impl App {
         }
     }
 
+    /// Typed text has a place in the editor when the editor accepts it, or
+    /// when a machine sent it. A remote key is literal text in every mode.
+    pub(super) fn editor_takes_typed_text(&self) -> bool {
+        self.remote_key_event || self.editor().accepts_typed_text()
+    }
+
     pub(super) fn forward_mouse_to_editor(
         &mut self,
         mouse: MouseEvent,

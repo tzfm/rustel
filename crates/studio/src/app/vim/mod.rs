@@ -5,8 +5,9 @@
 //! mappings, and list navigation. The generic routing calls this package,
 //! never a Vim module directly.
 //!
-//! [`enabled`] is the one switch. It off, no alias, modal key, hint,
-//! paste, or focus reset applies anywhere.
+//! [`enabled`] is the settings switch. [`applies`] adds the event rule:
+//! a machine's key is a normal key. With either off, no Vim alias, modal
+//! key, paste, or focus reset applies.
 
 use super::*;
 
@@ -25,4 +26,10 @@ pub(super) use keys::{
 pub(super) fn enabled(app: &App) -> bool {
     app.ui_settings.vim_list_navigation
         && app.ui_settings.editor_keybindings == crate::editor::EditorKeybindings::Vim
+}
+
+/// Vim handles this event. A remote key is a machine's key, so it edits
+/// normally even when the local user left a Vim mode behind.
+pub(super) fn applies(app: &App) -> bool {
+    enabled(app) && !app.remote_key_event
 }

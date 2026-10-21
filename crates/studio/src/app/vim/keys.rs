@@ -125,7 +125,7 @@ fn anchored(app: &App) -> bool {
 /// Whether the focused panel's text field is typing. `None` when Vim text
 /// modes do not apply, so the caller keeps the ordinary answer.
 pub(crate) fn surface_typing(app: &App) -> Option<bool> {
-    if !super::enabled(app) {
+    if !super::applies(app) {
         return None;
     }
     let surface = surface_ref(app)?;
@@ -204,7 +204,7 @@ enum TextAction {
 pub(crate) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
     if key.kind == KeyEventKind::Release
         || matches!(key.code, KeyCode::Modifier(_))
-        || !super::enabled(app)
+        || !super::applies(app)
     {
         return VimTextKey::Ignored;
     }
@@ -317,7 +317,7 @@ impl App {
     /// The arrow a plain j, k, h, or l stands in for while Vim list keys
     /// are on.
     pub(crate) fn list_navigation_alias(&self, key: &KeyEvent) -> Option<KeyEvent> {
-        if !super::enabled(self) || key.kind == KeyEventKind::Release || !key.modifiers.is_empty() {
+        if !super::applies(self) || key.kind == KeyEventKind::Release || !key.modifiers.is_empty() {
             return None;
         }
         let code = match key.code {

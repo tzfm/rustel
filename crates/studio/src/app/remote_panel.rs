@@ -771,6 +771,35 @@ mod tests {
                 "the remote key typed like normal editing: {:?}",
                 app.editor().source()
             );
+
+            // The same holds over a search box: a machine's j types.
+            app.ui_settings.vim_list_navigation = true;
+            let panel = crate::reference::ReferencePanel::browse(&app.reference);
+            app.set_reference_panel(Some(panel));
+            app.focus_panel(PanelKind::Reference);
+            app.reference_panel
+                .as_mut()
+                .expect("panel")
+                .select_tab(crate::reference::Tab::Chords);
+
+            writeln!(client, "key j").expect("send list letter");
+            reply.clear();
+            reader.read_line(&mut reply).expect("key reply");
+            assert_eq!(reply, "ok\n");
+            app.poll_remote().expect("apply list letter");
+            assert_eq!(
+                app.reference_panel.as_ref().expect("panel").chord_query,
+                "j",
+                "the remote j types instead of walking the list"
+            );
+
+            // The local user keeps their modal keys after the remote key.
+            press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+            assert_eq!(
+                app.reference_panel.as_ref().expect("panel").chord_query,
+                "j",
+                "local Command still keeps letters out"
+            );
         }
 
         #[test]
