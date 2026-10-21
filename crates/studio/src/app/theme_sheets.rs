@@ -87,7 +87,7 @@ impl App {
         self.dismiss_dialogs(Some(PanelKind::Theme));
         self.theme_picker = Some(ThemePicker::open(&self.theme));
         self.focus_panel(PanelKind::Theme);
-        self.status = if super::vim_keys::enabled(self) {
+        self.status = if super::vim::enabled(self) {
             "theme - j/k browse · i types · Enter keep · Esc back".into()
         } else {
             "theme - type to search · ←/→/↑/↓ preview · Enter keep · Esc back".into()

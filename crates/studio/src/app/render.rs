@@ -864,7 +864,7 @@ impl App {
             dirty: scene.dirty,
             status: &inputs.status,
             vim_label: inputs.vim_label.as_deref(),
-            vim_text_modes: super::vim_keys::enabled(self),
+            vim_text_modes: super::vim::enabled(self),
             find_label: inputs.find_label.as_deref(),
             remote_control: {
                 #[cfg(feature = "remote-control")]
@@ -1037,7 +1037,7 @@ impl App {
             .enumerate()
             .filter_map(|(index, (pane, map))| {
                 let scene = self.scenes.get(pane.scene)?;
-                let caret_shape = if scene.editor.vim_is_insert() {
+                let caret_shape = if scene.editor.accepts_typed_text() {
                     self.ui_settings.caret_shape
                 } else {
                     super::super::terminal::CaretShape::SteadyBlock

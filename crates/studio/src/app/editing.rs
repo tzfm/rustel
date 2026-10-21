@@ -8,193 +8,15 @@ use super::*;
 
 impl App {
     pub(super) fn sync_editor_keybindings(&mut self) {
-        self.keybinds
-            .set_editor_keybindings(self.ui_settings.editor_keybindings);
-        let mappings = self.vim_config.mappings();
-        for scene in self.scenes.scenes_mut() {
-            scene
-                .editor
-                .set_keybindings(self.ui_settings.editor_keybindings);
-            scene.editor.set_vim_mappings(Arc::clone(&mappings));
-        }
-        self.refresh_editor_shortcut_hints();
+        super::vim::sync(self);
     }
 
     pub(super) fn editor_cursor_shape(&self) -> super::super::terminal::CaretShape {
-        if self.editor_accepts_raw_paste() && !self.editor().vim_is_insert() {
+        if self.editor_accepts_raw_paste() && !self.editor().accepts_typed_text() {
             super::super::terminal::CaretShape::SteadyBlock
         } else {
             self.theme.caret_shape(self.ui_settings.caret_shape)
         }
-    }
-
-    pub(super) fn dispatch_vim_key(&mut self, key: KeyEvent) -> Result<bool, RuntimeError> {
-        // The remote sheet has the keyboard while it is open: its address
-        // and token are typed into, and its rows answer to j/k. Vim waits
-        // until it closes.
-        #[cfg(feature = "remote-control")]
-        if self.remote_panel_open {
-            return Ok(false);
-        }
-        let moment = self.moment();
-        if self
-            .scenes
-            .current_mut()
-            .editor
-            .vim_queue_mapped_key(key, moment)
-        {
-            self.drain_vim_mappings(false)?;
-            self.dirty_frame = true;
-            return Ok(true);
-        }
-        // Vim Normal does not eat the Esc that puts an open panel away. A
-        // sheet left behind the editor is otherwise impossible to close.
-        if key.code == KeyCode::Esc
-            && key.modifiers.is_empty()
-            && self.focus == Focus::Editor
-            && self.front_panel().is_some()
-            && self.editor().vim_is_normal()
-            && !self.editor().vim_has_pending_command()
-        {
-            return Ok(false);
-        }
-        self.dispatch_vim_builtin(key)
-    }
-
-    pub(super) fn flush_vim_mapping_timeout(&mut self) -> Result<(), RuntimeError> {
-        if self.editor().vim_mapping_timed_out(self.moment()) {
-            self.flush_vim_mapping_pending()?;
-        }
-        Ok(())
-    }
-
-    pub(super) fn flush_vim_mapping_pending(&mut self) -> Result<(), RuntimeError> {
-        self.drain_vim_mappings(true)
-    }
-
-    fn drain_vim_mappings(&mut self, force: bool) -> Result<(), RuntimeError> {
-        while let Some((mapped, remaining)) =
-            self.scenes.current_mut().editor.vim_take_mapped_keys(force)
-        {
-            for step in mapped {
-                match step {
-                    crate::vim_config::VimMappedKey::Key(key) => {
-                        if self.editor_accepts_raw_paste() && self.dispatch_vim_builtin(key)? {
-                            if self.editor().vim_motion_blocked() {
-                                break;
-                            }
-                        } else {
-                            self.route_terminal_event(Event::Key(key), false)?;
-                        }
-                    }
-                    crate::vim_config::VimMappedKey::Action(action) => {
-                        // A Studio action is not a Vim motion. A pending
-                        // operator must not wait for the next key.
-                        self.editor_mut().vim_cancel_pending();
-                        self.dispatch_bind_action(action, false)?;
-                    }
-                }
-            }
-            for key in remaining {
-                self.handle_terminal_event(Event::Key(key))?;
-            }
-        }
-        self.refresh_editor_shortcut_hints();
-        Ok(())
-    }
-
-    fn dispatch_vim_builtin(&mut self, key: KeyEvent) -> Result<bool, RuntimeError> {
-        let kind = key.kind;
-        let mut key = crate::vim_config::canonical_key(key);
-        key.kind = kind;
-        let pending = self.editor().vim_has_pending_command();
-        // Vim p puts what was copied last. The clipboard answers the key,
-        // and a yank or delete writes the register there (below), so a
-        // copied score and a yanked line take the same road.
-        if !pending
-            && key.kind == KeyEventKind::Press
-            && key.modifiers.is_empty()
-            && matches!(key.code, KeyCode::Char('p' | 'P'))
-            && self.editor().vim_accepts_put()
-        {
-            let register = self.editor().vim_register().map(str::to_owned);
-            let clipboard = self
-                .clipboard
-                .get_text()
-                .ok()
-                .filter(|text| !text.is_empty());
-            // A copy from another surface is newer than the register. When
-            // the two agree, Vim's own put keeps its linewise and visual
-            // rules.
-            if clipboard
-                .as_deref()
-                .is_some_and(|text| register.as_deref() != Some(text))
-            {
-                self.dispatch_editor(Command::Paste)?;
-                self.focus = Focus::Editor;
-                self.dirty_frame = true;
-                return Ok(true);
-            }
-        }
-        let register = self.editor().vim_register().map(str::to_owned);
-        let before = self.editor().revision();
-        let previous_caret = self.editor().primary_selection().head.0;
-        let moment = self.moment();
-        let atomic_delete_range = if !self.editor().vim_is_insert()
-            && matches!(key.code, KeyCode::Char('x') | KeyCode::Delete)
-        {
-            self.slider_delete_range(&Command::DeleteForward)
-        } else {
-            None
-        };
-        let outcome = self
-            .scenes
-            .current_mut()
-            .editor
-            .vim_key(key, moment, atomic_delete_range);
-        let mut handled = match outcome {
-            Ok(handled) => {
-                if handled {
-                    self.clear_error(ErrorOwner::Editor);
-                }
-                handled
-            }
-            Err(error) => {
-                self.set_error(ErrorOwner::Editor, error.to_string());
-                true
-            }
-        };
-        if !handled && pending {
-            self.scenes.current_mut().editor.vim_cancel_pending();
-            handled = true;
-        }
-        if !handled && let Some(command) = self.editor().vim_insert_command(key) {
-            self.dispatch_editor(command)?;
-            return Ok(true);
-        }
-        if handled {
-            // A yank or delete fills the register. Keep the clipboard in
-            // step, so p pastes the newest copy from any surface.
-            let register_now = self.editor().vim_register().map(str::to_owned);
-            if register_now.as_deref() != register.as_deref()
-                && let Some(text) = register_now
-            {
-                let _ = self.clipboard.set_text(text);
-            }
-            if self.editor().revision() != before || self.editor().vim_needs_escape() {
-                self.focus = Focus::Editor;
-            }
-            if self.editor().revision() != before {
-                #[cfg(feature = "hydra")]
-                self.sync_settings_webcam_preview();
-                self.armed_slider = None;
-                self.drop_pane_selection();
-            }
-            self.after_document_change(before, true);
-            self.warp_caret_over_sliders(previous_caret);
-            self.dirty_frame = true;
-        }
-        Ok(handled)
     }
 
     pub(super) fn forward_mouse_to_editor(
@@ -219,10 +41,7 @@ impl App {
                 .mouse_event(mouse, map, moment)
         };
         let outcome = outcome.and_then(|changed| {
-            self.scenes
-                .current_mut()
-                .editor
-                .vim_normalize_after_input()?;
+            self.scenes.current_mut().editor.normalize_after_input()?;
             Ok(changed)
         });
         match outcome {
@@ -257,10 +76,7 @@ impl App {
                 .editor
                 .dispatch(command, moment, &mut *self.clipboard);
         let outcome = outcome.and_then(|effects| {
-            self.scenes
-                .current_mut()
-                .editor
-                .vim_normalize_after_input()?;
+            self.scenes.current_mut().editor.normalize_after_input()?;
             Ok(effects)
         });
         match outcome {
@@ -278,7 +94,7 @@ impl App {
         Ok(())
     }
 
-    fn after_document_change(&mut self, before: Revision, may_restore_savepoint: bool) {
+    pub(super) fn after_document_change(&mut self, before: Revision, may_restore_savepoint: bool) {
         let scene = self.scenes.current().id;
         self.after_edit(scene, before, may_restore_savepoint);
     }
@@ -288,7 +104,7 @@ impl App {
     /// Right from before the widget lands after it, Left the reverse, and a
     /// click takes the nearer edge. What cannot rest inside cannot silently
     /// un-render or edit the call's hidden text.
-    fn warp_caret_over_sliders(&mut self, previous: usize) {
+    pub(super) fn warp_caret_over_sliders(&mut self, previous: usize) {
         let scene_id = self.scenes.current().id;
         let selection = self.editor().primary_selection();
         if !selection.is_empty() {

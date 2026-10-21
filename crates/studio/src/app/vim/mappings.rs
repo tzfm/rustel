@@ -6,7 +6,7 @@
 //! as text, and a mapping to Esc leaves Insert. No key is named in this
 //! file; the vimrc is the whole table.
 
-use super::*;
+use super::super::*;
 use crate::vim_config::{VimMappedKey, VimMappingMode};
 
 struct TextMapping {
@@ -116,7 +116,7 @@ fn apply(app: &mut App, replacement: &[VimMappedKey]) {
                         let _ = app.paste_to_prompt(&text);
                         text.clear();
                     }
-                    super::vim_keys::leave_insert(app);
+                    super::keys::leave_insert(app);
                     return;
                 }
                 _ => {}

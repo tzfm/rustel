@@ -136,7 +136,7 @@ impl App {
     }
 
     fn interrupt_vim_for_controller(&mut self) -> Result<(), RuntimeError> {
-        self.flush_vim_mapping_pending()?;
+        super::vim::flush_pending(self)?;
         for scene in self.scenes.scenes_mut() {
             scene.editor.vim_interrupt();
         }

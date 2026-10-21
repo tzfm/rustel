@@ -783,7 +783,7 @@ impl Editor {
         mut transaction: Transaction,
         moment: HistoryMoment,
     ) -> Result<(), EditorError> {
-        let moment = self.vim_history_transaction(&mut transaction, moment);
+        let moment = self.mode_history_transaction(&mut transaction, moment);
         transaction
             .edits
             .sort_by_key(|edit| (edit.range.start, edit.range.end));

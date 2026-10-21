@@ -129,6 +129,12 @@ impl Editor {
         self.vim.keybindings == EditorKeybindings::Default || self.vim.mode == Mode::Insert
     }
 
+    /// Whether typed text lands at the caret now. Normal editing always
+    /// takes it; a modal profile takes it only in its text mode.
+    pub(crate) fn accepts_typed_text(&self) -> bool {
+        self.vim_is_insert()
+    }
+
     /// Vim is on and rests in Normal, with no motion or command waiting.
     pub(crate) fn vim_is_normal(&self) -> bool {
         self.vim.keybindings == EditorKeybindings::Vim && self.vim.mode == Mode::Normal
@@ -243,7 +249,7 @@ impl Editor {
         }
     }
 
-    pub(crate) fn vim_normalize_after_input(&mut self) -> Result<(), EditorError> {
+    pub(crate) fn normalize_after_input(&mut self) -> Result<(), EditorError> {
         if self.vim.keybindings == EditorKeybindings::Vim
             && self.vim.mode == Mode::Normal
             && self.selections.len() == 1
@@ -254,7 +260,7 @@ impl Editor {
         Ok(())
     }
 
-    pub(super) fn vim_history_transaction(
+    pub(super) fn mode_history_transaction(
         &self,
         transaction: &mut Transaction,
         moment: HistoryMoment,

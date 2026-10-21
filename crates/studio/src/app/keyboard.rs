@@ -227,7 +227,7 @@ impl App {
 
     /// Whether the panel has a text field that owns held typing keys.
     fn panel_is_typing(&self, kind: PanelKind) -> bool {
-        if let Some(typing) = super::vim_keys::surface_typing(self) {
+        if let Some(typing) = super::vim::surface_typing(self) {
             return typing;
         }
         match kind {
@@ -500,7 +500,7 @@ impl App {
             && allow_vim
             && self.editor_accepts_raw_paste()
             && let Event::Key(key) = &terminal_event
-            && self.dispatch_vim_key(*key)?
+            && super::vim::dispatch(self, *key)?
         {
             // A mapping that calls Quit just armed it; any other key is
             // the "another key calls it off" press.
@@ -514,7 +514,7 @@ impl App {
         let non_key_interrupt = matches!(&terminal_event, Event::Paste(_) | Event::FocusLost)
             || matches!(&terminal_event, Event::Mouse(mouse) if mouse.kind != MouseEventKind::Moved);
         if non_key_interrupt {
-            self.flush_vim_mapping_pending()?;
+            super::vim::flush_pending(self)?;
         }
         let interrupts_vim = non_key_interrupt
             || matches!(&terminal_event, Event::Key(key)
@@ -807,10 +807,10 @@ impl App {
             self.close_panel(kind);
             return Ok(true);
         }
-        match super::vim_keys::handle_text_key(self, key) {
-            super::vim_keys::VimTextKey::Ignored => {}
-            super::vim_keys::VimTextKey::Consumed => return Ok(true),
-            super::vim_keys::VimTextKey::Arrow(kind, code) => {
+        match super::vim::handle_text_key(self, key) {
+            super::vim::VimTextKey::Ignored => {}
+            super::vim::VimTextKey::Consumed => return Ok(true),
+            super::vim::VimTextKey::Arrow(kind, code) => {
                 let _ = self.dispatch_panel_key(kind, code, false, false, false)?;
                 return Ok(true);
             }
@@ -996,7 +996,7 @@ impl App {
             // keys on they are list keys, not typing. An arrow with no
             // target still belongs to the panel: letting it through would
             // move a caret the reader cannot see.
-            if super::vim_keys::panel_takes_list_navigation(kind)
+            if super::vim::panel_takes_list_navigation(kind)
                 && let Some(alias) = self.list_navigation_alias(key)
             {
                 let _ = self.dispatch_panel_key(kind, alias.code, false, false, false)?;
@@ -1405,10 +1405,10 @@ impl App {
             return Ok(true);
         }
         if let Focus::Panel(kind) = self.focus {
-            match super::vim_keys::handle_text_key(self, key) {
-                super::vim_keys::VimTextKey::Ignored => {}
-                super::vim_keys::VimTextKey::Consumed => return Ok(true),
-                super::vim_keys::VimTextKey::Arrow(kind, code) => {
+            match super::vim::handle_text_key(self, key) {
+                super::vim::VimTextKey::Ignored => {}
+                super::vim::VimTextKey::Consumed => return Ok(true),
+                super::vim::VimTextKey::Arrow(kind, code) => {
                     let _ = self.dispatch_panel_key(kind, code, false, false, false)?;
                     return Ok(true);
                 }
@@ -1429,7 +1429,7 @@ impl App {
                 || (text_key(key.code) && self.panel_is_typing(kind))
             {
                 self.dispatch_panel_key(kind, key.code, primary, shift, alt)?;
-            } else if super::vim_keys::panel_takes_list_navigation(kind)
+            } else if super::vim::panel_takes_list_navigation(kind)
                 && !self.panel_is_typing(kind)
                 && let Some(alias) = self.list_navigation_alias(key)
                 && (panel_repeat_is_safe(kind, alias.code)
@@ -1504,7 +1504,8 @@ impl App {
             Some(EditorInput::Command(command)) => {
                 if self.focus == Focus::Editor
                     && matches!(command, Command::InsertText(_))
-                    && !self.editor().vim_is_insert()
+                    && !self.editor().accepts_typed_text()
+                    && !self.remote_key_event
                 {
                     return Ok(());
                 }

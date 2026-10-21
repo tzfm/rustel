@@ -807,7 +807,8 @@ The default address is `127.0.0.1:9247`. Studio generates a new token each time
 you enable remote control, unless you set a token of your own. Use the
 remote-control panel to reveal or copy it. A client must authenticate before
 it can send keys or request the screen. An authenticated client has full
-control of the Studio interface.
+control of the Studio interface. Keys from a client use normal editing,
+even when Vim editor keys are on.
 
 Studio also writes each generated token to a file named
 `rustel-studio-remote-<random>.token` in the system temporary directory. The

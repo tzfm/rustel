@@ -205,9 +205,7 @@ mod stage_pixels;
 mod string_roles;
 mod theme_sheets;
 mod transport;
-mod vim_config;
-mod vim_keys;
-mod vim_mappings;
+mod vim;
 mod viz_panel;
 #[cfg(feature = "vst")]
 mod vst;
@@ -1015,6 +1013,9 @@ struct App {
     vim_config: crate::vim_config::VimConfig,
     /// Plain keys waiting for an insert mapping in a Vim text surface.
     vim_insert_pending: String,
+    /// This key came from remote control. A machine sends normal keys, not
+    /// Vim modes, so the score reads it with its usual editing.
+    remote_key_event: bool,
     /// The value each control change last said and when it said it, keyed
     /// by number and channel, so a bound row reads the crossings of the
     /// line at 64 rather than every message: a knob swept across fires
@@ -1700,6 +1701,7 @@ impl App {
             keybinds: prefs.keybinds(),
             vim_config: crate::vim_config::VimConfig::default(),
             vim_insert_pending: String::new(),
+            remote_key_event: false,
             midi_cc_last: HashMap::new(),
             note_pressed_at: HashMap::new(),
             mapping_lit: [None; MAPPING_SLOTS],

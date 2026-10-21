@@ -8,10 +8,10 @@
 //! [`enabled`] is the one switch. It off, no alias, modal key, hint, paste
 //! or focus reset in this file applies anywhere.
 
-use super::*;
+use super::super::*;
 
 /// A panel search box that rests in Vim command mode.
-pub(super) trait VimTextSurface {
+pub(crate) trait VimTextSurface {
     fn panel_kind(&self) -> PanelKind;
     fn text_wanted(&self) -> bool;
     fn insert(&self) -> bool;
@@ -116,12 +116,6 @@ text_surfaces! {
     PanelKind::Export => export_sheet,
 }
 
-/// Vim list keys are on, and the editor uses Vim keys.
-pub(super) fn enabled(app: &App) -> bool {
-    app.ui_settings.vim_list_navigation
-        && app.ui_settings.editor_keybindings == crate::editor::EditorKeybindings::Vim
-}
-
 /// An anchored completion always types: the search is the word being
 /// completed, not a list to walk first.
 fn anchored(app: &App) -> bool {
@@ -130,8 +124,8 @@ fn anchored(app: &App) -> bool {
 
 /// Whether the focused panel's text field is typing. `None` when Vim text
 /// modes do not apply, so the caller keeps the ordinary answer.
-pub(super) fn surface_typing(app: &App) -> Option<bool> {
-    if !enabled(app) {
+pub(crate) fn surface_typing(app: &App) -> Option<bool> {
+    if !super::enabled(app) {
         return None;
     }
     let surface = surface_ref(app)?;
@@ -145,11 +139,11 @@ pub(super) fn surface_typing(app: &App) -> Option<bool> {
 /// completion, which opens ready to type into the word it was opened on.
 /// One hook serves every registered surface, so focus handling does not
 /// grow a match of its own.
-pub(super) fn focus_changed(app: &mut App) {
-    if !enabled(app) {
+pub(crate) fn focus_changed(app: &mut App) {
+    if !super::enabled(app) {
         return;
     }
-    super::vim_mappings::reset(app);
+    super::mappings::reset(app);
     let insert = anchored(app);
     if let Some(surface) = surface_mut(app) {
         surface.set_insert(insert);
@@ -158,11 +152,11 @@ pub(super) fn focus_changed(app: &mut App) {
 
 /// A paste into a Vim text surface enters Insert first, so a pasted word
 /// lands in the box that is waiting for it.
-pub(super) fn enter_insert(app: &mut App) {
-    if !enabled(app) {
+pub(crate) fn enter_insert(app: &mut App) {
+    if !super::enabled(app) {
         return;
     }
-    super::vim_mappings::reset(app);
+    super::mappings::reset(app);
     if let Some(surface) = surface_mut(app)
         && surface.text_wanted()
         && !surface.anchored()
@@ -173,18 +167,18 @@ pub(super) fn enter_insert(app: &mut App) {
 
 /// Leave Insert on the focused surface. A mapping prefix is dropped here
 /// because the caller flushes it first.
-pub(super) fn leave_insert(app: &mut App) {
+pub(crate) fn leave_insert(app: &mut App) {
     if let Some(surface) = surface_mut(app) {
         surface.set_insert(false);
     }
-    super::vim_mappings::reset(app);
+    super::mappings::reset(app);
     app.status = "command mode - i or a types".into();
     app.dirty_frame = true;
 }
 
 /// What the modal keys decided. An arrow is dispatched by the routing code;
 /// a message has already been shown.
-pub(super) enum VimTextKey {
+pub(crate) enum VimTextKey {
     Ignored,
     Consumed,
     Arrow(PanelKind, KeyCode),
@@ -207,10 +201,10 @@ enum TextAction {
 /// The modal keys of a search box. `i` and `a` enter Insert, `p` pastes the
 /// clipboard, Esc returns to Command, and Command keeps j k h l for the
 /// list and every other letter out of the query.
-pub(super) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
+pub(crate) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
     if key.kind == KeyEventKind::Release
         || matches!(key.code, KeyCode::Modifier(_))
-        || !enabled(app)
+        || !super::enabled(app)
     {
         return VimTextKey::Ignored;
     }
@@ -273,17 +267,17 @@ pub(super) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
     };
     match action {
         TextAction::Ignored => {
-            super::vim_mappings::reset(app);
+            super::mappings::reset(app);
             VimTextKey::Ignored
         }
         TextAction::Message(message) => {
-            super::vim_mappings::reset(app);
+            super::mappings::reset(app);
             app.status = message.into();
             app.dirty_frame = true;
             VimTextKey::Consumed
         }
         TextAction::Paste => {
-            super::vim_mappings::reset(app);
+            super::mappings::reset(app);
             let text = app.clipboard.get_text().unwrap_or_default();
             if text.is_empty() {
                 app.status = "the clipboard has no text".into();
@@ -294,7 +288,7 @@ pub(super) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
             VimTextKey::Consumed
         }
         TextAction::Arrow(kind, code) => {
-            super::vim_mappings::reset(app);
+            super::mappings::reset(app);
             VimTextKey::Arrow(kind, code)
         }
         TextAction::EnterInsert => {
@@ -304,15 +298,15 @@ pub(super) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
             VimTextKey::Consumed
         }
         TextAction::InsertKey => {
-            let _ = super::vim_mappings::insert_key(app, key);
+            let _ = super::mappings::insert_key(app, key);
             VimTextKey::Consumed
         }
         TextAction::FlushThenIgnored => {
-            super::vim_mappings::flush(app);
+            super::mappings::flush(app);
             VimTextKey::Ignored
         }
         TextAction::FlushThenCommand => {
-            super::vim_mappings::flush(app);
+            super::mappings::flush(app);
             leave_insert(app);
             VimTextKey::Consumed
         }
@@ -322,8 +316,8 @@ pub(super) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
 impl App {
     /// The arrow a plain j, k, h, or l stands in for while Vim list keys
     /// are on.
-    pub(super) fn list_navigation_alias(&self, key: &KeyEvent) -> Option<KeyEvent> {
-        if !enabled(self) || key.kind == KeyEventKind::Release || !key.modifiers.is_empty() {
+    pub(crate) fn list_navigation_alias(&self, key: &KeyEvent) -> Option<KeyEvent> {
+        if !super::enabled(self) || key.kind == KeyEventKind::Release || !key.modifiers.is_empty() {
             return None;
         }
         let code = match key.code {
@@ -338,7 +332,7 @@ impl App {
 }
 
 /// The panels whose rows j k h l walk.
-pub(super) fn panel_takes_list_navigation(kind: PanelKind) -> bool {
+pub(crate) fn panel_takes_list_navigation(kind: PanelKind) -> bool {
     matches!(
         kind,
         PanelKind::Settings

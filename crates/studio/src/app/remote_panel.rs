@@ -734,6 +734,46 @@ mod tests {
         }
 
         #[test]
+        fn remote_keys_use_normal_editing_with_vim_on() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 100, 30);
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.focus = Focus::Editor;
+            app.editor_mut()
+                .set_selection(crate::editor::Selection::caret(crate::editor::ByteOffset(
+                    0,
+                )))
+                .expect("caret at the start");
+            app.remote = Some(Box::new(
+                crate::remote::listen("127.0.0.1:0".parse().unwrap(), Some("gig1"))
+                    .expect("start listener"),
+            ));
+            let address = app.remote.as_ref().unwrap().address();
+            let mut client = TcpStream::connect(address).expect("connect client");
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("read timeout");
+            let mut reader = BufReader::new(client.try_clone().expect("clone client"));
+            let mut reply = String::new();
+            writeln!(client, "auth gig1").expect("authenticate");
+            reader.read_line(&mut reply).expect("auth reply");
+            assert_eq!(reply, "ok\n");
+
+            writeln!(client, "key j").expect("send key");
+            reply.clear();
+            reader.read_line(&mut reply).expect("key reply");
+            assert_eq!(reply, "ok\n");
+            app.poll_remote().expect("apply key");
+            assert!(
+                app.editor().source().starts_with('j'),
+                "the remote key typed like normal editing: {:?}",
+                app.editor().source()
+            );
+        }
+
+        #[test]
         fn remote_commands_light_the_indicator_and_expire_with_one_repaint() {
             let directory = tempfile::tempdir().expect("score directory");
             let mut app = app_over(directory.path());
