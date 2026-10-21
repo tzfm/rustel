@@ -433,6 +433,10 @@ const BUILT_INS: &[(&str, &str)] = &[
     // No palette of its own: `reset` and the terminal's 16 colours, so the
     // studio wears whatever palette the terminal already carries.
     ("terminal", include_str!("themes/terminal.json")),
+    // The same ground with one role moved: the accent and the selection
+    // take the palette's slot 1, which reads warm in palettes whose
+    // bright slot is gold.
+    ("terminal-warm", include_str!("themes/terminal-warm.json")),
     ("solarized", include_str!("themes/solarized.json")),
     ("ember", include_str!("themes/ember.json")),
     ("hell", include_str!("themes/hell.json")),
@@ -2508,6 +2512,22 @@ pub fn mix(left: Color, right: Color, right_amount: f32) -> Color {
     Color::Rgb(blend(lr, rr), blend(lg, rg), blend(lb, rb))
 }
 
+/// `colour_amount` of `colour` washed in over `ground`, for a fade that has to
+/// stay visible.
+///
+/// A theme that defers its ground to the terminal has no colour to blend
+/// with, and [`mix`] would snap to the ground itself - which the pixel
+/// raster paints as plain black. The colour stays whole instead, so a
+/// silent note keeps its grey rather than disappearing. A ground that is a
+/// colour takes its share exactly as [`mix`] gives it.
+pub fn wash(ground: Color, colour: Color, colour_amount: f32) -> Color {
+    if true_rgb(ground).is_none() {
+        colour
+    } else {
+        mix(ground, colour, colour_amount)
+    }
+}
+
 impl Theme {
     /// The theme as its own file format, ready to save or share.
     pub fn to_json(&self) -> String {
@@ -3730,6 +3750,24 @@ mod tests {
                 assert_eq!(theme.fill_text(), Color::Indexed(0), "{name}");
             }
         }
+    }
+
+    /// The warm sibling is one ground with one role moved: a theme that also
+    /// changed its ground would be a different theme, not a variant of this
+    /// one. Checking the whole document catches a field that drifts.
+    #[test]
+    fn terminal_warm_moves_only_the_accent_and_selection() {
+        let plain = Theme::built_in("terminal").expect("terminal ships");
+        let mut expected: serde_json::Value =
+            serde_json::from_str(&plain.to_json()).expect("plain theme is json");
+        expected["name"] = "terminal-warm".into();
+        expected["accent"] = "ansi1".into();
+        expected["selection"] = "ansi1".into();
+        let warm = Theme::built_in("terminal-warm").expect("warm ships");
+        let actual: serde_json::Value =
+            serde_json::from_str(&warm.to_json()).expect("warm theme is json");
+        assert_eq!(actual, expected);
+        assert_eq!(plain.background, warm.background, "the ground is shared");
     }
 
     #[test]

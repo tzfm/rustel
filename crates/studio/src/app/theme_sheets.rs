@@ -1468,9 +1468,8 @@ mod tests {
             app.preview_theme();
             assert_eq!(app.theme.name, before, "Up previews the previous theme");
 
-            // ←/→ do not: they belong to the randomize row, where the list is
-            // infinite in both directions and the arrows are drawn on the row
-            // itself to say so.
+            // ←/→ do not walk the list: they belong to the randomize row
+            // and to the terminal family, where they step between variants.
             press(&mut app, KeyCode::Right, KeyModifiers::NONE);
             assert_eq!(
                 app.theme.name, before,
