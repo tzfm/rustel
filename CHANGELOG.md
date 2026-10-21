@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Studio reloads the open score when another program saves its file. Settings > Live coding > watch external changes has three modes: off, sync, and sync & eval. Off is the default. The studio checks the file's size and modification time every half second and reads it only after a change settles, so an edit in Notepad shows up without a keypress.
 - Pattern queries allocate less. Time and value changes reuse a hap, and a shared object map stays shared until a write. A 4-cycle query with five controls drops from 3,297 to 2,353 allocations.
 - The Studio Chords tab sorts the chord symbols it has no name for. Their order changed on each run before.
 - The new `terminal` theme follows the terminal's own palette: `reset` and the 16 `ansiN` colours, so a custom scheme such as a Kitty or Noctalia one shows through the studio.

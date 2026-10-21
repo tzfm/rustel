@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::bounded_file::{self, MAX_DOCUMENT_BYTES, ReadError};
-use super::editor::{Editor, EditorError};
+use super::editor::{ByteOffset, Editor, EditorError, Selection};
 use super::minimap::Minimap;
 use super::pads::Pad;
 use super::prebake::PrebakeScope;
@@ -166,6 +166,30 @@ impl Scene {
                 .latest_save
                 .as_ref()
                 .is_some_and(|pending| pending.source_revision != current);
+    }
+
+    /// Take text another program saved into this scene's file.
+    ///
+    /// Answers whether the editor changed. The file is the source now, so
+    /// the scene is not dirty. The caret and the scroll stay where the
+    /// reader left them, as far as the new text allows.
+    pub(crate) fn adopt_source(&mut self, source: &str) -> bool {
+        let changed = self.editor.source() != source;
+        if changed {
+            let caret = self.editor.primary_selection().head;
+            let viewport = self.editor.viewport();
+            let Ok(mut editor) = Editor::new(source) else {
+                return false;
+            };
+            editor.set_viewport(viewport);
+            let caret = ByteOffset(caret.0.min(editor.document().len_bytes()));
+            let _ = editor.set_selection(Selection::caret(caret));
+            self.editor = editor;
+            self.minimap = Minimap::default();
+        }
+        self.saved_source_revision = source_revision(source);
+        self.refresh_dirty();
+        changed
     }
 
     /// Whether this score has text that is not in its file: a write failed,
