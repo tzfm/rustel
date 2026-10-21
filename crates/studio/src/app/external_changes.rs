@@ -1,6 +1,6 @@
 //! Reloading the open score when another program saves its file.
 //!
-//! One `metadata` call every half second while the setting is on, and one
+//! One `metadata` call ten times a second while the setting is on, and one
 //! read only after the file's size or modification time moved and stayed
 //! put for a poll. A stat is the cheapest check a score file allows on
 //! every system, and an OS change notification would need a thread and a
@@ -12,8 +12,9 @@ use std::time::SystemTime;
 use super::*;
 use crate::bounded_file::{self, MAX_DOCUMENT_BYTES};
 
-/// How often the open score's file is stat-ed.
-const POLL: Duration = Duration::from_millis(500);
+/// How often the open score's file is stat-ed. Ten checks a second costs
+/// microseconds of work, and a read happens only when the stamp moves.
+const POLL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FileStamp {
@@ -39,6 +40,8 @@ impl App {
     /// is the file whose changes they are looking at. A switch to another
     /// tab baselines that tab's file and reads it once, so an edit made to
     /// a tab while it was in the background lands when it comes forward.
+    /// A change is read after one more poll sees the same stamp, so a save
+    /// lands in about a tenth to a fifth of a second.
     pub(super) fn poll_external_changes(&mut self, now: Instant) {
         if self.ui_settings.external_changes == ExternalChanges::Off {
             self.external_watch = None;
@@ -124,6 +127,13 @@ impl App {
         self.readiness_due = Some((scene_id, now + super::readiness::READINESS_SETTLE));
         self.marks_muted = Some(scene_id);
         self.invalidate_maps();
+        // The sounding score's inline painters keep their rows: the edit
+        // above moved their anchors with it.
+        if Some(scene_id) == self.audible_scene
+            && let Some(revision) = self.visual_revision
+        {
+            self.install_virtual_rows(revision);
+        }
         self.dirty_frame = true;
         self.set_notice(format!("reloaded {name} from disk"));
         if self.ui_settings.external_changes == ExternalChanges::SyncAndEvaluate {

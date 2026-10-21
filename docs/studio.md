@@ -293,7 +293,7 @@ Settings ▸ Live coding. Off is the default.
 alone. `sync & eval` also evaluates the text, as an update would, even when the
 set is stopped.
 
-Studio checks the file's size and modification time every half second and reads
+Studio checks the file's size and modification time ten times a second and reads
 it after a change stays put for one check. A save made by Studio itself is
 ignored. Only the score in the active tab is watched. A save to another open
 tab lands when you select that tab.

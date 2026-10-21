@@ -26,7 +26,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::bounded_file::{self, MAX_DOCUMENT_BYTES, ReadError};
-use super::editor::{ByteOffset, Editor, EditorError, Selection};
+use super::editor::{
+    ByteOffset, Edit, EditOrigin, Editor, EditorError, HistoryMoment, Transaction,
+};
 use super::minimap::Minimap;
 use super::pads::Pad;
 use super::prebake::PrebakeScope;
@@ -171,25 +173,26 @@ impl Scene {
     /// Take text another program saved into this scene's file.
     ///
     /// Answers whether the editor changed. The file is the source now, so
-    /// the scene is not dirty. The caret and the scroll stay where the
-    /// reader left them, as far as the new text allows.
+    /// the scene is not dirty. The change is one programmatic edit, so the
+    /// caret, the undo history and the inline visualizer rows stay put.
     pub(crate) fn adopt_source(&mut self, source: &str) -> bool {
-        let changed = self.editor.source() != source;
-        if changed {
-            let caret = self.editor.primary_selection().head;
-            let viewport = self.editor.viewport();
-            let Ok(mut editor) = Editor::new(source) else {
+        let old = self.editor.source();
+        if old != source {
+            let mut transaction = Transaction::new(EditOrigin::Programmatic);
+            for edit in changed_edits(&old, source) {
+                transaction = transaction.replace(edit);
+            }
+            if self
+                .editor
+                .apply_transaction(transaction, HistoryMoment(0))
+                .is_err()
+            {
                 return false;
-            };
-            editor.set_viewport(viewport);
-            let caret = ByteOffset(caret.0.min(editor.document().len_bytes()));
-            let _ = editor.set_selection(Selection::caret(caret));
-            self.editor = editor;
-            self.minimap = Minimap::default();
+            }
         }
         self.saved_source_revision = source_revision(source);
         self.refresh_dirty();
-        changed
+        old != source
     }
 
     /// Whether this score has text that is not in its file: a write failed,
@@ -197,6 +200,71 @@ impl Scene {
     pub fn unsaved(&self) -> bool {
         self.is_score() && (self.dirty || self.latest_save.is_some())
     }
+}
+
+/// The edits that turn `old` into `new`: the body's changed range and a
+/// line ending the two spell differently.
+///
+/// Keeping the ending apart matters: an editor that adds a final newline
+/// beside an edit at the top would otherwise make the body diff cover the
+/// whole score and lose every inline visualizer anchor with it.
+fn changed_edits(old: &str, new: &str) -> Vec<Edit> {
+    let (old_body, old_ending) = split_ending(old);
+    let (new_body, new_ending) = split_ending(new);
+    let (range, insert) = changed_span(old_body, new_body);
+    let mut edits = Vec::new();
+    if !insert.is_empty() || range.start != range.end {
+        edits.push(Edit::new(range, insert));
+    }
+    if old_ending != new_ending {
+        edits.push(Edit::new(
+            ByteOffset(old_body.len())..ByteOffset(old.len()),
+            new_ending.to_owned(),
+        ));
+    }
+    edits
+}
+
+/// `text` without its final line ending, and that ending.
+fn split_ending(text: &str) -> (&str, &str) {
+    for ending in ["\r\n", "\n", "\r"] {
+        if let Some(body) = text.strip_suffix(ending) {
+            return (body, ending);
+        }
+    }
+    (text, "")
+}
+
+/// The one range that turns `old` into `new`, with the common prefix and
+/// suffix left in place.
+fn changed_span(old: &str, new: &str) -> (std::ops::Range<ByteOffset>, String) {
+    let (old_bytes, new_bytes) = (old.as_bytes(), new.as_bytes());
+    let mut prefix = 0;
+    while prefix < old_bytes.len().min(new_bytes.len()) && old_bytes[prefix] == new_bytes[prefix] {
+        prefix += 1;
+    }
+    while !old.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let mut suffix = 0;
+    let most = old_bytes.len().min(new_bytes.len()) - prefix;
+    while suffix < most
+        && old_bytes[old_bytes.len() - 1 - suffix] == new_bytes[new_bytes.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    while suffix > 0
+        && (!old.is_char_boundary(old_bytes.len() - suffix)
+            || !new.is_char_boundary(new_bytes.len() - suffix))
+    {
+        suffix -= 1;
+    }
+    let old_end = old_bytes.len() - suffix;
+    let new_end = new_bytes.len() - suffix;
+    (
+        ByteOffset(prefix)..ByteOffset(old_end),
+        new[prefix..new_end].to_owned(),
+    )
 }
 
 /// What a set says about the master limiter.
