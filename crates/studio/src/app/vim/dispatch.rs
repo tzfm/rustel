@@ -215,18 +215,8 @@ fn dispatch_builtin(app: &mut App, key: KeyEvent) -> Result<bool, RuntimeError> 
     Ok(handled)
 }
 
-/// Make every editor follow the chosen keybindings and mapping file.
-pub(crate) fn sync(app: &mut App) {
-    app.keybinds
-        .set_editor_keybindings(app.ui_settings.editor_keybindings);
-    let mappings = app.vim_config.mappings();
-    for scene in app.scenes.scenes_mut() {
-        scene
-            .editor
-            .set_keybindings(app.ui_settings.editor_keybindings);
-        scene
-            .editor
-            .set_vim_mappings(std::sync::Arc::clone(&mappings));
-    }
-    app.refresh_editor_shortcut_hints();
+/// The parsed mappings every editor follows. The settings fan-out stays
+/// generic; the Vim package owns only the mapping source.
+pub(crate) fn mappings(app: &App) -> std::sync::Arc<crate::vim_config::VimMappings> {
+    app.vim_config.mappings()
 }

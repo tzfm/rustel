@@ -8,7 +8,18 @@ use super::*;
 
 impl App {
     pub(super) fn sync_editor_keybindings(&mut self) {
-        super::vim::sync(self);
+        self.keybinds
+            .set_editor_keybindings(self.ui_settings.editor_keybindings);
+        let mappings = super::vim::mappings(self);
+        for scene in self.scenes.scenes_mut() {
+            scene
+                .editor
+                .set_keybindings(self.ui_settings.editor_keybindings);
+            scene
+                .editor
+                .set_vim_mappings(std::sync::Arc::clone(&mappings));
+        }
+        self.refresh_editor_shortcut_hints();
     }
 
     pub(super) fn editor_cursor_shape(&self) -> super::super::terminal::CaretShape {
