@@ -37,12 +37,16 @@ fn turn_watch_to(studio: &mut Hermetic, presses: usize) {
     studio.settle();
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     studio.settle();
+    // Let the watch take its first look: the first look at a whole set is
+    // only a baseline, so a file changed after this is a real change.
+    std::thread::sleep(Duration::from_millis(150));
+    studio.pump();
 }
 
 /// Turn the loop until the watch lands. The watch checks the file ten times
 /// a second and reads it after one more check sees the same stamp.
 fn wait_for(studio: &mut Hermetic, done: impl Fn(&Hermetic) -> bool) {
-    for _ in 0..40 {
+    for _ in 0..80 {
         if done(studio) {
             return;
         }
@@ -80,6 +84,38 @@ fn sync_and_eval_plays_the_new_text_and_keeps_the_file() {
         std::fs::read_to_string(&path).expect("read back"),
         "$: s(\"bd\") // from notepad\n"
     );
+}
+
+#[test]
+fn sync_and_eval_opens_an_unopened_score() {
+    let mut studio = hermetic();
+    let path = studio.set_directory().join("second.strudel");
+    std::fs::write(&path, "$: s(\"bd\") // second\n").expect("second score");
+    turn_watch_to(&mut studio, 2);
+
+    std::fs::write(&path, "$: s(\"bd\") // edited second\n").expect("external save");
+    wait_for(&mut studio, |studio| {
+        studio.is_playing() && studio.score().contains("edited second")
+    });
+}
+
+#[test]
+fn sync_and_eval_switches_to_an_open_tab() {
+    let mut studio = hermetic();
+    let path = studio.set_directory().join("second.strudel");
+    std::fs::write(&path, "$: s(\"bd\") // second\n").expect("second score");
+    studio.paste(&path.display().to_string());
+    studio.settle();
+    assert!(studio.score().contains("second"), "the second tab is open");
+    studio.press(KeyCode::F(6), KeyModifiers::NONE);
+    studio.settle();
+    assert!(!studio.score().contains("second"), "back on the first tab");
+
+    turn_watch_to(&mut studio, 2);
+    std::fs::write(&path, "$: s(\"bd\") // edited second\n").expect("external save");
+    wait_for(&mut studio, |studio| {
+        studio.is_playing() && studio.score().contains("edited second")
+    });
 }
 
 #[test]

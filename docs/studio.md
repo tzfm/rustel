@@ -286,17 +286,20 @@ Ctrl+S remains how playback starts.
 
 ### External changes
 
-Another program can edit the open score file. Choose watch external changes in
-Settings ▸ Live coding. Off is the default.
+Another program can edit score files in the set. Choose watch external changes
+in Settings ▸ Live coding. Off is the default.
 
-`sync` puts the file's text in the open editor and leaves the playing score
-alone. `sync & eval` also evaluates the text, as an update would, even when the
+`sync` watches the score in the active tab. It puts the file's text in the
+editor and leaves the playing score alone.
+
+`sync & eval` watches every `.strudel` file in the set folder and every open
+score. When a file is saved, Studio opens its tab, or selects it if it is
+already open, and evaluates the text as an update would. It plays even when the
 set is stopped.
 
-Studio checks the file's size and modification time ten times a second and reads
-it after a change stays put for one check. A save made by Studio itself is
-ignored. Only the score in the active tab is watched. A save to another open
-tab lands when you select that tab.
+Studio checks each watched file's size and modification time ten times a second
+and reads it after a change stays put for one check. A save made by Studio
+itself is ignored.
 
 A save from another program that changes the text replaces the open editor's
 text, including edits that are not saved yet. Studio does not merge the two.
