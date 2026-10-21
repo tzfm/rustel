@@ -2716,6 +2716,36 @@ mod tests {
             assert!(app.preview_gain > start, "the plus key still raises it");
         }
 
+        /// Alt+A says whether walking the browser's lists of things to hear
+        /// plays each row the cursor lands on, and the answer is kept for
+        /// the next session.
+        #[test]
+        fn alt_a_previews_each_row_you_walk_and_is_remembered() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.reference_panel = Some(crate::reference::ReferencePanel::browse(&app.reference));
+            app.reference_panel
+                .as_mut()
+                .expect("the browse list")
+                .select_tab(crate::reference::Tab::Chords);
+            app.focus = Focus::Panel(PanelKind::Reference);
+
+            // Off to start: the cursor walks quietly.
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            assert!(app.preview_armed.is_none(), "nothing was previewed");
+            // Alt+A turns it on, and the choice is kept.
+            press(&mut app, KeyCode::Char('a'), KeyModifiers::ALT);
+            assert!(app.ui_settings.auto_preview);
+            assert_eq!(app.prefs.auto_preview, Some(true));
+            assert!(app.status.contains("auto-play on"), "{}", app.status);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            assert!(app.status.contains("C7"), "{}", app.status);
+            // Alt+A again: the choice turns off, and is kept turned off.
+            press(&mut app, KeyCode::Char('a'), KeyModifiers::ALT);
+            assert!(!app.ui_settings.auto_preview);
+            assert_eq!(app.prefs.auto_preview, Some(false));
+        }
+
         /// A scale is a thing to hear: → and Space play it, one note after
         /// another.
         #[test]

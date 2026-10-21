@@ -783,6 +783,7 @@ impl ReferenceView<'_> {
             } else {
                 &[
                     "↑↓ move",
+                    "Alt+A auto",
                     "→ opens or plays",
                     "Space plays",
                     "← folds",
@@ -898,6 +899,7 @@ impl ReferenceView<'_> {
             } else {
                 &[
                     "↑↓ move",
+                    "Alt+A auto",
                     "→ opens or plays",
                     "Space plays/stops",
                     "← folds",
@@ -1391,11 +1393,11 @@ impl ReferenceView<'_> {
                 inner.bottom() - 2,
                 &[
                     "↑↓ move",
+                    "Alt+A auto",
                     "→ expand or preview",
                     "← folds",
                     "Space plays/stops",
                     "Esc stops too",
-                    "Alt+A auto-play",
                     "Alt+± volume",
                 ],
                 theme,
