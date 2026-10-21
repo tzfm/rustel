@@ -10,6 +10,7 @@
 - Vim `r` replaces the character under the cursor. A count replaces several.
 - Vim insert mappings from the vimrc apply in panel search boxes. For example, `inoremap jk <Esc>` leaves Insert in the reference search.
 - In Vim Normal mode, Esc closes a panel left open behind the editor. Before, Vim consumed the key and the panel could not be closed.
+- Vim `gg` no longer waits for the mapping timeout when a mapping starts with `g`.
 - The iTerm2 profile knows the characters its Option key composes. Studio recovers the Option panel shortcuts where they apply, such as Option+T for the tape timeline. Elsewhere the composed character types normally.
 - Composed keys type their character. Option+4 on a Mac ISO layout now types `$` in every text field and in Vim. Before, Studio typed `4`.
 - Pattern queries allocate less. Time and value changes reuse a hap, and a shared object map stays shared until a write. A 4-cycle query with five controls drops from 3,297 to 2,353 allocations.

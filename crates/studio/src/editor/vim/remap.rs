@@ -115,11 +115,16 @@ impl Editor {
             self.vim_remap.pending.drain(..mapping.keys.len());
             Some((keys, std::mem::take(&mut self.vim_remap.pending)))
         } else {
-            let key = self.vim_remap.pending.remove(0);
-            Some((
-                vec![VimMappedKey::Key(key)],
-                std::mem::take(&mut self.vim_remap.pending),
-            ))
+            // No mapping can match this sequence. The whole prefix goes
+            // out at once: keeping the tail pending would hold a built-in
+            // pair such as gg for the mapping timeout.
+            let keys = self
+                .vim_remap
+                .pending
+                .drain(..)
+                .map(VimMappedKey::Key)
+                .collect();
+            Some((keys, Vec::new()))
         }
     }
 
@@ -199,5 +204,30 @@ impl Editor {
                         | KeyCode::BackTab
                 )
             }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editor::{Editor, HistoryMoment};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::Arc;
+
+    #[test]
+    fn an_unmatched_pair_flushes_at_once_instead_of_waiting() {
+        let mut editor = Editor::new("one\ntwo\n").expect("editor");
+        editor.set_keybindings(EditorKeybindings::Vim);
+        editor.set_vim_mappings(Arc::new(
+            VimMappings::parse("nnoremap gs <Action:stop>\n").expect("mapping"),
+        ));
+        let g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
+        assert!(editor.vim_queue_mapped_key(g, HistoryMoment(0)));
+        assert!(editor.vim_queue_mapped_key(g, HistoryMoment(1)));
+        let (mapped, remaining) = editor
+            .vim_take_mapped_keys(false)
+            .expect("the pair is not a mapping");
+        assert!(remaining.is_empty(), "both keys go out at once");
+        assert_eq!(mapped, vec![VimMappedKey::Key(g), VimMappedKey::Key(g)]);
     }
 }
