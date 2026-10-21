@@ -8,6 +8,7 @@
 - Edit > Find opens the Vim search prompt when Vim editor keys are on. Enter searches once, and `n` and `N` walk the matches.
 - Vim `p` and `P` paste the system clipboard. A yank or delete fills the clipboard too, so a copied score or the last yank lands in the score.
 - Vim `r` replaces the character under the cursor. A count replaces several.
+- Vim Ctrl+D and Ctrl+U move half a page in the editor and page list panels. Docs moves to Shift+K while Vim keys are on, and Wrap has no default chord there. A learnt chord still wins.
 - Vim insert mappings from the vimrc apply in panel search boxes. For example, `inoremap jk <Esc>` leaves Insert in the reference search.
 - In Vim Normal mode, Esc closes a panel left open behind the editor. Before, Vim consumed the key and the panel could not be closed.
 - Vim `gg` no longer waits for the mapping timeout when a mapping starts with `g`.

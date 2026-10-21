@@ -4321,6 +4321,20 @@ fn keybinds_footer_hint(
         }
         return format!("Enter: reset all to {profile} defaults · Esc: close");
     }
+    if settings.editor_keybindings == EditorKeybindings::Vim {
+        match keybind_action_at(sheet.selected) {
+            Some(BindAction::Docs) => {
+                return "Vim: ⇧K · Ctrl+D pages down · Enter: rebind".to_owned();
+            }
+            Some(BindAction::Wrap) => {
+                return "Vim: no chord · Ctrl+U pages up · Enter: rebind".to_owned();
+            }
+            Some(BindAction::RenameScene) => {
+                return "Vim: no chord · Ctrl+R redoes · Enter: rebind".to_owned();
+            }
+            _ => {}
+        }
+    }
     "Enter: rebind a key or a control · Del: terminal default · Tab: pages · Esc: close".to_owned()
 }
 
@@ -5405,6 +5419,37 @@ mod tests {
             keybind_count(&settings),
             RESET_KEYBINDS_ROW + 1,
             "the Vim rows are not shown with Default keys"
+        );
+    }
+
+    #[test]
+    fn the_vim_layer_names_the_docs_and_wrap_changes() {
+        let settings = UiSettings {
+            editor_keybindings: EditorKeybindings::Vim,
+            ..Default::default()
+        };
+        let features = TerminalFeatures::default();
+        let row = |action| {
+            KEYBIND_ACTION_START
+                + BindAction::ALL
+                    .iter()
+                    .position(|candidate| *candidate == action)
+                    .expect("action row")
+        };
+        let mut sheet = SettingsSheet {
+            page: SettingsPage::Keybinds,
+            selected: row(BindAction::Docs),
+            keybind_count: keybind_count(&settings),
+            ..Default::default()
+        };
+        assert!(
+            keybinds_footer_hint(sheet, &settings, &features).contains("Ctrl+D pages down"),
+            "the Docs row names the key it gave up"
+        );
+        sheet.selected = row(BindAction::Wrap);
+        assert!(
+            keybinds_footer_hint(sheet, &settings, &features).contains("Ctrl+U pages up"),
+            "the Wrap row names the key it gave up"
         );
     }
 

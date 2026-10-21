@@ -1878,6 +1878,41 @@ mod tests {
         }
 
         #[test]
+        fn vim_k_opens_docs_and_insert_types_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.focus = Focus::Editor;
+
+            precision_key(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            precision_key(&mut app, KeyCode::Char('K'), KeyModifiers::SHIFT);
+            assert!(app.editor().source().starts_with('K'), "Insert types K");
+            precision_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+            precision_key(&mut app, KeyCode::Char('K'), KeyModifiers::SHIFT);
+            assert!(app.reference_panel.is_some(), "K opens Docs");
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Reference));
+        }
+
+        #[test]
+        fn a_learnt_ctrl_d_wins_over_page_down() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), &"a\n".repeat(12));
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.focus = Focus::Editor;
+            app.keybinds.learn(
+                crate::keybinds::BindAction::Docs,
+                crate::keybinds::KeyCombo::parse("ctrl+d"),
+            );
+
+            precision_key(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert!(app.reference_panel.is_some(), "the learnt chord opens Docs");
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Reference));
+        }
+
+        #[test]
         fn vim_yank_fills_the_clipboard_and_p_takes_the_newest_copy() {
             let directory = tempfile::tempdir().expect("temp dir");
             let (mut app, _scene) = plain_app(directory.path(), "one two\n");

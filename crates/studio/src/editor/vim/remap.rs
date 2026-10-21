@@ -175,6 +175,12 @@ impl Editor {
         {
             return true;
         }
+        if key.modifiers == KeyModifiers::CONTROL
+            && matches!(key.code, KeyCode::Char('d' | 'u'))
+            && self.vim.mode != Mode::Insert
+        {
+            return true;
+        }
         if key.modifiers.intersects(
             KeyModifiers::CONTROL
                 | KeyModifiers::ALT

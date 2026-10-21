@@ -383,7 +383,7 @@ fn studio_shortcuts_and_panel_focus_keep_their_meaning() {
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
 
     studio.set_caret(4);
-    studio.chord("ctrl+d");
+    studio.type_text("K");
     assert_eq!(studio.focus(), Some(PanelKind::Reference));
     assert_eq!(studio.status(), "reference - s");
     let (row, text) = studio

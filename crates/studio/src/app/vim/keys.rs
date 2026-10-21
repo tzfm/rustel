@@ -315,9 +315,20 @@ pub(crate) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
 
 impl App {
     /// The arrow a plain j, k, h, or l stands in for while Vim list keys
-    /// are on.
+    /// are on. Ctrl+D and Ctrl+U page, as they do in the editor.
     pub(crate) fn list_navigation_alias(&self, key: &KeyEvent) -> Option<KeyEvent> {
-        if !super::applies(self) || key.kind == KeyEventKind::Release || !key.modifiers.is_empty() {
+        if !super::applies(self) || key.kind == KeyEventKind::Release {
+            return None;
+        }
+        if key.modifiers == KeyModifiers::CONTROL {
+            let code = match key.code {
+                KeyCode::Char('d') => KeyCode::PageDown,
+                KeyCode::Char('u') => KeyCode::PageUp,
+                _ => return None,
+            };
+            return Some(KeyEvent::new_with_kind(code, KeyModifiers::NONE, key.kind));
+        }
+        if !key.modifiers.is_empty() {
             return None;
         }
         let code = match key.code {
@@ -437,6 +448,23 @@ mod tests {
         press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
         press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
         assert_eq!(query(&app), "x", "Insert types in the sample search");
+    }
+
+    #[test]
+    fn ctrl_d_and_ctrl_u_page_the_list() {
+        let (_directory, mut app) = vim_app();
+        let selected = |app: &App| app.reference_panel.as_ref().expect("panel").chord_selected;
+        let before = selected(&app);
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        let after_down = selected(&app);
+        assert!(after_down > before, "Ctrl+D pages down");
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert!(selected(&app) < after_down, "Ctrl+U pages up");
+        assert_eq!(
+            app.reference_panel.as_ref().expect("panel").chord_query,
+            "",
+            "paging does not type"
+        );
     }
 
     #[test]

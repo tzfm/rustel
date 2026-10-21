@@ -10,9 +10,14 @@ use super::*;
 impl App {
     pub(super) fn refresh_editor_shortcut_hints(&mut self) {
         let editor_focused = self.editor_accepts_raw_paste();
+        let mut vim_layer = self.keybinds.vim_layer_keys();
+        for key in &mut vim_layer {
+            self.keybinds.normalize_terminal_key(key);
+        }
         let editor = &self.scenes.current().editor;
-        self.keybinds
-            .filter_editor_hints(|key| editor_focused && editor.claims_key(key));
+        self.keybinds.filter_editor_hints(|key| {
+            editor_focused && editor.claims_key(key) && !vim_layer.contains(key)
+        });
     }
 
     /// What this press means to the chord table, as an editor command, for

@@ -649,7 +649,8 @@ surface. `r` then a character replaces the character under the cursor, and
 a count replaces that many. `D` deletes to the end of the line.
 `C` changes that text. `v` selects characters and `V` selects lines.
 `u` undoes an edit. Ctrl+R in Normal or Visual mode redoes it.
-`:redo` then Enter also redoes an edit.
+`:redo` then Enter also redoes an edit. Ctrl+D and Ctrl+U move half a page
+down and up. A count moves that many lines.
 
 `/` searches forward and `?` backward. Edit > Find opens `/`. Type a regular
 expression and press Enter. `n` repeats the search and `N` repeats it in the
@@ -666,21 +667,23 @@ to include the separators, such as `va(`. These objects also work with `d`,
 `c`, and `y`, such as `ci"` to replace a string. Supported separators are
 `()`, `[]`, `{}`, `<>`, single quotes, double quotes, and backticks.
 
-Vim keys take priority while the editor has focus, including keys you assign
-to Studio actions. Unclaimed keys keep their Studio action. A pending Vim
-command or mapping owns the next key. Settings, prompts, and other panels
-keep their usual controls, except the list keys below. Menus show the
-shortcuts available in the current context. In Insert mode, Ctrl+R is
-reserved for register entry, which is not supported. Pasted text stays
-literal. On terminals without bracketed paste, enter Insert mode before
-pasting.
+Vim keys take priority while the editor has focus. Unclaimed keys keep their
+Studio action. A pending Vim command or mapping owns the next key. While Vim
+keys are on, Docs answers to K (Shift+K) and Wrap has no default chord.
+Ctrl+D and Ctrl+U page instead. Settings > Keybinds shows these Vim defaults.
+A learnt chord replaces them, and a learnt chord on Ctrl+D or Ctrl+U wins
+over the page motion. Settings, prompts, and other panels keep their usual
+controls, except the list keys below. Menus show the shortcuts available in
+the current context. In Insert mode, Ctrl+R is reserved for register entry,
+which is not supported. Pasted text stays literal. On terminals without
+bracketed paste, enter Insert mode before pasting.
 
 The Vim list keys row in the Vim section of Settings > Keybinds is on by
 default. Plain `j`, `k`, `h`, and `l` move lists, menus, and help as the
-arrows do. A panel command keeps its meaning. The other menu letters do too.
-While the row is on, these four letters navigate menus even when they spell a
-menu mnemonic. Turn the row off to keep them for text fields and menu
-mnemonics. The arrows always work.
+arrows do. Ctrl+D and Ctrl+U page every list panel. A panel command keeps
+its meaning. The other menu letters do too. While the row is on, these four
+letters navigate menus even when they spell a menu mnemonic. Turn the row
+off to keep them for text fields and menu mnemonics. The arrows always work.
 
 A search box in the reference column starts in Command mode while the list
 keys are on. `j`, `k`, `h`, and `l` walk the list, and the other letters stay

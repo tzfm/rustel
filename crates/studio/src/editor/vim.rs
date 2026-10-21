@@ -353,6 +353,17 @@ impl Editor {
             self.vim.message = None;
             return Ok(false);
         }
+        if key.modifiers == KeyModifiers::CONTROL && matches!(key.code, KeyCode::Char('d' | 'u')) {
+            let counted = self.vim.count != 0;
+            let count = self.vim_take_count();
+            if self.vim.operator.take().is_some() {
+                self.vim_cancel_pending();
+                return Ok(true);
+            }
+            self.vim.message = None;
+            self.vim_half_page(key.code == KeyCode::Char('d'), counted.then_some(count))?;
+            return Ok(true);
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(false);
         }
@@ -956,5 +967,64 @@ impl Editor {
             self.vim.linewise_register = linewise;
         }
         self.vim_normalize_caret()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn editor() -> Editor {
+        let source = "a\n".repeat(12);
+        let mut editor = Editor::new(&source).expect("editor");
+        editor.set_keybindings(EditorKeybindings::Vim);
+        editor.set_page_rows(6);
+        editor
+    }
+
+    fn press(editor: &mut Editor, code: KeyCode, modifiers: KeyModifiers) {
+        editor
+            .vim_key(KeyEvent::new(code, modifiers), HistoryMoment(0), None)
+            .expect("key");
+    }
+
+    fn line(editor: &Editor) -> usize {
+        editor
+            .document
+            .line_of(editor.primary_selection().head)
+            .expect("line")
+    }
+
+    #[test]
+    fn ctrl_d_moves_half_a_page_and_ctrl_u_returns() {
+        let mut editor = editor();
+        assert_eq!(editor.viewport().page_rows, 6);
+        press(&mut editor, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(line(&editor), 3, "half of six rows");
+        assert_eq!(editor.viewport().top_row, 3, "the view scrolls too");
+        press(&mut editor, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(line(&editor), 0);
+        assert_eq!(editor.viewport().top_row, 0);
+    }
+
+    #[test]
+    fn a_count_moves_that_many_lines() {
+        let mut editor = editor();
+        press(&mut editor, KeyCode::Char('2'), KeyModifiers::NONE);
+        press(&mut editor, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(line(&editor), 2);
+        assert_eq!(editor.viewport().top_row, 2);
+    }
+
+    #[test]
+    fn ctrl_d_extends_a_visual_selection() {
+        let mut editor = editor();
+        press(&mut editor, KeyCode::Char('v'), KeyModifiers::NONE);
+        press(&mut editor, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        let selection = editor.primary_selection();
+        assert_eq!(selection.anchor, ByteOffset(0));
+        assert_eq!(line(&editor), 3, "the selection reaches the third line");
+        assert!(selection.head.0 >= 6);
     }
 }

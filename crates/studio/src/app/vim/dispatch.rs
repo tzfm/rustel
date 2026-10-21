@@ -15,7 +15,7 @@ type Bypass = fn(&App, &KeyEvent) -> bool;
 const BEFORE_MAPPINGS: &[Bypass] = &[remote_control_key, remote_sheet_key];
 
 /// Keys that fall through after mappings had their chance.
-const AFTER_MAPPINGS: &[Bypass] = &[panel_escape];
+const AFTER_MAPPINGS: &[Bypass] = &[learned_layer_shortcut, panel_escape];
 
 /// Route one key through the Vim engine. `false` sends it to the ordinary
 /// studio routing.
@@ -57,6 +57,15 @@ fn remote_sheet_key(app: &App, _key: &KeyEvent) -> bool {
         let _ = app;
         false
     }
+}
+
+/// A learnt studio chord on a key the Vim layer would take wins, as the
+/// player asked. A pending Vim command keeps its key.
+fn learned_layer_shortcut(app: &App, key: &KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
+        && !app.editor().vim_has_pending_command()
+        && app.keybinds.override_action_for(key).is_some()
+        && app.keybinds.takes_vim_layer_key(key)
 }
 
 /// Vim Normal does not eat the Esc that puts an open panel away. A sheet
@@ -127,6 +136,17 @@ fn dispatch_builtin(app: &mut App, key: KeyEvent) -> Result<bool, RuntimeError> 
     let mut key = crate::vim_config::canonical_key(key);
     key.kind = kind;
     let pending = app.editor().vim_has_pending_command();
+    // The Vim layer gives an action a key of its own, such as K for Docs.
+    // Mappings and learnt studio chords have already had their chance.
+    if !pending
+        && key.kind == KeyEventKind::Press
+        && let Some(action) = app.keybinds.vim_layer_action_for(&key)
+        && !app.editor().vim_is_insert()
+    {
+        app.dispatch_bind_action(action, false)?;
+        app.dirty_frame = true;
+        return Ok(true);
+    }
     // Vim p puts what was copied last. The clipboard answers the key, and
     // a yank or delete writes the register there, so a copied score and a
     // yanked line take the same road.
