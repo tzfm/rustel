@@ -73,6 +73,34 @@ cargo build --profile local -p rustel --no-default-features --features mp3-expor
 
 Adding `--all-features` enables `gamepad` again and requires the libudev headers on Linux.
 
+### ALSA on other distributions
+
+The Linux audio and MIDI backends use ALSA. A PipeWire system does not
+remove that build dependency: `pipewire-alsa` provides the running
+connection, while the build still reads `alsa.pc`. When the headers are
+missing, the `alsa-sys` build script stops with `Package alsa was not
+found in the pkg-config search path`.
+
+The package names differ by distribution:
+
+| Distribution | Command |
+| --- | --- |
+| Debian, Ubuntu | `sudo apt-get install -y build-essential pkg-config libasound2-dev libudev-dev` |
+| Fedora | `sudo dnf install -y gcc gcc-c++ make pkgconf-pkg-config alsa-lib-devel systemd-devel` |
+| Arch | `sudo pacman -S --needed base-devel pkgconf alsa-lib systemd-libs` |
+| openSUSE | `sudo zypper install -y gcc gcc-c++ make pkg-config alsa-devel systemd-devel` |
+| Alpine | `sudo apk add build-base pkgconf alsa-lib-dev eudev-dev` |
+
+Check the libraries with:
+
+```sh
+pkg-config --exists alsa && pkg-config --exists libudev && echo found
+```
+
+A headless build without `device-audio`, `midi` and `gamepad` needs neither
+library. `rustelup --branch` and `--commit` run this check before they
+build and print the command for the detected distribution.
+
 Visuals need no separate system graphics library. Procedural and camera
 visuals need no network, while `initImage()`
 fetches the public HTTPS image named by the score. Check your build with
