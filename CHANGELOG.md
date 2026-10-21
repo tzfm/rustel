@@ -7,6 +7,7 @@
 - The new `terminal` theme follows the terminal's own palette: `reset` and the 16 `ansiN` colours, so a custom scheme such as a Kitty or Noctalia one shows through the studio.
 - The theme picker's delete key refuses a theme the studio ships on the first press. Before, the second press went looking for a file a built-in theme does not have and answered with an error that listed every theme name.
 - The Studio Chords tab no longer leaks memory while it is open. Each draw leaked 336 small strings with the default dictionary.
+- `rustelup --branch` and `--commit` check for the ALSA and libudev development files before a Linux build and print the install command for the detected distribution. A missing `alsa.pc` stopped the `alsa-sys` build script with a panic that named the package but not how to install it. The build guide now lists the packages for Fedora, Arch, openSUSE and Alpine, and says why a PipeWire system still needs the ALSA headers.
 
 ## v0.1.5
 
