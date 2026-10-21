@@ -416,6 +416,60 @@ impl SyntaxCheck {
     }
 }
 
+/// What the studio does when another program saves the open score's file.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ExternalChanges {
+    /// The file is read when it is opened, and never watched.
+    #[default]
+    Off,
+    /// The editor takes the saved text.
+    Sync,
+    /// The editor takes the saved text, and the score plays it.
+    SyncAndEvaluate,
+}
+
+impl ExternalChanges {
+    const LADDER: [Self; 3] = [Self::Off, Self::Sync, Self::SyncAndEvaluate];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Sync => "sync",
+            Self::SyncAndEvaluate => "sync & eval",
+        }
+    }
+
+    /// The name the preferences file keeps.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Sync => "sync",
+            Self::SyncAndEvaluate => "sync-eval",
+        }
+    }
+
+    pub fn parse(text: &str) -> Self {
+        Self::LADDER
+            .iter()
+            .copied()
+            .find(|mode| mode.key() == text)
+            .unwrap_or_default()
+    }
+
+    fn step(self, forwards: bool) -> Self {
+        let index = Self::LADDER
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(0);
+        let len = Self::LADDER.len();
+        Self::LADDER[if forwards {
+            (index + 1) % len
+        } else {
+            (index + len - 1) % len
+        }]
+    }
+}
+
 /// How long a sounding mark lingers after its event ends.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum HighlightFade {
@@ -1475,6 +1529,9 @@ pub struct UiSettings {
     pub auto_evaluate: bool,
     /// How long typing must pause before it does.
     pub typing_pause: TypingPause,
+    /// What the studio does when another program saves the open score's
+    /// file. Off by default: reading the file again is opted into.
+    pub external_changes: ExternalChanges,
     pub load_mode: LoadMode,
     /// MIDI clock out, by port; none to send none.
     pub clock_out: Option<String>,
@@ -1651,6 +1708,7 @@ impl Default for UiSettings {
             quantise: Quantise::Off,
             auto_evaluate: false,
             typing_pause: TypingPause::Medium,
+            external_changes: ExternalChanges::Off,
             load_mode: LoadMode::Wait,
             clock_out: None,
             clock_in: None,
@@ -1767,6 +1825,8 @@ enum Row {
     AutoEvaluate,
     /// How long typing must pause before it does.
     TypingPause,
+    /// What happens when another program saves the open score's file.
+    ExternalChanges,
     /// How a start or an edit meets sounds still loading.
     LoadMode,
     Animation,
@@ -1979,6 +2039,7 @@ const ROWS: &[Row] = &[
     Row::MasterLimiter,
     Row::AutoEvaluate,
     Row::TypingPause,
+    Row::ExternalChanges,
     Row::ShowMenu,
     Row::ShowHeader,
     Row::ShowFooter,
@@ -2187,7 +2248,7 @@ impl Row {
     fn group(self) -> &'static str {
         match self {
             Self::Quantise | Self::MasterLimiter | Self::LoadMode => "Playback",
-            Self::AutoEvaluate | Self::TypingPause => "Live coding",
+            Self::AutoEvaluate | Self::TypingPause | Self::ExternalChanges => "Live coding",
 
             // The one latency knob: what the OUTPUT costs is a
             // machine-level choice, set once like a DAW's buffer size.
@@ -2248,6 +2309,7 @@ impl Row {
             Self::Quantise => "launch on",
             Self::AutoEvaluate => "auto evaluate",
             Self::TypingPause => "typing pause",
+            Self::ExternalChanges => "watch external changes",
             Self::LoadMode => "load mode",
             Self::Animation => "visualizers",
             Self::Highlights => "highlights",
@@ -2327,6 +2389,9 @@ impl Row {
             Self::Quantise => "every play waits for this line · off plays now",
             Self::AutoEvaluate => "a paused edit applies itself while the set plays",
             Self::TypingPause => "how long typing rests before the edit applies",
+            Self::ExternalChanges => {
+                "sync: the editor takes another program's save \u{b7} sync & eval: and plays it"
+            }
             Self::LoadMode => "wait: plays once its sounds load · async: skips late notes",
             Self::Animation => "pianoroll, scope and friends draw",
             Self::Highlights => "sounding events marked in the score",
@@ -3261,6 +3326,9 @@ impl SettingsSheet {
                 Row::AutoEvaluate => set_switch(&mut settings.auto_evaluate),
                 Row::TypingPause => {
                     settings.typing_pause = settings.typing_pause.step(forwards);
+                }
+                Row::ExternalChanges => {
+                    settings.external_changes = settings.external_changes.step(forwards);
                 }
                 Row::LoadMode => settings.load_mode = settings.load_mode.step(),
                 Row::Animation => set_switch(&mut settings.animation),

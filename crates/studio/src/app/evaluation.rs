@@ -285,10 +285,23 @@ impl App {
     /// same way. What it never owes is the flash: that confirms a press,
     /// and nobody pressed anything.
     pub(super) fn auto_evaluate(&mut self) {
+        self.apply_paused_edit(false);
+    }
+
+    /// Apply a score another program saved into the open file. The watch
+    /// mode is the decision to play, so this runs while the transport is
+    /// stopped too. A stop already under way still wins.
+    pub(super) fn apply_external_change(&mut self) {
+        self.apply_paused_edit(true);
+    }
+
+    /// `external` names the caller that asked: a typed pause waits for the
+    /// set to play, a watched file does not.
+    fn apply_paused_edit(&mut self, external: bool) {
         // The snapshot trails a Stop press by up to 100 ms, so the local
         // flag holds the apply until it catches up.
-        if !self.ui_settings.auto_evaluate
-            || !self.is_playing()
+        if (!external && !self.ui_settings.auto_evaluate)
+            || (!external && !self.is_playing())
             || self.is_stopping()
             || self.stop_requested
             || self.current_prebake().is_some()
@@ -329,15 +342,24 @@ impl App {
             LogLevel::Debug,
             "transport",
             format!(
-                "auto update - {} ({} bytes)",
+                "{} - {} ({} bytes)",
+                if external {
+                    "external update"
+                } else {
+                    "auto update"
+                },
                 self.scenes.current().name(),
                 source.len()
             ),
         );
         self.silence_preview();
         self.playing_pane = Some(self.focused);
-        // The file is what you hear, whoever asked for the update.
-        self.write_scene(id, revision, Arc::clone(&source));
+        // The file is what you hear, whoever asked for the update. A
+        // watched file already holds this text: writing it again could
+        // overwrite a newer save that landed while it was read.
+        if !external {
+            self.write_scene(id, revision, Arc::clone(&source));
+        }
         self.queue_evaluation(revision, source);
     }
 
