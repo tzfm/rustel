@@ -438,6 +438,12 @@ Open the Samples tab in Reference to browse banks. Right expands a bank and
 Left folds it. Space starts or stops a preview. Enter inserts or copies the
 selection; check the footer for the current action.
 
+Alt+A turns on auto preview. The up and down arrows then play each row the
+cursor lands on. It works on the Samples, Chords and Scales tabs. Studio keeps
+the choice in `studio.json`, so it stays on for the next session. Press Alt+A
+again to turn it off. The foot of the list names the shortcut beside the move
+keys, and the volume row says `auto on` or `auto off`.
+
 Drag and drop an audio file or folder into the terminal window running Studio
 to import samples. You can also add folders and packs in Settings ▸ Samples.
 Samples in the set folder are discovered automatically. Use File ▸ Copy

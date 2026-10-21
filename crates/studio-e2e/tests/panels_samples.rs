@@ -184,9 +184,9 @@ fn letters_type_and_alt_keys_command_the_browser() {
     row_containing(&studio.rows(), "search: a");
 
     studio.chord("alt+a");
-    assert_eq!(studio.status(), "samples - auto-play on: moving previews");
+    assert_eq!(studio.status(), "auto-play on: moving previews");
     studio.chord("alt+a");
-    assert_eq!(studio.status(), "samples - auto-play off");
+    assert_eq!(studio.status(), "auto-play off");
 
     // The query was untouched by the chords: the box still reads `a`.
     row_containing(&studio.rows(), "search: a");

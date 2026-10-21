@@ -1566,6 +1566,10 @@ pub struct UiSettings {
     /// What the examples tab hands over: one `$:` a voice, or the same
     /// voices folded into a single `$: stack(...)`.
     pub examples_stack: bool,
+    /// Whether moving through the browser's lists of things to hear - the
+    /// samples, chords and scales tabs - plays each row the cursor lands on.
+    /// Off by default: sound on every arrow is opted into.
+    pub auto_preview: bool,
     /// Whether Hydra's backdrop averages the pixels it scales down, or picks
     /// one of them. Costs the same either way; it is purely how it looks.
     pub backdrop_smoothing: bool,
@@ -1677,6 +1681,7 @@ impl Default for UiSettings {
             syntax_check: SyntaxCheck::Full,
             log_verbose: false,
             examples_stack: false,
+            auto_preview: false,
             backdrop_smoothing: false,
             slider_smoothing: false,
             frequency_slider_log: true,
