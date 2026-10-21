@@ -434,7 +434,7 @@ const BUILT_INS: &[(&str, &str)] = &[
     // studio wears whatever palette the terminal already carries.
     ("terminal", include_str!("themes/terminal.json")),
     // The same ground with one role moved: the accent and the selection
-    // take the palette's first slot, which reads warm in palettes whose
+    // take the palette's slot 1, which reads warm in palettes whose
     // bright slot is gold. ←/→ in the picker steps between the family.
     ("terminal-warm", include_str!("themes/terminal-warm.json")),
     ("solarized", include_str!("themes/solarized.json")),
@@ -2552,6 +2552,22 @@ pub fn mix(left: Color, right: Color, right_amount: f32) -> Color {
     };
     let blend = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * amount).round() as u8;
     Color::Rgb(blend(lr, rr), blend(lg, rg), blend(lb, rb))
+}
+
+/// `colour_amount` of `colour` washed in over `ground`, for a fade that has to
+/// stay visible.
+///
+/// A theme that defers its ground to the terminal has no colour to blend
+/// with, and [`mix`] would snap to the ground itself - which the pixel
+/// raster paints as plain black. The colour stays whole instead, so a
+/// silent note keeps its grey rather than disappearing. A ground that is a
+/// colour takes its share exactly as [`mix`] gives it.
+pub fn wash(ground: Color, colour: Color, colour_amount: f32) -> Color {
+    if true_rgb(ground).is_none() {
+        colour
+    } else {
+        mix(ground, colour, colour_amount)
+    }
 }
 
 impl Theme {

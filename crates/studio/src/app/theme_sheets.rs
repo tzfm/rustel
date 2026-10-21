@@ -165,7 +165,13 @@ impl App {
                 self.adopt_theme_opacity();
                 #[cfg(feature = "hydra")]
                 self.sync_theme_sketch();
-                self.status = format!("theme - {name}");
+                // The family's arrows are not drawn on the row the way the
+                // randomize row's are, so the line underneath says them.
+                self.status = if super::super::theme::TERMINAL_FAMILY.contains(&name.as_str()) {
+                    format!("theme - {name} · ←/→ swaps the accent")
+                } else {
+                    format!("theme - {name}")
+                };
             }
             Err(error) => self.status = format!("theme {name}: {error}"),
         }
@@ -1540,11 +1546,20 @@ mod tests {
             press(&mut app, KeyCode::Right, KeyModifiers::NONE);
             let picker = app.theme_picker.as_ref().expect("picker");
             assert_eq!(picker.selected_name(), Some("terminal-warm"));
+            assert!(
+                app.theme_apply_due.is_some(),
+                "the step must schedule the preview, as the list does"
+            );
             app.theme_apply_due = None;
             app.preview_theme();
             assert_eq!(
                 app.theme.name, "terminal-warm",
                 "Right previews the sibling"
+            );
+            assert!(
+                app.status.contains("swaps the accent"),
+                "the family's arrows are announced: {}",
+                app.status
             );
 
             press(&mut app, KeyCode::Left, KeyModifiers::NONE);
@@ -1555,6 +1570,25 @@ mod tests {
             app.theme_apply_due = None;
             app.preview_theme();
             assert_eq!(app.theme.name, "terminal", "Left steps back");
+
+            // A filter that hides the sibling leaves nothing to step to.
+            // The key is still swallowed, and no preview is scheduled.
+            // The dash keeps "swarm" out, so this row is the only match.
+            for character in "-warm".chars() {
+                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+            }
+            assert_eq!(
+                app.theme_picker.as_ref().expect("picker").selected_name(),
+                Some("terminal-warm")
+            );
+            app.theme_apply_due = None;
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+            assert_eq!(
+                app.theme_picker.as_ref().expect("picker").selected_name(),
+                Some("terminal-warm"),
+                "a hidden sibling is not reachable"
+            );
+            assert!(app.theme_apply_due.is_none(), "no preview was scheduled");
         }
 
         /// The picker's modified E opens the editor. A built-in theme arrives

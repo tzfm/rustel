@@ -8,7 +8,7 @@ use ratatui::{
     widgets::Widget,
 };
 
-use super::super::theme::{Theme, hsv, mix, rgb_parts};
+use super::super::theme::{Theme, hsv, rgb_parts, wash};
 use super::super::visuals::VisualState;
 
 /// The events as they are queued to sound, newest at the bottom, each a
@@ -185,9 +185,9 @@ impl Widget for EventsView<'_> {
             let style = if sounding {
                 Style::default().fg(colour).add_modifier(Modifier::BOLD)
             } else if event.target_time > now {
-                Style::default().fg(mix(theme.background, colour, 0.45))
+                Style::default().fg(wash(theme.background, colour, 0.45))
             } else {
-                Style::default().fg(mix(theme.background, colour, 0.7))
+                Style::default().fg(wash(theme.background, colour, 0.7))
             };
             for row in chain.into_iter().rev() {
                 lines.push((row, style));

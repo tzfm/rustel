@@ -25,7 +25,7 @@ use rustel_runtime::ui_events::{
 };
 
 use super::engine::StudioSnapshot;
-use super::theme::{Theme, VisualOptions, hsv, luminance, mix, parse_color, true_rgb};
+use super::theme::{Theme, VisualOptions, hsv, luminance, mix, parse_color, true_rgb, wash};
 
 const MAX_TIMELINE_EVENTS: usize = 2_048;
 const HISTORY_SECONDS: f64 = 8.0;
@@ -1400,7 +1400,7 @@ impl<'a, 'b> PianoRoll<'a, 'b> {
         if alpha >= 0.999 {
             colour
         } else {
-            wash(colour, self.background, 1.0 - alpha)
+            wash(self.background, colour, alpha)
         }
     }
 }
@@ -1881,7 +1881,7 @@ impl Widget for Spiral<'_, '_> {
             let color = if opacity >= 0.999 {
                 color
             } else {
-                wash(color, self.request.background, 1.0 - opacity)
+                wash(self.request.background, color, opacity)
             };
             // The arc runs to where the note stops sounding, not to the
             // end of its whole span.
@@ -2114,7 +2114,7 @@ impl Widget for PitchWheel<'_, '_> {
         }
         // The hour marks, one per division of the octave - faint for the
         // divisions the event's scale leaves out, as on strudel.cc.
-        let faint = wash(theme.grid, self.request.background, 0.85);
+        let faint = wash(self.request.background, theme.grid, 0.15);
         for division in 0..edo {
             let (x, y) = point_at(angle_of(division as f64 / edo as f64), radius);
             if x >= 0 && y >= 0 {
@@ -2148,7 +2148,7 @@ impl Widget for PitchWheel<'_, '_> {
             let color = if alpha >= 0.999 {
                 own
             } else {
-                wash(own, self.request.background, 1.0 - alpha)
+                wash(self.request.background, own, alpha)
             };
             // The scale's name for the note's degree, beside its name.
             let interval = scale.and_then(|scale| {
@@ -2695,6 +2695,19 @@ impl SpectrogramRamp {
                 theme.meter.peak,
             ],
         };
+        // The quiet end of the picture is painted, not left blank: on a
+        // pixel raster an untouched point is a hole, so the ground fills
+        // it. A ground the terminal owns has no pixel value - the raster
+        // would paint it black and a glyph cell would draw the default
+        // foreground - so the palette's muted colour stands in. The ramp
+        // then starts at a grey the terminal can show.
+        let ground = if true_rgb(ground).is_some() {
+            ground
+        } else if matches!(theme.muted, Color::Reset) {
+            stops[0]
+        } else {
+            theme.muted
+        };
         Self { ground, stops }
     }
 
@@ -2790,7 +2803,7 @@ impl<'a, 'b> Spectrum<'a, 'b> {
         let bars = usize::from(bars_area.width);
         for bar in 0..bars {
             let color = color_override.unwrap_or_else(|| spectrum_color(theme, bar, bars));
-            let peak_color = wash(color, self.request.background, 0.4);
+            let peak_color = wash(self.request.background, color, 0.6);
             let crest = brighten(color);
             let level = self.level(spectrum_level(&bands.levels, bar, bars));
             let peak = self.level(spectrum_level(&bands.peaks, bar, bars));
@@ -2921,21 +2934,8 @@ fn note_to_midi(name: &str) -> Option<f64> {
     Some(f64::from((base + accidental).rem_euclid(12)))
 }
 
-/// `ground_amount` of `ground` washed into `color`, when there is a
-/// ground to wash in. A theme that defers its ground to the terminal has
-/// no colour to blend, and `mix` would snap to the ground itself - which
-/// the pixel raster paints as plain black. The colour stays whole
-/// instead, so a silent note keeps its grey rather than disappearing.
-fn wash(color: Color, ground: Color, ground_amount: f32) -> Color {
-    if true_rgb(ground).is_none() {
-        color
-    } else {
-        mix(color, ground, ground_amount)
-    }
-}
-
 fn dim(color: Color, theme: &Theme) -> Color {
-    wash(color, theme.background, 0.55)
+    wash(theme.background, color, 0.55)
 }
 
 fn brighten(color: Color) -> Color {
@@ -3960,7 +3960,7 @@ mod tests {
         let area = Rect::new(0, 0, 60, 12);
         // Options that would draw a five-division wheel rooted on A.
         let picture = draw("pitchwheel", "{edo: 5, root: 440}", &state, area);
-        let faint = mix(theme.background, theme.grid, 0.15);
+        let faint = wash(theme.background, theme.grid, 0.15);
         assert!(
             cells_in(&picture, faint).len() >= 3,
             "the five divisions outside C major are faint:\n{}",
@@ -5225,14 +5225,88 @@ mod tests {
             terminal.event_inactive
         );
         assert_eq!(
-            wash(Color::Rgb(255, 0, 0), Color::Reset, 0.5),
+            wash(Color::Reset, Color::Rgb(255, 0, 0), 0.5),
             Color::Rgb(255, 0, 0)
         );
-        // A ground that is a colour still takes its share.
         assert_eq!(
-            wash(Color::Rgb(255, 0, 0), Color::Rgb(0, 0, 0), 0.5),
-            Color::Rgb(128, 0, 0)
+            wash(Color::Reset, Color::Rgb(255, 0, 0), 0.25),
+            Color::Rgb(255, 0, 0)
         );
+        // A ground that is a colour still takes its share, in the same
+        // order. The quarter is asymmetric on purpose: a swapped call
+        // lands on 191, not 64.
+        assert_eq!(
+            wash(Color::Rgb(0, 0, 0), Color::Rgb(255, 0, 0), 0.25),
+            Color::Rgb(64, 0, 0)
+        );
+    }
+
+    /// The spectrogram paints its quiet level, so its lowest colour must
+    /// be one the terminal can show. A reset ground would paint black or
+    /// the default foreground, and the picture would open on a slab.
+    #[test]
+    fn a_spectrum_ramp_on_a_terminal_ground_starts_visible() {
+        let theme = Theme::built_in("terminal").expect("terminal ships");
+        let ramp = SpectrogramRamp::new(&theme, theme.background, theme.accent);
+        for step in 0..=100 {
+            let level = step as f32 / 100.0;
+            let colour = ramp.at(level);
+            assert_ne!(colour, Color::Reset, "level {level} has no colour");
+            assert_ne!(colour, Color::Black, "level {level} paints black");
+        }
+    }
+
+    /// A silent note is the case the reports showed as black bars. The
+    /// whole painter path runs under the terminal theme: no cell that
+    /// carries a glyph may come back `Reset`, which the pixel raster
+    /// paints as plain black, and the bars wear the palette's own slots.
+    #[test]
+    fn a_roll_under_the_terminal_theme_paints_no_black_bars() {
+        let state = playing(
+            "$: s(\"bd sd\")._pianoroll()",
+            vec![event(1, "0/1", "1/2", 10.0), event(2, "1/2", "1/1", 10.5)],
+            0.75,
+        );
+        let theme = Theme::built_in("terminal").expect("terminal ships");
+        let parsed = VisualOptions::parse("");
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buffer = Buffer::empty(area);
+        render(
+            VisualRequest {
+                kind: "pianoroll",
+                slot: None,
+                options: &parsed,
+                state: &state,
+                theme: &theme,
+                background: theme.background,
+                inline: true,
+            },
+            area,
+            &mut buffer,
+        );
+        let painted = buffer
+            .content
+            .iter()
+            .filter(|cell| cell.symbol() != " ")
+            .collect::<Vec<_>>();
+        assert!(!painted.is_empty(), "the roll drew nothing");
+        for cell in painted {
+            assert_ne!(
+                cell.fg,
+                Color::Reset,
+                "a painted cell fell back to the terminal's ground"
+            );
+            // Silent notes wear slot 8, sounding ones slot 14, and the
+            // playhead crossing a bar recolours that cell with slot 3.
+            assert!(
+                matches!(
+                    cell.fg,
+                    Color::Indexed(3) | Color::Indexed(8) | Color::Indexed(14)
+                ),
+                "a bar wore {} instead of the palette's slots",
+                cell.fg
+            );
+        }
     }
 
     #[test]
