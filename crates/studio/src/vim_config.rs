@@ -18,6 +18,10 @@ const STARTER: &str = "\" Studio reads Vim mappings from this file.\n\
 \" Supported: noremap, map, nnoremap, inoremap, vnoremap, xnoremap, onoremap.\n\
 \" Lines Studio cannot use are skipped.\n";
 
+/// Mappings shipped with the studio, beneath the player's own file. An
+/// empty line here changes nothing. A user line for the same keys wins.
+const DEFAULT_VIMRC: &str = include_str!("../assets/vimrc");
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VimMappingMode {
     Normal,
@@ -58,8 +62,31 @@ impl VimMappings {
         }
     }
 
+    /// Parse exactly the vimrc, without the studio defaults. Tests use
+    /// this to check the file rules alone.
+    #[cfg(test)]
     pub(crate) fn parse(text: &str) -> Result<Self, String> {
+        Self::parse_text(text, false)
+    }
+
+    /// Parse a vimrc with the studio's Vim defaults beneath it. A later
+    /// definition of the same keys replaces a default, as in Vim.
+    pub(crate) fn parse_with_defaults(text: &str) -> Result<Self, String> {
+        Self::parse_text(text, true)
+    }
+
+    fn parse_text(text: &str, defaults: bool) -> Result<Self, String> {
         let mut maps = ModeMaps::default();
+        if defaults {
+            // gd is Vim's go-to-definition. Docs answers here while Vim
+            // owns Ctrl+D. The shipped defaults may replace it, and a vimrc
+            // line replaces both.
+            maps.normal.push(("gd".into(), "<Action:docs>".into()));
+            for (number, line) in DEFAULT_VIMRC.lines().enumerate() {
+                parse_map_line(line, &mut maps)
+                    .map_err(|error| format!("default vimrc line {}: {error}", number + 1))?;
+            }
+        }
         for (number, line) in text.lines().enumerate() {
             parse_map_line(line, &mut maps)
                 .map_err(|error| format!("line {}: {error}", number + 1))?;
@@ -555,8 +582,8 @@ impl VimConfig {
 
     fn apply(&mut self, current: Snapshot) -> bool {
         let result = match &current {
-            Snapshot::Missing => Ok(VimMappings::default()),
-            Snapshot::Text(text) => VimMappings::parse(text),
+            Snapshot::Missing => VimMappings::parse_with_defaults(""),
+            Snapshot::Text(text) => VimMappings::parse_with_defaults(text),
             Snapshot::Error(error) => Err(error.clone()),
         };
         self.observed = Some(current);
@@ -595,6 +622,44 @@ impl VimConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gd_opens_docs_and_a_vimrc_mapping_replaces_it() {
+        let gd = |mappings: &VimMappings| {
+            mappings
+                .for_mode(VimMappingMode::Normal)
+                .iter()
+                .find(|mapping| {
+                    mapping.keys
+                        == vec![
+                            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+                            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                        ]
+                })
+                .cloned()
+        };
+        let defaults = VimMappings::parse_with_defaults("").expect("defaults");
+        assert_eq!(
+            gd(&defaults).expect("gd default").replacement,
+            vec![VimMappedKey::Action(BindAction::Docs)]
+        );
+
+        let overridden = VimMappings::parse_with_defaults("nnoremap gd x\n").expect("vimrc");
+        assert_eq!(
+            gd(&overridden).expect("gd mapping").replacement,
+            vec![VimMappedKey::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE
+            ))]
+        );
+
+        let kept = VimMappings::parse_with_defaults("nnoremap K ?\\$<CR>\n").expect("vimrc");
+        assert_eq!(
+            gd(&kept).expect("gd default").replacement,
+            vec![VimMappedKey::Action(BindAction::Docs)],
+            "another mapping leaves gd alone"
+        );
+    }
 
     #[test]
     fn vimscript_maps_keep_modes_and_key_sequences_distinct() {
@@ -769,13 +834,20 @@ mod tests {
         assert!(!config.poll(now + POLL_INTERVAL));
         assert!(config.poll(now + POLL_INTERVAL * 2));
         assert_ne!(config.mappings(), loaded);
-        assert_eq!(config.mappings().for_mode(VimMappingMode::Normal).len(), 1);
+        assert_eq!(
+            config.mappings().for_mode(VimMappingMode::Normal).len(),
+            2,
+            "the gd default plus the file"
+        );
         config.configure(false, path.to_str(), now + POLL_INTERVAL * 3);
         assert!(config.configure(true, path.to_str(), now + POLL_INTERVAL * 4));
         fs::remove_file(&path).expect("remove custom file");
         assert!(!config.poll(now + POLL_INTERVAL * 5));
         assert!(config.poll(now + POLL_INTERVAL * 6));
-        assert_eq!(*config.mappings(), VimMappings::default());
+        assert_eq!(
+            *config.mappings(),
+            VimMappings::parse_with_defaults("").expect("defaults")
+        );
         assert!(!path.exists());
     }
 }

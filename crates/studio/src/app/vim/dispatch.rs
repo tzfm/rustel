@@ -136,17 +136,6 @@ fn dispatch_builtin(app: &mut App, key: KeyEvent) -> Result<bool, RuntimeError> 
     let mut key = crate::vim_config::canonical_key(key);
     key.kind = kind;
     let pending = app.editor().vim_has_pending_command();
-    // The Vim layer gives an action a key of its own, such as K for Docs.
-    // Mappings and learnt studio chords have already had their chance.
-    if !pending
-        && key.kind == KeyEventKind::Press
-        && let Some(action) = app.keybinds.vim_layer_action_for(&key)
-        && !app.editor().vim_is_insert()
-    {
-        app.dispatch_bind_action(action, false)?;
-        app.dirty_frame = true;
-        return Ok(true);
-    }
     // Vim p puts what was copied last. The clipboard answers the key, and
     // a yank or delete writes the register there, so a copied score and a
     // yanked line take the same road.

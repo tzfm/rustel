@@ -637,7 +637,9 @@ too much CPU. Check the Log for device or render errors.
 The Editor keybindings row selects Default or Vim. Default keeps the usual
 editor controls. Vim starts in Normal mode. Press `i` to insert text and Esc,
 Ctrl+[ or Ctrl+C to return to Normal mode. The status line shows the mode
-beside warnings and errors. Studio saves this choice in `studio.json`.
+beside warnings and errors. Vim uses a steady block in Normal and Visual and
+a steady bar in Insert. The caret shape setting applies outside Vim. Studio
+saves this choice in `studio.json`.
 
 Vim supports `hjkl`, word motions (`w`, `b`, `e`), `0`, `^`, `$`, `gg`, and `G`.
 Use `dd` to delete a line or `:42` then Enter to go to line 42. Counts work
@@ -669,14 +671,15 @@ to include the separators, such as `va(`. These objects also work with `d`,
 
 Vim keys take priority while the editor has focus. Unclaimed keys keep their
 Studio action. A pending Vim command or mapping owns the next key. While Vim
-keys are on, Docs answers to K (Shift+K) and Wrap has no default chord.
-Ctrl+D and Ctrl+U page instead. Settings > Keybinds shows these Vim defaults.
-A learnt chord replaces them, and a learnt chord on Ctrl+D or Ctrl+U wins
-over the page motion. Settings, prompts, and other panels keep their usual
-controls, except the list keys below. Menus show the shortcuts available in
-the current context. In Insert mode, Ctrl+R is reserved for register entry,
-which is not supported. Pasted text stays literal. On terminals without
-bracketed paste, enter Insert mode before pasting.
+keys are on, Docs answers to `gd` through a default mapping, and Wrap has no
+default chord. Ctrl+D and Ctrl+U page instead. Settings > Keybinds shows
+these Vim defaults. A vimrc line for `gd` replaces the Docs mapping. A learnt
+chord replaces the withdrawn table chords, and a learnt chord on Ctrl+D or
+Ctrl+U wins over the page motion. Settings, prompts, and other panels keep
+their usual controls, except the list keys below. Menus show the shortcuts
+available in the current context. In Insert mode, Ctrl+R is reserved for
+register entry, which is not supported. Pasted text stays literal. On
+terminals without bracketed paste, enter Insert mode before pasting.
 
 The Vim list keys row in the Vim section of Settings > Keybinds is on by
 default. Plain `j`, `k`, `h`, and `l` move lists, menus, and help as the
@@ -702,7 +705,8 @@ too. For example, `inoremap jk <Esc>` leaves Insert in the search.
 
 The first time you enable Vim, Studio creates `~/.rustel/vimrc` if it does not
 exist. `RUSTEL_CONFIG_DIR` changes that folder. Built-in bindings remain active
-until a map line overrides them.
+until a map line overrides them. Studio also ships default mappings beneath
+your file. Your file overrides them line for line.
 
 Edit the file in your own editor. The Vim mappings path row appears below
 Editor keybindings when Vim is enabled. Press Enter to set a full file path,

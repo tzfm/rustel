@@ -23,8 +23,19 @@ impl App {
     }
 
     pub(super) fn editor_cursor_shape(&self) -> super::super::terminal::CaretShape {
+        use super::super::terminal::CaretShape;
+        // Vim shapes follow the mode: a block in Normal and Visual, a bar
+        // in Insert. The setting and its blink do not apply, so typing
+        // cannot restart a blink phase on every key.
+        if self.editor().uses_modal_keys() {
+            return if self.editor().accepts_typed_text() {
+                CaretShape::SteadyBar
+            } else {
+                CaretShape::SteadyBlock
+            };
+        }
         if self.editor_accepts_raw_paste() && !self.editor().accepts_typed_text() {
-            super::super::terminal::CaretShape::SteadyBlock
+            CaretShape::SteadyBlock
         } else {
             self.theme.caret_shape(self.ui_settings.caret_shape)
         }

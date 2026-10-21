@@ -1878,24 +1878,6 @@ mod tests {
         }
 
         #[test]
-        fn vim_k_opens_docs_and_insert_types_it() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let (mut app, _scene) = plain_app(directory.path(), "// one\n");
-            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
-            app.sync_editor_keybindings();
-            app.focus = Focus::Editor;
-
-            precision_key(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
-            precision_key(&mut app, KeyCode::Char('K'), KeyModifiers::SHIFT);
-            assert!(app.editor().source().starts_with('K'), "Insert types K");
-            precision_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-
-            precision_key(&mut app, KeyCode::Char('K'), KeyModifiers::SHIFT);
-            assert!(app.reference_panel.is_some(), "K opens Docs");
-            assert_eq!(app.focus, Focus::Panel(PanelKind::Reference));
-        }
-
-        #[test]
         fn a_learnt_ctrl_d_wins_over_page_down() {
             let directory = tempfile::tempdir().expect("temp dir");
             let (mut app, _scene) = plain_app(directory.path(), &"a\n".repeat(12));
@@ -1910,6 +1892,36 @@ mod tests {
             precision_key(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
             assert!(app.reference_panel.is_some(), "the learnt chord opens Docs");
             assert_eq!(app.focus, Focus::Panel(PanelKind::Reference));
+        }
+
+        #[test]
+        fn vim_ignores_the_caret_shape_setting() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+            app.ui_settings.caret_shape = crate::terminal::CaretShape::BlinkingBar;
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.focus = Focus::Editor;
+
+            assert_eq!(
+                app.editor_cursor_shape(),
+                crate::terminal::CaretShape::SteadyBlock,
+                "Normal uses a steady block"
+            );
+            precision_key(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            assert_eq!(
+                app.editor_cursor_shape(),
+                crate::terminal::CaretShape::SteadyBar,
+                "Insert uses a steady bar"
+            );
+
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Default;
+            app.sync_editor_keybindings();
+            assert_eq!(
+                app.editor_cursor_shape(),
+                crate::terminal::CaretShape::BlinkingBar,
+                "Default editing keeps the setting"
+            );
         }
 
         #[test]

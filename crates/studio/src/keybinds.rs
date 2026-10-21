@@ -1171,16 +1171,6 @@ pub const SHIPS_UNBOUND: &[BindAction] = &[
     BindAction::FocusTimeline,
 ];
 
-/// A default that exists only while the editor uses Vim keys. The base
-/// table stays untouched, so switching back restores it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum VimDefault {
-    /// The action has no default chord in Vim mode.
-    Withdrawn,
-    /// The action answers to this chord instead of its base default.
-    Binding(KeyCombo),
-}
-
 /// The keybinding table: what every action answers to, once the learner
 /// has had its say. With no overrides it is the studio's own chords.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1239,44 +1229,12 @@ impl Keybinds {
         self.effective[action as usize]
     }
 
-    /// A Vim-layer action key that the studio dispatches itself, such as K
-    /// for Docs. `None` when the action has no such default or the key moved.
-    pub(crate) fn vim_layer_action_for(&self, event: &KeyEvent) -> Option<BindAction> {
-        if self.editor_keybindings != EditorKeybindings::Vim {
-            return None;
-        }
-        BindAction::ALL.into_iter().find(|action| {
-            self.vim_layer_default(*action)
-                .is_some_and(|layer| match layer {
-                    VimDefault::Binding(combo) => {
-                        self.binding(*action) == Some(combo) && combo.matches(event)
-                    }
-                    VimDefault::Withdrawn => false,
-                })
-        })
-    }
-
-    /// Whether a key belongs to the Vim layer: an action key above, or the
-    /// page motions Ctrl+D and Ctrl+U.
+    /// Whether a key belongs to the Vim page motions. They take Ctrl+D
+    /// and Ctrl+U from the base table while Vim keys are on.
     pub(crate) fn takes_vim_layer_key(&self, event: &KeyEvent) -> bool {
         self.editor_keybindings == EditorKeybindings::Vim
-            && (self.vim_layer_action_for(event).is_some()
-                || (event.modifiers == KeyModifiers::CONTROL
-                    && matches!(event.code, KeyCode::Char('d' | 'u'))))
-    }
-
-    /// The keys the Vim layer dispatches through the studio, as the hint
-    /// filter sees them.
-    pub(crate) fn vim_layer_keys(&self) -> Vec<KeyEvent> {
-        BindAction::ALL
-            .into_iter()
-            .filter_map(|action| match self.vim_layer_default(action)? {
-                VimDefault::Binding(combo) if self.binding(action) == Some(combo) => {
-                    Some(combo.event())
-                }
-                _ => None,
-            })
-            .collect()
+            && event.modifiers == KeyModifiers::CONTROL
+            && matches!(event.code, KeyCode::Char('d' | 'u'))
     }
 
     pub(crate) fn editor_keybindings(&self) -> EditorKeybindings {
@@ -1487,14 +1445,9 @@ impl Keybinds {
             return None;
         }
         // Vim owns Ctrl+D, Ctrl+U and Ctrl+R, so Docs, Wrap and the rename
-        // chord give way. The rename chord waits for Default keys, unless
-        // another chord was learnt for it.
-        match self.vim_layer_default(action) {
-            Some(VimDefault::Withdrawn) => return None,
-            Some(VimDefault::Binding(combo)) => {
-                return self.delivers_for(action, &combo).then_some(combo);
-            }
-            None => {}
+        // chord give way. Docs answers to gd through a default mapping.
+        if self.vim_withdraws(action) {
+            return None;
         }
         std::iter::once(action.default_binding())
             .chain(action.fallback_bindings())
@@ -1504,24 +1457,14 @@ impl Keybinds {
             .find(|combo| self.delivers_for(action, combo))
     }
 
-    /// The chord a Vim motion takes from the base table, when there is one.
-    fn vim_layer_default(&self, action: BindAction) -> Option<VimDefault> {
-        if self.editor_keybindings != EditorKeybindings::Vim {
-            return None;
-        }
-        Some(match action {
-            // Vim's keyword lookup. Ctrl+D pages down instead.
-            BindAction::Docs => VimDefault::Binding(KeyCombo {
-                code: KeyCode::Char('k'),
-                control: false,
-                shift: true,
-            }),
-            // Ctrl+U pages up. Wrap stays in the menu and can be learnt.
-            BindAction::Wrap => VimDefault::Withdrawn,
-            // Ctrl+R redoes.
-            BindAction::RenameScene => VimDefault::Withdrawn,
-            _ => return None,
-        })
+    /// The base chords Vim takes while the editor uses Vim keys. The base
+    /// table stays untouched, so switching back restores it.
+    fn vim_withdraws(&self, action: BindAction) -> bool {
+        self.editor_keybindings == EditorKeybindings::Vim
+            && matches!(
+                action,
+                BindAction::Docs | BindAction::Wrap | BindAction::RenameScene
+            )
     }
 
     fn delivers_for(&self, action: BindAction, combo: &KeyCombo) -> bool {
@@ -1590,14 +1533,10 @@ impl Keybinds {
         // Reserve all preferred defaults before selecting any fallback, so
         // adapting an early row can never silently take a later row's key.
         for action in BindAction::ALL {
-            if self.is_unbound(action) || self.overridden(action) {
+            if self.is_unbound(action) || self.overridden(action) || self.vim_withdraws(action) {
                 continue;
             }
-            let combo = match self.vim_layer_default(action) {
-                Some(VimDefault::Withdrawn) => continue,
-                Some(VimDefault::Binding(combo)) => combo,
-                None => action.default_binding(),
-            };
+            let combo = action.default_binding();
             if self.delivers_for(action, &combo) && self.available(action, combo) {
                 self.effective[action as usize] = Some(combo);
             }
@@ -1606,7 +1545,7 @@ impl Keybinds {
         for action in BindAction::ALL {
             if self.is_unbound(action)
                 || self.binding(action).is_some()
-                || self.vim_layer_default(action).is_some()
+                || self.vim_withdraws(action)
             {
                 continue;
             }
@@ -1619,7 +1558,7 @@ impl Keybinds {
         for action in BindAction::ALL {
             if self.is_unbound(action)
                 || self.binding(action).is_some()
-                || self.vim_layer_default(action).is_some()
+                || self.vim_withdraws(action)
             {
                 continue;
             }
@@ -1642,10 +1581,7 @@ impl Keybinds {
             self.effective.swap(up, down);
         }
         for action in BindAction::ALL {
-            if self.is_unbound(action)
-                || self.overridden(action)
-                || self.vim_layer_default(action).is_some()
-            {
+            if self.is_unbound(action) || self.overridden(action) || self.vim_withdraws(action) {
                 continue;
             }
             if let Some(alias) = action.default_alias()
@@ -3582,17 +3518,16 @@ mod tests {
     }
 
     #[test]
-    fn vim_moves_docs_to_k_and_withdraws_wrap() {
+    fn vim_withdraws_docs_wrap_and_rename() {
         let mut binds = Keybinds::default();
         binds.set_editor_keybindings(EditorKeybindings::Vim);
-        let k = KeyCombo {
-            code: KeyCode::Char('k'),
-            control: false,
-            shift: true,
-        };
-        assert_eq!(binds.binding(BindAction::Docs), Some(k));
+        assert_eq!(binds.binding(BindAction::Docs), None);
         assert_eq!(binds.binding(BindAction::Wrap), None);
         assert_eq!(binds.binding(BindAction::RenameScene), None);
+        assert!(
+            !binds.overrules(&press(KeyCode::Char('K'), KeyModifiers::SHIFT)),
+            "K is free for a mapping"
+        );
 
         binds.set_editor_keybindings(EditorKeybindings::Default);
         assert_eq!(

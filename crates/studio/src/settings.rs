@@ -4324,7 +4324,7 @@ fn keybinds_footer_hint(
     if settings.editor_keybindings == EditorKeybindings::Vim {
         match keybind_action_at(sheet.selected) {
             Some(BindAction::Docs) => {
-                return "Vim: ⇧K · Ctrl+D pages down · Enter: rebind".to_owned();
+                return "Vim: gd (default mapping) · Ctrl+D pages down · Enter: rebind".to_owned();
             }
             Some(BindAction::Wrap) => {
                 return "Vim: no chord · Ctrl+U pages up · Enter: rebind".to_owned();
