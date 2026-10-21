@@ -435,7 +435,7 @@ const BUILT_INS: &[(&str, &str)] = &[
     ("terminal", include_str!("themes/terminal.json")),
     // The same ground with one role moved: the accent and the selection
     // take the palette's slot 1, which reads warm in palettes whose
-    // bright slot is gold. ←/→ in the picker steps between the family.
+    // bright slot is gold.
     ("terminal-warm", include_str!("themes/terminal-warm.json")),
     ("solarized", include_str!("themes/solarized.json")),
     ("ember", include_str!("themes/ember.json")),
@@ -1698,11 +1698,6 @@ fn theme_from_palette(name: &str, palette: ThemePalette) -> Theme {
 /// The name of the theme that is a different theme every time.
 pub const RANDOMIZE_THEME: &str = "randomize";
 
-/// The terminal themes: one ground and one role moved, so a palette whose
-/// bright slot reads badly as an accent still has a sibling to wear. The
-/// picker's ←/→ step between them, as they roll [`RANDOMIZE_THEME`].
-pub const TERMINAL_FAMILY: &[&str] = &["terminal", "terminal-warm"];
-
 struct ThemeRng(u32);
 impl ThemeRng {
     fn next(&mut self) -> f64 {
@@ -2000,43 +1995,6 @@ impl ThemePicker {
     /// Whether the row under the cursor is the one that rolls a new theme.
     pub fn on_randomize(&self) -> bool {
         self.selected_name() == Some(RANDOMIZE_THEME)
-    }
-
-    /// Whether the selected row belongs to [`TERMINAL_FAMILY`], whose ←/→
-    /// step between accent variants.
-    pub fn on_terminal_family(&self) -> bool {
-        self.selected_name()
-            .is_some_and(|name| TERMINAL_FAMILY.contains(&name))
-    }
-
-    /// Step to the next (or previous) family member that the current filter
-    /// shows, and answer whether the selection moved. A sibling hidden by the
-    /// filter is not reachable, which keeps ←/→ honest about what is drawn.
-    pub fn step_terminal_family(&mut self, forwards: bool) -> bool {
-        if TERMINAL_FAMILY.len() < 2 {
-            return false;
-        }
-        let Some(current) = self.selected_name() else {
-            return false;
-        };
-        let Some(at) = TERMINAL_FAMILY.iter().position(|name| *name == current) else {
-            return false;
-        };
-        let step = if forwards {
-            1
-        } else {
-            TERMINAL_FAMILY.len() - 1
-        };
-        let target = TERMINAL_FAMILY[(at + step) % TERMINAL_FAMILY.len()];
-        let shown = self.matches().position(|name| name == target);
-        let Some(index) = shown else {
-            return false;
-        };
-        if index == self.selected {
-            return false;
-        }
-        self.move_by(index as isize - self.selected as isize);
-        true
     }
 
     /// Roll the next (or previous) [`RANDOMIZE_THEME`], and answer with its seed.
@@ -3794,21 +3752,17 @@ mod tests {
         }
     }
 
-    /// The family is one ground with one role moved: a sibling that also
+    /// The warm sibling is one ground with one role moved: a theme that also
     /// changed its ground would be a different theme, not a variant of this
     /// one. Checking the whole document catches a field that drifts.
     #[test]
-    fn terminal_family_members_move_only_the_accent_and_selection() {
+    fn terminal_warm_moves_only_the_accent_and_selection() {
         let plain = Theme::built_in("terminal").expect("terminal ships");
         let mut expected: serde_json::Value =
             serde_json::from_str(&plain.to_json()).expect("plain theme is json");
         expected["name"] = "terminal-warm".into();
         expected["accent"] = "ansi1".into();
         expected["selection"] = "ansi1".into();
-        for name in TERMINAL_FAMILY {
-            let member = Theme::built_in(name).expect("a family member ships");
-            assert_eq!(member.name, *name);
-        }
         let warm = Theme::built_in("terminal-warm").expect("warm ships");
         let actual: serde_json::Value =
             serde_json::from_str(&warm.to_json()).expect("warm theme is json");

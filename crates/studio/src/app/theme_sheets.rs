@@ -165,13 +165,7 @@ impl App {
                 self.adopt_theme_opacity();
                 #[cfg(feature = "hydra")]
                 self.sync_theme_sketch();
-                // The family's arrows are not drawn on the row the way the
-                // randomize row's are, so the line underneath says them.
-                self.status = if super::super::theme::TERMINAL_FAMILY.contains(&name.as_str()) {
-                    format!("theme - {name} · ←/→ swaps the accent")
-                } else {
-                    format!("theme - {name}")
-                };
+                self.status = format!("theme - {name}");
             }
             Err(error) => self.status = format!("theme {name}: {error}"),
         }
@@ -1210,17 +1204,13 @@ impl App {
                 picker.roll_randomize(code == KeyCode::Right);
                 self.schedule_theme_preview();
             }
-            // The terminal family is a row with siblings: ←/→ step between
-            // the accent variants it offers, the way they roll the
-            // randomize row above. On every other row ←/→ do nothing, but
-            // are still the picker's keys and are swallowed here. If they
-            // fell through, they would move the caret in the score under
-            // the sheet, where nobody can see it.
-            KeyCode::Left | KeyCode::Right if picker.on_terminal_family() => {
-                if picker.step_terminal_family(code == KeyCode::Right) {
-                    self.schedule_theme_preview();
-                }
-            }
+            // ↑/↓ walk the list. ←/→ do not: they belong to the randomize
+            // row above, the one place the list is infinite in both
+            // directions.
+            //
+            // They are still the picker's keys and are swallowed here. If
+            // they fell through, they would move the caret in the score
+            // under the sheet, where nobody can see it.
             KeyCode::Left | KeyCode::Right => {}
             KeyCode::Up => {
                 picker.move_by(-1);
@@ -1511,84 +1501,6 @@ mod tests {
                 "Right did not roll the randomize row"
             );
             assert!(picker.rolled, "the back arrow never appears");
-        }
-
-        /// The terminal rows are one family: ←/→ step between the accent
-        /// variants the same way ↑/↓ walk the list everywhere else. The
-        /// preview follows, so a player can flip and watch the accent move.
-        #[test]
-        fn the_terminal_family_steps_with_left_and_right() {
-            let directory = tempfile::tempdir().expect("temp dir");
-            let mut app = app_over(directory.path());
-            app.toggle_theme_picker();
-            let mut steps = 0;
-            while app
-                .theme_picker
-                .as_ref()
-                .expect("picker open")
-                .selected_name()
-                != Some("terminal")
-            {
-                press(&mut app, KeyCode::Down, KeyModifiers::NONE);
-                steps += 1;
-                assert!(steps < 200, "the terminal row is reachable");
-            }
-            assert!(
-                app.theme_picker
-                    .as_ref()
-                    .expect("picker")
-                    .on_terminal_family()
-            );
-            app.theme_apply_due = None;
-            app.preview_theme();
-            assert_eq!(app.theme.name, "terminal");
-
-            press(&mut app, KeyCode::Right, KeyModifiers::NONE);
-            let picker = app.theme_picker.as_ref().expect("picker");
-            assert_eq!(picker.selected_name(), Some("terminal-warm"));
-            assert!(
-                app.theme_apply_due.is_some(),
-                "the step must schedule the preview, as the list does"
-            );
-            app.theme_apply_due = None;
-            app.preview_theme();
-            assert_eq!(
-                app.theme.name, "terminal-warm",
-                "Right previews the sibling"
-            );
-            assert!(
-                app.status.contains("swaps the accent"),
-                "the family's arrows are announced: {}",
-                app.status
-            );
-
-            press(&mut app, KeyCode::Left, KeyModifiers::NONE);
-            assert_eq!(
-                app.theme_picker.as_ref().expect("picker").selected_name(),
-                Some("terminal")
-            );
-            app.theme_apply_due = None;
-            app.preview_theme();
-            assert_eq!(app.theme.name, "terminal", "Left steps back");
-
-            // A filter that hides the sibling leaves nothing to step to.
-            // The key is still swallowed, and no preview is scheduled.
-            // The dash keeps "swarm" out, so this row is the only match.
-            for character in "-warm".chars() {
-                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
-            }
-            assert_eq!(
-                app.theme_picker.as_ref().expect("picker").selected_name(),
-                Some("terminal-warm")
-            );
-            app.theme_apply_due = None;
-            press(&mut app, KeyCode::Right, KeyModifiers::NONE);
-            assert_eq!(
-                app.theme_picker.as_ref().expect("picker").selected_name(),
-                Some("terminal-warm"),
-                "a hidden sibling is not reachable"
-            );
-            assert!(app.theme_apply_due.is_none(), "no preview was scheduled");
         }
 
         /// The picker's modified E opens the editor. A built-in theme arrives

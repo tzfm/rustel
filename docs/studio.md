@@ -588,10 +588,9 @@ Webcam input is off by default and needs explicit consent in Settings.
 Every colour also accepts `reset` for the terminal default and `ansiN` for
 palette slot N, so a theme can wear the palette the terminal already carries.
 The built-in `terminal` theme is exactly that: a studio that looks like the
-rest of your terminal, Kitty scheme or Noctalia template included. Its family
-has two members: `terminal` takes the bright slot 12 for its accent, and
-`terminal-warm` moves the accent and the selection to slot 1. The picker's
-Left and Right step between them, so a palette whose bright slot reads badly
+rest of your terminal, Kitty scheme or Noctalia template included. It takes
+the bright slot 12 for its accent. Its sibling, `terminal-warm`, moves the
+accent and the selection to slot 1, so a palette whose bright slot reads badly
 as an accent has another to wear. Two things follow from a colour the studio
 cannot measure. A theme that keeps `reset` as its ground should set
 `event_mark` to `underline`, as `terminal` does, because a tint has no ground
