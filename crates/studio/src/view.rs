@@ -307,8 +307,8 @@ pub struct SceneChip {
     pub name: String,
     /// On screen right now.
     pub current: bool,
-    /// The other pane holds this scene, so a click on its chip only
-    /// says which pane it is in.
+    /// The other pane holds this scene: a click on its chip moves the caret
+    /// there.
     pub other_pane: bool,
     /// The generation the engine is playing came from this scene.
     pub playing: bool,

@@ -104,26 +104,6 @@ impl App {
         true
     }
 
-    /// A click on a scene chip puts the scene in the focused pane. A scene
-    /// the other pane shows stays there, and the caret stays here: a scene
-    /// has one caret, so two panes do not show the same scene.
-    pub(super) fn click_scene_chip(&mut self, index: usize) {
-        let elsewhere = self.scenes.scenes().get(index).and_then(|scene| {
-            let pane = self.panes.iter().position(|pane| pane.scene == scene.id)?;
-            (pane != self.focused).then(|| (pane, scene.name()))
-        });
-        let Some((pane, name)) = elsewhere else {
-            self.select_scene(index);
-            return;
-        };
-        self.status = format!(
-            "{name:?} is open in the {} pane - {} goes there",
-            if pane == 0 { "left" } else { "right" },
-            self.shortcut_or_menu(BindAction::HopPane, "View > Switch pane")
-        );
-        self.dirty_frame = true;
-    }
-
     pub(super) fn step_scene(&mut self, delta: isize) {
         if self.replay_view.is_some() {
             self.status = format!(
@@ -464,8 +444,8 @@ impl App {
                 replay: scene.is_replay(),
                 name: scene.name(),
                 current: index == self.scenes.current_index(),
-                // A click on this chip does not choose the scene; it says
-                // which pane holds it. The chip says that first, in colour.
+                // A click on this chip moves the caret to the pane that has
+                // the scene. The chip says which one is open, in colour.
                 other_pane: self
                     .panes
                     .iter()
