@@ -21,8 +21,9 @@ update fails, the last good score keeps playing. An update that changes nothing
 leaves the file, and its changed date, alone, so a set you only opened and played
 stays as it was.
 
-Use one editor for each score file. Studio does not detect external file
-changes or merge them with unsaved edits.
+Use one editor for each score file. Studio does not merge external edits with
+unsaved edits. See [External changes](#external-changes) to follow saves from
+another program.
 
 ## Shortcuts
 
@@ -282,6 +283,26 @@ or cycle holds it for the line the row names, and the header shows the
 
 Auto evaluate works while the set plays. A stopped set stays stopped, so
 Ctrl+S remains how playback starts.
+
+### External changes
+
+Another program can edit score files in the set. Choose watch external changes
+in Settings ▸ Live coding. Off is the default.
+
+`sync` watches the score in the active tab. It puts the file's text in the
+editor and leaves the playing score alone.
+
+`sync & eval` watches every `.strudel` file in the set folder and every open
+score. When a file is saved, Studio opens its tab, or selects it if it is
+already open, and evaluates the text as an update would. It plays even when the
+set is stopped.
+
+Studio checks each watched file's size and modification time ten times a second
+and reads it after a change stays put for one check. A save made by Studio
+itself is ignored.
+
+A save from another program that changes the text replaces the open editor's
+text, including edits that are not saved yet. Studio does not merge the two.
 
 ### Stopping
 
