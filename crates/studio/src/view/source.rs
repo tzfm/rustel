@@ -25,9 +25,10 @@ pub(crate) fn gutter_width(editor: &Editor, numbered: bool) -> u16 {
 }
 
 /// The name row over a pane in split view: which scene it shows, whether
-/// it is the sounding one, and whether the caret is here.
+/// it is the sounding one, and whether the caret is here. Titles focus their
+/// pane, and that is all they do: no click plays a scene. A pad does, and so
+/// does an update.
 pub(super) struct PaneTitle<'a> {
-    pub keybinds: &'a crate::keybinds::Keybinds,
     pub(super) name: &'a str,
     pub(super) dirty: bool,
     pub(super) playing: bool,
@@ -80,33 +81,7 @@ impl Widget for PaneTitle<'_> {
                 },
             )
         };
-        let title_width = UnicodeWidthStr::width(text.as_str());
         buffer.set_stringn(area.x, area.y, text, usize::from(area.width), style);
-        // Titles focus their pane, and that is all they do: no click
-        // plays a scene. A pad does, and so does an update.
-        if self.focused {
-            return;
-        }
-        let Some(binding) = self
-            .keybinds
-            .hint_binding(crate::keybinds::BindAction::HopPane)
-        else {
-            return;
-        };
-        let switch = format!("{} switches", binding.hint());
-        let hints: &[&str] = &[&switch];
-        if let Some((hint, width)) = hints.iter().find_map(|&hint| {
-            let width = UnicodeWidthStr::width(hint);
-            (usize::from(area.width) >= title_width + width + 2).then_some((hint, width as u16))
-        }) {
-            buffer.set_stringn(
-                area.right().saturating_sub(width + 1),
-                area.y,
-                hint,
-                usize::from(width),
-                Style::default().fg(theme.muted),
-            );
-        }
     }
 }
 
@@ -2126,36 +2101,5 @@ mod tests {
                 .all(|row| matches!(row, ScreenRow::Virtual(_)))
         );
         assert_eq!(visible_rows(&map), (4, 7));
-    }
-    #[test]
-    fn pane_title_advertises_only_the_active_switch_binding() {
-        use crate::keybinds::{BindAction, KeyCombo, Keybinds};
-        let theme = Theme::built_in_default();
-        let draw = |keybinds: &Keybinds| {
-            let area = Rect::new(0, 0, 70, 1);
-            let mut buffer = Buffer::empty(area);
-            PaneTitle {
-                keybinds,
-                name: "verse",
-                dirty: false,
-                playing: false,
-                focused: false,
-                prebake: false,
-                replay: false,
-                theme: &theme,
-            }
-            .render(area, &mut buffer);
-            buffer
-                .content
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>()
-        };
-        let mut bindings = Keybinds::default();
-        bindings.learn(BindAction::HopPane, KeyCombo::parse("f2"));
-        assert!(draw(&bindings).contains("F2 switches"));
-        assert!(!draw(&bindings).contains("F10"));
-        bindings.unbind(BindAction::HopPane);
-        assert!(!draw(&bindings).contains("switches"));
     }
 }

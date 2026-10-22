@@ -858,7 +858,6 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
         if !region.title.is_empty() {
             frame.render_widget(
                 PaneTitle {
-                    keybinds: chrome.keybinds,
                     name: &pane.name,
                     dirty: pane.dirty,
                     playing: pane.playing,
@@ -3302,7 +3301,6 @@ mod tests {
         let titles = row(layout.panes[0].title.y);
         assert!(titles.contains("▶ intro"), "{titles}");
         assert!(titles.contains("drop ●"), "{titles}");
-        assert!(titles.contains("F10 switches"), "{titles}");
         assert!(
             !titles.contains("plays"),
             "a title does not play its scene: {titles}"

@@ -634,7 +634,6 @@ mod tests {
         .render(area, &mut strip);
         let mut title = Buffer::empty(area);
         PaneTitle {
-            keybinds: &crate::keybinds::Keybinds::default(),
             name: "scene 1 2",
             dirty: false,
             playing: false,
