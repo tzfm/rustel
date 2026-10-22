@@ -25,6 +25,7 @@ pub mod jobs;
 /// The one shortcut table: what every chord means, and the Settings page
 /// that changes it.
 pub mod keybinds;
+pub mod knobs_panel;
 pub mod lint;
 pub mod log;
 pub mod memory;
@@ -32,6 +33,7 @@ pub mod menu;
 pub mod meter;
 pub mod minimap;
 pub mod mixer_panel;
+pub mod number_form;
 pub mod pads;
 mod performance;
 mod piano;

@@ -67,6 +67,22 @@ pub struct ParamInfo {
     pub steps: u32,
     /// The value at the start as the plugin prints it.
     pub default_text: String,
+    /// What the parameter is to a host, as the plugin marks it.
+    pub role: ParamRole,
+}
+
+/// What a parameter is to a host, as the plugin marks it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ParamRole {
+    /// A parameter of the sound.
+    #[default]
+    Plain,
+    /// The dry/wet mix, as the plugin names it to a host.
+    Mix,
+    /// The plugin's own bypass.
+    Bypass,
+    /// The plugin's program change.
+    Program,
 }
 
 impl ParamInfo {

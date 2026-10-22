@@ -86,6 +86,9 @@ pub enum BindAction {
     Jobs,
     Memory,
     Export,
+    /// The knobs column: a rail for each numeric parameter of the call
+    /// at the caret.
+    Knobs,
     SmartAction,
     Split,
     HopPane,
@@ -134,7 +137,7 @@ pub enum BindAction {
 
 impl BindAction {
     /// Every action, in the order the Keybinds page lists them.
-    pub const ALL: [BindAction; 58] = [
+    pub const ALL: [BindAction; 59] = [
         // Transport
         Self::Evaluate,
         Self::Stop,
@@ -161,6 +164,7 @@ impl BindAction {
         Self::Jobs,
         Self::Memory,
         Self::Export,
+        Self::Knobs,
         Self::SmartAction,
         Self::Split,
         Self::HopPane,
@@ -229,6 +233,7 @@ impl BindAction {
             Self::Jobs => "jobs",
             Self::Memory => "memory",
             Self::Export => "export",
+            Self::Knobs => "knobs",
             Self::SmartAction => "smart-action",
             Self::Split => "split",
             Self::HopPane => "hop-pane",
@@ -300,6 +305,7 @@ impl BindAction {
             Self::Jobs => "background jobs",
             Self::Memory => "memory breakdown",
             Self::Export => "export scene",
+            Self::Knobs => "knobs column",
             Self::SmartAction => "quick action",
             Self::Split => "split the editor",
             Self::HopPane => "hop between panes",
@@ -395,6 +401,9 @@ impl BindAction {
             Self::Visualizers => plain(F(12)), // unused: ships unbound; learn a key on the Keybinds page
             Self::OpenGlobalPrebake => plain(F(12)), // unused: ships unbound; open from Options or learn a key
             Self::OpenLocalPrebake => plain(F(12)), // unused: ships unbound; open from Options or learn a key
+            // K for knobs, beside ^K's zen. A terminal that cannot send ^⇧K
+            // apart from ^K gets one of the spare keys instead.
+            Self::Knobs => ctrl_shift(Char('k')),
             Self::Export => ctrl_shift(Char('x')),
             Self::SmartAction => ctrl(Char('j')),
             Self::Split => ctrl(Char('e')),
@@ -1149,11 +1158,17 @@ pub enum KeybindCapture {
     },
 }
 
+/// The actions that keep their default where the terminal can send it, and
+/// take no spare key where it cannot. The knobs column opens from View ▸
+/// Knobs too, so a legacy terminal's few spare keys stay with the actions
+/// that have no other door.
+pub const NO_SPARE_KEY: &[BindAction] = &[BindAction::Knobs];
+
 /// The actions the studio ships with no chord, on purpose. Background jobs
 /// and Memory open from their View menu rows, and the memory breakdown from
 /// the header's figures too. The prebakes open from the Options menu. They
 /// are looked at now and then, not played, and every plain function key and
-/// Ctrl letter already means something a set is performed with; a player
+/// Ctrl letter already means something a set is performed with. A player
 /// who wants one learns it in Settings ▸ Keybinds.
 ///
 /// The panel actions ship with no chord in the table too. Each one answers
@@ -1559,6 +1574,7 @@ impl Keybinds {
             if self.is_unbound(action)
                 || self.binding(action).is_some()
                 || self.vim_withdraws(action)
+                || NO_SPARE_KEY.contains(&action)
             {
                 continue;
             }
@@ -2280,6 +2296,7 @@ mod tests {
                 ("export", "cut"),
                 ("find", "redo"),
                 ("forget-pad", "learn-pad"),
+                ("knobs", "zen-mode"),
                 ("open-set", "settings"),
                 ("record-take", "rename-scene"),
                 ("redo", "undo"),
@@ -2332,6 +2349,8 @@ mod tests {
                     ("find", "^⇧F2".to_owned()),
                     ("first-error", "\u{21e7}F4".to_owned()),
                     ("forget-pad", "\u{21e7}F8".to_owned()),
+                    // Its menu row stays its door: no spare key.
+                    ("knobs", String::new()),
                     ("next-scene", "F7".to_owned()),
                     ("open-set", "\u{21e7}F6".to_owned()),
                     ("previous-scene", "F6".to_owned()),
@@ -2946,6 +2965,14 @@ mod tests {
                     for action in BindAction::ALL {
                         if SHIPS_UNBOUND.contains(&action) {
                             assert_eq!(binds.binding(action), None);
+                            continue;
+                        }
+                        // Its default where the terminal sends it, or nothing.
+                        if NO_SPARE_KEY.contains(&action) {
+                            if let Some(combo) = binds.binding(action) {
+                                assert_eq!(combo, action.default_binding());
+                                assert!(reach.delivers(&combo));
+                            }
                             continue;
                         }
                         let combo = binds.binding(action).unwrap_or_else(|| panic!(

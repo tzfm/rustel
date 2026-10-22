@@ -35,7 +35,11 @@ pub(super) const COMPRESSOR: ControlRow = ControlRow {
         synonyms: &[],
         summary: "Dynamics Compressor.",
         description: "Dynamics Compressor. The params are `compressor(\"threshold:ratio:knee:attack:release\")`\nMore info [here](https://developer.mozilla.org/en-US/docs/Web/API/DynamicsCompressorNode?retiredLocale=de#instance_properties)\n\nThe stage is absent until compressor supplies a threshold in dB, clamped to -100..0. The secondary parameters alone do not create it. Ratio/knee/attack/release default to 10, 10 dB, 0.005 seconds, and 0.05 seconds. These are effects on any native audio source, including oscillators, wavetables, samples, `gm_*` soundfonts, and live input.",
-        params: &[],
+        params: &[ReferenceParam {
+            name: "threshold",
+            r#type: "number | string | Pattern",
+            description: "in dB from -100 to 0, or the whole threshold:ratio:knee:attack:release string",
+        }],
         examples: &[
             "s(\"bd sd [~ bd] sd,hh*8\")\n.compressor(\"-20:20:10:.002:.02\")",
         ],

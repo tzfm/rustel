@@ -46,6 +46,7 @@ Use these alternatives if the terminal or operating system takes a shortcut.
 | Master volume | ^⇧↑ / ^⇧↓; Ctrl+F12 / Ctrl+F11 |
 | Slider under the caret | Alt+↑ / Alt+↓ |
 | Quick action at the caret | ^J |
+| Knobs column | ^⇧K; View ▸ Knobs |
 | Zen mode | ^K or F11 |
 | Word wrap | ^U |
 | Previous / next scene | ^[ / ^]; F6 / F7 |
@@ -524,6 +525,104 @@ The sliders page in Settings can bind a MIDI knob or controller axis to a
 slider. The keybinds page can bind a button to any studio action, Update and
 Stop included. See [hardware](hardware.md) for setup. Terminals that report
 pixel positions give finer mouse control; other terminals use cell positions.
+A drag lands on a whole number when the cell or the pixel under the pointer
+holds one that the slider's steps reach.
+
+## Knobs
+
+View ▸ Knobs or ^⇧K opens a column beside the score. It reads the call the
+caret is in, and its top row names that call. Its numbers show as sliders:
+each plain numeric argument, each `slider(...)` argument, and each numeric
+entry of an options object. A plain argument goes by the name the reference
+gives it, such as `frequency` for `lpf(800)`. A different call under the
+caret moves the rails with it. The column stays while you edit. Esc returns
+the keyboard to the score, and ^⇧K closes the column. A terminal that cannot
+tell ^⇧K from ^K uses View ▸ Knobs.
+
+Options objects belong to calls that take them, such as
+`set({ cutoff: 800, resonance: 5 })` and `vst("Name", { mix: 0.5 })`. An
+audio control such as `lpf` takes a number: `lpf(800)` has a rail, and
+`lpf({ cutoff: 800 })` has none, because the engine refuses that note.
+
+A rail writes the score in place as you move it. With auto evaluate on, you
+hear the change after the typing pause. If the score already holds a
+`slider(value, min, max, step)`, the rail moves its value argument and keeps
+the call. The score is the master. The column only edits what is written.
+
+A number with no `slider(...)` gets bounds the studio works out:
+
+- A plugin parameter travels 0 to 1, the numbers a `vst` call takes.
+- A function or a control travels the numbers its reference gives it. A
+  count moves in whole numbers: `seg(16)`, `ply(3)`, `chop(8)` and
+  `euclid(3, 8)` never land between two. A speed such as `fast(1.5)` moves
+  in quarters, a place in the cycle such as `off(0.125)` in sixteenths, a
+  chance such as `degradeBy(0.3)` in hundredths, and `lpf` from 20 to 20000
+  Hz on a log scale. A number past the travel, such as `seg(128)`, widens
+  it.
+- Any other number up to 1 travels 0 to 1. A larger number travels from 0
+  to a round number at least twice its value, in whole steps when it is a
+  whole number. A negative number travels the same way below zero.
+
+The bounds stay put while the caret stays in the call, so a value pushed to
+the top does not widen its rail. Each rail keeps its row too: an entry that
+goes off, comes back or moves in the object does not push the others. Press
+Enter to set your own bounds. The studio keeps them for that call name and
+parameter.
+
+← and → move a rail one notch, as the score's own sliders move. A notch is
+one step on a rail of up to 200 steps. On a longer rail it is about a
+hundredth of the travel, in 1, 2 or 5 steps times a power of ten, and on a
+log rail a hundredth of the travel. A notch stops on its own grid, so a
+value with a fraction, such as 16.3, comes back to 16.5 and 17. Shift+← and
+Shift+→ move one step. A drag lands on a whole number when the cell or the
+pixel under the pointer holds one that the rail's steps reach. It holds the
+rail it started on: the pointer can leave the column, and the rail follows
+it until you let go.
+
+The far left of a rail is an off stop. On an object entry it takes the entry
+out of the score and leaves its comments where they are. Backspace or
+Delete does the same. The column's last two rows name the keys: the first
+for the rail under the hand, the second for the call. The rail dims at the off stop, and a move right writes the entry back
+as it was. If you edit the call while the entry is off, the entry comes back
+at the front of the object. A plain numeric argument has no off stop,
+because the call needs it. Home moves it to the bottom of its rail.
+
+Press Enter to type an exact value, with min, max and step in the same form. A
+value below min or above max moves that bound to it. The form writes what the
+score keeps: a plain number changes the literal, and on a
+`slider(...)` argument it rewrites the call's own bounds.
+
+On a `vst(...)` or `vsti(...)` call, press `a` for the plugin's parameter list.
+It opens over the score beside the column. Type to search, and press Enter or
+click a name to add it as a rail at its default value. The wheel and the
+trackpad scroll the list. Plugin values show and write three decimals at
+most. The choice is kept in the studio's settings, so the same plugin shows
+the same rails in every set. Delete in the list forgets a kept choice, and
+Delete on a kept rail that is off takes it off the column.
+
+Before you choose, a plugin call shows up to 10 suggested rails, off until
+you move one. A host cannot see a plugin's window, so the studio ranks what
+the plugin tells it: the dry/wet mix first when the plugin names one, then
+the continuous parameters in the plugin's own order, then its switches and
+lists, which are mostly modes and settings. A bypass, a program change and
+the MIDI controller stand-ins some plugins add are left out. The first rail
+you add or take off starts your own list from the suggestions you kept.
+Press `r` twice to drop your list and get the suggestions back. Any other key
+between the two keeps your list. Values in the score stay as they are.
+
+A call whose options the reference documents, such as `_pianoroll`,
+`scope`, `spectrum`, `lfo` and `env`, shows up to 10 of its documented keys
+as rails, in the order of the reference. A key the score does not hold is
+off until you move it. It comes on at the value the call already uses, so
+the sound and the picture stay the same until the next move. For a painter,
+that is the value the terminal uses. A key with no such value, such as
+`sync` of `lfo`, is in the `a` list only, and it comes on at the middle of
+its travel. A key written by its alias, such as `a` for the `attack` of
+`env`, or in another case, is that key. Press `a` for the full list. Enter
+or a click adds a key, and a call with nothing in it, such as
+`_pianoroll()`, gets the object. A key the score already holds stays as it
+is. A key that takes text, such as a colour, a key the terminal ignores,
+and the FX stage index `fxi` have no rail.
 
 ## Mixer and limiter
 

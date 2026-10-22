@@ -373,7 +373,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
             ReferenceParam {
                 name: "config.depth",
                 r#type: "number | Pattern",
-                description: "Relative modulation depth. Aliases: dep, dr",
+                description: "Relative modulation depth. Defaults to 1. Aliases: dep, dr",
             },
             ReferenceParam {
                 name: "config.depthabs",
@@ -383,7 +383,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
             ReferenceParam {
                 name: "config.dc",
                 r#type: "number | Pattern",
-                description: "DC offset prior to application",
+                description: "DC offset prior to application. Defaults to 0.",
             },
             ReferenceParam {
                 name: "config.fxi",
@@ -762,7 +762,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
             ReferenceParam {
                 name: "config.depth",
                 r#type: "number | Pattern",
-                description: "Relative modulation depth. Aliases: dep, dr",
+                description: "Relative modulation depth. Defaults to 1. Aliases: dep, dr",
             },
             ReferenceParam {
                 name: "config.depthabs",
@@ -772,37 +772,37 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
             ReferenceParam {
                 name: "config.attack",
                 r#type: "number | Pattern",
-                description: "Time to reach depth. Aliases: att, a",
+                description: "Time to reach depth. Defaults to 0.005. Aliases: att, a",
             },
             ReferenceParam {
                 name: "config.decay",
                 r#type: "number | Pattern",
-                description: "Time to reach sustain. Aliases: dec, d",
+                description: "Time to reach sustain. Defaults to 0.14. Aliases: dec, d",
             },
             ReferenceParam {
                 name: "config.sustain",
                 r#type: "number | Pattern",
-                description: "Sustain depth. Aliases: sus, s",
+                description: "Sustain depth. Defaults to 0. Aliases: sus, s",
             },
             ReferenceParam {
                 name: "config.release",
                 r#type: "number | Pattern",
-                description: "Time to return to nominal value. Aliases: rel, r",
+                description: "Time to return to nominal value. Defaults to 0.1. Aliases: rel, r",
             },
             ReferenceParam {
                 name: "config.acurve",
                 r#type: "number | Pattern",
-                description: "Snappiness of attack curve (-1 = relaxed, 1 = snappy). Aliases: ac",
+                description: "Snappiness of attack curve (-1 = relaxed, 1 = snappy). Defaults to 0. Aliases: ac",
             },
             ReferenceParam {
                 name: "config.dcurve",
                 r#type: "number | Pattern",
-                description: "Snappiness of decay curve (-1 = relaxed, 1 = snappy). Aliases: dc",
+                description: "Snappiness of decay curve (-1 = relaxed, 1 = snappy). Defaults to 0. Aliases: dc",
             },
             ReferenceParam {
                 name: "config.rcurve",
                 r#type: "number | Pattern",
-                description: "Snappiness of release curve (-1 = relaxed, 1 = snappy). Aliases: rc",
+                description: "Snappiness of release curve (-1 = relaxed, 1 = snappy). Defaults to 0. Aliases: rc",
             },
             ReferenceParam {
                 name: "config.fxi",
@@ -1233,7 +1233,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
             ReferenceParam {
                 name: "config.rate",
                 r#type: "number | Pattern",
-                description: "Modulation rate. Aliases: r",
+                description: "Modulation rate. Defaults to 1. Aliases: r",
             },
             ReferenceParam {
                 name: "config.sync",
@@ -1243,7 +1243,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
             ReferenceParam {
                 name: "config.depth",
                 r#type: "number | Pattern",
-                description: "Relative modulation depth. Aliases: dep, dr",
+                description: "Relative modulation depth. Defaults to 1. Aliases: dep, dr",
             },
             ReferenceParam {
                 name: "config.depthabs",
@@ -1253,27 +1253,27 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
             ReferenceParam {
                 name: "config.dcoffset",
                 r#type: "number | Pattern",
-                description: "DC offset / bias for the waveform. Aliases: dc",
+                description: "DC offset / bias for the waveform. Defaults to -0.5. Aliases: dc",
             },
             ReferenceParam {
                 name: "config.shape",
                 r#type: "number | string | Pattern",
-                description: "triangle/tri (0), sine (1), ramp (2), saw (3), or square (4). Alias: sh",
+                description: "triangle/tri (0), sine (1), ramp (2), saw (3), or square (4). Defaults to 0. Alias: sh",
             },
             ReferenceParam {
                 name: "config.skew",
                 r#type: "number | Pattern",
-                description: "Skew amount. Aliases: sk",
+                description: "Skew amount. Defaults to 0.5. Aliases: sk",
             },
             ReferenceParam {
                 name: "config.curve",
                 r#type: "number | Pattern",
-                description: "Exponential curve amount. Aliases: cu",
+                description: "Exponential curve amount. Defaults to 1. Aliases: cu",
             },
             ReferenceParam {
                 name: "config.retrig",
                 r#type: "number | Pattern",
-                description: "If > 0.5, the LFO will retrigger on each event. Aliases: rt",
+                description: "If > 0.5, the LFO will retrigger on each event. Defaults to 0. Aliases: rt",
             },
             ReferenceParam {
                 name: "config.fxi",
@@ -1331,7 +1331,11 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         synonyms: &["loopat"],
         summary: "Makes the sample fit the given number of cycles by changing the speed.",
         description: "Makes the sample fit the given number of cycles by changing the speed.",
-        params: &[],
+        params: &[ReferenceParam {
+            name: "factor",
+            r#type: "number | Pattern",
+            description: "number of cycles to fit the sample into",
+        }],
         examples: &[
             "samples({ rhodes: 'https://cdn.freesound.org/previews/132/132051_316502-lq.mp3' })\ns(\"rhodes\").loopAt(2)",
         ],

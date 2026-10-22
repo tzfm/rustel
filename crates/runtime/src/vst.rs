@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use rustel_audio::InsertControls;
 pub use rustel_vst3::{
-    Host, ParamInfo, PluginInfo, Resolved, ScanProgress, Status, canonical, serve,
+    Host, ParamInfo, ParamRole, PluginInfo, Resolved, ScanProgress, Status, canonical, serve,
 };
 
 /// Folders with plugins, in place of the standard VST3 folders of the

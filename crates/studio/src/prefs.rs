@@ -257,6 +257,20 @@ pub struct StudioPrefs {
     pub slider_smoothing: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frequency_slider_log: Option<bool>,
+    /// The bounds a knob's form set for it, keyed by the call and the
+    /// parameter: `set:cutoff` for an object entry, `ring:#0` for the
+    /// first positional argument. Text rather than numbers, so the file
+    /// keeps what the form wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knob_ranges: Option<std::collections::BTreeMap<String, KnobRange>>,
+    /// The parameters chosen for a plugin's knobs panel: plugin name →
+    /// the keys the score writes. The same plugin shows the same rails
+    /// in every set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vst_knobs: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    /// The knobs column is open, and comes back open at the next launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knobs_panel: Option<bool>,
     /// The twelve mapping slots, in order: the MIDI knob (`cc74/ch2`) or
     /// the gamepad axis (`x1`) that drives each one, `off` for a slot
     /// nobody has bound. Slot `n` drives the `n`th slider of whatever
@@ -435,6 +449,14 @@ pub(super) fn names_below(folder: &std::path::Path, path: &std::path::Path) -> O
 
 /// The most sets Open recent offers.
 pub const RECENT_SETS: usize = 8;
+
+/// One remembered bound of a knob, as its form wrote it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct KnobRange {
+    pub min: String,
+    pub max: String,
+    pub step: String,
+}
 
 impl Default for StudioPrefs {
     fn default() -> Self {

@@ -11,7 +11,8 @@ use std::collections::BTreeSet;
 
 use rustel_runtime::vst::{ParamInfo, PluginInfo, Status, canonical};
 
-use super::{Reference, ReferencePanel};
+use super::{Reference, ReferencePanel, score_key};
+use crate::number_form::short_number;
 
 /// One row of the vst tab: a plugin, or a row under the open plugin.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,7 +89,7 @@ pub fn key_words(params: &[ParamInfo]) -> (Vec<String>, Vec<String>) {
 /// punctuation do not count, a part of a name is enough, and the shortest
 /// name with the part leads. The names the list search finds follow, so a
 /// name with a typing error still has an answer.
-pub(super) fn rank_names(query: &str, names: &[String]) -> Vec<usize> {
+pub fn rank_names(query: &str, names: &[String]) -> Vec<usize> {
     let wanted = canonical(query);
     let mut ranked: Vec<usize> = Vec::new();
     if !wanted.is_empty() {
@@ -171,27 +172,6 @@ impl ReferencePanel {
             self.selected = self.row_of_result(result);
         }
         true
-    }
-}
-
-/// A value from 0 to 1 in the form a score writes: 3 decimals at most.
-fn short_number(value: f64) -> String {
-    let text = format!("{value:.3}");
-    text.trim_end_matches('0').trim_end_matches('.').to_owned()
-}
-
-/// A parameter key in the form a score writes in the object of a plugin
-/// call: a name or a number as is, each other key in single quotes. A score
-/// reads a key in double quotes as mini-notation.
-fn score_key(key: &str) -> String {
-    let word = |char: char| char.is_ascii_alphanumeric() || char == '_';
-    let name = key.starts_with(|char: char| char.is_ascii_alphabetic() || char == '_')
-        && key.chars().all(word);
-    let number = !key.is_empty() && key.chars().all(|char| char.is_ascii_digit());
-    if name || number {
-        key.to_owned()
-    } else {
-        format!("'{}'", key.replace('\\', "\\\\").replace('\'', "\\'"))
     }
 }
 
@@ -619,6 +599,7 @@ mod tests {
             default: 0.5,
             steps: 0,
             default_text: "0.5".into(),
+            role: Default::default(),
         }
     }
 

@@ -390,6 +390,20 @@ impl App {
                     self.handle_memory_key(code, primary)
                 }
             }
+            // The knobs column keeps the keyboard the same way: on screen
+            // or waiting for its first layout, and Esc hands it back to
+            // the score when the layout found it no room.
+            PanelKind::Knobs => {
+                if !self.knobs_unlaid && self.regions.knobs.is_empty() {
+                    if code == KeyCode::Esc {
+                        self.focus = Focus::Editor;
+                        self.dirty_frame = true;
+                    }
+                    code == KeyCode::Esc
+                } else {
+                    self.handle_knobs_key(code, primary, shift, alt)
+                }
+            }
         })
     }
 
@@ -1048,6 +1062,17 @@ impl App {
             && !self.settings_hold_the_keys()
         {
             self.toggle_mixer_panel();
+            return true;
+        }
+        // The knobs column: K for knobs, beside ^K's zen, where the
+        // terminal tells ^⇧K from ^K.
+        if primary
+            && shift
+            && letter == Some('k')
+            && !self.key_is_a_learnt_chord(key)
+            && !self.settings_hold_the_keys()
+        {
+            self.toggle_knobs_panel();
             return true;
         }
         if primary && shift && letter == Some('x') && !self.key_is_a_learnt_chord(key) {

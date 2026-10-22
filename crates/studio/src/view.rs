@@ -117,6 +117,9 @@ pub enum PanelKind {
     Mixer,
     /// The memory breakdown, a band along the top or the bottom.
     Memory,
+    /// The knobs column, a rail for each numeric parameter of the call
+    /// at the caret.
+    Knobs,
 }
 
 impl PanelKind {
@@ -135,6 +138,7 @@ impl PanelKind {
             Self::Viz => "visuals",
             Self::Mixer => "mixer",
             Self::Memory => "memory",
+            Self::Knobs => "knobs",
         }
     }
 }
@@ -647,6 +651,9 @@ pub struct StudioView<'a> {
     pub mixer: Option<super::viz_panel::MixerFacts>,
     /// The mixer panel, while it is open.
     pub mixer_panel: Option<super::mixer_panel::MixerPanel>,
+    /// The knobs column, while it is open: each frame's reading of the
+    /// call at the caret, and what the hand is doing to it.
+    pub knobs: Option<super::knobs_panel::KnobsData<'a>>,
     /// A drag selection over the mixer's devices block, painted while its
     /// rows are still the ones on screen.
     pub mixer_selection: Option<&'a super::mixer_panel::MixerSelection>,
@@ -823,6 +830,7 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
         view.mixer_panel.map(super::mixer_panel::MixerPanel::dock),
         view.log.and_then(|(_, panel)| log_dock(panel, area)),
         view.memory.as_ref().map(|(_, dock)| *dock),
+        view.knobs.is_some(),
         u16::from(chrome.error.is_some()) + u16::from(chrome.audio_warning.is_some()),
         chrome.piano_notes.is_some(),
     );
@@ -1133,6 +1141,24 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
                 area: layout.viz[index],
                 focused: view.focused_panel == Some(PanelKind::Viz) && view.viz_focus == index,
                 mixer: view.mixer.as_ref(),
+            },
+            area,
+        );
+    }
+    // The knobs column, a fixture at the score's right edge, painted with
+    // the other fixtures and under every sheet.
+    if let Some(knobs) = view.knobs
+        && !layout.knobs.is_empty()
+    {
+        frame.render_widget(
+            super::knobs_panel::KnobsView {
+                name: knobs.name,
+                listed: knobs.listed,
+                knobs: knobs.knobs,
+                panel: knobs.panel,
+                theme,
+                focused: view.focused_panel == Some(PanelKind::Knobs),
+                area: layout.knobs,
             },
             area,
         );
@@ -1915,6 +1941,7 @@ mod tests {
                 band(Edge::Bottom, 16),
                 band(Edge::Bottom, 13),
                 memory,
+                false,
                 0,
                 false,
             )
@@ -2277,6 +2304,7 @@ mod tests {
                 None,
                 log,
                 None,
+                false,
                 0,
                 false,
             )
@@ -2627,6 +2655,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
                 0,
                 false,
             )
@@ -2706,6 +2735,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
                 notices,
                 piano,
             )
@@ -2929,6 +2959,7 @@ mod tests {
                         viz_focus: 0,
                         mixer: None,
                         mixer_panel: None,
+                        knobs: None,
                         mixer_selection: None,
                         reference_on_top: false,
                         theme_camera: None,
@@ -3053,6 +3084,7 @@ mod tests {
                         viz_focus: 0,
                         mixer: None,
                         mixer_panel: None,
+                        knobs: None,
                         mixer_selection: None,
                         reference_on_top: false,
                         theme_camera: None,
@@ -3165,6 +3197,7 @@ mod tests {
                         viz_focus: 0,
                         mixer: None,
                         mixer_panel: None,
+                        knobs: None,
                         mixer_selection: None,
                         reference_on_top: false,
                         theme_camera: None,
@@ -3298,6 +3331,7 @@ mod tests {
                         viz_focus: 0,
                         mixer: None,
                         mixer_panel: None,
+                        knobs: None,
                         mixer_selection: None,
                         reference_on_top: false,
                         theme_camera: None,

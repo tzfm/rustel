@@ -5,7 +5,7 @@
 
 use ratatui::layout::Rect;
 
-use super::super::{set_panel, viz_panel};
+use super::super::{knobs_panel, set_panel, viz_panel};
 
 /// Narrowest source pane that still gets a minimap.
 const MINIMAP_MIN_EDITOR_WIDTH: u16 = 64;
@@ -109,6 +109,10 @@ pub struct StudioRegions {
     /// True when the reference sits over the rightmost pane rather than
     /// beside it, because the terminal is too narrow for both.
     pub reference_overlays: bool,
+    /// The knobs column, a rail for each numeric parameter of the call at
+    /// the caret, when it is open and the panes keep their least. Empty in
+    /// zen, where the column refuses to open.
+    pub knobs: Rect,
     /// The notice rows, the status line and, while the footer setting is
     /// on, the meter, orbits and device chips. Empty in zen.
     pub footer: Rect,
@@ -310,6 +314,7 @@ pub fn regions_with(
         mixer,
         log,
         None,
+        false,
         0,
         false,
     )
@@ -337,6 +342,7 @@ pub fn regions_with_footer(
     mixer: Option<viz_panel::Dock>,
     log: Option<viz_panel::Dock>,
     memory: Option<viz_panel::Dock>,
+    knobs: bool,
     notice_rows: u16,
     has_piano_notes: bool,
 ) -> StudioRegions {
@@ -354,6 +360,7 @@ pub fn regions_with_footer(
             mixer,
             log,
             memory,
+            knobs,
             notice_rows,
             has_piano_notes,
         )
@@ -394,6 +401,7 @@ fn layout_regions(
     mixer: Option<viz_panel::Dock>,
     log: Option<viz_panel::Dock>,
     memory: Option<viz_panel::Dock>,
+    knobs: bool,
     notice_rows: u16,
     has_piano_notes: bool,
 ) -> StudioRegions {
@@ -685,6 +693,28 @@ fn layout_regions(
         }
     }
 
+    // The knobs column hugs the score, inside every other column: the
+    // rails are for the call under the caret, and everything between
+    // them and the score is one more thing the eye crosses. It is the
+    // first thing to go when the room runs short - a rail can wait for a
+    // wider terminal, the panes cannot - and a reference sitting over
+    // the score hides this edge, so it waits too.
+    let mut knobs_area = Rect::default();
+    if knobs
+        && !reference_overlays
+        && body.width >= knobs_panel::KNOBS_WIDTH + least
+        && body.height >= knobs_panel::KNOBS_HEIGHT
+    {
+        let width = knobs_panel::KNOBS_WIDTH;
+        knobs_area = Rect::new(
+            body.right().saturating_sub(width),
+            body.y,
+            width,
+            body.height,
+        );
+        body.width = body.width.saturating_sub(width);
+    }
+
     let mut panes = [PaneRegion::default(); 2];
     let title_height = u16::from(pane_count == 2 && body.height >= 4);
     let left_width = if pane_count == 2 {
@@ -749,6 +779,7 @@ fn layout_regions(
         memory: memory_area,
         reference,
         reference_overlays,
+        knobs: knobs_area,
         footer,
     }
 }

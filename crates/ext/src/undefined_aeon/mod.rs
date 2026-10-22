@@ -7,6 +7,7 @@
 mod inspire;
 
 use rustel_core::reference::ReferenceEntry;
+use rustel_core::reference::numbers::{ReferenceNumber, count, share};
 use rustel_core::register::{Origin, Registry};
 
 use crate::Extension;
@@ -16,6 +17,13 @@ pub const ORIGIN: Origin = Origin::new("undefined_aeon");
 
 const REFERENCE_ENTRIES: &[ReferenceEntry] = &[inspire::REFERENCE];
 
+const REFERENCE_NUMBERS: &[ReferenceNumber] = &[
+    share("inspire", "density"),
+    count("inspire", "octaves", 0.0, 4.0),
+    count("inspire", "seed", 0.0, 64.0),
+    count("inspire", "bars", 1.0, 16.0),
+];
+
 pub(crate) const EXTENSION: Extension = Extension {
     origin: ORIGIN,
     install_patterns: install,
@@ -23,6 +31,7 @@ pub(crate) const EXTENSION: Extension = Extension {
     pattern_callables: &[],
     value_callables: &[],
     reference_groups: &[REFERENCE_ENTRIES],
+    reference_numbers: REFERENCE_NUMBERS,
 };
 
 fn install(registry: &mut Registry) {

@@ -18,7 +18,7 @@ use crate::com::{
     Changes, Events, Handler, HostApp, MAX_CHANGES, MAX_EVENTS, Stream, pointer, wide_to_string,
 };
 use crate::module::{ClassInfo, Module};
-use crate::{Job, ParamInfo, canonical, preset};
+use crate::{Job, ParamInfo, ParamRole, canonical, preset};
 
 /// The engine gives an insert from 1 to 128 frames in one call.
 pub(crate) const MAX_BLOCK: usize = 128;
@@ -252,6 +252,21 @@ impl Loaded {
         let skipped = ParameterInfo_::ParameterFlags_::kIsReadOnly
             | ParameterInfo_::ParameterFlags_::kIsHidden;
         let groups = self.groups();
+        // The parameter the plugin names as its dry/wet mix, when it names
+        // one to a host.
+        let mix = controller
+            .cast::<IParameterFunctionName>()
+            .and_then(|named| {
+                let mut id: ParamID = 0;
+                let found = unsafe {
+                    named.getParameterIDFromFunctionName(
+                        kRootUnitId,
+                        FunctionNameType::kDryWetMix,
+                        &mut id,
+                    )
+                };
+                (found == kResultOk).then_some(id)
+            });
         let mut params: Vec<ParamInfo> = Vec::new();
         let mut keys = std::collections::HashSet::new();
         for index in 0..unsafe { controller.getParameterCount() } {
@@ -290,6 +305,15 @@ impl Loaded {
                     wide_to_string(&text)
                 } else {
                     String::new()
+                },
+                role: if info.flags & ParameterInfo_::ParameterFlags_::kIsBypass != 0 {
+                    ParamRole::Bypass
+                } else if info.flags & ParameterInfo_::ParameterFlags_::kIsProgramChange != 0 {
+                    ParamRole::Program
+                } else if Some(info.id) == mix {
+                    ParamRole::Mix
+                } else {
+                    ParamRole::Plain
                 },
             });
         }

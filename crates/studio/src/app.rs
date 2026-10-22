@@ -25,6 +25,7 @@
 //! | sets and the set panel (^B) | `sets.rs` |
 //! | tapes, the replay tab and timeline | `replay_tabs.rs`, `replay_edit.rs`, `replay_pointer.rs`, `sessions.rs` |
 //! | inline sliders in the score | `slider.rs`, `slider_precision.rs` |
+//! | the knobs column beside the score | `knobs.rs` |
 //! | the visuals docks | `viz_panel.rs` |
 //! | Hydra visuals behind the score | `hydra_backdrop.rs`, `stage_pixels.rs` |
 //! | split panes, scrollbars, minimap, zen, wrap | `panes.rs` |
@@ -148,6 +149,7 @@ use rustel_runtime::session_log::{
 use rustel_runtime::ui_events::{UiLayout, UiVisual, source_revision, visual_layout};
 use rustel_runtime::{ProcessMonitor, ProcessStats, RuntimeError, SessionConfig};
 
+mod args;
 mod audio_advisory;
 mod bank_context;
 mod completion;
@@ -166,6 +168,7 @@ mod hydra_backdrop;
 mod jobs_panel;
 mod key_bindings;
 mod keyboard;
+mod knobs;
 mod link;
 mod list_keys;
 mod loading_line;
@@ -997,6 +1000,20 @@ struct App {
     /// The mixer panel - the desk along the top or the bottom - while it
     /// is open. Sticky like the set panel: Esc leaves it standing.
     mixer_panel: Option<MixerPanel>,
+    /// The knobs column - a rail for each numeric parameter of the call
+    /// at the caret - while it is open. Sticky like the mixer: Esc leaves
+    /// it standing.
+    knobs_panel: Option<super::knobs_panel::KnobsPanel>,
+    /// Opened since the last draw, like `mixer_unlaid`: until a draw lays
+    /// the column, its keys must not fall through to the score.
+    knobs_unlaid: bool,
+    /// The call at the caret as the panel last read it, kept until the
+    /// scene, the text or the caret changes. The parse is the heavy part,
+    /// with the faders the transpiler's own reading, so it is done once
+    /// per change, not once per frame.
+    knobs_parse: Option<knobs::KnobsParse>,
+    /// The rows the painter draws this frame, assembled from the parse.
+    knobs_rows: Option<knobs::KnobsRows>,
     /// A drag selection over the mixer's devices block - the MIDI log and
     /// the pads - kept with the rows it was drawn on, for `c` to copy.
     mixer_selection: Option<MixerSelection>,
@@ -1699,6 +1716,10 @@ impl App {
             viz_unlaid: [false; DOCKS],
             mixer_unlaid: false,
             mixer_panel: None,
+            knobs_panel: None,
+            knobs_unlaid: false,
+            knobs_parse: None,
+            knobs_rows: None,
             mixer_selection: None,
             pixel_budget: super::graphics::PIXEL_CEILING,
             pixel_budget_said: false,
@@ -2103,6 +2124,9 @@ impl App {
         if self.prefs.mixer_panel == Some(true) {
             self.open_mixer_panel(false);
         }
+        if self.prefs.knobs_panel == Some(true) {
+            self.open_knobs_panel(false);
+        }
         self.restore_sticky_log();
     }
 
@@ -2180,6 +2204,7 @@ impl App {
             mixer,
             log,
             memory,
+            self.knobs_panel.is_some(),
             self.footer_notice_rows(),
             self.has_piano_notes(),
         )
