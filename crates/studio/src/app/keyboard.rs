@@ -1878,6 +1878,31 @@ mod tests {
         }
 
         #[test]
+        fn a_shift_arrow_selection_is_deleted_by_d() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "hello\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.focus = Focus::Editor;
+
+            precision_key(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+            assert!(
+                !app.editor().primary_selection().is_empty(),
+                "Shift+Right makes a selection"
+            );
+            assert!(
+                app.editor().vim_is_visual(),
+                "a Shift+arrow selection enters Visual"
+            );
+            precision_key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+            assert!(
+                app.editor().source().starts_with("ello\n"),
+                "the selected h is gone: {:?}",
+                app.editor().source()
+            );
+        }
+
+        #[test]
         fn a_learnt_ctrl_d_wins_over_page_down() {
             let directory = tempfile::tempdir().expect("temp dir");
             let (mut app, _scene) = plain_app(directory.path(), &"a\n".repeat(12));

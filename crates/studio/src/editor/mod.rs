@@ -1727,6 +1727,7 @@ impl Editor {
                 if self.drag.is_some() {
                     self.extend_drag(point, map)?;
                     self.drag = None;
+                    self.sync_selection_mode()?;
                     return Ok(true);
                 }
                 Ok(false)

@@ -10,6 +10,7 @@
 - Vim `p` and `P` paste the system clipboard. A yank or delete fills the clipboard too, so a copied score or the last yank lands in the score.
 - Vim `r` replaces the character under the cursor. A count replaces several.
 - Vim Ctrl+D and Ctrl+U move half a page in the editor and page list panels. Docs moves to `gd` while Vim keys are on, and Wrap has no default chord there. A learnt chord still wins.
+- In Vim mode, selecting with the mouse or with Shift+arrows enters Visual, and the selection commands act on it. Backspace or Delete deletes it. Mouse dragging itself is unchanged.
 - Vim mode uses a steady block in Normal and Visual and a steady bar in Insert. A blinking caret shape setting no longer restarts its phase on every key.
 - Vim insert mappings from the vimrc apply in panel search boxes. For example, `inoremap jk <Esc>` leaves Insert in the reference search.
 - In Vim Normal mode, Esc closes a panel left open behind the editor. Before, Vim consumed the key and the panel could not be closed.

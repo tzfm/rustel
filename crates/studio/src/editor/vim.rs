@@ -353,6 +353,35 @@ impl Editor {
             self.vim.message = None;
             return Ok(false);
         }
+        // A mouse drag or a Shift+arrow selection is still a selection.
+        // Adopt it as Visual for the commands that act on one, so d, c, y,
+        // x and p use it. Other keys keep their Normal meaning: i enters
+        // Insert and a motion moves instead of extending.
+        let pending = self.vim_has_pending_command();
+        let acts_on_selection = key.modifiers.is_empty()
+            && (matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
+                || matches!(
+                    key.code,
+                    KeyCode::Char(
+                        'd' | 'c' | 'y' | 'x' | 'X' | 'D' | 'C' | 'Y' | 'p' | 'P' | 'v' | 'V'
+                    )
+                ));
+        let entered_visual = !pending && acts_on_selection && self.vim_selection_to_visual()?;
+        if entered_visual && matches!(key.code, KeyCode::Char('v' | 'V')) {
+            return Ok(true);
+        }
+        if !entered_visual
+            && !pending
+            && self.vim.mode == Mode::Normal
+            && key.modifiers.contains(KeyModifiers::SHIFT)
+            && let Some(motion) = selection_motion(key.code)
+        {
+            // The ordinary editor extends the selection exactly as it does
+            // outside Vim. Visual takes it over at once.
+            self.move_selection(motion, true)?;
+            self.vim_selection_to_visual()?;
+            return Ok(true);
+        }
         if key.modifiers == KeyModifiers::CONTROL && matches!(key.code, KeyCode::Char('d' | 'u')) {
             let counted = self.vim.count != 0;
             let count = self.vim_take_count();
@@ -383,7 +412,16 @@ impl Editor {
         self.vim_normalize_caret()?;
         let character = match key.code {
             KeyCode::Char(character) => character,
-            KeyCode::Left | KeyCode::Backspace => 'h',
+            KeyCode::Left => 'h',
+            // Vim's Visual backspace deletes the highlighted text, while
+            // Normal backspace is the left motion.
+            KeyCode::Backspace => {
+                if matches!(self.vim.mode, Mode::Visual { .. }) {
+                    'x'
+                } else {
+                    'h'
+                }
+            }
             KeyCode::Right => 'l',
             KeyCode::Up => 'k',
             KeyCode::Down => 'j',
@@ -674,6 +712,59 @@ impl Editor {
                 self.vim_select_visual(head, head, linewise)
             }
         }
+    }
+
+    /// A selection made with the mouse or with Shift+arrows is still a
+    /// selection. Adopt it as Visual before the next command, so d, c, y,
+    /// x and p act on it instead of collapsing it. `true` when a Normal
+    /// mode selection became Visual.
+    fn vim_selection_to_visual(&mut self) -> Result<bool, EditorError> {
+        if !matches!(self.vim.mode, Mode::Normal | Mode::Visual { .. })
+            || matches!(self.vim.mode, Mode::Visual { linewise: true, .. })
+        {
+            return Ok(false);
+        }
+        let selection = self.primary_selection();
+        if selection.is_empty() {
+            return Ok(false);
+        }
+        let was_normal = self.vim.mode == Mode::Normal;
+        let (anchor, head) = if selection.anchor <= selection.head {
+            (
+                selection.anchor,
+                self.document
+                    .previous_grapheme_boundary(selection.head)?
+                    .max(selection.anchor),
+            )
+        } else {
+            (
+                self.document.previous_grapheme_boundary(selection.anchor)?,
+                selection.head,
+            )
+        };
+        self.vim_select_visual(anchor, head, false)?;
+        Ok(was_normal)
+    }
+
+    /// Take a released pointer selection into Visual, and a plain click
+    /// back to Normal. Drag updates stay untouched until the release.
+    pub(super) fn sync_selection_mode(&mut self) -> Result<(), EditorError> {
+        if self.vim.keybindings != EditorKeybindings::Vim {
+            return Ok(());
+        }
+        if self.primary_selection().is_empty() {
+            if matches!(self.vim.mode, Mode::Visual { .. }) {
+                self.vim.mode = Mode::Normal;
+            }
+            return Ok(());
+        }
+        self.vim_selection_to_visual()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn vim_is_visual(&self) -> bool {
+        matches!(self.vim.mode, Mode::Visual { .. })
     }
 
     fn vim_select_visual(
@@ -970,6 +1061,21 @@ impl Editor {
     }
 }
 
+/// The ordinary editor motion a Shift+arrow asks for.
+fn selection_motion(code: KeyCode) -> Option<super::Motion> {
+    Some(match code {
+        KeyCode::Left => super::Motion::Left,
+        KeyCode::Right => super::Motion::Right,
+        KeyCode::Up => super::Motion::Up,
+        KeyCode::Down => super::Motion::Down,
+        KeyCode::Home => super::Motion::LineStart,
+        KeyCode::End => super::Motion::LineEnd,
+        KeyCode::PageUp => super::Motion::PageUp,
+        KeyCode::PageDown => super::Motion::PageDown,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -994,6 +1100,94 @@ mod tests {
             .document
             .line_of(editor.primary_selection().head)
             .expect("line")
+    }
+
+    #[test]
+    fn a_selection_outside_visual_is_adopted() {
+        let mut editor = Editor::new("hello world\n").expect("editor");
+        editor.set_keybindings(EditorKeybindings::Vim);
+        editor
+            .set_selection(Selection::range(ByteOffset(0), ByteOffset(5)))
+            .expect("selection");
+        press(&mut editor, KeyCode::Char('d'), KeyModifiers::NONE);
+        assert_eq!(editor.source(), " world\n");
+        assert_eq!(editor.vim.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn v_keeps_a_selection_made_outside_visual() {
+        let mut editor = Editor::new("hello world\n").expect("editor");
+        editor.set_keybindings(EditorKeybindings::Vim);
+        editor
+            .set_selection(Selection::range(ByteOffset(0), ByteOffset(5)))
+            .expect("selection");
+        press(&mut editor, KeyCode::Char('v'), KeyModifiers::NONE);
+        assert!(matches!(editor.vim.mode, Mode::Visual { .. }));
+        assert_eq!(
+            editor.primary_selection().ordered(),
+            ByteOffset(0)..ByteOffset(5)
+        );
+    }
+
+    #[test]
+    fn i_with_a_selection_still_enters_insert() {
+        let mut editor = Editor::new("hello world\n").expect("editor");
+        editor.set_keybindings(EditorKeybindings::Vim);
+        editor
+            .set_selection(Selection::range(ByteOffset(0), ByteOffset(5)))
+            .expect("selection");
+        press(&mut editor, KeyCode::Char('i'), KeyModifiers::NONE);
+        assert!(editor.vim_is_insert());
+    }
+
+    #[test]
+    fn a_control_chord_does_not_adopt_a_selection() {
+        let mut editor = Editor::new("hello world\n").expect("editor");
+        editor.set_keybindings(EditorKeybindings::Vim);
+        editor
+            .set_selection(Selection::range(ByteOffset(0), ByteOffset(5)))
+            .expect("selection");
+        press(&mut editor, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(editor.vim_is_normal(), "Ctrl+C keeps the Normal mode");
+        assert_eq!(
+            editor.primary_selection().ordered(),
+            ByteOffset(0)..ByteOffset(5),
+            "the copy chord leaves the band for the editor to copy"
+        );
+    }
+
+    #[test]
+    fn backspace_deletes_a_selection() {
+        let mut editor = Editor::new("hello world\n").expect("editor");
+        editor.set_keybindings(EditorKeybindings::Vim);
+        editor
+            .set_selection(Selection::range(ByteOffset(0), ByteOffset(5)))
+            .expect("selection");
+        press(&mut editor, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(editor.source(), " world\n");
+        assert_eq!(editor.vim.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn backspace_without_a_selection_still_moves_left() {
+        let mut editor = Editor::new("hello world\n").expect("editor");
+        editor.set_keybindings(EditorKeybindings::Vim);
+        editor
+            .set_selection(Selection::caret(ByteOffset(5)))
+            .expect("caret");
+        press(&mut editor, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(editor.primary_selection().head, ByteOffset(4));
+    }
+
+    #[test]
+    fn shift_right_enters_visual() {
+        let mut editor = Editor::new("hello world\n").expect("editor");
+        editor.set_keybindings(EditorKeybindings::Vim);
+        press(&mut editor, KeyCode::Right, KeyModifiers::SHIFT);
+        assert!(editor.vim_is_visual());
+        assert!(!editor.primary_selection().is_empty());
+        press(&mut editor, KeyCode::Char('d'), KeyModifiers::NONE);
+        assert_eq!(editor.source(), "ello world\n");
     }
 
     #[test]
