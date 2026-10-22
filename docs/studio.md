@@ -80,10 +80,12 @@ for Vim controls.
 
 In a split view, use **Ctrl+Shift+[ / Ctrl+Shift+]** to change scenes. F6 and F7
 also work. Each pane has its own caret and scroll position. A scene shows in one
-pane at a time. The tab of a score the other pane holds wears the accent
-colour on a dim fill, and so does the title of that pane. Tabs that are
-nowhere open stay muted. A click on the tab of a scene in
-the other pane moves the caret to that pane, as F10 does. A split does not create a second player.
+pane at a time. Each pane has its own colour: the first wears the theme's
+accent, and the second wears another accent. The pane's tab and its title both
+wear it, filled where the caret is and on a dim fill where it is not. Tabs that
+are nowhere open stay muted. A click on the tab of a scene in the other pane
+moves the caret to that pane, as F10 does. A split does not create a second
+player.
 
 F1 opens keyboard help when the menu bar is hidden. Menus show available
 actions and shortcuts. Press Esc to return to the editor. To cancel the first

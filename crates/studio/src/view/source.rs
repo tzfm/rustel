@@ -29,6 +29,8 @@ pub(crate) fn gutter_width(editor: &Editor, numbered: bool) -> u16 {
 /// pane, and that is all they do: no click plays a scene. A pad does, and so
 /// does an update.
 pub(super) struct PaneTitle<'a> {
+    /// Which pane this is: it sets the colour, the same whoever has the caret.
+    pub(super) index: usize,
     pub(super) name: &'a str,
     pub(super) dirty: bool,
     pub(super) playing: bool,
@@ -63,24 +65,15 @@ impl Widget for PaneTitle<'_> {
             self.name,
             if self.dirty { " ●" } else { "" }
         );
-        let style = if self.focused {
-            Style::default()
-                .fg(theme.fill_text())
-                .bg(theme.accent)
-                .add_modifier(Modifier::BOLD)
+        // The title wears what its tab on the strip wears.
+        let colour = if self.prebake {
+            theme.mini
+        } else if self.replay {
+            theme.replay_colour()
         } else {
-            // The pane the caret is not in matches its tab on the strip.
-            held_style(
-                theme,
-                if self.prebake {
-                    theme.mini
-                } else if self.replay {
-                    theme.replay_colour()
-                } else {
-                    theme.accent
-                },
-            )
+            theme.pane_colour(self.index)
         };
+        let style = pane_style(theme, colour, self.focused);
         buffer.set_stringn(area.x, area.y, text, usize::from(area.width), style);
     }
 }

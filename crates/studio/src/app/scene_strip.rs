@@ -444,13 +444,9 @@ impl App {
                 replay: scene.is_replay(),
                 name: scene.name(),
                 current: index == self.scenes.current_index(),
-                // A click on this chip moves the caret to the pane that has
-                // the scene. The chip says which one is open, in colour.
-                other_pane: self
-                    .panes
-                    .iter()
-                    .enumerate()
-                    .any(|(pane, shown)| pane != self.focused && shown.scene == scene.id),
+                // The chip wears the colour of the pane that shows it. A click
+                // on one in the other pane moves the caret there.
+                pane: self.panes.iter().position(|shown| shown.scene == scene.id),
                 playing: playing_scene == Some(scene.id),
                 dirty: scene.dirty,
                 rewind: scene.rewind,
@@ -694,39 +690,41 @@ mod tests {
             assert_eq!(app.scenes.current().id, second);
         }
 
-        /// Only the chip of the scene the other pane holds is marked, so
-        /// the strip can say which clicks only report where a scene is.
+        /// Each chip names the pane that shows its scene, so the strip can
+        /// colour a tab by its pane and leave the rest plain.
         #[test]
-        fn chips_mark_which_scene_the_other_pane_holds() {
+        fn chips_name_the_pane_that_shows_them() {
             let directory = tempfile::tempdir().expect("temp dir");
             let mut app = crate::app::tests::support::app_over(directory.path());
             app.new_scene(false);
+            app.new_scene(false);
             app.toggle_split();
             app.focus_pane(0);
-            let other = app.panes[1].scene;
-            let held = app
-                .scenes
-                .get(other)
-                .expect("the other pane's scene")
-                .name();
+            let shown = |app: &App, pane: usize| {
+                app.scenes
+                    .get(app.panes[pane].scene)
+                    .expect("the pane's scene")
+                    .name()
+            };
 
-            let chips = app.scene_chips();
-            assert_eq!(
-                chips
-                    .iter()
-                    .filter(|chip| chip.other_pane)
-                    .map(|chip| chip.name.as_str())
-                    .collect::<Vec<_>>(),
-                vec![held.as_str()],
-                "the other pane's scene alone is marked"
-            );
-            assert!(
-                !chips
-                    .iter()
-                    .find(|chip| chip.current)
-                    .expect("a current chip")
-                    .other_pane
-            );
+            for focused in [0, 1] {
+                app.focus_pane(focused);
+                let chips = app.scene_chips();
+                let named = |pane: usize| {
+                    chips
+                        .iter()
+                        .find(|chip| chip.pane == Some(pane))
+                        .map(|chip| chip.name.clone())
+                };
+                // A tab names its pane whichever pane has the caret.
+                assert_eq!(named(0), Some(shown(&app, 0)), "caret in pane {focused}");
+                assert_eq!(named(1), Some(shown(&app, 1)), "caret in pane {focused}");
+                assert_eq!(
+                    chips.iter().filter(|chip| chip.pane.is_none()).count(),
+                    1,
+                    "the scene no pane shows has no pane"
+                );
+            }
         }
     }
 }

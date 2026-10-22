@@ -307,9 +307,10 @@ pub struct SceneChip {
     pub name: String,
     /// On screen right now.
     pub current: bool,
-    /// The other pane holds this scene: a click on its chip moves the caret
+    /// The pane that shows this scene, if one does. The tab wears that
+    /// pane's colour, and a click on a tab in the other pane moves the caret
     /// there.
-    pub other_pane: bool,
+    pub pane: Option<usize>,
     /// The generation the engine is playing came from this scene.
     pub playing: bool,
     pub dirty: bool,
@@ -858,6 +859,7 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
         if !region.title.is_empty() {
             frame.render_widget(
                 PaneTitle {
+                    index,
                     name: &pane.name,
                     dirty: pane.dirty,
                     playing: pane.playing,

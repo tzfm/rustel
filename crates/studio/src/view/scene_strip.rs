@@ -19,14 +19,21 @@ const STRIP_SEPARATOR: u16 = 1;
 /// How much of its own colour the fill behind a held tab takes.
 const HELD_FILL: f32 = 0.22;
 
-/// How a tab, and the title of its pane, read when the other pane has the
-/// caret: the tab's own colour on a dim fill of it. A theme with no ground of
-/// its own has nothing to tint, so it keeps the colour alone. The tab and
-/// the title both come here, so the two always match.
-pub(super) fn held_style(theme: &Theme, colour: Color) -> Style {
-    Style::default()
-        .fg(colour)
-        .bg(crate::theme::mix(theme.surface, colour, HELD_FILL))
+/// How a tab, and the title of its pane, read in `colour`: filled where the
+/// caret is, and a dim fill of the same colour where it is not. A theme with
+/// no ground of its own has nothing to tint, so the dim one keeps the colour
+/// alone. The tab and the title both come here, so the two always match.
+pub(super) fn pane_style(theme: &Theme, colour: Color, focused: bool) -> Style {
+    if focused {
+        Style::default()
+            .fg(theme.fill_text())
+            .bg(colour)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(colour)
+            .bg(crate::theme::mix(theme.surface, colour, HELD_FILL))
+    }
 }
 
 /// Where each chip of the strip lands, computed the same way it is drawn.
@@ -232,39 +239,30 @@ impl Widget for SceneStrip<'_> {
                 _ => None,
             };
             let text = chip_text(index, chip, renaming);
-            // Setup reads in its own colour wherever it appears, so a
-            // glance at the strip never mistakes it for a scene.
-            let style = match (chip.current, chip.prebake.is_some(), chip.replay) {
-                (true, true, _) => Style::default()
-                    .fg(theme.fill_text())
-                    .bg(theme.mini)
-                    .add_modifier(Modifier::BOLD),
-                (true, false, true) => Style::default()
-                    .fg(theme.fill_text())
-                    .bg(theme.replay_colour())
-                    .add_modifier(Modifier::BOLD),
-                (true, false, false) => Style::default()
-                    .fg(theme.fill_text())
-                    .bg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-                (false, true, _) => Style::default().fg(theme.mini),
-                (false, false, true) => Style::default().fg(theme.replay_colour()),
-                // The tab the other pane holds is somewhere you are
-                // already, so it wins over playing: the `▶` still says
-                // that. The accent colour stands out from the muted tabs
-                // a click can still choose.
-                (false, false, false) if chip.other_pane => Style::default().fg(theme.accent),
-                (false, false, false) if chip.playing => Style::default().fg(theme.ok),
+            // Setup and tapes keep their own colour wherever they sit, so a
+            // glance at the strip never mistakes them for a scene. A score
+            // tab wears the colour of the pane that shows it, the same
+            // whichever pane has the caret: filled where it is, dim where
+            // it is not. The tab the caret is on always belongs to a pane.
+            let own = if chip.prebake.is_some() {
+                Some(theme.mini)
+            } else if chip.replay {
+                Some(theme.replay_colour())
+            } else {
+                None
+            };
+            let pane = chip.pane.or(chip.current.then_some(0));
+            let style = match own.or_else(|| pane.map(|pane| theme.pane_colour(pane))) {
+                Some(colour) if chip.current => pane_style(theme, colour, true),
+                Some(colour) if pane.is_some() => pane_style(theme, colour, false),
+                Some(colour) => Style::default().fg(colour),
+                // A pane's colour wins over playing: the `▶` still says it.
+                None if chip.playing => Style::default().fg(theme.ok),
                 // Quieter than the text under it. A tab nobody is on is
                 // somewhere to go, not something to read. The strip sits
                 // one row above a pane's own title, which names the scene
                 // you are on, so the muted colour keeps the two rows apart.
-                (false, false, false) => Style::default().fg(theme.muted),
-            };
-            // A tab the other pane holds is open, but not where the caret is.
-            let style = match style.fg {
-                Some(colour) if chip.other_pane && !chip.current => held_style(theme, colour),
-                _ => style,
+                None => Style::default().fg(theme.muted),
             };
             // A rename draft may be wider than the chip the hits were
             // measured for; it simply runs on to the right.
@@ -412,7 +410,7 @@ mod tests {
         SceneChip {
             name: name.to_owned(),
             current,
-            other_pane: false,
+            pane: None,
             playing: false,
             dirty: false,
             rewind: false,
@@ -486,7 +484,7 @@ mod tests {
                 prebake: None,
                 name: "intro".into(),
                 current: false,
-                other_pane: false,
+                pane: None,
                 playing: true,
                 dirty: false,
                 rewind: false,
@@ -499,7 +497,7 @@ mod tests {
                 prebake: None,
                 name: "drop".into(),
                 current: true,
-                other_pane: false,
+                pane: None,
                 playing: false,
                 dirty: true,
                 rewind: false,
@@ -551,105 +549,99 @@ mod tests {
         assert!(text.contains("Enter renames"), "{text}");
     }
 
-    /// A score tab the other pane holds wears the accent colour on a dim
-    /// fill of it. Tabs that are nowhere open stay muted, on the plain strip.
-    #[test]
-    fn the_other_panes_chip_reads_as_open_beside_tabs_that_are_not() {
-        let theme = theme();
-        let mut held = strip_chip("held", false);
-        held.other_pane = true;
-        let chips = vec![strip_chip("now", true), held, strip_chip("away", false)];
+    /// Draw the strip and say where each chip landed.
+    fn drawn(theme: &Theme, chips: &[SceneChip]) -> (Buffer, Vec<Rect>) {
         let area = Rect::new(0, 1, 120, 1);
         let mut buffer = Buffer::empty(area);
         SceneStrip {
             keybinds: &crate::keybinds::Keybinds::default(),
-            chips: &chips,
+            chips,
             mode: &SceneStripMode::Idle,
             split: true,
             capabilities: KeyboardCapabilities::enhanced(),
-            theme: &theme,
+            theme,
         }
         .render(area, &mut buffer);
-        let hits = scene_strip_hits(area, &chips);
-        let cell = |chip: usize| buffer.cell((hits[chip].x, 1)).unwrap();
-        assert_eq!(cell(0).bg, theme.accent);
-        assert_eq!(cell(1).fg, theme.accent);
-        assert_eq!(
-            cell(1).bg,
-            crate::theme::mix(theme.surface, theme.accent, HELD_FILL)
-        );
-        assert_ne!(cell(1).bg, theme.surface, "the fill shows");
-        assert_ne!(
-            cell(1).bg,
-            theme.accent,
-            "and is dimmer than the current tab"
-        );
-        assert_eq!(cell(2).fg, theme.muted);
-        assert_eq!(cell(2).bg, theme.surface);
+        (buffer, scene_strip_hits(area, chips))
     }
 
-    /// A held tab that is also the one playing keeps the accent colour: the
-    /// `▶` says it plays, so the green is not needed.
+    /// A pane keeps its colour whichever pane has the caret: the first is the
+    /// accent, the second its own. The caret decides only whether the tab is
+    /// filled or dim. A tab no pane shows stays muted, on the plain strip.
     #[test]
-    fn a_playing_chip_the_other_pane_holds_keeps_the_accent_colour() {
+    fn a_tab_wears_its_panes_colour_whichever_pane_has_the_caret() {
+        let theme = theme();
+        let dim = |colour| crate::theme::mix(theme.surface, colour, HELD_FILL);
+        let (first, second) = (theme.pane_colour(0), theme.pane_colour(1));
+        assert_ne!(first, second, "two panes, two colours");
+
+        for caret in [0, 1] {
+            let mut left = strip_chip("left", caret == 0);
+            left.pane = Some(0);
+            let mut right = strip_chip("right", caret == 1);
+            right.pane = Some(1);
+            let (buffer, hits) = drawn(&theme, &[left, right, strip_chip("away", false)]);
+            let cell = |chip: usize| buffer.cell((hits[chip].x, 1)).unwrap();
+            for (chip, colour) in [(0, first), (1, second)] {
+                if chip == caret {
+                    assert_eq!(cell(chip).bg, colour, "the caret's tab is filled");
+                } else {
+                    assert_eq!(cell(chip).fg, colour, "the other tab keeps its colour");
+                    assert_eq!(cell(chip).bg, dim(colour), "on a dim fill");
+                }
+            }
+            assert_eq!(cell(2).fg, theme.muted);
+            assert_eq!(cell(2).bg, theme.surface);
+        }
+    }
+
+    /// A tab that is playing and in a pane keeps the pane's colour: the `▶`
+    /// says it plays, so the green is not needed.
+    #[test]
+    fn a_playing_tab_in_a_pane_keeps_the_panes_colour() {
         let theme = theme();
         let mut playing = strip_chip("playing", false);
-        playing.other_pane = true;
+        playing.pane = Some(1);
         playing.playing = true;
-        let chips = vec![strip_chip("now", true), playing];
-        let area = Rect::new(0, 1, 120, 1);
-        let mut buffer = Buffer::empty(area);
-        SceneStrip {
-            keybinds: &crate::keybinds::Keybinds::default(),
-            chips: &chips,
-            mode: &SceneStripMode::Idle,
-            split: true,
-            capabilities: KeyboardCapabilities::enhanced(),
-            theme: &theme,
-        }
-        .render(area, &mut buffer);
-        let hits = scene_strip_hits(area, &chips);
-        let cell = |chip: usize| buffer.cell((hits[chip].x, 1)).unwrap();
-        assert_eq!(cell(1).fg, theme.accent, "held beats playing in colour");
+        let (buffer, hits) = drawn(&theme, &[strip_chip("now", true), playing]);
+        assert_eq!(
+            buffer.cell((hits[1].x, 1)).unwrap().fg,
+            theme.pane_colour(1),
+            "the pane's colour beats the playing green"
+        );
     }
 
-    /// The pane the caret is not in reads like its tab on the strip: the
-    /// same colour on the same fill, so the two point at each other.
+    /// A pane's title wears what its tab on the strip wears, filled or dim,
+    /// so the two point at each other.
     #[test]
-    fn the_unfocused_pane_title_matches_its_held_tab() {
+    fn a_pane_title_matches_its_tab() {
         let theme = theme();
-        let mut held = strip_chip("scene 1 2", false);
-        held.other_pane = true;
-        let chips = vec![strip_chip("scene 1", true), held];
-        let area = Rect::new(0, 1, 120, 1);
-        let mut strip = Buffer::empty(area);
-        SceneStrip {
-            keybinds: &crate::keybinds::Keybinds::default(),
-            chips: &chips,
-            mode: &SceneStripMode::Idle,
-            split: true,
-            capabilities: KeyboardCapabilities::enhanced(),
-            theme: &theme,
-        }
-        .render(area, &mut strip);
-        let mut title = Buffer::empty(area);
-        PaneTitle {
-            name: "scene 1 2",
-            dirty: false,
-            playing: false,
-            focused: false,
-            prebake: false,
-            replay: false,
-            theme: &theme,
-        }
-        .render(area, &mut title);
+        for (pane, focused) in [(0, true), (0, false), (1, true), (1, false)] {
+            let mut tab = strip_chip("scene", focused);
+            tab.pane = Some(pane);
+            let (strip, hits) = drawn(&theme, &[tab]);
+            let area = Rect::new(0, 1, 120, 1);
+            let mut title = Buffer::empty(area);
+            PaneTitle {
+                index: pane,
+                name: "scene",
+                dirty: false,
+                playing: false,
+                focused,
+                prebake: false,
+                replay: false,
+                theme: &theme,
+            }
+            .render(area, &mut title);
 
-        let tab = strip
-            .cell((scene_strip_hits(area, &chips)[1].x, 1))
-            .unwrap();
-        let pane = title.cell((area.x, 1)).unwrap();
-        assert_eq!((pane.fg, pane.bg), (tab.fg, tab.bg));
-        assert_ne!(pane.bg, theme.surface, "the fill shows");
+            let tab = strip.cell((hits[0].x, 1)).unwrap();
+            let title = title.cell((area.x, 1)).unwrap();
+            assert_eq!(
+                (title.fg, title.bg),
+                (tab.fg, tab.bg),
+                "pane {pane}, caret {focused}"
+            );
+        }
     }
     #[cfg(test)]
     mod scene_separator_tests {
@@ -663,7 +655,7 @@ mod tests {
                 .map(|(index, name)| SceneChip {
                     name: name.into(),
                     current: index == 1,
-                    other_pane: false,
+                    pane: None,
                     playing: index == 0,
                     dirty: true,
                     errors: true,
@@ -715,7 +707,7 @@ mod tests {
                 prebake: None,
                 name: "intro".into(),
                 current: false,
-                other_pane: false,
+                pane: None,
                 playing: true,
                 dirty: false,
                 rewind: false,
@@ -728,7 +720,7 @@ mod tests {
                 prebake: Some(PrebakeScope::Global),
                 name: PrebakeScope::Global.tab_name(),
                 current: false,
-                other_pane: false,
+                pane: None,
                 playing: false,
                 dirty: true,
                 rewind: false,
@@ -741,7 +733,7 @@ mod tests {
                 prebake: Some(PrebakeScope::Local),
                 name: PrebakeScope::Local.tab_name(),
                 current: true,
-                other_pane: false,
+                pane: None,
                 playing: false,
                 dirty: false,
                 rewind: false,
@@ -793,7 +785,7 @@ mod tests {
             prebake: Some(PrebakeScope::Local),
             name: "prebake".into(),
             current: true,
-            other_pane: false,
+            pane: None,
             playing: false,
             dirty: false,
             rewind: false,
