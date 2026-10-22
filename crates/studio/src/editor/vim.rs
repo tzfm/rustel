@@ -324,7 +324,11 @@ impl Editor {
         }
         // r waits for its replacement character. Esc above cancels it.
         if let Some(count) = self.vim.replace.take() {
-            self.vim_replace(count, key, moment)?;
+            if matches!(self.vim.mode, Mode::Visual { .. }) {
+                self.vim_replace_selection(key, moment)?;
+            } else {
+                self.vim_replace(count, key, moment)?;
+            }
             return Ok(true);
         }
         // Ctrl+C leaves Insert mode, as it does in Vim. Elsewhere it keeps
@@ -569,7 +573,7 @@ impl Editor {
                 self.vim_apply_operator(operator, range, linewise, moment)?;
             }
             'p' | 'P' => self.vim_put(character == 'P', count, moment)?,
-            'r' if self.vim.mode == Mode::Normal => {
+            'r' => {
                 self.vim.replace = Some(count);
             }
             'u' => {
@@ -954,6 +958,53 @@ impl Editor {
         Ok(())
     }
 
+    /// Visual `r`: every selected character becomes the typed character.
+    /// Line breaks stay, so a linewise selection keeps its lines.
+    fn vim_replace_selection(
+        &mut self,
+        key: KeyEvent,
+        moment: HistoryMoment,
+    ) -> Result<(), EditorError> {
+        let character = match key.code {
+            KeyCode::Char(character)
+                if !character.is_control()
+                    && !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT,
+                    ) =>
+            {
+                character
+            }
+            _ => {
+                self.vim_cancel_pending();
+                return Ok(());
+            }
+        };
+        let range = self.primary_selection().ordered();
+        if range.is_empty() {
+            self.vim_cancel_pending();
+            return Ok(());
+        }
+        let selected = self.document.slice(range.clone())?;
+        let replacement = character.to_string();
+        let text: String = selected
+            .graphemes(true)
+            .map(|cluster| match cluster {
+                "\n" | "\r\n" | "\r" => cluster.to_owned(),
+                _ => replacement.clone(),
+            })
+            .collect();
+        self.vim.mode = Mode::Normal;
+        self.vim_cancel_pending();
+        self.apply_transaction(
+            Transaction::new(EditOrigin::Typing)
+                .replace(Edit::new(range.clone(), text))
+                .with_selection(SelectionSet::single(range.start)),
+            moment,
+        )?;
+        self.vim_normalize_caret()?;
+        Ok(())
+    }
+
     fn vim_put(
         &mut self,
         before: bool,
@@ -1154,6 +1205,20 @@ mod tests {
             ByteOffset(0)..ByteOffset(5),
             "the copy chord leaves the band for the editor to copy"
         );
+    }
+
+    #[test]
+    fn visual_r_replaces_every_selected_character_and_keeps_line_breaks() {
+        let mut editor = Editor::new("ab\ncd\n").expect("editor");
+        editor.set_keybindings(EditorKeybindings::Vim);
+        editor
+            .set_selection(Selection::range(ByteOffset(0), ByteOffset(5)))
+            .expect("selection");
+        press(&mut editor, KeyCode::Char('v'), KeyModifiers::NONE);
+        press(&mut editor, KeyCode::Char('r'), KeyModifiers::NONE);
+        press(&mut editor, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(editor.source(), "xx\nxx\n");
+        assert_eq!(editor.vim.mode, Mode::Normal);
     }
 
     #[test]

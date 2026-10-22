@@ -693,7 +693,8 @@ a count replaces that many. `D` deletes to the end of the line.
 `C` changes that text. `v` selects characters and `V` selects lines.
 A selection made with the mouse or with Shift+arrows enters Visual. `d`,
 `c`, `y`, `x`, `X`, `D`, `C`, `Y`, `p`, and `P` act on it. Backspace or
-Delete deletes it. Esc returns to Normal. `u` undoes an edit. Ctrl+R in Normal or Visual mode redoes it.
+Delete deletes it, and `r` then a character replaces every selected
+character. Esc returns to Normal. `u` undoes an edit. Ctrl+R in Normal or Visual mode redoes it.
 `:redo` then Enter also redoes an edit. Ctrl+D and Ctrl+U move half a page
 down and up. A count moves that many lines.
 
