@@ -685,11 +685,11 @@ impl Session {
             ),
         };
         // The label rewrite found a different count of labeled statements
-        // and wrote places. No note carries the lane numbers of this read,
-        // so the commit keeps the lanes of the score in play.
+        // and wrote places. The notes of this text carry places, and not
+        // the lane numbers of this read.
         #[cfg(feature = "vst")]
         if matches!(&evaluated, Ok((output, ..)) if output.lanes_by_place) {
-            self.lanes.forget_read();
+            self.lanes.wrote_places();
         }
         match evaluated {
             // `effects.hydra` is taken below, and only the visuals build has
@@ -707,15 +707,37 @@ impl Session {
                 {
                     self.staged_hydra = Some(effects.hydra.take().unwrap_or_default());
                 }
+                // Each door that evaluates a text comes here. The plugins of
+                // the calls the score ran load at the next look at the plugin
+                // copies, after the copies of the lanes that play.
+                #[cfg(feature = "vst")]
+                self.keep_ran_plugins(&effects.plugins);
                 let csound = match seed {
                     Some((_, snapshot)) => self.csound.stage_from_snapshot(
                         snapshot,
                         &effects.csound,
                         &self.config.score_import_access,
-                    )?,
+                    ),
                     None => self
                         .csound
-                        .stage(&effects.csound, &self.config.score_import_access)?,
+                        .stage(&effects.csound, &self.config.score_import_access),
+                };
+                // The evaluation put this score in the active slot. A refused
+                // orchestra puts the score in play there again, so each query
+                // of the active slot reads the score in play. The visuals of
+                // this score go too.
+                let csound = match csound {
+                    Ok(csound) => csound,
+                    Err(error) => {
+                        #[cfg(feature = "hydra")]
+                        {
+                            self.staged_hydra = None;
+                        }
+                        self.js
+                            .restore_last_good_active()
+                            .map_err(|error| RuntimeError::Js(error.to_string()))?;
+                        return Err(error);
+                    }
                 };
                 match self.js.active_pattern() {
                     Some(pattern) => Ok(EvaluatedScore::JavaScript {
@@ -906,16 +928,17 @@ impl Session {
         // the commit reads the clock, so its time takes nothing from the
         // takeover margin.
         #[cfg(all(feature = "vst", feature = "device-audio"))]
-        if !self.plugin_seam(
+        let Some(plan_lines) = self.plugin_seam(
             &evaluated,
             source,
             hold,
             realtime_cps,
             probe_elapsed,
             &mut clock,
-        )? {
+        )?
+        else {
             return Ok(());
-        }
+        };
         let sampled_now = clock();
         let now = match earliest_now {
             Some(earliest_now) if !sampled_now.is_finite() || sampled_now < earliest_now => {
@@ -933,7 +956,13 @@ impl Session {
             restart_transport,
             candidate_settings,
             Self::live_replacement_takeover_headroom(realtime_cps, probe_elapsed),
-        )
+        )?;
+        // The commit forgot the plugin lines said before. The lines of the
+        // plan go out now, so a note of the score with the same line gives
+        // no second one.
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        self.report_plugin_lines(plan_lines);
+        Ok(())
     }
 
     pub(super) fn evaluated_realtime_cps(
@@ -1161,6 +1190,7 @@ impl Session {
                     cps,
                     samples,
                     preload,
+                    plugins: _kept_at_the_evaluation,
                     gamepad,
                     hydra: _taken_before_the_no_pattern_arms,
                     ..
@@ -1170,6 +1200,7 @@ impl Session {
                     cps,
                     samples,
                     preload,
+                    plugins: _kept_at_the_evaluation,
                     gamepad,
                     ..
                 } = *effects;
@@ -1323,11 +1354,18 @@ impl Session {
         self.recovered_source = None;
         self.js.snapshot_active_as_last_good();
         // The lanes of this text are now the lanes of the score in play, and
-        // the chains of this session get the text.
+        // the chains of this session get them: a chain of a lane that left
+        // ends after its time, at once with no live output. A lane that left
+        // keeps its number while a chain has it. The looks at the plugin
+        // copies of the cycles ahead start again with the new score.
         #[cfg(feature = "vst")]
         {
             self.lanes.install(source);
-            crate::vst::score_changed(&self.chains, Some(source));
+            let live = self.plugins_live();
+            crate::vst::score_changed(&self.chains, &self.lanes, Some(source), live);
+            crate::vst::forget_lanes_away(&self.chains, &mut self.lanes);
+            #[cfg(feature = "device-audio")]
+            self.plugin_ahead.restart();
         }
         Ok(())
     }
@@ -2590,6 +2628,16 @@ mod tests {
             assert!(matches!(&error, RuntimeError::ResourceLimit(_)), "{error}");
             assert!(error.to_string().contains("8 haps"), "{error}");
             assert_eq!(session.generation(), 0);
+
+            // The lanes that do not play keep the cap.
+            #[cfg(feature = "vst")]
+            {
+                let muted = "$: s(\"bd\")\n_$: s(\"hh*16\").vst(\"fx\")";
+                session.reload_at(muted, false, 0.0).expect("one hap plays");
+                let deadline = Instant::now() + Duration::from_secs(1);
+                let shadow = session.shadow_haps(Fraction::ZERO, Fraction::ONE, deadline);
+                assert!(shadow.is_none());
+            }
         }
     }
 
@@ -3076,7 +3124,8 @@ mod tests {
 
     /// A score uses a native orchestra only while the host permits one. The
     /// refusal is typed, so the studio can offer its switch, and a permit
-    /// the host takes back refuses the next score again.
+    /// the host takes back refuses the next score again. A refused score
+    /// leaves the score in play in the active slot.
     #[test]
     fn an_orchestra_loads_only_while_it_is_permitted() {
         let load = "loadCSound`instr voice
@@ -3107,6 +3156,15 @@ endin`";
             .evaluate_prebake(load)
             .expect_err("permission taken back");
         assert_eq!(refused.kind(), "csound-permission");
+
+        // The score runs, then the host refuses its orchestra.
+        session.evaluate("note(60)").expect("score in play");
+        let playing = active_values(&session);
+        let refused = session
+            .evaluate(&format!("{load}\nnote(62)"))
+            .expect_err("no permission");
+        assert_eq!(refused.kind(), "csound-permission");
+        assert_eq!(active_values(&session), playing);
     }
 
     /// Two scripts give `sc` two meanings. A score gets the meaning of the

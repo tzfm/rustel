@@ -789,6 +789,7 @@ impl Session {
             continuation_reserve,
             mode,
             self.live_producer_schedule_cover(),
+            true,
         )
     }
 
@@ -806,12 +807,15 @@ impl Session {
         } else {
             0.0
         };
+        // The evaluation after the shield waits for this turn, so the turn
+        // looks at no plugin copy.
         self.schedule_audio_live_with_cover_at(
             now,
             sample_rate,
             continuation_reserve,
             LiveQueryBudgetMode::Steady,
             self.live_schedule_cover() + extra,
+            false,
         )
     }
 
@@ -823,6 +827,7 @@ impl Session {
         continuation_reserve: Duration,
         mode: LiveQueryBudgetMode,
         cover: f64,
+        look_ahead: bool,
     ) -> Result<LiveAudioBatch, LiveAudioScheduleError> {
         // The producer publishes a takeover at this same rate.
         self.live_sample_rate = (sample_rate > 0).then_some(sample_rate);
@@ -840,6 +845,7 @@ impl Session {
                 continuation_reserve,
                 mode,
                 cover,
+                look_ahead,
             ))
         })
         .map_err(LiveAudioScheduleError::Retryable)?
@@ -853,6 +859,7 @@ impl Session {
         continuation_reserve: Duration,
         mode: LiveQueryBudgetMode,
         cover: f64,
+        look_ahead: bool,
     ) -> Result<LiveAudioBatch, LiveAudioScheduleError> {
         let mut record = ProducerTurnRecord {
             cover_start_nanos: crate::producer::seconds_nanos(
@@ -937,6 +944,22 @@ impl Session {
         {
             record.loading_refusal_count = 1;
         }
+        // A turn of the producer with its cover full looks at the plugin
+        // copies of the cycles ahead. A shield does not look. The look caps
+        // itself by the cover, so no reserve of the producer holds its time:
+        // the tail of the turn starts after it.
+        #[cfg(feature = "vst")]
+        let result = if look_ahead {
+            let looked = self.plugin_turn(now, continuation_reserve, mode, &profile, &mut record);
+            result.map(|mut batch| {
+                batch.tail_started += looked;
+                batch
+            })
+        } else {
+            result
+        };
+        #[cfg(not(feature = "vst"))]
+        let _ = look_ahead;
         self.merge_producer_turn(record);
         result
     }
@@ -1165,6 +1188,9 @@ impl Session {
         // The plain events, for a copy whose effect a save removed. Only a
         // window with a takeover frame can meet such a copy.
         let mut plain: Vec<handover::ConvertedOnset<'_>> = Vec::new();
+        // The note of each event, for its plugin chain.
+        #[cfg(feature = "vst")]
+        let mut values = Vec::new();
         let conversion_started = Instant::now();
         let (mut events, notices) =
             rustel_voice::with_diagnostic_policy(self.direct_diagnostic_logging, || {
@@ -1173,6 +1199,8 @@ impl Session {
                     .filter_map(|onset| {
                         match self.live_audio_event(onset, sample_rate, cps, lookup) {
                             Ok(event) => {
+                                #[cfg(feature = "vst")]
+                                values.push(&onset.value);
                                 if let Some(warning) = self.input_channel_warning(&event)
                                     && !input_warnings.contains(&warning)
                                 {
@@ -1267,6 +1295,9 @@ impl Session {
                     })
                     .collect::<Vec<_>>()
             });
+        #[cfg(feature = "vst")]
+        self.chain_live_events(&mut events, &values);
+        self.record_csound_chains(&events);
         // Leave out each compensated event whose onset has an outgoing copy
         // on the device: both copies would play, and the outgoing copy can
         // already sound. A left-out event leaves the converted and the
@@ -2260,7 +2291,8 @@ mod tests {
         /// command line's direct log, not one per onset. (The diagnostics queue
         /// collapses a run by itself, so only the direct log can show this.)
         /// A plugin problem is one line for each evaluation, in the queue and on
-        /// the direct log.
+        /// the direct log. A note the voice refuses takes no plugin chain, and
+        /// the notes after it keep their own chains.
         #[test]
         fn a_repeated_refusal_is_one_direct_record_a_window() {
             let mut session = Session::with_config(SessionConfig {
@@ -2361,6 +2393,108 @@ mod tests {
             assert!(plugin_lines(&mut session, 0.5).is_empty());
             let records = direct_diagnostics_for_test::take().into_iter();
             assert_eq!(records.filter(|kind| kind == PLUGIN_DIAGNOSTIC).count(), 1);
+
+            // A count of the live output that rises gives a plugin line: the
+            // output had no bus for a chain, or a plugin worker ran late. A
+            // new output counts from 0.
+            #[cfg(feature = "vst")]
+            {
+                let _plugins = fixture_plugins();
+                session.set_direct_diagnostic_logging(false);
+                let _ = crate::vst::take_errors();
+                let mut output = ManualLiveOutput::new(RATE, session.generation()).expect("output");
+                session.attach_plugins(output.device());
+                let output_lines = |session: &mut Session| -> Vec<String> {
+                    session.report_voice_notices(Vec::new());
+                    let diagnostics = session.take_diagnostics().into_iter();
+                    let lines =
+                        diagnostics.filter(|diagnostic| diagnostic.kind == PLUGIN_DIAGNOSTIC);
+                    lines.map(|diagnostic| diagnostic.message).collect()
+                };
+                let refused = "the output had no room for a plugin chain: 64 chains play at most";
+                let late = "a plugin worker ran late, and the audio waited for it";
+                // The note of one chain more than the buses finds no bus.
+                for chain in 0..=rustel_audio::MAX_INSERT_BUSES as u64 {
+                    let mut controls = rustel_audio::OscillatorControls {
+                        insert_chain: Some(100 + chain),
+                        ..Default::default()
+                    };
+                    let key = rustel_audio::InsertKey {
+                        plugin: 1,
+                        preset: 0,
+                    };
+                    controls.effects[0] = Some(rustel_audio::InsertControls::new(key));
+                    assert!(output.device().push(rustel_audio::AudioEvent {
+                        onset_id: chain + 1,
+                        generation: output.device().generation(),
+                        target_frame: 0,
+                        onset_lead: 0.0,
+                        freq_hz: 220.0,
+                        gain: 0.5,
+                        duration_secs: 0.05,
+                        ui_visuals: 0,
+                        controls,
+                        sample: None,
+                        synth: None,
+                        wavetable: None,
+                        cut: None,
+                    }));
+                }
+                let mut pcm = [0.0_f32; 256];
+                output.render(&mut pcm);
+                output.render(&mut pcm);
+                assert!(output_lines(&mut session).is_empty());
+                rustel_audio::LiveReverbBatch::install_inserts(output.device(), &[]);
+                assert_eq!(output_lines(&mut session), [refused]);
+                // The names source of the output hears each later count.
+                let turn = |refusals, late_jobs| rustel_audio::InsertTurn {
+                    refusals,
+                    late_jobs,
+                    inline_jobs: 0,
+                };
+                let counts = |session: &mut Session, refusals, late_jobs| -> Vec<String> {
+                    crate::vst::named_chains(&session.chains, turn(refusals, late_jobs));
+                    output_lines(session)
+                };
+                assert_eq!(counts(&mut session, 1, 3), [late]);
+                session.set_pattern(voice("sine", 1.0)).unwrap();
+                assert!(counts(&mut session, 1, 3).is_empty());
+                assert_eq!(counts(&mut session, 4, 4), [refused, late]);
+                // A new output counts from 0, also over 2 turns.
+                session.set_pattern(voice("sine", 1.0)).unwrap();
+                crate::vst::named_chains(&session.chains, turn(1, 0));
+                assert_eq!(counts(&mut session, 1, 2), [refused, late]);
+                // A session with no live output tells nothing.
+                session.set_pattern(voice("sine", 1.0)).unwrap();
+                let relaxed = std::sync::atomic::Ordering::Relaxed;
+                session.plugins_live.store(false, relaxed);
+                assert!(counts(&mut session, 2, 3).is_empty());
+
+                // A note the voice refuses takes no chain, in both live
+                // paths: each note of b has the chain of b.
+                let mut session = Session::with_config(SessionConfig {
+                    cps: 1.0,
+                    horizon: 0.5,
+                    sample_rate: RATE,
+                    ..SessionConfig::default()
+                })
+                .unwrap();
+                session.set_direct_diagnostic_logging(false);
+                let text = "a: s(\"nosuchsound\").vst(\"delay\")\nb: s(\"sine\").vst(\"delay\")";
+                session.evaluate(text).unwrap();
+                let batch = session
+                    .schedule_audio_live_at(0.0, RATE, Duration::ZERO, LiveQueryBudgetMode::Steady)
+                    .unwrap_or_else(|_| panic!("b plays, the unknown sound is skipped"));
+                session.restart_transport_at(0.0);
+                let through = session.schedule_audio_at(0.0, RATE).expect("events");
+                assert!(!batch.events.is_empty() && !through.is_empty());
+                let events = batch.events.iter().chain(&through);
+                let chains: Vec<Option<u64>> =
+                    events.map(|event| event.controls.insert_chain).collect();
+                assert!(chains[0].is_some() && chains.iter().all(|chain| *chain == chains[0]));
+                let named = crate::vst::named_chains(&session.chains, turn(0, 0)).named;
+                assert_eq!(named.len(), 1);
+            }
         }
 
         #[test]

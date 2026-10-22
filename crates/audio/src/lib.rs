@@ -33,6 +33,9 @@ pub mod meter;
 pub mod mmcss;
 mod output_options;
 mod periodic_wave;
+// Only a device output starts plugin workers.
+#[cfg_attr(not(feature = "device-audio"), allow(dead_code))]
+mod pool;
 pub mod power_mode;
 pub mod pressure;
 #[cfg(feature = "device-audio")]
@@ -79,9 +82,9 @@ pub use device_facts::{
 pub use dispatch::DspDispatch;
 pub use distortion::{DISTORTION_ALGORITHMS, DistortControls};
 pub use insert::{
-    EFFECT_CHAIN, INSERT_SLOTS, InsertControls, InsertKey, InsertNames, InsertNote, InsertParam,
-    InsertProvider, InsertSlot, MAX_INSERT_BUSES, MAX_INSERT_PARAMS, OrbitInsert, effect_slot,
-    instrument_slot,
+    EFFECT_CHAIN, INSERT_SLOTS, InsertChains, InsertControls, InsertKey, InsertNames, InsertNote,
+    InsertParam, InsertProvider, InsertSlot, InsertTurn, InsertValue, InsertValues,
+    MAX_INSERT_BUSES, MAX_INSERT_PARAMS, NO_STAGE, OrbitInsert, effect_slot, instrument_slot,
 };
 pub use limiter::{Character as LimiterCharacter, DEFAULT_THRESHOLD_DB, Limiter};
 pub use live::{
@@ -92,6 +95,8 @@ pub use meter::{
     linear_to_db,
 };
 pub use output_options::LiveOutputOptions;
+#[cfg(any(test, feature = "test-support"))]
+pub use pool::set_plugin_pool_for_test;
 pub use pressure::{RealtimePool, RealtimePressureSnapshot};
 #[cfg(feature = "device-audio")]
 pub use realtime::RealtimeLoadSnapshot;

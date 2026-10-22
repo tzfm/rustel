@@ -296,6 +296,18 @@ impl State {
         }
     }
 
+    /// The orbits of the Csound chains of the session. A Csound note with no
+    /// plugin plays on the chain of its orbit. A Csound note with a plugin
+    /// plays on a plugin chain, and that chain counts with the plugin chains.
+    #[cfg(feature = "vst")]
+    pub(crate) fn orbit_chains(&self) -> Vec<u64> {
+        let store = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let orbits = store.chains.iter().copied();
+        orbits
+            .filter(|chain| *chain < rustel_audio::MAX_ORBITS as u64)
+            .collect()
+    }
+
     #[cfg(feature = "device-audio")]
     pub(crate) fn named_chains(&self) -> Vec<u64> {
         self.0

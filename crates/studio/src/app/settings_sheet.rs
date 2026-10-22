@@ -1065,6 +1065,8 @@ impl App {
             SettingsAction::ScanVst => self.scan_vst(),
             #[cfg(feature = "vst")]
             SettingsAction::RescanVst => self.rescan_vst(),
+            #[cfg(feature = "vst")]
+            SettingsAction::ToggleAudioThread(at) => self.toggle_audio_thread(at),
         }
         // The keybind learn belongs to the Keybinds page: Tabbed away
         // from it - or closed by any door the sheet has - the learn goes

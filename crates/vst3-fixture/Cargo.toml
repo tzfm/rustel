@@ -14,3 +14,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 vst3 = "0.3.0"
+
+[dev-dependencies]
+# The unit tests count the allocations of the audio call.
+rustel-audio = { path = "../audio" }

@@ -2644,8 +2644,8 @@ pub struct SettingsSheet {
     /// as one. A standard folder is read-only.
     #[cfg(feature = "vst")]
     pub vst_standard_count: usize,
-    /// How many plugins the scan found follow the folders. The rows are
-    /// read-only: the scan is what changes them.
+    /// How many plugins the scan found follow the folders. The scan adds and
+    /// removes the rows. Each row has the switch `audio thread only`.
     #[cfg(feature = "vst")]
     pub vst_scanned_count: usize,
     /// The first line of the page drawn, kept from key to key so walking
@@ -2730,6 +2730,11 @@ pub enum SettingsAction {
     /// again.
     #[cfg(feature = "vst")]
     RescanVst,
+    /// Space on a plugin row: turn the switch `audio thread only` of the
+    /// plugin on or off. The number is the place of the plugin in the list
+    /// of plugins.
+    #[cfg(feature = "vst")]
+    ToggleAudioThread(usize),
     /// Enter on a keybind row: wait for a chord, and make it this
     /// action's. The chord itself arrives through the app's learn state.
     LearnKeybind(BindAction),
@@ -2988,15 +2993,18 @@ impl SettingsSheet {
     /// The vst page is a list, as the sources page is: the arrows walk the
     /// two actions, the folders the player added, the standard folders,
     /// then the plugins the scan found. Only a folder the player added is
-    /// removed.
+    /// removed. Space on a plugin turns its switch `audio thread only` on or
+    /// off.
     #[cfg(feature = "vst")]
     fn vst_key(&mut self, code: crossterm::event::KeyCode) -> SettingsAction {
         use crossterm::event::KeyCode;
         let added = self.vst_folder_count;
-        let len = VST_CONTROL_COUNT + added + self.vst_standard_count + self.vst_scanned_count;
+        let folders = VST_CONTROL_COUNT + added + self.vst_standard_count;
+        let len = folders + self.vst_scanned_count;
         let at = self.selected.min(len - 1);
         let on_added = at >= VST_CONTROL_COUNT && at < VST_CONTROL_COUNT + added;
         match code {
+            KeyCode::Char(' ') if at >= folders => SettingsAction::ToggleAudioThread(at - folders),
             KeyCode::Up => {
                 self.selected = (at + len - 1) % len;
                 SettingsAction::Nothing
@@ -4520,8 +4528,8 @@ pub struct VstPage {
     pub presets: String,
 }
 
-/// One plugin the scan found, as its row reads: the name, and where the
-/// plugin is now.
+/// One plugin the scan found, as its row reads: the name, where the plugin
+/// is now, and its switch.
 #[cfg(feature = "vst")]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VstScanned {
@@ -4529,6 +4537,9 @@ pub struct VstScanned {
     /// The state of the plugin in this studio: `found` before its first
     /// load, then `loading`, `ready`, or `failed`.
     pub state: String,
+    /// The switch `audio thread only`: the copies of the plugin stay on the
+    /// audio thread.
+    pub audio_thread: bool,
 }
 
 /// One plugin folder, as its row reads.
@@ -8624,10 +8635,12 @@ mod tests {
                 VstScanned {
                     name: "Tone".into(),
                     state: "ready".into(),
+                    audio_thread: false,
                 },
                 VstScanned {
                     name: "Kick".into(),
                     state: "found".into(),
+                    audio_thread: true,
                 },
             ],
             plugins: 2,
@@ -8684,18 +8697,34 @@ mod tests {
             .join("\n");
         assert!(text.contains("scanned plugins"), "{text}");
         assert!(text.contains("Tone · ready"), "{text}");
-        assert!(text.contains("Kick · found"), "{text}");
+        assert!(!text.contains("Tone · ready ·"), "{text}");
+        assert!(text.contains("Kick · found · audio thread only"), "{text}");
         assert!(
             text.contains("scanning · 3 of 124 bundles · Shell › Comp"),
             "{text}"
         );
         // The rows are part of the walk: six Downs from the first action
-        // reach the last plugin, and the hint under the list says so.
+        // reach the last plugin, and the hint under the list says so. Space
+        // on a plugin turns its switch on or off, and does nothing on a
+        // folder.
         let mut walked = UiSettings::default();
-        for _ in 0..6 {
-            sheet.key(crossterm::event::KeyCode::Down, &mut walked, &features);
+        let mut walk = |sheet: &mut SettingsSheet, code| sheet.key(code, &mut walked, &features);
+        let (down, space) = (KeyCode::Down, KeyCode::Char(' '));
+        for _ in 0..4 {
+            walk(&mut sheet, down);
         }
+        assert_eq!(walk(&mut sheet, space), SettingsAction::Ignored);
+        walk(&mut sheet, down);
+        assert_eq!(
+            walk(&mut sheet, space),
+            SettingsAction::ToggleAudioThread(0)
+        );
+        walk(&mut sheet, down);
         assert_eq!(sheet.selected, 6);
+        assert_eq!(
+            walk(&mut sheet, space),
+            SettingsAction::ToggleAudioThread(1)
+        );
         let mut buffer = Buffer::empty(frame);
         SettingsSheetView {
             sheet,
@@ -8733,7 +8762,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            text.contains("the list of every plugin the scan found"),
+            text.contains("Space turns audio thread only on or off"),
             "{text}"
         );
         assert!(text.contains("▸ Kick"), "{text}");

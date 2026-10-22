@@ -25,6 +25,14 @@ use effects::notch_coefs;
 use effects::reserve_fx_reverb_returns;
 use effects::voice_fx_pre_distort;
 use inserts::claim_insert_bus;
+use inserts::deliver;
+use inserts::displace_insert;
+pub(crate) use inserts::effect_stage_wakes;
+pub(crate) use inserts::fade_effect_stage;
+use inserts::order_insert_stages;
+pub(crate) use inserts::ordered_stages;
+pub(crate) use inserts::render_leaving_insert;
+pub(crate) use inserts::settle_insert_block;
 use kabelsalat::kabel_available;
 pub(crate) use kabelsalat::kabel_controls;
 #[cfg(feature = "device-audio")]
@@ -41,6 +49,7 @@ use modulation::lfo_waveshape;
 use modulation::lfo_waveshape_f64;
 use modulation::nan_param_default;
 use orbit::stereo_pan;
+pub(crate) use render::enable_denormal_flush;
 use std::sync::Arc;
 use voice::begin_frame;
 use voice::fm_advance;
@@ -158,6 +167,9 @@ const INSERT_SILENCE: f32 = 1e-6;
 /// An insert output with this many silent frames in a row makes no sound:
 /// a sound that goes through zero is silent for 1 frame or 2.
 const INSERT_QUIET_FRAMES: u16 = 64;
+/// The values sliders moved that the notes in the queue take: see
+/// [`ScalarBackend::set_insert_value`].
+const MAX_INSERT_VALUES: usize = 64;
 /// Frames of per-orbit mix kept for routing: the largest block a host asks
 /// for in one go.
 pub const ORBIT_MIX_FRAMES: usize = 4096;
@@ -1108,6 +1120,18 @@ struct InsertPostgain {
     unfed: u16,
 }
 
+/// The levels of the copies of one slot. A stage fades in or out with the
+/// level of its active copy, and a copy that leaves the slot fades out
+/// beside the copy that takes its place.
+#[derive(Clone, Copy)]
+pub(crate) struct InsertMix {
+    /// The level of the active copy: 1 at rest, 0 at the end of a stage
+    /// that leaves the order.
+    active: crate::live_control::Ramp,
+    /// The level of the copy in the leaving place: 0 at rest.
+    leaving: crate::live_control::Ramp,
+}
+
 /// The scalar renderer: voices, modulators, effects and orbit mixing,
 /// computed one sample at a time.
 #[derive(Default)]
@@ -1134,6 +1158,9 @@ pub struct ScalarBackend {
     /// Recent exact targets also correct prefetched onsets. The producer's
     /// ordinary requery replaces the horizon; sounding voices own their ramps.
     live_control_targets: Vec<crate::live_control::LiveControlUpdate>,
+    /// The values sliders moved, one for each parameter of a copy, for the
+    /// notes in the queue: see [`Self::set_insert_value`].
+    insert_values: Vec<crate::insert::InsertValue>,
     tables: Option<Arc<PeriodicWaveTables>>,
     /// SBD's WaveShaper curve, allocated when the backend is prepared and only
     /// read by the audio callback.
@@ -1159,9 +1186,16 @@ pub struct ScalarBackend {
     orbit_inserts: Vec<Option<Box<dyn crate::insert::OrbitInsert>>>,
     /// Live inserts wait for a matching onset before replacing the active copy.
     prepared_inserts: Vec<Option<Box<dyn crate::insert::OrbitInsert>>>,
+    /// The copy a slot gives up while its stage is heard: it fades out
+    /// beside the copy that takes its place, then goes back.
+    leaving_inserts: Vec<Option<Box<dyn crate::insert::OrbitInsert>>>,
     /// Displaced copies wait in this bounded list for return to the producer.
     retired_inserts: Vec<Box<dyn crate::insert::OrbitInsert>>,
     insert_blocks: Vec<[[f32; crate::reverb::REVERB_BLOCK]; 2]>,
+    /// For each chain: the input of a stage whose levels move, and the block
+    /// of the copy in its leaving place. See [`InsertMix`].
+    insert_dry: Vec<[[f32; crate::reverb::REVERB_BLOCK]; 2]>,
+    insert_leaving_blocks: Vec<[[f32; crate::reverb::REVERB_BLOCK]; 2]>,
     /// Each submitted instrument keeps its own block until collection.
     instrument_blocks: Vec<[[f32; crate::reverb::REVERB_BLOCK]; 2]>,
     /// Stage instrument sends so worker collection cannot reorder orbit sums.
@@ -1182,12 +1216,25 @@ pub struct ScalarBackend {
     /// fade.
     insert_fade_from: Vec<u64>,
     insert_refusals: u64,
+    /// A chain the host names found no free bus since the last reclaim: see
+    /// [`Self::reclaim_insert_chains`].
+    insert_bus_wanted: bool,
     /// Frames each insert had no input and no output. A long idle insert
     /// sleeps until a note asks for the effect again.
     insert_idle_frames: Vec<u32>,
-    /// The effects that run, one bit for each stage of the
-    /// chain: the stages that served the last note with an effect.
-    effect_stages: Vec<u8>,
+    /// The stages of each chain that run, in signal order, with
+    /// [`crate::insert::NO_STAGE`] after the last: the stages that served
+    /// the newest note with an effect, in the order of its calls, and each
+    /// stage that fades out in its place.
+    effect_order: Vec<[u8; crate::insert::EFFECT_CHAIN]>,
+    /// The levels of the copies of each slot: see [`InsertMix`].
+    insert_mixes: Vec<InsertMix>,
+    /// The generation of the newest note of each chain. An older note
+    /// changes no copy and no order.
+    insert_generations: Vec<u64>,
+    /// The chains with a fade that has not ended, one bit for each bus: see
+    /// [`Self::finish_insert_fades`].
+    insert_fading: u64,
     /// The latest instrument note sends its output through the chain effects.
     instrument_to_effect: Vec<bool>,
     /// A shared instrument's latest onset controls its output and tail.
@@ -1200,6 +1247,9 @@ pub struct ScalarBackend {
     insert_provider: Option<Arc<crate::insert::InsertProvider>>,
     /// Notes that asked for an insert their chain did not hold.
     missing_insert_events: u64,
+    /// The plugin workers of the output. A chain of inserts that run on any
+    /// thread posts its blocks to them as jobs. Live only.
+    plugin_pool: Option<crate::pool::PoolHandle>,
     /// Per-orbit stereo accumulation for one ≤128-frame sub-block: the
     /// pre-duck orbit signal (voices + delay + reverb returns).
     orbit_blocks: Vec<[[f32; crate::reverb::REVERB_BLOCK]; 2]>,
@@ -1435,6 +1485,43 @@ impl ScalarBackend {
         }
     }
 
+    /// Moves a parameter value of an insert: see
+    /// [`crate::insert::InsertValue`]. The copy in the slot of the value
+    /// takes it at once, when the copy has the key of the value. Each note
+    /// of the generation of the value or older takes it too. A new move of a
+    /// parameter takes the place of the move before and goes last. The
+    /// backend keeps the last moves of [`MAX_INSERT_VALUES`] values. A full
+    /// table drops the oldest move. A value that is not finite goes nowhere.
+    pub fn set_insert_value(&mut self, value: crate::insert::InsertValue) {
+        if !value.param.value.is_finite() {
+            return;
+        }
+        let held = |chain: &Option<u64>| *chain == Some(value.slot.chain);
+        let bus = value
+            .slot
+            .is_valid()
+            .then(|| self.insert_chains.iter().position(held))
+            .flatten();
+        let copy = bus.and_then(|bus| self.orbit_inserts[value.slot.physical(bus)].as_mut());
+        if let Some(copy) = copy.filter(|copy| copy.key() == value.key) {
+            copy.set_param_now(value.param);
+        }
+        let same = |kept: &crate::insert::InsertValue| {
+            (kept.slot, kept.key, kept.param.id) == (value.slot, value.key, value.param.id)
+        };
+        if let Some(at) = self.insert_values.iter().position(same) {
+            // The new move goes last, so a full table drops the oldest move.
+            self.insert_values[at..].rotate_left(1);
+            *self.insert_values.last_mut().unwrap() = value;
+        } else if self.insert_values.len() < self.insert_values.capacity() {
+            self.insert_values.push(value);
+        } else if !self.insert_values.is_empty() {
+            // Bounded, so a move never allocates in the callback.
+            self.insert_values.rotate_left(1);
+            *self.insert_values.last_mut().unwrap() = value;
+        }
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -1618,6 +1705,7 @@ impl ScalarBackend {
         self.pending_chokes.fill(None);
         self.preview_epoch = 0;
         self.live_control_targets.clear();
+        self.insert_values.clear();
         while let Some(mut voice) = self.voices.pop() {
             retire_voice_resources(
                 &mut voice,
@@ -1644,6 +1732,23 @@ impl ScalarBackend {
         for reverb in self.orbit_reverbs.iter_mut().flatten() {
             reverb.reset();
         }
+        // Each fade ends now: the copy in a leaving place goes back, and a
+        // stage that fades out leaves the order. A copy with no place in the
+        // list of the copies that go back waits for the next stopped block.
+        let mut buses = self.insert_fading;
+        while buses != 0 {
+            let bus = buses.trailing_zeros() as usize;
+            buses &= buses - 1;
+            for stage in 0..=crate::insert::EFFECT_CHAIN {
+                let mix = &mut self.insert_mixes[stage * crate::insert::MAX_INSERT_BUSES + bus];
+                *mix = InsertMix {
+                    active: crate::live_control::Ramp::new(0, mix.active.target()),
+                    ..InsertMix::default()
+                };
+            }
+        }
+        self.finish_insert_fades();
+        self.insert_generations.fill(0);
         for insert in self.orbit_inserts.iter_mut().flatten() {
             insert.reset();
         }

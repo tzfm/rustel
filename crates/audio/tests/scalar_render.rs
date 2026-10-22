@@ -5078,8 +5078,11 @@ impl rustel_audio::OrbitInsert for GainInsert {
 
 #[test]
 fn an_orbit_insert_processes_the_notes_that_ask_for_the_effect() {
-    use rustel_audio::{InsertControls, InsertKey, InsertParam, InsertProvider, OrbitInsert};
+    use rustel_audio::{
+        InsertControls, InsertKey, InsertParam, InsertProvider, OrbitInsert, render_pcm_events,
+    };
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let key = InsertKey {
         plugin: 7,
@@ -5125,6 +5128,17 @@ fn an_orbit_insert_processes_the_notes_that_ask_for_the_effect() {
     for (frame, (wet, dry)) in chained.iter().zip(&dry).enumerate() {
         assert_eq!(*wet, dry * 0.25, "sample {frame}");
     }
+    // With the stages 1 and 0, the note goes through both effects. Two
+    // effects at one stage run that stage one time.
+    let staged = |stages: [u8; 2]| {
+        let mut event = note(1, &[0.5, 0.5]);
+        for (effect, stage) in event.controls.effects.iter_mut().flatten().zip(stages) {
+            effect.set_stage(stage);
+        }
+        render(&[event], Some(&provider))
+    };
+    assert_eq!(staged([1, 0]), (chained, 0));
+    assert_eq!(staged([0, 0]), (halved, 0));
 
     // Only the note that asks goes through the insert. A note on the same
     // orbit with no request, and a note on orbit 2, keep the level.
@@ -5138,6 +5152,35 @@ fn an_orbit_insert_processes_the_notes_that_ask_for_the_effect() {
     let (unserved, missed) = render(&[note(1, &[0.5])], None);
     assert_eq!(unserved, dry);
     assert_eq!(missed, 1);
+
+    // An offline render names each chain: the chain keeps its insert
+    // through 31 seconds of silence, and the provider builds one copy. With
+    // no name a chain leaves after 30 seconds with no use.
+    const RATE: u32 = 8_000;
+    let builds = Arc::new(AtomicUsize::new(0));
+    let counted: Arc<InsertProvider> = {
+        let builds = Arc::clone(&builds);
+        Arc::new(move |wanted, rate, slot| {
+            builds.fetch_add(1, Ordering::Relaxed);
+            provider(wanted, rate, slot)
+        })
+    };
+    let mut late = note(1, &[0.5]);
+    late.onset_frame = u64::from(31 * RATE);
+    for offline in [true, false] {
+        builds.store(0, Ordering::Relaxed);
+        let mut backend = ScalarBackend::new();
+        if offline {
+            backend.render_offline();
+        }
+        backend.set_insert_provider(Arc::clone(&counted));
+        let events = [note(1, &[0.5]), late.clone()];
+        let frames = 32 * RATE as usize;
+        render_pcm_events(&mut backend, RATE, frames, events).expect("render");
+        assert_eq!(backend.missing_insert_events(), 0);
+        let copies = if offline { 1 } else { 2 };
+        assert_eq!(builds.load(Ordering::Relaxed), copies, "offline: {offline}");
+    }
 }
 
 /// An instrument insert with a long silent start: one click 31 seconds into

@@ -503,8 +503,10 @@ A live change updates the code and is recorded in the session tape.
 A slider placed directly on `gain`, `lpf` or `lpq` also moves notes already
 sounding. An exact move takes 5 ms. With slider smoothing on in Settings, a
 mouse move takes 35 ms. With a lowpass envelope on the same note, such as
-`lpenv` or `lpattack`, an `lpf` slider changes from the next note. Any other
-control changes from the next note.
+`lpenv` or `lpattack`, an `lpf` slider changes from the next note. A slider
+that is the value of a plugin key moves the parameter value at once: see
+[plugins](plugins.md#names-and-values). Any other control changes from the
+next note.
 
 Ctrl+J opens the quick action at the caret. On a number, it can create a slider.
 On a slider, it can change or remove the control. These source edits require
@@ -655,7 +657,13 @@ Enter on `rescan` empties the scan cache and tests each plugin again. While a
 scan runs, the `scan` row names the plugin in its test. The page shows the number of plugins found and the preset
 folder, `<rustel-config>/vst`, with one folder of `.vstpreset` files for each
 plugin. A row for each plugin ends the page, with its state, and with its
-fault when it failed.
+fault when it failed. Space on a plugin row turns its switch
+`audio thread only` on or off, for a plugin that breaks on another thread.
+The row then ends in `audio thread only`. Before the load or the test of its
+plugin, a row has the name of its bundle and takes no switch. A plugin copy
+that loads after the change follows the switch. Studio keeps the switches in
+`<rustel-config>/rustel.json`, so `rustel play` follows them too. See
+[plugins](plugins.md#where-the-audio-runs).
 
 Studio saves preferences in `<rustel-config>/studio.json`. The default config
 folder is `~/.rustel`, including `%USERPROFILE%\.rustel` on Windows.

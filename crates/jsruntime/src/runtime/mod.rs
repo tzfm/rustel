@@ -361,6 +361,10 @@ pub struct ScoreEffects {
     pub preload: Vec<String>,
     /// Orchestra requests in score order, applied before Csound events play.
     pub csound: Vec<CsoundSource>,
+    /// The plugin name of each plugin call the score ran, one time each, in
+    /// call order. A name in a comment, or in a branch that does not run,
+    /// is not here. The host loads these plugins before a note asks.
+    pub plugins: Vec<String>,
     /// Start the host's gamepad poller only if this score is committed.
     pub gamepad: bool,
     pub(super) midi_inputs: MidiInputCandidate,

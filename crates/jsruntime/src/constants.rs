@@ -14,6 +14,7 @@ pub(super) const PICK_LOOKUP_SHAPE: &str = "__rustel_pick_lookup_shape";
 pub(super) const SQUEEZE_LOOKUP_SHAPE: &str = "__rustel_squeeze_lookup_shape";
 pub(super) const LANE_RESET: &str = "__rustel_lane_reset";
 pub(super) const LANE_FINISH: &str = "__rustel_lane_finish";
+pub(super) const LANE_SHADOW: &str = "__rustel_lane_shadow";
 
 /// Array nesting depth at which list constructors and pattern arguments are
 /// refused. Each level is a native recursion step, so a self-containing array

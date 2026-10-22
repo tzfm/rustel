@@ -36,23 +36,30 @@ fn wait_for_row(studio: &mut Hermetic, text: &str) {
     });
 }
 
-/// The `vst_folders` list of `studio.json`. Empty with no key.
-fn saved_folders(studio: &Hermetic) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(studio.config_home().join("studio.json")) else {
+/// The list `key` of the file `file` in the config home: `vst_folders` of
+/// `studio.json`, or `plugin_audio_thread` of `rustel.json`. Empty with no
+/// key.
+fn saved_list(studio: &Hermetic, file: &str, key: &str) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(studio.config_home().join(file)) else {
         return Vec::new();
     };
-    let prefs: serde_json::Value = serde_json::from_str(&text).expect("preferences");
-    prefs["vst_folders"]
+    let saved: serde_json::Value = serde_json::from_str(&text).expect("settings");
+    saved[key]
         .as_array()
         .into_iter()
         .flatten()
-        .map(|folder| folder.as_str().expect("a path").to_owned())
+        .map(|entry| entry.as_str().expect("a text").to_owned())
         .collect()
 }
 
 /// `a` opens the folder prompt over the vst page. The folder goes on the
-/// page, into the preferences and to the plugin host. `d` takes the folder
-/// off all three, and the rescan row counts the plugins again.
+/// page, into the preferences and to the plugin host. Space on the plugin
+/// of the folder turns its switch `audio thread only` on and off, in the
+/// host and in `rustel.json`. The row takes the switch after the load of
+/// its plugin. Before, it has the bundle name and takes no switch. A fault
+/// of the file gives a line and changes nothing. `d` takes the folder off
+/// the page, the preferences and the host, and the rescan row counts the
+/// plugins again.
 #[test]
 fn a_plugin_folder_added_on_the_sheet_reaches_the_host_and_can_be_removed() {
     let mut studio = hermetic();
@@ -97,8 +104,63 @@ fn a_plugin_folder_added_on_the_sheet_reaches_the_host_and_can_be_removed() {
     wait_for_row(&mut studio, "1 plugin found");
     assert_eq!(vst::user_folders(), [folder.path()]);
     studio.pump_until(PREFS_BUDGET, "the folder was saved", |studio| {
-        saved_folders(studio) == [path.as_str()]
+        saved_list(studio, "studio.json", "vst_folders") == [path.as_str()]
     });
+
+    // The plugin row is under the folder. `rustel play` reads the switch
+    // in `rustel.json` too.
+    let plugin = rustel_vst3_fixture::NAME;
+    let switched = || {
+        let plugins = vst::host().plugins();
+        let row = plugins.iter().find(|row| row.name == plugin);
+        row.expect("the plugin of the folder").audio_thread
+    };
+    let saved = |studio: &Hermetic| saved_list(studio, "rustel.json", "plugin_audio_thread");
+    studio.press(KeyCode::Down, KeyModifiers::NONE);
+    // Before its load, the row has the name of the bundle and takes no
+    // switch. The load gives the bundle its 2 plugins.
+    studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
+    studio.settle();
+    assert_eq!(
+        studio.status(),
+        format!("{plugin} · no switch before the load or the test of the plugin")
+    );
+    assert!(saved(&studio).is_empty());
+    vst::host().resolve(plugin, true);
+    wait_for_row(&mut studio, "2 plugins found");
+    studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
+    studio.settle();
+    assert_eq!(
+        studio.status(),
+        format!("{plugin} · audio thread only on · for the copies that load from now")
+    );
+    row_containing(
+        &studio.rows(),
+        &format!("{plugin} · ready · audio thread only"),
+    );
+    assert!(switched());
+    assert_eq!(saved(&studio), [plugin]);
+    studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
+    studio.settle();
+    assert!(studio.status().contains("audio thread only off"));
+    assert!(!switched());
+    assert!(saved(&studio).is_empty());
+    // A file with a fault stays as it is, and so does the switch.
+    let settings = studio.config_home().join("rustel.json");
+    let faulty = r#"{"plugin_audio_thread": "OTT"}"#;
+    std::fs::write(&settings, faulty).expect("settings");
+    studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
+    studio.settle();
+    assert_eq!(
+        studio.status(),
+        format!("{plugin}: plugin_audio_thread must be a list of plugin names")
+    );
+    assert!(!switched());
+    assert_eq!(
+        std::fs::read_to_string(&settings).expect("settings"),
+        faulty
+    );
+    studio.press(KeyCode::Up, KeyModifiers::NONE);
 
     studio.press(KeyCode::Char('d'), KeyModifiers::NONE);
     studio.settle();
@@ -108,7 +170,7 @@ fn a_plugin_folder_added_on_the_sheet_reaches_the_host_and_can_be_removed() {
     wait_for_row(&mut studio, "0 plugins found");
     assert!(vst::user_folders().is_empty());
     studio.pump_until(PREFS_BUDGET, "the folder left the file", |studio| {
-        saved_folders(studio).is_empty()
+        saved_list(studio, "studio.json", "vst_folders").is_empty()
     });
 
     // The cursor went up to the rescan row with the last folder.
@@ -229,11 +291,11 @@ fn a_completion_in_a_plugin_call_lists_names_keys_and_presets() {
         );
     }
 
-    // The object of the call: `preset` at once, and the 3 keys of the
+    // The object of the call: `preset` at once, and the 4 keys of the
     // effect at the end of its load, each with its title.
     let text = "$: s(\"bd\").vst(\"rustel fixture\", { ga })";
     complete_after(&mut studio, text, "ga");
-    wait_for_row(&mut studio, "1 of 4 parameter choices");
+    wait_for_row(&mut studio, "1 of 5 parameter choices");
     assert!(studio.rows()[row_containing(&studio.rows(), " gain ")].contains("Gain · "));
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();
@@ -265,7 +327,7 @@ fn a_completion_in_a_plugin_call_lists_names_keys_and_presets() {
         ),
     ] {
         complete_after(&mut studio, text, before);
-        wait_for_row(&mut studio, "1 of 4 parameter choices");
+        wait_for_row(&mut studio, "1 of 5 parameter choices");
         studio.press(KeyCode::Enter, KeyModifiers::NONE);
         studio.settle();
         assert_eq!(studio.score(), expected);
