@@ -226,6 +226,35 @@ impl Terminal {
         self.writer.flush().expect("the pty flushes");
     }
 
+    /// How many output bytes have arrived so far.
+    #[cfg(unix)]
+    fn mark(&self) -> usize {
+        self.buffer.lock().expect("drain buffer").len()
+    }
+
+    /// Whether the needle appears in output written after `mark`. The
+    /// whole stream keeps every frame, so a check that a view moved has to
+    /// read only what came after the move.
+    #[cfg(unix)]
+    fn wait_for_new(&mut self, mark: usize, needle: &str, budget: Duration) -> bool {
+        let stop = Instant::now() + budget;
+        while Instant::now() < stop {
+            let found = {
+                let buffer = self.buffer.lock().expect("drain buffer");
+                let start = mark.min(buffer.len());
+                contains_plain(&String::from_utf8_lossy(&buffer[start..]), needle)
+            };
+            if found {
+                return true;
+            }
+            if self.child.try_wait().expect("child polls").is_some() {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
     fn resize(&mut self, rows: u16, cols: u16) {
         self.master
             .resize(PtySize {
@@ -490,6 +519,32 @@ fn wait_for_source_any(path: &std::path::Path, acceptable: &[&str], budget: Dura
     false
 }
 
+/// Answer the kitty keyboard query with every flag the studio asks for, the
+/// way a terminal with full support does. Shifted chords then keep their
+/// modifiers instead of folding to the legacy byte.
+fn answer_keyboard_query(terminal: &mut Terminal) {
+    let query = b"\x1b[?u";
+    let stop = Instant::now() + BOOT_BUDGET;
+    loop {
+        let asked = terminal
+            .buffer
+            .lock()
+            .expect("drain buffer")
+            .windows(query.len())
+            .any(|window| window == query);
+        if asked {
+            break;
+        }
+        assert!(
+            Instant::now() < stop,
+            "the keyboard query never arrived:\n{}",
+            terminal.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    terminal.write(b"\x1b[?31u\x1b[?62;c");
+}
+
 /// Terminal paste framing and mixed line endings reach the real editor as
 /// one paste, and update writes its normalized text to the scene on disk.
 #[test]
@@ -649,6 +704,361 @@ fn a_space_prefixed_vim_mapping_fires_in_a_real_terminal() {
         toggled,
         "Space V did not fire the mapping; preferences:\n{:?}\nterminal:\n{}",
         std::fs::read_to_string(&saved),
+        terminal.diagnostics()
+    );
+}
+
+/// A composed key carries its text in the kitty sequence. The real terminal
+/// stream turns Option+4 into `$` in the editor and into the saved scene.
+#[test]
+fn a_composed_key_types_its_text_in_a_real_terminal() {
+    let binary = rustel_binary().expect("build `rustel` before the feature=pty suite");
+    let home = set_directory();
+    let path = home.path().join("live.strudel");
+    std::fs::write(&path, "// first\n").expect("score");
+    let mut terminal = Terminal::open(&binary, 24, 80, home.path());
+    let query = b"\x1b[?u";
+    let stop = Instant::now() + BOOT_BUDGET;
+    loop {
+        let answered = terminal
+            .buffer
+            .lock()
+            .expect("drain buffer")
+            .windows(query.len())
+            .any(|window| window == query);
+        if answered {
+            break;
+        }
+        assert!(
+            Instant::now() < stop,
+            "the keyboard query never arrived:\n{}",
+            terminal.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    terminal.write(b"\x1b[?31u\x1b[?62;c");
+    assert!(
+        terminal.wait_for(" ready", BOOT_BUDGET),
+        "the studio did not load:\n{}",
+        terminal.diagnostics()
+    );
+
+    // Two Rights put the caret after `//`. The composed key types there,
+    // inside the comment, and Ctrl+S writes the result.
+    terminal.write(b"\x1b[C\x1b[C");
+    terminal.write(b"\x1b[52;3;36u");
+    terminal.write(&[0x13]);
+    assert!(
+        wait_for_source(&path, "//$ first\n", REPAINT_BUDGET),
+        "the composed key did not reach the scene; got {:?}; terminal:\n{}",
+        std::fs::read_to_string(&path),
+        terminal.diagnostics()
+    );
+}
+
+/// Vim list keys leave the reference search in Command mode. A letter
+/// waits, i types, Esc returns to Command, and a second Esc closes.
+#[test]
+fn vim_list_keys_keep_the_reference_search_modal() {
+    let binary = rustel_binary().expect("build `rustel` before the feature=pty suite");
+    let home = set_directory();
+    std::fs::write(
+        home.path().join("studio.json"),
+        r#"{"editor_keybindings":"vim","vim_list_navigation":true,"animation":false}"#,
+    )
+    .expect("Vim preferences");
+    std::fs::write(home.path().join("live.strudel"), "// first\n\n").expect("score");
+    let mut terminal = Terminal::open(&binary, 24, 80, home.path());
+    assert!(
+        terminal.wait_for(" ready", BOOT_BUDGET),
+        "the studio did not load:\n{}",
+        terminal.diagnostics()
+    );
+
+    // j moves to the empty line, where Ctrl+F browses instead of looking
+    // up a word, and the samples search row is on screen.
+    terminal.write(b"j");
+    terminal.write(&[0x06]);
+    assert!(
+        terminal.wait_for("search:", REPAINT_BUDGET),
+        "the reference did not open:\n{}",
+        terminal.diagnostics()
+    );
+
+    // Command: letters stay out of the query.
+    terminal.write(b"bd");
+    assert!(
+        terminal.wait_for("press i or a", REPAINT_BUDGET),
+        "the command-mode hint did not appear:\n{}",
+        terminal.diagnostics()
+    );
+    assert!(
+        !contains_plain(&terminal.text(), "search: bd"),
+        "a command-mode letter reached the search:\n{}",
+        terminal.diagnostics()
+    );
+
+    // i types, and the search row shows the text.
+    terminal.write(b"i");
+    assert!(
+        terminal.wait_for("insert mode", REPAINT_BUDGET),
+        "i did not enter Insert:\n{}",
+        terminal.diagnostics()
+    );
+    terminal.write(b"bd");
+    assert!(
+        terminal.wait_for("search: bd", REPAINT_BUDGET),
+        "Insert did not type into the search:\n{}",
+        terminal.diagnostics()
+    );
+
+    // Esc returns to Command: x waits and the query keeps its text.
+    terminal.write(&[0x1b]);
+    assert!(
+        terminal.wait_for("command mode", REPAINT_BUDGET),
+        "Esc did not return to Command:\n{}",
+        terminal.diagnostics()
+    );
+    terminal.write(b"x");
+    assert!(
+        terminal.wait_for("press i or a", REPAINT_BUDGET),
+        "Command took x:\n{}",
+        terminal.diagnostics()
+    );
+    assert!(
+        !contains_plain(&terminal.text(), "search: bdx"),
+        "Command typed x:\n{}",
+        terminal.diagnostics()
+    );
+
+    // A second Esc closes the panel rather than only leaving Insert.
+    terminal.write(&[0x1b]);
+    assert!(
+        terminal.wait_for("reference cl", REPAINT_BUDGET),
+        "the second Esc did not close the reference:\n{}",
+        terminal.diagnostics()
+    );
+}
+
+/// A composed key is text. In Command mode it waits like any other letter.
+/// After i it types its character, the dollar sign Option+4 makes on a Mac
+/// ISO layout.
+#[test]
+fn a_composed_key_waits_for_insert_in_the_reference() {
+    let binary = rustel_binary().expect("build `rustel` before the feature=pty suite");
+    let home = set_directory();
+    std::fs::write(
+        home.path().join("studio.json"),
+        r#"{"editor_keybindings":"vim","vim_list_navigation":true,"animation":false}"#,
+    )
+    .expect("Vim preferences");
+    std::fs::write(home.path().join("live.strudel"), "// first\n\n").expect("score");
+    let mut terminal = Terminal::open(&binary, 24, 80, home.path());
+    answer_keyboard_query(&mut terminal);
+    assert!(
+        terminal.wait_for(" ready", BOOT_BUDGET),
+        "the studio did not load:\n{}",
+        terminal.diagnostics()
+    );
+
+    terminal.write(b"j");
+    terminal.write(b"\x1b[102;5u");
+    assert!(
+        terminal.wait_for("search:", REPAINT_BUDGET),
+        "the reference did not open:\n{}",
+        terminal.diagnostics()
+    );
+
+    // Option+4 on a Mac ISO layout, with its associated text.
+    terminal.write(b"\x1b[52;3;36u");
+    assert!(
+        terminal.wait_for("press i or a", REPAINT_BUDGET),
+        "a composed key did not wait for Insert:\n{}",
+        terminal.diagnostics()
+    );
+
+    terminal.write(b"i");
+    assert!(
+        terminal.wait_for("insert mode", REPAINT_BUDGET),
+        "i did not enter Insert:\n{}",
+        terminal.diagnostics()
+    );
+    terminal.write(b"\x1b[52;3;36u");
+    assert!(
+        terminal.wait_for("search: $", REPAINT_BUDGET),
+        "the composed key did not type its text:\n{}",
+        terminal.diagnostics()
+    );
+}
+
+/// Edit > Find in Vim opens a typing prompt, not Command mode. The pattern
+/// goes in as typed, Enter searches once and closes, and n and N walk the
+/// matches in the score.
+#[cfg(unix)]
+#[test]
+fn vim_find_takes_typed_text_and_walks_with_n() {
+    let binary = rustel_binary().expect("build `rustel` before the feature=pty suite");
+    let home = set_directory();
+    std::fs::write(
+        home.path().join("studio.json"),
+        r#"{"editor_keybindings":"vim","animation":false}"#,
+    )
+    .expect("Vim preferences");
+    let mut source = String::from("// needle one\n");
+    for index in 0..30 {
+        source.push_str(&format!("// filler {index}\n"));
+    }
+    source.push_str("// needle two\n");
+    std::fs::write(home.path().join("live.strudel"), source).expect("score with two matches");
+    let mut terminal = Terminal::open(&binary, 24, 80, home.path());
+    answer_keyboard_query(&mut terminal);
+    assert!(
+        terminal.wait_for(" ready", BOOT_BUDGET),
+        "the studio did not load:\n{}",
+        terminal.diagnostics()
+    );
+
+    // Ctrl+Shift+Y as an enhanced terminal sends it: y is 121, and the
+    // modifiers are 1 + Shift + Ctrl.
+    terminal.write(b"\x1b[121;6u");
+    assert!(
+        terminal.wait_for("find - type a reg", REPAINT_BUDGET),
+        "the find prompt did not open:\n{}",
+        terminal.diagnostics()
+    );
+    terminal.write(b"needle");
+    assert!(
+        terminal.wait_for("VIM /needle", REPAINT_BUDGET),
+        "the pattern did not type straight into the prompt:\n{}",
+        terminal.diagnostics()
+    );
+
+    terminal.write(b"\r");
+    assert!(
+        terminal.wait_for("find closed", REPAINT_BUDGET),
+        "Enter did not search and close the prompt:\n{}",
+        terminal.diagnostics()
+    );
+
+    // The second match is off screen, so its line appears only after n
+    // moves the view. The first is already in the stream, so N has to be
+    // read from the output written after it.
+    let mark = terminal.mark();
+    terminal.write(b"n");
+    assert!(
+        terminal.wait_for_new(mark, "needle two", REPAINT_BUDGET),
+        "n did not walk to the second match:\n{}",
+        terminal.diagnostics()
+    );
+    let mark = terminal.mark();
+    terminal.write(b"N");
+    assert!(
+        terminal.wait_for_new(mark, "needle one", REPAINT_BUDGET),
+        "N did not walk back to the first match:\n{}",
+        terminal.diagnostics()
+    );
+}
+
+/// Vim key modes cover the theme picker and the export sheet. j and k walk
+/// the list or form, i types, Esc returns to Command, and a second Esc
+/// closes.
+#[cfg(unix)]
+#[test]
+fn vim_key_modes_cover_the_theme_picker_and_export_sheet() {
+    let binary = rustel_binary().expect("build `rustel` before the feature=pty suite");
+    let home = set_directory();
+    std::fs::write(
+        home.path().join("studio.json"),
+        r#"{"editor_keybindings":"vim","vim_list_navigation":true,"animation":false}"#,
+    )
+    .expect("Vim preferences");
+    std::fs::write(home.path().join("live.strudel"), "// first\n\n").expect("score");
+    let mut terminal = Terminal::open(&binary, 24, 80, home.path());
+    answer_keyboard_query(&mut terminal);
+    assert!(
+        terminal.wait_for(" ready", BOOT_BUDGET),
+        "the studio did not load:\n{}",
+        terminal.diagnostics()
+    );
+
+    // Ctrl+T opens the picker. j and x go out together: if j typed, x
+    // would type after it and the query would read jx.
+    terminal.write(b"\x1b[116;5u");
+    assert!(
+        terminal.wait_for("search: i or a types", REPAINT_BUDGET),
+        "the theme picker did not open in Command:\n{}",
+        terminal.diagnostics()
+    );
+    terminal.write(b"jx");
+    assert!(
+        !contains_plain(&terminal.text(), "search: jx"),
+        "a Command-mode key reached the theme search:\n{}",
+        terminal.diagnostics()
+    );
+
+    let mark = terminal.mark();
+    terminal.write(b"i");
+    assert!(
+        terminal.wait_for_new(mark, "VIM INSERT", REPAINT_BUDGET),
+        "i did not enter Insert:\n{}",
+        terminal.diagnostics()
+    );
+    terminal.write(b"x");
+    assert!(
+        terminal.wait_for("search: x", REPAINT_BUDGET),
+        "Insert did not type in the theme search:\n{}",
+        terminal.diagnostics()
+    );
+    let mark = terminal.mark();
+    terminal.write(&[0x1b]);
+    assert!(
+        terminal.wait_for_new(mark, "j/k browse", REPAINT_BUDGET),
+        "Esc did not return the picker to Command:\n{}",
+        terminal.diagnostics()
+    );
+
+    // A second Esc closes the picker. Let the lone Esc leave the parser
+    // before the next escape sequence arrives. Ctrl+Shift+X on an enhanced
+    // terminal is x (120) with Shift and Ctrl.
+    terminal.write(&[0x1b]);
+    std::thread::sleep(Duration::from_millis(150));
+    terminal.write(b"\x1b[120;6u");
+    assert!(
+        terminal.wait_for("export -", REPAINT_BUDGET),
+        "the export sheet did not open:\n{}",
+        terminal.diagnostics()
+    );
+
+    // j walks to the cycles field. A Command-mode 2 would stay pending and
+    // make the value 232. The sheet covers the footer, so its visible hint
+    // is the mode witness.
+    terminal.write(b"j");
+    terminal.write(b"2");
+    let mark = terminal.mark();
+    terminal.write(b"i");
+    assert!(
+        terminal.wait_for_new(mark, "returns to Command", REPAINT_BUDGET),
+        "i did not enter Insert in the export sheet:\n{}",
+        terminal.diagnostics()
+    );
+    terminal.write(b"32");
+    assert!(
+        terminal.wait_for("cycles   32", REPAINT_BUDGET),
+        "Insert did not type the cycles:\n{}",
+        terminal.diagnostics()
+    );
+    let mark = terminal.mark();
+    terminal.write(&[0x1b]);
+    assert!(
+        terminal.wait_for_new(mark, "j/k moves", REPAINT_BUDGET),
+        "Esc did not return the export sheet to Command:\n{}",
+        terminal.diagnostics()
+    );
+    let mark = terminal.mark();
+    terminal.write(&[0x1b]);
+    assert!(
+        terminal.wait_for_new(mark, "export close", REPAINT_BUDGET),
+        "the second Esc did not close the export sheet:\n{}",
         terminal.diagnostics()
     );
 }

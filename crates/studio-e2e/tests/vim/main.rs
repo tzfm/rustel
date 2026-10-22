@@ -90,6 +90,35 @@ fn vim_modes_and_commands_stay_visible_beside_a_diagnostic() {
 }
 
 #[test]
+fn r_replaces_characters_without_entering_insert() {
+    let mut studio = hermetic();
+    enable_vim(&mut studio);
+    studio.set_score("abc\n");
+    studio.set_caret(1);
+    studio.type_text("rx");
+    assert_eq!(studio.source(), "axc\n");
+    assert!(studio.rows().iter().any(|row| row.contains("VIM NORMAL")));
+
+    studio.type_text("2ry");
+    assert_eq!(studio.source(), "ayy\n");
+    studio.type_text("u");
+    assert_eq!(
+        studio.source(),
+        "axc\n",
+        "one undo step for the counted replace"
+    );
+
+    studio.set_score("ab\n");
+    studio.set_caret(0);
+    studio.type_text("5rz");
+    assert_eq!(
+        studio.source(),
+        "ab\n",
+        "a count past the line changes nothing"
+    );
+}
+
+#[test]
 fn editor_keybindings_default_to_typing_and_vim_survives_reopening() {
     let mut studio = hermetic();
     open_editor_keybindings(&mut studio);
@@ -339,7 +368,7 @@ fn studio_shortcuts_and_panel_focus_keep_their_meaning() {
 
     studio.chord("ctrl+o");
     assert_eq!(studio.focus(), Some(PanelKind::Settings));
-    studio.type_text("hjkl");
+    studio.type_text("zq");
     assert_eq!(studio.source(), source);
     studio.chord("ctrl+s");
     studio.settle();
@@ -354,7 +383,7 @@ fn studio_shortcuts_and_panel_focus_keep_their_meaning() {
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
 
     studio.set_caret(4);
-    studio.chord("ctrl+d");
+    studio.type_text("gd");
     assert_eq!(studio.focus(), Some(PanelKind::Reference));
     assert_eq!(studio.status(), "reference - s");
     let (row, text) = studio

@@ -467,28 +467,31 @@ impl App {
             return true;
         }
         match event {
-            Event::Key(key) => match panel_key_action(key) {
-                Some(PanelKeyAction::Close) => self.close_remote_panel(),
-                Some(PanelKeyAction::Reveal) => self.reveal_remote_token(),
-                Some(PanelKeyAction::Copy) => self.copy_remote_token(),
-                Some(PanelKeyAction::Previous) => {
-                    self.remote_panel_selected = self.remote_panel_selected.saturating_sub(1);
-                    self.dirty_frame = true;
+            Event::Key(key) => {
+                let alias = self.list_navigation_alias(key);
+                match panel_key_action(alias.as_ref().unwrap_or(key)) {
+                    Some(PanelKeyAction::Close) => self.close_remote_panel(),
+                    Some(PanelKeyAction::Reveal) => self.reveal_remote_token(),
+                    Some(PanelKeyAction::Copy) => self.copy_remote_token(),
+                    Some(PanelKeyAction::Previous) => {
+                        self.remote_panel_selected = self.remote_panel_selected.saturating_sub(1);
+                        self.dirty_frame = true;
+                    }
+                    Some(PanelKeyAction::Next) => {
+                        let last = if self.remote_panel_token().is_some() {
+                            4
+                        } else {
+                            2
+                        };
+                        self.remote_panel_selected = (self.remote_panel_selected + 1).min(last);
+                        self.dirty_frame = true;
+                    }
+                    Some(PanelKeyAction::Activate) => {
+                        self.activate_remote_panel_row(self.remote_panel_selected);
+                    }
+                    _ => {}
                 }
-                Some(PanelKeyAction::Next) => {
-                    let last = if self.remote_panel_token().is_some() {
-                        4
-                    } else {
-                        2
-                    };
-                    self.remote_panel_selected = (self.remote_panel_selected + 1).min(last);
-                    self.dirty_frame = true;
-                }
-                Some(PanelKeyAction::Activate) => {
-                    self.activate_remote_panel_row(self.remote_panel_selected);
-                }
-                _ => {}
-            },
+            }
             Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
                 let Some(geometry) = RemotePanelView::geometry(self.frame) else {
                     self.close_remote_panel();
@@ -697,6 +700,107 @@ mod tests {
         use crate::app::*;
         use std::io::{BufRead, BufReader, Write};
         use std::net::TcpStream;
+
+        #[test]
+        fn vim_list_keys_do_not_steal_the_remote_sheet() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 100, 30);
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.ui_settings.vim_list_navigation = true;
+            app.sync_editor_keybindings();
+            app.open_remote_panel();
+            assert!(app.remote_panel_open, "the sheet opens");
+
+            let before = app.remote_panel_selected;
+            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert_eq!(
+                app.remote_panel_selected,
+                before + 1,
+                "j moves the remote rows"
+            );
+
+            app.activate_remote_panel_row(1);
+            assert!(app.remote_edit.is_some(), "the address row edits");
+            press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+            assert_eq!(
+                app.remote_edit
+                    .as_ref()
+                    .expect("edit")
+                    .visible_text(64, true),
+                "x",
+                "the edit takes the letter, not a Vim command"
+            );
+        }
+
+        #[test]
+        fn remote_keys_use_normal_editing_with_vim_on() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 100, 30);
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.focus = Focus::Editor;
+            app.editor_mut()
+                .set_selection(crate::editor::Selection::caret(crate::editor::ByteOffset(
+                    0,
+                )))
+                .expect("caret at the start");
+            app.remote = Some(Box::new(
+                crate::remote::listen("127.0.0.1:0".parse().unwrap(), Some("gig1"))
+                    .expect("start listener"),
+            ));
+            let address = app.remote.as_ref().unwrap().address();
+            let mut client = TcpStream::connect(address).expect("connect client");
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("read timeout");
+            let mut reader = BufReader::new(client.try_clone().expect("clone client"));
+            let mut reply = String::new();
+            writeln!(client, "auth gig1").expect("authenticate");
+            reader.read_line(&mut reply).expect("auth reply");
+            assert_eq!(reply, "ok\n");
+
+            writeln!(client, "key j").expect("send key");
+            reply.clear();
+            reader.read_line(&mut reply).expect("key reply");
+            assert_eq!(reply, "ok\n");
+            app.poll_remote().expect("apply key");
+            assert!(
+                app.editor().source().starts_with('j'),
+                "the remote key typed like normal editing: {:?}",
+                app.editor().source()
+            );
+
+            // The same holds over a search box: a machine's j types.
+            app.ui_settings.vim_list_navigation = true;
+            let panel = crate::reference::ReferencePanel::browse(&app.reference);
+            app.set_reference_panel(Some(panel));
+            app.focus_panel(PanelKind::Reference);
+            app.reference_panel
+                .as_mut()
+                .expect("panel")
+                .select_tab(crate::reference::Tab::Chords);
+
+            writeln!(client, "key j").expect("send list letter");
+            reply.clear();
+            reader.read_line(&mut reply).expect("key reply");
+            assert_eq!(reply, "ok\n");
+            app.poll_remote().expect("apply list letter");
+            assert_eq!(
+                app.reference_panel.as_ref().expect("panel").chord_query,
+                "j",
+                "the remote j types instead of walking the list"
+            );
+
+            // The local user keeps their modal keys after the remote key.
+            press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+            assert_eq!(
+                app.reference_panel.as_ref().expect("panel").chord_query,
+                "j",
+                "local Command still keeps letters out"
+            );
+        }
 
         #[test]
         fn remote_commands_light_the_indicator_and_expire_with_one_repaint() {

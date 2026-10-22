@@ -88,6 +88,9 @@ pub(super) fn panel_repeat_is_safe(kind: PanelKind, code: KeyCode) -> bool {
         && !(kind == PanelKind::Reference && matches!(code, KeyCode::Left | KeyCode::Right))
 }
 
+/// Panels where a held j, k, h, or l stands in for an arrow once the panel
+/// has declined the letter. Panels that bind the letters themselves, or
+/// move controls with the arrows, keep their own reading.
 /// Whether this key WALKS rather than types: what a column being read
 /// beside the score still hands to the caret.
 fn moves_the_caret(code: KeyCode) -> bool {
@@ -224,6 +227,9 @@ impl App {
 
     /// Whether the panel has a text field that owns held typing keys.
     fn panel_is_typing(&self, kind: PanelKind) -> bool {
+        if let Some(typing) = super::vim::surface_typing(self) {
+            return typing;
+        }
         match kind {
             PanelKind::Set => self.set_prompt.is_some(),
             PanelKind::Viz => self.viz_docks[self.viz_focus]
@@ -395,15 +401,68 @@ impl App {
         &mut self,
         terminal_event: Event,
     ) -> Result<(), RuntimeError> {
+        let terminal_event = self.option_panel_spelling(terminal_event);
+        let terminal_event = composed_text_event(terminal_event);
         let result = self.route_terminal_event(terminal_event, true);
         self.refresh_editor_shortcut_hints();
         result
     }
 
+    /// Recover an Option panel chord from the composed character a terminal
+    /// sends. Only where the focused surface answers to that Option letter,
+    /// so the same character types normally everywhere else.
+    fn option_panel_spelling(&self, event: Event) -> Event {
+        match &event {
+            Event::KeyWithText { key, .. }
+                if key.modifiers == KeyModifiers::ALT
+                    && let KeyCode::Char(letter) = key.code =>
+            {
+                let letter = letter.to_ascii_lowercase();
+                if self.alt_panel_action_applies(letter) && self.keybinds.composes_option(letter) {
+                    return Event::Key(KeyEvent::new_with_kind_and_state(
+                        KeyCode::Char(letter),
+                        KeyModifiers::ALT,
+                        key.kind,
+                        key.state,
+                    ));
+                }
+            }
+            Event::Key(key) if key.modifiers.is_empty() => {
+                if let KeyCode::Char(character) = key.code
+                    && let Some(letter) = self.keybinds.option_letter_for(character)
+                    && self.alt_panel_action_applies(letter)
+                {
+                    return Event::Key(KeyEvent::new_with_kind_and_state(
+                        KeyCode::Char(letter),
+                        KeyModifiers::ALT,
+                        key.kind,
+                        key.state,
+                    ));
+                }
+            }
+            _ => {}
+        }
+        event
+    }
+
+    /// Whether the focused surface has a use for an Option letter. A chord
+    /// learnt over the action retires the letter, so it is not recovered.
+    fn alt_panel_action_applies(&self, letter: char) -> bool {
+        if let Some(action) = self.panel_action_at(letter) {
+            return !self.keybinds.overridden(action);
+        }
+        letter == 'a'
+            && self.focus == Focus::Panel(PanelKind::Reference)
+            && self
+                .reference_panel
+                .as_ref()
+                .is_some_and(|panel| matches!(panel.tab, crate::reference::Tab::Samples))
+    }
+
     pub(super) fn route_terminal_event(
         &mut self,
         mut terminal_event: Event,
-        allow_vim: bool,
+        allow_modal_keys: bool,
     ) -> Result<(), RuntimeError> {
         if let Event::Key(key) = &mut terminal_event {
             self.keybinds.normalize_terminal_key(key);
@@ -427,7 +486,7 @@ impl App {
         self.note_pointer_shape_event(&terminal_event);
         // A find prompt owns the keys before Vim mappings and every editor
         // command: a typed pattern is never a motion or an edit.
-        if allow_vim && self.route_find_event(&terminal_event)? {
+        if allow_modal_keys && self.route_find_event(&terminal_event)? {
             return Ok(());
         }
         // Quit and the transport outrank even Vim, so they must not be
@@ -438,10 +497,10 @@ impl App {
                 && self.find_global_chord(key));
         let quit_was_armed = self.quit_armed;
         if !find_global
-            && allow_vim
+            && allow_modal_keys
             && self.editor_accepts_raw_paste()
             && let Event::Key(key) = &terminal_event
-            && self.dispatch_vim_key(*key)?
+            && super::vim::dispatch(self, *key)?
         {
             // A mapping that calls Quit just armed it; any other key is
             // the "another key calls it off" press.
@@ -455,9 +514,9 @@ impl App {
         let non_key_interrupt = matches!(&terminal_event, Event::Paste(_) | Event::FocusLost)
             || matches!(&terminal_event, Event::Mouse(mouse) if mouse.kind != MouseEventKind::Moved);
         if non_key_interrupt {
-            self.flush_vim_mapping_pending()?;
+            super::vim::flush_pending(self)?;
         }
-        let interrupts_vim = non_key_interrupt
+        let interrupts_key_mode = non_key_interrupt
             || matches!(&terminal_event, Event::Key(key)
                 if key.kind != KeyEventKind::Release
                     && (key.modifiers.intersects(
@@ -465,9 +524,9 @@ impl App {
                             | KeyModifiers::HYPER | KeyModifiers::META,
                     ) || matches!(key.code, KeyCode::F(_) | KeyCode::Tab | KeyCode::BackTab)
                         || self.keybinds.override_action_for(key).is_some()));
-        if interrupts_vim {
+        if interrupts_key_mode {
             for scene in self.scenes.scenes_mut() {
-                scene.editor.vim_interrupt();
+                scene.editor.interrupt_key_mode();
             }
         }
         // A Vim mapping has first use of the focused editor's keys.
@@ -748,6 +807,14 @@ impl App {
             self.close_panel(kind);
             return Ok(true);
         }
+        match super::vim::handle_text_key(self, key) {
+            super::vim::VimTextKey::Ignored => {}
+            super::vim::VimTextKey::Consumed => return Ok(true),
+            super::vim::VimTextKey::Arrow(kind, code) => {
+                let _ = self.dispatch_panel_key(kind, code, false, false, false)?;
+                return Ok(true);
+            }
+        }
         if self.focused_panel_key(
             key,
             &contextual,
@@ -872,6 +939,9 @@ impl App {
         (adapted, contextual)
     }
 
+    /// The arrow a plain j, k, h, or l means in a list while Vim editor
+    /// keys and list navigation are on. Surfaces try the letter first, so
+    /// their own commands and menu mnemonics win.
     /// The focused panel's turn. It takes what it has a use for, and what
     /// it declines is swallowed and said out loud rather than typed into a
     /// score the eye is not on. `true` when the key stops here.
@@ -920,6 +990,18 @@ impl App {
             let indents = matches!(key.code, KeyCode::Tab | KeyCode::BackTab);
             let passes = self.panel_types_through(kind)
                 || (self.panel_reads_beside_score(kind) && moves_the_caret(key.code));
+            // A plain j, k, h, or l the panel had no use for is the arrow
+            // it stands in for. The four letters navigate even where the
+            // panel otherwise passes letters to the score: with Vim list
+            // keys on they are list keys, not typing. An arrow with no
+            // target still belongs to the panel: letting it through would
+            // move a caret the reader cannot see.
+            if super::vim::panel_takes_list_navigation(kind)
+                && let Some(alias) = self.list_navigation_alias(key)
+            {
+                let _ = self.dispatch_panel_key(kind, alias.code, false, false, false)?;
+                return Ok(true);
+            }
             if !primary
                 && !alt
                 // `Null` is what a legacy terminal sends for Ctrl+Space,
@@ -1323,6 +1405,14 @@ impl App {
             return Ok(true);
         }
         if let Focus::Panel(kind) = self.focus {
+            match super::vim::handle_text_key(self, key) {
+                super::vim::VimTextKey::Ignored => {}
+                super::vim::VimTextKey::Consumed => return Ok(true),
+                super::vim::VimTextKey::Arrow(kind, code) => {
+                    let _ = self.dispatch_panel_key(kind, code, false, false, false)?;
+                    return Ok(true);
+                }
+            }
             // Space auditions the reference row even on tabs with a
             // search box. A held preview key must not toggle it off.
             if kind == PanelKind::Reference
@@ -1339,6 +1429,13 @@ impl App {
                 || (text_key(key.code) && self.panel_is_typing(kind))
             {
                 self.dispatch_panel_key(kind, key.code, primary, shift, alt)?;
+            } else if super::vim::panel_takes_list_navigation(kind)
+                && !self.panel_is_typing(kind)
+                && let Some(alias) = self.list_navigation_alias(key)
+                && (panel_repeat_is_safe(kind, alias.code)
+                    || self.generator_control_repeats(kind, alias.code))
+            {
+                self.dispatch_panel_key(kind, alias.code, false, false, false)?;
             }
             return Ok(true);
         }
@@ -1407,7 +1504,7 @@ impl App {
             Some(EditorInput::Command(command)) => {
                 if self.focus == Focus::Editor
                     && matches!(command, Command::InsertText(_))
-                    && !self.editor().vim_is_insert()
+                    && !self.editor_takes_typed_text()
                 {
                     return Ok(());
                 }
@@ -1726,6 +1823,335 @@ mod tests {
 
         use crate::app::keyboard::*;
         use crate::app::tests::support::*;
+
+        #[test]
+        fn esc_closes_an_open_sheet_from_vim_normal_behind_the_editor() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.toggle_settings_sheet();
+            assert!(app.settings_sheet.is_some());
+            // The editor takes the keyboard while the sheet stays open.
+            app.focus = Focus::Editor;
+
+            precision_key(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            assert!(app.editor().vim_is_insert(), "i enters Insert");
+            precision_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(!app.editor().vim_is_insert(), "Esc leaves Insert");
+            assert!(app.settings_sheet.is_some(), "the sheet waits for Normal");
+
+            precision_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(
+                app.settings_sheet.is_none(),
+                "Esc in Normal closes the sheet"
+            );
+        }
+
+        #[test]
+        fn vim_p_pastes_the_clipboard_once() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.focus = Focus::Editor;
+            app.clipboard
+                .set_text("// two\n".into())
+                .expect("clipboard holds text");
+
+            precision_key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            let source = app.editor().source();
+            assert_eq!(source.matches("// two").count(), 1, "{source:?}");
+
+            // A release is not a second press.
+            app.handle_terminal_event(Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('p'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            )))
+            .unwrap();
+            assert_eq!(
+                app.editor().source().matches("// two").count(),
+                1,
+                "a release pasted again"
+            );
+        }
+
+        #[test]
+        fn a_shift_arrow_selection_is_deleted_by_d() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "hello\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.focus = Focus::Editor;
+
+            precision_key(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+            assert!(
+                !app.editor().primary_selection().is_empty(),
+                "Shift+Right makes a selection"
+            );
+            assert!(
+                app.editor().vim_is_visual(),
+                "a Shift+arrow selection enters Visual"
+            );
+            precision_key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+            assert!(
+                app.editor().source().starts_with("ello\n"),
+                "the selected h is gone: {:?}",
+                app.editor().source()
+            );
+        }
+
+        #[test]
+        fn a_learnt_ctrl_d_wins_over_page_down() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), &"a\n".repeat(12));
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.focus = Focus::Editor;
+            app.keybinds.learn(
+                crate::keybinds::BindAction::Docs,
+                crate::keybinds::KeyCombo::parse("ctrl+d"),
+            );
+
+            precision_key(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert!(app.reference_panel.is_some(), "the learnt chord opens Docs");
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Reference));
+        }
+
+        #[test]
+        fn vim_ignores_the_caret_shape_setting() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+            app.ui_settings.caret_shape = crate::terminal::CaretShape::BlinkingBar;
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.focus = Focus::Editor;
+
+            assert_eq!(
+                app.editor_cursor_shape(),
+                crate::terminal::CaretShape::SteadyBlock,
+                "Normal uses a steady block"
+            );
+            precision_key(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            assert_eq!(
+                app.editor_cursor_shape(),
+                crate::terminal::CaretShape::SteadyBar,
+                "Insert uses a steady bar"
+            );
+
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Default;
+            app.sync_editor_keybindings();
+            assert_eq!(
+                app.editor_cursor_shape(),
+                crate::terminal::CaretShape::BlinkingBar,
+                "Default editing keeps the setting"
+            );
+        }
+
+        #[test]
+        fn vim_yank_fills_the_clipboard_and_p_takes_the_newest_copy() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "one two\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.focus = Focus::Editor;
+
+            for key in ['v', 'e', 'y'] {
+                precision_key(&mut app, KeyCode::Char(key), KeyModifiers::NONE);
+            }
+            assert_eq!(
+                app.clipboard.get_text().expect("yank in clipboard"),
+                "one",
+                "the visual yank filled the clipboard"
+            );
+
+            // A newer copy from another surface beats the old register.
+            app.clipboard
+                .set_text("generated\n".into())
+                .expect("newer copy");
+            precision_key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            let source = app.editor().source();
+            assert!(source.contains("generated"), "{source:?}");
+            assert_eq!(source.matches("generated").count(), 1, "{source:?}");
+        }
+
+        #[test]
+        fn vim_list_keys_move_panels_and_follow_the_toggle() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.toggle_settings_sheet();
+            let selected = |app: &App| {
+                app.settings_sheet
+                    .as_ref()
+                    .expect("the settings sheet")
+                    .selected
+            };
+
+            let before = selected(&app);
+            precision_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert_eq!(selected(&app), before + 1, "j is Down");
+            precision_key(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            assert_eq!(selected(&app), before, "k is Up");
+
+            let quantise = app.ui_settings.quantise;
+            precision_key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+            assert_ne!(app.ui_settings.quantise, quantise, "l is Right");
+            precision_key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            assert_eq!(app.ui_settings.quantise, quantise, "h is Left");
+
+            let before = selected(&app);
+            precision_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            assert_eq!(selected(&app), before + 1, "the arrows still work");
+
+            app.ui_settings.vim_list_navigation = false;
+            let before = selected(&app);
+            let source = app.editor().source();
+            precision_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert_eq!(selected(&app), before, "the toggle is off");
+            assert_eq!(app.editor().source(), source);
+
+            app.ui_settings.vim_list_navigation = true;
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Default;
+            let before = selected(&app);
+            precision_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert_eq!(
+                selected(&app),
+                before,
+                "Default editor keys keep j for text"
+            );
+        }
+
+        #[test]
+        fn a_held_vim_list_key_keeps_moving_the_rows() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.toggle_settings_sheet();
+            let before = app
+                .settings_sheet
+                .as_ref()
+                .expect("the settings sheet")
+                .selected;
+            app.handle_terminal_event(Event::Key(crossterm::event::KeyEvent::new_with_kind(
+                KeyCode::Char('j'),
+                KeyModifiers::NONE,
+                crossterm::event::KeyEventKind::Repeat,
+            )))
+            .expect("repeat handled");
+            assert_eq!(
+                app.settings_sheet
+                    .as_ref()
+                    .expect("the settings sheet")
+                    .selected,
+                before + 1,
+                "a held j keeps stepping"
+            );
+        }
+
+        #[test]
+        fn vim_list_keys_leave_mixer_faders_to_the_arrows() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "$: s(\"bd\")\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.prefs.audio_input = Some("Mic".into());
+            app.open_mixer_panel(true);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Mixer));
+            app.mixer.selected = crate::app::mixer::MixerTarget::Input;
+            let before = app.mixer.input_gain_db;
+
+            precision_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert_eq!(app.mixer.input_gain_db, before, "j is not a fader nudge");
+            precision_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            assert_ne!(app.mixer.input_gain_db, before, "the arrow still nudges");
+        }
+
+        #[test]
+        fn vim_list_keys_walk_menus_and_other_letters_keep_their_meaning() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.menu = Some(crate::menu::MenuState::opened());
+
+            precision_key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+            assert_eq!(
+                app.menu.as_ref().expect("menu").open_title(),
+                1,
+                "l moves to the next menu"
+            );
+            // A held l with no press behind it is still the arrow.
+            app.menu = Some(crate::menu::MenuState::opened());
+            app.handle_terminal_event(Event::Key(crossterm::event::KeyEvent::new_with_kind(
+                KeyCode::Char('l'),
+                KeyModifiers::NONE,
+                crossterm::event::KeyEventKind::Repeat,
+            )))
+            .expect("repeat handled");
+            assert_eq!(
+                app.menu.as_ref().expect("menu").open_title(),
+                1,
+                "a held l walks the bar"
+            );
+            // h is the Help title mnemonic, but the list keys own it
+            // while the mode is on: h moves left.
+            precision_key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            assert_eq!(
+                app.menu.as_ref().expect("menu").open_title(),
+                0,
+                "h moves back to the previous menu"
+            );
+            // A held title mnemonic stays that menu instead of firing a
+            // row mnemonic in the level it opened.
+            app.menu = Some(crate::menu::MenuState::opened());
+            precision_key(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+            assert_eq!(
+                app.menu.as_ref().expect("menu").open_title(),
+                4,
+                "v opened View"
+            );
+            app.handle_terminal_event(Event::Key(crossterm::event::KeyEvent::new_with_kind(
+                KeyCode::Char('v'),
+                KeyModifiers::NONE,
+                crossterm::event::KeyEventKind::Repeat,
+            )))
+            .expect("repeat handled");
+            assert!(
+                app.menu.as_ref().is_some_and(|menu| menu.is_dropped()),
+                "the held v did not fire a View row"
+            );
+            assert_eq!(app.menu.as_ref().expect("menu").open_title(), 4);
+
+            app.menu = Some(crate::menu::MenuState::opened());
+            app.ui_settings.vim_list_navigation = false;
+            precision_key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+            assert_eq!(app.menu.as_ref().expect("menu").open_title(), 0);
+            // With the mode off, the menu letters are mnemonics again.
+            precision_key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+            assert_eq!(
+                app.menu.as_ref().expect("menu").open_title(),
+                6,
+                "h opens Help when Vim list keys are off"
+            );
+        }
+
+        #[test]
+        fn vim_list_keys_scroll_help_and_follow_the_toggle() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.toggle_help();
+            app.help.as_mut().expect("help").scroll = 0;
+            precision_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert_eq!(app.help.as_ref().expect("help").scroll, 1, "j scrolls");
+
+            app.help.as_mut().expect("help").scroll = 0;
+            app.ui_settings.vim_list_navigation = false;
+            precision_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            assert_eq!(app.help.as_ref().expect("help").scroll, 0);
+        }
 
         #[test]
         fn a_focused_panel_never_leaks_typing_into_the_score() {
@@ -2276,6 +2702,90 @@ mod tests {
             press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
             assert!(app.caret_visible);
             assert!(app.caret_activity >= before);
+        }
+
+        #[test]
+        fn a_composed_option_character_types_in_every_editor_mode() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "ax\n");
+            let composed = || Event::KeyWithText {
+                key: KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT),
+                text: "$".into(),
+            };
+            app.handle_terminal_event(composed())
+                .expect("composed text");
+            assert!(
+                app.editor().source().starts_with('$'),
+                "Default typing takes it"
+            );
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "ax\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            precision_key(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            app.handle_terminal_event(composed())
+                .expect("composed text");
+            assert!(
+                app.editor().source().starts_with('$'),
+                "Vim Insert takes it"
+            );
+
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "ax\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            let source = app.editor().source();
+            app.handle_terminal_event(composed())
+                .expect("composed text");
+            assert_eq!(app.editor().source(), source, "Vim Normal does not type it");
+            assert_ne!(
+                app.editor().primary_selection().head.0,
+                0,
+                "Vim Normal moves the caret"
+            );
+        }
+
+        #[test]
+        fn composed_text_with_many_characters_pastes() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "ax\n");
+            app.handle_terminal_event(Event::KeyWithText {
+                key: KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT),
+                text: "ab".into(),
+            })
+            .expect("composed text");
+            assert!(app.editor().source().contains("ab"));
+        }
+
+        #[test]
+        fn composed_text_on_a_lock_key_does_not_type() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "ax\n");
+            let source = app.editor().source();
+            app.handle_terminal_event(Event::KeyWithText {
+                key: KeyEvent::new(KeyCode::CapsLock, KeyModifiers::NONE),
+                text: "A".into(),
+            })
+            .expect("composed lock key");
+            assert_eq!(app.editor().source(), source);
+        }
+
+        #[test]
+        fn a_composed_release_does_not_type() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "ax\n");
+            let source = app.editor().source();
+            app.handle_terminal_event(Event::KeyWithText {
+                key: KeyEvent::new_with_kind(
+                    KeyCode::Char('4'),
+                    KeyModifiers::ALT,
+                    KeyEventKind::Release,
+                ),
+                text: "$".into(),
+            })
+            .expect("composed release");
+            assert_eq!(app.editor().source(), source);
         }
     }
 

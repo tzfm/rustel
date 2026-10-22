@@ -2049,6 +2049,8 @@ mod tests {
                     theme: &theme,
                     keybinds: &keybinds,
                     focused: true,
+                    vim: false,
+                    anchored: false,
                     pulse: None,
                     sounding_note: None,
                     picture: false,

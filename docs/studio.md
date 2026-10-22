@@ -75,6 +75,9 @@ to the next match and keeps the bar open. Backspace on an empty bar leaves it
 open. Esc or a click elsewhere closes it. Some terminals keep this chord for
 themselves; Settings > Keybinds shows the fallback.
 
+With Vim editor keys on, Ctrl+Shift+Y and Edit > Find open the Vim search
+prompt. Enter searches once and closes it. `n` and `N` walk the matches.
+
 Vim changes Ctrl+R and Ctrl+[ in the score editor. See [Settings](#settings)
 for Vim controls.
 
@@ -167,7 +170,9 @@ tape. Keep a separate backup of sets you want to preserve.
 ### Prebakes
 
 A prebake runs setup code before scores. Open the global or local prebake from
-Settings. The global file is `<rustel-config>/prebake.strudel`. The local prebake
+Options > Global prebake or Options > Local prebake, or from Settings. Learn a
+key for either on Settings > Keybinds. The global file is
+`<rustel-config>/prebake.strudel`. The local prebake
 is stored in the set. Studio runs the global code first, then the local code.
 
 Update checks and saves the prebake, then applies it to the playing score. It
@@ -649,6 +654,12 @@ To change a shortcut, select its row, press Enter, then press the new chord.
 Del restores the default. The panel shortcuts Alt+O, Alt+R, Alt+D and Alt+T
 are at the end of the list. The panel footers show the chord you set.
 
+In iTerm2, Option set to Normal composes a character. Studio knows the
+characters the profile sends and recovers the Option panel shortcut where
+the focused surface uses it. Option+T then focuses the tape timeline, and
+the composed character types normally everywhere else. Set Option to Esc+
+if you want the raw Alt key instead.
+
 The vst page lists the folders the plugin host reads for VST3 plugins: your
 folders first, then the standard folders of the system. Press `a` to add a
 folder and `d` to remove one of yours. Enter on `scan` reads every folder and
@@ -681,23 +692,32 @@ too much CPU. Check the Log for device or render errors.
 The Editor keybindings row selects Default or Vim. Default keeps the usual
 editor controls. Vim starts in Normal mode. Press `i` to insert text and Esc,
 Ctrl+[ or Ctrl+C to return to Normal mode. The status line shows the mode
-beside warnings and errors. Studio saves this choice in `studio.json`.
+beside warnings and errors. Vim uses a steady block in Normal and Visual and
+a steady bar in Insert. The caret shape setting applies outside Vim. Studio
+saves this choice in `studio.json`.
 
 Vim supports `hjkl`, word motions (`w`, `b`, `e`), `0`, `^`, `$`, `gg`, and `G`.
 Use `dd` to delete a line or `:42` then Enter to go to line 42. Counts work
 with motions and edits, such as `3j` and `2dd`. Use `a`, `I`, `A`, `o`, and `O`
 to enter Insert mode, `d`, `c`, and `y` with a motion to delete, change, or
-copy text, and `p` or `P` to put it back. `D` deletes to the end of the line.
+copy text, and `p` or `P` to put it back. A yank or delete fills the
+register and the system clipboard, so `p` pastes the newest copy from any
+surface. `r` then a character replaces the character under the cursor, and
+a count replaces that many. `D` deletes to the end of the line.
 `C` changes that text. `v` selects characters and `V` selects lines.
-`u` undoes an edit. Ctrl+R in Normal or Visual mode redoes it.
-`:redo` then Enter also redoes an edit.
+A selection made with the mouse or with Shift+arrows enters Visual. `d`,
+`c`, `y`, `x`, `X`, `D`, `C`, `Y`, `p`, and `P` act on it. Backspace or
+Delete deletes it, and `r` then a character replaces every selected
+character. Esc returns to Normal. `u` undoes an edit. Ctrl+R in Normal or Visual mode redoes it.
+`:redo` then Enter also redoes an edit. Ctrl+D and Ctrl+U move half a page
+down and up. A count moves that many lines.
 
-`/` searches forward and `?` backward. Type a regular expression and press
-Enter. `n` repeats the search and `N` repeats it in the other direction; both
-take counts, such as `2n`. A count on the search also works: `3/foo` lands on
-the third match. An empty pattern repeats the last search. The search wraps
-and is case-sensitive. It uses the Rust regex syntax in
-[regex](https://docs.rs/regex/latest/regex/#syntax), so `\$` finds a literal
+`/` searches forward and `?` backward. Edit > Find opens `/`. Type a regular
+expression and press Enter. `n` repeats the search and `N` repeats it in the
+other direction; both take counts, such as `2n`. A count on the search also
+works: `3/foo` lands on the third match. An empty pattern repeats the last
+search. The search wraps and is case-sensitive. It uses the Rust regex syntax
+in [regex](https://docs.rs/regex/latest/regex/#syntax), so `\$` finds a literal
 dollar sign and `\d+` finds digits. Backreferences and look-around are not
 supported. Zero-width matches are skipped.
 
@@ -707,19 +727,50 @@ to include the separators, such as `va(`. These objects also work with `d`,
 `c`, and `y`, such as `ci"` to replace a string. Supported separators are
 `()`, `[]`, `{}`, `<>`, single quotes, double quotes, and backticks.
 
-Vim keys take priority while the editor has focus, including keys you assign
-to Studio actions. Unclaimed keys keep their Studio action. A pending Vim
-command or mapping owns the next key. Settings, prompts, and other panels
-keep their usual controls. Menus show the shortcuts available in the current
-context. In Insert mode, Ctrl+R is reserved for register entry, which is not
-supported. Pasted text stays literal. On terminals without bracketed paste,
-enter Insert mode before pasting.
+Vim keys take priority while the editor has focus. Unclaimed keys keep their
+Studio action. A pending Vim command or mapping owns the next key. While Vim
+keys are on, Docs answers to `gd` through a default mapping, and Wrap has no
+default chord. Ctrl+D and Ctrl+U page instead. Settings > Keybinds shows
+these Vim defaults. A vimrc line for `gd` replaces the Docs mapping. A learnt
+chord replaces the withdrawn table chords, and a learnt chord on Ctrl+D or
+Ctrl+U wins over the page motion. Settings, prompts, and other panels keep
+their usual controls, except the list keys below. Menus show the shortcuts
+available in the current context. In Insert mode, Ctrl+R is reserved for
+register entry, which is not supported. Pasted text stays literal. On
+terminals without bracketed paste, enter Insert mode before pasting.
+
+The Vim list keys row in the Vim section of Settings > Keybinds is on by
+default. Plain `j`, `k`, `h`, and `l` move lists, menus, and help as the
+arrows do. Ctrl+D and Ctrl+U page every list panel. A panel command keeps
+its meaning. The other menu letters do too. While the row is on, these four
+letters navigate menus even when they spell a menu mnemonic. Turn the row
+off to keep them for text fields and menu mnemonics. The arrows always work.
+
+A search box in the reference column starts in Command mode while the list
+keys are on. `j`, `k`, `h`, and `l` walk the list, and the other letters stay
+out of the search. Press `i` or `a` to type in the search, then Esc to return
+to Command. Space still auditions the selected row. An anchored completion
+starts in Insert mode.
+
+The theme picker and the export sheet use the same modes. `j` and `k` move
+the list or the form, `i` or `a` type, and Esc returns to Command. On the
+export sheet, `h` and `l` change a choice or a number, and Space toggles a
+choice. In Command mode, `p` pastes the clipboard into the search or form
+and enters Insert. Insert mappings from your vimrc and the shipped defaults
+apply in these fields too. The shipped `jk` mapping leaves Insert in the
+search.
 
 ### Custom Vim mappings
 
 The first time you enable Vim, Studio creates `~/.rustel/vimrc` if it does not
 exist. `RUSTEL_CONFIG_DIR` changes that folder. Built-in bindings remain active
-until a map line overrides them.
+until a map line overrides them. Studio also ships default mappings beneath
+your file. Your file overrides them line for line. The shipped mappings
+include `U` update, `Q` stop, `J` and `K` for `$` labels, `M` for `_`, `jk`
+to leave Insert, `gcl` and `gc` to comment, and `gf` for the Reference. The
+shipped `<Space>` chords are `V` visualizers, `O` set panel, `H` and `L`
+previous and next scene, `P` local prebake, `I` panels, and `1` and `2`
+visual set one and two.
 
 Edit the file in your own editor. The Vim mappings path row appears below
 Editor keybindings when Vim is enabled. Press Enter to set a full file path,
@@ -772,7 +823,8 @@ skips the line.
 The stable names for `<Action:...>` are:
 
 - Transport: `update`, `stop`, `rewind-update`
-- Menus and surfaces: `menu-bar`, `help`, `settings`, `devices`, `theme`,
+- Menus and surfaces: `menu-bar`, `help`, `settings`, `global-prebake`,
+  `local-prebake`, `devices`, `theme`,
   `reference`, `docs`, `piano-mode`, `set-panel`, `mixer`, `visuals-one`,
   `visuals-two`, `visualizers`, `log`, `log-sticky`, `focus-panels`, `jobs`,
   `memory`, `export`, `smart-action`, `split`, `hop-pane`
@@ -826,7 +878,8 @@ The default address is `127.0.0.1:9247`. Studio generates a new token each time
 you enable remote control, unless you set a token of your own. Use the
 remote-control panel to reveal or copy it. A client must authenticate before
 it can send keys or request the screen. An authenticated client has full
-control of the Studio interface.
+control of the Studio interface. Keys from a client use normal editing,
+even when Vim editor keys are on.
 
 Studio also writes each generated token to a file named
 `rustel-studio-remote-<random>.token` in the system temporary directory. The

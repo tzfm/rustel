@@ -872,7 +872,11 @@ pub(super) fn render_keybind_rows(
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD)
-        } else if index < KEYBIND_ACTION_START || index == VIM_MAPPINGS_PATH_ROW || row.learnt {
+        } else if index < KEYBIND_ACTION_START
+            || index == VIM_MAPPINGS_PATH_ROW
+            || index == LIST_NAVIGATION_ROW
+            || row.learnt
+        {
             Style::default().fg(theme.foreground)
         } else {
             Style::default().fg(theme.muted)
@@ -898,7 +902,10 @@ pub(super) fn render_keybind_rows(
             1,
         );
         // Settings values use the whole row instead of the chord column.
-        if index < KEYBIND_ACTION_START || index == VIM_MAPPINGS_PATH_ROW {
+        if index < KEYBIND_ACTION_START
+            || index == VIM_MAPPINGS_PATH_ROW
+            || index == LIST_NAVIGATION_ROW
+        {
             cell(2, &format!("{}: {}", row.action, row.chord), width);
             continue;
         }

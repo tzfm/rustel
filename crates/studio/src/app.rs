@@ -87,7 +87,7 @@ use super::editor::{
     ByteOffset, Clipboard, Command, DEFAULT_MAX_DOCUMENT_BYTES, Edit, EditOrigin, Editor,
     EditorEffect, EditorInput, HistoryMoment, KeyboardCapabilities, MemoryClipboard,
     PlatformClipboard, Revision, TerminalEventBatch, Transaction, VirtualRowSpec,
-    event_to_input_with_binds, is_plain_text_key_event, key_to_command,
+    composed_text_event, event_to_input_with_binds, is_plain_text_key_event, key_to_command,
 };
 use super::engine::{DiagnosticAlert, Launch, LiveMaterial, StudioDiagnostic};
 use super::engine::{StudioConfig, StudioDeviceInfo, StudioDiagnosticLevel, StudioSnapshot};
@@ -208,7 +208,7 @@ mod stage_pixels;
 mod string_roles;
 mod theme_sheets;
 mod transport;
-mod vim_config;
+mod vim;
 mod viz_panel;
 #[cfg(feature = "vst")]
 mod vst;
@@ -1018,6 +1018,11 @@ struct App {
     /// re-learnt from there, so every surface asks the same table.
     keybinds: super::keybinds::Keybinds,
     vim_config: crate::vim_config::VimConfig,
+    /// Plain keys waiting for an insert mapping in a Vim text surface.
+    vim_insert_pending: String,
+    /// This key came from remote control. A machine sends normal keys, not
+    /// Vim modes, so the score reads it with its usual editing.
+    remote_key_event: bool,
     /// The value each control change last said and when it said it, keyed
     /// by number and channel, so a bound row reads the crossings of the
     /// line at 64 rather than every message: a knob swept across fires
@@ -1701,6 +1706,8 @@ impl App {
             keybind_learn: None,
             keybinds: prefs.keybinds(),
             vim_config: crate::vim_config::VimConfig::default(),
+            vim_insert_pending: String::new(),
+            remote_key_event: false,
             midi_cc_last: HashMap::new(),
             note_pressed_at: HashMap::new(),
             mapping_lit: [None; MAPPING_SLOTS],

@@ -32,7 +32,7 @@ pub use input::{
     EditorInput, KeyboardCapabilities, PRIMARY_MODIFIER, click_extends, event_to_input,
     event_to_input_with_binds, is_stray_control, key_to_command,
 };
-pub(crate) use input::{TerminalEventBatch, is_plain_text_key_event};
+pub(crate) use input::{TerminalEventBatch, composed_text_event, is_plain_text_key_event};
 pub use layout::{
     Affinity, CellPoint, CellSpan, GridRect, Hit, InlineVirtualRow, InlineWidth, RowStart,
     ScreenMap, ScreenRow, TextRow, Viewport, VirtualRowError, VirtualRowSpec, WRAP_MAX_LINE_BYTES,
@@ -103,6 +103,8 @@ pub enum Motion {
     DocumentEnd,
     PageUp,
     PageDown,
+    HalfPageUp,
+    HalfPageDown,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -783,7 +785,7 @@ impl Editor {
         mut transaction: Transaction,
         moment: HistoryMoment,
     ) -> Result<(), EditorError> {
-        let moment = self.vim_history_transaction(&mut transaction, moment);
+        let moment = self.mode_history_transaction(&mut transaction, moment);
         transaction
             .edits
             .sort_by_key(|edit| (edit.range.start, edit.range.end));
@@ -1242,18 +1244,21 @@ impl Editor {
         self.selections.set_single(moved);
         // Paging moves the viewport as well as the caret. Merely revealing
         // the destination scrolls by just one row when starting at the top.
+        let page = self.viewport.page_rows.max(1);
+        let step = match motion {
+            Motion::PageUp | Motion::PageDown => page,
+            Motion::HalfPageUp | Motion::HalfPageDown => (page / 2).max(1),
+            _ => 0,
+        };
         match motion {
-            Motion::PageUp => {
-                self.viewport.top_row = self
-                    .viewport
-                    .top_row
-                    .saturating_sub(self.viewport.page_rows);
+            Motion::PageUp | Motion::HalfPageUp => {
+                self.viewport.top_row = self.viewport.top_row.saturating_sub(step);
             }
-            Motion::PageDown => {
+            Motion::PageDown | Motion::HalfPageDown => {
                 self.viewport.top_row = self
                     .viewport
                     .top_row
-                    .saturating_add(self.viewport.page_rows)
+                    .saturating_add(step)
                     .min(self.maximum_top_row());
             }
             _ => {}
@@ -1292,33 +1297,43 @@ impl Editor {
                 let line = self.document.line_of(head)?;
                 (self.document.line_content_range(line).end, None)
             }
-            Motion::Up | Motion::Down | Motion::PageUp | Motion::PageDown => {
+            Motion::Up
+            | Motion::Down
+            | Motion::PageUp
+            | Motion::PageDown
+            | Motion::HalfPageUp
+            | Motion::HalfPageDown => {
                 let line = self.document.line_of(head)?;
                 let distance = match motion {
                     Motion::PageUp | Motion::PageDown => self.viewport.page_rows.max(1),
+                    Motion::HalfPageUp | Motion::HalfPageDown => {
+                        (self.viewport.page_rows / 2).max(1)
+                    }
                     _ => 1,
                 };
-                let upwards = matches!(motion, Motion::Up | Motion::PageUp);
-                let paged_target =
-                    if matches!(motion, Motion::PageUp | Motion::PageDown) {
-                        let column = display_column_of_offset_cached(
-                            &self.document,
-                            line,
-                            head,
-                            self.viewport.tab_width,
-                            &mut self.horizontal_layout.borrow_mut(),
-                        );
-                        let segment = self
-                            .wrap_index()
-                            .map_or(0, |wrap| wrap.segment_of(line, column));
-                        let row = self.global_row_for_line(line).saturating_add(segment);
-                        Some(self.text_position_at_screen_row(
-                            self.page_motion_row(row, upwards),
-                            upwards,
-                        ))
-                    } else {
-                        None
-                    };
+                let upwards = matches!(motion, Motion::Up | Motion::PageUp | Motion::HalfPageUp);
+                let paged_target = if matches!(
+                    motion,
+                    Motion::PageUp | Motion::PageDown | Motion::HalfPageUp | Motion::HalfPageDown
+                ) {
+                    let column = display_column_of_offset_cached(
+                        &self.document,
+                        line,
+                        head,
+                        self.viewport.tab_width,
+                        &mut self.horizontal_layout.borrow_mut(),
+                    );
+                    let segment = self
+                        .wrap_index()
+                        .map_or(0, |wrap| wrap.segment_of(line, column));
+                    let row = self.global_row_for_line(line).saturating_add(segment);
+                    Some(self.text_position_at_screen_row(
+                        self.page_motion_row(row, upwards, distance),
+                        upwards,
+                    ))
+                } else {
+                    None
+                };
                 if let Some(wrap) = self.wrap_index() {
                     // Wrapped, the caret moves by row and straight down the
                     // screen: the goal is a screen column, kept from row to
@@ -1450,7 +1465,7 @@ impl Editor {
         Ok((drawn_on(inward) == segment).then_some(inward))
     }
 
-    fn page_motion_row(&self, caret_row: usize, upwards: bool) -> usize {
+    fn page_motion_row(&self, caret_row: usize, upwards: bool, distance: usize) -> usize {
         let page = self.viewport.page_rows.max(1);
         // A wheel-scrolled view may no longer contain the caret. Page from
         // the visible edge in that case rather than jumping back to it.
@@ -1459,9 +1474,9 @@ impl Editor {
             self.viewport.top_row.saturating_add(page.saturating_sub(1)),
         );
         if upwards {
-            row.saturating_sub(page)
+            row.saturating_sub(distance)
         } else {
-            row.saturating_add(page)
+            row.saturating_add(distance)
                 .min(self.total_rows().saturating_sub(1))
         }
     }
@@ -1712,6 +1727,7 @@ impl Editor {
                 if self.drag.is_some() {
                     self.extend_drag(point, map)?;
                     self.drag = None;
+                    self.sync_selection_mode()?;
                     return Ok(true);
                 }
                 Ok(false)

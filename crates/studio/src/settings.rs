@@ -1516,6 +1516,9 @@ pub struct UiSettings {
     pub terminal_profile: Option<String>,
     pub editor_keybindings: EditorKeybindings,
     pub vim_mappings_path: Option<String>,
+    /// Whether plain j k h l move lists and menus while Vim editor keys
+    /// are on. The arrows always work.
+    pub vim_list_navigation: bool,
     pub rendering: RenderingMode,
     /// How often the screen is repainted while something moves.
     pub frame_rate: FrameRate,
@@ -1702,6 +1705,7 @@ impl Default for UiSettings {
             terminal_profile: None,
             editor_keybindings: EditorKeybindings::Default,
             vim_mappings_path: None,
+            vim_list_navigation: true,
             rendering: RenderingMode::Automatic,
             frame_rate: FrameRate::default(),
             show_full_paths: false,
@@ -2153,9 +2157,10 @@ pub(super) const KEYBIND_ACTION_START: usize = 2;
 /// The final keybind row is an action, after every binding.
 pub(super) const RESET_KEYBINDS_ROW: usize = KEYBIND_ACTION_START + BindAction::ALL.len();
 pub(super) const VIM_MAPPINGS_PATH_ROW: usize = RESET_KEYBINDS_ROW + 1;
+pub(super) const LIST_NAVIGATION_ROW: usize = VIM_MAPPINGS_PATH_ROW + 1;
 
 pub(super) fn keybind_count(settings: &UiSettings) -> usize {
-    RESET_KEYBINDS_ROW + 1 + usize::from(settings.editor_keybindings == EditorKeybindings::Vim)
+    RESET_KEYBINDS_ROW + 1 + 2 * usize::from(settings.editor_keybindings == EditorKeybindings::Vim)
 }
 
 pub(super) fn keybind_action_at(row: usize) -> Option<BindAction> {
@@ -2516,9 +2521,12 @@ fn keybind_lines(count: usize) -> Vec<DisplayRow> {
             if count > VIM_MAPPINGS_PATH_ROW {
                 lines.push(DisplayRow::Control(VIM_MAPPINGS_PATH_ROW));
             }
+            if count > LIST_NAVIGATION_ROW {
+                lines.push(DisplayRow::Control(LIST_NAVIGATION_ROW));
+            }
             lines.push(DisplayRow::Gap);
         }
-        if index != VIM_MAPPINGS_PATH_ROW {
+        if index != VIM_MAPPINGS_PATH_ROW && index != LIST_NAVIGATION_ROW {
             lines.push(DisplayRow::Control(index));
         }
     }
@@ -3111,6 +3119,20 @@ impl SettingsSheet {
             }
             KeyCode::Delete | KeyCode::Backspace if at == VIM_MAPPINGS_PATH_ROW && len > at => {
                 SettingsAction::ResetVimMappingsPath
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ')
+                if at == LIST_NAVIGATION_ROW && len > at =>
+            {
+                settings.vim_list_navigation = !settings.vim_list_navigation;
+                SettingsAction::Changed
+            }
+            KeyCode::Delete | KeyCode::Backspace if at == LIST_NAVIGATION_ROW && len > at => {
+                if settings.vim_list_navigation {
+                    SettingsAction::Nothing
+                } else {
+                    settings.vim_list_navigation = true;
+                    SettingsAction::Changed
+                }
             }
             KeyCode::Enter if len > 0 => match action {
                 Some(action) => SettingsAction::LearnKeybind(action),
@@ -4370,12 +4392,29 @@ fn keybinds_footer_hint(
     if sheet.selected == VIM_MAPPINGS_PATH_ROW {
         return "Enter: change path · Del: use default · Esc: close".to_owned();
     }
+    if sheet.selected == LIST_NAVIGATION_ROW {
+        return "j k h l as arrows · Left/Right or Enter: on/off · Del: on".to_owned();
+    }
     if sheet.selected == RESET_KEYBINDS_ROW {
         let profile = terminal_profile_label(settings, features);
         if sheet.confirm_reset_keybinds {
             return format!("Reset all to {profile} defaults? Enter: confirm · Esc: cancel");
         }
         return format!("Enter: reset all to {profile} defaults · Esc: close");
+    }
+    if settings.editor_keybindings == EditorKeybindings::Vim {
+        match keybind_action_at(sheet.selected) {
+            Some(BindAction::Docs) => {
+                return "Vim: gd (default mapping) · Ctrl+D pages down · Enter: rebind".to_owned();
+            }
+            Some(BindAction::Wrap) => {
+                return "Vim: no chord · Ctrl+U pages up · Enter: rebind".to_owned();
+            }
+            Some(BindAction::RenameScene) => {
+                return "Vim: no chord · Ctrl+R redoes · Enter: rebind".to_owned();
+            }
+            _ => {}
+        }
     }
     "Enter: rebind a key or a control · Del: terminal default · Tab: pages · Esc: close".to_owned()
 }
@@ -5412,6 +5451,90 @@ mod tests {
         let mut sheet = armed;
         sheet.show_page(SettingsPage::Advanced);
         assert!(!sheet.confirm_reset_keybinds);
+    }
+
+    #[test]
+    fn the_vim_list_navigation_row_toggles_and_delete_restores_on() {
+        let features = TerminalFeatures::default();
+        let area = Rect::new(0, 0, 120, 40);
+        let mut settings = UiSettings {
+            editor_keybindings: EditorKeybindings::Vim,
+            ..UiSettings::default()
+        };
+        assert!(settings.vim_list_navigation, "Vim starts with list keys on");
+        let mut sheet = SettingsSheet {
+            page: SettingsPage::Keybinds,
+            selected: LIST_NAVIGATION_ROW,
+            keybind_count: keybind_count(&settings),
+            ..SettingsSheet::default()
+        };
+        assert_eq!(
+            sheet.key_in_frame(KeyCode::Enter, &mut settings, &features, area),
+            SettingsAction::Changed
+        );
+        assert!(!settings.vim_list_navigation);
+        assert_eq!(
+            sheet.key_in_frame(KeyCode::Delete, &mut settings, &features, area),
+            SettingsAction::Changed
+        );
+        assert!(settings.vim_list_navigation, "Delete restores the default");
+        assert!(
+            keybinds_footer_hint(sheet, &settings, &features).contains("on/off"),
+            "the footer names the toggle"
+        );
+        assert_eq!(
+            keybind_count(&settings),
+            RESET_KEYBINDS_ROW + 3,
+            "reset, Vim mappings path, list navigation"
+        );
+        let lines = keybind_lines(keybind_count(&settings));
+        assert_eq!(
+            lines[KEYBIND_ACTION_START],
+            DisplayRow::Control(VIM_MAPPINGS_PATH_ROW),
+            "the Vim rows sit together below the editor keys"
+        );
+        assert_eq!(
+            lines[KEYBIND_ACTION_START + 1],
+            DisplayRow::Control(LIST_NAVIGATION_ROW)
+        );
+        assert_eq!(lines[KEYBIND_ACTION_START + 2], DisplayRow::Gap);
+        settings.editor_keybindings = EditorKeybindings::Default;
+        assert_eq!(
+            keybind_count(&settings),
+            RESET_KEYBINDS_ROW + 1,
+            "the Vim rows are not shown with Default keys"
+        );
+    }
+
+    #[test]
+    fn the_vim_layer_names_the_docs_and_wrap_changes() {
+        let settings = UiSettings {
+            editor_keybindings: EditorKeybindings::Vim,
+            ..Default::default()
+        };
+        let features = TerminalFeatures::default();
+        let row = |action| {
+            KEYBIND_ACTION_START
+                + BindAction::ALL
+                    .iter()
+                    .position(|candidate| *candidate == action)
+                    .expect("action row")
+        };
+        let mut sheet = SettingsSheet {
+            page: SettingsPage::Keybinds,
+            selected: row(BindAction::Docs),
+            keybind_count: keybind_count(&settings),
+            ..Default::default()
+        };
+        assert!(
+            keybinds_footer_hint(sheet, &settings, &features).contains("Ctrl+D pages down"),
+            "the Docs row names the key it gave up"
+        );
+        sheet.selected = row(BindAction::Wrap);
+        assert!(
+            keybinds_footer_hint(sheet, &settings, &features).contains("Ctrl+U pages up"),
+            "the Wrap row names the key it gave up"
+        );
     }
 
     #[test]

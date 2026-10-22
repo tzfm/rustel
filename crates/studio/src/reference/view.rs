@@ -192,6 +192,16 @@ impl Widget for ReferenceView<'_> {
 }
 
 impl ReferenceView<'_> {
+    /// The search row. In Vim Command an empty row says how to type, so the
+    /// eye is not left with a bare label and a blinking caret.
+    fn search_row(&self, query: &str) -> String {
+        if self.vim && !self.panel.vim_insert() && !self.anchored && query.is_empty() {
+            "search: i or a types".to_owned()
+        } else {
+            format!("search: {query}")
+        }
+    }
+
     /// The example tree and the highlighted code that is about to be copied.
     #[cfg(feature = "hydra")]
     fn render_snippets(&self, inner: Rect, buffer: &mut Buffer) {
@@ -676,7 +686,7 @@ impl ReferenceView<'_> {
         buffer.set_stringn(
             inner.x,
             inner.y + 1,
-            format!("search: {}", self.panel.chord_query),
+            self.search_row(&self.panel.chord_query),
             usize::from(inner.width),
             Style::default().fg(theme.foreground),
         );
@@ -801,7 +811,7 @@ impl ReferenceView<'_> {
         buffer.set_stringn(
             inner.x,
             inner.y + 1,
-            format!("search: {}", self.panel.scale_query),
+            self.search_row(&self.panel.scale_query),
             usize::from(inner.width),
             Style::default().fg(theme.foreground),
         );
@@ -920,7 +930,7 @@ impl ReferenceView<'_> {
         buffer.set_stringn(
             inner.x,
             inner.y + 1,
-            format!("search: {}", tab.query()),
+            self.search_row(tab.query()),
             usize::from(inner.width),
             Style::default().fg(theme.foreground),
         );
@@ -1067,7 +1077,7 @@ impl ReferenceView<'_> {
     /// the count.
     fn render_samples(&self, inner: Rect, buffer: &mut Buffer) {
         let theme = self.theme;
-        let query = format!("search: {}", self.panel.sound_query);
+        let query = self.search_row(&self.panel.sound_query);
         buffer.set_stringn(
             inner.x,
             inner.y + 1,
@@ -1411,22 +1421,40 @@ impl ReferenceView<'_> {
                 Style::default().fg(theme.muted),
             );
             use super::super::keybinds::BindAction;
-            let hint = |action, does: &str| format!("{} {does}", self.keybinds.hint(action));
+            let hint = |action, does: &str| {
+                let label = self.keybinds.hint(action);
+                (!label.is_empty()).then(|| format!("{label} {does}"))
+            };
             let show = hint(BindAction::ShowFile, "shows file");
             let rename_file = hint(BindAction::RenameFile, "renames file");
             let rename_bank = hint(BindAction::RenameFile, "bank alias");
             let trim = hint(BindAction::TrimSample, "trims");
             let delete = hint(BindAction::DeleteSample, "deletes file");
-            let mut actions = vec![show.as_str()];
+            let mut actions: Vec<&str> = Vec::new();
+            if let Some(text) = show.as_deref() {
+                actions.push(text);
+            }
             if self.panel.selected_bank_is_editable() {
                 match self.panel.rename() {
-                    PanelAction::RenameSample { .. } => actions.push(&rename_file),
-                    PanelAction::RenameBank { .. } => actions.push(&rename_bank),
+                    PanelAction::RenameSample { .. } => {
+                        if let Some(text) = rename_file.as_deref() {
+                            actions.push(text);
+                        }
+                    }
+                    PanelAction::RenameBank { .. } => {
+                        if let Some(text) = rename_bank.as_deref() {
+                            actions.push(text);
+                        }
+                    }
                     _ => {}
                 }
-                actions.push(&trim);
-                if self.panel.selected_sample_file().is_some() {
-                    actions.push(&delete);
+                if let Some(text) = trim.as_deref() {
+                    actions.push(text);
+                }
+                if self.panel.selected_sample_file().is_some()
+                    && let Some(text) = delete.as_deref()
+                {
+                    actions.push(text);
                 }
             }
             actions.extend([
@@ -1443,7 +1471,7 @@ impl ReferenceView<'_> {
 
     fn render_browse(&self, inner: Rect, buffer: &mut Buffer) {
         let theme = self.theme;
-        let query = format!("search: {}", self.panel.query);
+        let query = self.search_row(&self.panel.query);
         buffer.set_stringn(
             inner.x,
             inner.y + 1,

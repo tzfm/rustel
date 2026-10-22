@@ -109,7 +109,14 @@ impl App {
         if self.menu.is_some() {
             let menus = self.menus();
             let mut state = self.menu.take().expect("menu is some");
-            let outcome = state.key_with_area(key, &menus, self.menu_row(), self.frame);
+            // Vim list keys own j k h l in the menus while the mode is
+            // on, so h moves left instead of opening Help. Other letters
+            // keep their mnemonics.
+            let outcome = if let Some(alias) = self.list_navigation_alias(key) {
+                state.key_with_area(&alias, &menus, self.menu_row(), self.frame)
+            } else {
+                state.key_with_area(key, &menus, self.menu_row(), self.frame)
+            };
             if matches!(outcome, super::super::menu::MenuKey::Ignored) {
                 // A modified key is nobody's mnemonic; let the chord
                 // table have it, with the menu still down.
@@ -133,6 +140,7 @@ impl App {
         // Help is modal only for input, not for application state. Esc
         // closes it; navigation scrolls its lower list; everything else
         // is swallowed so it cannot act on the preserved surface below.
+        let alias = self.list_navigation_alias(key);
         if let Some(help) = self.help.as_mut() {
             if key.code == KeyCode::Esc {
                 self.help = None;
@@ -140,7 +148,11 @@ impl App {
                 self.sync_settings_webcam_preview();
                 self.dirty_frame = true;
             } else {
-                let _ = help.scroll_key(key.code, self.frame, self.capabilities);
+                if !help.scroll_key(key.code, self.frame, self.capabilities)
+                    && let Some(alias) = alias
+                {
+                    let _ = help.scroll_key(alias.code, self.frame, self.capabilities);
+                }
                 self.dirty_frame = true;
             }
             return true;
@@ -157,7 +169,23 @@ impl App {
                 Event::Key(key) if key.kind == KeyEventKind::Repeat => {
                     let menus = self.menus();
                     let mut state = self.menu.take().expect("menu is some");
-                    let outcome = state.key_with_area(key, &menus, self.menu_row(), self.frame);
+                    // A held letter is the command its press named, or a
+                    // list key. It must not become some other row's
+                    // mnemonic after the level changes under it.
+                    let outcome = if matches!(key.code, KeyCode::Char(_)) {
+                        if state.repeats_mnemonic(key) {
+                            super::super::menu::MenuKey::Consumed
+                        } else {
+                            self.list_navigation_alias(key).map_or(
+                                super::super::menu::MenuKey::Consumed,
+                                |alias| {
+                                    state.key_with_area(&alias, &menus, self.menu_row(), self.frame)
+                                },
+                            )
+                        }
+                    } else {
+                        state.key_with_area(key, &menus, self.menu_row(), self.frame)
+                    };
                     state.follow_scroll(&menus, self.menu_row(), self.frame, true);
                     self.menu = Some(state);
                     if let super::super::menu::MenuKey::Events(events) = outcome {
@@ -177,10 +205,18 @@ impl App {
     /// the wheel, clicks and pastes - belongs to the overlay. `true` while
     /// help is open.
     pub(super) fn help_event(&mut self, terminal_event: &Event) -> bool {
+        let alias = match terminal_event {
+            Event::Key(key) if key.kind == KeyEventKind::Repeat => self.list_navigation_alias(key),
+            _ => None,
+        };
         if let Some(help) = self.help.as_mut() {
             match terminal_event {
                 Event::Key(key) if key.kind == KeyEventKind::Repeat => {
-                    let _ = help.scroll_key(key.code, self.frame, self.capabilities);
+                    if !help.scroll_key(key.code, self.frame, self.capabilities)
+                        && let Some(alias) = alias
+                    {
+                        let _ = help.scroll_key(alias.code, self.frame, self.capabilities);
+                    }
                     self.dirty_frame = true;
                 }
                 Event::Mouse(mouse) => match mouse.kind {
@@ -570,6 +606,8 @@ impl App {
                     self.focus_panel(PanelKind::Settings);
                 }
             }
+            Do::GlobalPrebake => self.open_prebake(PrebakeScope::Global),
+            Do::LocalPrebake => self.open_prebake(PrebakeScope::Local),
             Do::KeyboardReference => {
                 if self.help.is_none() {
                     self.toggle_help();

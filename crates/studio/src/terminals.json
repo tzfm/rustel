@@ -529,13 +529,20 @@
     {
       "terminal": "iTerm2",
       "capabilities": {"truecolor": true},
-      "source": "https://github.com/gnachman/iTerm2/blob/master/plists/DefaultGlobalKeyMap.plist",
-      "unbind": "Settings > Keys > Key Bindings: remove the conflicting global shortcut.",
+      "source": "https://github.com/gnachman/iTerm2/blob/master/plists/DefaultGlobalKeyMap.plist ; https://iterm2.com/documentation-preferences-profiles-keys.html",
+      "unbind": "Settings > Keys > Key Bindings: remove the conflicting global shortcut. Profiles > Keys: set Option to Esc+ for the panel Option shortcuts, or learn another chord in Studio Settings > Keybinds.",
       "steals": [
         {"chord": "ctrl+tab", "does": "switches terminal tab"},
         {"chord": "ctrl+shift+tab", "does": "switches terminal tab"},
         {"chord": "shift+pageup", "does": "scrolls terminal history"},
         {"chord": "shift+pagedown", "does": "scrolls terminal history"}
+      ],
+      "alt_input": [
+        {"chord": "alt+a", "received": "å", "reason": "Option as Normal sends å; Studio recovers Alt+A where the focus uses it"},
+        {"chord": "alt+d", "received": "∂", "reason": "Option as Normal sends ∂; Studio recovers Alt+D where the focus uses it"},
+        {"chord": "alt+o", "received": "ø", "reason": "Option as Normal sends ø; Studio recovers Alt+O where the focus uses it"},
+        {"chord": "alt+r", "received": "®", "reason": "Option as Normal sends ®; Studio recovers Alt+R where the focus uses it"},
+        {"chord": "alt+t", "received": "†", "reason": "Option as Normal sends †; Studio recovers Alt+T where the focus uses it"}
       ]
     },
     {

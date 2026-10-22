@@ -5,6 +5,22 @@
 - The corpus gains its heaviest loader case, `tutti-stress`: 22 tracks on 22 sample banks, all demanded in the first cycle. The previous maximum was 10 banks. A song converted from a MIDI file asks for that many banks the moment it plays.
 - The studio no longer leaks memory on macOS while it runs. The gamepad poll asked GameController for its controllers every loop turn, and each call left an autoreleased array in a pool the studio's own loop never drained, about 200 arrays a second. A pool per poll releases them.
 - Studio reloads scores when another program saves their files. Settings > Live coding > watch external changes has three modes: off, sync, and sync & eval. Off is the default. `sync` follows the active tab. `sync & eval` follows every score in the set, opens the saved file's tab, and plays it. The studio checks each file's size and modification time ten times a second and reads it only after a change settles.
+- The global and local prebakes open from the Options menu. Learn a key for either on Settings > Keybinds.
+- With Vim editor keys on, j k h l move lists, menus, and help as the arrows do. Turn Vim list keys off in the Vim section of Settings > Keybinds to use the letters as text.
+- Reference searches, the theme picker, and the export sheet rest in Vim Command mode. j k h l walk the list or form, p pastes the clipboard, i or a type, and Esc returns to Command. The caret follows the active reference tab's query.
+- Edit > Find opens the Vim search prompt when Vim editor keys are on. Enter searches once, and `n` and `N` walk the matches.
+- Vim `p` and `P` paste the system clipboard. A yank or delete fills the clipboard too, so a copied score or the last yank lands in the score.
+- Vim `r` replaces the character under the cursor. A count replaces several.
+- Vim Ctrl+D and Ctrl+U move half a page in the editor and page list panels. Docs moves to `gd` while Vim keys are on, and Wrap has no default chord there. A learnt chord still wins.
+- In Vim mode, selecting with the mouse or with Shift+arrows enters Visual, and the selection commands act on it. Backspace or Delete deletes it, and `r` then a character replaces every selected character. Mouse dragging itself is unchanged.
+- Vim mode uses a steady block in Normal and Visual and a steady bar in Insert. A blinking caret shape setting no longer restarts its phase on every key.
+- Vim insert mappings from the vimrc apply in panel search boxes. For example, `inoremap jk <Esc>` leaves Insert in the reference search.
+- Studio ships default Vim mappings beneath your vimrc. They cover Studio actions, `$` label jumps, and `jk` to leave Insert. Your file overrides them line for line.
+- In Vim Normal mode, Esc closes a panel left open behind the editor. Before, Vim consumed the key and the panel could not be closed.
+- Vim `gg` no longer waits for the mapping timeout when a mapping starts with `g`.
+- Keys sent by remote control use normal editing, not Vim modes.
+- The iTerm2 profile knows the characters its Option key composes. Studio recovers the Option panel shortcuts where they apply, such as Option+T for the tape timeline. Elsewhere the composed character types normally.
+- Composed keys type their character. Option+4 on a Mac ISO layout now types `$` in every text field and in Vim. Before, Studio typed `4`.
 - A prebake that only defines a helper around a call setup may not make applies. The checker refused any text that named `setcps` before a parenthesis, so a community prebake that hands scores `window.bpm = b => setcpm(b/4)` was refused over a call the prebake never makes, and with it every helper the set needed. The call runs when a score calls the helper, where the engine allows it. A prebake that makes the call itself is still refused, in the engine's words.
 - A prebake or score that writes over a name the engine owns says so in the footer, as a hint: `window.note = …` replaces what every score that follows means by `note`. The write is kept and runs. Before, the replacement was silent. A `register(...)` of a sealed name keeps its own engine refusal.
 - The Studio memory viewer shows the latency of each loaded plugin when it is above 0: the largest latency of its copies since the plugin loaded. The last copy of each preset at each sample rate counts, also after the copy ends. `rustel vst` shows no latency, because it loads no plugin copy. See [plugins](https://github.com/tzfm/rustel/blob/main/docs/plugins.md#load-time-and-memory).
