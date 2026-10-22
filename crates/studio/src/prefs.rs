@@ -72,6 +72,10 @@ pub struct StudioPrefs {
     /// How long typing must pause first: `250ms`, `500ms`, `1s` or `2s`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub typing_pause: Option<String>,
+    /// What another program's save of the open score does: `off`, `sync`
+    /// or `sync-eval`. Absent is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_changes: Option<String>,
     /// `wait` or `async`. `strudel-like` still reads as async.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_mode: Option<String>,
@@ -655,6 +659,11 @@ impl StudioPrefs {
                 .as_deref()
                 .map(super::settings::TypingPause::parse)
                 .unwrap_or(defaults.typing_pause),
+            external_changes: self
+                .external_changes
+                .as_deref()
+                .map(super::settings::ExternalChanges::parse)
+                .unwrap_or(defaults.external_changes),
             load_mode: self
                 .load_mode
                 .as_deref()
@@ -841,6 +850,7 @@ impl StudioPrefs {
         self.quantise = Some(settings.quantise.key());
         self.auto_evaluate = Some(settings.auto_evaluate);
         self.typing_pause = Some(settings.typing_pause.key().to_owned());
+        self.external_changes = Some(settings.external_changes.key().to_owned());
         self.load_mode = Some(settings.load_mode.key().to_owned());
         self.animation = Some(settings.animation);
         self.highlights = Some(settings.highlights);

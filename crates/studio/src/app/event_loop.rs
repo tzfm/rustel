@@ -259,6 +259,7 @@ impl App {
         self.poll_export();
         self.poll_reveal();
         self.poll_vim_config(now);
+        self.poll_external_changes(now);
         if let Err(error) = self.flush_vim_mapping_timeout() {
             self.set_error(ErrorOwner::Editor, error.to_string());
         }
