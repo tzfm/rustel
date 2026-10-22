@@ -699,6 +699,8 @@ impl App {
                 let syntax_check_changed = settings.syntax_check != self.ui_settings.syntax_check;
                 let auto_evaluate_changed =
                     settings.auto_evaluate != self.ui_settings.auto_evaluate;
+                let external_changes_changed =
+                    settings.external_changes != self.ui_settings.external_changes;
                 // A set with a limiter of its own keeps it, so the row can
                 // change the default and this set go on sounding the same.
                 // That is the design, but it is not obvious from the sheet,
@@ -822,6 +824,19 @@ impl App {
                         "auto evaluate on - a paused edit applies itself while the set plays"
                     } else {
                         "auto evaluate off - update applies the score"
+                    }
+                    .into();
+                } else if external_changes_changed {
+                    self.status = match self.ui_settings.external_changes {
+                        ExternalChanges::Off => {
+                            "external watch off - the file is read when the score opens"
+                        }
+                        ExternalChanges::Sync => {
+                            "external watch sync - a save elsewhere replaces the text"
+                        }
+                        ExternalChanges::SyncAndEvaluate => {
+                            "external watch sync & eval - a save elsewhere replaces the text and plays"
+                        }
                     }
                     .into();
                 } else if webcam_confirmed {

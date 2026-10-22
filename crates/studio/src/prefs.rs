@@ -76,6 +76,10 @@ pub struct StudioPrefs {
     /// How long typing must pause first: `250ms`, `500ms`, `1s` or `2s`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub typing_pause: Option<String>,
+    /// What another program's save of the open score does: `off`, `sync`
+    /// or `sync-eval`. Absent is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_changes: Option<String>,
     /// `wait` or `async`. `strudel-like` still reads as async.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_mode: Option<String>,
@@ -243,6 +247,10 @@ pub struct StudioPrefs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(alias = "generator_stack")]
     pub examples_stack: Option<bool>,
+    /// The browser's lists of things to hear play each row the cursor
+    /// lands on: the samples, chords and scales tabs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_preview: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backdrop_smoothing: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -658,6 +666,11 @@ impl StudioPrefs {
                 .as_deref()
                 .map(super::settings::TypingPause::parse)
                 .unwrap_or(defaults.typing_pause),
+            external_changes: self
+                .external_changes
+                .as_deref()
+                .map(super::settings::ExternalChanges::parse)
+                .unwrap_or(defaults.external_changes),
             load_mode: self
                 .load_mode
                 .as_deref()
@@ -755,6 +768,7 @@ impl StudioPrefs {
                 .unwrap_or(defaults.syntax_check),
             log_verbose: self.log_verbose.unwrap_or(defaults.log_verbose),
             examples_stack: self.examples_stack.unwrap_or(defaults.examples_stack),
+            auto_preview: self.auto_preview.unwrap_or(defaults.auto_preview),
             slider_smoothing: self.slider_smoothing.unwrap_or(defaults.slider_smoothing),
             frequency_slider_log: self
                 .frequency_slider_log
@@ -844,6 +858,7 @@ impl StudioPrefs {
         self.quantise = Some(settings.quantise.key());
         self.auto_evaluate = Some(settings.auto_evaluate);
         self.typing_pause = Some(settings.typing_pause.key().to_owned());
+        self.external_changes = Some(settings.external_changes.key().to_owned());
         self.load_mode = Some(settings.load_mode.key().to_owned());
         self.animation = Some(settings.animation);
         self.highlights = Some(settings.highlights);
@@ -906,6 +921,7 @@ impl StudioPrefs {
         self.syntax_check_mode = Some(settings.syntax_check.key().to_owned());
         self.log_verbose = Some(settings.log_verbose);
         self.examples_stack = Some(settings.examples_stack);
+        self.auto_preview = Some(settings.auto_preview);
         self.backdrop_smoothing = Some(settings.backdrop_smoothing);
         self.slider_smoothing = Some(settings.slider_smoothing);
         self.frequency_slider_log = Some(settings.frequency_slider_log);
@@ -1769,6 +1785,26 @@ mod tests {
             let restored: StudioPrefs =
                 serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
             assert_eq!(restored.ui_settings().show_scrollbars, enabled);
+        }
+    }
+
+    #[test]
+    fn auto_preview_defaults_off_and_is_remembered() {
+        let legacy: StudioPrefs = serde_json::from_str("{}").unwrap();
+        assert!(
+            !legacy.ui_settings().auto_preview,
+            "sound on every arrow is opted into"
+        );
+        for enabled in [true, false] {
+            let settings = super::super::settings::UiSettings {
+                auto_preview: enabled,
+                ..legacy.ui_settings()
+            };
+            let mut prefs = StudioPrefs::default();
+            prefs.set_ui_settings(&settings);
+            let restored: StudioPrefs =
+                serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+            assert_eq!(restored.ui_settings().auto_preview, enabled);
         }
     }
 

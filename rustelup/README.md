@@ -79,8 +79,11 @@ desktop. A build of an unchanged commit takes 1 second. Delete
 `~/.rustel/src` has a local edit.
 
 A source build needs `git`, [rustup](https://rustup.rs) and the system
-packages in the [build guide](../docs/building.md). No checksum covers a
-source build. `rustel doctor` prints the commit of the build. Run `rustelup`
+packages in the [build guide](../docs/building.md). On Linux, rustelup
+checks for the ALSA and libudev development files before it builds, and
+prints the install command for your distribution instead of letting the
+`alsa-sys` build script fail. No checksum covers a source build.
+`rustel doctor` prints the commit of the build. Run `rustelup`
 with no option to return to the newest release.
 
 ## Where things live

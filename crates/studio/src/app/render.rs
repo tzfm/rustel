@@ -1158,6 +1158,7 @@ impl App {
                 || overlays.replay_edit.is_some()
                 || self.piano.open,
             preview_gain: self.preview_gain,
+            auto_preview: self.ui_settings.auto_preview,
             // Which note of a previewed run should be lit: the step the
             // clock has reached since it started.
             sounding_note: self.sounding_preview_note(),

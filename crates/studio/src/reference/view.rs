@@ -793,6 +793,7 @@ impl ReferenceView<'_> {
             } else {
                 &[
                     "↑↓ move",
+                    "Alt+A auto",
                     "→ opens or plays",
                     "Space plays",
                     "← folds",
@@ -908,6 +909,7 @@ impl ReferenceView<'_> {
             } else {
                 &[
                     "↑↓ move",
+                    "Alt+A auto",
                     "→ opens or plays",
                     "Space plays/stops",
                     "← folds",
@@ -1314,7 +1316,7 @@ impl ReferenceView<'_> {
             };
             let style = if selected {
                 Style::default()
-                    .fg(theme.background)
+                    .fg(theme.fill_text())
                     .bg(theme.accent)
                     .add_modifier(Modifier::BOLD)
             } else if matches!(sound_row, SoundRow::Variant(..)) {
@@ -1401,11 +1403,11 @@ impl ReferenceView<'_> {
                 inner.bottom() - 2,
                 &[
                     "↑↓ move",
+                    "Alt+A auto",
                     "→ expand or preview",
                     "← folds",
                     "Space plays/stops",
                     "Esc stops too",
-                    "Alt+A auto-play",
                     "Alt+± volume",
                 ],
                 theme,
@@ -1643,7 +1645,7 @@ impl ReferenceView<'_> {
             let selected = geometry.first_row + row == self.panel.selected;
             let name_style = if selected {
                 Style::default()
-                    .fg(theme.background)
+                    .fg(theme.fill_text())
                     .bg(theme.accent)
                     .add_modifier(Modifier::BOLD)
             } else {

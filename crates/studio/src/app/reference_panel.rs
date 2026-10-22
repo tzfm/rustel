@@ -588,8 +588,9 @@ impl App {
     /// dragged across it; `s` on the examples or generator tab, which
     /// switches the snippet's music between one `$:` a voice and one
     /// `$: stack(...)`; the generator tab's own keys, which deal ideas and
-    /// turn its controls; then the panel's key map, whose action is
-    /// carried out last. Whether the key was taken.
+    /// turn its controls; Alt+A on the tabs that audition, which says
+    /// whether moving plays each row; then the panel's key map, whose
+    /// action is carried out last. Whether the key was taken.
     fn handle_reference_key_inner(
         &mut self,
         code: KeyCode,
@@ -626,6 +627,21 @@ impl App {
         }
         #[cfg(feature = "hydra")]
         if self.generator_key(code, primary, _shift, alt) {
+            return Ok(true);
+        }
+        // Alt+A on the tabs that audition says whether moving plays each row
+        // the cursor lands on, and keeps the answer in the preferences.
+        // Alt-modified, because plain letters belong to the search box -
+        // typing "cla" must not toggle auto-play mid-word.
+        if matches!(code, KeyCode::Char('a' | 'A'))
+            && alt
+            && !primary
+            && self
+                .reference_panel
+                .as_ref()
+                .is_some_and(|panel| super::super::reference::tab_previews(panel.tab))
+        {
+            self.toggle_auto_preview();
             return Ok(true);
         }
         let action = match self.reference_command_key(code, primary, alt) {
@@ -683,6 +699,21 @@ impl App {
         } else {
             "taken as one $: a voice"
         });
+        self.dirty_frame = true;
+    }
+
+    /// Say whether moving through the browser's lists of things to hear
+    /// plays each row the cursor lands on, and keep the answer for the next
+    /// session.
+    fn toggle_auto_preview(&mut self) {
+        self.ui_settings.auto_preview = !self.ui_settings.auto_preview;
+        self.status = if self.ui_settings.auto_preview {
+            "auto-play on: moving previews".to_owned()
+        } else {
+            "auto-play off".to_owned()
+        };
+        self.prefs.auto_preview = Some(self.ui_settings.auto_preview);
+        self.save_prefs_soon();
         self.dirty_frame = true;
     }
 
@@ -850,18 +881,6 @@ impl App {
             }
             #[cfg(feature = "hydra")]
             KeyCode::Char('c' | 'C') if !primary && !alt && panel.tab.is_snippets() => panel.copy(),
-            // Walking the list can audition as it goes. Alt-modified,
-            // because plain letters belong to the search box on this tab -
-            // typing "cla" must not toggle auto-play mid-word.
-            KeyCode::Char('a' | 'A') if alt && !primary && panel.tab == Tab::Samples => {
-                self.preview_autoplay = !self.preview_autoplay;
-                self.status = if self.preview_autoplay {
-                    "samples - auto-play on: moving previews".to_owned()
-                } else {
-                    "samples - auto-play off".to_owned()
-                };
-                PanelAction::Nothing
-            }
             // The preview's own volume, past unity on purpose: a browser
             // next to a playing set needs headroom to be heard through it.
             // On every tab that auditions, not only the samples one - a
@@ -1025,7 +1044,8 @@ impl App {
             }
             KeyCode::Up => {
                 panel.move_by(-1);
-                if self.preview_autoplay && panel.tab == Tab::Samples {
+                if self.ui_settings.auto_preview && super::super::reference::tab_previews(panel.tab)
+                {
                     panel.preview()
                 } else {
                     PanelAction::Nothing
@@ -1033,7 +1053,8 @@ impl App {
             }
             KeyCode::Down => {
                 panel.move_by(1);
-                if self.preview_autoplay && panel.tab == Tab::Samples {
+                if self.ui_settings.auto_preview && super::super::reference::tab_previews(panel.tab)
+                {
                     panel.preview()
                 } else {
                     PanelAction::Nothing
@@ -1449,19 +1470,22 @@ impl App {
         // press or drag sets the volume, like the master. Every tab that
         // draws the fader takes the press, the chords and scales tabs
         // included.
-        if self
-            .reference_panel
-            .as_ref()
-            .is_some_and(|panel| super::super::reference::tab_previews(panel.tab))
+        if let Some(tab) = showing
+            && super::super::reference::tab_previews(tab)
         {
             let inner = super::super::reference::inner_area(self.regions.reference);
-            let (_, meter_y) = if showing == Some(Tab::Samples) {
+            let (_, meter_y) = if tab == Tab::Samples {
                 super::super::reference::sample_pulse_rows(inner)
             } else {
                 super::super::reference::samples_pulse_rows(inner)
             };
             if y == meter_y {
-                self.preview_gain = super::super::reference::preview_gain_at(inner, x);
+                self.preview_gain = super::super::reference::preview_gain_at(
+                    inner,
+                    x,
+                    tab,
+                    self.ui_settings.auto_preview,
+                );
                 self.status = format!(
                     "preview {}",
                     super::super::reference::format_preview_gain(self.preview_gain)
@@ -1610,7 +1634,12 @@ impl App {
     /// as the press on it does.
     pub(super) fn drag_preview_volume(&mut self, x: u16) {
         let inner = super::super::reference::inner_area(self.regions.reference);
-        self.preview_gain = super::super::reference::preview_gain_at(inner, x);
+        let tab = self
+            .reference_panel
+            .as_ref()
+            .map_or(Tab::Reference, |panel| panel.tab);
+        self.preview_gain =
+            super::super::reference::preview_gain_at(inner, x, tab, self.ui_settings.auto_preview);
         self.status = format!(
             "preview {}",
             super::super::reference::format_preview_gain(self.preview_gain)

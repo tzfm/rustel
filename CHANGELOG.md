@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Studio reloads scores when another program saves their files. Settings > Live coding > watch external changes has three modes: off, sync, and sync & eval. Off is the default. `sync` follows the active tab. `sync & eval` follows every score in the set, opens the saved file's tab, and plays it. The studio checks each file's size and modification time ten times a second and reads it only after a change settles.
 - The global and local prebakes open from the Options menu. Learn a key for either on Settings > Keybinds.
 - With Vim editor keys on, j k h l move lists, menus, and help as the arrows do. Turn Vim list keys off in the Vim section of Settings > Keybinds to use the letters as text.
 - Reference searches, the theme picker, and the export sheet rest in Vim Command mode. j k h l walk the list or form, p pastes the clipboard, i or a type, and Esc returns to Command. The caret follows the active reference tab's query.
@@ -18,6 +19,14 @@
 - Composed keys type their character. Option+4 on a Mac ISO layout now types `$` in every text field and in Vim. Before, Studio typed `4`.
 - Pattern queries allocate less. Time and value changes reuse a hap, and a shared object map stays shared until a write. A 4-cycle query with five controls drops from 3,297 to 2,353 allocations.
 - The Studio Chords tab sorts the chord symbols it has no name for. Their order changed on each run before.
+- The new `terminal` theme follows the terminal's own palette: `reset` and the 16 `ansiN` colours, so a custom scheme such as a Kitty or Noctalia one shows through the studio.
+- The theme picker's delete key refuses a theme the studio ships on the first press. Before, the second press went looking for a file a built-in theme does not have and answered with an error that listed every theme name.
+- The Studio Chords tab no longer leaks memory while it is open. Each draw leaked 336 small strings with the default dictionary.
+- `rustelup --branch` and `--commit` check for the ALSA and libudev development files before a Linux build and print the install command for the detected distribution. A missing `alsa.pc` stopped the `alsa-sys` build script with a panic that named the package but not how to install it. The build guide now lists the packages for Fedora, Arch, openSUSE and Alpine, and says why a PipeWire system still needs the ALSA headers.
+- Alt+A turns on auto preview in the sample, chord and scale lists of the Reference browser. The up and down arrows then play each row the cursor lands on. The choice is kept in `studio.json`. Before, only the samples list had the shortcut, and the choice was lost on quit.
+- Painter colours no longer turn black under the `terminal` theme. A silent note or a faint mark faded toward the theme's ground, and a ground the theme leaves to the terminal has no colour to blend with, so the fade painted plain black on the pixel raster. The colour now stands whole when the ground cannot take its share.
+- The `terminal` theme gains a warm sibling, `terminal-warm`, which moves the accent and the selection to the palette's colour slot 1. A palette whose bright slot reads badly as an accent now has another to wear.
+- An `all()` callback that returns `undefined` stops the update with an error. Before, a typo at the end of its chain, such as `.ross`, played silence and `rustel check` found no issue.
 
 ## v0.1.5
 

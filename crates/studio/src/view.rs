@@ -599,6 +599,9 @@ pub struct StudioView<'a> {
     pub audition_loading: Option<String>,
     /// How loud a sample preview plays, for the samples tab's pulse row.
     pub preview_gain: f32,
+    /// Whether moving through the browser's lists of things to hear plays
+    /// each row, for the pulse row to say.
+    pub auto_preview: bool,
     /// Whether a preview is sounding: a chord's piano recolours its whole
     /// voicing at once, a run its steps, for as long as they sound.
     pub sounding_note: Option<usize>,
@@ -1009,6 +1012,7 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
                     // what the browser is sounding.
                     peak_db: super::reference::audition_peak_db(chrome.audition_audio),
                     preview_gain: view.preview_gain,
+                    auto_preview: view.auto_preview,
                     shape: view.preview_shape,
                 }),
                 sounding_note: view.sounding_note,
@@ -2877,6 +2881,7 @@ mod tests {
                         focused_panel: None,
                         help_open: false,
                         preview_gain: 1.0,
+                        auto_preview: false,
                         sounding_note: None,
                         audition_loading: None,
                         snippet_picture: false,
@@ -3000,6 +3005,7 @@ mod tests {
                         focused_panel: None,
                         help_open: true,
                         preview_gain: 1.0,
+                        auto_preview: false,
                         sounding_note: None,
                         audition_loading: None,
                         snippet_picture: false,
@@ -3111,6 +3117,7 @@ mod tests {
                         focused_panel: None,
                         help_open: false,
                         preview_gain: 1.0,
+                        auto_preview: false,
                         sounding_note: None,
                         audition_loading: None,
                         snippet_picture: false,
@@ -3225,6 +3232,7 @@ mod tests {
                         focused_panel: None,
                         help_open: false,
                         preview_gain: 1.0,
+                        auto_preview: false,
                         sounding_note: None,
                         audition_loading: None,
                         snippet_picture: false,

@@ -54,6 +54,7 @@
 //! | building and painting a frame | `render.rs` |
 //! | what an edit sets off | `editing.rs` |
 //! | evaluating the score, auto evaluate, and the engine's events | `evaluation.rs` |
+//! | reloading the open score when another program saves it | `external_changes.rs` |
 //! | saving scenes, preferences and the manifest | `persistence.rs` |
 //! | quitting, play state, the errors shown | `transport.rs` |
 //!
@@ -116,7 +117,8 @@ use super::save::{SaveRequest, SaveResult, SaveWorker};
 use super::scenes::{PendingSave, SceneError, SceneId, SceneSet, SetLimiter};
 use super::set_panel::{SetLine, SetPanel};
 use super::settings::{
-    self, OutputLatency, SettingsAction, SettingsNavigation, SettingsSheet, SyntaxCheck, UiSettings,
+    self, ExternalChanges, OutputLatency, SettingsAction, SettingsNavigation, SettingsSheet,
+    SyntaxCheck, UiSettings,
 };
 use super::terminal::TerminalSession;
 use super::terminal::{TerminalFeatures, cell_pixels_now};
@@ -157,6 +159,7 @@ mod evaluation;
 mod evaluation_flash;
 mod event_loop;
 mod export_sheet;
+mod external_changes;
 mod find;
 mod focus;
 mod hydra_backdrop;
@@ -937,6 +940,10 @@ struct App {
     limiter_mode_due: Option<(rustel_audio::LimiterCharacter, Instant)>,
     manifest_changed_at: Instant,
     last_edit_at: Instant,
+    /// The open score's file as the external watch last saw it, and when
+    /// it last looked. See `external_changes.rs`.
+    external_watch: Option<external_changes::ExternalWatch>,
+    external_watch_checked_at: Instant,
     /// The word the reference column was opened on, so the name chosen
     /// there replaces it rather than landing beside it.
     reference_anchor: Option<ReferenceAnchor>,
@@ -1440,9 +1447,6 @@ struct App {
     /// while it is still `None`: a sound heard for the first time is being
     /// decoded at the moment it is asked for.
     preview_shape: Option<(std::sync::Arc<[u8]>, f64)>,
-    /// Whether walking the samples list auditions each sound as the cursor
-    /// lands on it.
-    preview_autoplay: bool,
     /// How long the studio has had sound, in seconds, and when that was
     /// last counted.
     ///
@@ -1668,6 +1672,8 @@ impl App {
             limiter_mode_due: None,
             manifest_changed_at: now,
             last_edit_at: now - LINT_DEBOUNCE,
+            external_watch: None,
+            external_watch_checked_at: now,
             reference_anchor: None,
             slider_tape_due: None,
             fader_tape_due: None,
@@ -1887,7 +1893,6 @@ impl App {
             #[cfg(feature = "hydra")]
             snippet_under_cursor: None,
             stop_requested: false,
-            preview_autoplay: false,
             marks: Vec::new(),
             #[cfg(feature = "hydra")]
             snippet_marks: Vec::new(),

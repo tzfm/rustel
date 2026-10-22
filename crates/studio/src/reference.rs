@@ -784,6 +784,9 @@ pub struct SamplesPulse<'a> {
     pub peak_db: f32,
     /// The preview's own volume, 1.0 being unity.
     pub preview_gain: f32,
+    /// Whether moving through the list plays each row the cursor lands on,
+    /// so the shortcut that turns it off is in reach of the eye.
+    pub auto_preview: bool,
     /// The sounding preview's shape, as peaks 0 through 255, and how far
     /// into it the sound has got, 0 through 1. `None` with nothing being
     /// previewed, or before a first-time sound has finished decoding.
@@ -2753,6 +2756,7 @@ mod tests {
             let pulse = SamplesPulse {
                 peak_db: -18.0,
                 preview_gain: 1.0,
+                auto_preview: false,
                 shape: None,
             };
             let row_text = |buffer: &Buffer, y: u16| {
@@ -2952,6 +2956,7 @@ mod tests {
             let pulse = SamplesPulse {
                 peak_db: f32::NEG_INFINITY,
                 preview_gain: 1.0,
+                auto_preview: false,
                 shape: None,
             };
 
@@ -4214,7 +4219,7 @@ mod tests {
         fn the_preview_fader_can_land_exactly_on_unity() {
             let inner = Rect::new(0, 0, 40, 10);
             let exact = (inner.x..inner.right())
-                .map(|x| preview_gain_at(inner, x))
+                .map(|x| preview_gain_at(inner, x, Tab::Samples, false))
                 .filter(|gain| *gain == 1.0)
                 .count();
             assert!(exact >= 1, "some column must mean exactly 0 dB");

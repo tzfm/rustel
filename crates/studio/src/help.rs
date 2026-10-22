@@ -278,7 +278,10 @@ impl HelpContext {
                     "arrows · PgUp/PgDn · Tab",
                     "navigate, fold/open, change tab",
                 ),
-                ("Enter · Space · Esc", "use · preview · go back/close"),
+                (
+                    "Alt+A · Enter · Space · Esc",
+                    "auto preview · use · preview · go back/close",
+                ),
             ],
             Self::Settings => [
                 ("Up / Down", "choose a setting"),

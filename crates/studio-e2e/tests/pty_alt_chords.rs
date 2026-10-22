@@ -558,14 +558,15 @@ fn probe_alt_chords_through_a_real_pty() {
     );
 
     // Alt+A as Windows Terminal delivers it: ESC a (sanity: the other Alt
-    // chord, proven in the same encoding).
+    // chord, proven in the same encoding). The status line is the witness:
+    // the footer shows the shortcut whether or not it is on.
     let mark = terminal.buffer.lock().unwrap().len();
     terminal.write(&[0x1b, b'a']);
     std::thread::sleep(Duration::from_millis(800));
     let frame = terminal.text();
     let after = &frame[mark..];
     assert!(
-        after.contains("samples") && contains_plain(&frame, "auto-play"),
+        after.contains("auto-play on"),
         "Alt+A produced no reaction:\n{}",
         terminal.diagnostics()
     );

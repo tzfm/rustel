@@ -21,8 +21,9 @@ update fails, the last good score keeps playing. An update that changes nothing
 leaves the file, and its changed date, alone, so a set you only opened and played
 stays as it was.
 
-Use one editor for each score file. Studio does not detect external file
-changes or merge them with unsaved edits.
+Use one editor for each score file. Studio does not merge external edits with
+unsaved edits. See [External changes](#external-changes) to follow saves from
+another program.
 
 ## Shortcuts
 
@@ -288,6 +289,26 @@ or cycle holds it for the line the row names, and the header shows the
 Auto evaluate works while the set plays. A stopped set stays stopped, so
 Ctrl+S remains how playback starts.
 
+### External changes
+
+Another program can edit score files in the set. Choose watch external changes
+in Settings ▸ Live coding. Off is the default.
+
+`sync` watches the score in the active tab. It puts the file's text in the
+editor and leaves the playing score alone.
+
+`sync & eval` watches every `.strudel` file in the set folder and every open
+score. When a file is saved, Studio opens its tab, or selects it if it is
+already open, and evaluates the text as an update would. It plays even when the
+set is stopped.
+
+Studio checks each watched file's size and modification time ten times a second
+and reads it after a change stays put for one check. A save made by Studio
+itself is ignored.
+
+A save from another program that changes the text replaces the open editor's
+text, including edits that are not saved yet. Studio does not merge the two.
+
 ### Stopping
 
 The first Stop lets envelopes and effect tails finish. The transport shows
@@ -443,6 +464,12 @@ Open the Samples tab in Reference to browse banks. Right expands a bank and
 Left folds it. Space starts or stops a preview. Enter inserts or copies the
 selection; check the footer for the current action.
 
+Alt+A turns on auto preview. The up and down arrows then play each row the
+cursor lands on. It works on the Samples, Chords and Scales tabs. Studio keeps
+the choice in `studio.json`, so it stays on for the next session. Press Alt+A
+again to turn it off. The foot of the list names the shortcut beside the move
+keys, and the volume row says `auto on` or `auto off`.
+
 Drag and drop an audio file or folder into the terminal window running Studio
 to import samples. You can also add folders and packs in Settings ▸ Samples.
 Samples in the set folder are discovered automatically. Use File ▸ Copy
@@ -583,6 +610,20 @@ the theme picker:
 
 Themes can also use shader effects. A theme cannot grant camera access.
 Webcam input is off by default and needs explicit consent in Settings.
+
+Every colour also accepts `reset` for the terminal default and `ansiN` for
+palette slot N, so a theme can wear the palette the terminal already carries.
+The built-in `terminal` theme is exactly that: a studio that looks like the
+rest of your terminal, Kitty scheme or Noctalia template included. It takes
+the bright slot 12 for its accent. Its sibling, `terminal-warm`, moves the
+accent and the selection to slot 1, so a palette whose bright slot reads badly
+as an accent has another to wear. Two things follow from a colour the studio
+cannot measure. A theme that keeps `reset` as its ground should set
+`event_mark` to `underline`, as `terminal` does, because a tint has no ground
+to tint. And the filled chips write the palette's black, slot 0, so they read
+best on a palette whose black is dark. A painter that fades a colour toward
+such a ground keeps the colour whole, since a fade with nothing to blend into
+would otherwise land on the ground itself.
 
 ## Settings
 

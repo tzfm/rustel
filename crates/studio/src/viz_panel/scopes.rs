@@ -4,7 +4,7 @@
 
 use ratatui::{buffer::Buffer, layout::Rect, style::Color, widgets::Widget};
 
-use super::super::theme::{Theme, mix};
+use super::super::theme::{Theme, mix, wash};
 use std::collections::VecDeque;
 
 use super::super::visuals::{
@@ -112,7 +112,7 @@ impl Widget for ScopeView<'_> {
         };
         match self.style {
             ScopeStyle::Line | ScopeStyle::Glow => {
-                let halo = mix(theme.background, palette.at(width / 2, centre), 0.35);
+                let halo = wash(theme.background, palette.at(width / 2, centre), 0.35);
                 let mut previous: Option<(isize, isize)> = None;
                 for x in 0..width {
                     let y = row(at(x));
@@ -298,7 +298,7 @@ impl SpectrumView<'_> {
                         }
                         if peak > lit + 1 && peak <= height {
                             let y = height - peak;
-                            canvas.set(x, y, mix(theme.background, colour_at(x, y), 0.6));
+                            canvas.set(x, y, wash(theme.background, colour_at(x, y), 0.6));
                         }
                     }
                 }
@@ -317,7 +317,7 @@ impl SpectrumView<'_> {
                             let colour = colour_at(x, up);
                             canvas.set(x, up, colour);
                             if down < height {
-                                canvas.set(x, down, mix(theme.background, colour, 0.45));
+                                canvas.set(x, down, wash(theme.background, colour, 0.45));
                             }
                         }
                     }
@@ -337,7 +337,7 @@ impl SpectrumView<'_> {
                             let shade = if lamp < lit {
                                 colour
                             } else {
-                                mix(theme.background, colour, 0.12)
+                                wash(theme.background, colour, 0.12)
                             };
                             canvas.set(x, y, shade);
                         }
@@ -453,7 +453,7 @@ impl Widget for VectorView<'_> {
         };
         let origin = point(0.0, 0.0);
         // The ring and the centre, faint.
-        let faint = mix(theme.background, theme.rule, 0.8);
+        let faint = wash(theme.background, theme.rule, 0.8);
         let mut previous = None;
         for step in 0..=96 {
             let angle = step as f32 / 96.0 * TAU;
