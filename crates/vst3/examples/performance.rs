@@ -11,9 +11,15 @@
 //! With no such option, automation sends an edit at every callback start.
 //! `--value=0` sends a fixed parameter value instead of the automation sweep.
 //! `--poll` also checks readiness and requests preparation during processing.
+//! `--threads=3` runs the process calls of each callback on 3 threads in
+//! turn. The chain goes to the thread of the next callback through a channel.
+//! `--parallel=3` runs 3 copies of the chain at the same time on 3 threads.
+//! With either option, a chain on this thread gets the same input, and each
+//! callback compares the output of the threads with its output.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -23,6 +29,8 @@ use serde_json::json;
 
 // The host gives a plugin 128 frames at most in one call.
 const MAX_PLUGIN_FRAMES: usize = 128;
+// The threads of `--threads`, and the chains of `--parallel`, at most.
+const MAX_THREADS: usize = 64;
 
 struct Options {
     rate: u32,
@@ -32,6 +40,8 @@ struct Options {
     automation_hz: Option<f64>,
     value: Option<f32>,
     poll: bool,
+    threads: usize,
+    parallel: usize,
     requested: Vec<String>,
 }
 
@@ -45,6 +55,8 @@ impl Options {
             automation_hz: None,
             value: None,
             poll: false,
+            threads: 1,
+            parallel: 1,
             requested: Vec::new(),
         };
         let mut args = args.into_iter();
@@ -63,6 +75,8 @@ impl Options {
                             | "--copies"
                             | "--automation-hz"
                             | "--value"
+                            | "--threads"
+                            | "--parallel"
                     ) {
                         return Err(format!("unknown option {name}"));
                     }
@@ -96,6 +110,13 @@ impl Options {
                             options.value =
                                 Some(value.parse().map_err(|_| "invalid parameter value")?);
                         }
+                        "--threads" => {
+                            options.threads = value.parse().map_err(|_| "invalid thread count")?;
+                        }
+                        "--parallel" => {
+                            options.parallel =
+                                value.parse().map_err(|_| "invalid parallel chain count")?;
+                        }
                         _ => unreachable!(),
                     }
                 }
@@ -107,7 +128,17 @@ impl Options {
             || options.rate == 0
             || options.copies == 0
         {
-            return Err("usage: performance [--rate=48000] [--blocks=2000] [--frames=16,64,128] [--copies=1] [--automation-hz=30] 'Plugin:param' ...".into());
+            return Err("usage: performance [--rate=48000] [--blocks=2000] [--frames=16,64,128] [--copies=1] [--automation-hz=30] [--threads=3 | --parallel=3] 'Plugin:param' ...".into());
+        }
+        if !(1..=MAX_THREADS).contains(&options.threads)
+            || !(1..=MAX_THREADS).contains(&options.parallel)
+        {
+            return Err(format!(
+                "threads and parallel chains must be from 1 to {MAX_THREADS}"
+            ));
+        }
+        if options.threads > 1 && options.parallel > 1 {
+            return Err("use --threads or --parallel, not both".into());
         }
         if options
             .frames
@@ -137,6 +168,7 @@ impl Options {
             || options
                 .copies
                 .checked_mul(options.requested.len())
+                .and_then(|chain| chain.checked_mul(options.parallel + 1))
                 .is_none()
         {
             return Err("requested workload is too large".into());
@@ -239,6 +271,142 @@ fn micros(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000_000.0
 }
 
+/// What a chain gets in one callback. Each chain of a run gets the same.
+#[derive(Clone, Copy)]
+struct Callback {
+    block: usize,
+    frames: usize,
+    rate: u32,
+    transport_frames: u64,
+    update: bool,
+    parameter_value: Option<f32>,
+}
+
+/// Runs one callback through the chain, in chunks of 128 frames at most, as
+/// the host does.
+fn process(plugins: &mut [Loaded], left: &mut [f32], right: &mut [f32], at: Callback) {
+    for (chunk, (left, right)) in left
+        .chunks_mut(MAX_PLUGIN_FRAMES)
+        .zip(right.chunks_mut(MAX_PLUGIN_FRAMES))
+        .enumerate()
+    {
+        let chunk_frame = at.transport_frames + (chunk * MAX_PLUGIN_FRAMES) as u64;
+        for plugin in plugins.iter_mut() {
+            let note_due = chunk == 0 && plugin.instrument && at.block.is_multiple_of(128);
+            if note_due || (chunk == 0 && at.update && plugin.param.is_some()) {
+                plugin.insert.restore_params(0);
+                if let Some(param) = plugin.param {
+                    plugin.insert.set_param(
+                        InsertParam {
+                            id: param.id,
+                            value: at.parameter_value.unwrap_or(param.value),
+                        },
+                        0,
+                    );
+                }
+            }
+            plugin
+                .insert
+                .sync(chunk_frame as f64 / f64::from(at.rate) * 1.5, 90.0, 0);
+            if note_due {
+                plugin.insert.note(
+                    InsertNote {
+                        pitch: 60.0 + (at.block / 128 % 5) as f32,
+                        velocity: 0.5,
+                        frames: (at.frames * 120) as u32,
+                    },
+                    0,
+                );
+            }
+            plugin.insert.process(left, right);
+        }
+    }
+}
+
+/// A chain of `--threads` or `--parallel`, with the samples of its callback.
+struct ThreadChain {
+    plugins: Vec<Loaded>,
+    left: Vec<f32>,
+    right: Vec<f32>,
+}
+
+/// A thread that runs the callback of each chain it gets, and gives the
+/// chain back with the start and the end of the callback.
+struct Worker {
+    work: Option<mpsc::Sender<(ThreadChain, Callback)>>,
+    done: mpsc::Receiver<(ThreadChain, Instant, Instant)>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Worker {
+    fn start() -> Self {
+        let (work, chains) = mpsc::channel::<(ThreadChain, Callback)>();
+        let (finished, done) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            for (mut chain, at) in chains {
+                let start = Instant::now();
+                process(&mut chain.plugins, &mut chain.left, &mut chain.right, at);
+                if finished.send((chain, start, Instant::now())).is_err() {
+                    return;
+                }
+            }
+        });
+        Self {
+            work: Some(work),
+            done,
+            thread: Some(thread),
+        }
+    }
+
+    fn send(&self, chain: ThreadChain, at: Callback) -> Result<(), String> {
+        let work = self.work.as_ref().expect("the channel of the thread");
+        work.send((chain, at))
+            .map_err(|_| "a processing thread stopped".into())
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        // The thread ends when its channel closes.
+        drop(self.work.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Runs one callback of each chain on the workers. With `threads` above 1,
+/// the one chain goes to the worker of its turn. Otherwise each chain has a
+/// worker of its own, and the chains run at the same time. Returns the time
+/// from the first start to the last end, in microseconds.
+fn turn(
+    workers: &[Worker],
+    chains: &mut Vec<ThreadChain>,
+    at: Callback,
+    threads: usize,
+) -> Result<f64, String> {
+    let worker = |index: usize| match threads {
+        1 => &workers[index],
+        threads => &workers[at.block % threads],
+    };
+    let count = chains.len();
+    for (index, chain) in chains.drain(..).enumerate() {
+        worker(index).send(chain, at)?;
+    }
+    let mut span: Option<(Instant, Instant)> = None;
+    for index in 0..count {
+        let (chain, start, end) = worker(index)
+            .done
+            .recv()
+            .map_err(|_| "a processing thread stopped")?;
+        chains.push(chain);
+        span = Some(span.map_or((start, end), |(first, last)| {
+            (first.min(start), last.max(end))
+        }));
+    }
+    Ok(span.map_or(0.0, |(first, last)| micros(last.duration_since(first))))
+}
+
 fn run() -> Result<(), String> {
     let Options {
         rate,
@@ -248,6 +416,8 @@ fn run() -> Result<(), String> {
         automation_hz,
         value,
         poll,
+        threads,
+        parallel,
         requested,
     } = Options::parse(std::env::args().skip(1))?;
 
@@ -260,11 +430,22 @@ fn run() -> Result<(), String> {
     host.scan(&folders);
     host.wait_idle();
     let scan_us = micros(scan.elapsed());
-    let mut plugins = Vec::new();
+    // Chain 0 runs on this thread. The chains after it run on the threads of
+    // `--threads` and `--parallel`.
+    let thread_chains = match (threads, parallel) {
+        (1, 1) => 0,
+        (1, parallel) => parallel,
+        _ => 1,
+    };
+    let length = requested.len() * copies;
+    let total = length * (1 + thread_chains);
+    let mut chains: Vec<Vec<Loaded>> = (0..=thread_chains).map(|_| Vec::new()).collect();
     let mut startup = Vec::new();
     for (slot, request) in requested
         .iter()
         .flat_map(|request| std::iter::repeat_n(request, copies))
+        .cycle()
+        .take(total)
         .enumerate()
     {
         let (name, param) = request
@@ -311,6 +492,7 @@ fn run() -> Result<(), String> {
             .ok_or_else(|| format!("{name}: instance build failed: {:?}", host.take_errors()))?;
         startup.push(json!({
             "plugin": plugin.name(),
+            "chain": slot / length,
             "slot": slot,
             "copy": slot % copies + 1,
             "parameters": plugin.params().len(),
@@ -318,7 +500,7 @@ fn run() -> Result<(), String> {
             "load_us": load_us,
             "build_us": micros(start.elapsed()),
         }));
-        plugins.push(Loaded {
+        chains[slot / length].push(Loaded {
             name: plugin.name().to_owned(),
             instrument: plugin.is_instrument(),
             slot: insert_slot,
@@ -331,7 +513,7 @@ fn run() -> Result<(), String> {
     let start = Instant::now();
     let mut not_ready = 0;
     for _ in 0..100 {
-        for plugin in &plugins {
+        for plugin in chains.iter().flatten() {
             not_ready += usize::from(!matches!(
                 host.prepared(&plugin.name, None, plugin.instrument, rate, plugin.slot),
                 Prepared::Ready(_)
@@ -351,16 +533,31 @@ fn run() -> Result<(), String> {
             "max_plugin_frames": MAX_PLUGIN_FRAMES,
             "scan_us": scan_us,
             "plugins": startup,
-            "prepare_checks": 100 * plugins.len(),
+            "prepare_checks": 100 * total,
             "prepare_total_us": reuse_us,
             "not_ready": not_ready,
             "running_copies": running,
         })
     );
-    if not_ready != 0 || running != plugins.len() {
+    if not_ready != 0 || running != total {
         return Err("preparing a held insert did not reuse its running copy".into());
     }
 
+    let mut chains = chains.into_iter();
+    let mut plugins = chains.next().expect("the chain of this thread");
+    let mut thread_chains: Vec<ThreadChain> = chains
+        .map(|plugins| ThreadChain {
+            plugins,
+            left: Vec::new(),
+            right: Vec::new(),
+        })
+        .collect();
+    let workers: Vec<Worker> = match thread_chains.len() {
+        0 => Vec::new(),
+        _ => (0..threads.max(parallel))
+            .map(|_| Worker::start())
+            .collect(),
+    };
     let chain: Vec<_> = plugins.iter().map(|plugin| plugin.name.clone()).collect();
     let poller = poll.then(|| Poller::start(host.clone(), &plugins, rate));
     let mut transport_frames = 0u64;
@@ -377,10 +574,24 @@ fn run() -> Result<(), String> {
             let mut peak = 0.0f32;
             let mut square_sum = 0.0f64;
             let mut first_us = 0.0;
+            // The figures of the thread chains, and how far their output is
+            // from the output of this thread.
+            let mut thread_timings = Vec::with_capacity(blocks);
+            let mut thread_late = 0;
+            let mut thread_first_us = 0.0;
+            let mut equal = true;
+            let mut max_difference = 0.0f32;
             let mut automation_step = 0usize;
             let mut automation_updates = 0;
             let mut parameter_value = None;
-            for plugin in &mut plugins {
+            for thread_chain in &mut thread_chains {
+                thread_chain.left = vec![0.0; frames];
+                thread_chain.right = vec![0.0; frames];
+            }
+            let thread_plugins = thread_chains
+                .iter_mut()
+                .flat_map(|thread_chain| &mut thread_chain.plugins);
+            for plugin in plugins.iter_mut().chain(thread_plugins) {
                 plugin.insert.reset();
                 if let Some(param) = plugin.param {
                     plugin.insert.set_param(param, 0);
@@ -400,43 +611,20 @@ fn run() -> Result<(), String> {
                     *left = (at * std::f32::consts::TAU * 220.0 / rate as f32).sin() * 0.1;
                     *right = *left;
                 }
-                let start = Instant::now();
-                for (chunk, (left, right)) in left
-                    .chunks_mut(MAX_PLUGIN_FRAMES)
-                    .zip(right.chunks_mut(MAX_PLUGIN_FRAMES))
-                    .enumerate()
-                {
-                    let chunk_frame = transport_frames + (chunk * MAX_PLUGIN_FRAMES) as u64;
-                    for plugin in &mut plugins {
-                        let note_due = chunk == 0 && plugin.instrument && block % 128 == 0;
-                        if note_due || (chunk == 0 && update && plugin.param.is_some()) {
-                            plugin.insert.restore_params(0);
-                            if let Some(param) = plugin.param {
-                                plugin.insert.set_param(
-                                    InsertParam {
-                                        id: param.id,
-                                        value: parameter_value.unwrap_or(param.value),
-                                    },
-                                    0,
-                                );
-                            }
-                        }
-                        plugin
-                            .insert
-                            .sync(chunk_frame as f64 / f64::from(rate) * 1.5, 90.0, 0);
-                        if note_due {
-                            plugin.insert.note(
-                                InsertNote {
-                                    pitch: 60.0 + (block / 128 % 5) as f32,
-                                    velocity: 0.5,
-                                    frames: (frames * 120) as u32,
-                                },
-                                0,
-                            );
-                        }
-                        plugin.insert.process(left, right);
-                    }
+                for thread_chain in &mut thread_chains {
+                    thread_chain.left.copy_from_slice(&left);
+                    thread_chain.right.copy_from_slice(&right);
                 }
+                let at = Callback {
+                    block,
+                    frames,
+                    rate,
+                    transport_frames,
+                    update,
+                    parameter_value,
+                };
+                let start = Instant::now();
+                process(&mut plugins, &mut left, &mut right, at);
                 let elapsed = micros(start.elapsed());
                 transport_frames += frames as u64;
                 if block == 0 {
@@ -454,6 +642,27 @@ fn run() -> Result<(), String> {
                 if block >= 128 {
                     late += usize::from(elapsed > budget_us);
                     timings.push(elapsed);
+                }
+                if thread_chains.is_empty() {
+                    continue;
+                }
+                let elapsed = turn(&workers, &mut thread_chains, at, threads)?;
+                if block == 0 {
+                    thread_first_us = elapsed;
+                }
+                for thread_chain in &thread_chains {
+                    let output = thread_chain.left.iter().chain(&thread_chain.right);
+                    for (value, alone) in output.zip(left.iter().chain(&right)) {
+                        if !value.is_finite() {
+                            return Err("plugin produced non-finite audio".into());
+                        }
+                        equal &= value == alone;
+                        max_difference = max_difference.max((value - alone).abs());
+                    }
+                }
+                if block >= 128 {
+                    thread_late += usize::from(elapsed > budget_us);
+                    thread_timings.push(elapsed);
                 }
             }
             timings.sort_by(f64::total_cmp);
@@ -490,6 +699,31 @@ fn run() -> Result<(), String> {
                     "rms": (square_sum / (blocks * frames * 2) as f64).sqrt(),
                 })
             );
+            if thread_chains.is_empty() {
+                continue;
+            }
+            thread_timings.sort_by(f64::total_cmp);
+            println!(
+                "{}",
+                json!({
+                    "kind": if threads > 1 { "threads" } else { "parallel" },
+                    "plugins": chain,
+                    "threads": threads,
+                    "parallel": parallel,
+                    "frames": frames,
+                    "automation_enabled": automate,
+                    "blocks": blocks,
+                    "budget_us": budget_us,
+                    "first_us": thread_first_us,
+                    "mean_us": thread_timings.iter().sum::<f64>() / blocks as f64,
+                    "p50_us": thread_timings[blocks / 2],
+                    "p99_us": thread_timings[(blocks - 1) * 99 / 100],
+                    "max_us": thread_timings[blocks - 1],
+                    "over_budget": thread_late,
+                    "equal": equal,
+                    "max_difference": max_difference,
+                })
+            );
         }
     }
     if let Some(poller) = poller {
@@ -506,11 +740,12 @@ fn run() -> Result<(), String> {
                 "running_copies": running,
             })
         );
-        if stats.checks == 0 || stats.not_ready != 0 || running != plugins.len() {
+        if stats.checks == 0 || stats.not_ready != 0 || running != total {
             return Err("concurrent preparation did not reuse each running copy".into());
         }
     }
-    drop(plugins);
+    // The threads end first, then each copy.
+    drop((workers, thread_chains, plugins));
     host.wait_idle();
     let errors = host.take_errors();
     if errors.is_empty() {
@@ -544,10 +779,13 @@ mod tests {
         assert_eq!(options.copies, 1);
         assert_eq!(options.automation_hz, None);
         assert!(!options.poll);
+        assert_eq!((options.threads, options.parallel), (1, 1));
     }
 
     #[test]
     fn accepts_spaced_and_inline_options_with_callback_sizes_above_the_host_limit() {
+        let parallel = options(&["--parallel", "4", "Plugin"]).unwrap();
+        assert_eq!((parallel.threads, parallel.parallel), (1, 4));
         let options = options(&[
             "--poll",
             "--rate=96000",
@@ -559,6 +797,7 @@ mod tests {
             "--automation-hz",
             "30",
             "--value=0.5",
+            "--threads=3",
             "First:mix",
             "Second:drive",
         ])
@@ -569,6 +808,7 @@ mod tests {
         assert_eq!(options.copies, 16);
         assert_eq!(options.automation_hz, Some(30.0));
         assert_eq!(options.value, Some(0.5));
+        assert_eq!((options.threads, options.parallel), (3, 1));
         assert_eq!(options.requested, ["First:mix", "Second:drive"]);
         assert!(options.poll);
     }
@@ -588,11 +828,16 @@ mod tests {
             "--automation-hz=NaN",
             "--automation-hz=inf",
             "--value=NaN",
+            "--threads=0",
+            "--threads=65",
+            "--parallel=0",
+            "--parallel=65",
             "--unknown=1",
         ] {
             assert!(options(&[arg, "Plugin"]).is_err(), "{arg}");
         }
         assert!(options(&["Plugin", "--frames"]).is_err());
+        assert!(options(&["--threads=2", "--parallel=2", "Plugin"]).is_err());
         assert!(options(&[]).is_err());
     }
 

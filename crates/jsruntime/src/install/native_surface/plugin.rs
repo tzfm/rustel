@@ -6,15 +6,18 @@ enum Field {
     /// its object after the first: the effects of a note are a chain, in
     /// call order. A second `vsti` call replaces the first.
     Name(String),
-    /// A key of the object the score wrote. `preset` is the name of a
-    /// preset file. Each other key is a parameter of the plugin.
-    Key(String),
+    /// A key of the object the score wrote, and the id of the slider that
+    /// is its value. `preset` is the name of a preset file. Each other key
+    /// is a parameter of the plugin.
+    Key(String, Option<String>),
 }
 
 /// Sets one field of a plugin object of a hap. An instrument has one
 /// object under `vsti`. The effects are a list under `vst`, and a key goes
 /// to the last object of the list:
 /// `vsti: { name, preset, params: { key: value } }`, `vst: [{ name }, { name }]`.
+/// A parameter whose value is a slider also names the slider:
+/// `__rustel_sliders: { key: id }`.
 fn set_plugin_field(hap: &Value, call: &str, field: &Field, setting: &Value) -> Value {
     let Value::Object(mut controls) = rustel_core::materialize_js_value(hap) else {
         rustel_core::signal_query_error(|| format!("{call} expects object-valued haps"));
@@ -35,7 +38,7 @@ fn set_plugin_field(hap: &Value, call: &str, field: &Field, setting: &Value) -> 
         controls.get(call).cloned()
     };
     let mut plugin = match (held, field) {
-        (Some(Value::Object(plugin)), Field::Key(_)) => plugin,
+        (Some(Value::Object(plugin)), Field::Key(..)) => plugin,
         (held, _) => {
             // A new name keeps the effect before it in the chain.
             effects.extend(held.filter(|_| chain));
@@ -47,16 +50,24 @@ fn set_plugin_field(hap: &Value, call: &str, field: &Field, setting: &Value) -> 
             plugin.insert("name".into(), setting);
             plugin.insert("__rustel_binding".into(), Value::Str(binding.clone()));
         }
-        Field::Key(key) if key == "preset" => {
+        Field::Key(key, _) if key == "preset" => {
             plugin.insert("preset".into(), setting);
         }
-        Field::Key(key) => {
+        Field::Key(key, slider) => {
             let mut params = match plugin.get("params") {
                 Some(Value::Object(params)) => params.clone(),
                 _ => rustel_core::OrderedMap::new(),
             };
             params.insert(key.clone(), setting);
             plugin.insert("params".into(), Value::Object(params));
+            if let Some(slider) = slider {
+                let mut sliders = match plugin.get("__rustel_sliders") {
+                    Some(Value::Object(sliders)) => sliders.clone(),
+                    _ => rustel_core::OrderedMap::new(),
+                };
+                sliders.insert(key.clone(), Value::Str(slider.clone()));
+                plugin.insert("__rustel_sliders".into(), Value::Object(sliders));
+            }
         }
     }
     let plugin = Value::Object(plugin);
@@ -128,7 +139,7 @@ fn install_plugin<'js>(
             &format!("{call} expects the name of a plugin as its first argument.{forms}"),
         ));
     };
-    let binding = with_bridge_frame(BridgeFrame::next_plugin_binding)
+    let binding = with_bridge_frame(|frame: &BridgeFrame<'js>| frame.next_plugin_binding(&name))
         .flatten()
         .ok_or_else(|| {
             rquickjs::Exception::throw_type(
@@ -143,9 +154,10 @@ fn install_plugin<'js>(
     if let Some(config) = args.0.get(1).and_then(rquickjs::Value::as_object) {
         for entry in config.props::<String, rquickjs::Value>() {
             let (key, value) = entry?;
+            let slider = slider_of(&value);
             let (value, sidecar) = reify_bridged(&ctx, &value)?;
             sidecars.push(sidecar);
-            let field = Field::Key(key);
+            let field = Field::Key(key, slider);
             // The note keeps the live links of its own controls.
             output = output.app_left_with_lookup(
                 value,
@@ -178,15 +190,22 @@ mod tests {
     }
 
     fn query_bindings(runtime: &JsRuntime, cycle: i64) -> Vec<(String, Vec<String>)> {
-        runtime
-            .query(
-                Slot::Active,
-                0,
-                Fraction::from(cycle),
-                Fraction::from(cycle + 1),
-            )
-            .expect("query")
-            .into_iter()
+        let (begin, end) = (Fraction::from(cycle), Fraction::from(cycle + 1));
+        notes(runtime.query(Slot::Active, 0, begin, end).expect("query"))
+    }
+
+    /// The notes of the first cycle of the shadow of the active score.
+    fn shadow_bindings(runtime: &JsRuntime) -> Vec<(String, Vec<String>)> {
+        let budget = std::time::Duration::from_secs(1);
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let cap = rustel_core::DEFAULT_HAP_BUDGET;
+        let shadow = runtime.query_shadow(Fraction::ZERO, Fraction::ONE, budget, cap, &stopped);
+        notes(shadow.expect("shadow"))
+    }
+
+    /// The lane tag and the plugin bindings of each note.
+    fn notes(haps: Vec<Hap>) -> Vec<(String, Vec<String>)> {
+        haps.into_iter()
             .map(|hap| {
                 let Value::Object(controls) = hap.value else {
                     panic!("object hap");
@@ -196,16 +215,9 @@ mod tests {
                     None => String::new(),
                     _ => panic!("lane tag"),
                 };
-                let mut plugins: Vec<_> = controls.get("vsti").into_iter().collect();
-                if let Some(Value::List(effects)) = controls.get("vst") {
-                    plugins.extend(effects);
-                }
-                let ids = plugins
+                let ids = plugins(&controls)
                     .into_iter()
                     .map(|plugin| {
-                        let Value::Object(plugin) = plugin else {
-                            panic!("plugin object");
-                        };
                         let Some(Value::Str(binding)) = plugin.get("__rustel_binding") else {
                             panic!("binding");
                         };
@@ -213,6 +225,42 @@ mod tests {
                     })
                     .collect();
                 (lane, ids)
+            })
+            .collect()
+    }
+
+    /// The sliders each plugin of each note of the first cycle names, as
+    /// `key:id`.
+    fn sliders(runtime: &JsRuntime) -> Vec<Vec<String>> {
+        let haps = runtime.query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE);
+        haps.expect("query")
+            .into_iter()
+            .map(|hap| {
+                let Value::Object(controls) = hap.value else {
+                    panic!("object hap");
+                };
+                plugins(&controls)
+                    .into_iter()
+                    .map(|plugin| plugin.get("__rustel_sliders").map(Value::show))
+                    .map(Option::unwrap_or_default)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The plugin objects of a note: the instrument, then the effects.
+    fn plugins(controls: &rustel_core::OrderedMap) -> Vec<&rustel_core::OrderedMap> {
+        let mut plugins: Vec<_> = controls.get("vsti").into_iter().collect();
+        if let Some(Value::List(effects)) = controls.get("vst") {
+            plugins.extend(effects);
+        }
+        plugins
+            .into_iter()
+            .map(|plugin| {
+                let Value::Object(plugin) = plugin else {
+                    panic!("plugin object");
+                };
+                plugin
             })
             .collect()
     }
@@ -243,6 +291,57 @@ mod tests {
             ),
             expected
         );
+
+        // A slider that is the value of a key names its id beside the
+        // params. A slider in an expression, with a time transform or as the
+        // preset names none. The lane tag and the binding stay.
+        let one = ("#0".to_owned(), vec!["p0".to_owned()]);
+        for (config, named) in [
+            ("{ gain: sliderWithID('g', 1) }", "gain:g"),
+            (
+                "{ gain: sliderWithID('g', 1), mix: sliderWithID('m', .5) }",
+                "gain:g mix:m",
+            ),
+            ("{ gain: sliderWithID('g', 1).mul(1) }", ""),
+            ("{ gain: sliderWithID('g', 1).fast(2) }", ""),
+            ("{ preset: sliderWithID('g', 1) }", ""),
+        ] {
+            let source = format!(r#"lead: note("c3 e3").vst("effect", {config});"#);
+            let notes = bindings(&runtime, &source);
+            assert_eq!(notes, [one.clone(), one.clone()], "{config}");
+            assert_eq!(sliders(&runtime), [[named], [named]], "{config}");
+        }
+        // One slider in a variable on 2 keys of 2 plugins names the key of
+        // each plugin.
+        let shared = r#"
+          const level = sliderWithID('level', .5);
+          lead: note("c3").vsti("synth", { gain: level }).vst("effect", { mix: level });
+        "#;
+        let both = ("#0".to_owned(), vec!["p0".to_owned(), "p1".to_owned()]);
+        assert_eq!(bindings(&runtime, shared), [both]);
+        assert_eq!(sliders(&runtime), [["gain:level", "mix:level"]]);
+
+        // The evaluation gives the plugin name of each call that ran, one
+        // time each, in call order: a call in a helper, in a callback, with
+        // a name from a variable, and in a muted lane. A name in a comment
+        // or in a branch that does not run is not a call.
+        let ran = |source: &str| {
+            let budget = std::time::Duration::from_secs(1);
+            let stopped = std::sync::atomic::AtomicBool::new(false);
+            let options = TranspileOptions::default();
+            let evaluated =
+                runtime.evaluate_score_with_effects_cancellable(source, &options, budget, &stopped);
+            evaluated.expect("evaluate").1.plugins
+        };
+        assert_eq!(ran(source), ["effect", "tail", "synth"]);
+        let calls = r#"
+          const name = 'named';
+          // $: note("c3").vst("comment");
+          if (false) note("c3").vst("branch");
+          lead: s("bd").every(2, x => x.vst("callback"));
+          _bass: note("g2").vsti(name);
+        "#;
+        assert_eq!(ran(calls), ["callback", "named"]);
 
         let reused = bindings(
             &runtime,
@@ -289,6 +388,118 @@ mod tests {
             ("lead: fx; S$: fx;", vec!["#1"]),
         ] {
             assert_eq!(lane_tags(lanes, &[]), tags, "{lanes}");
+        }
+
+        // A muted lane and the lanes a solo drops are in the shadow of the
+        // score, with the tag and the bindings each note has when it plays.
+        // The callback of `lead` runs in the shadow query too.
+        let shadow = |source: &str| {
+            ran(source);
+            shadow_bindings(&runtime)
+        };
+        let note = |lane: &str, ids: &[&str]| {
+            let ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+            (lane.to_owned(), ids)
+        };
+        let (lead, bass, drums) = (
+            note("#0", &["p0"]),
+            note("#1", &["p1"]),
+            note("#2", &["p2"]),
+        );
+        let lanes = r#"
+          lead: note("c3").vst("effect").fmap(v => ({ ...v }));
+          bass: note("g2").vsti("synth");
+          $: s("bd").vst("tail");
+        "#;
+        let played = [lead.clone(), bass.clone(), drums.clone()];
+        assert_eq!(bindings(&runtime, lanes), played);
+        assert!(shadow_bindings(&runtime).is_empty());
+        let quiet = lanes.replace(r#"("synth")"#, r#"("synth").q()"#);
+        for (marked, notes) in [
+            (lanes.replace("bass:", "_bass:"), vec![bass.clone()]),
+            (quiet.clone(), vec![bass.clone()]),
+            (quiet.replace("bass:", "_bass:"), vec![bass.clone()]),
+            (lanes.replace("$:", "S$:"), vec![lead, bass]),
+        ] {
+            assert_eq!(shadow(&marked), notes, "{marked}");
+        }
+        // `all` runs on the shadow again from the bindings of its first run,
+        // with no console line. A note of a lane with no plugin of its own
+        // has no tag, as when it plays.
+        let all = r#"
+          all(x => (console.log('all'), x.vst("tail")));
+          $: note("c3").vsti("synth");
+          $: note("e3").vsti("synth");
+          $: s("bd");
+        "#;
+        let (synth, drums) = (note("#1", &["p1", "p2"]), note("", &["p2"]));
+        let played = [note("#0", &["p0", "p2"]), synth.clone(), drums.clone()];
+        assert_eq!(bindings(&runtime, all), played);
+        assert_eq!(runtime.take_logs(), ["all"]);
+        let muted = all
+            .replace(r#"$: note("e3")"#, r#"_$: note("e3")"#)
+            .replace("$: s(", "_$: s(");
+        assert_eq!(shadow(&muted), [synth, drums]);
+        assert_eq!(runtime.take_logs(), ["all"]);
+        // A throw of the second run drops the shadow, and the score plays.
+        let again = r#"
+          let runs = 0;
+          all(x => { if (runs++) throw new Error('again'); return x; });
+          $: note("c3").vsti("synth");
+          _$: note("e3").vsti("synth");
+        "#;
+        assert!(shadow(again).is_empty());
+        assert_eq!(query_bindings(&runtime, 0), [note("#0", &["p0"])]);
+        // A second run with no time left before the deadline gives no
+        // shadow, and the score plays.
+        let slow = r#"
+          all(x => { const end = Date.now() + 600; while (Date.now() < end) {} return x; });
+          $: note("c3").vsti("synth");
+          _$: note("e3").vsti("synth");
+        "#;
+        assert!(shadow(slow).is_empty());
+        assert_eq!(query_bindings(&runtime, 0), [note("#0", &["p0"])]);
+        // The shadow query writes no console line, and a throw in it is in no
+        // report.
+        for source in [
+            r#"$: s("hh"); _$: note("c3").vsti("synth").fmap(v => { console.log('lane'); throw new Error('lane'); });"#,
+            r#"all(x => x.fmap(v => { console.log('all'); throw new Error('all'); })); _$: note("c3").vsti("synth");"#,
+        ] {
+            assert!(shadow(source).is_empty(), "{source}");
+            assert!(runtime.take_logs().is_empty(), "{source}");
+            assert_eq!(runtime.take_query_throw(), None, "{source}");
+            assert_eq!(rustel_core::take_query_contained_throw(), None, "{source}");
+            assert_eq!(rustel_core::take_query_callback_failure(), None, "{source}");
+        }
+
+        // A score with no plugin call has no shadow. A muted `$` lane with no
+        // statement is not in it, and a muted name with no statement has the
+        // tag it has when it plays.
+        assert!(shadow(r#"$: s("hh"); _$: s("bd");"#).is_empty());
+        assert!(shadow(r#"$: s("hh").vst("tail"); note("g2").vsti("synth").p('_$');"#).is_empty());
+        let hand = r#"note("g2").vsti("synth").p('hand');"#;
+        assert_eq!(bindings(&runtime, hand), [note("hand", &["p0"])]);
+        assert_eq!(
+            shadow(&hand.replace("hand", "_hand")),
+            [note("hand", &["p0"])]
+        );
+        // The shadow is on a wrapper of its own: the one shared silence a
+        // muted lane returns keeps none.
+        assert_eq!(
+            shadow(r#"_$: note("g2").vsti("synth");"#),
+            [note("#0", &["p0"])]
+        );
+        assert!(shadow("silence").is_empty());
+        // Only the lane call right after a `.q()` keeps its pattern, and only
+        // when that lane plays the silence of the `.q()`. Each evaluation
+        // starts with no `.q()`.
+        for source in [
+            r#"const a = note("c3").vsti("synth").q(); const b = s("bd").vst("tail").q(); $: a; $: b;"#,
+            r#"const a = note("c3").vsti("synth").q(); $: s("hh"); $: silence;"#,
+            r#"$: s("hh").vst("tail"); note("c3").vsti("synth").q();"#,
+            r#"$: silence; $: s("hh").vst("tail");"#,
+        ] {
+            assert!(shadow(source).is_empty(), "{source}");
         }
     }
 

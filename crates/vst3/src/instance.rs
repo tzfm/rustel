@@ -1,10 +1,12 @@
 //! One plugin: made and prepared on the plugin thread, run in the audio
-//! callback, and returned to the plugin thread at the end.
+//! callback or on a plugin worker of the engine, one thread at a time, and
+//! returned to the plugin thread at the end.
 
 use std::cell::Cell;
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 
 use rustel_audio::{InsertKey, InsertNote, InsertParam, MAX_INSERT_PARAMS, OrbitInsert};
@@ -96,6 +98,21 @@ impl HeldNote {
     }
 }
 
+/// The cell of one plugin copy. The host creates the cell when it creates
+/// the plugin. The copy keeps the same cell to its end. Each field is an
+/// atomic. Any thread reads and writes the cell with no lock.
+#[derive(Default)]
+pub(crate) struct CopyState {
+    /// True while an engine holds the copy: see [`Instance::hold`].
+    pub held: AtomicBool,
+    /// The latency of the plugin in frames. The plugin thread reads it
+    /// from the plugin after the first blocks of the copy.
+    pub latency: AtomicU32,
+    /// The plugin asked for a restart because its latency changed. Only
+    /// the plugin thread acts on the flag.
+    pub latency_changed: AtomicBool,
+}
+
 /// A plugin with its two halves connected. The plugin thread owns a
 /// `Loaded` value from the first call to the last. The value is one field
 /// so that its drop can move the whole value to the main thread, which
@@ -114,7 +131,9 @@ pub(crate) struct Whole {
     separate_controller: bool,
     active: Cell<bool>,
     /// The count of running copies of the plugin, held while this one runs.
-    running: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    running: Option<Arc<AtomicUsize>>,
+    /// The cell of the copy, shared with the handler.
+    state: Arc<CopyState>,
     _handler: ComWrapper<Handler>,
     _host: ComWrapper<HostApp>,
     _module: Arc<Module>,
@@ -152,7 +171,8 @@ impl Loaded {
 
     fn make(module: Arc<Module>, class: &ClassInfo) -> Result<Self, String> {
         let host = ComWrapper::new(HostApp);
-        let handler = ComWrapper::new(Handler);
+        let cell = Arc::new(CopyState::default());
+        let handler = Handler::new(Arc::clone(&cell));
         let context: *mut FUnknown = pointer::<_, IHostApplication>(&host).cast();
         module.set_host(context);
 
@@ -204,6 +224,7 @@ impl Loaded {
             separate_controller,
             active: Cell::new(false),
             running: None,
+            state: cell,
             _handler: handler,
             _host: host,
             _module: module,
@@ -407,7 +428,7 @@ impl Loaded {
         key: InsertKey,
         sample_rate: u32,
         retire: Sender<Job>,
-        running: Arc<std::sync::atomic::AtomicUsize>,
+        running: Arc<AtomicUsize>,
         params: &[ParamInfo],
     ) -> Result<Instance, String> {
         let sample32 = SymbolicSampleSizes_::kSample32 as i32;
@@ -444,10 +465,12 @@ impl Loaded {
         if unsafe { self.component.setActive(1) } != kResultOk {
             return Err("the plugin did not turn on".into());
         }
+        // The plugin turned on after each restart request it made so far.
+        self.state.latency_changed.store(false, Ordering::Relaxed);
         let at_start = self.param_values(params);
         self.active.set(true);
         unsafe { self.processor.setProcessing(1) };
-        running.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        running.fetch_add(1, Ordering::Relaxed);
         self.running = Some(running);
 
         // One block of samples for each channel of each bus, the inputs
@@ -491,9 +514,11 @@ impl Loaded {
         let main_input = input_channels.first().copied().unwrap_or(0);
         let main_output = output_channels.first().copied().unwrap_or(0);
         let output_start: usize = input_channels.iter().sum();
+        let state = Arc::clone(&self.state);
         let mut instance = Instance {
             key,
             plugin: Some(self),
+            any_thread: true,
             changes: Changes::new(),
             events: Events::new(),
             notes: [HeldNote::default(); MAX_NOTES],
@@ -515,7 +540,7 @@ impl Loaded {
             beats: 0.0,
             tempo: DEFAULT_TEMPO,
             order: 0,
-            held: None,
+            state,
             retire,
         };
         // Silent blocks before the audio starts: 0.1 seconds. Some plugins
@@ -525,15 +550,62 @@ impl Loaded {
         // DAW runs a plugin all the time, so a plugin does not count on a
         // first note in its first block. This runs on the plugin thread,
         // where such work costs no audio deadline.
-        let (mut left, mut right) = ([0.0f32; MAX_BLOCK], [0.0f32; MAX_BLOCK]);
-        for _ in 0..(sample_rate as usize / 10).div_ceil(MAX_BLOCK) {
-            left.fill(0.0);
-            right.fill(0.0);
-            instance.process(&mut left, &mut right);
+        let warm_up = |instance: &mut Instance| {
+            let (mut left, mut right) = ([0.0f32; MAX_BLOCK], [0.0f32; MAX_BLOCK]);
+            for _ in 0..(sample_rate as usize / 10).div_ceil(MAX_BLOCK) {
+                left.fill(0.0);
+                right.fill(0.0);
+                instance.process(&mut left, &mut right);
+            }
+        };
+        warm_up(&mut instance);
+        // A plugin that finds its latency in its first blocks asks for a
+        // restart there. The build restarts it one time at most, with the
+        // silent blocks again. A request after the plugin turns on again
+        // leaves the flag set.
+        if let Some(plugin) = &instance.plugin
+            && plugin.state.latency_changed.swap(false, Ordering::Acquire)
+        {
+            if let Err(error) = plugin.restart() {
+                // The copy ends here, in its build, so the count of running
+                // copies drops before the host stores the failure.
+                drop(instance.plugin.take());
+                return Err(error);
+            }
+            warm_up(&mut instance);
+        }
+        // The one latency read of the build, after the first blocks.
+        if let Some(plugin) = &instance.plugin {
+            // SAFETY: the call takes no pointer, and the plugin thread makes
+            // it while no block runs.
+            let latency = unsafe { plugin.processor.getLatencySamples() };
+            plugin.state.latency.store(latency, Ordering::Relaxed);
         }
         instance.frames = 0;
         instance.beats = 0.0;
         Ok(instance)
+    }
+
+    /// Turns the plugin off and on, as a plugin asks for when its latency
+    /// changes. Runs on the plugin thread while no block runs.
+    fn restart(&self) -> Result<(), String> {
+        // SAFETY: the calls take no pointer, and the plugin thread makes
+        // them while no block runs.
+        unsafe {
+            self.processor.setProcessing(0);
+            self.component.setActive(0);
+        }
+        self.active.set(false);
+        // SAFETY: as above.
+        if unsafe { self.component.setActive(1) } != kResultOk {
+            return Err("the plugin did not turn on".into());
+        }
+        // The plugin turned on after each restart request it made so far.
+        self.state.latency_changed.store(false, Ordering::Relaxed);
+        self.active.set(true);
+        // SAFETY: as above.
+        unsafe { self.processor.setProcessing(1) };
+        Ok(())
     }
 }
 
@@ -557,7 +629,7 @@ impl Whole {
     /// object can destroy objects that belong on this thread.
     fn end(self) {
         if let Some(running) = &self.running {
-            running.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            running.fetch_sub(1, Ordering::Relaxed);
         }
         unsafe {
             if self.active.get() {
@@ -579,11 +651,15 @@ impl Whole {
     }
 }
 
-/// A plugin on an orbit. The audio callback owns the value.
+/// A plugin on an orbit. The audio engine owns the value, and runs its
+/// blocks in the callback or on a plugin worker, one thread at a time.
 pub(crate) struct Instance {
     key: InsertKey,
     /// Goes back to the plugin thread at the end.
     plugin: Option<Loaded>,
+    /// False keeps the blocks of the copy in the audio callback: see
+    /// [`Instance::set_any_thread`].
+    any_thread: bool,
     changes: ComWrapper<Changes>,
     events: ComWrapper<Events>,
     notes: [HeldNote; MAX_NOTES],
@@ -613,13 +689,16 @@ pub(crate) struct Instance {
     tempo: f64,
     /// The place of this instance in the order the host built them.
     order: u64,
-    /// Alive while an engine holds this instance: see [`Instance::hold`].
-    held: Option<std::sync::Arc<()>>,
+    /// The cell of the copy: see [`CopyState`].
+    state: Arc<CopyState>,
     retire: Sender<Job>,
 }
 
-// SAFETY: one thread owns an instance at a time. The pointers go to memory
-// the instance owns, and the plugin objects go back to the plugin thread.
+// SAFETY: one thread owns an instance at a time and makes each call on it:
+// the plugin thread at the build, then the audio engine, which runs the
+// blocks in the callback or on a plugin worker, one thread at a time. The
+// pointers go to memory the instance owns, and the plugin objects go back
+// to the plugin thread at the end.
 unsafe impl Send for Instance {}
 
 impl Instance {
@@ -647,17 +726,28 @@ impl Instance {
         self.order
     }
 
-    /// Marks the instance as held by an engine. The mark the host gets is
-    /// alive until the instance ends.
-    pub(crate) fn hold(&mut self) -> std::sync::Weak<()> {
-        let held = std::sync::Arc::new(());
-        let mark = std::sync::Arc::downgrade(&held);
-        self.held = Some(held);
-        mark
+    /// Marks the instance as held by an engine until the instance ends.
+    /// The host reads the mark in the cell it gets.
+    pub(crate) fn hold(&self) -> Arc<CopyState> {
+        self.state.held.store(true, Ordering::Relaxed);
+        Arc::clone(&self.state)
+    }
+
+    /// The latency of the plugin in frames, as the plugin thread last read
+    /// it.
+    pub(crate) fn latency(&self) -> u32 {
+        self.state.latency.load(Ordering::Relaxed)
     }
 
     pub(crate) fn set_order(&mut self, order: u64) {
         self.order = order;
+    }
+
+    /// With false, the engine runs each block of the copy in the audio
+    /// callback, for a plugin that breaks on another thread. A new copy
+    /// runs its blocks on any thread.
+    pub(crate) fn set_any_thread(&mut self, any_thread: bool) {
+        self.any_thread = any_thread;
     }
 
     fn channel(&mut self, channel: usize, frames: usize) -> &mut [f32] {
@@ -765,6 +855,20 @@ impl OrbitInsert for Instance {
         self.set_at(Some(param.id), at, f64::from(param.value.clamp(0.0, 1.0)));
     }
 
+    fn set_param_now(&mut self, param: InsertParam) {
+        if !param.value.is_finite() {
+            return;
+        }
+        let value = f64::from(param.value.clamp(0.0, 1.0));
+        let id = Some(param.id);
+        // A value that waits is the value of a note in the queue.
+        let waiting = &mut self.params[..self.param_count];
+        for known in waiting.iter_mut().filter(|known| known.id == id) {
+            known.value = value;
+        }
+        self.set_at(id, self.frames, value);
+    }
+
     fn restore_params(&mut self, frames: u32) {
         let at = self.frames + i64::from(frames);
         self.set_at(None, at, 0.0);
@@ -847,6 +951,10 @@ impl OrbitInsert for Instance {
         // A cut that waits needs the frame count to go on: a sleeping
         // instance does not count frames.
         self.note_count > 0 || self.param_count > 0 || self.cut_at.is_some()
+    }
+
+    fn any_thread(&self) -> bool {
+        self.any_thread
     }
 
     fn reset(&mut self) {
@@ -985,6 +1093,9 @@ impl OrbitInsert for Instance {
 
 impl Drop for Instance {
     fn drop(&mut self) {
+        // No engine holds the copy from here on. The mark clears first: a
+        // copy that ended on the plugin thread has no plugin left.
+        self.state.held.store(false, Ordering::Relaxed);
         let Some(plugin) = self.plugin.take() else {
             return;
         };

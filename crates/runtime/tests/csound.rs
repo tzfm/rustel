@@ -238,22 +238,48 @@ fn recorded_sets_keep_the_orchestra_of_each_accepted_save() {
             (third / first - 1.5).abs() < 0.02,
             "levels: {first}, {unchanged}, {third}"
         );
-        // Both revisions land inside the same 128-frame render block.
-        for (frames, level) in [
-            (3_996..4_000, first),
-            (4_000..4_004, first * 2.0),
-            (4_060..4_064, first * 2.0),
-            (4_064..4_068, first * 1.5),
-        ] {
-            for frame in frames {
-                for channel in 0..2 {
-                    let actual = decoded.pcm()[frame * 2 + channel];
-                    assert!(
-                        (actual - level).abs() < 2.0 / 32_768.0,
-                        "frame {frame}, channel {channel}: {actual} != {level}"
-                    );
-                }
+        // Both revisions land inside the same 128-frame render block, each on
+        // its own frame. From that frame the new orchestra plays at its full
+        // level, and the orchestra before plays at most at its level while
+        // it fades out in 5 ms (40 frames at 8 kHz). Then the new one plays
+        // alone.
+        let near = |frame: usize, level: f32| {
+            for channel in 0..2 {
+                let actual = decoded.pcm()[frame * 2 + channel];
+                assert!(
+                    (actual - level).abs() < 3.0 / 32_768.0,
+                    "frame {frame}, channel {channel}: {actual} != {level}"
+                );
             }
+        };
+        let landed = |frame: usize, new: f32, before: f32| {
+            for channel in 0..2 {
+                let actual = decoded.pcm()[frame * 2 + channel];
+                assert!(
+                    actual > new - 3.0 / 32_768.0 && actual < new + before + 3.0 / 32_768.0,
+                    "frame {frame}, channel {channel}: {actual} is not {new} with a fade of {before}"
+                );
+            }
+        };
+        for frame in 3_996..4_000 {
+            near(frame, first);
+        }
+        for frame in 4_000..4_004 {
+            landed(frame, first * 2.0, first);
+        }
+        for frame in 4_040..4_064 {
+            near(frame, first * 2.0);
+        }
+        for frame in 4_064..4_068 {
+            landed(frame, first * 1.5, first * 2.0);
+            let actual = decoded.pcm()[frame * 2];
+            assert!(
+                (actual - first * 2.0).abs() > 3.0 / 32_768.0,
+                "frame {frame}: the second revision did not land"
+            );
+        }
+        for frame in 4_104..4_108 {
+            near(frame, first * 1.5);
         }
     });
 }

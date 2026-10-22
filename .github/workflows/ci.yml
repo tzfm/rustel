@@ -296,7 +296,9 @@ jobs:
     concurrency:
       group: ${{ github.workflow }}-miri-${{ github.ref }}
       cancel-in-progress: true
-    timeout-minutes: 30
+    # The Csound worker and plugin pool tests run under 16 thread schedules
+    # each, and the job takes about 35 minutes.
+    timeout-minutes: 45
     env:
       # Miri does not optimize, and warns about a profile with an opt-level.
       CARGO_PROFILE_TEST_OPT_LEVEL: "0"

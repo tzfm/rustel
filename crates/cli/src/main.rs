@@ -4821,6 +4821,37 @@ mod live_output_contract_tests {
             live_engine_pressure_detail(&pressure, now + Duration::from_secs(20), &mut last_notice,),
             LiveDetail::Debug
         );
+
+        // An output on Windows counts an underrun from its playback clock,
+        // and the warning shows it as one the device reports. A buffer of
+        // 256 frames lasts 5.3 ms, and the device plays it 10 ms after its
+        // callback. The clock runs 30 ms ahead at the 16th buffer, where the
+        // load meter publishes.
+        let mut manual =
+            rustel_audio::device::ManualLiveOutput::new(48_000, 1).expect("manual output");
+        let mut buffer = [0.0f32; 256 * 2];
+        for index in 0..16 {
+            let ahead = if index == 15 { 30_000_000 } else { 0 };
+            manual.render_at(&mut buffer, index * 5_333_333 + ahead, 10_000_000);
+        }
+        let report = manual.device().report();
+        assert_eq!(report.callback_xruns, 1);
+        let pressure = rustel_runtime::EnginePressureMonitor::default().sample(
+            report,
+            rustel_runtime::ProducerLoadSnapshot::default(),
+            256,
+        );
+        let event = live_engine_pressure_event(
+            pressure,
+            rustel_runtime::EnginePressureReportContext::default(),
+        );
+        let line = output
+            .render(
+                live_engine_pressure_detail(&pressure, now, &mut None),
+                &event,
+            )
+            .expect("the default CLI warns");
+        assert!(line.contains("audio device underrun"), "{line}");
     }
 
     #[test]

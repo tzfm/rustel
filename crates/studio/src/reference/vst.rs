@@ -633,6 +633,8 @@ mod tests {
             instrument: false,
             running: 0,
             load_time: std::time::Duration::ZERO,
+            audio_thread: false,
+            latency: None,
         }
     }
 

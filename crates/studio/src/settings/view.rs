@@ -1350,9 +1350,15 @@ fn render_vst(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer: &mu
                     };
                     buffer.set_stringn(content_x, y, &text, content_width, style);
                 } else if let Some(plugin) = scanned.get(at - folders.len()) {
-                    // The plugin rows are read-only, as a standard folder
-                    // is: the scan is what changes them.
-                    let text = format!("{} {} · {}", marker(selected), plugin.name, plugin.state);
+                    // The scan adds and removes the plugin rows. A row says
+                    // its switch `audio thread only` when the switch is on.
+                    let tag = if plugin.audio_thread {
+                        " · audio thread only"
+                    } else {
+                        ""
+                    };
+                    let (name, state) = (&plugin.name, &plugin.state);
+                    let text = format!("{} {name} · {state}{tag}", marker(selected));
                     let style = if selected {
                         Style::default()
                             .fg(theme.accent)
@@ -1381,7 +1387,7 @@ fn render_vst(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer: &mu
     } else if at < VST_CONTROL_COUNT + folders.len() {
         "a standard folder stays on the list"
     } else {
-        "the list of every plugin the scan found"
+        "Space turns audio thread only on or off"
     };
     let footer = [
         plugins_found(view.vst.plugins),

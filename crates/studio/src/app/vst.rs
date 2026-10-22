@@ -35,16 +35,24 @@ fn plugin_memory(plugins: &[PluginInfo]) -> Vec<PluginMemory> {
         .map(|plugin| {
             let name = &plugin.name;
             let label = match &plugin.status {
-                Status::Ready => format!(
-                    "{name} · {} · {} running · {} ms",
-                    if plugin.instrument {
-                        "instrument"
-                    } else {
-                        "effect"
-                    },
-                    plugin.running,
-                    plugin.load_time.as_millis()
-                ),
+                Status::Ready => {
+                    // A plugin with no latency shows none.
+                    let latency = plugin
+                        .latency
+                        .filter(|frames| *frames > 0)
+                        .map(|frames| format!(" · latency {frames} samples"))
+                        .unwrap_or_default();
+                    format!(
+                        "{name} · {} · {} running · {} ms{latency}",
+                        if plugin.instrument {
+                            "instrument"
+                        } else {
+                            "effect"
+                        },
+                        plugin.running,
+                        plugin.load_time.as_millis()
+                    )
+                }
                 Status::Failed(reason) => format!("{name} · failed: {reason}"),
                 Status::Found | Status::Loading => format!("{name} · loading"),
             };
@@ -437,6 +445,7 @@ impl App {
                             format!("failed · {reason}")
                         }
                     },
+                    audio_thread: plugin.audio_thread,
                 })
                 .collect(),
             plugins: plugins.len(),
@@ -523,6 +532,44 @@ impl App {
     pub(super) fn rescan_vst(&mut self) {
         vst::rescan();
         self.status = "reading the plugin folders".to_owned();
+    }
+
+    /// Space on a plugin row: the switch `audio thread only` of the plugin.
+    /// The runtime keeps the switch in the user settings, so `rustel play`
+    /// follows it too. A copy that loads after the change follows it. A row
+    /// before the load or the test of its plugin takes no switch.
+    pub(super) fn toggle_audio_thread(&mut self, at: usize) {
+        let plugins = vst::host().plugins();
+        let Some(plugin) = plugins.get(at) else {
+            return;
+        };
+        // Before its load or its test, a row has the name of its bundle.
+        // The test gives the row the name of the plugin, and a switch saved
+        // under the bundle name then names no plugin.
+        if plugin.status != Status::Ready && plugin.categories.is_empty() {
+            self.status = format!(
+                "{} · no switch before the load or the test of the plugin",
+                plugin.name
+            );
+            return;
+        }
+        self.status = match vst::toggle_audio_thread_only(&plugin.name) {
+            Ok(Some(on)) => {
+                let state = if on { "on" } else { "off" };
+                let name = &plugin.name;
+                format!("{name} · audio thread only {state} · for the copies that load from now")
+            }
+            Ok(None) => format!(
+                "{} saved · {} decides while it is set",
+                plugin.name,
+                vst::AUDIO_THREAD_ENV
+            ),
+            Err(error) => {
+                let said = format!("{}: {error}", plugin.name);
+                self.log.push(LogLevel::Warn, "vst", said.clone());
+                said
+            }
+        };
     }
 
     /// The plugins the reference column shows now: the open plugin of the
@@ -800,7 +847,9 @@ mod tests {
 
     /// The memory breakdown has one row for each plugin the host loaded, and
     /// no row for a plugin the host only found. A plugin is in the Studio
-    /// process and has no figure of its own. An unload takes the rows away.
+    /// process and has no figure of its own. A row shows the latency of the
+    /// copies of its plugin when the latency is above 0. An unload takes the
+    /// rows away.
     #[test]
     fn a_loaded_plugin_is_a_row_of_the_memory_breakdown() {
         let folder = tempfile::tempdir().unwrap();
@@ -808,6 +857,14 @@ mod tests {
         // A host of its own reads this folder only: no plugin of the
         // machine, and no other test changes its list.
         let host = vst::Host::new();
+        // The default preset of the effect delays its output by 1024 frames:
+        // 0.25 of 4096.
+        let presets = tempfile::tempdir().unwrap();
+        let effect_presets = presets.path().join(rustel_vst3_fixture::NAME);
+        std::fs::create_dir_all(&effect_presets).unwrap();
+        let delay = rustel_vst3_fixture::preset_with_delay(1.0, 0.0, 0.25);
+        std::fs::write(effect_presets.join("default.vstpreset"), delay).unwrap();
+        host.set_preset_folder(presets.path().to_path_buf());
         host.scan(&[folder.path().to_path_buf()]);
         host.wait_idle();
         assert!(plugin_memory(&host.plugins()).is_empty());
@@ -829,6 +886,28 @@ mod tests {
         let facts = "Rustel Fixture Tone · instrument · 0 running · ";
         assert!(tone.label.starts_with(facts), "{}", tone.label);
         assert_eq!(tone.value, "in process");
+        // No copy ran, so the row has no latency.
+        assert!(effect.label.ends_with(" ms"), "{}", effect.label);
+
+        // The copy of the effect plays the default preset, and its row shows
+        // the delay as the latency. The copy of the instrument has a latency
+        // of 0, and its row shows none.
+        let rate = 48_000;
+        let slot = rustel_audio::InsertSlot::effect(1, 0);
+        host.prepare(rustel_vst3_fixture::NAME, None, false, rate, slot);
+        let slot = rustel_audio::InsertSlot::instrument(1);
+        host.prepare(rustel_vst3_fixture::TONE_NAME, None, true, rate, slot);
+        host.wait_idle();
+        let [effect, tone] = &plugin_memory(&host.plugins())[..] else {
+            panic!("2 plugin rows");
+        };
+        let facts = "Rustel Fixture · effect · 1 running · ";
+        assert!(effect.label.starts_with(facts), "{}", effect.label);
+        let latency = " ms · latency 1024 samples";
+        assert!(effect.label.ends_with(latency), "{}", effect.label);
+        let facts = "Rustel Fixture Tone · instrument · 1 running · ";
+        assert!(tone.label.starts_with(facts), "{}", tone.label);
+        assert!(tone.label.ends_with(" ms"), "{}", tone.label);
 
         host.unload_unused(&[]);
         host.wait_idle();

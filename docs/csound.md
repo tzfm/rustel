@@ -82,7 +82,8 @@ session. A definition-only evaluation works too. A syntax or compile error
 leaves the last accepted score and orchestra playing. Studio export retains
 the accepted definitions, including instruments from an earlier evaluation.
 An orchestra edit or export starts fresh engines. It does not retain running
-notes or the previous engine's global values.
+notes or the previous engine's global values. In play, the previous engine
+fades out in 5 ms under the first note of the new one.
 
 ## Score fields
 
@@ -173,7 +174,10 @@ audio callback. The callback posts its commands and reads finished frames
 from the ring. It never waits for Csound, so a costly opcode cannot stall
 the device output. When an orchestra costs more than the run-ahead allows,
 the ring runs dry, that one insert goes silent for the gap, and the rest of
-the output plays on.
+the output plays on. Gaps that add up to more than 512 frames, about 11 ms
+at 48 kHz, give a line in the log, one time for each evaluation. The silence
+before the note that restarts an orchestra does not count. Neither does the
+silence while the worker fills its run-ahead after an orchestra starts.
 
 A scheduled note reaches the worker when the engine admits it, one schedule
 lead before the note sounds, so its onset keeps its frame. A cut restarts

@@ -120,7 +120,7 @@ impl HelpContext {
             }
             #[cfg(feature = "vst")]
             Self::SettingsVst => {
-                "The folders with your VST3 plugins, then the standard folders of the system. The plugin host reads all of them. Rescan after you install a plugin."
+                "The folders with your VST3 plugins, then the standard folders of the system. The plugin host reads all of them. Rescan after you install a plugin. A plugin that breaks on another thread stays on the audio thread with its audio thread only switch on. Space on a plugin row turns its switch on or off."
             }
             Self::Log => {
                 "The newest studio messages are at the bottom of the log. v shows the running commentary underneath them."
@@ -322,7 +322,10 @@ impl HelpContext {
             Self::SettingsVst => [
                 ("a / +", "add a folder with VST3 plugins"),
                 ("Enter · d", "do the selected action · remove the folder"),
-                ("Tab · Esc", "other pages · close"),
+                (
+                    "Space · Tab · Esc",
+                    "turn audio thread only on or off · other pages · close",
+                ),
             ],
             Self::Log => [
                 (

@@ -181,6 +181,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio_thread_priority"
+version = "0.38.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0b30b2f3d2da482d0faeaafd8f88a38fbc62abb58d3b402cfa195793f4c92ab"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "log",
+ "mach2 0.4.3",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3637,7 +3650,9 @@ dependencies = [
 name = "rustel-audio"
 version = "0.1.5"
 dependencies = [
+ "audio_thread_priority",
  "cpal",
+ "libc",
  "rustel-kabel",
  "rustfft",
  "serde",
@@ -3921,6 +3936,7 @@ dependencies = [
 name = "rustel-vst3-fixture"
 version = "0.1.5"
 dependencies = [
+ "rustel-audio",
  "vst3",
 ]
 
