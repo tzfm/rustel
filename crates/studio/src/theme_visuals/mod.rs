@@ -611,12 +611,16 @@ pub(super) fn composite_effect(
             let joins = effect.symbol() == cell.symbol() && is_punctuation(cell.symbol());
             if cell == effect || strength <= 0.0 {
                 // The effect left this cell alone.
-            } else if is_interface && cell.symbol() != " " {
+            } else if is_interface
+                && (cell.symbol() != " " || cell.modifier.contains(Modifier::UNDERLINED))
+            {
                 // Controls must keep their labels, colours and emphasis even
                 // when a text effect decrypts or dims the score. Opacity can
                 // soften a colour, but cannot make a substituted menu letter
                 // readable. Keep its moving ground and let blank interface
                 // cells carry particles, while preserving the control itself.
+                // A space under a line is part of the control too: the effect
+                // would cut the line wherever it takes the cell's style.
                 cell.bg = blend_rgb(cell.bg, effect.bg, strength);
             } else if strength >= 1.0 {
                 cell.clone_from(effect);
@@ -1063,6 +1067,41 @@ mod tests {
             );
             if strength == 1.0 {
                 assert_eq!(painted.cell((2, 0)), effect.cell((2, 0)));
+            }
+        }
+    }
+
+    /// An underline runs under the spaces of a label too. The effect took
+    /// the style of those blank cells and cut the line into words.
+    #[test]
+    fn an_underlined_label_keeps_its_line_through_the_spaces_under_an_effect() {
+        let area = Rect::new(0, 0, 16, 1);
+        let mut baseline = Buffer::empty(area);
+        baseline.set_style(
+            area,
+            Style::default()
+                .bg(Color::Rgb(10, 20, 30))
+                .fg(Color::Rgb(220, 230, 240))
+                .add_modifier(Modifier::UNDERLINED),
+        );
+        let mut effect = baseline.clone();
+        for cell in &mut effect.content {
+            cell.set_bg(Color::Rgb(210, 220, 230));
+            cell.modifier = Modifier::DIM;
+        }
+
+        for strength in [0.25, 0.6, 1.0] {
+            let mut painted = baseline.clone();
+            composite_effect(&mut painted, &effect, area, 1.0, strength, &[area], &[]);
+            for x in area.x..area.right() {
+                assert!(
+                    painted
+                        .cell((x, 0))
+                        .unwrap()
+                        .modifier
+                        .contains(Modifier::UNDERLINED),
+                    "the line is cut at column {x}, strength {strength}"
+                );
             }
         }
     }
