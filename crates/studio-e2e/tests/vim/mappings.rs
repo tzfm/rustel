@@ -28,23 +28,13 @@ fn external_mappings_reload_and_survive_mode_changes_and_reopening() {
     assert_eq!(studio.source(), "// second");
     studio.type_text("u");
 
-    std::fs::write(&custom, "nnoremap Q x\n").expect("updated mappings");
-    studio.pump_until(
-        Duration::from_secs(5),
-        "updated mappings loaded",
-        |studio| studio.status() == "Vim mappings reloaded",
-    );
+    write_vimrc_reload(&mut studio, &custom, "nnoremap Q x\n");
     studio.set_caret(0);
     studio.type_text("Q");
     assert_eq!(studio.source(), "/ first\n// second");
     studio.type_text("u");
 
-    std::fs::write(&custom, "\" no mappings here\n").expect("empty external edit");
-    studio.pump_until(
-        Duration::from_secs(5),
-        "an empty mapping file loads",
-        |studio| studio.status() == "Vim mappings reloaded",
-    );
+    write_vimrc_reload(&mut studio, &custom, "\" no mappings here\n");
     let unchanged = studio.source();
     studio.set_caret(0);
     studio.type_text("Q");
@@ -53,12 +43,7 @@ fn external_mappings_reload_and_survive_mode_changes_and_reopening() {
         unchanged,
         "Q returns to the shipped Stop mapping"
     );
-    std::fs::write(&custom, "nnoremap Q x\n").expect("repaired mappings");
-    studio.pump_until(
-        Duration::from_secs(5),
-        "repaired mappings loaded",
-        |studio| studio.status() == "Vim mappings reloaded",
-    );
+    write_vimrc_reload(&mut studio, &custom, "nnoremap Q x\n");
 
     open_editor_keybindings(&mut studio);
     studio.press(KeyCode::Right, KeyModifiers::NONE);
@@ -316,4 +301,14 @@ fn mapping_prefixes_preserve_insert_text_and_native_shortcuts() {
     studio.midi_note_on("e2e pads", 0, 37, 100);
     assert_eq!(studio.source(), "// j");
     assert_eq!(studio.focus(), Some(PanelKind::Reference));
+}
+
+/// A reload notice can repeat the last one. Clear it first, so the wait
+/// below sees the notice for this write, not the one before it.
+fn write_vimrc_reload(studio: &mut Hermetic, path: &std::path::Path, text: &str) {
+    studio.clear_status();
+    std::fs::write(path, text).expect("mapping file");
+    studio.pump_until(Duration::from_secs(5), "Vim mappings reloaded", |studio| {
+        studio.status() == "Vim mappings reloaded"
+    });
 }
