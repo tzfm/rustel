@@ -748,15 +748,21 @@ The theme picker and the export sheet use the same modes. `j` and `k` move
 the list or the form, `i` or `a` type, and Esc returns to Command. On the
 export sheet, `h` and `l` change a choice or a number, and Space toggles a
 choice. In Command mode, `p` pastes the clipboard into the search or form
-and enters Insert. Insert mappings from your vimrc apply in these fields
-too. For example, `inoremap jk <Esc>` leaves Insert in the search.
+and enters Insert. Insert mappings from your vimrc and the shipped defaults
+apply in these fields too. The shipped `jk` mapping leaves Insert in the
+search.
 
 ### Custom Vim mappings
 
 The first time you enable Vim, Studio creates `~/.rustel/vimrc` if it does not
 exist. `RUSTEL_CONFIG_DIR` changes that folder. Built-in bindings remain active
 until a map line overrides them. Studio also ships default mappings beneath
-your file. Your file overrides them line for line.
+your file. Your file overrides them line for line. The shipped mappings
+include `U` update, `Q` stop, `J` and `K` for `$` labels, `M` for `_`, `jk`
+to leave Insert, `gcl` and `gc` to comment, and `gf` for the Reference. The
+shipped `<Space>` chords are `V` visualizers, `O` set panel, `H` and `L`
+previous and next scene, `P` local prebake, `I` panels, and `1` and `2`
+visual set one and two.
 
 Edit the file in your own editor. The Vim mappings path row appears below
 Editor keybindings when Vim is enabled. Press Enter to set a full file path,
