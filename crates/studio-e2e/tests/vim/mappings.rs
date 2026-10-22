@@ -45,10 +45,14 @@ fn external_mappings_reload_and_survive_mode_changes_and_reopening() {
         "an empty mapping file loads",
         |studio| studio.status() == "Vim mappings reloaded",
     );
+    let unchanged = studio.source();
     studio.set_caret(0);
     studio.type_text("Q");
-    assert_eq!(studio.source(), "/ first\n// second", "Q is a motion again");
-    studio.type_text("u");
+    assert_eq!(
+        studio.source(),
+        unchanged,
+        "Q returns to the shipped Stop mapping"
+    );
     std::fs::write(&custom, "nnoremap Q x\n").expect("repaired mappings");
     studio.pump_until(
         Duration::from_secs(5),

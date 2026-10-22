@@ -13,6 +13,7 @@
 - In Vim mode, selecting with the mouse or with Shift+arrows enters Visual, and the selection commands act on it. Backspace or Delete deletes it, and `r` then a character replaces every selected character. Mouse dragging itself is unchanged.
 - Vim mode uses a steady block in Normal and Visual and a steady bar in Insert. A blinking caret shape setting no longer restarts its phase on every key.
 - Vim insert mappings from the vimrc apply in panel search boxes. For example, `inoremap jk <Esc>` leaves Insert in the reference search.
+- Studio ships default Vim mappings beneath your vimrc. They cover Studio actions, `$` label jumps, and `jk` to leave Insert. Your file overrides them line for line.
 - In Vim Normal mode, Esc closes a panel left open behind the editor. Before, Vim consumed the key and the panel could not be closed.
 - Vim `gg` no longer waits for the mapping timeout when a mapping starts with `g`.
 - Keys sent by remote control use normal editing, not Vim modes.

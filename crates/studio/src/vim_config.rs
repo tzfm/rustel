@@ -662,6 +662,48 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_default_vimrc_binds_studio_actions() {
+        let mappings = VimMappings::parse_with_defaults("").expect("defaults");
+        let normal = mappings.for_mode(VimMappingMode::Normal);
+        let visual = mappings.for_mode(VimMappingMode::Visual);
+        let insert = mappings.for_mode(VimMappingMode::Insert);
+        assert_eq!(normal.len(), 17, "the 16 shipped normal maps and gd");
+        assert_eq!(visual.len(), 3);
+        assert_eq!(insert.len(), 1);
+        let replacement = |list: &[VimMapping], text: &str| {
+            let wanted = parse_keys(text).expect("keys");
+            list.iter()
+                .find(|mapping| mapping.keys == wanted)
+                .unwrap_or_else(|| panic!("missing mapping {text}"))
+                .replacement
+                .clone()
+        };
+        assert_eq!(
+            replacement(normal, "U"),
+            vec![VimMappedKey::Action(BindAction::Evaluate)]
+        );
+        assert_eq!(
+            replacement(normal, "Q"),
+            vec![VimMappedKey::Action(BindAction::Stop)]
+        );
+        assert_eq!(
+            replacement(visual, "gc"),
+            vec![VimMappedKey::Action(BindAction::ToggleComment)]
+        );
+        assert_eq!(
+            replacement(insert, "jk"),
+            vec![VimMappedKey::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE
+            ))]
+        );
+        assert_eq!(
+            replacement(normal, "<Space>V"),
+            vec![VimMappedKey::Action(BindAction::Visualizers)]
+        );
+    }
+
+    #[test]
     fn vimscript_maps_keep_modes_and_key_sequences_distinct() {
         let mappings = VimMappings::parse(
             "\" Studio reads this file like a small .vimrc.\n\
@@ -835,9 +877,9 @@ mod tests {
         assert!(config.poll(now + POLL_INTERVAL * 2));
         assert_ne!(config.mappings(), loaded);
         assert_eq!(
-            config.mappings().for_mode(VimMappingMode::Normal).len(),
-            2,
-            "the gd default plus the file"
+            *config.mappings(),
+            VimMappings::parse_with_defaults("nnoremap Q dd\n").expect("mappings"),
+            "the user's Q replaces the shipped Q"
         );
         config.configure(false, path.to_str(), now + POLL_INTERVAL * 3);
         assert!(config.configure(true, path.to_str(), now + POLL_INTERVAL * 4));
