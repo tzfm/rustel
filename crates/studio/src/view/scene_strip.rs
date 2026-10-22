@@ -236,12 +236,24 @@ impl Widget for SceneStrip<'_> {
                     .add_modifier(Modifier::BOLD),
                 (false, true, _) => Style::default().fg(theme.mini),
                 (false, false, true) => Style::default().fg(theme.replay_colour()),
+                // The tab the other pane holds is somewhere you are
+                // already, so it wins over playing: the `▶` still says
+                // that. The accent colour stands out from the muted tabs
+                // a click can still choose.
+                (false, false, false) if chip.other_pane => Style::default().fg(theme.accent),
                 (false, false, false) if chip.playing => Style::default().fg(theme.ok),
                 // Quieter than the text under it. A tab nobody is on is
                 // somewhere to go, not something to read. The strip sits
                 // one row above a pane's own title, which names the scene
                 // you are on, so the muted colour keeps the two rows apart.
                 (false, false, false) => Style::default().fg(theme.muted),
+            };
+            // Whatever the tab is, a line under it says the other pane has
+            // it. Setup and tape tabs keep their own colours.
+            let style = if chip.other_pane && !chip.current {
+                style.add_modifier(Modifier::UNDERLINED)
+            } else {
+                style
             };
             // A rename draft may be wider than the chip the hits were
             // measured for; it simply runs on to the right.
@@ -389,6 +401,7 @@ mod tests {
         SceneChip {
             name: name.to_owned(),
             current,
+            other_pane: false,
             playing: false,
             dirty: false,
             rewind: false,
@@ -462,6 +475,7 @@ mod tests {
                 prebake: None,
                 name: "intro".into(),
                 current: false,
+                other_pane: false,
                 playing: true,
                 dirty: false,
                 rewind: false,
@@ -474,6 +488,7 @@ mod tests {
                 prebake: None,
                 name: "drop".into(),
                 current: true,
+                other_pane: false,
                 playing: false,
                 dirty: true,
                 rewind: false,
@@ -524,6 +539,65 @@ mod tests {
         assert!(text.contains("2 dr▏"), "{text}");
         assert!(text.contains("Enter renames"), "{text}");
     }
+
+    /// The tab the other pane holds is underlined, and a score tab wears the
+    /// accent colour, playing or not. Tabs that are nowhere open stay muted.
+    #[test]
+    fn the_other_panes_chip_reads_as_open_beside_tabs_that_are_not() {
+        let theme = theme();
+        let mut held = strip_chip("held", false);
+        held.other_pane = true;
+        let chips = vec![strip_chip("now", true), held, strip_chip("away", false)];
+        let area = Rect::new(0, 1, 120, 1);
+        let mut buffer = Buffer::empty(area);
+        SceneStrip {
+            keybinds: &crate::keybinds::Keybinds::default(),
+            chips: &chips,
+            mode: &SceneStripMode::Idle,
+            split: true,
+            capabilities: KeyboardCapabilities::enhanced(),
+            theme: &theme,
+        }
+        .render(area, &mut buffer);
+        let hits = scene_strip_hits(area, &chips);
+        let cell = |chip: usize| buffer.cell((hits[chip].x, 1)).unwrap();
+        assert_eq!(cell(0).bg, theme.accent);
+        assert_eq!(cell(1).fg, theme.accent);
+        assert!(cell(1).modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(cell(2).fg, theme.muted);
+        assert!(!cell(2).modifier.contains(Modifier::UNDERLINED));
+    }
+
+    /// A held tab that is also the one playing, and a held setup tab, are
+    /// underlined too. The first keeps the accent colour, the second its own.
+    #[test]
+    fn a_playing_or_setup_chip_the_other_pane_holds_is_still_marked() {
+        let theme = theme();
+        let mut playing = strip_chip("playing", false);
+        playing.other_pane = true;
+        playing.playing = true;
+        let mut setup = strip_chip("prebake", false);
+        setup.other_pane = true;
+        setup.prebake = Some(PrebakeScope::Local);
+        let chips = vec![strip_chip("now", true), playing, setup];
+        let area = Rect::new(0, 1, 120, 1);
+        let mut buffer = Buffer::empty(area);
+        SceneStrip {
+            keybinds: &crate::keybinds::Keybinds::default(),
+            chips: &chips,
+            mode: &SceneStripMode::Idle,
+            split: true,
+            capabilities: KeyboardCapabilities::enhanced(),
+            theme: &theme,
+        }
+        .render(area, &mut buffer);
+        let hits = scene_strip_hits(area, &chips);
+        let cell = |chip: usize| buffer.cell((hits[chip].x, 1)).unwrap();
+        assert_eq!(cell(1).fg, theme.accent, "held beats playing in colour");
+        assert!(cell(1).modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(cell(2).fg, theme.mini, "setup keeps its own colour");
+        assert!(cell(2).modifier.contains(Modifier::UNDERLINED));
+    }
     #[cfg(test)]
     mod scene_separator_tests {
         use super::*;
@@ -536,6 +610,7 @@ mod tests {
                 .map(|(index, name)| SceneChip {
                     name: name.into(),
                     current: index == 1,
+                    other_pane: false,
                     playing: index == 0,
                     dirty: true,
                     errors: true,
@@ -587,6 +662,7 @@ mod tests {
                 prebake: None,
                 name: "intro".into(),
                 current: false,
+                other_pane: false,
                 playing: true,
                 dirty: false,
                 rewind: false,
@@ -599,6 +675,7 @@ mod tests {
                 prebake: Some(PrebakeScope::Global),
                 name: PrebakeScope::Global.tab_name(),
                 current: false,
+                other_pane: false,
                 playing: false,
                 dirty: true,
                 rewind: false,
@@ -611,6 +688,7 @@ mod tests {
                 prebake: Some(PrebakeScope::Local),
                 name: PrebakeScope::Local.tab_name(),
                 current: true,
+                other_pane: false,
                 playing: false,
                 dirty: false,
                 rewind: false,
@@ -662,6 +740,7 @@ mod tests {
             prebake: Some(PrebakeScope::Local),
             name: "prebake".into(),
             current: true,
+            other_pane: false,
             playing: false,
             dirty: false,
             rewind: false,

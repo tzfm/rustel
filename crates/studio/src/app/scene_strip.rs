@@ -464,6 +464,13 @@ impl App {
                 replay: scene.is_replay(),
                 name: scene.name(),
                 current: index == self.scenes.current_index(),
+                // A click on this chip does not choose the scene; it says
+                // which pane holds it. The chip says that first, in colour.
+                other_pane: self
+                    .panes
+                    .iter()
+                    .enumerate()
+                    .any(|(pane, shown)| pane != self.focused && shown.scene == scene.id),
                 playing: playing_scene == Some(scene.id),
                 dirty: scene.dirty,
                 rewind: scene.rewind,
@@ -705,6 +712,41 @@ mod tests {
 
             // What a click does do: it chooses the scene it landed on.
             assert_eq!(app.scenes.current().id, second);
+        }
+
+        /// Only the chip of the scene the other pane holds is marked, so
+        /// the strip can say which clicks only report where a scene is.
+        #[test]
+        fn chips_mark_which_scene_the_other_pane_holds() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.new_scene(false);
+            app.toggle_split();
+            app.focus_pane(0);
+            let other = app.panes[1].scene;
+            let held = app
+                .scenes
+                .get(other)
+                .expect("the other pane's scene")
+                .name();
+
+            let chips = app.scene_chips();
+            assert_eq!(
+                chips
+                    .iter()
+                    .filter(|chip| chip.other_pane)
+                    .map(|chip| chip.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec![held.as_str()],
+                "the other pane's scene alone is marked"
+            );
+            assert!(
+                !chips
+                    .iter()
+                    .find(|chip| chip.current)
+                    .expect("a current chip")
+                    .other_pane
+            );
         }
     }
 }
