@@ -248,13 +248,6 @@ impl Widget for SceneStrip<'_> {
                 // you are on, so the muted colour keeps the two rows apart.
                 (false, false, false) => Style::default().fg(theme.muted),
             };
-            // Whatever the tab is, a line under it says the other pane has
-            // it. Setup and tape tabs keep their own colours.
-            let style = if chip.other_pane && !chip.current {
-                style.add_modifier(Modifier::UNDERLINED)
-            } else {
-                style
-            };
             // A rename draft may be wider than the chip the hits were
             // measured for; it simply runs on to the right.
             let width = UnicodeWidthStr::width(text.as_str()) as u16;
@@ -540,8 +533,8 @@ mod tests {
         assert!(text.contains("Enter renames"), "{text}");
     }
 
-    /// The tab the other pane holds is underlined, and a score tab wears the
-    /// accent colour, playing or not. Tabs that are nowhere open stay muted.
+    /// A score tab the other pane holds wears the accent colour. Tabs that
+    /// are nowhere open stay muted.
     #[test]
     fn the_other_panes_chip_reads_as_open_beside_tabs_that_are_not() {
         let theme = theme();
@@ -563,23 +556,18 @@ mod tests {
         let cell = |chip: usize| buffer.cell((hits[chip].x, 1)).unwrap();
         assert_eq!(cell(0).bg, theme.accent);
         assert_eq!(cell(1).fg, theme.accent);
-        assert!(cell(1).modifier.contains(Modifier::UNDERLINED));
         assert_eq!(cell(2).fg, theme.muted);
-        assert!(!cell(2).modifier.contains(Modifier::UNDERLINED));
     }
 
-    /// A held tab that is also the one playing, and a held setup tab, are
-    /// underlined too. The first keeps the accent colour, the second its own.
+    /// A held tab that is also the one playing keeps the accent colour: the
+    /// `▶` says it plays, so the green is not needed.
     #[test]
-    fn a_playing_or_setup_chip_the_other_pane_holds_is_still_marked() {
+    fn a_playing_chip_the_other_pane_holds_keeps_the_accent_colour() {
         let theme = theme();
         let mut playing = strip_chip("playing", false);
         playing.other_pane = true;
         playing.playing = true;
-        let mut setup = strip_chip("prebake", false);
-        setup.other_pane = true;
-        setup.prebake = Some(PrebakeScope::Local);
-        let chips = vec![strip_chip("now", true), playing, setup];
+        let chips = vec![strip_chip("now", true), playing];
         let area = Rect::new(0, 1, 120, 1);
         let mut buffer = Buffer::empty(area);
         SceneStrip {
@@ -594,9 +582,6 @@ mod tests {
         let hits = scene_strip_hits(area, &chips);
         let cell = |chip: usize| buffer.cell((hits[chip].x, 1)).unwrap();
         assert_eq!(cell(1).fg, theme.accent, "held beats playing in colour");
-        assert!(cell(1).modifier.contains(Modifier::UNDERLINED));
-        assert_eq!(cell(2).fg, theme.mini, "setup keeps its own colour");
-        assert!(cell(2).modifier.contains(Modifier::UNDERLINED));
     }
     #[cfg(test)]
     mod scene_separator_tests {
