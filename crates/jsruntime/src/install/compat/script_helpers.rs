@@ -13,7 +13,7 @@ pub(crate) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
         name: "getTime",
         synonyms: &[],
         summary: "the cycle that plays now",
-        description: "Returns the cycle position of the newest scheduling window as a number. It is 0 before the first window. A bounce to a file has one window, at its first cycle. A setup script reads it to start a pattern on the next bar.",
+        description: "Returns the cycle position of the newest scheduling window as a number. It is 0 before the first window. A bounce to a file has one window, at its first cycle. A setup script reads it to start a pattern on the next bar.\n\nWhile an update runs, it is 0 when the new score starts from its own first cycle: at Play, at a restart and at a rewind. When an update fails while it plays, the engine goes back to the score before it, and that score reads the value it read the first time.",
         params: &[],
         examples: &["s(\"hh*8\").late(Math.ceil(getTime()))"],
         tags: &["internals"],

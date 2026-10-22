@@ -338,6 +338,7 @@ impl Session {
             cycle_zero_time: self
                 .scheduler
                 .time_at_cycle(rustel_fraction::Fraction::ZERO),
+            evaluated_cycle: self.installed_cycle,
         });
         let book = self
             .audio_confirmations

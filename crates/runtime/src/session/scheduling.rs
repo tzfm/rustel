@@ -656,10 +656,18 @@ impl Session {
         #[cfg(any(test, feature = "test-support"))]
         self.panic_if_injected(SessionPanicPoint::Query);
         let clock = VirtualClock::new(now);
+        let cycle = self.scheduler.cycle_at_time(now);
+        // Read the count before the flag. A stop sets the flag first, so a
+        // window that finds the transport running holds a count from before
+        // any later stop.
+        let stops = self.transport.stops();
+        if !self.transport.is_stopped() {
+            self.newest_window = Some((cycle, stops));
+        }
         let cancellation = self.transport.stopped_flag();
         let js = &self.js;
         let scheduler = &mut self.scheduler;
-        js.set_cycle_time(scheduler.cycle_at_time(now));
+        js.set_cycle_time(cycle);
         js.set_cps(scheduler.cps());
         let status = js
             .with_runtime_settings(|| {

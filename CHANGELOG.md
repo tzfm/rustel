@@ -17,6 +17,7 @@
 - Pattern queries allocate less, and rustelup checks the Linux build packages first..
 - View ▸ Knobs or ^⇧K opens a column of sliders for the numbers of the call under the caret. A move writes the score. Counts stay whole, speeds move in quarters, and vst calls and documented options such as `_pianoroll` or `lfo` get their own rails.
 - A drag or a notch on any slider can land back on a whole number.
+- `getTime()` reads 0 when a score starts from its first cycle: Play after a stop, a restart or a rewind. Before, it kept the old cycle, so a pattern placed with it played late. A failed update that falls back to the last score gives that score its first value again.
 - New `oneshot(grid)` from Switch Angel plays a pattern once, on the next grid line after the update.
 
 ## v0.1.5
