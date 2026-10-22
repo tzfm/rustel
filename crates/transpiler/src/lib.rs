@@ -14,12 +14,12 @@ later version.
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, ArrayExpression, ArrayExpressionElement, AssignmentExpression, AwaitExpression,
-    BindingPattern, CallExpression, ExportAllDeclaration, ExportDeclaration,
-    ExportDefaultDeclaration, ExportFromDeclaration, ExportNamedDeclaration, Expression,
-    ForOfStatement, IfStatement, ImportDeclaration, ImportExpression, ImportMeta,
-    JSXAttributeValue, JSXText, NewExpression, ObjectExpression, ObjectPropertyKind, Program,
-    PropertyKey, RegExpLiteral, Statement, TemplateLiteral, VariableDeclarationKind,
+    Argument, ArrayExpression, ArrayExpressionElement, ArrowFunctionExpression,
+    AssignmentExpression, AwaitExpression, BindingPattern, CallExpression, ExportAllDeclaration,
+    ExportDeclaration, ExportDefaultDeclaration, ExportFromDeclaration, ExportNamedDeclaration,
+    Expression, ForOfStatement, Function, IfStatement, ImportDeclaration, ImportExpression,
+    ImportMeta, JSXAttributeValue, JSXText, NewExpression, ObjectExpression, ObjectPropertyKind,
+    Program, PropertyKey, RegExpLiteral, Statement, TemplateLiteral, VariableDeclarationKind,
     VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, VisitMut, walk, walk_mut};
@@ -27,7 +27,7 @@ use oxc_codegen::{Codegen, CodegenOptions};
 use oxc_parser::Parser;
 use oxc_semantic::{Scoping, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType};
-use oxc_syntax::{symbol::SymbolId, xml_entities::XML_ENTITIES};
+use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId, xml_entities::XML_ENTITIES};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -1444,6 +1444,110 @@ pub fn unresolved_reads(source: &str) -> Vec<(String, std::ops::Range<usize>)> {
     .unwrap_or_default()
 }
 
+/// Calls of the given names that run while the file itself runs, with the
+/// callee's byte range.
+///
+/// A call inside a function body the file only defines does not run here:
+/// it runs when something calls that function, which is exactly how a
+/// prebake hands later scores a helper that wraps a call the prebake itself
+/// may not make. The calls that do run - at the top level, in a block or
+/// expression the file evaluates, or inside a function invoked where it is
+/// written, as `(() => …)()` - are reported in source order. A call of a
+/// name the file binds itself is a call of the file's own function, not the
+/// host's global of that name.
+///
+/// This reads the syntax alone. Whether some binding a deferred call hides
+/// behind later reaches a helper at setup time is left to the host that
+/// runs the file.
+pub fn running_calls(source: &str, names: &[&str]) -> Vec<(String, std::ops::Range<usize>)> {
+    if check_nesting(source).is_err() {
+        return Vec::new();
+    }
+    on_parse_stack(|| {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
+        if parsed.panicked || !parsed.diagnostics.is_empty() {
+            return Vec::new();
+        }
+        let built = SemanticBuilder::new().build(&parsed.program);
+        let mut calls = RunningCalls {
+            scoping: built.semantic.scoping(),
+            watched: names.iter().copied().collect(),
+            deferred: 0,
+            immediate: HashSet::new(),
+            found: Vec::new(),
+        };
+        calls.visit_program(&parsed.program);
+        calls.found.sort_by_key(|(_, span)| span.start);
+        calls.found
+    })
+    .unwrap_or_default()
+}
+
+/// Collects watched calls and the number of function bodies the file only
+/// defines between them and the code the file runs.
+struct RunningCalls<'s, 'n> {
+    scoping: &'s Scoping,
+    watched: HashSet<&'n str>,
+    deferred: usize,
+    /// First bytes of function bodies invoked where they are written, so
+    /// `(() => …)()` runs its body with the code around it.
+    immediate: HashSet<u32>,
+    found: Vec<(String, std::ops::Range<usize>)>,
+}
+
+impl<'a, 's, 'n> Visit<'a> for RunningCalls<'s, 'n> {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if let Expression::Identifier(identifier) = &call.callee
+            && self.watched.contains(identifier.name.as_str())
+            && self.deferred == 0
+            // A callee the file itself bound is the file's own function,
+            // not the host's global of that name.
+            && identifier
+                .reference_id
+                .get()
+                .is_none_or(|reference| self.scoping.get_reference(reference).symbol_id().is_none())
+        {
+            self.found.push((
+                identifier.name.as_str().to_owned(),
+                identifier.span.start as usize..identifier.span.end as usize,
+            ));
+        }
+        // A function called the moment it is written runs its body with the
+        // code around it, so mark the body before the walk reaches it.
+        match call.callee.get_inner_expression() {
+            Expression::FunctionExpression(function) => {
+                self.immediate.insert(function.span.start);
+            }
+            Expression::ArrowFunctionExpression(function) => {
+                self.immediate.insert(function.span.start);
+            }
+            _ => {}
+        }
+        walk::walk_call_expression(self, call);
+    }
+
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if self.immediate.contains(&function.span.start) {
+            walk::walk_function(self, function, flags);
+            return;
+        }
+        self.deferred += 1;
+        walk::walk_function(self, function, flags);
+        self.deferred -= 1;
+    }
+
+    fn visit_arrow_function_expression(&mut self, function: &ArrowFunctionExpression<'a>) {
+        if self.immediate.contains(&function.span.start) {
+            walk::walk_arrow_function_expression(self, function);
+            return;
+        }
+        self.deferred += 1;
+        walk::walk_arrow_function_expression(self, function);
+        self.deferred -= 1;
+    }
+}
+
 /// A top-level declaration in a setup file.
 ///
 /// Setup runs in its own function scope, so this name is gone the moment the
@@ -1645,6 +1749,91 @@ impl<'a> Visit<'a> for SetupCollector {
         }
         // Always walk on: a setup may define its globals inside a
         // `queueMicrotask` or an `await`ed helper, and those count.
+        walk::walk_call_expression(self, call);
+    }
+}
+
+/// Names a file writes onto the surface every score shares, with the
+/// name's byte range.
+///
+/// These are `window.NAME = …` and `globalThis.NAME = …`, the keys of an
+/// `Object.assign(globalThis, { NAME: … })`, the names in an
+/// `Object.defineProperty(globalThis, 'NAME', …)`, and the same on
+/// `Pattern.prototype`. A write whose name cannot be read - computed,
+/// spread or imported - is not reported. A host that knows the names its
+/// engine answers to can tell which writes land on one of them.
+pub fn global_writes(source: &str) -> Vec<(String, std::ops::Range<usize>)> {
+    if check_nesting(source).is_err() {
+        return Vec::new();
+    }
+    on_parse_stack(|| {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
+        if parsed.panicked {
+            return Vec::new();
+        }
+        let mut collector = GlobalWrites { writes: Vec::new() };
+        collector.visit_program(&parsed.program);
+        collector.writes
+    })
+    .unwrap_or_default()
+}
+
+/// Collects the names written onto the shared surface, and where.
+#[derive(Default)]
+struct GlobalWrites {
+    writes: Vec<(String, std::ops::Range<usize>)>,
+}
+
+impl GlobalWrites {
+    fn push(&mut self, name: &str, span: oxc_span::Span) {
+        self.writes
+            .push((name.to_owned(), span.start as usize..span.end as usize));
+    }
+}
+
+impl<'a> Visit<'a> for GlobalWrites {
+    fn visit_assignment_expression(&mut self, assignment: &AssignmentExpression<'a>) {
+        if let Some(member) = assignment.left.as_member_expression() {
+            let object = member.object();
+            if (is_shared_global(object)
+                || object.is_specific_member_access("Pattern", "prototype"))
+                && let Some((span, name)) = member.static_property_info()
+            {
+                self.push(name, span);
+            }
+        }
+        walk::walk_assignment_expression(self, assignment);
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if call.callee.is_specific_member_access("Object", "assign")
+            && call
+                .arguments
+                .first()
+                .and_then(Argument::as_expression)
+                .is_some_and(is_shared_global)
+            && let Some(Argument::ObjectExpression(object)) = call.arguments.get(1)
+        {
+            for property in &object.properties {
+                if let ObjectPropertyKind::ObjectProperty(property) = property
+                    && !property.computed
+                    && let Some(name) = property.key.static_name()
+                {
+                    self.push(&name, property.key.span());
+                }
+            }
+        } else if call
+            .callee
+            .is_specific_member_access("Object", "defineProperty")
+            && let Some(target) = call.arguments.first().and_then(Argument::as_expression)
+            && (is_shared_global(target)
+                || target.is_specific_member_access("Pattern", "prototype"))
+            && let Some(Expression::StringLiteral(literal)) =
+                call.arguments.get(1).and_then(Argument::as_expression)
+        {
+            self.push(literal.value.as_str(), literal.span);
+        }
         walk::walk_call_expression(self, call);
     }
 }
@@ -4349,6 +4538,98 @@ mod tests {
         let deep = "(".repeat(MAX_STRUCTURAL_BYTES + 1);
         assert_eq!(setup_definitions(&deep), SetupDefinitions::default());
         assert_eq!(setup_definitions(""), SetupDefinitions::default());
+    }
+
+    #[test]
+    fn running_calls_report_the_ones_the_file_makes() {
+        let source = "setcpm(120);\n\
+                      const later = b => setcpm(b / 4);\n\
+                      window.bpm = b => setcpm(b / 4);\n\
+                      function named(b) { return setcpm(b / 4); }\n\
+                      const held = { run: () => setcpm(1) };\n\
+                      clock.setCps(1);\n\
+                      (function () { setcps(2); })();\n\
+                      (() => midin('IAC'))();\n\
+                      if (true) { setCpm(60); }\n";
+        let names = ["setcpm", "setCps", "setcps", "setCpm", "midin"];
+        let calls = running_calls(source, &names);
+        let found = calls
+            .iter()
+            .map(|(name, span)| (name.as_str(), &source[span.start..span.end]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            found,
+            [
+                ("setcpm", "setcpm"),
+                ("setcps", "setcps"),
+                ("midin", "midin"),
+                ("setCpm", "setCpm"),
+            ],
+            "a helper only defined, a method of something else, and a name \
+             in a string are not calls the file makes"
+        );
+    }
+
+    #[test]
+    fn a_file_that_binds_a_watched_name_calls_its_own() {
+        let own = "function setcps(x) { return x }\n\
+                   setcps(1)\n\
+                   const midin = f => f\n\
+                   midin('IAC')\n";
+        assert!(running_calls(own, &["setcps", "midin"]).is_empty());
+
+        let global = "setcps(1)\n";
+        let calls = running_calls(global, &["setcps"]);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(&global[calls[0].1.clone()], "setcps");
+    }
+
+    #[test]
+    fn running_calls_survive_text_that_does_not_parse() {
+        assert!(running_calls("setcps(1", &["setcps"]).is_empty());
+        assert!(running_calls("", &["setcps"]).is_empty());
+    }
+
+    #[test]
+    fn global_writes_name_what_they_replace_and_where() {
+        let source = "window.note = 1\n\
+                      globalThis['stack'] = 2\n\
+                      Pattern.prototype.slow = (p) => p\n\
+                      Object.assign(globalThis, { hush: 1 })\n\
+                      Object.defineProperty(window, 's', { value: 1 })\n";
+        let writes = global_writes(source);
+        let found = writes
+            .iter()
+            .map(|(name, span)| (name.as_str(), &source[span.start..span.end]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            found,
+            [
+                ("note", "note"),
+                ("stack", "'stack'"),
+                ("slow", "slow"),
+                ("hush", "hush"),
+                ("s", "'s'"),
+            ],
+            "every shared surface, and the span of the name on it"
+        );
+    }
+
+    #[test]
+    fn global_writes_skip_the_ones_they_cannot_name() {
+        for source in [
+            "window[key] = 1",
+            "Object.assign(globalThis, helpers)",
+            "Object.assign(window, { [key]: 1 })",
+            "Object.defineProperty(window, key, {})",
+            "local.note = 1",
+            "Object.assign(plugin, { note: 1 })",
+            "read('window.note = 1')",
+        ] {
+            assert!(global_writes(source).is_empty(), "{source}");
+        }
+        assert!(global_writes("globalThis.a = (").is_empty());
+        assert!(global_writes("").is_empty());
     }
 
     /// Device names remain literal strings in either quote style. Treating a

@@ -174,7 +174,13 @@ Update checks and saves the prebake, then applies it to the playing score. It
 does not start playback when Studio is stopped. Use `globalThis` or `register`
 to share helpers with scores. A top-level `const` is local to its setup run.
 Sample loading is allowed in a prebake. Transport changes, live MIDI input,
-and `initHydra` must stay in scores.
+and `initHydra` must stay in scores. A prebake may still define a helper that
+wraps them, such as `window.bpm = b => setcpm(b/4)`: the call runs in the
+score that calls the helper.
+
+A write that replaces a name the engine owns, such as `window.note = …`, runs
+and is kept. The footer names the write once, so you know what every score
+after it means by that name.
 
 ### Script imports
 

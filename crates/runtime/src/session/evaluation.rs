@@ -2865,6 +2865,33 @@ mod tests {
     }
 
     #[test]
+    fn a_prebake_helper_may_wrap_a_tempo_setter_for_scores_to_call() {
+        // The community prebake shape: a `bpm` helper that wraps the tempo
+        // setter is setup defining a function, not calling one. The call
+        // runs when a score calls the helper, where a tempo change is
+        // allowed.
+        let mut session = Session::new().expect("session");
+        session
+            .evaluate_prebake("window.bpm = b => setcpm(b / 4)")
+            .expect("a helper that only wraps a tempo setter is setup");
+        session
+            .evaluate("bpm(128); note('c4')")
+            .expect("the score calls the helper, where tempo may change");
+        assert_eq!(session.config().cps, 128.0 / 4.0 / 60.0);
+        assert_eq!(session.scheduler.cps(), 128.0 / 4.0 / 60.0);
+
+        // A wrapper the setup itself calls runs in setup, and the engine
+        // still refuses it there, in its own words.
+        let refused = session
+            .evaluate_prebake("window.cpms = c => setcpm(c)\ncpms(60)")
+            .expect_err("a wrapper called in setup runs in setup");
+        assert!(
+            refused.to_string().contains("setCps/setcps"),
+            "the refusal names the tempo rule: {refused}"
+        );
+    }
+
+    #[test]
     fn accepted_host_effects_apply_once_after_graph_and_tempo_commit() {
         let mut session = session_with_sample_origin("http://127.0.0.1:9");
         session.samples = Some(Arc::new(crate::samples::SampleLibrary::empty()));
