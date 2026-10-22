@@ -1752,6 +1752,60 @@ mod tests {
             assert_eq!(app.focus, Focus::Panel(PanelKind::Log));
         }
 
+        /// A mouse drag still selects in Vim Normal. The mode does not
+        /// change under the hand, and the next operator uses the band.
+        #[test]
+        fn a_mouse_selection_enters_visual_and_d_uses_it() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            type_text(&mut app, "hello world");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.focus = Focus::Editor;
+            app.editor_mut().set_wrap(false);
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+                .expect("test terminal");
+            let mut draw = |app: &mut App| {
+                terminal
+                    .draw(|frame| app.paint_into(frame, Instant::now()).expect("frame paints"))
+                    .expect("draw");
+            };
+            draw(&mut app);
+            let score = app.focused_map().expect("the score is drawn").area();
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                score.x + 2,
+                score.y,
+            );
+            mouse(
+                &mut app,
+                MouseEventKind::Drag(MouseButton::Left),
+                score.x + 6,
+                score.y,
+            );
+            mouse(
+                &mut app,
+                MouseEventKind::Up(MouseButton::Left),
+                score.x + 6,
+                score.y,
+            );
+            assert!(
+                !app.editor().primary_selection().is_empty(),
+                "the mouse still selects"
+            );
+            assert!(
+                app.editor().vim_is_visual(),
+                "the released selection enters Visual"
+            );
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+            assert_ne!(
+                app.editor().source().trim_end(),
+                "hello world",
+                "d used the mouse selection"
+            );
+        }
+
         /// A drag in a prompt's field is the field's alone, down to the release: a
         /// score drag whose release never arrived stays where it was.
         #[test]

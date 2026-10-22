@@ -166,7 +166,14 @@ fn reverb_installation_adopts_dispatch_without_callback_allocation() {
     );
 }
 
-/// A gain as an orbit insert. Parameter 1 is the gain.
+/// The calls of a [`GainInsert`] on a plugin worker.
+static WORKER_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// The calls of the [`GainInsert`] of plugin 7, on any thread.
+static PLUGIN_7_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// A gain as an orbit insert that runs on any thread. Parameter 1 is the
+/// gain.
 struct GainInsert {
     key: rustel_audio::InsertKey,
     gain: f32,
@@ -184,10 +191,36 @@ impl rustel_audio::OrbitInsert for GainInsert {
     }
 
     fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        if self.key.plugin == 7 {
+            PLUGIN_7_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        if std::thread::current()
+            .name()
+            .is_some_and(|name| name.starts_with("rustel-plugin"))
+        {
+            WORKER_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
         for sample in left.iter_mut().chain(right) {
             *sample *= self.gain;
         }
     }
+
+    fn any_thread(&self) -> bool {
+        true
+    }
+}
+
+/// 2 plugin workers for the chains of `backend`, whose jobs run under the
+/// tripwire too. The workers stop when the value drops.
+#[cfg(feature = "test-support")]
+fn plugin_workers(backend: &mut ScalarBackend) -> Option<impl Sized + use<>> {
+    backend.start_test_pool(2)
+}
+
+/// Without test support, the chains stay on the callback.
+#[cfg(not(feature = "test-support"))]
+fn plugin_workers(_: &mut ScalarBackend) -> Option<()> {
+    None
 }
 
 #[test]
@@ -197,37 +230,216 @@ fn an_orbit_insert_installs_and_processes_without_callback_allocation() {
         plugin: 7,
         preset: 0,
     };
-    let mut backend = ScalarBackend::prepared(48_000, 1).expect("scalar init");
-    let mut insert = rustel_audio::InsertControls::new(key);
-    assert!(insert.push(rustel_audio::InsertParam { id: 1, value: 0.0 }));
-    let controls = OscillatorControls {
-        effects: [Some(insert), None, None, None],
-        ..OscillatorControls::default()
-    };
-    assert!(
-        backend.try_note_prepared(OnsetEvent::new(0, 440.0, 0.5, 0.05).with_controls(controls))
-    );
-    let first = Box::new(GainInsert { key, gain: 1.0 });
-    let second = Box::new(GainInsert { key, gain: 1.0 });
-    let mut output = [1.0f32; 128 * 2];
+    // The second run puts the chain on plugin workers.
+    for pooled in [false, true] {
+        // Room for the voices of 3 notes.
+        let mut backend = ScalarBackend::prepared(48_000, 3).expect("scalar init");
+        // A live backend builds no copy: it takes the copies it gets.
+        backend.forbid_inline_reverb();
+        let workers = pooled.then(|| plugin_workers(&mut backend)).flatten();
+        // With workers, a worker runs the block of the chain, not the callback.
+        #[cfg(feature = "test-support")]
+        backend.leave_plugin_blocks_to_workers();
+        let mut insert = rustel_audio::InsertControls::new(key);
+        assert!(insert.push(rustel_audio::InsertParam { id: 1, value: 0.0 }));
+        let controls = OscillatorControls {
+            effects: [Some(insert), None, None, None],
+            ..OscillatorControls::default()
+        };
+        assert!(
+            backend.try_note_prepared(OnsetEvent::new(0, 440.0, 0.5, 0.05).with_controls(controls))
+        );
+        let first = Box::new(GainInsert { key, gain: 1.0 });
+        let second = Box::new(GainInsert { key, gain: 1.0 });
+        let mut output = [1.0f32; 128 * 2];
+        let worker_calls = WORKER_CALLS.load(Ordering::Relaxed);
+
+        let before = Violations::capture();
+        let (empty, replaced) = tripwire::audio_scope(|| {
+            let slot = rustel_audio::InsertSlot::effect(1, 0);
+            let empty = backend.install_insert(slot, first);
+            let replaced = backend.install_insert(slot, second);
+            backend.process_block(&mut output, 128);
+            (empty, replaced)
+        });
+        let delta = Violations::capture().since(before);
+        assert!(
+            delta.clean(),
+            "the orbit insert allocated or freed in the callback: {delta:?}"
+        );
+        assert!(empty.is_none());
+        assert!(replaced.is_some());
+        // The note set the gain to zero, so the orbit is silent.
+        assert!(output.iter().all(|sample| *sample == 0.0));
+        assert_eq!(backend.missing_insert_events(), 0);
+        if workers.is_some() {
+            assert!(
+                WORKER_CALLS.load(Ordering::Relaxed) > worker_calls,
+                "no job ran on a worker"
+            );
+        }
+
+        // A newer note while the first note sounds: a new copy at stage 0,
+        // and a new stage 1. The copy before fades out beside the new copy,
+        // and the new stage fades in. The blocks of the fades allocate and
+        // free nothing. The copy of the new stage has a gain of zero, so
+        // only its fade passes sound.
+        let next = rustel_audio::InsertKey { plugin: 8, ..key };
+        let added = rustel_audio::InsertKey { plugin: 9, ..key };
+        let mut controls = OscillatorControls::default();
+        controls.effects[0] = Some(rustel_audio::InsertControls::new(next));
+        controls.effects[1] = Some(rustel_audio::InsertControls::new(added));
+        let event = OnsetEvent::new(128, 440.0, 0.5, 0.05)
+            .with_generation(1)
+            .with_controls(controls);
+        assert!(backend.try_note_prepared(event));
+        let next_copy = Box::new(GainInsert {
+            key: next,
+            gain: 1.0,
+        });
+        let added_copy = Box::new(GainInsert {
+            key: added,
+            gain: 0.0,
+        });
+        let worker_calls = WORKER_CALLS.load(Ordering::Relaxed);
+        // The calls of the copy before at the start and after each block,
+        // and whether each block sounds.
+        let mut calls = [PLUGIN_7_CALLS.load(Ordering::Relaxed); 4];
+        let mut sounded = [false; 3];
+        let before = Violations::capture();
+        let (prepared, installed) = tripwire::audio_scope(|| {
+            let prepared =
+                backend.prepare_insert(rustel_audio::InsertSlot::effect(1, 0), next_copy);
+            let installed =
+                backend.install_insert(rustel_audio::InsertSlot::effect(1, 1), added_copy);
+            for (sounds, count) in sounded.iter_mut().zip(&mut calls[1..]) {
+                backend.process_block(&mut output, 128);
+                *sounds = output.iter().any(|sample| *sample != 0.0);
+                *count = PLUGIN_7_CALLS.load(Ordering::Relaxed);
+            }
+            (prepared, installed)
+        });
+        let delta = Violations::capture().since(before);
+        assert!(
+            delta.clean(),
+            "a fade of the orbit insert allocated or freed in the callback: {delta:?}"
+        );
+        assert!(prepared.is_none() && installed.is_none());
+        // The copy before fades out for 240 frames from frame 128. It
+        // processes in the first 2 blocks and not in the third.
+        let [start, first, second, third] = calls;
+        assert!(
+            start < first && first < second && second == third,
+            "the copy before did not fade out: {calls:?}"
+        );
+        assert_eq!(
+            backend.orbit_insert_key(rustel_audio::InsertSlot::effect(1, 0)),
+            Some(next)
+        );
+        // The fades sound in the first 2 blocks. After the fades the orbit
+        // is silent.
+        assert_eq!(sounded, [true, true, false], "no stage faded");
+        assert_eq!(backend.missing_insert_events(), 0);
+        if workers.is_some() {
+            assert!(
+                WORKER_CALLS.load(Ordering::Relaxed) > worker_calls,
+                "no job ran on a worker"
+            );
+        }
+
+        // 66 moves of 65 values: the backend keeps the last moves of 64
+        // values, so a full table drops the oldest move. The gain of the
+        // new stage moves first, then 63 other values move, then the gain
+        // moves to zero for the notes of generation 1 and older, then a
+        // 65th value moves. An older note with the gain 1 takes the moved
+        // zero, so the block is silent.
+        let moved = |id, value| rustel_audio::InsertValue {
+            slot: rustel_audio::InsertSlot::effect(1, 1),
+            key: added,
+            param: rustel_audio::InsertParam { id, value },
+            generation: 1,
+        };
+        let mut gain = rustel_audio::InsertControls::new(added);
+        assert!(gain.push(rustel_audio::InsertParam { id: 1, value: 1.0 }));
+        let mut controls = OscillatorControls::default();
+        controls.effects[0] = Some(rustel_audio::InsertControls::new(next));
+        controls.effects[1] = Some(gain);
+        let older = OnsetEvent::new(512, 440.0, 0.5, 0.05).with_controls(controls);
+        assert!(backend.try_note_prepared(older));
+        let before = Violations::capture();
+        tripwire::audio_scope(|| {
+            backend.set_insert_value(moved(1, 0.5));
+            for id in 2..65 {
+                backend.set_insert_value(moved(id, 0.5));
+            }
+            backend.set_insert_value(moved(1, 0.0));
+            backend.set_insert_value(moved(65, 0.5));
+            backend.process_block(&mut output, 128);
+        });
+        let delta = Violations::capture().since(before);
+        assert!(
+            delta.clean(),
+            "a moved value allocated or freed in the callback: {delta:?}"
+        );
+        assert!(output.iter().all(|sample| *sample == 0.0));
+        assert_eq!(backend.missing_insert_events(), 0);
+    }
+}
+
+/// Plugin chains on 2 workers allocate and free nothing, on the callback
+/// and on the workers: 2 instruments through effects, a native chain and an
+/// instrument with no effect, for 200 blocks.
+#[cfg(feature = "test-support")]
+#[test]
+fn pooled_inserts_process_without_allocation_on_any_thread() {
+    let _serial = serial_tripwire_test();
+    let mut backend = ScalarBackend::prepared(48_000, 8).expect("scalar init");
+    let _workers = plugin_workers(&mut backend).expect("plugin workers");
+    let key = |plugin| rustel_audio::InsertKey { plugin, preset: 0 };
+    for chain in 0..4u64 {
+        let mut controls = OscillatorControls {
+            insert_chain: Some(chain),
+            ..OscillatorControls::default()
+        };
+        let plugin = 10 * chain as u32;
+        let mut install = |slot, plugin| {
+            let insert = Box::new(GainInsert {
+                key: key(plugin),
+                gain: 1.0,
+            });
+            assert!(backend.install_insert(slot, insert).is_none());
+        };
+        if chain != 2 {
+            install(rustel_audio::instrument_slot(chain), plugin);
+            controls.instrument = Some(rustel_audio::InsertControls::new(key(plugin)));
+        }
+        for stage in 0..[1, 2, 1, 0][chain as usize] {
+            let effect = plugin + 1 + stage as u32;
+            install(rustel_audio::effect_slot(chain, stage), effect);
+            controls.effects[stage] = Some(rustel_audio::InsertControls::new(key(effect)));
+        }
+        assert!(
+            backend.try_note_prepared(OnsetEvent::new(0, 440.0, 0.5, 1.0).with_controls(controls))
+        );
+    }
+    let mut output = [0.0f32; 128 * 2];
+    let worker_calls = WORKER_CALLS.load(Ordering::Relaxed);
 
     let before = Violations::capture();
-    let (empty, replaced) = tripwire::audio_scope(|| {
-        let slot = rustel_audio::InsertSlot::effect(1, 0);
-        let empty = backend.install_insert(slot, first);
-        let replaced = backend.install_insert(slot, second);
-        backend.process_block(&mut output, 128);
-        (empty, replaced)
+    tripwire::audio_scope(|| {
+        for _ in 0..200 {
+            backend.process_block(&mut output, 128);
+        }
     });
     let delta = Violations::capture().since(before);
     assert!(
         delta.clean(),
-        "the orbit insert allocated or freed in the callback: {delta:?}"
+        "pooled inserts allocated or freed on a thread: {delta:?}"
     );
-    assert!(empty.is_none());
-    assert!(replaced.is_some());
-    // The note set the gain to zero, so the orbit is silent.
-    assert!(output.iter().all(|sample| *sample == 0.0));
+    assert!(
+        WORKER_CALLS.load(Ordering::Relaxed) > worker_calls,
+        "no job ran on a worker"
+    );
     assert_eq!(backend.missing_insert_events(), 0);
 }
 

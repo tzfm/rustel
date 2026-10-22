@@ -203,37 +203,46 @@ impl StudioEngine {
         }))
     }
 
-    /// Prepares the plugin copies of a text that plays later, in the wait
-    /// mode: see [`rustel_runtime::Session::prepare_reload`]. The text plays
-    /// from `from_cycle`. The shield keeps the score in play sounding
-    /// through the evaluation. The call prepares nothing while a new score
-    /// waits for its first window: a launch armed then waits at its fire,
-    /// and takes a later line. A text that fails here fails again when it
-    /// plays, and says so then. The call prepares nothing for a session with
-    /// no plugins on its output, or for a text that names no plugin: such a
-    /// text costs no second evaluation, and a slow text keeps its line. A
-    /// launch of a text with a plugin name only in a variable, a helper or a
-    /// setup waits at its fire, and takes a later line.
+    /// Prepares the plugin copies of a text that plays later: see
+    /// [`rustel_runtime::Session::prepare_reload`]. The text plays from
+    /// `from_cycle`. In the wait mode the session holds the text while a
+    /// copy is not ready. In the async mode the builds start, and nothing
+    /// waits. The shield keeps the score in play sounding through the
+    /// evaluation. A text that fails here fails again when it plays, and
+    /// says so then.
+    ///
+    /// The call prepares nothing for a session with no plugins on its
+    /// output, or for a text with no `vst` in a session where no evaluation
+    /// ran a plugin call: a set with no plugin costs no second evaluation.
+    /// Such a session builds the copies of a chain from a setup helper when
+    /// the text plays. `Some(true)` when the prepare ran. `None` when a new
+    /// score waits for its first window: the call prepares nothing then. A
+    /// launch asks again at a later turn of its countdown. A held edit
+    /// builds its copies at its landing.
     #[cfg(feature = "vst")]
-    pub(super) fn prepare_live(&mut self, source: &str, mini: bool, from_cycle: f64) {
+    pub(super) fn prepare_live(
+        &mut self,
+        source: &str,
+        mini: bool,
+        from_cycle: f64,
+    ) -> Option<bool> {
         if mini
-            || !self.waits_for_sounds()
             || !self.session.plugins_live()
-            || rustel_runtime::vst::names_in_source(source).is_empty()
+            || !(source.contains("vst") || self.session.ran_plugin_calls())
         {
-            return;
+            return Some(false);
         }
         // A new score that waits for its first window publishes it before
         // its takeover. An evaluation here holds this thread past it, and
         // the producer rolls that score back.
         let live = self.live.as_ref().expect("checked live playback");
         if live.device.generation() != self.session.generation() {
-            return;
+            return None;
         }
         if self.shield_evaluation().is_err() {
-            return;
+            return Some(false);
         }
-        self.session.set_plugin_wait(true);
+        self.session.set_plugin_wait(self.waits_for_sounds());
         let live = self.live.as_ref().expect("checked live playback");
         let transport = self.session.transport();
         let _ =
@@ -241,6 +250,50 @@ impl StudioEngine {
                 .prepare_reload(source, mini, from_cycle, transport.stopped_flag(), || {
                     live.device.clock_seconds()
                 });
+        Some(true)
+    }
+
+    /// Prepares the plugin copies of the armed launch, in each mode: see
+    /// [`Self::prepare_live`]. The arm calls it, and each turn of the
+    /// countdown before the fire time, a head-room before the line: a launch
+    /// armed while a new score waits for its first window prepares at a
+    /// later turn. Past the fire time the launch does not prepare: the fire
+    /// evaluates the text. A prepare that ends past the fire time lets the
+    /// line pass, as a launch that waits for its sounds does, and the launch
+    /// takes the next line. A launch with nothing to prepare keeps its line.
+    #[cfg(feature = "vst")]
+    pub(super) fn prepare_launch(&mut self) {
+        let Some(pending) = self.pending_launch.as_ref() else {
+            return;
+        };
+        if pending.prepared {
+            return;
+        }
+        let (source, mini) = (pending.source.clone(), pending.mini);
+        let from_cycle = if pending.rewind {
+            0.0
+        } else {
+            pending.boundary_cycle
+        };
+        let Some(ran) = self.prepare_live(&source, mini, from_cycle) else {
+            return;
+        };
+        if let Some(pending) = self.pending_launch.as_mut() {
+            pending.prepared = true;
+        }
+        if !ran {
+            return;
+        }
+        let now = self.device_time();
+        let Some(pending) = self.pending_launch.as_ref() else {
+            return;
+        };
+        if now >= self.pending_line_time(pending, now) - self.launch_headroom() {
+            self.launch_takes_next_line(
+                now,
+                "plugin prepare ran past the head-room - the launch takes the next line",
+            );
+        }
     }
 
     /// Keeps the score in play sounding through an evaluation on this

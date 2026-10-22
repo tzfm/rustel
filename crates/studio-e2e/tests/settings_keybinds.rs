@@ -14,9 +14,9 @@ use rustel_studio_e2e::{Hermetic, hermetic};
 
 /// Walk the sheet's rows by label until the given one is selected. The
 /// Keybinds page has a row per action, so the walk is longer than a
-/// settings page - sixty steps covers the table twice over.
+/// settings page - seventy steps covers the table and its fixed rows.
 fn select_row(studio: &mut Hermetic, marker: &str) {
-    for _ in 0..60 {
+    for _ in 0..70 {
         if studio.rows().iter().any(|row| row.contains(marker)) {
             return;
         }
@@ -439,5 +439,114 @@ fn the_mapping_page_walks_its_slots_and_arms_a_learn() {
         studio.status(),
         "slot 5 is not bound to anything",
         "and Down steps a row of the three-column grid"
+    );
+}
+
+/// A chord learnt for a prebake action fires from the sheet, which closes
+/// as the prebake tab takes the keyboard.
+#[test]
+fn a_learned_prebake_chord_opens_the_tab() {
+    let mut studio = hermetic();
+    open_keybinds(&mut studio);
+    select_row(&mut studio, "▸ open global prebake");
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.press(KeyCode::F(14), KeyModifiers::NONE);
+    studio.settle();
+    assert!(
+        row_with(&mut studio, "open global prebake").contains("F14"),
+        "the chord was learnt"
+    );
+
+    studio.press(KeyCode::F(14), KeyModifiers::NONE);
+    studio.settle();
+    assert!(
+        studio.status().contains("prebake (global)"),
+        "the learned chord opened the global prebake: {}",
+        studio.status()
+    );
+    assert_eq!(studio.focus(), None, "the prebake editor has the keyboard");
+}
+
+/// With Vim on, the list-navigation row starts on and plain j/k walk the
+/// keybind rows. Turning it off gives the letters back to the text fields,
+/// and the arrows keep working either way.
+#[test]
+fn vim_list_navigation_moves_rows_and_can_be_turned_off() {
+    let mut studio = hermetic();
+    open_keybinds(&mut studio);
+    studio.press(KeyCode::Down, KeyModifiers::NONE);
+    studio.press(KeyCode::Right, KeyModifiers::NONE);
+    studio.settle();
+    assert!(
+        row_with(&mut studio, "Editor keybindings").contains("Vim"),
+        "the editor keys are Vim"
+    );
+
+    select_row(&mut studio, "▸ Vim list keys");
+    assert!(
+        row_with(&mut studio, "Vim list keys").contains("On"),
+        "the Vim section shows Vim list keys on"
+    );
+
+    studio.press(KeyCode::Home, KeyModifiers::NONE);
+    studio.pump();
+    studio.press(KeyCode::Char('j'), KeyModifiers::NONE);
+    studio.pump();
+    assert!(
+        studio
+            .rows()
+            .iter()
+            .any(|row| row.contains("▸ Editor keybindings")),
+        "j moved down one row:\n{}",
+        studio.rows().join("\n")
+    );
+    studio.press(KeyCode::Char('k'), KeyModifiers::NONE);
+    studio.pump();
+    assert!(
+        studio.rows().iter().any(|row| row.contains("▸ Terminal")),
+        "k moved back up:\n{}",
+        studio.rows().join("\n")
+    );
+
+    select_row(&mut studio, "▸ Vim list keys");
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.settle();
+    assert!(
+        row_with(&mut studio, "Vim list keys").contains("Off"),
+        "Enter turned Vim list keys off"
+    );
+
+    studio.press(KeyCode::Home, KeyModifiers::NONE);
+    studio.pump();
+    studio.press(KeyCode::Char('j'), KeyModifiers::NONE);
+    studio.pump();
+    assert!(
+        studio.rows().iter().any(|row| row.contains("▸ Terminal")),
+        "with the row off, j does not move the list:\n{}",
+        studio.rows().join("\n")
+    );
+    studio.press(KeyCode::Down, KeyModifiers::NONE);
+    studio.pump();
+    assert!(
+        studio
+            .rows()
+            .iter()
+            .any(|row| row.contains("▸ Editor keybindings")),
+        "the arrow still moves:\n{}",
+        studio.rows().join("\n")
+    );
+
+    select_row(&mut studio, "▸ Vim list keys");
+    let line = studio
+        .rows()
+        .iter()
+        .position(|row| row.contains("Vim list keys"))
+        .expect("the Vim list keys row is on screen");
+    studio.click(3, line as u16);
+    studio.settle();
+    assert!(
+        row_with(&mut studio, "Vim list keys").contains("On"),
+        "a click on the fixed row toggles it:\n{}",
+        studio.rows().join("\n")
     );
 }

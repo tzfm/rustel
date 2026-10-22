@@ -14,7 +14,7 @@ impl App {
             return true;
         }
         // Normal-mode command bursts must reach Vim one key at a time.
-        if !self.editor().vim_is_insert()
+        if !self.editor().accepts_typed_text()
             && (self.editor_accepts_raw_paste()
                 || (self.focus == Focus::Panel(PanelKind::Reference)
                     && self
@@ -102,6 +102,7 @@ impl App {
                 })
             }
             PanelKind::Reference => {
+                super::vim::enter_insert(self);
                 let Some(panel) = self.reference_panel.as_mut() else {
                     return false;
                 };
@@ -112,6 +113,7 @@ impl App {
                 true
             }
             PanelKind::Theme => {
+                super::vim::enter_insert(self);
                 let Some(picker) = self.theme_picker.as_mut() else {
                     return false;
                 };
@@ -122,6 +124,16 @@ impl App {
                 true
             }
             PanelKind::Export => {
+                if matches!(
+                    self.export_sheet.as_ref().map(|sheet| sheet.field),
+                    Some(
+                        super::super::export::Field::First
+                            | super::super::export::Field::Second
+                            | super::super::export::Field::Target
+                    )
+                ) {
+                    super::vim::enter_insert(self);
+                }
                 let Some(sheet) = self.export_sheet.as_mut() else {
                     return false;
                 };

@@ -62,6 +62,10 @@ pub enum BindAction {
     MenuBar,
     Help,
     Settings,
+    /// Open the global prebake in the score editor.
+    OpenGlobalPrebake,
+    /// Open the set's local prebake in the score editor.
+    OpenLocalPrebake,
     Devices,
     ThemePicker,
     /// The list for the place at the caret: the values an argument takes, or
@@ -130,7 +134,7 @@ pub enum BindAction {
 
 impl BindAction {
     /// Every action, in the order the Keybinds page lists them.
-    pub const ALL: [BindAction; 56] = [
+    pub const ALL: [BindAction; 58] = [
         // Transport
         Self::Evaluate,
         Self::Stop,
@@ -139,6 +143,8 @@ impl BindAction {
         Self::MenuBar,
         Self::Help,
         Self::Settings,
+        Self::OpenGlobalPrebake,
+        Self::OpenLocalPrebake,
         Self::Devices,
         Self::ThemePicker,
         Self::Reference,
@@ -204,6 +210,8 @@ impl BindAction {
             Self::MenuBar => "menu-bar",
             Self::Help => "help",
             Self::Settings => "settings",
+            Self::OpenGlobalPrebake => "global-prebake",
+            Self::OpenLocalPrebake => "local-prebake",
             Self::Devices => "devices",
             Self::ThemePicker => "theme",
             // The name older preference files hold. It keeps the Ctrl+F action.
@@ -274,6 +282,8 @@ impl BindAction {
             Self::MenuBar => "open the menu bar",
             Self::Help => "keyboard reference",
             Self::Settings => "settings",
+            Self::OpenGlobalPrebake => "open global prebake",
+            Self::OpenLocalPrebake => "open local prebake",
             Self::Devices => "devices",
             Self::ThemePicker => "theme picker",
             Self::Reference => "argument values, reference",
@@ -383,6 +393,8 @@ impl BindAction {
             Self::Jobs => plain(F(12)), // unused: Jobs ships unbound; open from View ▸ Background jobs
             Self::Memory => plain(F(12)), // unused: Memory ships unbound; open from the header
             Self::Visualizers => plain(F(12)), // unused: ships unbound; learn a key on the Keybinds page
+            Self::OpenGlobalPrebake => plain(F(12)), // unused: ships unbound; open from Options or learn a key
+            Self::OpenLocalPrebake => plain(F(12)), // unused: ships unbound; open from Options or learn a key
             Self::Export => ctrl_shift(Char('x')),
             Self::SmartAction => ctrl(Char('j')),
             Self::Split => ctrl(Char('e')),
@@ -1139,10 +1151,10 @@ pub enum KeybindCapture {
 
 /// The actions the studio ships with no chord, on purpose. Background jobs
 /// and Memory open from their View menu rows, and the memory breakdown from
-/// the header's figures too. They are looked at now and then, not played, and
-/// every plain function key and Ctrl letter already means something a set
-/// is performed with; a player who wants one learns it in Settings ▸
-/// Keybinds.
+/// the header's figures too. The prebakes open from the Options menu. They
+/// are looked at now and then, not played, and every plain function key and
+/// Ctrl letter already means something a set is performed with; a player
+/// who wants one learns it in Settings ▸ Keybinds.
 ///
 /// The panel actions ship with no chord in the table too. Each one answers
 /// to its [`BindAction::panel_letter`] with Alt until a chord is learnt.
@@ -1150,6 +1162,8 @@ pub const SHIPS_UNBOUND: &[BindAction] = &[
     BindAction::Jobs,
     BindAction::Memory,
     BindAction::Visualizers,
+    BindAction::OpenGlobalPrebake,
+    BindAction::OpenLocalPrebake,
     BindAction::ShowFile,
     BindAction::RenameFile,
     BindAction::DeleteSample,
@@ -1215,6 +1229,14 @@ impl Keybinds {
         self.effective[action as usize]
     }
 
+    /// Whether a key belongs to the Vim page motions. They take Ctrl+D
+    /// and Ctrl+U from the base table while Vim keys are on.
+    pub(crate) fn takes_vim_layer_key(&self, event: &KeyEvent) -> bool {
+        self.editor_keybindings == EditorKeybindings::Vim
+            && event.modifiers == KeyModifiers::CONTROL
+            && matches!(event.code, KeyCode::Char('d' | 'u'))
+    }
+
     pub(crate) fn editor_keybindings(&self) -> EditorKeybindings {
         self.editor_keybindings
     }
@@ -1253,6 +1275,25 @@ impl Keybinds {
 
     pub(crate) fn hint_available(&self, key: KeyEvent) -> bool {
         !self.suppressed_hints.contains(&(key.code, key.modifiers))
+    }
+
+    /// Whether this terminal's Option composes the letter into text, and
+    /// the panel recovers the Alt chord from it.
+    pub(crate) fn composes_option(&self, letter: char) -> bool {
+        !self.reach.terminal.is_empty()
+            && super::terminal::profiles::alt_input_limitation(
+                &self.reach.terminal,
+                &format!("alt+{letter}"),
+            )
+            .is_some()
+    }
+
+    /// The Option letter a composed character stands for on this terminal.
+    pub(crate) fn option_letter_for(&self, character: char) -> Option<char> {
+        if self.reach.terminal.is_empty() {
+            return None;
+        }
+        super::terminal::profiles::alt_input_letter(&self.reach.terminal, character)
     }
 
     /// A shortcut that also works while the score has the keyboard.
@@ -1403,9 +1444,9 @@ impl Keybinds {
         if Self::ships_unbound(action) {
             return None;
         }
-        // Vim holds Ctrl+R for redo, so the rename chord is not on offer.
-        // Learning it anyway records the player's choice.
-        if self.editor_keybindings == EditorKeybindings::Vim && action == BindAction::RenameScene {
+        // Vim owns Ctrl+D, Ctrl+U and Ctrl+R, so Docs, Wrap and the rename
+        // chord give way. Docs answers to gd through a default mapping.
+        if self.vim_withdraws(action) {
             return None;
         }
         std::iter::once(action.default_binding())
@@ -1414,6 +1455,16 @@ impl Keybinds {
             .chain(action.legacy_aliases())
             .chain(Self::portable_candidates())
             .find(|combo| self.delivers_for(action, combo))
+    }
+
+    /// The base chords Vim takes while the editor uses Vim keys. The base
+    /// table stays untouched, so switching back restores it.
+    fn vim_withdraws(&self, action: BindAction) -> bool {
+        self.editor_keybindings == EditorKeybindings::Vim
+            && matches!(
+                action,
+                BindAction::Docs | BindAction::Wrap | BindAction::RenameScene
+            )
     }
 
     fn delivers_for(&self, action: BindAction, combo: &KeyCombo) -> bool {
@@ -1482,7 +1533,7 @@ impl Keybinds {
         // Reserve all preferred defaults before selecting any fallback, so
         // adapting an early row can never silently take a later row's key.
         for action in BindAction::ALL {
-            if self.is_unbound(action) || self.overridden(action) {
+            if self.is_unbound(action) || self.overridden(action) || self.vim_withdraws(action) {
                 continue;
             }
             let combo = action.default_binding();
@@ -1492,7 +1543,10 @@ impl Keybinds {
         }
         // Reserve dedicated fallbacks before using the general spare keys.
         for action in BindAction::ALL {
-            if self.is_unbound(action) || self.binding(action).is_some() {
+            if self.is_unbound(action)
+                || self.binding(action).is_some()
+                || self.vim_withdraws(action)
+            {
                 continue;
             }
             self.effective[action as usize] = action
@@ -1502,7 +1556,10 @@ impl Keybinds {
                 .find(|combo| self.delivers_for(action, combo) && self.available(action, *combo));
         }
         for action in BindAction::ALL {
-            if self.is_unbound(action) || self.binding(action).is_some() {
+            if self.is_unbound(action)
+                || self.binding(action).is_some()
+                || self.vim_withdraws(action)
+            {
                 continue;
             }
             self.effective[action as usize] = Self::portable_candidates()
@@ -1524,7 +1581,7 @@ impl Keybinds {
             self.effective.swap(up, down);
         }
         for action in BindAction::ALL {
-            if self.is_unbound(action) || self.overridden(action) {
+            if self.is_unbound(action) || self.overridden(action) || self.vim_withdraws(action) {
                 continue;
             }
             if let Some(alias) = action.default_alias()
@@ -1534,15 +1591,6 @@ impl Keybinds {
             {
                 self.aliases[action as usize] = Some(alias);
             }
-        }
-        // Vim owns Ctrl+R for redo while the editor uses Vim keys. The
-        // rename chord waits for Default keys, unless another chord was
-        // learnt for it.
-        if self.editor_keybindings == EditorKeybindings::Vim
-            && !self.is_unbound(BindAction::RenameScene)
-            && !self.overridden(BindAction::RenameScene)
-        {
-            self.effective[BindAction::RenameScene as usize] = None;
         }
     }
 
@@ -1664,6 +1712,11 @@ impl Keybinds {
     pub fn overrules(&self, event: &KeyEvent) -> bool {
         if event.kind != KeyEventKind::Press || event.modifiers.contains(KeyModifiers::ALT) {
             return false;
+        }
+        // The Vim layer owns these keys, so the legacy Ctrl+D and Ctrl+U
+        // branches give way even when no action holds them.
+        if self.takes_vim_layer_key(event) {
+            return true;
         }
         if self.adapted_action_for(event).is_some() {
             return true;
@@ -2785,6 +2838,29 @@ mod tests {
         assert!(binds.prefs().is_empty());
     }
 
+    #[test]
+    fn a_composed_option_letter_recovers_its_alt_chord() {
+        let mut binds = Keybinds::default();
+        binds.set_reach(Reach {
+            enhanced: false,
+            terminal: "iTerm2".into(),
+        });
+        assert!(binds.composes_option('t'));
+        assert_eq!(binds.option_letter_for('†'), Some('t'));
+        assert_eq!(binds.hint(BindAction::TrimSample), shortcut_label("Alt+T"));
+        assert_eq!(
+            binds.hint(BindAction::FocusTimeline),
+            shortcut_label("Alt+T")
+        );
+
+        binds.set_reach(Reach {
+            enhanced: false,
+            terminal: "Ghostty".into(),
+        });
+        assert!(!binds.composes_option('t'));
+        assert_eq!(binds.option_letter_for('†'), None);
+    }
+
     /// Delete on the row of an action shipped with no key puts back its
     /// default, which is no key: never a spare chord for the session that
     /// a restart then takes away. Learnt or not, the table writes nothing.
@@ -3438,6 +3514,46 @@ mod tests {
         assert_eq!(
             binds.binding(BindAction::Reference),
             Some(BindAction::Reference.default_binding())
+        );
+    }
+
+    #[test]
+    fn vim_withdraws_docs_wrap_and_rename() {
+        let mut binds = Keybinds::default();
+        binds.set_editor_keybindings(EditorKeybindings::Vim);
+        assert_eq!(binds.binding(BindAction::Docs), None);
+        assert_eq!(binds.binding(BindAction::Wrap), None);
+        assert_eq!(binds.binding(BindAction::RenameScene), None);
+        assert!(
+            !binds.overrules(&press(KeyCode::Char('K'), KeyModifiers::SHIFT)),
+            "K is free for a mapping"
+        );
+
+        binds.set_editor_keybindings(EditorKeybindings::Default);
+        assert_eq!(
+            binds.binding(BindAction::Docs),
+            Some(BindAction::Docs.default_binding())
+        );
+        assert_eq!(
+            binds.binding(BindAction::Wrap),
+            Some(BindAction::Wrap.default_binding())
+        );
+        assert_eq!(
+            binds.binding(BindAction::RenameScene),
+            Some(BindAction::RenameScene.default_binding())
+        );
+    }
+
+    #[test]
+    fn a_learnt_chord_wins_over_the_vim_layer() {
+        let mut binds = Keybinds::default();
+        binds.set_editor_keybindings(EditorKeybindings::Vim);
+        let ctrl_d = KeyCombo::parse("ctrl+d").expect("chord");
+        binds.learn(BindAction::Docs, Some(ctrl_d));
+        assert_eq!(binds.binding(BindAction::Docs), Some(ctrl_d));
+        assert_eq!(
+            binds.override_action_for(&press(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            Some(BindAction::Docs)
         );
     }
 

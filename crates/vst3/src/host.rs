@@ -14,7 +14,7 @@ use rustel_audio::{
 };
 
 use crate::cache::{self, Cache, Scanned};
-use crate::instance::{Instance, Loaded};
+use crate::instance::{CopyState, Instance, Loaded};
 use crate::module::{ClassInfo, Module};
 use crate::{Job, ParamInfo, canonical, scan};
 
@@ -32,7 +32,8 @@ pub struct WorkerProgram {
 
 /// The plugins the host keeps ready for a slot that did not take them yet.
 /// One score needs one for each slot at most, so a start that waits for
-/// its plugins finds all of them.
+/// its plugins finds all of them. A copy of a chain a caller names stays:
+/// see [`Host::keep`].
 const MAX_PARKED: usize = rustel_audio::INSERT_SLOTS;
 /// A prepared plugin waits behind the read of the folders and the load:
 /// its build goes to the end of the line this many times at most.
@@ -148,6 +149,12 @@ impl Plugin {
     pub fn is_instrument(&self) -> bool {
         self.class.categories.contains("Instrument")
     }
+
+    /// The call a score writes for the plugin: `vsti` for an instrument,
+    /// `vst` for an effect.
+    fn call(&self) -> &'static str {
+        if self.is_instrument() { "vsti" } else { "vst" }
+    }
 }
 
 /// How far a plugin is.
@@ -180,6 +187,13 @@ pub struct PluginInfo {
     pub running: usize,
     /// The time the first load took.
     pub load_time: Duration,
+    /// True when the copies of the plugin stay in the audio callback: see
+    /// [`Host::set_audio_thread_plugins`].
+    pub audio_thread: bool,
+    /// The largest latency of the copies of the plugin, in frames. The last
+    /// copy of each preset at each sample rate counts: see
+    /// [`Host::latency`]. `None` before the first copy since the load.
+    pub latency: Option<u32>,
 }
 
 /// The answer to a preset name.
@@ -209,6 +223,15 @@ pub enum Prepared {
     /// No such plugin or preset, the wrong kind, or a failure: nothing to
     /// wait for. The text is the reason, for the user.
     Unavailable(String),
+}
+
+/// A plugin copy a live chain wants: the slot of the copy, and the plugin
+/// and the preset by name, as a score writes them. See [`Host::keep`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WantedCopy {
+    pub slot: InsertSlot,
+    pub name: String,
+    pub preset: Option<String>,
 }
 
 /// The answer to a plugin name.
@@ -291,16 +314,25 @@ struct State {
     /// The preset files of each plugin, by the compare form of its name.
     preset_lists: HashMap<String, PresetList>,
     builds: HashMap<(InsertKey, u32, InsertSlot), Build>,
-    /// The builds an engine took: the mark of each is alive while the
-    /// engine holds the plugin.
-    taken: HashMap<(InsertKey, u32, InsertSlot), std::sync::Weak<()>>,
+    /// The builds an engine took, with the cell of each copy: the cell has
+    /// the mark while the engine holds the plugin.
+    taken: HashMap<(InsertKey, u32, InsertSlot), Arc<CopyState>>,
+    /// The latency of the last copy of each key at each rate, in frames:
+    /// see [`Host::latency`].
+    latencies: HashMap<(InsertKey, u32), u32>,
     /// The prepared plugins with a build in the line behind a load or a
     /// read of the preset folder: see [`Host::prepare`].
     preparing: Vec<Prepare>,
-    /// The chains that ended: see [`Host::end_chains`]. No chain number
-    /// comes a second time, so a chain here gets no new build. An engine
-    /// holds the copy of such a chain until the end of its tail.
+    /// The chains that ended: see [`Host::keep`]. No chain number comes a
+    /// second time, so a chain here gets no new build. An engine holds the
+    /// copy of such a chain until the end of its tail.
     ended: HashSet<u64>,
+    /// What each caller of [`Host::keep`] keeps, by the number of the
+    /// caller.
+    callers: HashMap<u64, Kept>,
+    /// The compare forms of the plugin names whose copies stay in the audio
+    /// callback: see [`Host::set_audio_thread_plugins`].
+    audio_thread: HashSet<String>,
     preset_root: Option<PathBuf>,
     worker: Option<WorkerProgram>,
     /// The completed builds so far. The count orders copies and failures.
@@ -316,6 +348,15 @@ struct State {
     /// files at that time: from the cache, from the scan or from a load.
     scanned: HashMap<PathBuf, cache::Stamp>,
     scan: Scan,
+}
+
+/// The plugin copies and the chains of one caller of [`Host::keep`].
+#[derive(Default)]
+struct Kept {
+    /// The copies each live chain of the caller wants, by chain.
+    wanted: HashMap<u64, Vec<WantedCopy>>,
+    /// The chains the caller names.
+    named: HashSet<u64>,
 }
 
 /// The read of each bundle with no plugin names yet, on a thread of its
@@ -445,6 +486,53 @@ impl State {
         self.ended.contains(&build.2.chain)
     }
 
+    /// True for a build for a slot of a live chain with a key no copy of
+    /// the slot asks for: see [`Host::keep`]. A chain no caller lists asks
+    /// for each key.
+    fn unwanted(&self, build: &(InsertKey, u32, InsertSlot)) -> bool {
+        let (key, _, slot) = build;
+        let mut lists = self.callers.values();
+        let Some(copies) = lists.find_map(|kept| kept.wanted.get(&slot.chain)) else {
+            return false;
+        };
+        let asks = |copy: &WantedCopy| copy.slot == *slot && self.asks_for(copy, *key);
+        !copies.iter().any(asks)
+    }
+
+    /// True when `copy` asks for the copy with `key`. The name and the
+    /// preset resolve as in [`Host::key`], with no load and no read of a
+    /// folder. A name with no answer yet asks for each key: the host reads
+    /// the folders, the plugin loads, or no call asked for the preset yet.
+    fn asks_for(&self, copy: &WantedCopy, key: InsertKey) -> bool {
+        let Some(row) = self.find(&copy.name) else {
+            return self.scans > 0;
+        };
+        match &self.entries[row].stage {
+            Stage::Ready(_) => {}
+            Stage::Found | Stage::Loading => return true,
+            Stage::Failed(_) => return false,
+        }
+        let plugin = State::number(row);
+        let preset = copy.preset.as_deref().unwrap_or(DEFAULT_PRESET);
+        let preset = match self.known_presets.get(&(plugin, canonical(preset))) {
+            Some(KnownPreset::Number(number)) => *number,
+            // With no file `default`, a call with no preset plays the state
+            // the plugin starts in. A call with a missing preset gets no
+            // copy.
+            Some(KnownPreset::MissingSince(_)) if copy.preset.is_none() => 0,
+            Some(KnownPreset::MissingSince(_)) => return false,
+            None => return true,
+        };
+        key == InsertKey { plugin, preset }
+    }
+
+    /// True when a caller of [`Host::keep`] names the chain.
+    fn named(&self, chain: u64) -> bool {
+        self.callers
+            .values()
+            .any(|kept| kept.named.contains(&chain))
+    }
+
     /// Takes the ready copies of the builds that `ends` names out of the
     /// list. The caller ends them on the plugin thread.
     // A copy stays in the box an engine takes.
@@ -466,8 +554,15 @@ impl State {
 
     /// True while an engine holds the plugin it took for this build.
     fn held(&self, build: &(InsertKey, u32, InsertSlot)) -> bool {
-        let alive = |held: &std::sync::Weak<()>| held.strong_count() > 0;
-        self.taken.get(build).is_some_and(alive)
+        let held = |cell: &Arc<CopyState>| cell.held.load(Ordering::Relaxed);
+        self.taken.get(build).is_some_and(held)
+    }
+
+    /// True when the copies of the plugin of a number stay in the audio
+    /// callback: see [`Host::set_audio_thread_plugins`].
+    fn on_audio_thread(&self, plugin: u32) -> bool {
+        let entry = row_of(plugin).and_then(|row| self.entries.get(row));
+        entry.is_some_and(|entry| self.audio_thread.contains(&entry.key))
     }
 
     fn find(&self, name: &str) -> Option<usize> {
@@ -752,6 +847,15 @@ impl Host {
     /// The folder with one folder of `.vstpreset` files for each plugin.
     pub fn set_preset_folder(&self, folder: PathBuf) {
         self.state().preset_root = Some(folder);
+    }
+
+    /// Keeps each copy of the plugins in `names` in the audio callback, for
+    /// a plugin that breaks on another thread: such a copy answers false to
+    /// [`OrbitInsert::any_thread`]. A name is the whole name of a plugin, and
+    /// compares in the form of [`canonical`]. A copy an engine takes after
+    /// the call follows the list.
+    pub fn set_audio_thread_plugins(&self, names: &[String]) {
+        self.state().audio_thread = names.iter().map(|name| canonical(name)).collect();
     }
 
     /// Reads the folders again, on the plugin thread: a folder on a slow
@@ -1046,12 +1150,15 @@ impl Host {
         let mut list: Vec<PluginInfo> = state
             .entries
             .iter()
-            .filter(|entry| entry.present)
-            .map(|entry| {
+            .enumerate()
+            .filter(|(_, entry)| entry.present)
+            .map(|(row, entry)| {
                 let plugin = match &entry.stage {
                     Stage::Ready(plugin) => Some(plugin),
                     _ => None,
                 };
+                let latencies = state.latencies.iter();
+                let latencies = latencies.filter(|((key, _), _)| row_of(key.plugin) == Some(row));
                 PluginInfo {
                     name: entry.name.clone(),
                     bundle: entry.bundle.clone(),
@@ -1069,6 +1176,8 @@ impl Host {
                     instrument: entry.categories.contains("Instrument"),
                     running: plugin.map_or(0, |plugin| plugin.running.load(Ordering::Relaxed)),
                     load_time: plugin.map_or(Duration::ZERO, |plugin| plugin.load_time),
+                    audio_thread: state.audio_thread.contains(&entry.key),
+                    latency: latencies.map(|(_, latency)| *latency).max(),
                 }
             })
             .collect();
@@ -1292,8 +1401,8 @@ impl Host {
             .filter_map(|name| state.find(name))
             .map(|index| state.entries[index].bundle.as_path())
             .collect();
-        state.taken.iter().any(|(build, held)| {
-            held.strong_count() > 0
+        state.taken.iter().any(|(build, cell)| {
+            cell.held.load(Ordering::Relaxed)
                 && row_of(build.0.plugin)
                     .and_then(|row| state.entries.get(row))
                     .is_some_and(|entry| !kept.contains(&entry.bundle.as_path()))
@@ -1308,27 +1417,93 @@ impl Host {
         names.iter().filter(whole).cloned().collect()
     }
 
-    /// Ends the chains in `chains`: no score has these chains now. Each
-    /// copy the host made ready for a slot of the chains ends, so no engine
-    /// takes it. A build in the line for such a slot makes no copy, and no
-    /// later call starts one.
-    pub fn end_chains(&self, chains: Vec<u64>) {
+    /// Tells the host the plugin copies the chains of one caller want.
+    /// `caller` is the number of the caller, as the chains of one session.
+    /// `live` has each copy a live chain of the caller wants. `named` has
+    /// the chains the caller names: the bound of the parked copies ends no
+    /// copy of such a chain. A call takes the place of the last call of the
+    /// same caller, so a second caller unnames no chain of the first.
+    /// `ended` has the chains that ended: no score has these chains now.
+    ///
+    /// Each build of an ended chain ends, and so does each build for a slot
+    /// of a live chain with a key no copy of the slot asks for. So no
+    /// engine takes such a copy, a build in the line makes no copy, and no
+    /// later call starts one. A ready copy ends in a job of the plugin
+    /// thread. A call that wants the copy again before that job keeps the
+    /// copy. A chain no caller lists keeps its builds. The host resolves
+    /// each name and preset as [`Host::key`] does, with no load and no read
+    /// of a folder. A name with no answer yet keeps each key of its slot.
+    ///
+    /// Gives the slot and the key of each copy an engine holds for a chain
+    /// the caller names, with a key no copy of its slot asks for. The engine
+    /// gives such a copy back when it is not busy and its stage is not
+    /// heard.
+    pub fn keep(
+        &self,
+        caller: u64,
+        live: Vec<WantedCopy>,
+        named: Vec<u64>,
+        ended: Vec<u64>,
+    ) -> Vec<(InsertSlot, InsertKey)> {
         let mut state = self.state();
-        state.ended.extend(&chains);
-        let of_chain = move |build: &(InsertKey, u32, InsertSlot)| chains.contains(&build.2.chain);
+        state.ended.extend(ended);
+        let mut kept = Kept {
+            named: named.into_iter().collect(),
+            ..Kept::default()
+        };
+        for copy in live {
+            kept.wanted.entry(copy.slot.chain).or_default().push(copy);
+        }
+        if kept.wanted.is_empty() && kept.named.is_empty() {
+            state.callers.remove(&caller);
+        } else {
+            state.callers.insert(caller, kept);
+        }
+        let kept_chain = |chain| {
+            let kept = state.callers.get(&caller);
+            kept.is_some_and(|kept| kept.named.contains(&chain))
+        };
+        let held: Vec<(InsertSlot, InsertKey)> = state
+            .taken
+            .iter()
+            .filter(|(build, cell)| {
+                cell.held.load(Ordering::Relaxed)
+                    && kept_chain(build.2.chain)
+                    && state.unwanted(build)
+            })
+            .map(|((key, _, slot), _)| (*slot, *key))
+            .collect();
+        let gone: HashSet<(InsertKey, u32, InsertSlot)> = state
+            .builds
+            .keys()
+            .filter(|build| state.chain_ended(build) || state.unwanted(build))
+            .copied()
+            .collect();
         // A ready copy ends on the plugin thread. A build in the line
         // finds no entry: see `Host::finish`.
         state
             .builds
-            .retain(|build, built| matches!(built, Build::Ready(_)) || !of_chain(build));
+            .retain(|build, built| matches!(built, Build::Ready(_)) || !gone.contains(build));
+        if !gone.iter().any(|build| state.builds.contains_key(build)) {
+            return held;
+        }
         drop(state);
         let host = self.clone();
         self.enqueue(move || {
-            let copies = host.state().take_ready(of_chain);
+            let copies = {
+                let mut state = host.state();
+                // A later call that wants a copy again keeps it.
+                let gone: HashSet<(InsertKey, u32, InsertSlot)> = gone
+                    .into_iter()
+                    .filter(|build| state.chain_ended(build) || state.unwanted(build))
+                    .collect();
+                state.take_ready(|build| gone.contains(build))
+            };
             for copy in copies {
                 copy.end_here();
             }
         });
+        held
     }
 
     /// Runs on the plugin thread.
@@ -1382,7 +1557,13 @@ impl Host {
                         return None;
                     }
                     match std::mem::replace(&mut entry.stage, Stage::Found) {
-                        Stage::Ready(plugin) => Some(plugin),
+                        Stage::Ready(plugin) => {
+                            // The latencies of its copies go with the plugin.
+                            state
+                                .latencies
+                                .retain(|(key, _), _| row_of(key.plugin) != Some(row));
+                            Some(plugin)
+                        }
                         _ => None,
                     }
                 })
@@ -1592,8 +1773,11 @@ impl Host {
         let build = (key, sample_rate, slot);
         let take = |state: &mut State| match state.builds.remove(&build) {
             Some(Build::Ready(mut copy)) => {
-                state.taken.retain(|_, held| held.strong_count() > 0);
+                state
+                    .taken
+                    .retain(|_, cell| cell.held.load(Ordering::Relaxed));
                 state.taken.insert(build, copy.hold());
+                copy.set_any_thread(!state.on_audio_thread(key.plugin));
                 Some(copy as Box<dyn OrbitInsert>)
             }
             Some(other) => {
@@ -1652,6 +1836,23 @@ impl Host {
         }
     }
 
+    /// The latency of the plugin copy of one slot, in frames: the copy that
+    /// waits for the slot, else the copy an engine holds, else the last
+    /// copy of the key at this rate. `None` when the host built no copy of
+    /// the key at this rate since the plugin loaded. The call makes no
+    /// plugin call and waits for nothing.
+    pub fn latency(&self, key: InsertKey, sample_rate: u32, slot: InsertSlot) -> Option<u32> {
+        let build = (key, sample_rate, slot);
+        let state = self.state();
+        match (state.builds.get(&build), state.taken.get(&build)) {
+            (Some(Build::Ready(copy)), _) => Some(copy.latency()),
+            (_, Some(cell)) if cell.held.load(Ordering::Relaxed) => {
+                Some(cell.latency.load(Ordering::Relaxed))
+            }
+            _ => state.latencies.get(&(key, sample_rate)).copied(),
+        }
+    }
+
     /// Loads the plugin a score names and builds it for one slot, with no
     /// wait, so the plugin is ready before the first note asks. A later
     /// [`Host::insert`] for the same slot takes the plugin. A name the host
@@ -1703,40 +1904,24 @@ impl Host {
     /// Puts the build of a prepared plugin in the line of the plugin
     /// thread. The plugin thread does one job at a time, so the build runs
     /// after the read of the folders or the load that is in the line now.
-    /// A build that finds the plugin not ready goes to the end of the line
-    /// again, `tries` times at most.
+    /// The build has the key a note asks for: see [`Host::key`]. While the
+    /// plugin loads or the host reads its preset folder, the build has no
+    /// key yet. It then goes to the end of the line again, `tries` times at
+    /// most.
     fn prepare_soon(&self, request: Prepare, tries: u32) {
         let host = self.clone();
         self.enqueue(move || {
-            let resolved = host.resolve(&request.name, false);
-            if matches!(resolved, Resolved::Pending) && tries > 0 {
+            let preset = request.preset.as_deref();
+            let key = host.key(&request.name, preset, request.instrument);
+            if matches!(key, Ok(None)) && tries > 0 {
                 return host.prepare_soon(request, tries - 1);
             }
             // The request leaves the line here. A later call is a new one.
             host.state().preparing.retain(|waiting| *waiting != request);
-            let Resolved::Ready(plugin, loaded) = resolved else {
+            let Ok(Some((key, _))) = key else {
                 return;
             };
-            if loaded.is_instrument() != request.instrument {
-                return;
-            }
-            let preset = match &request.preset {
-                None => 0,
-                Some(preset) => {
-                    // This is the plugin thread: read the folder here.
-                    let root = host.state().preset_root.clone();
-                    host.store_presets(loaded.name(), root.as_deref());
-                    match host.preset(plugin, preset) {
-                        FoundPreset::Number(number) => number,
-                        _ => return,
-                    }
-                }
-            };
-            let build = (
-                InsertKey { plugin, preset },
-                request.sample_rate,
-                request.slot,
-            );
+            let build = (key, request.sample_rate, request.slot);
             let claimed = Self::claim_prepared(&mut host.state(), build);
             if let Some(claimed) = claimed {
                 host.finish(build, claimed);
@@ -1757,13 +1942,15 @@ impl Host {
     }
 
     /// Marks a build as started and gives what the build needs. `None`
-    /// means the build exists already, the chain of its slot ended, or the
-    /// host has no such plugin.
+    /// means the build exists already, the chain of its slot ended, no live
+    /// chain wants the key for the slot, the host has no such plugin, or
+    /// the parked copies leave no room.
     fn claim(
         state: &mut State,
         build: (InsertKey, u32, InsertSlot),
     ) -> Option<(Arc<Plugin>, Option<PathBuf>)> {
-        if state.builds.contains_key(&build) || state.chain_ended(&build) {
+        if state.builds.contains_key(&build) || state.chain_ended(&build) || state.unwanted(&build)
+        {
             return None;
         }
         let key = build.0;
@@ -1778,20 +1965,33 @@ impl Host {
             number => Some(state.presets.get(number as usize - 1)?.1.clone()),
         };
         // A plugin prepared for a score that no longer asks for it stays
-        // parked. Bound copies, failures and queued builds together, and
-        // forget old failures before discarding a usable copy.
+        // parked. Bound copies, failures and queued builds together. Old
+        // failures go first, then the oldest copy of a chain no caller
+        // names. A copy of a named chain stays: with no other, the build
+        // does not start, with one line.
         while state.builds.len() >= MAX_PARKED {
             let oldest = state
                 .builds
                 .iter()
                 .filter_map(|(build, built)| match built {
                     Build::Failed(order, _) => Some((*build, (0, *order))),
-                    Build::Ready(copy) => Some((*build, (1, copy.order()))),
-                    Build::Running => None,
+                    Build::Ready(copy) if !state.named(build.2.chain) => {
+                        Some((*build, (1, copy.order())))
+                    }
+                    Build::Ready(_) | Build::Running => None,
                 })
                 .min_by_key(|(_, order)| *order)
                 .map(|(build, _)| build);
-            let oldest = oldest?;
+            let Some(oldest) = oldest else {
+                let (call, name) = (plugin.call(), plugin.name());
+                let line = format!(
+                    "{call} skipped: {name} did not start: the host keeps {MAX_PARKED} copies ready at most"
+                );
+                if !state.errors.contains(&line) {
+                    state.errors.push(line);
+                }
+                return None;
+            };
             state.builds.remove(&oldest);
         }
         state.builds.insert(build, Build::Running);
@@ -1799,16 +1999,24 @@ impl Host {
     }
 
     /// Builds the plugin of a claimed build. Runs on the plugin thread. A
-    /// build with no entry makes no copy: the chain of its slot ended, and
-    /// [`Host::end_chains`] took the entry. When the chain ends during the
-    /// build, the copy ends here.
+    /// build with no entry makes no copy: the chain of its slot ended, or no
+    /// live chain wants the key for the slot, and [`Host::keep`] took the
+    /// entry. A build no live chain wants now leaves the list here. When
+    /// this happens during the build, the copy ends here.
     fn finish(
         &self,
         build: (InsertKey, u32, InsertSlot),
         (plugin, preset): (Arc<Plugin>, Option<PathBuf>),
     ) {
-        let waits = |state: &State| matches!(state.builds.get(&build), Some(Build::Running));
-        if !waits(&self.state()) {
+        let waits = |state: &mut State| {
+            let running = matches!(state.builds.get(&build), Some(Build::Running));
+            if running && state.unwanted(&build) {
+                state.builds.remove(&build);
+                return false;
+            }
+            running
+        };
+        if !waits(&mut self.state()) {
             return;
         }
         let retire = self.shared.jobs.clone();
@@ -1823,7 +2031,7 @@ impl Host {
             contained("build", build)
         });
         let mut state = self.state();
-        if !waits(&state) {
+        if !waits(&mut state) {
             drop(state);
             if let Ok(copy) = built {
                 Box::new(copy).end_here();
@@ -1834,12 +2042,18 @@ impl Host {
         let result = match built {
             Ok(mut copy) => {
                 copy.set_order(state.built);
+                state.latencies.insert((key, rate), copy.latency());
                 Build::Ready(Box::new(copy))
             }
             Err(error) => {
-                let name = plugin.name();
-                state.errors.push(format!("vst {name}: {error}"));
-                Build::Failed(state.built, format!("{name} did not start: {error}"))
+                // A caller that asks `Host::prepared` for the slot makes the
+                // same line from the reason. A caller that says each text one
+                // time then says the fault one time.
+                let reason = format!("{} did not start: {error}", plugin.name());
+                state
+                    .errors
+                    .push(format!("{} skipped: {reason}", plugin.call()));
+                Build::Failed(state.built, reason)
             }
         };
         state.builds.insert(build, result);

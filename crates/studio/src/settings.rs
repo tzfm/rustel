@@ -1516,6 +1516,9 @@ pub struct UiSettings {
     pub terminal_profile: Option<String>,
     pub editor_keybindings: EditorKeybindings,
     pub vim_mappings_path: Option<String>,
+    /// Whether plain j k h l move lists and menus while Vim editor keys
+    /// are on. The arrows always work.
+    pub vim_list_navigation: bool,
     pub rendering: RenderingMode,
     /// How often the screen is repainted while something moves.
     pub frame_rate: FrameRate,
@@ -1702,6 +1705,7 @@ impl Default for UiSettings {
             terminal_profile: None,
             editor_keybindings: EditorKeybindings::Default,
             vim_mappings_path: None,
+            vim_list_navigation: true,
             rendering: RenderingMode::Automatic,
             frame_rate: FrameRate::default(),
             show_full_paths: false,
@@ -2153,9 +2157,10 @@ pub(super) const KEYBIND_ACTION_START: usize = 2;
 /// The final keybind row is an action, after every binding.
 pub(super) const RESET_KEYBINDS_ROW: usize = KEYBIND_ACTION_START + BindAction::ALL.len();
 pub(super) const VIM_MAPPINGS_PATH_ROW: usize = RESET_KEYBINDS_ROW + 1;
+pub(super) const LIST_NAVIGATION_ROW: usize = VIM_MAPPINGS_PATH_ROW + 1;
 
 pub(super) fn keybind_count(settings: &UiSettings) -> usize {
-    RESET_KEYBINDS_ROW + 1 + usize::from(settings.editor_keybindings == EditorKeybindings::Vim)
+    RESET_KEYBINDS_ROW + 1 + 2 * usize::from(settings.editor_keybindings == EditorKeybindings::Vim)
 }
 
 pub(super) fn keybind_action_at(row: usize) -> Option<BindAction> {
@@ -2516,9 +2521,12 @@ fn keybind_lines(count: usize) -> Vec<DisplayRow> {
             if count > VIM_MAPPINGS_PATH_ROW {
                 lines.push(DisplayRow::Control(VIM_MAPPINGS_PATH_ROW));
             }
+            if count > LIST_NAVIGATION_ROW {
+                lines.push(DisplayRow::Control(LIST_NAVIGATION_ROW));
+            }
             lines.push(DisplayRow::Gap);
         }
-        if index != VIM_MAPPINGS_PATH_ROW {
+        if index != VIM_MAPPINGS_PATH_ROW && index != LIST_NAVIGATION_ROW {
             lines.push(DisplayRow::Control(index));
         }
     }
@@ -2644,8 +2652,8 @@ pub struct SettingsSheet {
     /// as one. A standard folder is read-only.
     #[cfg(feature = "vst")]
     pub vst_standard_count: usize,
-    /// How many plugins the scan found follow the folders. The rows are
-    /// read-only: the scan is what changes them.
+    /// How many plugins the scan found follow the folders. The scan adds and
+    /// removes the rows. Each row has the switch `audio thread only`.
     #[cfg(feature = "vst")]
     pub vst_scanned_count: usize,
     /// The first line of the page drawn, kept from key to key so walking
@@ -2730,6 +2738,11 @@ pub enum SettingsAction {
     /// again.
     #[cfg(feature = "vst")]
     RescanVst,
+    /// Space on a plugin row: turn the switch `audio thread only` of the
+    /// plugin on or off. The number is the place of the plugin in the list
+    /// of plugins.
+    #[cfg(feature = "vst")]
+    ToggleAudioThread(usize),
     /// Enter on a keybind row: wait for a chord, and make it this
     /// action's. The chord itself arrives through the app's learn state.
     LearnKeybind(BindAction),
@@ -2988,15 +3001,18 @@ impl SettingsSheet {
     /// The vst page is a list, as the sources page is: the arrows walk the
     /// two actions, the folders the player added, the standard folders,
     /// then the plugins the scan found. Only a folder the player added is
-    /// removed.
+    /// removed. Space on a plugin turns its switch `audio thread only` on or
+    /// off.
     #[cfg(feature = "vst")]
     fn vst_key(&mut self, code: crossterm::event::KeyCode) -> SettingsAction {
         use crossterm::event::KeyCode;
         let added = self.vst_folder_count;
-        let len = VST_CONTROL_COUNT + added + self.vst_standard_count + self.vst_scanned_count;
+        let folders = VST_CONTROL_COUNT + added + self.vst_standard_count;
+        let len = folders + self.vst_scanned_count;
         let at = self.selected.min(len - 1);
         let on_added = at >= VST_CONTROL_COUNT && at < VST_CONTROL_COUNT + added;
         match code {
+            KeyCode::Char(' ') if at >= folders => SettingsAction::ToggleAudioThread(at - folders),
             KeyCode::Up => {
                 self.selected = (at + len - 1) % len;
                 SettingsAction::Nothing
@@ -3103,6 +3119,20 @@ impl SettingsSheet {
             }
             KeyCode::Delete | KeyCode::Backspace if at == VIM_MAPPINGS_PATH_ROW && len > at => {
                 SettingsAction::ResetVimMappingsPath
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ')
+                if at == LIST_NAVIGATION_ROW && len > at =>
+            {
+                settings.vim_list_navigation = !settings.vim_list_navigation;
+                SettingsAction::Changed
+            }
+            KeyCode::Delete | KeyCode::Backspace if at == LIST_NAVIGATION_ROW && len > at => {
+                if settings.vim_list_navigation {
+                    SettingsAction::Nothing
+                } else {
+                    settings.vim_list_navigation = true;
+                    SettingsAction::Changed
+                }
             }
             KeyCode::Enter if len > 0 => match action {
                 Some(action) => SettingsAction::LearnKeybind(action),
@@ -4362,12 +4392,29 @@ fn keybinds_footer_hint(
     if sheet.selected == VIM_MAPPINGS_PATH_ROW {
         return "Enter: change path · Del: use default · Esc: close".to_owned();
     }
+    if sheet.selected == LIST_NAVIGATION_ROW {
+        return "j k h l as arrows · Left/Right or Enter: on/off · Del: on".to_owned();
+    }
     if sheet.selected == RESET_KEYBINDS_ROW {
         let profile = terminal_profile_label(settings, features);
         if sheet.confirm_reset_keybinds {
             return format!("Reset all to {profile} defaults? Enter: confirm · Esc: cancel");
         }
         return format!("Enter: reset all to {profile} defaults · Esc: close");
+    }
+    if settings.editor_keybindings == EditorKeybindings::Vim {
+        match keybind_action_at(sheet.selected) {
+            Some(BindAction::Docs) => {
+                return "Vim: gd (default mapping) · Ctrl+D pages down · Enter: rebind".to_owned();
+            }
+            Some(BindAction::Wrap) => {
+                return "Vim: no chord · Ctrl+U pages up · Enter: rebind".to_owned();
+            }
+            Some(BindAction::RenameScene) => {
+                return "Vim: no chord · Ctrl+R redoes · Enter: rebind".to_owned();
+            }
+            _ => {}
+        }
     }
     "Enter: rebind a key or a control · Del: terminal default · Tab: pages · Esc: close".to_owned()
 }
@@ -4520,8 +4567,8 @@ pub struct VstPage {
     pub presets: String,
 }
 
-/// One plugin the scan found, as its row reads: the name, and where the
-/// plugin is now.
+/// One plugin the scan found, as its row reads: the name, where the plugin
+/// is now, and its switch.
 #[cfg(feature = "vst")]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VstScanned {
@@ -4529,6 +4576,9 @@ pub struct VstScanned {
     /// The state of the plugin in this studio: `found` before its first
     /// load, then `loading`, `ready`, or `failed`.
     pub state: String,
+    /// The switch `audio thread only`: the copies of the plugin stay on the
+    /// audio thread.
+    pub audio_thread: bool,
 }
 
 /// One plugin folder, as its row reads.
@@ -5401,6 +5451,90 @@ mod tests {
         let mut sheet = armed;
         sheet.show_page(SettingsPage::Advanced);
         assert!(!sheet.confirm_reset_keybinds);
+    }
+
+    #[test]
+    fn the_vim_list_navigation_row_toggles_and_delete_restores_on() {
+        let features = TerminalFeatures::default();
+        let area = Rect::new(0, 0, 120, 40);
+        let mut settings = UiSettings {
+            editor_keybindings: EditorKeybindings::Vim,
+            ..UiSettings::default()
+        };
+        assert!(settings.vim_list_navigation, "Vim starts with list keys on");
+        let mut sheet = SettingsSheet {
+            page: SettingsPage::Keybinds,
+            selected: LIST_NAVIGATION_ROW,
+            keybind_count: keybind_count(&settings),
+            ..SettingsSheet::default()
+        };
+        assert_eq!(
+            sheet.key_in_frame(KeyCode::Enter, &mut settings, &features, area),
+            SettingsAction::Changed
+        );
+        assert!(!settings.vim_list_navigation);
+        assert_eq!(
+            sheet.key_in_frame(KeyCode::Delete, &mut settings, &features, area),
+            SettingsAction::Changed
+        );
+        assert!(settings.vim_list_navigation, "Delete restores the default");
+        assert!(
+            keybinds_footer_hint(sheet, &settings, &features).contains("on/off"),
+            "the footer names the toggle"
+        );
+        assert_eq!(
+            keybind_count(&settings),
+            RESET_KEYBINDS_ROW + 3,
+            "reset, Vim mappings path, list navigation"
+        );
+        let lines = keybind_lines(keybind_count(&settings));
+        assert_eq!(
+            lines[KEYBIND_ACTION_START],
+            DisplayRow::Control(VIM_MAPPINGS_PATH_ROW),
+            "the Vim rows sit together below the editor keys"
+        );
+        assert_eq!(
+            lines[KEYBIND_ACTION_START + 1],
+            DisplayRow::Control(LIST_NAVIGATION_ROW)
+        );
+        assert_eq!(lines[KEYBIND_ACTION_START + 2], DisplayRow::Gap);
+        settings.editor_keybindings = EditorKeybindings::Default;
+        assert_eq!(
+            keybind_count(&settings),
+            RESET_KEYBINDS_ROW + 1,
+            "the Vim rows are not shown with Default keys"
+        );
+    }
+
+    #[test]
+    fn the_vim_layer_names_the_docs_and_wrap_changes() {
+        let settings = UiSettings {
+            editor_keybindings: EditorKeybindings::Vim,
+            ..Default::default()
+        };
+        let features = TerminalFeatures::default();
+        let row = |action| {
+            KEYBIND_ACTION_START
+                + BindAction::ALL
+                    .iter()
+                    .position(|candidate| *candidate == action)
+                    .expect("action row")
+        };
+        let mut sheet = SettingsSheet {
+            page: SettingsPage::Keybinds,
+            selected: row(BindAction::Docs),
+            keybind_count: keybind_count(&settings),
+            ..Default::default()
+        };
+        assert!(
+            keybinds_footer_hint(sheet, &settings, &features).contains("Ctrl+D pages down"),
+            "the Docs row names the key it gave up"
+        );
+        sheet.selected = row(BindAction::Wrap);
+        assert!(
+            keybinds_footer_hint(sheet, &settings, &features).contains("Ctrl+U pages up"),
+            "the Wrap row names the key it gave up"
+        );
     }
 
     #[test]
@@ -8624,10 +8758,12 @@ mod tests {
                 VstScanned {
                     name: "Tone".into(),
                     state: "ready".into(),
+                    audio_thread: false,
                 },
                 VstScanned {
                     name: "Kick".into(),
                     state: "found".into(),
+                    audio_thread: true,
                 },
             ],
             plugins: 2,
@@ -8684,18 +8820,34 @@ mod tests {
             .join("\n");
         assert!(text.contains("scanned plugins"), "{text}");
         assert!(text.contains("Tone · ready"), "{text}");
-        assert!(text.contains("Kick · found"), "{text}");
+        assert!(!text.contains("Tone · ready ·"), "{text}");
+        assert!(text.contains("Kick · found · audio thread only"), "{text}");
         assert!(
             text.contains("scanning · 3 of 124 bundles · Shell › Comp"),
             "{text}"
         );
         // The rows are part of the walk: six Downs from the first action
-        // reach the last plugin, and the hint under the list says so.
+        // reach the last plugin, and the hint under the list says so. Space
+        // on a plugin turns its switch on or off, and does nothing on a
+        // folder.
         let mut walked = UiSettings::default();
-        for _ in 0..6 {
-            sheet.key(crossterm::event::KeyCode::Down, &mut walked, &features);
+        let mut walk = |sheet: &mut SettingsSheet, code| sheet.key(code, &mut walked, &features);
+        let (down, space) = (KeyCode::Down, KeyCode::Char(' '));
+        for _ in 0..4 {
+            walk(&mut sheet, down);
         }
+        assert_eq!(walk(&mut sheet, space), SettingsAction::Ignored);
+        walk(&mut sheet, down);
+        assert_eq!(
+            walk(&mut sheet, space),
+            SettingsAction::ToggleAudioThread(0)
+        );
+        walk(&mut sheet, down);
         assert_eq!(sheet.selected, 6);
+        assert_eq!(
+            walk(&mut sheet, space),
+            SettingsAction::ToggleAudioThread(1)
+        );
         let mut buffer = Buffer::empty(frame);
         SettingsSheetView {
             sheet,
@@ -8733,7 +8885,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            text.contains("the list of every plugin the scan found"),
+            text.contains("Space turns audio thread only on or off"),
             "{text}"
         );
         assert!(text.contains("▸ Kick"), "{text}");

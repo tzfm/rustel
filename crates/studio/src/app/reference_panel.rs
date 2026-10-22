@@ -1915,6 +1915,8 @@ mod tests {
             ReferenceView {
                 keybinds: &crate::keybinds::Keybinds::default(),
                 focused: true,
+                vim: false,
+                anchored: false,
                 pulse: None,
                 sounding_note: None,
                 loading: None,

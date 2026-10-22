@@ -446,6 +446,7 @@ impl App {
             }
             if row < super::super::settings::KEYBIND_ACTION_START
                 || row == super::super::settings::VIM_MAPPINGS_PATH_ROW
+                || row == super::super::settings::LIST_NAVIGATION_ROW
             {
                 self.keybind_learn = None;
                 self.handle_settings_key(KeyCode::Enter, false, false);
@@ -1065,6 +1066,8 @@ impl App {
             SettingsAction::ScanVst => self.scan_vst(),
             #[cfg(feature = "vst")]
             SettingsAction::RescanVst => self.rescan_vst(),
+            #[cfg(feature = "vst")]
+            SettingsAction::ToggleAudioThread(at) => self.toggle_audio_thread(at),
         }
         // The keybind learn belongs to the Keybinds page: Tabbed away
         // from it - or closed by any door the sheet has - the learn goes
@@ -1399,6 +1402,19 @@ impl App {
                 || super::super::settings::KeybindRow {
                     action: "Vim mappings path",
                     chord: self.vim_mappings_path_label(),
+                    ..Default::default()
+                },
+            ),
+        )
+        .chain(
+            (self.ui_settings.editor_keybindings == crate::editor::EditorKeybindings::Vim).then(
+                || super::super::settings::KeybindRow {
+                    action: "Vim list keys",
+                    chord: if self.ui_settings.vim_list_navigation {
+                        "On".into()
+                    } else {
+                        "Off".into()
+                    },
                     ..Default::default()
                 },
             ),

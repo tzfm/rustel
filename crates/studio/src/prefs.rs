@@ -53,6 +53,10 @@ pub struct StudioPrefs {
     pub editor_keybindings: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vim_mappings_path: Option<String>,
+    /// Whether j k h l move lists while Vim editor keys are on. Absent
+    /// means on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vim_list_navigation: Option<bool>,
     /// How often the screen repaints while a set plays: `60`, `30`, `15`
     /// or `8`. Absent is sixty, which is what a machine with cores to
     /// spare should have.
@@ -637,6 +641,9 @@ impl StudioPrefs {
                 .and_then(super::editor::EditorKeybindings::from_key)
                 .unwrap_or(defaults.editor_keybindings),
             vim_mappings_path: self.vim_mappings_path.clone(),
+            vim_list_navigation: self
+                .vim_list_navigation
+                .unwrap_or(defaults.vim_list_navigation),
             show_full_paths: self.show_full_paths.unwrap_or(defaults.show_full_paths),
             rendering: self
                 .rendering
@@ -844,6 +851,7 @@ impl StudioPrefs {
             .map(str::to_owned);
         self.editor_keybindings = Some(settings.editor_keybindings.key().to_owned());
         self.vim_mappings_path = settings.vim_mappings_path.clone();
+        self.vim_list_navigation = Some(settings.vim_list_navigation);
         self.frame_rate = Some(settings.frame_rate.key().to_owned());
         self.clock_out = settings.clock_out.clone();
         self.clock_in = settings.clock_in.clone();
@@ -1859,6 +1867,26 @@ mod tests {
         // A file written by the two-way switch this replaced still loads.
         let switch: StudioPrefs = serde_json::from_str(r#"{"syntax_check": false}"#).unwrap();
         assert_eq!(switch.ui_settings().syntax_check, SyntaxCheck::Full);
+    }
+
+    #[test]
+    fn vim_list_navigation_defaults_on_and_remembers_off() {
+        let legacy: StudioPrefs = serde_json::from_str("{}").unwrap();
+        assert!(
+            legacy.ui_settings().vim_list_navigation,
+            "an old preferences file means list keys on"
+        );
+        for value in [false, true] {
+            let settings = super::super::settings::UiSettings {
+                vim_list_navigation: value,
+                ..legacy.ui_settings()
+            };
+            let mut prefs = StudioPrefs::default();
+            prefs.set_ui_settings(&settings);
+            let restored: StudioPrefs =
+                serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+            assert_eq!(restored.ui_settings().vim_list_navigation, value);
+        }
     }
 
     #[test]

@@ -511,6 +511,11 @@ impl Studio {
         &self.app.status
     }
 
+    /// Clear the status bar so a test can wait for the next notice.
+    pub fn clear_status(&mut self) {
+        self.app.status.clear();
+    }
+
     /// The focused pane's source, exactly as stored.
     pub fn source(&self) -> String {
         self.app.editor().source()

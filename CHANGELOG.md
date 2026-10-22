@@ -2,24 +2,19 @@
 
 ## Unreleased
 
-- The corpus gains its heaviest loader case, `tutti-stress`: 22 tracks on 22 sample banks, all demanded in the first cycle. The previous maximum was 10 banks. A song converted from a MIDI file asks for that many banks the moment it plays.
-- The studio no longer leaks memory on macOS while it runs. The gamepad poll asked GameController for its controllers every loop turn, and each call left an autoreleased array in a pool the studio's own loop never drained, about 200 arrays a second. A pool per poll releases them.
-- Studio reloads scores when another program saves their files. Settings > Live coding > watch external changes has three modes: off, sync, and sync & eval. Off is the default. `sync` follows the active tab. `sync & eval` follows every score in the set, opens the saved file's tab, and plays it. The studio checks each file's size and modification time ten times a second and reads it only after a change settles.
-- The mixer's devices block no longer shows a "no gamepad" row when no gamepad is plugged in. It lists gamepads only when there is one.
-- The warning "webcam theme blocked; enable Hydra webcam in Settings" stays on the header's warning chip only while a theme or score asks for the camera and Settings refuses it. It clears when the theme changes to one without a camera, or when Settings allows the camera. The log keeps the line as history. Before, it counted as news for a short stay and then went quiet, whatever the cause.
-- In a split view, each pane has its own colour: the first wears the theme's accent and the second wears another accent. The pane's tab on the strip and its title wear it, filled where the caret is and on a dim fill where it is not, even while the scene plays. Tabs that are nowhere open stay muted. A click on that tab moves the caret to its pane. Before, it only said which pane had the scene. The "F10 switches" hint is gone from the pane title, because a click does the same and the View menu lists the key.
-- A prebake that only defines a helper around a call setup may not make applies. The checker refused any text that named `setcps` before a parenthesis, so a community prebake that hands scores `window.bpm = b => setcpm(b/4)` was refused over a call the prebake never makes, and with it every helper the set needed. The call runs when a score calls the helper, where the engine allows it. A prebake that makes the call itself is still refused, in the engine's words.
-- A prebake or score that writes over a name the engine owns says so in the footer, as a hint: `window.note = …` replaces what every score that follows means by `note`. The write is kept and runs. Before, the replacement was silent. A `register(...)` of a sealed name keeps its own engine refusal.
-- Pattern queries allocate less. Time and value changes reuse a hap, and a shared object map stays shared until a write. A 4-cycle query with five controls drops from 3,297 to 2,353 allocations.
-- The Studio Chords tab sorts the chord symbols it has no name for. Their order changed on each run before.
-- The new `terminal` theme follows the terminal's own palette: `reset` and the 16 `ansiN` colours, so a custom scheme such as a Kitty or Noctalia one shows through the studio.
-- The theme picker's delete key refuses a theme the studio ships on the first press. Before, the second press went looking for a file a built-in theme does not have and answered with an error that listed every theme name.
-- The Studio Chords tab no longer leaks memory while it is open. Each draw leaked 336 small strings with the default dictionary.
-- `rustelup --branch` and `--commit` check for the ALSA and libudev development files before a Linux build and print the install command for the detected distribution. A missing `alsa.pc` stopped the `alsa-sys` build script with a panic that named the package but not how to install it. The build guide now lists the packages for Fedora, Arch, openSUSE and Alpine, and says why a PipeWire system still needs the ALSA headers.
-- Alt+A turns on auto preview in the sample, chord and scale lists of the Reference browser. The up and down arrows then play each row the cursor lands on. The choice is kept in `studio.json`. Before, only the samples list had the shortcut, and the choice was lost on quit.
-- Painter colours no longer turn black under the `terminal` theme. A silent note or a faint mark faded toward the theme's ground, and a ground the theme leaves to the terminal has no colour to blend with, so the fade painted plain black on the pixel raster. The colour now stands whole when the ground cannot take its share.
-- The `terminal` theme gains a warm sibling, `terminal-warm`, which moves the accent and the selection to the palette's colour slot 1. A palette whose bright slot reads badly as an accent now has another to wear.
-- An `all()` callback that returns `undefined` stops the update with an error. Before, a typo at the end of its chain, such as `.ross`, played silence and `rustel check` found no issue.
+- Each pane in a split has its own colour, and a click on a tab moves the caret to that pane.
+- Studio reloads scores when another program saves them.
+- Vim keys work in many more places: lists, menus, search boxes, find, paste, replace and half-page moves. Default Vim mappings ship under your vimrc.
+- Mac Option keys type their character, so Option+4 on an ISO layout types $.
+- The prebakes open from the Options menu.
+- Prebake helpers such as window.bpm = b => setcpm(b/4) now pass. Writing over an engine name gives a hint.
+- The mixer no longer shows "no gamepad". The camera warning clears when nothing asks for the camera.
+- New terminal and terminal-warm themes use your terminal's colours.
+- Plugin edits load only the copy that changed. Heavy sets spread plugin chains over several cores.
+- Windows reports underruns, and Csound reports when it falls behind.
+- Two memory leaks are fixed, in macOS gamepad polling and in the Chords tab.
+- all() returning undefined is an error now.
+- Pattern queries allocate less, and rustelup checks the Linux build packages first..
 
 ## v0.1.5
 

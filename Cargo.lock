@@ -181,6 +181,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio_thread_priority"
+version = "0.38.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0b30b2f3d2da482d0faeaafd8f88a38fbc62abb58d3b402cfa195793f4c92ab"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "log",
+ "mach2 0.4.3",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -720,7 +733,7 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 [[package]]
 name = "crossterm"
 version = "0.29.0"
-source = "git+https://github.com/tzfm/crossterm?rev=88dc698277fa9470a5d1a268244c95069af39bb6#88dc698277fa9470a5d1a268244c95069af39bb6"
+source = "git+https://github.com/tzfm/crossterm?rev=f772fd3f90be8a85d0a94866bc9daeb0e082255d#f772fd3f90be8a85d0a94866bc9daeb0e082255d"
 dependencies = [
  "bitflags 2.13.1",
  "crossterm_winapi",
@@ -3637,7 +3650,9 @@ dependencies = [
 name = "rustel-audio"
 version = "0.1.5"
 dependencies = [
+ "audio_thread_priority",
  "cpal",
+ "libc",
  "rustel-kabel",
  "rustfft",
  "serde",
@@ -3921,6 +3936,7 @@ dependencies = [
 name = "rustel-vst3-fixture"
 version = "0.1.5"
 dependencies = [
+ "rustel-audio",
  "vst3",
 ]
 

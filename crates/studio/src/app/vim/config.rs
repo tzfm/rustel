@@ -1,9 +1,9 @@
 //! External Vim mapping preferences and reload notices.
 
-use super::*;
+use super::super::*;
 
 impl App {
-    pub(super) fn refresh_vim_config(&mut self) {
+    pub(crate) fn refresh_vim_config(&mut self) {
         let changed = self.vim_config.configure(
             self.ui_settings.editor_keybindings == crate::editor::EditorKeybindings::Vim,
             self.ui_settings.vim_mappings_path.as_deref(),
@@ -15,7 +15,7 @@ impl App {
         self.show_vim_config_notice();
     }
 
-    pub(super) fn poll_vim_config(&mut self, now: Instant) {
+    pub(crate) fn poll_vim_config(&mut self, now: Instant) {
         if self.vim_config.poll(now) {
             self.sync_editor_keybindings();
         }
@@ -32,13 +32,13 @@ impl App {
         }
     }
 
-    pub(super) fn vim_mappings_path_label(&self) -> String {
+    pub(crate) fn vim_mappings_path_label(&self) -> String {
         crate::vim_config::path(self.ui_settings.vim_mappings_path.as_deref())
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|| "default path unavailable".into())
     }
 
-    pub(super) fn set_vim_mappings_path(&mut self, path: Option<String>) {
+    pub(crate) fn set_vim_mappings_path(&mut self, path: Option<String>) {
         self.ui_settings.vim_mappings_path = path;
         self.prefs.set_ui_settings(&self.ui_settings);
         self.save_prefs_soon();

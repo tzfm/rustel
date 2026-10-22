@@ -519,6 +519,10 @@ pub mod profiles {
         pub steals: Vec<Stolen>,
         #[serde(default)]
         legacy_input: Vec<InputLimitation>,
+        /// Option chords the terminal spends on composed text. Alt is not
+        /// a [`KeyCombo`] modifier, so these rows are listed apart.
+        #[serde(default)]
+        alt_input: Vec<InputLimitation>,
         /// The name stands for a family of emulators and identifies none.
         #[serde(default)]
         generic: bool,
@@ -792,6 +796,33 @@ pub mod profiles {
             .map(|row| row.reason.as_str())
     }
 
+    /// An Option chord this terminal composes into text instead of sending
+    /// as Alt. The physical chord is still named, such as `alt+t`.
+    pub fn alt_input_limitation(terminal: &str, chord: &str) -> Option<&'static str> {
+        table()
+            .terminals
+            .iter()
+            .filter(|known| matches_profile(terminal, &known.terminal))
+            .flat_map(|known| &known.alt_input)
+            .find(|row| row.chord.eq_ignore_ascii_case(chord))
+            .map(|row| row.reason.as_str())
+    }
+
+    /// The Option letter a composed character stands for, where the
+    /// terminal profile names one. This is how iTerm2's Option+T, which
+    /// arrives as `†`, still reaches the panel that answers to Alt+T.
+    pub fn alt_input_letter(terminal: &str, received: char) -> Option<char> {
+        let wanted = received.to_string();
+        table()
+            .terminals
+            .iter()
+            .filter(|known| matches_profile(terminal, &known.terminal))
+            .flat_map(|known| &known.alt_input)
+            .find(|row| row.received.as_deref() == Some(wanted.as_str()))
+            .and_then(|row| row.chord.strip_prefix("alt+"))
+            .and_then(|letter| letter.chars().next())
+    }
+
     /// Recover physical chord names from a terminal's legacy keymap. This
     /// keeps shortcut hints and learned keys consistent with actual input.
     pub fn legacy_key(terminal: &str, received: &KeyCombo) -> Option<KeyCombo> {
@@ -962,6 +993,41 @@ pub mod profiles {
                     assert_eq!(KeyCombo::parse(received).unwrap().key(), *received);
                 }
             }
+            for limitation in super::table()
+                .terminals
+                .iter()
+                .flat_map(|known| &known.alt_input)
+            {
+                let letter = limitation
+                    .chord
+                    .strip_prefix("alt+")
+                    .unwrap_or_else(|| panic!("{:?} is not an Option chord", limitation.chord));
+                assert_eq!(
+                    letter.chars().count(),
+                    1,
+                    "{} names more than one key",
+                    limitation.chord
+                );
+                assert!(!limitation.reason.is_empty());
+            }
+        }
+
+        #[test]
+        fn iterm2_option_letters_compose_and_recover() {
+            for (letter, composed) in [('t', '†'), ('o', 'ø'), ('r', '®'), ('d', '∂'), ('a', 'å')]
+            {
+                assert!(
+                    super::alt_input_limitation("iTerm2", &format!("alt+{letter}")).is_some(),
+                    "alt+{letter} is missing from the iTerm2 profile"
+                );
+                assert_eq!(
+                    super::alt_input_letter("iTerm2", composed),
+                    Some(letter),
+                    "{composed} does not recover alt+{letter}"
+                );
+            }
+            assert!(super::alt_input_limitation("Ghostty", "alt+t").is_none());
+            assert_eq!(super::alt_input_letter("Ghostty", '†'), None);
         }
 
         #[test]
@@ -1764,6 +1830,7 @@ fn queue_terminal_entry(
                     | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
                     | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
                     | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | KeyboardEnhancementFlags::REPORT_ASSOCIATED_TEXT
             )
         )?;
     }
@@ -2773,8 +2840,9 @@ mod tests {
         queue_terminal_entry(&mut bytes, true, true).expect("queue terminal entry");
         let output = String::from_utf8(bytes).expect("terminal sequences are ASCII");
         // Alternate characters are required for shifted text in iTerm2;
-        // event types retain piano releases. Test the actual wire request.
-        assert!(output.contains("\x1b[>15u"));
+        // event types retain piano releases. Associated text keeps composed
+        // characters such as Option+4. Test the actual wire request.
+        assert!(output.contains("\x1b[>31u"));
         let alternate = output.find("\x1b[?1049h").expect("alternate screen");
         let keyboard = output.find("\x1b[>").expect("keyboard enhancement");
         let paste = output.find("\x1b[?2004h").expect("bracketed paste");

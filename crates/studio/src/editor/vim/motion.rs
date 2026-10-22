@@ -88,6 +88,46 @@ impl Editor {
         Ok(())
     }
 
+    /// Ctrl+D and Ctrl+U. A count scrolls that many lines, as Vim does.
+    /// Without one, half the window moves, caret and viewport together.
+    /// Ctrl+D and Ctrl+U. A count scrolls that many lines, as Vim does.
+    /// Without one, half the window moves, caret and viewport together.
+    pub(super) fn vim_half_page(
+        &mut self,
+        down: bool,
+        count: Option<usize>,
+    ) -> Result<(), EditorError> {
+        let before = self.vim_head();
+        let visual = matches!(self.vim.mode, Mode::Visual { .. });
+        match count {
+            None => {
+                let motion = if down {
+                    super::super::Motion::HalfPageDown
+                } else {
+                    super::super::Motion::HalfPageUp
+                };
+                self.move_selection(motion, visual)?;
+                if !visual {
+                    self.vim_normalize_caret()?;
+                }
+            }
+            Some(count) => {
+                self.vim_move(if down { Motion::Down } else { Motion::Up }, count)?;
+                self.viewport.top_row = if down {
+                    self.viewport
+                        .top_row
+                        .saturating_add(count)
+                        .min(self.maximum_top_row())
+                } else {
+                    self.viewport.top_row.saturating_sub(count)
+                };
+                self.ensure_primary_visible();
+            }
+        }
+        self.vim.motion_blocked |= self.vim_head() == before;
+        Ok(())
+    }
+
     pub(super) fn vim_motion_target(
         &self,
         motion: Motion,

@@ -4,7 +4,8 @@
 //! allocation off the CPAL callback. The live path crosses a fixed-capacity
 //! POD ring and filters replaced generations at the block boundary. Device
 //! recovery after device loss is not implemented by this module. Live reports
-//! count xruns when the host reports them.
+//! count xruns when the host reports them. On Windows the output counts them
+//! from its playback clock.
 
 mod callback;
 mod control;
@@ -65,6 +66,8 @@ const TARGET_LIVE_BUFFER_FRAMES: u32 = 128;
 const MAX_LIVE_PLAYBACK_LATENCY_NANOS: u64 = 250_000_000;
 const MAX_LIVE_LATENCY_ENV: &str = "RUSTEL_MAX_LIVE_LATENCY_MS";
 const LIVE_BUFFER_FRAMES_ENV: &str = "RUSTEL_LIVE_BUFFER_FRAMES";
+/// The plugin workers of an output. 0 runs each plugin on the callback.
+const PLUGIN_THREADS_ENV: &str = "RUSTEL_PLUGIN_THREADS";
 const UNSET_STREAM_INSTANT_NANOS: u64 = u64::MAX;
 static NEXT_LIVE_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -169,11 +172,25 @@ pub struct LiveScalarDevice {
         std::sync::Mutex<Vec<(crate::insert::InsertSlot, crate::insert::InsertKey, usize)>>,
     insert_waiting:
         std::sync::Mutex<Vec<(crate::insert::InsertSlot, crate::insert::InsertKey, Instant)>>,
+    /// The time of the last release of each shipped copy the score no longer
+    /// has, by slot and key: see `release_inserts`.
+    insert_released:
+        std::sync::Mutex<Vec<(crate::insert::InsertSlot, crate::insert::InsertKey, Instant)>>,
     /// Builds an insert outside the callback. With no provider, a note that
     /// asks for an insert plays dry.
     insert_provider: std::sync::Mutex<Option<Arc<crate::insert::InsertProvider>>>,
     /// Names the chains of the playing score before each turn of inserts.
     insert_names: std::sync::Mutex<Option<Arc<crate::insert::InsertNames>>>,
+    /// Gives the values sliders moved at each turn of inserts, after the
+    /// names: see [`Self::set_insert_values`].
+    insert_values: std::sync::Mutex<Option<Arc<crate::insert::InsertValues>>>,
+    /// The plugin workers, started by the first copy that runs on any
+    /// thread. They live as long as the device and stop after the stream. A
+    /// lock of the producer only.
+    plugin_pool: std::sync::Mutex<Option<crate::pool::PluginPool>>,
+    /// Set when the backend of the stream has the plugin workers. A recycle
+    /// clears it, and the next turn ships them to the new backend.
+    plugin_pool_shipped: AtomicBool,
     shared: LiveShared,
     sample_rate: u32,
     channels: u16,
@@ -270,7 +287,9 @@ pub struct LiveDeviceReport {
     pub realtime_pressure: crate::RealtimePressureSnapshot,
     pub refused_voices: u64,
     pub callback_errors: u64,
-    /// Recoverable xruns reported by the active output's host backend.
+    /// Recoverable xruns of the active output. On Windows the output counts
+    /// them from its playback clock. On the other systems its host backend
+    /// reports them.
     pub callback_xruns: u64,
     /// Calls to the live DSP writer that occurred outside the callback
     /// tripwire scope. A non-zero value invalidates zero-allocation reporting.
@@ -299,6 +318,15 @@ pub struct LiveDeviceReport {
     /// check but before the device callback published its counters. Such a
     /// cutover is bounded to that block; the next block resets old voices.
     pub cutover_race_blocks: u64,
+    /// Plugin workers that have their real-time class and take jobs.
+    pub plugin_workers: u64,
+    /// Plugin jobs the callback ran itself.
+    pub plugin_jobs_inline: u64,
+    /// Time the callback spun for a plugin worker.
+    pub plugin_join_wait_nanos: u64,
+    /// Plugin jobs that ran late while the callback waited for them. Each
+    /// sends its worker into a cool-down.
+    pub plugin_late_jobs: u64,
 }
 
 /// Why a live output cannot be trusted to report callback allocations.
@@ -355,6 +383,9 @@ struct LiveShared {
     /// Hand-played notes bypass the score ring and its lookahead.
     immediate: Arc<Ring>,
     live_controls: Arc<crate::assets::AssetRing<crate::live_control::LiveControlUpdate>>,
+    /// The values sliders moved, on their way to the inserts of the
+    /// callback: see [`LiveScalarDevice::set_insert_values`].
+    insert_values: Arc<crate::assets::AssetRing<crate::insert::InsertValue>>,
     max_polyphony: Arc<AtomicUsize>,
     confirmations: crate::confirmation::ConfirmationChannel,
     analysis: Arc<LiveAnalysisTap>,
@@ -433,6 +464,14 @@ struct LiveShared {
     callback_xruns: Arc<AtomicU64>,
     callback_scope_misses: Arc<AtomicU64>,
     cutover_race_blocks: Arc<AtomicU64>,
+    /// The figures of the plugin jobs, added at the end of each buffer.
+    plugin_jobs_inline: Arc<AtomicU64>,
+    plugin_join_wait_nanos: Arc<AtomicU64>,
+    plugin_late_jobs: Arc<AtomicU64>,
+    /// Set when a plugin worker of the output has its real-time class,
+    /// before the workers go to the callback. On Linux the callback then
+    /// takes the same class.
+    plugin_real_time: Arc<AtomicBool>,
     /// Sample delivery to the callback bank (install/return SPSC pair).
     samples: Arc<crate::assets::SampleChannel>,
     /// Master fader and post-fader metering, shared with the callback.
@@ -629,6 +668,8 @@ pub struct ManualLiveOutput {
     backend: LiveScalarBackend,
     meters: LiveCallbackMeters,
     gate: Arc<CallbackGate>,
+    /// The underruns [`Self::render_at`] reads from its clock.
+    underruns: PlaybackUnderruns,
     _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
@@ -691,10 +732,89 @@ enum AudioDeviceDetails {
 #[cfg(windows)]
 struct CallbackProAudio(Option<Option<crate::mmcss::ProAudioThread>>);
 
+/// The output callback's real-time class on Linux: `SCHED_FIFO`, the class
+/// of a plugin worker. The callback asks for it at its first call after a
+/// worker of the output got it, so no worker outranks the callback that
+/// waits for it. An output with no such worker keeps its priority.
+///
+/// The drop gives the class back. On the PulseAudio host the callback runs
+/// on the reader thread of the connection, which serves the process after
+/// the stream ends. The closure drops on that thread when the server deletes
+/// the stream. A drop on any other thread skips the demotion, as the drop of
+/// a Windows registration does.
+#[cfg(target_os = "linux")]
+struct CallbackRealTime {
+    frames: u32,
+    rate: u32,
+    asked: bool,
+    /// The promotion and the thread that made it.
+    promoted: Option<(
+        audio_thread_priority::RtPriorityHandle,
+        std::thread::ThreadId,
+    )>,
+}
+
+/// The underruns of an output on Windows, read from its playback clock: cpal
+/// reports no underrun for a WASAPI output.
+///
+/// The clock gives the time the first frame of each buffer plays, from the
+/// first buffer on. While the device plays, the clock moves on by the frames
+/// the callback submitted. In a gap the device plays silence, and the clock
+/// runs ahead of the submitted frames by the time of the gap. One underrun
+/// counts when the clock runs more than 2 buffers further ahead than its
+/// base.
+///
+/// ```text
+///  ahead                      _________  a gap: 1 underrun
+///    |                       /
+///    |      ________________/   more than 2 buffers
+///    |     /
+///    |____/  the start: no underrun
+///    +-----------------------------------> buffers
+/// ```
+///
+/// The clock also moves ahead at the start, until the device plays the first
+/// frame, and after a gap, until the device plays again. Each lasts the
+/// playback latency of the device at most. A Bluetooth headset takes 150 ms
+/// or more. The base follows the clock until it holds still. It follows for
+/// the largest playback latency the callback read and 2 buffers at most, so
+/// the start counts none and a gap counts once. A set over its budget keeps
+/// the clock moving ahead. After that time the base holds, so the gaps of the
+/// set add up and count again. The clock of the device drifts from the system
+/// clock too. The base follows the clock down at once and up by about 1 ms a
+/// second, so a drift counts none.
+///
+/// The callback of each stream owns its reading of the clock. A recycle
+/// starts a new reading with the new stream, and the count of the output
+/// goes on. A stream that reported an error counts none. At a change of the
+/// default device, Windows moves the stream to the new device, and the gap of
+/// that move is no underrun.
+#[cfg(any(windows, feature = "test-support"))]
+struct PlaybackUnderruns {
+    sample_rate: u64,
+    /// One buffer of the stream, in nanoseconds.
+    buffer_nanos: i64,
+    /// The frames the callback submitted before this buffer.
+    submitted: u64,
+    /// How far the clock ran ahead of the submitted frames at the last
+    /// buffer, in nanoseconds. `None` before the first buffer.
+    ahead: Option<i64>,
+    /// How far ahead the clock was when the base last followed it.
+    base: i64,
+    /// The submitted frames, in nanoseconds, when the base began to follow
+    /// the clock: 0 at the start, and the frames before a counted buffer.
+    /// `None` once the clock holds still, or after the latency and 2 buffers.
+    rising: Option<i64>,
+    /// The largest playback latency the callback read, in nanoseconds.
+    latency: i64,
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     // The allocation counters are process-wide, so a positive-control canary
-    // must not overlap another test's zero-delta assertion.
+    // must not overlap another test's zero-delta assertion. The switch of the
+    // plugin workers is process-wide too. Each test that sets it holds this
+    // lock.
     static TRIPWIRE_ASSERTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     pub(crate) fn tripwire_assertion_guard() -> std::sync::MutexGuard<'static, ()> {

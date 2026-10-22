@@ -1151,6 +1151,12 @@ impl App {
             .smart_action
             .as_ref()
             .is_some_and(|state| state.form.is_some());
+        let menu_code = if in_form {
+            key.code
+        } else {
+            self.list_navigation_alias(key)
+                .map_or(key.code, |alias| alias.code)
+        };
         if in_form {
             match key.code {
                 KeyCode::Esc => {
@@ -1233,12 +1239,12 @@ impl App {
             self.lint_smart_action_soon();
             return true;
         }
-        match key.code {
+        match menu_code {
             KeyCode::Esc => self.close_smart_action(),
             KeyCode::Up | KeyCode::Down => {
                 if let Some(state) = self.smart_action.as_mut() {
                     let len = state.menu_rows().len().max(1);
-                    let delta = if key.code == KeyCode::Down {
+                    let delta = if menu_code == KeyCode::Down {
                         1
                     } else {
                         len - 1

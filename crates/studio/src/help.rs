@@ -120,7 +120,7 @@ impl HelpContext {
             }
             #[cfg(feature = "vst")]
             Self::SettingsVst => {
-                "The folders with your VST3 plugins, then the standard folders of the system. The plugin host reads all of them. Rescan after you install a plugin."
+                "The folders with your VST3 plugins, then the standard folders of the system. The plugin host reads all of them. Rescan after you install a plugin. A plugin that breaks on another thread stays on the audio thread with its audio thread only switch on. Space on a plugin row turns its switch on or off."
             }
             Self::Log => {
                 "The newest studio messages are at the bottom of the log. v shows the running commentary underneath them."
@@ -322,7 +322,10 @@ impl HelpContext {
             Self::SettingsVst => [
                 ("a / +", "add a folder with VST3 plugins"),
                 ("Enter · d", "do the selected action · remove the folder"),
-                ("Tab · Esc", "other pages · close"),
+                (
+                    "Space · Tab · Esc",
+                    "turn audio thread only on or off · other pages · close",
+                ),
             ],
             Self::Log => [
                 (
@@ -427,6 +430,17 @@ fn shortcut_with_alias(keybinds: &Keybinds, action: BindAction) -> String {
     join_hints(hints, " / ")
 }
 
+/// The learned chord when the action has one, else the menu path that
+/// reaches it. A shipped-unbound action still reads as reachable.
+fn shortcut_or_menu(keybinds: &Keybinds, action: BindAction, menu: &str) -> String {
+    let shortcut = shortcut_with_alias(keybinds, action);
+    if shortcut.is_empty() {
+        menu.to_owned()
+    } else {
+        shortcut
+    }
+}
+
 fn join_hints(hints: impl IntoIterator<Item = String>, separator: &str) -> String {
     hints
         .into_iter()
@@ -513,8 +527,20 @@ fn shortcut_rows_with_keybinds(
         ),
         HelpRow::new(hint(BindAction::Settings), "open settings"),
         HelpRow::new(
-            "Options > Settings > prebakes",
-            "open the selected global/local prebake",
+            shortcut_or_menu(
+                keybinds,
+                BindAction::OpenGlobalPrebake,
+                "Options > Global prebake",
+            ),
+            "open the global prebake",
+        ),
+        HelpRow::new(
+            shortcut_or_menu(
+                keybinds,
+                BindAction::OpenLocalPrebake,
+                "Options > Local prebake",
+            ),
+            "open the local prebake",
         ),
         HelpRow::new(hint(BindAction::ThemePicker), "open the theme picker"),
         HelpRow::new(hint(BindAction::SetPanel), "show or hide the set panel"),

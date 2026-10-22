@@ -2,12 +2,31 @@ use super::*;
 
 impl Session {
     /// Update one slider registered by the active score. Callers are
-    /// responsible for revision/id/range policy; this boundary only performs
-    /// the finite host-cell mutation and reports an unknown id as `false`.
+    /// responsible for revision/id/range policy. This boundary performs the
+    /// finite host-cell mutation and reports an unknown id as `false`.
+    ///
+    /// A slider that is the value of a plugin key also moves the parameter
+    /// value at once, on a live output that plays: the next turn of the
+    /// output gives the value to the copy, and to each note in its queue of
+    /// this generation or older. The move makes no new generation. While the
+    /// transport is stopped, no parameter value moves: the next start reads
+    /// the slider. After a score change, a slider moves no parameter value
+    /// until a note of the new score links it.
     pub fn set_slider_value(&self, id: &str, value: f64) -> Result<bool, RuntimeError> {
-        self.js
+        let moved = self
+            .js
             .set_slider_value(id, value)
-            .map_err(RuntimeError::Js)
+            .map_err(RuntimeError::Js)?;
+        // A move of a score with no link takes no lock of the chains.
+        #[cfg(feature = "vst")]
+        if moved
+            && self.slider_links.load(std::sync::atomic::Ordering::Relaxed)
+            && self.plugins_live()
+            && !self.transport.is_stopped()
+        {
+            crate::vst::slider_moved(&self.chains, id, value, self.generation());
+        }
+        Ok(moved)
     }
 
     /// Current value of one active query-time slider cell.
@@ -240,10 +259,16 @@ impl Session {
             self.js.adopt_runtime_settings(&settings);
             self.core_settings_initialized = true;
         }
-        // A direct pattern has no text to read the plugin chains from.
+        // A direct pattern has no text, so it has no lanes: each lane of the
+        // score before leaves.
         #[cfg(feature = "vst")]
         if result.is_ok() {
-            crate::vst::score_changed(&self.chains, None);
+            self.lanes.install_pattern();
+            let live = self.plugins_live();
+            crate::vst::score_changed(&self.chains, &self.lanes, None, live);
+            crate::vst::forget_lanes_away(&self.chains, &mut self.lanes);
+            #[cfg(feature = "device-audio")]
+            self.plugin_ahead.restart();
         }
         result
     }

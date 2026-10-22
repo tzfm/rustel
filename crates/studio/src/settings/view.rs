@@ -872,7 +872,11 @@ pub(super) fn render_keybind_rows(
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD)
-        } else if index < KEYBIND_ACTION_START || index == VIM_MAPPINGS_PATH_ROW || row.learnt {
+        } else if index < KEYBIND_ACTION_START
+            || index == VIM_MAPPINGS_PATH_ROW
+            || index == LIST_NAVIGATION_ROW
+            || row.learnt
+        {
             Style::default().fg(theme.foreground)
         } else {
             Style::default().fg(theme.muted)
@@ -898,7 +902,10 @@ pub(super) fn render_keybind_rows(
             1,
         );
         // Settings values use the whole row instead of the chord column.
-        if index < KEYBIND_ACTION_START || index == VIM_MAPPINGS_PATH_ROW {
+        if index < KEYBIND_ACTION_START
+            || index == VIM_MAPPINGS_PATH_ROW
+            || index == LIST_NAVIGATION_ROW
+        {
             cell(2, &format!("{}: {}", row.action, row.chord), width);
             continue;
         }
@@ -1350,9 +1357,15 @@ fn render_vst(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer: &mu
                     };
                     buffer.set_stringn(content_x, y, &text, content_width, style);
                 } else if let Some(plugin) = scanned.get(at - folders.len()) {
-                    // The plugin rows are read-only, as a standard folder
-                    // is: the scan is what changes them.
-                    let text = format!("{} {} · {}", marker(selected), plugin.name, plugin.state);
+                    // The scan adds and removes the plugin rows. A row says
+                    // its switch `audio thread only` when the switch is on.
+                    let tag = if plugin.audio_thread {
+                        " · audio thread only"
+                    } else {
+                        ""
+                    };
+                    let (name, state) = (&plugin.name, &plugin.state);
+                    let text = format!("{} {name} · {state}{tag}", marker(selected));
                     let style = if selected {
                         Style::default()
                             .fg(theme.accent)
@@ -1381,7 +1394,7 @@ fn render_vst(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer: &mu
     } else if at < VST_CONTROL_COUNT + folders.len() {
         "a standard folder stays on the list"
     } else {
-        "the list of every plugin the scan found"
+        "Space turns audio thread only on or off"
     };
     let footer = [
         plugins_found(view.vst.plugins),
