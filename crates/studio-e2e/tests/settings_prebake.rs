@@ -334,6 +334,50 @@ fn a_refused_prebake_is_not_applied_but_still_kept() {
     assert!(studio.score().contains("setcps(3)"));
 }
 
+/// A helper that only wraps a refused call is setup the checker takes:
+/// community prebakes hand scores a `bpm` helper that wraps `setcpm`, and
+/// defining it runs nothing - the call runs when a score calls the helper.
+/// Applying it used to refuse the whole prebake over the wrapper, and with
+/// it every helper the set needed.
+#[test]
+fn a_prebake_helper_that_wraps_a_refused_call_applies() {
+    let mut studio = hermetic();
+
+    studio.chord("ctrl+o");
+    select_row(&mut studio, "▸ local prebake");
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.set_score("window.bpm = b => setcpm(b/4)");
+    studio.chord("ctrl+s");
+    studio.settle();
+
+    assert_eq!(studio.status(), "prebake (local) applied");
+}
+
+/// Writing over a name the engine owns is a hint in the footer, never a
+/// refusal: the paste is kept, runs, and the footer says which native name
+/// it replaced.
+#[test]
+fn replacing_an_engine_name_says_so_without_refusing() {
+    let mut studio = hermetic();
+
+    studio.chord("ctrl+o");
+    select_row(&mut studio, "▸ local prebake");
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.set_score("window.note = (p) => p");
+    studio.chord("ctrl+s");
+    studio.settle();
+
+    assert_eq!(studio.status(), "prebake (local) applied");
+    assert!(
+        studio
+            .rows()
+            .iter()
+            .any(|row| row.contains("hint: ") && row.contains("`note`")),
+        "the footer names what the paste replaced:\n{}",
+        studio.rows().join("\n")
+    );
+}
+
 /// A blank prebake applies as nothing: the store is emptied, and the
 /// status says there was nothing to run.
 #[test]
