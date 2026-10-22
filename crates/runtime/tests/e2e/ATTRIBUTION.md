@@ -26,6 +26,10 @@ project and carry its AGPL-3.0 licence.
 
 - rustel maintainers
 
+## rustel - 1 score(s)
+
+- undy-aeon
+
 ## songs-awesome - 28 score(s)
 
 - awesome-strudel
