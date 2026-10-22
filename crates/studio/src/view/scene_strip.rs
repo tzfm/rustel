@@ -16,6 +16,19 @@ const STRIP_MARKER: u16 = 3;
 /// One dim separator cell between adjacent chips.
 const STRIP_SEPARATOR: u16 = 1;
 
+/// How much of its own colour the fill behind a held tab takes.
+const HELD_FILL: f32 = 0.22;
+
+/// How a tab, and the title of its pane, read when the other pane has the
+/// caret: the tab's own colour on a dim fill of it. A theme with no ground of
+/// its own has nothing to tint, so it keeps the colour alone. The tab and
+/// the title both come here, so the two always match.
+pub(super) fn held_style(theme: &Theme, colour: Color) -> Style {
+    Style::default()
+        .fg(colour)
+        .bg(crate::theme::mix(theme.surface, colour, HELD_FILL))
+}
+
 /// Where each chip of the strip lands, computed the same way it is drawn.
 /// A chip is `▶1 name ♪c1/10 ●` with a space of padding either side.
 ///
@@ -247,6 +260,11 @@ impl Widget for SceneStrip<'_> {
                 // one row above a pane's own title, which names the scene
                 // you are on, so the muted colour keeps the two rows apart.
                 (false, false, false) => Style::default().fg(theme.muted),
+            };
+            // A tab the other pane holds is open, but not where the caret is.
+            let style = match style.fg {
+                Some(colour) if chip.other_pane && !chip.current => held_style(theme, colour),
+                _ => style,
             };
             // A rename draft may be wider than the chip the hits were
             // measured for; it simply runs on to the right.
@@ -533,8 +551,8 @@ mod tests {
         assert!(text.contains("Enter renames"), "{text}");
     }
 
-    /// A score tab the other pane holds wears the accent colour. Tabs that
-    /// are nowhere open stay muted.
+    /// A score tab the other pane holds wears the accent colour on a dim
+    /// fill of it. Tabs that are nowhere open stay muted, on the plain strip.
     #[test]
     fn the_other_panes_chip_reads_as_open_beside_tabs_that_are_not() {
         let theme = theme();
@@ -556,7 +574,18 @@ mod tests {
         let cell = |chip: usize| buffer.cell((hits[chip].x, 1)).unwrap();
         assert_eq!(cell(0).bg, theme.accent);
         assert_eq!(cell(1).fg, theme.accent);
+        assert_eq!(
+            cell(1).bg,
+            crate::theme::mix(theme.surface, theme.accent, HELD_FILL)
+        );
+        assert_ne!(cell(1).bg, theme.surface, "the fill shows");
+        assert_ne!(
+            cell(1).bg,
+            theme.accent,
+            "and is dimmer than the current tab"
+        );
         assert_eq!(cell(2).fg, theme.muted);
+        assert_eq!(cell(2).bg, theme.surface);
     }
 
     /// A held tab that is also the one playing keeps the accent colour: the
@@ -582,6 +611,46 @@ mod tests {
         let hits = scene_strip_hits(area, &chips);
         let cell = |chip: usize| buffer.cell((hits[chip].x, 1)).unwrap();
         assert_eq!(cell(1).fg, theme.accent, "held beats playing in colour");
+    }
+
+    /// The pane the caret is not in reads like its tab on the strip: the
+    /// same colour on the same fill, so the two point at each other.
+    #[test]
+    fn the_unfocused_pane_title_matches_its_held_tab() {
+        let theme = theme();
+        let mut held = strip_chip("scene 1 2", false);
+        held.other_pane = true;
+        let chips = vec![strip_chip("scene 1", true), held];
+        let area = Rect::new(0, 1, 120, 1);
+        let mut strip = Buffer::empty(area);
+        SceneStrip {
+            keybinds: &crate::keybinds::Keybinds::default(),
+            chips: &chips,
+            mode: &SceneStripMode::Idle,
+            split: true,
+            capabilities: KeyboardCapabilities::enhanced(),
+            theme: &theme,
+        }
+        .render(area, &mut strip);
+        let mut title = Buffer::empty(area);
+        PaneTitle {
+            keybinds: &crate::keybinds::Keybinds::default(),
+            name: "scene 1 2",
+            dirty: false,
+            playing: false,
+            focused: false,
+            prebake: false,
+            replay: false,
+            theme: &theme,
+        }
+        .render(area, &mut title);
+
+        let tab = strip
+            .cell((scene_strip_hits(area, &chips)[1].x, 1))
+            .unwrap();
+        let pane = title.cell((area.x, 1)).unwrap();
+        assert_eq!((pane.fg, pane.bg), (tab.fg, tab.bg));
+        assert_ne!(pane.bg, theme.surface, "the fill shows");
     }
     #[cfg(test)]
     mod scene_separator_tests {

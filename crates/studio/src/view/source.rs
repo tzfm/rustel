@@ -67,10 +67,18 @@ impl Widget for PaneTitle<'_> {
                 .fg(theme.fill_text())
                 .bg(theme.accent)
                 .add_modifier(Modifier::BOLD)
-        } else if self.playing {
-            Style::default().fg(theme.ok)
         } else {
-            Style::default().fg(theme.foreground)
+            // The pane the caret is not in matches its tab on the strip.
+            held_style(
+                theme,
+                if self.prebake {
+                    theme.mini
+                } else if self.replay {
+                    theme.replay_colour()
+                } else {
+                    theme.accent
+                },
+            )
         };
         let title_width = UnicodeWidthStr::width(text.as_str());
         buffer.set_stringn(area.x, area.y, text, usize::from(area.width), style);

@@ -81,7 +81,8 @@ for Vim controls.
 In a split view, use **Ctrl+Shift+[ / Ctrl+Shift+]** to change scenes. F6 and F7
 also work. Each pane has its own caret and scroll position. A scene shows in one
 pane at a time. The tab of a score the other pane holds wears the accent
-colour. Tabs that are nowhere open stay muted. A click on the tab of a scene in
+colour on a dim fill, and so does the title of that pane. Tabs that are
+nowhere open stay muted. A click on the tab of a scene in
 the other pane keeps the caret in your pane, and F10 moves the caret to the
 other pane. A split does not create a second player.
 
