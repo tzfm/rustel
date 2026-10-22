@@ -522,6 +522,7 @@ fn wait_for_source_any(path: &std::path::Path, acceptable: &[&str], budget: Dura
 /// Answer the kitty keyboard query with every flag the studio asks for, the
 /// way a terminal with full support does. Shifted chords then keep their
 /// modifiers instead of folding to the legacy byte.
+#[cfg(unix)]
 fn answer_keyboard_query(terminal: &mut Terminal) {
     let query = b"\x1b[?u";
     let stop = Instant::now() + BOOT_BUDGET;
@@ -710,6 +711,8 @@ fn a_space_prefixed_vim_mapping_fires_in_a_real_terminal() {
 
 /// A composed key carries its text in the kitty sequence. The real terminal
 /// stream turns Option+4 into `$` in the editor and into the saved scene.
+/// The kitty keyboard protocol is a Unix terminal protocol.
+#[cfg(unix)]
 #[test]
 fn a_composed_key_types_its_text_in_a_real_terminal() {
     let binary = rustel_binary().expect("build `rustel` before the feature=pty suite");
@@ -758,6 +761,9 @@ fn a_composed_key_types_its_text_in_a_real_terminal() {
 
 /// Vim list keys leave the reference search in Command mode. A letter
 /// waits, i types, Esc returns to Command, and a second Esc closes.
+/// Windows ConPTY does not drive this key sequence reliably. The modal
+/// keys have unit and harness coverage.
+#[cfg(unix)]
 #[test]
 fn vim_list_keys_keep_the_reference_search_modal() {
     let binary = rustel_binary().expect("build `rustel` before the feature=pty suite");
@@ -843,6 +849,7 @@ fn vim_list_keys_keep_the_reference_search_modal() {
 /// A composed key is text. In Command mode it waits like any other letter.
 /// After i it types its character, the dollar sign Option+4 makes on a Mac
 /// ISO layout.
+#[cfg(unix)]
 #[test]
 fn a_composed_key_waits_for_insert_in_the_reference() {
     let binary = rustel_binary().expect("build `rustel` before the feature=pty suite");
