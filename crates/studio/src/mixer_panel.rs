@@ -911,10 +911,12 @@ fn devices_lines(facts: &MixerFacts, desk: Rect, theme: &Theme) -> Vec<(String, 
     };
     let midi = super::view::midi_chip_text(facts.midi_ports);
     let pad_glyph = super::terminal::symbol("▣");
+    // Said only when there is one: nearly nobody has a gamepad, and a row
+    // that says so is a row nobody needs.
     let pads = match facts.pads {
-        0 => format!("{pad_glyph} no gamepad"),
-        1 => format!("{pad_glyph} 1 gamepad"),
-        many => format!("{pad_glyph} {many} gamepads"),
+        0 => None,
+        1 => Some(format!("{pad_glyph} 1 gamepad")),
+        many => Some(format!("{pad_glyph} {many} gamepads")),
     };
     let mut rows = Vec::new();
     let mut y = desk.y;
@@ -923,8 +925,10 @@ fn devices_lines(facts: &MixerFacts, desk: Rect, theme: &Theme) -> Vec<(String, 
     if y >= desk.bottom() {
         return rows;
     }
-    rows.push((pads, lit(facts.pad_active)));
-    y += 1;
+    if let Some(pads) = pads {
+        rows.push((pads, lit(facts.pad_active)));
+        y += 1;
+    }
     // The pads first - a line each, few - then their own recent presses
     // and stick moves, then the last MIDI messages, newest at the bottom
     // of each, as many as fit.
@@ -1668,6 +1672,28 @@ mod tests {
         assert!(!lines[0].0.contains('⌁'), "{}", lines[0].0);
         assert!(lines[1].0.contains('#'), "{}", lines[1].0);
         assert!(!lines[1].0.contains('▣'), "{}", lines[1].0);
+    }
+
+    /// No gamepad is not news: the devices block has no row for it, and
+    /// says how many only when there is one.
+    #[test]
+    fn the_devices_lines_say_nothing_of_gamepads_when_there_are_none() {
+        let theme = Theme::built_in_default();
+        let desk = Rect::new(0, 0, 40, 10);
+        let mut none = facts();
+        none.pads = 0;
+        none.pads_live.clear();
+        none.gamepad_recent.clear();
+        let said = |facts: &MixerFacts| {
+            super::devices_lines(facts, desk, &theme)
+                .iter()
+                .any(|(line, _)| line.contains("gamepad"))
+        };
+        assert!(!said(&none));
+
+        let mut one = none;
+        one.pads = 1;
+        assert!(said(&one));
     }
 
     /// A column maps to its strip and the gap to none. A row maps to a level

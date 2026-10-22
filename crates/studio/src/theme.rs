@@ -1138,6 +1138,30 @@ impl Theme {
         self.replay.unwrap_or(self.warn)
     }
 
+    /// The colour of a pane: its tab on the strip, and its title. The first
+    /// pane wears the accent. The second wears the accent's hue turned a
+    /// sixth of the way round the colour wheel, with its saturation and
+    /// lightness kept, and nudged until it stands off the background as the
+    /// accent does: a neighbouring hue, so it belongs to the theme, and still
+    /// another colour, so the two read as two wherever the caret is. A
+    /// palette the terminal owns has no hue to turn, and the second pane
+    /// takes its `mini` colour instead. A grey accent has no hue either.
+    pub fn pane_colour(&self, pane: usize) -> Color {
+        if pane == 0 {
+            return self.accent;
+        }
+        true_rgb(self.accent).map_or(self.mini, |rgb| {
+            let (hue, saturation, lightness) = to_hsl(rgb);
+            readable(
+                hue + 60.0,
+                saturation,
+                lightness,
+                self.background,
+                ACCENT_CONTRAST,
+            )
+        })
+    }
+
     /// The text that reads on a filled chip: the background, where the
     /// theme owns one, and the palette's black where the terminal owns
     /// the ground. A palette keeps every accent readable on its black -
@@ -2527,6 +2551,30 @@ pub fn true_rgb(color: Color) -> Option<(u8, u8, u8)> {
 /// footer's master - because two caps blended differently read as two
 /// different controls.
 pub const FADER_HANDLE_OPACITY: f32 = 0.5;
+
+/// RGB to the hue (degrees), saturation and lightness [`hsl`] takes.
+fn to_hsl((red, green, blue): (u8, u8, u8)) -> (f64, f64, f64) {
+    let (red, green, blue) = (
+        f64::from(red) / 255.0,
+        f64::from(green) / 255.0,
+        f64::from(blue) / 255.0,
+    );
+    let (high, low) = (red.max(green).max(blue), red.min(green).min(blue));
+    let lightness = (high + low) / 2.0;
+    let spread = high - low;
+    if spread == 0.0 {
+        return (0.0, 0.0, lightness);
+    }
+    let saturation = spread / (1.0 - (2.0 * lightness - 1.0).abs());
+    let sector = if high == red {
+        ((green - blue) / spread).rem_euclid(6.0)
+    } else if high == green {
+        (blue - red) / spread + 2.0
+    } else {
+        (red - green) / spread + 4.0
+    };
+    (60.0 * sector, saturation, lightness)
+}
 
 /// Mix `left` towards `right` by `right_amount`, 0 through 1.
 pub fn mix(left: Color, right: Color, right_amount: f32) -> Color {
@@ -3994,6 +4042,52 @@ mod tests {
         let theme = Theme::built_in_default();
         let error = save_named(&theme, "rustel-dark").expect_err("refused");
         assert!(error.to_string().contains("built in"), "{error}");
+    }
+
+    /// The first pane is the accent and the second is one other colour, the
+    /// same on every call. It keeps the accent's brightness. A palette the
+    /// terminal owns has no hue to turn, so there it is the `mini` colour.
+    #[test]
+    fn the_second_pane_has_its_own_steady_colour() {
+        let mut theme = Theme::built_in(DEFAULT_THEME).unwrap();
+        theme.accent = Color::Rgb(255, 92, 168);
+        assert_eq!(theme.pane_colour(0), theme.accent);
+        let second = theme.pane_colour(1);
+        assert_ne!(second, theme.accent);
+        assert_eq!(second, theme.pane_colour(1), "the same every time");
+        assert!(
+            contrast_ratio(second, theme.background) >= ACCENT_CONTRAST - 0.05,
+            "{second:?} does not stand off the background"
+        );
+
+        // A blue theme stays blue: the second colour is a neighbouring hue,
+        // not the far side of the wheel.
+        theme.accent = Color::Rgb(37, 201, 255);
+        let Color::Rgb(red, green, blue) = theme.pane_colour(1) else {
+            panic!("a true-colour accent gives a true-colour pane colour");
+        };
+        assert!(
+            blue >= red && blue >= green,
+            "({red}, {green}, {blue}) left the blue family"
+        );
+        assert_ne!(theme.pane_colour(1), theme.accent);
+
+        let terminal = Theme::built_in("terminal").expect("terminal ships");
+        assert_eq!(terminal.pane_colour(0), terminal.accent);
+        assert_eq!(terminal.pane_colour(1), terminal.mini);
+        assert_ne!(terminal.pane_colour(1), terminal.pane_colour(0));
+    }
+
+    #[test]
+    fn to_hsl_reads_back_the_hue_hsl_wrote() {
+        for hue in [0.0, 40.0, 120.0, 195.0, 260.0, 330.0] {
+            let rgb = true_rgb(hsl(hue, 0.8, 0.6)).unwrap();
+            let (read, saturation, lightness) = to_hsl(rgb);
+            assert!((read - hue).abs() < 1.5, "hue {hue} read as {read}");
+            assert!((saturation - 0.8).abs() < 0.02, "saturation {saturation}");
+            assert!((lightness - 0.6).abs() < 0.01, "lightness {lightness}");
+        }
+        assert_eq!(to_hsl((128, 128, 128)).1, 0.0, "a grey has no saturation");
     }
 
     /// A palette colour cannot be blended, so a mix that touches one snaps

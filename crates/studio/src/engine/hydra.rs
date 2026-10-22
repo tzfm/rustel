@@ -1,5 +1,42 @@
 use super::*;
 
+/// The log alert under which a refused camera is raised and later resolved.
+#[cfg(feature = "hydra")]
+const CAMERA_ALERT: &str = "hydra:camera";
+
+/// A Hydra failure as the log says it. A refused camera is a condition, not
+/// an event: it stands until nothing asks for the camera, so it is raised
+/// under a key that [`settle_camera_alert`] resolves.
+#[cfg(feature = "hydra")]
+fn hydra_diagnostic(message: String) -> StudioDiagnostic {
+    let blocked = message.ends_with(rustel_runtime::hydra::WEBCAM_BLOCKED_HINT);
+    let diagnostic = StudioDiagnostic::message("hydra", message);
+    if blocked {
+        diagnostic.raising(CAMERA_ALERT)
+    } else {
+        diagnostic
+    }
+}
+
+/// Resolve the camera alert once a theme or score stops asking for the
+/// camera, or Settings allows it. The log keeps the line as history.
+#[cfg(feature = "hydra")]
+fn settle_camera_alert(
+    pending: &mut PendingDiagnostics,
+    policy: &rustel_runtime::hydra::HydraInputPolicy,
+) {
+    // Only while the alert stands: nothing to read on an ordinary turn.
+    if !pending.alert_keys.contains(CAMERA_ALERT) {
+        return;
+    }
+    let status = policy.webcam_status();
+    let refused =
+        status.requested && status.state == rustel_runtime::hydra::HydraWebcamState::Blocked;
+    if !refused {
+        queue_diagnostic(pending, StudioDiagnostic::resolve(CAMERA_ALERT));
+    }
+}
+
 impl StudioEngine {
     /// What the snippet shelf wants shown, if anything has changed.
     ///
@@ -117,11 +154,9 @@ impl StudioEngine {
             hydra.audio(&rustel_runtime::hydra::audio_frame(rms, &frame.spectrum));
         }
         for message in trouble {
-            queue_diagnostic(
-                &mut self.pending_diagnostics,
-                StudioDiagnostic::message("hydra", message),
-            );
+            queue_diagnostic(&mut self.pending_diagnostics, hydra_diagnostic(message));
         }
+        settle_camera_alert(&mut self.pending_diagnostics, &hydra.input_policy());
         note.map(|message| StudioDiagnostic::info("hydra", message))
     }
 
@@ -139,6 +174,53 @@ impl StudioEngine {
 mod tests {
     use super::*;
     use crate::engine::tests::*;
+
+    /// A refused camera warns under a key. The warning resolves when nothing
+    /// asks for the camera any more, or when Settings allows it, and the
+    /// other Hydra failures carry no key.
+    #[test]
+    fn a_refused_camera_warning_resolves_when_the_request_ends() {
+        let blocked = hydra_diagnostic(format!(
+            "Hydra s0: webcam theme blocked; {}",
+            rustel_runtime::hydra::WEBCAM_BLOCKED_HINT
+        ));
+        assert_eq!(
+            blocked.alert,
+            Some(DiagnosticAlert::Raise(CAMERA_ALERT.into()))
+        );
+        assert_eq!(
+            hydra_diagnostic("Hydra s0: no such image".into()).alert,
+            None
+        );
+
+        let resolves = |pending: &PendingDiagnostics| {
+            pending.iter().any(|diagnostic| {
+                diagnostic.alert == Some(DiagnosticAlert::Resolve(CAMERA_ALERT.into()))
+            })
+        };
+        let bridge = rustel_runtime::hydra::HydraBridge::new();
+        let policy = bridge.input_policy();
+
+        // Asked for and refused: the warning stands.
+        policy.set_settings_preview_requested(true);
+        let mut pending = PendingDiagnostics::default();
+        queue_diagnostic(&mut pending, blocked.clone());
+        settle_camera_alert(&mut pending, &policy);
+        assert!(!resolves(&pending));
+
+        // Nothing asks for it any more.
+        policy.set_settings_preview_requested(false);
+        settle_camera_alert(&mut pending, &policy);
+        assert!(resolves(&pending));
+
+        // Still asked for, but Settings now allows it.
+        let mut pending = PendingDiagnostics::default();
+        queue_diagnostic(&mut pending, blocked);
+        policy.set_settings_preview_requested(true);
+        policy.set_webcam_allowed(true);
+        settle_camera_alert(&mut pending, &policy);
+        assert!(resolves(&pending));
+    }
 
     /// Two chains that fail differently in one frame each reach the
     /// diagnostics once, through the queue a full channel holds.
