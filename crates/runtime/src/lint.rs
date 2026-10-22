@@ -565,6 +565,18 @@ fn lint_with_scan(
             });
         }
     }
+    // A paste that replaces an engine name changes what every score that
+    // follows means by that name. That is worth saying without standing in
+    // the way: the write is kept, the engine runs it, and the hint says
+    // which of its own names was replaced.
+    for (from, to, message) in replaced_engine_names(source, context.mode) {
+        notes.push(Diagnostic {
+            level: Level::Note,
+            message,
+            from,
+            to,
+        });
+    }
 
     // A call to a name nothing answers to fails the moment the update
     // runs (`lpff is not a function`), so it is a finding now, with the
@@ -1348,11 +1360,30 @@ const JAVASCRIPT_GLOBALS: &[&str] = &[
     "with",
 ];
 
+/// The names a setup may not call, however the engine spells them.
+#[cfg(not(feature = "hydra"))]
+const REFUSED_SETUP_CALLS: &[&str] = &["setcps", "setCps", "setcpm", "setCpm", "midin", "midikeys"];
+#[cfg(feature = "hydra")]
+const REFUSED_SETUP_CALLS: &[&str] = &[
+    "setcps",
+    "setCps",
+    "setcpm",
+    "setCpm",
+    "midin",
+    "midikeys",
+    "initHydra",
+    "H",
+];
+
 /// Calls a setup file may not make, with the engine's own reason.
 ///
 /// Read from the code alone, like every other check here: a name in a
-/// comment or a string is not a call, and one the setup declares itself is
-/// the setup's own function rather than the engine's.
+/// comment or a string is not a call, a method of something else is not
+/// this name, and one the setup binds itself is the setup's own function
+/// rather than the engine's. A call inside a helper the setup only defines
+/// is not made here - it runs when a score calls that helper, where the
+/// engine allows it - and one a setup hides behind a helper it does call
+/// is still refused by the engine when the setup runs.
 fn refused_setup_calls(source: &str) -> Vec<(usize, usize, String)> {
     /// Every name and the policy the engine would answer with.
     fn policy(name: &str) -> Option<&'static str> {
@@ -1365,61 +1396,46 @@ fn refused_setup_calls(source: &str) -> Vec<(usize, usize, String)> {
         }
     }
 
-    let code = code_only(source);
-    let bytes = code.as_bytes();
-    let mut identifiers = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        match scan::identifier_at(&code, index) {
-            Some(name) => {
-                index = name.end;
-                identifiers.push((name.start, name.end));
-            }
-            None => index += 1,
-        }
-    }
-
-    // A setup that declares the name itself is calling its own function, and
-    // the engine's policy has nothing to say about it.
-    let own = identifiers
-        .iter()
-        .filter(|&&(start, end)| {
-            matches!(
-                word_before_in(&code, start),
-                Some("function" | "class" | "const" | "let" | "var")
-            ) && policy(&code[start..end]).is_some()
+    rustel_transpiler::running_calls(source, REFUSED_SETUP_CALLS)
+        .into_iter()
+        .filter_map(|(name, span)| {
+            policy(&name).map(|policy| {
+                (
+                    span.start,
+                    span.end,
+                    format!("`{name}` cannot run in a prebake - {policy}"),
+                )
+            })
         })
-        .map(|&(start, end)| &code[start..end])
-        .collect::<HashSet<_>>();
-
-    let mut refused = Vec::new();
-    for &(start, end) in &identifiers {
-        let name = &code[start..end];
-        let Some(policy) = policy(name) else {
-            continue;
-        };
-        if own.contains(name) {
-            continue;
-        }
-        // A method of something else - `clock.setCps(1)` - is not this name.
-        if scan::dot_before(&code, start).is_some() {
-            continue;
-        }
-        if bytes.get(scan::space_after(&code, end)) != Some(&b'(') {
-            continue;
-        }
-        refused.push((
-            start,
-            end,
-            format!("`{name}` cannot run in a prebake - {policy}"),
-        ));
-    }
-    refused
+        .collect()
 }
 
-/// The word immediately before `at`, skipping whitespace.
-fn word_before_in(code: &str, at: usize) -> Option<&str> {
-    scan::name_before(code, at).map(|name| &code[name])
+/// Writes over a name the engine already answers to, with where the name
+/// was written.
+///
+/// A setup that replaces an engine name is news, not an error: the write is
+/// legitimate and kept, and knowing that `window.note = …` changed what
+/// every later score means by `note` is the useful part. A score's own
+/// writes are restored on its next turn, so it says only that they replace
+/// it. `register(...)` is not read here: the engine seals its own names and
+/// answers a sealed one with a refusal of its own.
+fn replaced_engine_names(source: &str, mode: LintMode) -> Vec<(usize, usize, String)> {
+    let known = known_names();
+    let once = match mode {
+        LintMode::Setup => "for every score that follows",
+        LintMode::Score => "for the rest of this turn",
+    };
+    rustel_transpiler::global_writes(source)
+        .into_iter()
+        .filter(|(name, _)| known.contains(name.as_str()))
+        .map(|(name, span)| {
+            (
+                span.start,
+                span.end,
+                format!("`{name}` is the engine's own name - this write replaces it {once}"),
+            )
+        })
+        .collect()
 }
 
 fn unknown_calls(
@@ -3054,6 +3070,95 @@ mod tests {
                 "a mention was read as a call: {source}"
             );
         }
+    }
+
+    /// A helper that wraps a refused call is setup defining a function, not
+    /// calling one. Community prebakes hand scores a `bpm` that wraps
+    /// `setcpm`, and the call runs when a score calls the helper - where a
+    /// tempo change is allowed. Refusing the definition used to reject the
+    /// whole prebake over the wrapper, and with it every helper the set
+    /// needed.
+    #[test]
+    fn a_prebake_helper_that_wraps_a_refused_call_is_not_refused() {
+        let setup = LintContext::default().as_setup();
+        // The line a shared prebake pastes, verbatim.
+        let kt = "window.bpm=b=>setcpm(b/4)";
+        for source in [
+            kt,
+            "const later = b => setcpm(b / 4)\n",
+            "function bpm(b) { return setcpm(b / 4) }\n",
+            "globalThis.helper = { run: () => setcps(2) }\n",
+            "const wrap = () => { setcps(1) }\n",
+            // A wrapper the setup calls itself runs in setup, and the
+            // engine says so in the same words when the setup runs - the
+            // lint reads syntax, not the bindings behind it.
+            "const bpm = b => setcpm(b / 4)\nbpm(128)\n",
+            "window.bpm = b => setcpm(b / 4)\nbpm(128)\n",
+        ] {
+            assert!(
+                lint_with(source, false, None, &setup)
+                    .iter()
+                    .all(|finding| !finding.message.contains("cannot run in a prebake")),
+                "a helper a setup only defines was read as its call: {source}"
+            );
+        }
+        // A call the file makes itself, in the words the file writes it.
+        for source in ["(() => setcps(1))()\n", "setcps(1)\n"] {
+            assert!(
+                lint_with(source, false, None, &setup)
+                    .iter()
+                    .any(|finding| finding.message.contains("cannot run in a prebake")),
+                "a call the setup itself makes went unseen: {source}"
+            );
+        }
+    }
+
+    /// Writing over an engine name is a hint, never a refusal: the paste is
+    /// kept, runs, and the musician is told which native name it replaced.
+    #[test]
+    fn replacing_an_engine_name_is_a_hint_not_a_problem() {
+        let setup = LintContext::default().as_setup();
+        let source = "window.note = (p) => p";
+        let findings = lint_with(source, false, None, &setup);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].level, Level::Note);
+        assert_eq!(&source[findings[0].from..findings[0].to], "note");
+        assert!(
+            findings[0]
+                .message
+                .contains("`note` is the engine's own name - this write replaces it"),
+            "{}",
+            findings[0].message
+        );
+        assert!(
+            rejection_with(source, false, None, &setup).is_none(),
+            "a hint refused a prebake"
+        );
+
+        // Every surface counts: the global object, its alias, the pattern
+        // methods, and both Object helpers that write through it.
+        for source in [
+            "globalThis.stack = () => note('c')",
+            "Pattern.prototype.slow = (p) => p",
+            "Object.assign(globalThis, { note: (p) => p })",
+            "Object.defineProperty(window, 'hush', { value: 1 })",
+        ] {
+            let findings = lint_with(source, false, None, &setup);
+            assert_eq!(findings.len(), 1, "{source}: {findings:?}");
+            assert_eq!(findings[0].level, Level::Note, "{source}: {findings:?}");
+        }
+
+        // A name the engine does not answer to is a plain definition, and a
+        // score that writes an engine name is told what its turn replaces.
+        assert!(lint_with("globalThis.riff = () => note('c')", false, None, &setup).is_empty());
+        let findings = lint_with(
+            "window.note = (p) => p",
+            false,
+            None,
+            &LintContext::default(),
+        );
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].message.contains("for the rest of this turn"));
     }
 
     /// A top-level declaration in a setup is a note: it reads like a
