@@ -59,6 +59,7 @@ mod min;
 mod mpan;
 mod noisehat;
 mod notearp;
+mod oneshot;
 mod operand;
 mod over;
 mod overin;
@@ -170,6 +171,7 @@ const PREBAKE_REFERENCES: &[ReferenceEntry] = &[
     roller::REFERENCE,
     roller2::REFERENCE,
     to_major_key::REFERENCE,
+    oneshot::REFERENCE,
 ];
 
 const PATTERN_STATES: &[PatternState] = &[cue::STATE, scale::STATE];
@@ -202,6 +204,7 @@ const PATTERN_CALLABLES: &[PatternCallable] = &[
     zap::CALLABLE,
     roller::CALLABLE,
     roller2::CALLABLE,
+    oneshot::CALLABLE,
 ];
 
 const VALUE_CALLABLES: &[ValueCallable] = &[to_major_key::CALLABLE];
