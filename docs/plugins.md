@@ -138,6 +138,12 @@ The scan makes a folder for each plugin it finds, so the folder names show
 the exact plugin names. The preset name, as the plugin name, ignores upper
 case, spaces and punctuation.
 
+Any folder of `.vstpreset` files works too, in any structure: Settings ▸
+VST ▸ `add preset folder` adds one. Each file names its plugin in its
+header, so rustel finds the presets of a plugin in every folder you added,
+and the plugin rows of the page say the count. Enter on a plugin row lists
+its presets.
+
 A plugin call with no `preset` plays `default.vstpreset` when the folder of
 the plugin has one. Save the start sound of a plugin there, and each call
 starts with it:

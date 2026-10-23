@@ -1053,6 +1053,14 @@ impl App {
                 return true;
             }
             #[cfg(feature = "vst")]
+            SettingsAction::AddPresetFolder => {
+                self.settings_sheet = Some(sheet);
+                self.open_set_prompt(SetPrompt::AddPresetFolder);
+                #[cfg(feature = "hydra")]
+                self.sync_settings_webcam_preview();
+                return true;
+            }
+            #[cfg(feature = "vst")]
             SettingsAction::RemoveVstFolder(at) => {
                 self.remove_vst_folder(at);
                 // The list is one row shorter, and the cursor stays on a row.
@@ -1063,11 +1071,23 @@ impl App {
                 sheet.selected = sheet.selected.min(rows - 1);
             }
             #[cfg(feature = "vst")]
+            SettingsAction::RemovePresetFolder(at) => {
+                self.remove_preset_folder(at);
+                self.count_vst_folders(&mut sheet);
+                let rows = super::super::settings::VST_CONTROL_COUNT
+                    + sheet.vst_folder_count
+                    + sheet.vst_standard_count
+                    + sheet.vst_preset_folder_count;
+                sheet.selected = sheet.selected.min(rows - 1);
+            }
+            #[cfg(feature = "vst")]
             SettingsAction::ScanVst => self.scan_vst(),
             #[cfg(feature = "vst")]
             SettingsAction::RescanVst => self.rescan_vst(),
             #[cfg(feature = "vst")]
             SettingsAction::ToggleAudioThread(at) => self.toggle_audio_thread(at),
+            #[cfg(feature = "vst")]
+            SettingsAction::ToggleVstPresets(at) => self.toggle_vst_presets(&mut sheet, at),
         }
         // The keybind learn belongs to the Keybinds page: Tabbed away
         // from it - or closed by any door the sheet has - the learn goes

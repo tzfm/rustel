@@ -240,10 +240,23 @@ impl App {
         vst::set_user_folders(self.prefs.vst_folders.iter().map(PathBuf::from).collect());
     }
 
+    /// Gives the host the preset folders the player added, and the host
+    /// reads the preset folders again.
+    pub(super) fn adopt_preset_folders(&self) {
+        vst::set_preset_folders(
+            self.prefs
+                .preset_folders
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
+        );
+    }
+
     /// Tells the sheet how far the cursor of the vst page goes.
     pub(super) fn count_vst_folders(&self, sheet: &mut SettingsSheet) {
         sheet.vst_folder_count = self.prefs.vst_folders.len();
         sheet.vst_standard_count = vst::standard_folders().len();
+        sheet.vst_preset_folder_count = self.prefs.preset_folders.len();
         sheet.vst_scanned_count = vst::host().plugins().len();
     }
 
@@ -268,6 +281,12 @@ impl App {
                         .map(|path| folder(path, true)),
                 )
                 .collect(),
+            preset_folders: self
+                .prefs
+                .preset_folders
+                .iter()
+                .map(|path| folder(PathBuf::from(path), false))
+                .collect(),
             scanned: plugins
                 .iter()
                 .map(|plugin| settings::VstScanned {
@@ -282,13 +301,12 @@ impl App {
                         }
                     },
                     audio_thread: plugin.audio_thread,
+                    presets: plugin.presets,
                 })
                 .collect(),
             plugins: plugins.len(),
             scan: self.plugin_scan.clone(),
-            presets: vst::presets_folder()
-                .map(|presets| shorten_home(&presets))
-                .unwrap_or_default(),
+            open_presets: self.settings_vst_open_presets.clone(),
         }
     }
 
@@ -352,6 +370,79 @@ impl App {
             "{} removed",
             status_file_path(&gone, self.ui_settings.show_full_paths)
         );
+    }
+
+    /// The folder the picker gave goes on the list, and the host reads the
+    /// preset folders again. The cursor goes to the new row.
+    pub(super) fn add_preset_folder(&mut self, path: &std::path::Path) {
+        if !path.is_dir() {
+            if let Some((_, picker)) = self.set_prompt.as_mut() {
+                picker.error = Some(format!("cannot use {}: not a folder", path.display()));
+            }
+            return;
+        }
+        self.close_set_prompt();
+        let path = &std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let label = status_file_path(path, self.ui_settings.show_full_paths);
+        let folder = path.to_string_lossy().into_owned();
+        let known = self
+            .prefs
+            .preset_folders
+            .iter()
+            .position(|at| *at == folder);
+        let row = known.unwrap_or(self.prefs.preset_folders.len());
+        if known.is_none() {
+            self.prefs.preset_folders.push(folder);
+            self.save_prefs_soon();
+            self.adopt_preset_folders();
+        }
+        if let Some(sheet) = self.settings_sheet.as_mut() {
+            // The page counts one row more, and the cursor lands on it:
+            // the keys of the page reach the new row.
+            sheet.vst_preset_folder_count = self.prefs.preset_folders.len();
+            sheet.select(
+                settings::VST_CONTROL_COUNT
+                    + self.prefs.vst_folders.len()
+                    + sheet.vst_standard_count
+                    + row,
+            );
+        }
+        self.status = if known.is_some() {
+            format!("{label} is on the list")
+        } else {
+            format!("{label} added")
+        };
+        self.dirty_frame = true;
+    }
+
+    /// `d` on a preset folder the player added.
+    pub(super) fn remove_preset_folder(&mut self, at: usize) {
+        if at >= self.prefs.preset_folders.len() {
+            return;
+        }
+        let gone = PathBuf::from(self.prefs.preset_folders.remove(at));
+        self.save_prefs_soon();
+        self.adopt_preset_folders();
+        self.status = format!(
+            "{} removed",
+            status_file_path(&gone, self.ui_settings.show_full_paths)
+        );
+    }
+
+    /// Enter on a plugin row: the row opens its presets, the names of the
+    /// `.vstpreset` files the folders hold for the plugin. The names come
+    /// with the read of the folders: see [`Self::poll_plugins`].
+    pub(super) fn toggle_vst_presets(&mut self, sheet: &mut SettingsSheet, at: usize) {
+        if sheet.vst_open == Some(at) {
+            sheet.vst_open = None;
+            sheet.vst_presets_due = false;
+        } else {
+            sheet.vst_open = Some(at);
+            sheet.vst_presets_due = true;
+        }
+        sheet.vst_open_count = 0;
+        self.settings_vst_open_presets.clear();
+        self.dirty_frame = true;
     }
 
     /// Enter on the scan row. A plugin with an answer in the scan cache
@@ -500,6 +591,23 @@ impl App {
             if let Some(sheet) = self.settings_sheet.as_mut() {
                 self.dirty_frame |= sheet.vst_scanned_count != count;
                 sheet.vst_scanned_count = count;
+                // The host reads the preset folders on its own thread. An
+                // open plugin row asks again on each poll until the names
+                // of its presets are here, and asks once more when a read
+                // changes the count the row holds.
+                if let Some(open) = sheet.vst_open
+                    && let Some(plugin) = vst::host().plugins().get(open)
+                {
+                    sheet.vst_presets_due |= plugin.presets != sheet.vst_open_count;
+                    if sheet.vst_presets_due
+                        && let Some(presets) = vst::host().presets(&plugin.name)
+                    {
+                        self.settings_vst_open_presets = presets;
+                        sheet.vst_open_count = self.settings_vst_open_presets.len();
+                        sheet.vst_presets_due = false;
+                        self.dirty_frame = true;
+                    }
+                }
             }
         }
         // The list of background jobs has a row for the scan and a row

@@ -862,6 +862,10 @@ struct App {
     /// The plugin rows of the memory breakdown, as last measured.
     #[cfg(feature = "vst")]
     plugin_memory: Vec<super::memory::PluginMemory>,
+    /// The presets of the settings vst page's open plugin row, as the host
+    /// last read them: see [`SettingsSheet::vst_open`].
+    #[cfg(feature = "vst")]
+    settings_vst_open_presets: Vec<String>,
     linter: Linter,
     /// The newest finding per scene, in the coordinates of the revision
     /// it was checked at.
@@ -1641,6 +1645,8 @@ impl App {
             #[cfg(feature = "vst")]
             plugin_loads: Vec::new(),
             #[cfg(feature = "vst")]
+            settings_vst_open_presets: Vec::new(),
+            #[cfg(feature = "vst")]
             plugin_scan: None,
             #[cfg(feature = "vst")]
             plugin_memory: Vec::new(),
@@ -1950,7 +1956,10 @@ impl App {
         app.adopt_global_sources();
         app.refresh_catalogue();
         #[cfg(feature = "vst")]
-        app.adopt_vst_folders();
+        {
+            app.adopt_vst_folders();
+            app.adopt_preset_folders();
+        }
         // Laid out the way the set was left: the same scores in the same
         // panes, with the caret in the pane that had it.
         app.restore_panes();
