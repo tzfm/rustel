@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Sample and manifest fetches retry a transient 429 or 5xx after a short rest, so a briefly overloaded sample host no longer fails a corpus run.
 
 - A rail in the knobs column sounds while it moves, the way a score slider does. Before, the change waited for the typing pause.
 - Each pane in a split has its own colour, and a click on a tab moves the caret to that pane.
