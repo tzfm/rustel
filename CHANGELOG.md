@@ -21,6 +21,7 @@
 - A drag or a notch on any slider can land back on a whole number.
 - `getTime()` reads 0 when a score starts from its first cycle: Play after a stop, a restart or a rewind. Before, it kept the old cycle, so a pattern placed with it played late. A failed update that falls back to the last score gives that score its first value again.
 - New `oneshot(grid)` from Switch Angel plays a pattern once, on the next grid line after the update.
+- In Windows Terminal, a syntax error no longer leaves stray coloured cells across the screen. The studio now sends underline colours in the colon form that Windows Terminal reads.
 
 ### Sound changes
 
