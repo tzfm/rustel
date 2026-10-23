@@ -3265,6 +3265,38 @@ endin`";
         assert_eq!(play(&mut session, &with("low")).expect("low"), low);
     }
 
+    /// A score takes a built-in name with `register`, the log says so once,
+    /// and the engine's version answers again once the call is gone.
+    #[test]
+    fn register_takes_a_builtin_and_gives_it_back() {
+        fn play(session: &mut Session, source: &str) -> Result<Vec<String>, RuntimeError> {
+            session.evaluate(source).map(|()| active_values(session))
+        }
+        let mut session = Session::new().expect("session");
+        let engine = play(&mut session, "$: note(0).oneshot(4)").expect("built-in oneshot");
+        let over = "register('oneshot', (grid, pat) => pat.add(note(24)))\n$: note(0).oneshot(4)";
+        let taken = play(&mut session, over).expect("register takes the built-in");
+        assert_ne!(taken, engine);
+        assert_eq!(
+            play(&mut session, over).expect("second update"),
+            taken,
+            "the taken name stays the score's across updates"
+        );
+        let noticed = session.js.take_logs();
+        assert_eq!(
+            noticed
+                .iter()
+                .filter(|line| line.contains("replaces the built-in 'oneshot' (switch angel)"))
+                .count(),
+            1,
+            "said once across updates: {noticed:?}"
+        );
+        assert_eq!(
+            play(&mut session, "$: note(0).oneshot(4)").expect("engine oneshot again"),
+            engine
+        );
+    }
+
     #[test]
     fn cancellation_after_setup_staging_discards_the_whole_transaction() {
         use std::sync::atomic::Ordering;
