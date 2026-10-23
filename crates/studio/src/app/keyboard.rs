@@ -470,7 +470,7 @@ impl App {
             && self
                 .reference_panel
                 .as_ref()
-                .is_some_and(|panel| matches!(panel.tab, crate::reference::Tab::Samples))
+                .is_some_and(|panel| crate::reference::tab_previews(panel.tab))
     }
 
     pub(super) fn route_terminal_event(
