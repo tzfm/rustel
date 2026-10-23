@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A `$:` typed with no chain under it no longer doubles the lane above it. A label with no code changes no sound.
 - A rail in the knobs column sounds while it moves, the way a score slider does. Before, the change waited for the typing pause.
 - Each pane in a split has its own colour, and a click on a tab moves the caret to that pane.
 - Studio reloads scores when another program saves them.

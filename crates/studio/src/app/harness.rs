@@ -696,6 +696,13 @@ impl Studio {
         self.app.master.gain_db()
     }
 
+    /// The loudest master sample since the last read, the meter's own
+    /// reading. A test pumps in a wall-clock loop and takes the worst of
+    /// these, the way the meter does across turns.
+    pub fn master_peak(&mut self) -> f32 {
+        self.app.worker.master().take_levels().peak
+    }
+
     /// Replace the focused scene's whole score - the way a paste of a
     /// complete score would, without a test typing it key by key. The
     /// caret ends after the last inserted byte, where a paste leaves it.

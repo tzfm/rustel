@@ -975,7 +975,8 @@ pub struct TranspileOptions {
     /// reads the labeled statements with [`lane_statements`]. The label
     /// rewrite writes each number as the second argument of `.p()`. It does
     /// not use a list with a different count. See
-    /// [`TranspileOutput::lanes_by_place`].
+    /// [`TranspileOutput::lanes_by_place`]. A label with no code is no
+    /// lane, here and in the rewrite.
     pub lane_numbers: Vec<u64>,
 }
 
@@ -4017,6 +4018,16 @@ struct Scanned {
     end: usize,
 }
 
+/// Whether a labeled statement has code to play. A label with no code -
+/// a `$:` at the end of the text, still waiting for its chain - is no
+/// lane: its `.p()` would glue onto the chain of the statement above,
+/// which stacks that lane a second time.
+fn label_has_code(source: &str, statement: &Scanned, regexes_are_present: bool) -> bool {
+    let body = &source[statement.body_start..statement.end];
+    let (chain, _) = split_trailing_trivia(body, regexes_are_present);
+    !chain.trim().is_empty()
+}
+
 /// The top-level statements of `source`, in source order.
 ///
 /// The label rewrite and [`lane_statements`] share this scan, so they find
@@ -4145,6 +4156,10 @@ fn scan_statements(source: &str, regexes_are_present: bool) -> Vec<Scanned> {
 /// Every labeled statement is rewritten even when non-label statements appear
 /// before it, as in `setcpm(140/4)` followed by `$: s("bd*4")`.
 ///
+/// A label with no code is dropped rather than rewritten: its `.p()`, glued
+/// onto the chain of the statement above, would stack that lane a second
+/// time. A `$:` at the end of the text changes no sound.
+///
 /// The second argument of `.p()` is the lane number of the statement.
 /// `lane_numbers` has one number for each labeled statement, in source order.
 /// With no numbers, or with a different count, the second argument is the
@@ -4153,11 +4168,14 @@ fn scan_statements(source: &str, regexes_are_present: bool) -> Vec<Scanned> {
 fn rewrite_labels(source: &str, regexes_are_present: bool, lane_numbers: &[u64]) -> (String, bool) {
     let bytes = source.as_bytes();
     let statements = scan_statements(source, regexes_are_present);
+    let is_lane = |statement: &Scanned| {
+        statement.colon.is_some() && label_has_code(source, statement, regexes_are_present)
+    };
     let labeled = statements
         .iter()
-        .filter(|statement| statement.colon.is_some())
+        .filter(|statement| is_lane(statement))
         .count();
-    if labeled == 0 {
+    if statements.iter().all(|statement| statement.colon.is_none()) {
         return (source.to_string(), false);
     }
     let by_place = lane_numbers.len() != labeled;
@@ -4166,14 +4184,15 @@ fn rewrite_labels(source: &str, regexes_are_present: bool, lane_numbers: &[u64])
     let mut place = 0usize;
 
     for statement in statements {
+        let statement_is_lane = is_lane(&statement);
         let Scanned {
             start: statement_start,
             name_end,
-            colon: Some(colon_at),
+            colon,
             body_start,
             mut end,
-        } = statement
-        else {
+        } = statement;
+        let Some(colon_at) = colon else {
             continue;
         };
         output.push_str(&source[cursor..statement_start]);
@@ -4189,17 +4208,19 @@ fn rewrite_labels(source: &str, regexes_are_present: bool, lane_numbers: &[u64])
         // A trailing line comment is part of the scanned span; `.p()`
         // appended after it would be commented out and the lane lost.
         let (chain, trivia) = split_trailing_trivia(body, regexes_are_present);
-        output.push_str(chain.trim_end());
-        output.push_str(".p(");
-        output.push_str(&quote_single(name));
-        output.push_str(", ");
-        if by_place {
-            output.push_str(&place.to_string());
-        } else {
-            output.push_str(&lane_numbers[place].to_string());
+        if statement_is_lane {
+            output.push_str(chain.trim_end());
+            output.push_str(".p(");
+            output.push_str(&quote_single(name));
+            output.push_str(", ");
+            if by_place {
+                output.push_str(&place.to_string());
+            } else {
+                output.push_str(&lane_numbers[place].to_string());
+            }
+            output.push(')');
+            place += 1;
         }
-        output.push(')');
-        place += 1;
         if !trivia.is_empty() {
             output.push(' ');
             output.push_str(trivia);
@@ -4218,9 +4239,11 @@ fn rewrite_labels(source: &str, regexes_are_present: bool, lane_numbers: &[u64])
 
 /// The lanes in the text of a score, in source order.
 ///
-/// Each labeled statement (`kick: s("bd")`, `$: s("bd*4")`) is one lane. A
-/// score with no label is one lane with the empty label. Its body is the last
-/// statement with code, or empty when the score has no code.
+/// Each labeled statement (`kick: s("bd")`, `$: s("bd*4")`) is one lane,
+/// except a label with no code, which is no lane: a `$:` at the end of the
+/// text, still waiting for its chain. A score with no label is one lane
+/// with the empty label. Its body is the last statement with code, or
+/// empty when the score has no code.
 ///
 /// This reads the score as written, with the scan of the label rewrite. The
 /// rewritten text holds source offsets, which move with each edit above a
@@ -4258,10 +4281,13 @@ fn lane_statements_here(source: &str) -> Vec<LaneStatement> {
         let (code, _) = split_trailing_trivia(&source[start..statement.end], regexes_are_present);
         (start, code)
     };
-    // The label, the offset of its line, and the code of each lane.
+    // The label, the offset of its line, and the code of each lane. A label
+    // with no code is no lane, as the rewrite also finds.
     let mut lanes: Vec<(&str, usize, &str)> = statements
         .iter()
-        .filter(|statement| statement.colon.is_some())
+        .filter(|statement| {
+            statement.colon.is_some() && label_has_code(source, statement, regexes_are_present)
+        })
         .map(|statement| {
             let label = &source[statement.start..statement.name_end];
             (label, statement.start, code(statement).1)
@@ -5709,6 +5735,28 @@ mod tests {
             ..TranspileOptions::default()
         };
         assert_eq!(transpile("mondo`a b`", &none).output, "mondo`a b`;");
+    }
+
+    /// A label with no code is no lane: it writes no `.p()`. Before, the
+    /// call glued onto the chain of the statement above and stacked that
+    /// lane a second time, so a `$:` typed at the end of a playing score
+    /// made the set louder.
+    #[test]
+    fn a_label_with_no_code_is_no_lane() {
+        let options = TranspileOptions::default();
+        let base = "$: note(60)\nlead: s(\"hh\")\n";
+        let plain = transpile(base, &options).output;
+        assert_eq!(transpile(&format!("{base}$:"), &options).output, plain);
+        assert_eq!(
+            lane_statements(&format!("{base}$:")),
+            lane_statements(base),
+            "a label with no code is no lane for a host either"
+        );
+        // A label whose chain starts on the next line is still one lane.
+        assert_eq!(
+            lane_statements("$:\n  note(60)"),
+            Some(vec![lane("$", "note(60)", 1)])
+        );
     }
 
     #[test]
