@@ -228,38 +228,33 @@ pub(super) fn oscillator_sample(
     controls: &VoiceRenderControls,
     table_selection: TableSelection,
     phase: &mut f64,
+    partial_limit: &mut usize,
     freq_hz: f32,
     fm_offset_hz: f32,
     pitch_ratio: f32,
     sr: f64,
 ) -> f32 {
     let frequency = (freq_hz + fm_offset_hz) * pitch_ratio;
-    let wave = match &controls.partials {
-        Some(partials) => partials_sample(partials, *phase, frequency.abs(), (sr * 0.5) as f32),
-        None if fm_offset_hz != 0.0 || pitch_ratio != 1.0 => {
-            tables.sample_for_frequency(controls.waveform, *phase, frequency)
+    let moving = fm_offset_hz != 0.0 || pitch_ratio != 1.0;
+    let wave = match controls.partials.map(|partials| partials.wave) {
+        // A note whose wave no lease holds plays silence.
+        Some(None) => 0.0,
+        Some(Some(wave)) => {
+            let wave = wave.wave();
+            let selection = if moving {
+                wave.selection(frequency, sr as f32)
+            } else {
+                table_selection
+            };
+            *partial_limit = (*partial_limit).max(wave.partial_limit(frequency, sr as f32));
+            wave.sample(*phase, selection) * wave.norm(*partial_limit)
         }
+        None if moving => tables.sample_for_frequency(controls.waveform, *phase, frequency),
         None => tables.sample(controls.waveform, *phase, table_selection),
     };
     *phase += f64::from(frequency) / sr;
     *phase -= phase.floor();
     wave
-}
-
-/// A custom periodic wave at `phase`, summed exactly from its partials, with
-/// every partial of `f0` at or past `nyquist` left out (band-limited
-/// playback).
-fn partials_sample(partials: &PartialsControls, phase: f64, f0: f32, nyquist: f32) -> f32 {
-    let mut sum = 0.0f32;
-    for k in 0..usize::from(partials.len) {
-        let harmonic = (k + 1) as f32;
-        if f0 * harmonic >= nyquist {
-            break;
-        }
-        let angle = std::f32::consts::TAU * harmonic * (phase as f32);
-        sum += partials.real[k] * angle.cos() + partials.imag[k] * angle.sin();
-    }
-    sum * partials.norm
 }
 
 impl PreparedSupersaw {
@@ -2173,6 +2168,7 @@ mod tests {
                         &controls,
                         tables.selection(freq),
                         &mut phase,
+                        &mut 0,
                         freq,
                         offset,
                         1.0,
@@ -2194,28 +2190,24 @@ mod tests {
         //! start and steps its phase by one period's wrap, bit for bit. Only a moving
         //! frequency picks its table at each sample.
 
-        use super::{VoiceRenderControls, oscillator_sample, partials_sample};
+        use super::{VoiceRenderControls, oscillator_sample};
         use crate::Waveform;
-        use crate::backend::{MAX_PARTIALS, OscillatorControls, PartialsControls};
+        use crate::backend::{OscillatorControls, PartialsControls};
         use crate::periodic_wave::prepared_tables;
 
         const RATE: f64 = 48_000.0;
 
         /// Eight partials with both cosine and sine terms, so a phase that drifts
-        /// shows in either.
-        fn custom_wave() -> PartialsControls {
-            let mut real = [0.0; MAX_PARTIALS];
-            let mut imag = [0.0; MAX_PARTIALS];
-            for k in 0..8 {
-                real[k] = 1.0 / (k + 1) as f32;
-                imag[k] = 0.5 / (k + 1) as f32;
-            }
-            PartialsControls {
-                real,
-                imag,
-                len: 8,
-                norm: 0.5,
-            }
+        /// shows in either. The second value holds the wave while the test reads it.
+        fn custom_wave() -> (
+            PartialsControls,
+            std::sync::Arc<crate::periodic_wave::CustomWave>,
+        ) {
+            let real: Vec<f32> = (0..8).map(|k| 1.0 / (k + 1) as f32).collect();
+            let imag: Vec<f32> = (0..8).map(|k| 0.5 / (k + 1) as f32).collect();
+            let mut partials = crate::register_partials(8, &real, &imag);
+            let wave = crate::partials::lease(&mut partials).expect("a registered wave");
+            (partials, wave)
         }
 
         /// Against the steady oscillator written out: the table picked once from the
@@ -2225,13 +2217,13 @@ mod tests {
         #[test]
         fn a_steady_oscillator_reads_its_start_table_and_wraps_by_one_period() {
             let tables = prepared_tables(RATE as u32);
-            let nyquist = (RATE * 0.5) as f32;
+            let (custom, _held) = custom_wave();
             let voices = [
                 (Waveform::Sine, None),
                 (Waveform::Square, None),
                 (Waveform::Sawtooth, None),
                 (Waveform::Triangle, None),
-                (Waveform::Sine, Some(custom_wave())),
+                (Waveform::Sine, Some(custom)),
             ];
             for (waveform, partials) in voices {
                 let controls =
@@ -2245,17 +2237,25 @@ mod tests {
                 } else {
                     format!("{waveform:?}")
                 };
+                let wave = partials.and_then(|partials| partials.wave);
                 for freq in [27.5f32, 440.0, 3_520.0, 18_000.0, 30_000.0, -440.0] {
-                    let selection = tables.selection(freq);
+                    let selection = match wave {
+                        Some(wave) => wave.wave().selection(freq, RATE as f32),
+                        None => tables.selection(freq),
+                    };
                     let mut phase = 0.0f64;
+                    let mut limit = 0;
                     let mut expected_phase = 0.0f64;
                     for frame in 0..RATE as usize {
                         let played = oscillator_sample(
-                            &tables, &controls, selection, &mut phase, freq, 0.0, 1.0, RATE,
+                            &tables, &controls, selection, &mut phase, &mut limit, freq, 0.0, 1.0,
+                            RATE,
                         );
-                        let expected = match &partials {
-                            Some(partials) => {
-                                partials_sample(partials, expected_phase, freq.abs(), nyquist)
+                        let expected = match wave {
+                            Some(wave) => {
+                                let wave = wave.wave();
+                                wave.sample(expected_phase, selection)
+                                    * wave.norm(wave.partial_limit(freq, RATE as f32))
                             }
                             None => tables.sample(waveform, expected_phase, selection),
                         };

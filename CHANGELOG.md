@@ -18,6 +18,11 @@
 - View ▸ Knobs or ^⇧K opens a column of sliders for the numbers of the call under the caret. A move writes the score. Counts stay whole, speeds move in quarters, and vst calls and documented options such as `_pianoroll` or `lfo` get their own rails.
 - A drag or a notch on any slider can land back on a whole number.
 
+### Sound changes
+
+- `partials` plays up to 2047 partials, or 4095 from a list of 4096, as Firefox does. Before, only the first 32 played, so a 128-partial sawtooth was too dark. The partials use Firefox's band-limited tables and normalization. Eight voices with 128 partials render 128 s of audio in 4.6 s instead of 62 s on a 4-core x86-64 Linux machine.
+- Sawtooth, square and triangle tables have 4096 samples at every sample rate, as in Firefox. At 44.1 kHz and 48 kHz the sound does not change.
+
 ## v0.1.5
 
 - A score that stretches every voice no longer overruns the audio device. The stretch vocoder slid its input and output windows one sample at a time, two 8 KiB moves per sample per channel, so a set of stretched voices spent most of its callback moving memory. The vocoder now keeps both as rings and reads each output slot once per overlap cycle. A score of about thirty stretched voices runs under half the callback budget where it overran before, with byte-identical audio.

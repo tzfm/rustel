@@ -265,6 +265,9 @@ impl LiveShared {
         // The old callback has joined: there is no remaining in-flight
         // reservation to carry into the new frame domain.
         self.rendering_until_frame.store(frames, Ordering::Release);
+        for ring in [&self.ring, &self.immediate] {
+            ring.publish_frontier(frames, frames, new_sample_rate);
+        }
         self.playback_origin_nanos
             .store(UNSET_STREAM_INSTANT_NANOS, Ordering::Release);
         self.buffer_playback_nanos.store(0, Ordering::Release);
