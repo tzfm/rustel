@@ -544,10 +544,12 @@ Options objects belong to calls that take them, such as
 audio control such as `lpf` takes a number: `lpf(800)` has a rail, and
 `lpf({ cutoff: 800 })` has none, because the engine refuses that note.
 
-A rail writes the score in place as you move it. With auto evaluate on, you
-hear the change after the typing pause. If the score already holds a
-`slider(value, min, max, step)`, the rail moves its value argument and keeps
-the call. The score is the master. The column only edits what is written.
+A rail writes the score in place as you move it. While the set plays and
+auto evaluate is on, the change sounds at once, the way a score's own
+slider sounds. A stopped set, or auto evaluate off, keeps the typing pause.
+If the score already holds a `slider(value, min, max, step)`, the rail moves
+its value argument and keeps the call. The score is the master. The column
+only edits what is written.
 
 A number with no `slider(...)` gets bounds the studio works out:
 

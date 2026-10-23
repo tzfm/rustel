@@ -2321,8 +2321,10 @@ impl App {
 
     /// One edit of the score the panel owns: a control edit, undoable,
     /// keeping the viewport - a rail that moves must not scroll the text
-    /// under the pointer - and setting off what an edit always sets off,
-    /// so auto evaluate hears the move once debounced.
+    /// under the pointer - setting off what an edit always sets off, and
+    /// applied at once: a rail that moves sounds while it moves, the way
+    /// the score's own sliders do, instead of after the typing pause. A
+    /// stopped set, or auto evaluate off, keeps the pause.
     fn knobs_write(&mut self, range: Range<usize>, text: &str) -> bool {
         self.knobs_edit(vec![(range, text.to_owned())])
     }
@@ -2357,6 +2359,8 @@ impl App {
             }
         }
         self.after_edit(scene, before, false);
+        self.auto_evaluate_due = false;
+        self.auto_evaluate();
         self.knobs_parse = None;
         self.dirty_frame = true;
         true
@@ -2987,6 +2991,39 @@ mod tests {
             let written = count(&app);
             assert!(!written.contains('.'), "the drag wrote {written}");
         }
+    }
+
+    /// A rail's move leaves with the write, not after the typing pause, so
+    /// a plain number is heard as the rail moves, the way a score slider
+    /// is. Nothing leaves while the set is stopped: the write alone is
+    /// owed, and the press that plays carries it.
+    #[test]
+    fn a_rail_move_is_applied_at_once_while_the_set_plays() {
+        use super::super::tests::support::{app_over, sounding};
+        use crate::editor::{ByteOffset, Selection};
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut app = app_over(directory.path());
+        app.ui_settings.auto_evaluate = true;
+        let score = "$: s(\"bd\").gain(0.5)\n";
+        app.scenes.current_mut().editor = Editor::new(score).expect("score");
+        let caret = score.find("0.5").expect("the value");
+        let _ = app
+            .scenes
+            .current_mut()
+            .editor
+            .set_selection(Selection::caret(ByteOffset(caret)));
+        app.open_knobs_panel(true);
+        app.drag_knob(0, Rect::new(0, 0, 24, 1), 20);
+        assert!(
+            app.pending_evaluation.is_none() && app.inflight.is_empty(),
+            "a stopped set is asked for nothing"
+        );
+        app.snapshot = Some(sounding(true, false));
+        app.drag_knob(0, Rect::new(0, 0, 24, 1), 4);
+        assert!(
+            app.pending_evaluation.is_some() || !app.inflight.is_empty(),
+            "the update left with the write"
+        );
     }
 
     /// What the hand holds belongs to one call: an entry taken off one
