@@ -109,6 +109,8 @@ pub enum PatternCallableBehavior {
     WriteState {
         key: &'static str,
     },
+    /// Receives the cycle that `getTime()` returns at the call.
+    ReadCycle(fn(f64, &[Pattern], Option<&Pattern>) -> Pattern),
 }
 
 /// One native pattern-returning global and/or Pattern method.
