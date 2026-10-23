@@ -609,6 +609,13 @@ fn write_live_output_inner<T>(
         shared
             .rendering_until_frame
             .store(end_frame, Ordering::Release);
+        for ring in [&shared.ring, &shared.immediate] {
+            ring.publish_frontier(
+                start.saturating_add(rendered as u64),
+                end_frame,
+                meters.sample_rate,
+            );
+        }
         backend.set_max_polyphony(shared.max_polyphony.load(Ordering::Relaxed));
         let visual_analysis_mask = shared.visual_analysis_mask.load(Ordering::Acquire);
         let visual_generation_floor = shared

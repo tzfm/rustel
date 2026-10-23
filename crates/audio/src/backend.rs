@@ -273,20 +273,7 @@ pub struct TransientControls {
     pub sustain: f32,
 }
 
-/// Resolved additive-synthesis coefficients: `x(φ) = norm · Σ real[k]·cos
-/// (2π(k+1)φ) + imag[k]·sin(2π(k+1)φ)`, matching Web Audio
-/// `createPeriodicWave`'s normalized output. Partials whose frequency would
-/// cross Nyquist are skipped at render time (band-limited playback).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PartialsControls {
-    pub real: [f32; MAX_PARTIALS],
-    pub imag: [f32; MAX_PARTIALS],
-    pub len: u8,
-    /// 1 / peak of one cycle (createPeriodicWave normalizes by default).
-    pub norm: f32,
-}
-
-pub const MAX_PARTIALS: usize = 32;
+pub use crate::partials::PartialsControls;
 
 /// DynamicsCompressorNode parameters (defaults: threshold −3,
 /// ratio 10, knee 10, attack 0.005, release 0.05).

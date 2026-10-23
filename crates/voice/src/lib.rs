@@ -715,7 +715,7 @@ mod tests {
     /// sentence.
     #[test]
     fn record_only_notices_carry_a_readable_message() {
-        let partials = vec![1.0; rustel_audio::MAX_PARTIALS + 1];
+        let partials = vec![1.0; 2048];
         let voices = [
             serde_json::json!({ "s": "sawtooth", "partials": partials }),
             serde_json::json!({ "s": "sine", "room": 0.5, "ir": "nowhere" }),
@@ -732,12 +732,7 @@ mod tests {
         assert_eq!(
             messages,
             [
-                format!(
-                    "{} partials requested; the first {} play",
-                    rustel_audio::MAX_PARTIALS + 1,
-                    rustel_audio::MAX_PARTIALS
-                )
-                .as_str(),
+                "2048 partials requested; the first 2047 play",
                 "impulse response 'nowhere' is not a known sound; the generated reverb plays",
             ]
         );
@@ -5257,7 +5252,7 @@ fn modulator_controls(
 /// `partials`: an array of magnitudes, or a count of all-1 magnitudes
 /// (`n` doubles as that count on synth sounds), scaled by the base
 /// waveform's Fourier terms and rotated by optional `phases`.
-/// The result is peak-normalized like createPeriodicWave's default.
+/// The wave normalizes like createPeriodicWave's default.
 fn partials_controls(
     object: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Option<rustel_audio::PartialsControls>, String> {
@@ -5280,13 +5275,22 @@ fn partials_controls(
     let Some(raw) = raw else {
         return Ok(None);
     };
-    let mags: Vec<f64> = match raw {
-        serde_json::Value::Array(items) => {
-            items.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect()
-        }
+    let (requested, mags): (usize, Vec<f64>) = match raw {
+        serde_json::Value::Array(items) => (
+            items.len(),
+            items
+                .iter()
+                .take(rustel_audio::played_partials(items.len()))
+                .map(|v| v.as_f64().unwrap_or(0.0))
+                .collect(),
+        ),
         other => match other.as_f64() {
             Some(count) if count >= 1.0 => {
-                vec![1.0; (count as usize).min(rustel_audio::MAX_PARTIALS)]
+                let requested = count as usize;
+                (
+                    requested,
+                    vec![1.0; rustel_audio::played_partials(requested)],
+                )
             }
             _ => return Ok(None),
         },
@@ -5294,17 +5298,17 @@ fn partials_controls(
     if mags.is_empty() {
         return Ok(None);
     }
-    if mags.len() > rustel_audio::MAX_PARTIALS {
+    if mags.len() < requested {
         report_notice(
             format!(
                 "{} partials requested; the first {} play",
-                mags.len(),
-                rustel_audio::MAX_PARTIALS
+                requested,
+                mags.len()
             ),
             serde_json::json!({
                 "partials_truncated": {
-                    "requested": mags.len(),
-                    "kept": rustel_audio::MAX_PARTIALS
+                    "requested": requested,
+                    "kept": mags.len()
                 }
             }),
         );
@@ -5315,10 +5319,9 @@ fn partials_controls(
         }
         _ => Vec::new(),
     };
-    let mut real = [0.0f32; rustel_audio::MAX_PARTIALS];
-    let mut imag = [0.0f32; rustel_audio::MAX_PARTIALS];
-    let len = mags.len().min(rustel_audio::MAX_PARTIALS);
-    for (k, mag) in mags.iter().take(len).enumerate() {
+    let mut real = Vec::with_capacity(mags.len());
+    let mut imag = Vec::with_capacity(mags.len());
+    for (k, mag) in mags.iter().enumerate() {
         let n = (k + 1) as f64;
         let (r, i) = match kind.as_str() {
             "sawtooth" | "saw" => (0.0, -1.0 / n),
@@ -5336,30 +5339,15 @@ fn partials_controls(
             r = c * r0 - s * i0;
             i = s * r0 + c * i0;
         }
-        real[k] = r as f32;
-        imag[k] = i as f32;
-    }
-    // createPeriodicWave normalizes to peak 1 by default.
-    let mut peak = 0.0f64;
-    for step in 0..2048 {
-        let phi = step as f64 / 2048.0;
-        let mut sum = 0.0f64;
-        for k in 0..len {
-            let angle = std::f64::consts::TAU * (k + 1) as f64 * phi;
-            sum += f64::from(real[k]) * angle.cos() + f64::from(imag[k]) * angle.sin();
-        }
-        peak = peak.max(sum.abs());
+        real.push(r as f32);
+        imag.push(i as f32);
     }
     // A list whose every magnitude is zero still builds a periodic wave in
     // the browser: an all-zero table, so the note is silent rather than a
     // stock waveform. `randL` hands one over at cycle zero.
-    let norm = if peak > 0.0 { (1.0 / peak) as f32 } else { 0.0 };
-    Ok(Some(rustel_audio::PartialsControls {
-        real,
-        imag,
-        len: len as u8,
-        norm,
-    }))
+    Ok(Some(rustel_audio::register_partials(
+        requested, &real, &imag,
+    )))
 }
 
 /// The transient shaper's controls, shared by the main chain and by each
