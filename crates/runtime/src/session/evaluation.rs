@@ -4312,6 +4312,24 @@ endin`";
         assert_eq!(onsets(&session), [0.0], "play after a stop");
     }
 
+    /// With no grid the next cycle plays: an edit at 37.3 fires at 38, the
+    /// cycle a player waits for when nothing larger was asked for.
+    #[cfg(feature = "extensions")]
+    #[test]
+    fn a_bare_oneshot_plays_on_the_next_cycle() {
+        let mut session = Session::new().expect("session");
+        session
+            .evaluate("setcps(1); $: s('riser').oneshot()")
+            .expect("start");
+        assert_eq!(onsets(&session), [0.0], "a start");
+
+        run_clock(&mut session, 0.0, 37.3);
+        session
+            .reload_at("setcps(1); $: s('riser').oneshot()", false, 37.3)
+            .expect("edit");
+        assert_eq!(onsets(&session), [38.0], "an edit");
+    }
+
     #[cfg(all(feature = "extensions", feature = "device-audio"))]
     #[test]
     fn a_rollback_keeps_the_line_its_oneshot_had() {

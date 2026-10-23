@@ -9,13 +9,16 @@ use crate::{CallableSurface, PatternCallable, PatternCallableBehavior};
 pub(super) const REFERENCE: ReferenceEntry = simple_reference!(
     "oneshot",
     "play once, on the next grid line",
-    "Plays the pattern for one cycle, one time, on the next line of the grid. With a grid of 4, an update at cycle 37.3 plays cycle 40 and nothing after it.\n\nEach update reads the cycle again, so the pattern plays once more after every update that keeps the call. Delete the call when it has played. After Play, a restart or a rewind, the count starts at cycle 0, so the pattern plays in the first cycle.",
+    "Plays the pattern for one cycle, one time, on the next line of the grid. With a grid of 4, an update at cycle 37.3 plays cycle 40 and nothing after it. With no grid, the next cycle plays.\n\nEach update reads the cycle again, so the pattern plays once more after every update that keeps the call. Delete the call when it has played. After Play, a restart or a rewind, the count starts at cycle 0, so the pattern plays in the first cycle.",
     params: [ReferenceParam {
         name: "grid",
         r#type: "number",
-        description: "the size of the grid in cycles. With 4, the pattern plays on the next multiple of 4.",
+        description: "the size of the grid in cycles. With 4, the pattern plays on the next multiple of 4. Defaults to 1, the next cycle.",
     }],
-    examples: ["note(\"c3 e3 g3 c4\").s(\"sawtooth\").oneshot(4)"],
+    examples: [
+        "note(\"c3 e3 g3 c4\").s(\"sawtooth\").oneshot(4)",
+        "s(\"bd\").oneshot()",
+    ],
     "time"
 );
 
@@ -36,7 +39,7 @@ fn apply(cycle: f64, args: &[Pattern], receiver: Option<&Pattern>) -> Pattern {
     let Some(receiver) = receiver.cloned() else {
         return rustel_core::silence();
     };
-    let grid = pattern_argument(args, 0, Value::Undefined);
+    let grid = pattern_argument(args, 0, Value::F64(1.0));
     match grid.as_pure() {
         Some(grid) => once(&receiver, cycle, &grid),
         None => grid.inner_bind(move |grid| once(&receiver, cycle, grid)),
