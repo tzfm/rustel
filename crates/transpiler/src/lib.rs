@@ -4268,6 +4268,31 @@ pub fn lane_statements(source: &str) -> Option<Vec<LaneStatement>> {
     Some(lanes)
 }
 
+/// Whether two scores hold the same instructions: the sound of one is the
+/// sound of the other. The comparison is the transpiled text with its
+/// error locations off, so a restyling that changes no note - a label with
+/// no code, a new line - reads as the same score. A comment, any code at
+/// all, and a string with another quote style (a plain argument here, not
+/// mini notation) read as changes.
+///
+/// A host asks this before an automatic apply, to leave a set playing when
+/// the edit so far adds nothing. The comparison is of whole programs, so
+/// two scores that read the same here cannot sound different.
+pub fn same_instructions(playing: &str, typed: &str) -> bool {
+    let options = TranspileOptions {
+        emit_mini_locations: false,
+        ..TranspileOptions::default()
+    };
+    let program = |source: &str| transpile(source, &options).output.trim().to_owned();
+    // A text the transpile refuses prints nothing. Two refusals would
+    // compare equal, so a failure on either side answers false: the
+    // question is only answerable for two whole programs.
+    match (program(playing), program(typed)) {
+        (playing, typed) if playing.is_empty() || typed.is_empty() => false,
+        (playing, typed) => playing == typed,
+    }
+}
+
 /// The body of `lane_statements`, always called on a parse stack. Empty when
 /// the score has no code.
 fn lane_statements_here(source: &str) -> Vec<LaneStatement> {
@@ -5757,6 +5782,30 @@ mod tests {
             lane_statements("$:\n  note(60)"),
             Some(vec![lane("$", "note(60)", 1)])
         );
+    }
+
+    /// A label half typed and a new line are the score they finish. Any
+    /// code, a comment, and another quote style are changes: a single
+    /// quoted string is a plain argument here, not mini notation.
+    #[test]
+    fn same_instructions_reads_only_silent_edits_as_the_same() {
+        let playing = "$: s(\"bd\")\nlead: note(\"c\")\n";
+        for typed in [
+            format!("{playing}$:"),
+            format!("{playing}mylane:"),
+            format!("{playing}\n"),
+        ] {
+            assert!(same_instructions(playing, &typed), "{typed:?}");
+        }
+        for typed in [
+            "$: s(\"bd\").gain(.2)\nlead: note(\"c\")\n",
+            "setcps(1)\n$: s(\"bd\")\nlead: note(\"c\")\n",
+            "// mix\n$: s(\"bd\")\nlead: note(\"c\")\n",
+            "$: s(\"bd\")\nlead: note(\"c\")\n4",
+            "$: s('bd')\nlead: note(\"c\")\n",
+        ] {
+            assert!(!same_instructions(playing, typed), "{typed:?}");
+        }
     }
 
     #[test]

@@ -322,6 +322,39 @@ impl App {
             self.rebind_unchanged_score(id, revision, Arc::clone(&source));
             return;
         }
+        // A paused edit that adds no instruction is not an update: the set
+        // keeps playing as it was, so a lane that fires on each update -
+        // `oneshot` - does not fire for a label half typed. The text is
+        // still the player's words, so the file takes it. A watched file,
+        // or a press, is a decision made on purpose and always applies. A
+        // byte-identical text is the install check's to answer, not this
+        // one: what it knows about the installed revision, this cannot.
+        // And while any evaluation of this scene is unsent or unanswered -
+        // a launch armed for its line, or an edit the worker holds until
+        // its sounds are ready - the skip stands down: that edit is a
+        // decision this one must supersede, not land over.
+        if !external
+            && !self.options.mini
+            && self.armed_revision.is_none()
+            && self.pending_evaluation.is_none()
+            && self.inflight.is_empty()
+            && matches!(self.next_launch, Launch::Now)
+            && self.is_playing()
+            && !self.is_stopping()
+            && self.audible_scene == Some(id)
+            && self.evaluated_source.as_deref().is_some_and(|playing| {
+                playing != source.as_ref() && rustel_transpiler::same_instructions(playing, &source)
+            })
+        {
+            self.log.push(
+                LogLevel::Debug,
+                "transport",
+                "auto update skipped - the edit adds no instruction".to_owned(),
+            );
+            self.write_scene(id, revision, Arc::clone(&source));
+            self.bind_live_sliders(id, revision, &source);
+            return;
+        }
         // Already armed for its line: pressing again would only cancel and
         // re-arm it on the same line, and applying again is the same
         // non-press twice over.
@@ -1487,6 +1520,152 @@ mod tests {
             assert!(
                 !app.auto_evaluate_due,
                 "the elapsed pause is spent stopped, not saved up"
+            );
+        }
+
+        /// A studio that is playing this text, as an install would leave it.
+        fn playing_this(app: &mut App, scene: SceneId, score: &str) {
+            app.snapshot = Some(sounding(true, false));
+            app.audible_scene = Some(scene);
+            app.installed_revision = Some(source_revision(score));
+            app.evaluated_source = Some(std::sync::Arc::from(score));
+        }
+
+        /// Run the typing pause out and pump until `done` observes what the
+        /// apply left - the worker of an idle studio keeps reporting the set
+        /// stopped, and a pause spent that way has to be owed again.
+        fn past_the_pause(app: &mut App, done: impl Fn(&App) -> bool) {
+            let elapsed =
+                app.ui_settings.typing_pause.duration() + std::time::Duration::from_millis(50);
+            app.last_edit_at = std::time::Instant::now()
+                .checked_sub(elapsed)
+                .expect("backdate the edit");
+            for _ in 0..200 {
+                app.snapshot = Some(sounding(true, false));
+                app.pump_turn();
+                if done(app) {
+                    return;
+                }
+                app.auto_evaluate_due = true;
+            }
+            panic!("the apply never landed");
+        }
+
+        /// A paused edit that adds no instruction sends nothing to the
+        /// engine: a lane that fires on each update, such as `oneshot`,
+        /// does not fire for a label half typed. The file still takes the
+        /// words, and a press of the same text still applies - the player
+        /// asked for that one.
+        #[test]
+        fn a_paused_edit_with_no_new_instruction_sends_nothing() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene) = playing_app(directory.path(), true);
+            playing_this(&mut app, scene, "$: s(\"bd\")\n");
+
+            app.scenes.current_mut().editor =
+                Editor::new("$: s(\"bd\")\n$:").expect("type the label");
+            app.auto_evaluate_due = true;
+            let skipped = |app: &App| {
+                app.log
+                    .lines()
+                    .iter()
+                    .any(|line| line.text.contains("auto update skipped"))
+            };
+            past_the_pause(&mut app, skipped);
+            assert!(
+                queued_by(&app, scene).is_empty(),
+                "no update left for a label half typed"
+            );
+            let file = directory.path().join("first.strudel");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::fs::read_to_string(&file).ok().as_deref() != Some("$: s(\"bd\")\n$:") {
+                app.pump_turn();
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the file never took the words"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+
+            let request_id = app.next_request_id;
+            let pressed = app.editor().source();
+            app.handle_editor_effect(EditorEffect::Evaluate {
+                revision: app.editor().revision(),
+                source: ropey::Rope::from_str(&pressed),
+            })
+            .expect("press the same text");
+            assert_eq!(
+                app.next_request_id,
+                request_id + 1,
+                "a press is owed its update, whatever the text"
+            );
+        }
+
+        /// The skip is only for edits that add nothing: a change to the
+        /// score still applies itself through the pause.
+        #[test]
+        fn a_paused_edit_that_changes_instructions_still_applies() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene) = playing_app(directory.path(), true);
+            playing_this(&mut app, scene, "$: s(\"bd\")\n");
+
+            app.scenes.current_mut().editor =
+                Editor::new("$: s(\"bd\").gain(.1)\n").expect("change the score");
+            app.auto_evaluate_due = true;
+            past_the_pause(&mut app, |app| !queued_by(app, scene).is_empty());
+            assert!(
+                !queued_by(&app, scene).is_empty(),
+                "a real change was queued"
+            );
+        }
+
+        /// While a launch waits armed for its line, the skip stands down:
+        /// the armed score is a decision the edit must supersede, not land
+        /// over.
+        #[test]
+        fn a_paused_edit_while_another_score_is_armed_still_applies() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene) = playing_app(directory.path(), true);
+            playing_this(&mut app, scene, "$: s(\"bd\")\n");
+            app.armed_revision = Some(source_revision("$: s(\"cp\")\n"));
+
+            app.scenes.current_mut().editor =
+                Editor::new("$: s(\"bd\")\n$:").expect("type the label");
+            app.auto_evaluate_due = true;
+            past_the_pause(&mut app, |app| !queued_by(app, scene).is_empty());
+            assert!(
+                !queued_by(&app, scene).is_empty(),
+                "an armed launch must be superseded, not landed over"
+            );
+        }
+
+        /// An edit the worker holds until its sounds are ready is the same
+        /// decision: while it is in flight, the skip stands down.
+        #[test]
+        fn a_paused_edit_while_an_update_is_held_still_applies() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene) = playing_app(directory.path(), true);
+            playing_this(&mut app, scene, "$: s(\"bd\")\n");
+            app.inflight.insert(
+                app.next_request_id,
+                PendingEvaluation {
+                    request_id: app.next_request_id,
+                    scene,
+                    editor_revision: Revision(7),
+                    source: std::sync::Arc::from("$: s(\"cp\")\n"),
+                    launch: Launch::Now,
+                    rewind: false,
+                    record: true,
+                },
+            );
+
+            app.scenes.current_mut().editor =
+                Editor::new("$: s(\"bd\")\n$:").expect("type the label");
+            app.auto_evaluate_due = true;
+            past_the_pause(&mut app, |app| !queued_by(app, scene).is_empty());
+            assert!(
+                !queued_by(&app, scene).is_empty(),
+                "a held update must be superseded, not landed over"
             );
         }
     }

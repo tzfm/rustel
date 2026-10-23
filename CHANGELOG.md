@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Auto evaluate no longer reinstalls a score when the edit adds no instruction. Typing a `$:`, a lane name, or a new line under a playing set leaves the sound alone, so an `oneshot` lane does not fire for it. A press, or a watched file, still applies.
 - `oneshot()` with no grid plays on the next cycle, the same as `oneshot(1)`. Before, it was silent.
 - A `$:` typed with no chain under it no longer doubles the lane above it. A label with no code changes no sound.
 - A rail in the knobs column sounds while it moves, the way a score slider does. Before, the change waited for the typing pause.
