@@ -48,22 +48,18 @@ pub(crate) struct RegistrationSeal {
 }
 
 impl RegistrationSeal {
+    /// Close the surface inventory: every method the engine put on the
+    /// Pattern prototype, and every global the score scope projects, is a
+    /// built-in. `register` may still take any of them, as on strudel.cc;
+    /// the inventory is what the one-line replacement notice reads.
     pub(crate) fn finish(&self, proto: &rquickjs::Object<'_>) -> Result<(), String> {
-        let extensions: HashSet<_> = registry()
-            .names()
-            .into_iter()
-            .filter(|name| {
-                registry()
-                    .get(name)
-                    .is_some_and(|entry| entry.declared_in.is_extension())
-            })
-            .collect();
         let mut names = self.names.borrow_mut();
         for name in proto.own_keys::<String>(rquickjs::object::Filter::new().string()) {
             let name = name.map_err(|error| error.to_string())?;
-            if !extensions.contains(name.as_str()) {
-                names.insert(name);
-            }
+            names.insert(name);
+        }
+        for name in supported_global_names() {
+            names.insert(name.to_owned());
         }
         Ok(())
     }

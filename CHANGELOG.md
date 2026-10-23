@@ -8,6 +8,7 @@
 - Vim keys work in many more places: lists, menus, search boxes, find, paste, replace and half-page moves. Default Vim mappings ship under your vimrc.
 - Mac Option keys type their character, so Option+4 on an ISO layout types $.
 - The prebakes open from the Options menu.
+- `register()` can replace any built-in name, as on strudel.cc. The log notes each replacement once, and the built-in comes back when the call is removed.
 - Prebake helpers such as window.bpm = b => setcpm(b/4) now pass. Writing over an engine name gives a hint.
 - The mixer no longer shows "no gamepad". The camera warning clears when nothing asks for the camera.
 - New terminal and terminal-warm themes use your terminal's colours.
