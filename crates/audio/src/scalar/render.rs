@@ -290,6 +290,7 @@ impl AudioBackend for ScalarBackend {
         }
         self.ensure_fx_stage_state_pool(self.voices.capacity());
         self.ensure_fm_state_pool(self.voices.capacity());
+        self.leasing_waves |= event.controls.partials.is_some();
         self.pending
             .push(event.map_kabel(CompactKabelControls::from));
     }
@@ -299,6 +300,7 @@ impl AudioBackend for ScalarBackend {
             out.len() >= frames * 2,
             "stereo interleaved buffer too small"
         );
+        self.lease_due_waves(frames);
         let visual_frames = frames.min(UI_VISUAL_MIX_FRAMES) * 2;
         let mut visual_slots = self.ui_visual_capture_mask;
         while visual_slots != 0 {
@@ -352,6 +354,54 @@ impl AudioBackend for ScalarBackend {
 }
 
 impl ScalarBackend {
+    /// Lease the custom waves of notes given to [`AudioBackend::note`] that
+    /// start before this block ends, and let go of those whose notes ended.
+    /// Notes from the ring arrive leased, so a live callback has nothing to
+    /// do here.
+    fn lease_due_waves(&mut self, frames: usize) {
+        if !self.leasing_waves {
+            return;
+        }
+        let block_end = self.frame.saturating_add(frames as u64);
+        let mut waiting = false;
+        for &slot in &self.pending.order {
+            let Some(event) = self.pending.slots[slot].event.as_mut() else {
+                continue;
+            };
+            if event
+                .controls
+                .partials
+                .is_none_or(|partials| partials.wave.is_some())
+            {
+                continue;
+            }
+            if event.onset_frame >= block_end {
+                waiting = true;
+                continue;
+            }
+            let hold = crate::partials::hold_frames(
+                event.duration_secs,
+                event.controls.envelope.release_secs,
+                event.onset_frame,
+                kabel_controls(&event.controls)
+                    .map(|kabel| kabel.end_secs)
+                    .reduce(f64::max),
+                self.sample_rate,
+            );
+            let start = event.onset_frame.max(self.frame);
+            if let Some(wave) = event
+                .controls
+                .partials
+                .as_mut()
+                .and_then(crate::partials::lease)
+            {
+                self.wave_leases.hold(wave, start.saturating_add(hold));
+            }
+        }
+        self.wave_leases.release_before(self.frame);
+        self.leasing_waves = waiting || !self.wave_leases.is_empty();
+    }
+
     fn instrument_revision_frames(&self, maximum: usize) -> usize {
         if self.pending.order.is_empty() {
             return maximum;
@@ -887,8 +937,16 @@ impl ScalarBackend {
                     } else {
                         (
                             VoiceSource::Oscillator {
-                                table_selection: tables.selection(e.freq_hz),
+                                table_selection: match e
+                                    .controls
+                                    .partials
+                                    .and_then(|partials| partials.wave)
+                                {
+                                    Some(wave) => wave.wave().selection(e.freq_hz, sr as f32),
+                                    None => tables.selection(e.freq_hz),
+                                },
                                 phase: f64::from(e.onset_lead * e.freq_hz) / sr,
+                                partial_limit: 0,
                             },
                             e.duration_secs,
                             e.gain * e.controls.velocity * 0.3,
@@ -2334,12 +2392,14 @@ impl ScalarBackend {
                         VoiceSource::Oscillator {
                             table_selection,
                             phase,
+                            partial_limit,
                         } => {
                             let wave = oscillator_sample(
                                 tables,
                                 &v.controls,
                                 *table_selection,
                                 phase,
+                                partial_limit,
                                 v.freq_hz,
                                 fm_offset_hz,
                                 pitch_ratio,

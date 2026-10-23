@@ -114,7 +114,7 @@ impl JsRuntime {
             kabelsalat::install(&ctx).map_err(|error| error.to_string())?;
             generators::install(self, ctx.clone(), &surface)?;
             #[cfg(feature = "extensions")]
-            extensions::install(&ctx, &surface.proto, &surface.globals)?;
+            extensions::install(self, &ctx, &surface.proto, &surface.globals)?;
             pattern_bindings::install(ctx.clone(), &surface)?;
             let registration_seal = install_user_setup_surface(
                 &ctx,

@@ -868,6 +868,9 @@ enum VoiceSource {
     Oscillator {
         table_selection: TableSelection,
         phase: f64,
+        /// A custom wave's most partials below Nyquist at any pitch played
+        /// so far; see [`crate::periodic_wave::CustomWave::partial_limit`].
+        partial_limit: usize,
     },
     Sample {
         sample: SampleId,
@@ -1145,6 +1148,12 @@ pub struct ScalarBackend {
     kabel_bytes: usize,
     kabel_count: usize,
     missing_kabel_events: u64,
+    /// The custom waves of notes given to [`AudioBackend::note`], leased as
+    /// the notes come due. A live callback takes notes from the ring, which
+    /// holds their waves instead.
+    wave_leases: crate::partials::WaveLeases,
+    /// A noted note waits for its wave, or a leased wave waits for release.
+    leasing_waves: bool,
     max_polyphony: PolyphonyLimit,
     sample_rate: u32,
     sample_resampling_mode: SampleResamplingMode,

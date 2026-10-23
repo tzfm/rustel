@@ -431,6 +431,8 @@ struct AudibleSource {
     csound: crate::CsoundSnapshot,
     cps: f64,
     cycle_zero_time: f64,
+    /// The cycle that `getTime()` returned while this source evaluated.
+    evaluated_cycle: f64,
 }
 
 /// Settings a Session is built with; [`Session::with_config`] validates them.
@@ -929,6 +931,17 @@ pub struct Session {
     /// The next live reload plays its score from the score's own cycle
     /// zero, instead of joining the cycle already running.
     next_from_zero: bool,
+    /// The cycle of the newest scheduling window, with the transport's stop
+    /// count when it ran. A stop or a restart ends that timeline, so a later
+    /// evaluation does not read its cycle.
+    newest_window: Option<(f64, u64)>,
+    /// The cycle that `getTime()` returned while the newest score evaluated.
+    #[cfg(feature = "device-audio")]
+    evaluated_cycle: f64,
+    /// The cycle that `getTime()` returned while the installed score
+    /// evaluated. A rollback evaluates that score again with it.
+    #[cfg(feature = "device-audio")]
+    installed_cycle: f64,
     last_path: EvaluateSource,
     /// The default sample banks. `None` until enabled;
     /// resolution then falls back to the bundled `bd` alone.
@@ -1171,6 +1184,11 @@ impl Session {
             requeried_generation: None,
             takeover_override: None,
             next_from_zero: false,
+            newest_window: None,
+            #[cfg(feature = "device-audio")]
+            evaluated_cycle: 0.0,
+            #[cfg(feature = "device-audio")]
+            installed_cycle: 0.0,
             last_path: EvaluateSource::Pattern,
             last_play_iterations: 0,
             samples: None,

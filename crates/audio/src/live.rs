@@ -150,7 +150,13 @@ impl LiveScalarBackend {
         frames: usize,
     ) -> LiveBlockReport {
         let mut report = LiveBlockReport::default();
-        for offset in 0..frames.min(64) {
+        let admitted = frames.min(64);
+        ring.publish_frontier(
+            start_frame,
+            start_frame.saturating_add(admitted as u64),
+            self.sample_rate,
+        );
+        for offset in 0..admitted {
             let Some(event) = ring.pop() else { break };
             if self.scalar.try_note_prepared_with_confirmation(
                 OnsetEvent::new(
@@ -730,6 +736,11 @@ impl LiveScalarBackend {
         flip: LiveFlipAtomics<'_>,
         stopped: &AtomicBool,
     ) -> LiveBlockReport {
+        ring.publish_frontier(
+            start_frame,
+            start_frame.saturating_add(frames as u64),
+            self.sample_rate,
+        );
         let events = ring.drain_queued_available();
         self.process_block_with_events(
             output,

@@ -369,6 +369,7 @@ impl Session {
                     csound: self.csound_snapshot(),
                     cps: checkpoint.cps,
                     cycle_zero_time: now - checkpoint.cycle / checkpoint.cps,
+                    evaluated_cycle: self.installed_cycle,
                 });
             }
             return Ok(checkpoint.source.is_some());

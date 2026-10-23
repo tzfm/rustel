@@ -88,6 +88,43 @@ fn controls(waveform: Waveform, pan: Option<f32>) -> OscillatorControls {
     }
 }
 
+/// A list of 128 partials plays every one below Nyquist: a custom sawtooth
+/// at 65.4 Hz keeps its 100th partial 40 dB under the first, as the terms ask.
+#[test]
+fn a_custom_wave_plays_every_partial_of_a_long_list() {
+    let count = 128;
+    let real = vec![0.0f32; count];
+    let imag: Vec<f32> = (1..=count).map(|n| -1.0 / n as f32).collect();
+    let mut controls = controls(Waveform::Sawtooth, None);
+    controls.partials = Some(rustel_audio::register_partials(count, &real, &imag));
+    let frequency = 65.406f32;
+    let event = OnsetEvent::new(0, frequency, 1.0, 1.0).with_controls(controls);
+    let pcm = render_pcm(&mut ScalarBackend::new(), 48_000, 48_000, &[event]).unwrap();
+    let left: Vec<f32> = pcm
+        .iter()
+        .step_by(2)
+        .skip(4_800)
+        .take(38_400)
+        .copied()
+        .collect();
+    // One DFT bin under a Hann window.
+    let level = |hz: f32| {
+        let (mut re, mut im) = (0.0f64, 0.0f64);
+        for (n, sample) in left.iter().enumerate() {
+            let window = 0.5 - 0.5 * (std::f64::consts::TAU * n as f64 / left.len() as f64).cos();
+            let angle = std::f64::consts::TAU * f64::from(hz) * n as f64 / 48_000.0;
+            re += f64::from(*sample) * window * angle.cos();
+            im += f64::from(*sample) * window * angle.sin();
+        }
+        re.hypot(im)
+    };
+    let below_first = 20.0 * (level(frequency * 100.0) / level(frequency)).log10();
+    assert!(
+        (below_first + 40.0).abs() < 0.5,
+        "the 100th partial sits {below_first:.2} dB under the first"
+    );
+}
+
 #[test]
 fn scalar_wav_is_streamed_with_a_correct_non_silent_body() {
     let path = std::env::temp_dir().join(format!(

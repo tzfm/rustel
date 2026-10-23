@@ -32,6 +32,7 @@ pub mod meter;
 #[cfg(windows)]
 pub mod mmcss;
 mod output_options;
+mod partials;
 mod periodic_wave;
 // Only a device output starts plugin workers.
 #[cfg_attr(not(feature = "device-audio"), allow(dead_code))]
@@ -62,10 +63,10 @@ pub use backend::{
     DelayControls, DuckControls, DuckTarget, EnvMod, Envelope, EnvelopeParam, FilterControls,
     FilterEnvelope, FilterLfoKind, FilterStages, FmControls, FmOperator, FmRoute, FmWave, FxStage,
     KabelControls, LfoMod, MAX_BUSES, MAX_DUCK_TARGETS, MAX_FM_OPERATORS, MAX_FM_ROUTES,
-    MAX_FX_STAGES, MAX_PARTIALS, MAX_VOICE_MODS, ModTarget, ModulatorParam, OnsetEvent,
-    OscillatorControls, PartialsControls, PhaserControls, PitchEnvControls, PulseWidthLfoControls,
-    ReverbControls, ShapeControls, StaticBiquad, SynthSource, TransientControls, TremoloControls,
-    VibratoControls, VowelControls, Waveform, WavetableControls, fm_operator_slot,
+    MAX_FX_STAGES, MAX_VOICE_MODS, ModTarget, ModulatorParam, OnsetEvent, OscillatorControls,
+    PartialsControls, PhaserControls, PitchEnvControls, PulseWidthLfoControls, ReverbControls,
+    ShapeControls, StaticBiquad, SynthSource, TransientControls, TremoloControls, VibratoControls,
+    VowelControls, Waveform, WavetableControls, fm_operator_slot,
 };
 pub use buffer::{AudioBufferError, AudioBufferPreference, AudioBufferRange};
 pub use convolution_kernel::{ConvolutionKernelKind, selected_convolution_kernel_kind};
@@ -95,6 +96,7 @@ pub use meter::{
     linear_to_db,
 };
 pub use output_options::LiveOutputOptions;
+pub use partials::{played_partials, register_partials};
 #[cfg(any(test, feature = "test-support"))]
 pub use pool::set_plugin_pool_for_test;
 pub use pressure::{RealtimePool, RealtimePressureSnapshot};
