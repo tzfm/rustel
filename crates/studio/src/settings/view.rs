@@ -1470,7 +1470,10 @@ fn render_vst(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer: &mu
         "Enter lists the presets · Space turns audio thread only on or off"
     };
     let footer = [
-        plugins_found(view.vst.plugins),
+        format!(
+            "{} · a letter jumps to its plugins",
+            plugins_found(view.vst.plugins)
+        ),
         format!("a adds · {hint} · Tab pages · Esc closes"),
     ];
     for (line, y) in footer.iter().zip(panel.bottom().saturating_sub(3)..) {

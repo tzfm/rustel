@@ -130,6 +130,21 @@ fn plugin_call(source: &str, caret: usize) -> Option<(String, usize)> {
         })
 }
 
+/// The row a letter jumps to on the vst page: the next plugin that begins
+/// with it, from `at` and around the list. The row `at` itself counts as
+/// visited, so the same letter again goes to the next of its plugins.
+/// `None` when no plugin begins with the letter.
+fn jump_row(names: &[&str], at: usize, letter: char) -> Option<usize> {
+    (at + 1..at + 1 + names.len())
+        .find(|row| {
+            names[row % names.len()]
+                .chars()
+                .next()
+                .is_some_and(|first| first.eq_ignore_ascii_case(&letter))
+        })
+        .map(|row| row % names.len())
+}
+
 impl App {
     /// The word list of a plugin call, searched for `query`.
     pub(super) fn plugin_words_panel(&self, words: PluginWords, query: &str) -> ReferencePanel {
@@ -445,11 +460,39 @@ impl App {
         self.dirty_frame = true;
     }
 
+    /// A letter on the vst page: the cursor goes to the next plugin whose
+    /// name begins with it, from the row the cursor holds and around the
+    /// list, so `s` reaches Serum and then the rest of the s's. The names
+    /// come from the host, which the page lists in their order.
+    pub(super) fn jump_vst_plugin(&mut self, sheet: &mut SettingsSheet, letter: char) {
+        let plugins = vst::host().plugins();
+        let names: Vec<&str> = plugins.iter().map(|plugin| plugin.name.as_str()).collect();
+        let Some(last) = names.len().checked_sub(1) else {
+            return;
+        };
+        let base = settings::VST_CONTROL_COUNT
+            + sheet.vst_folder_count
+            + sheet.vst_standard_count
+            + sheet.vst_preset_folder_count;
+        let at = sheet.selected.saturating_sub(base).min(last);
+        match jump_row(&names, at, letter) {
+            Some(row) => sheet.select(base + row),
+            None => {
+                self.status = format!("no plugin begins with '{}'", letter.to_ascii_lowercase())
+            }
+        }
+        self.dirty_frame = true;
+    }
+
+    /// What the status line says while the host reads the plugin folders.
+    /// The end of the read retires it: see [`Self::poll_plugins`].
+    const READING_THE_FOLDERS: &str = "reading the plugin folders";
+
     /// Enter on the scan row. A plugin with an answer in the scan cache
     /// for the files it has now gets no new test, a failed plugin too.
     pub(super) fn scan_vst(&mut self) {
         vst::scan();
-        self.status = "reading the plugin folders".to_owned();
+        self.status = Self::READING_THE_FOLDERS.to_owned();
     }
 
     /// Enter on the rescan row. The scan cache is empty after, so each
@@ -458,7 +501,7 @@ impl App {
     /// of the read.
     pub(super) fn rescan_vst(&mut self) {
         vst::rescan();
-        self.status = "reading the plugin folders".to_owned();
+        self.status = Self::READING_THE_FOLDERS.to_owned();
     }
 
     /// Space on a plugin row: the switch `audio thread only` of the plugin.
@@ -576,6 +619,11 @@ impl App {
         // a read changes the plugin count of the Settings page.
         let scanning = vst::scanning();
         if scanning != self.plugins_scanning {
+            // The read of the folders ended: the line that said it runs
+            // says the count now, when no other word came in between.
+            if self.plugins_scanning && self.status == Self::READING_THE_FOLDERS {
+                self.status = settings::plugins_found(vst::host().plugins().len());
+            }
             self.plugins_scanning = scanning;
             self.dirty_frame = true;
         }
@@ -672,6 +720,19 @@ impl App {
 mod tests {
     use super::*;
     use crate::memory::{self, MemoryFigures};
+
+    #[test]
+    fn a_letter_reaches_the_next_of_its_plugins() {
+        let names = ["Serum", "Surge", "Vital"];
+        // The row the cursor holds counts as visited: the same letter
+        // again goes on, and around the end of the list.
+        assert_eq!(jump_row(&names, 0, 's'), Some(1));
+        assert_eq!(jump_row(&names, 1, 's'), Some(0));
+        assert_eq!(jump_row(&names, 2, 's'), Some(0));
+        assert_eq!(jump_row(&names, 1, 'V'), Some(2));
+        // A letter no plugin begins with reaches none.
+        assert_eq!(jump_row(&names, 1, 'z'), None);
+    }
 
     #[test]
     fn a_plugin_call_contains_its_name_and_nested_values() {

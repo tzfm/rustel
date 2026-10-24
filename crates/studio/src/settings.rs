@@ -2958,6 +2958,10 @@ pub enum SettingsAction {
     /// of plugins.
     #[cfg(feature = "vst")]
     ToggleAudioThread(usize),
+    /// A letter on the vst page: jump to the next plugin whose name
+    /// begins with it, from the row the cursor holds and around the list.
+    #[cfg(feature = "vst")]
+    JumpVst(char),
     /// Enter on a keybind row: wait for a chord, and make it this
     /// action's. The chord itself arrives through the app's learn state.
     LearnKeybind(BindAction),
@@ -3251,10 +3255,16 @@ impl SettingsSheet {
             KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace if on_preset => {
                 SettingsAction::RemovePresetFolder(at - folders)
             }
-            // The page takes the key, so the score does not.
-            KeyCode::Enter | KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
-                SettingsAction::Nothing
+            // A letter jumps to the next plugin that begins with it, from
+            // the row the cursor holds and around: `s` reaches Serum and
+            // the rest of the s's. The arms above took `d` on the rows it
+            // removes, and `a` adds a folder everywhere, so `A` reaches
+            // the a's.
+            KeyCode::Char(letter) if letter.is_alphanumeric() && !matches!(letter, 'a' | '+') => {
+                SettingsAction::JumpVst(letter)
             }
+            // The page takes the key, so the score does not.
+            KeyCode::Enter | KeyCode::Delete | KeyCode::Backspace => SettingsAction::Nothing,
             _ => SettingsAction::Ignored,
         }
     }
@@ -5065,6 +5075,50 @@ mod tests {
         assert_eq!(
             SettingsNavigation::default().open(),
             SettingsSheet::default()
+        );
+    }
+
+    /// A letter on the vst page jumps to a plugin, and the keys the page
+    /// binds stay bound: `a` adds a folder from any row, and `d` takes a
+    /// folder off only on the rows that hold one.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn a_letter_jumps_and_the_bound_keys_of_the_vst_page_stay() {
+        let mut settings = UiSettings::default();
+        let features = TerminalFeatures::default();
+        let mut sheet = SettingsSheet::default();
+        sheet.show_page(SettingsPage::Vst);
+        sheet.vst_folder_count = 1;
+        sheet.vst_standard_count = 1;
+        sheet.vst_preset_folder_count = 1;
+        sheet.vst_scanned_count = 3;
+        let mut key = |sheet: &mut SettingsSheet, code| sheet.key(code, &mut settings, &features);
+        // The rows before the plugins: the folder the player added, then
+        // the standard folder, then the preset folder.
+        sheet.selected = VST_CONTROL_COUNT;
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char('d')),
+            SettingsAction::RemoveVstFolder(0)
+        );
+        // `a` keeps its add from every row, and a letter no row binds
+        // jumps to the plugins.
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char('a')),
+            SettingsAction::AddVstFolder
+        );
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char('s')),
+            SettingsAction::JumpVst('s')
+        );
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char('S')),
+            SettingsAction::JumpVst('S')
+        );
+        // On a plugin row no folder sits under, `d` is a letter too.
+        sheet.selected = VST_CONTROL_COUNT + 3 + 1;
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char('d')),
+            SettingsAction::JumpVst('d')
         );
     }
 
@@ -9390,6 +9444,10 @@ mod tests {
             .join("\n");
         assert!(
             text.contains("Enter lists the presets · Space turns audio thread only on or off"),
+            "{text}"
+        );
+        assert!(
+            text.contains("2 plugins found · a letter jumps to its plugins"),
             "{text}"
         );
         assert!(text.contains("▸ Kick"), "{text}");

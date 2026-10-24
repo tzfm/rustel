@@ -1088,6 +1088,8 @@ impl App {
             SettingsAction::ToggleAudioThread(at) => self.toggle_audio_thread(at),
             #[cfg(feature = "vst")]
             SettingsAction::ToggleVstPresets(at) => self.toggle_vst_presets(&mut sheet, at),
+            #[cfg(feature = "vst")]
+            SettingsAction::JumpVst(letter) => self.jump_vst_plugin(&mut sheet, letter),
         }
         // The keybind learn belongs to the Keybinds page: Tabbed away
         // from it - or closed by any door the sheet has - the learn goes
