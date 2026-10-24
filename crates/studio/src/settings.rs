@@ -8657,10 +8657,10 @@ mod tests {
         assert_eq!(at(34), None);
         assert_eq!(at(45), None);
 
-        // At 70 columns the tabs lose their padding, and the ones past the
+        // At 69 columns the tabs lose their padding, and the ones past the
         // edge are gone rather than half drawn. Each one that stays whole
         // answers to a click on its own label, and the corner stays.
-        let area = Rect::new(0, 0, 70, 40);
+        let area = Rect::new(0, 0, 69, 40);
         let (panel, _) = SettingsSheetView::geometry(area).expect("fits");
         let buffer = render_sheet(
             SettingsSheet::default(),
