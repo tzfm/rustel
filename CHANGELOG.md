@@ -3,6 +3,7 @@
 ## Unreleased
 - The plugin list of the Settings vst page takes a filter: `/` starts it, the letters keep the plugins their names reach - a part of a name is enough, as the preset search reads it - Enter keeps it standing and Esc drops it. While it types, the keys the page binds are letters of it, so `a` adds no folder.
 - The header's tempo line reads cycle 0.00 while the studio is stopped, as before the first play. The stop freezes the clock for the canvas the player keeps, and the header kept saying the cycle the score stopped on. A canvas that is already stopped no longer takes a second stop word, and a stop pressed while the playback is already stopped no longer asks the engine to stop again: the word came back as a second settle, which reset the advisories and discarded the visual update the held frame was showing.
+- Copying samples into a set refuses bank names and links that could write outside the set folder.
 - On a terminal that composes Option+A into text, the Chords and Scales tabs read it as the auto preview toggle. Before, the composed character typed into the search box.
 - A click on the preview fader reads the bar it draws. Before, the click's bar was narrower than the drawn one, so a click on the knob set a gain a few dB higher.
 - Sample and manifest fetches retry a transient 429 or 5xx after a short rest, so a briefly overloaded sample host no longer fails a corpus run.

@@ -3446,6 +3446,74 @@ pub(super) mod tests {
             let _ = std::fs::remove_dir_all(set);
         }
 
+        #[test]
+        fn consolidating_refuses_a_bank_name_outside_the_set() {
+            let source = test_dir("consolidate-escape-source");
+            let set = test_dir("consolidate-escape-set");
+            let escaped = test_dir("consolidate-escape-target");
+            std::fs::write(source.join("clap.wav"), tiny_wav()).expect("fixture");
+            let url = local_file_url(&source.join("clap.wav"));
+            let escaped_name = escaped.file_name().expect("name").to_string_lossy();
+            let name = format!("../{escaped_name}");
+            let library = SampleLibrary::empty();
+            library
+                .banks
+                .write()
+                .expect("banks")
+                .insert(name.clone(), Bank::Array(vec![Arc::from(url.as_str())]));
+
+            let result = library.copy_bank_into(&name, &set);
+            let wrote_outside = escaped.join("0.wav").exists();
+            let _ = std::fs::remove_dir_all(source);
+            let _ = std::fs::remove_dir_all(set);
+            let _ = std::fs::remove_dir_all(escaped);
+
+            assert!(result.is_err(), "a parent bank name was accepted");
+            assert!(!wrote_outside, "the bank wrote outside the set");
+        }
+
+        #[cfg(any(unix, windows))]
+        #[test]
+        fn consolidating_refuses_a_bank_folder_link_outside_the_set() {
+            let source = test_dir("consolidate-link-source");
+            let set = test_dir("consolidate-link-set");
+            let target = test_dir("consolidate-link-target");
+            std::fs::write(source.join("clap.wav"), tiny_wav()).expect("fixture");
+            let url = local_file_url(&source.join("clap.wav"));
+            let library = SampleLibrary::empty();
+            library
+                .banks
+                .write()
+                .expect("banks")
+                .insert("kit".to_owned(), Bank::Array(vec![Arc::from(url.as_str())]));
+            let link = set.join("kit");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &link).expect("directory link");
+            #[cfg(windows)]
+            {
+                let link_text = link.display().to_string();
+                let target_text = target.display().to_string();
+                let output = std::process::Command::new("cmd")
+                    .args(["/C", "mklink", "/J", &link_text, &target_text])
+                    .output()
+                    .expect("run mklink");
+                assert!(
+                    output.status.success(),
+                    "create a junction: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+
+            let result = library.copy_bank_into("kit", &set);
+            let wrote_outside = target.join("0.wav").exists();
+            let _ = std::fs::remove_dir_all(source);
+            let _ = std::fs::remove_dir_all(set);
+            let _ = std::fs::remove_dir_all(target);
+
+            assert!(result.is_err(), "a linked bank folder was accepted");
+            assert!(!wrote_outside, "the bank wrote through the link");
+        }
+
         /// The extension a copy gets is the one the scan will read back, taken
         /// from the path rather than from a query or a fragment.
         #[test]
