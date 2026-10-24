@@ -8681,6 +8681,8 @@ mod tests {
             #[cfg(feature = "vst")]
             ("vst", SettingsPage::Vst),
             ("reference", SettingsPage::Reference),
+            #[cfg(not(feature = "vst"))]
+            ("permissions", SettingsPage::Permissions),
         ] {
             let column = title[..title.find(label).expect(label)].chars().count() as u16;
             for dx in 0..label.len() as u16 {
@@ -8688,12 +8690,27 @@ mod tests {
                 assert_eq!(click, Some(page), "{label} in {title}");
             }
         }
+        // A column narrower the permissions tab no longer fits whole, so it
+        // is gone rather than half drawn, and it is not click-stripped
+        // either.
+        let area = Rect::new(0, 0, 69, 40);
+        let (panel, _) = SettingsSheetView::geometry(area).expect("fits");
+        let buffer = render_sheet(
+            SettingsSheet::default(),
+            &UiSettings::default(),
+            &TerminalFeatures::default(),
+            area,
+        );
+        let title: String = (panel.x..panel.right())
+            .map(|x| buffer[(x, panel.y)].symbol())
+            .collect();
+        assert!(title.ends_with('╮'), "{title}");
         assert!(
             !title.contains("permissions"),
             "a tab that cannot fit whole is not half drawn: {title}"
         );
         assert_eq!(
-            SettingsSheet::tab_at(area, panel.x + 65, panel.y),
+            SettingsSheet::tab_at(area, panel.x + 61, panel.y),
             None,
             "and it is not click-stripped either"
         );
