@@ -2,6 +2,7 @@
 
 ## Unreleased
 - On a terminal that composes Option+A into text, the Chords and Scales tabs read it as the auto preview toggle. Before, the composed character typed into the search box.
+- A click on the preview fader reads the bar it draws. Before, the click's bar was narrower than the drawn one, so a click on the knob set a gain a few dB higher.
 - Sample and manifest fetches retry a transient 429 or 5xx after a short rest, so a briefly overloaded sample host no longer fails a corpus run.
 
 - Settings has an Appearance page: the visual rows of the first page in one place. The Advanced page is gone, its rows sit at the end of General, and the first tab is renamed General. A beat line under the header keeps the tempo visible in pulse, travel and wave looks, and the evaluation animation row shapes the flash a run of code makes, with fades of three speeds, swipe, zap, steps, glitch and wave.
@@ -19,7 +20,7 @@
 - The mixer no longer shows "no gamepad". The camera warning clears when nothing asks for the camera.
 - New terminal and terminal-warm themes use your terminal's colours.
 - Plugin edits load only the copy that changed. Heavy sets spread plugin chains over several cores.
-- Windows reports underruns, and Csound reports when it falls behind.
+- Windows reports underruns, and Csound reports when it falls behind, in play and in an offline render.
 - Two memory leaks are fixed, in macOS gamepad polling and in the Chords tab.
 - all() returning undefined is an error now.
 - Pattern queries allocate less, and rustelup checks the Linux build packages first..

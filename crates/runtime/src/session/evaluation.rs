@@ -580,17 +580,33 @@ impl Session {
         no_pattern: NoPatternPolicy,
         allow_mini_fallback: bool,
     ) -> Result<(), RuntimeError> {
-        if restart_transport {
-            self.newest_window = None;
-        }
-        let evaluated = self.evaluate_score_cancellable(
+        // A restarting score reads cycle 0 while it evaluates. A candidate
+        // that fails leaves the score that keeps playing holding the window
+        // of the running timeline, until a restart or a stop clears it.
+        let prior_window = if restart_transport {
+            self.newest_window.take()
+        } else {
+            self.newest_window
+        };
+        let evaluated = match self.evaluate_score_cancellable(
             source,
             budget,
             cancellation,
             allow_mini_fallback,
             no_pattern,
-        )?;
-        self.install_evaluated_score(evaluated, source, now, restart_transport, None)
+        ) {
+            Ok(evaluated) => evaluated,
+            Err(error) => {
+                self.newest_window = prior_window;
+                return Err(error);
+            }
+        };
+        let installed =
+            self.install_evaluated_score(evaluated, source, now, restart_transport, None);
+        if installed.is_err() {
+            self.newest_window = prior_window;
+        }
+        installed
     }
 
     pub(super) fn evaluate_score_cancellable(
@@ -2072,9 +2088,17 @@ impl Session {
 
     /// Reload the score, then restart its timeline at cycle zero at `now`.
     pub fn restart_at(&mut self, source: &str, mini: bool, now: f64) -> Result<u64, RuntimeError> {
-        // The score starts the new timeline, so `getTime()` reads its cycle 0.
-        self.newest_window = None;
-        let generation = self.reload_at(source, mini, now)?;
+        // The score starts the new timeline, so `getTime()` reads its cycle 0
+        // while it evaluates. A candidate that fails leaves the running
+        // timeline playing, and its window comes back until one restarts.
+        let prior_window = self.newest_window.take();
+        let generation = match self.reload_at(source, mini, now) {
+            Ok(generation) => generation,
+            Err(error) => {
+                self.newest_window = prior_window;
+                return Err(error);
+            }
+        };
         self.restart_transport_at(now);
         Ok(generation)
     }
@@ -4360,6 +4384,27 @@ endin`";
             .reload_at("setcps(1); $: s('riser').oneshot()", false, 37.3)
             .expect("edit");
         assert_eq!(onsets(&session), [38.0], "an edit");
+    }
+
+    /// A restart whose candidate fails leaves the timeline running, and
+    /// the next edit still reads the cycle it joins, not cycle 0.
+    #[cfg(feature = "extensions")]
+    #[test]
+    fn a_failed_restart_keeps_the_running_timeline_for_get_time() {
+        let mut session = Session::new().expect("session");
+        session.evaluate(ONESHOT).expect("start");
+        run_clock(&mut session, 0.0, 37.3);
+        session
+            .restart_at("throw new Error('reject candidate')", false, 37.3)
+            .expect_err("candidate must reject");
+        session
+            .reload_at("setcps(1); $: s('riser').oneshot()", false, 37.3)
+            .expect("edit");
+        assert_eq!(
+            onsets(&session),
+            [38.0],
+            "the edit joins the running timeline"
+        );
     }
 
     #[cfg(all(feature = "extensions", feature = "device-audio"))]

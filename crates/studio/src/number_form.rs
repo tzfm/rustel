@@ -38,10 +38,19 @@ pub(crate) fn format_value(value: f64) -> String {
 
 /// A value in the form a score writes a plugin parameter: 3 decimals at
 /// most. A rail shows its value this way too, so a step of a third reads
-/// `0.333`, not every digit the float holds.
+/// `0.333`, not every digit the float holds. A negative that rounds to
+/// zero writes the zero it is, as `format_value` does.
 pub(crate) fn short_number(value: f64) -> String {
+    if value == 0.0 {
+        return "0".to_owned();
+    }
     let text = format!("{value:.3}");
-    text.trim_end_matches('0').trim_end_matches('.').to_owned()
+    let short = text.trim_end_matches('0').trim_end_matches('.');
+    if short == "-0" {
+        "0".to_owned()
+    } else {
+        short.to_owned()
+    }
 }
 
 /// One number field of the slider form.
@@ -258,5 +267,7 @@ mod tests {
         assert_eq!(short_number(1.0), "1");
         assert_eq!(short_number(0.5), "0.5");
         assert_eq!(short_number(812.6543), "812.654");
+        assert_eq!(short_number(-0.0), "0");
+        assert_eq!(short_number(-0.0004), "0");
     }
 }
