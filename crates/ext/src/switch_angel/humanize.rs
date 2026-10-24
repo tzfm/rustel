@@ -60,7 +60,15 @@ impl ExtensionPatternNode for HumanizeNode {
                 let offset = Fraction::from_f64(0.1 * amount * (2.0 * random[0] - 1.0))
                     .unwrap_or(Fraction::ZERO);
                 let velocity_delta = 0.5 * amount * (2.0 * random[1] - 1.0);
-                let moved = hap.with_span(|span| span.with_time(|position| position.add(offset)));
+                let moved = hap.with_span(|span| {
+                    span.with_time(|position| match position.checked_add(offset) {
+                        Some(moved) => moved,
+                        None => {
+                            rustel_core::refuse_native_fraction("humanize");
+                            position
+                        }
+                    })
+                });
                 // One output hap per inner hap, across every amount hap;
                 // charge the running total before it grows past the query's
                 // hap budget.

@@ -2657,6 +2657,13 @@ pub fn refuse_euclid_steps(steps: u64, limit: u64) {
     refuse(QueryLimit::EuclidSteps { steps, limit });
 }
 
+/// Refuse a native-fraction overflow through the typed resource channel.
+/// Extension nodes use this where their span shifts leave the range an
+/// `i128` numerator can hold.
+pub fn refuse_native_fraction(operation: &'static str) {
+    refuse(QueryLimit::NativeFraction { operation });
+}
+
 /// Charge a growing collection outside this crate, by its current length.
 ///
 /// `charge_haps` is a high-water bound on a single vector, so the caller
@@ -5125,15 +5132,44 @@ impl Pattern {
             }
 
             Node::RepeatCycles(pattern, count) => {
+                // Every shift is checked: a span at the far edge of the
+                // native range refuses rather than unwinds, as `fastGap`
+                // does.
+                let refuse_shift = || {
+                    refuse(QueryLimit::NativeFraction {
+                        operation: "repeatCycles",
+                    });
+                };
                 let cycle = state.span.begin.sam();
-                let source_cycle = cycle.div(*count).sam();
-                let delta = cycle.sub(source_cycle);
-                let shifted = state.with_span(|span| span.with_time(|time| time.sub(delta)));
+                let Some(delta) = cycle
+                    .checked_div(*count)
+                    .and_then(|source| cycle.checked_sub(source.sam()))
+                else {
+                    refuse_shift();
+                    return Vec::new();
+                };
+                let shifted = state.with_span(|span| {
+                    match (span.begin.checked_sub(delta), span.end.checked_sub(delta)) {
+                        (Some(begin), Some(end)) => TimeSpan::new(begin, end),
+                        _ => {
+                            refuse_shift();
+                            *span
+                        }
+                    }
+                });
                 pattern
                     .query(&shifted)
                     .into_iter()
                     .map(|mut hap| {
-                        hap.update_span(|span| span.with_time(|time| time.add(delta)));
+                        hap.update_span(|span| {
+                            span.with_time(|time| match time.checked_add(delta) {
+                                Some(shifted) => shifted,
+                                None => {
+                                    refuse_shift();
+                                    time
+                                }
+                            })
+                        });
                         hap
                     })
                     .collect()
@@ -6849,7 +6885,16 @@ impl Pattern {
     /// query span and the hap spans.
     pub fn revv(&self) -> Self {
         fn negate(span: &TimeSpan) -> TimeSpan {
-            TimeSpan::new(span.end.neg(), span.begin.neg())
+            // A span at the far edge of the native range cannot be negated;
+            // the query refuses rather than unwinds. The returned span is
+            // never read once the refusal flag is set.
+            match (span.end.checked_neg(), span.begin.checked_neg()) {
+                (Some(end), Some(begin)) => TimeSpan::new(end, begin),
+                (None, _) | (_, None) => {
+                    refuse(QueryLimit::NativeFraction { operation: "revv" });
+                    *span
+                }
+            }
         }
         self.with_query_span(negate).with_hap_span(negate)
     }

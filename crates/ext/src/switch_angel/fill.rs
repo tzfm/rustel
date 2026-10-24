@@ -114,7 +114,18 @@ impl FillNode {
     fn evaluate(pattern: &Pattern, state: &State) -> Vec<Hap> {
         let original = state.span;
         let haps = pattern.query(&state.with_span(|span| {
-            TimeSpan::new(span.begin.sub(Fraction::ONE), span.end.add(Fraction::ONE))
+            // A span at the far edge of the native range cannot widen by a
+            // cycle; the query refuses rather than unwinds.
+            match (
+                span.begin.checked_sub(Fraction::ONE),
+                span.end.checked_add(Fraction::ONE),
+            ) {
+                (Some(begin), Some(end)) => TimeSpan::new(begin, end),
+                _ => {
+                    rustel_core::refuse_native_fraction("fill");
+                    *span
+                }
+            }
         }));
         if haps.iter().any(|hap| hap.whole.is_none()) {
             rustel_core::signal_query_error(|| {
