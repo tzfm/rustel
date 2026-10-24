@@ -1053,6 +1053,35 @@ mod tests {
         }
     }
 
+    // A banked wavetable and its direct spelling must classify the same:
+    // the gates test the bank-prefixed name, as selection does.
+    #[test]
+    fn a_banked_wavetable_gates_like_its_direct_spelling() {
+        let mods = |json: &str| {
+            modulator_controls(&object(json), 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
+        };
+        for control in ["note", "s", "freq", "frequency", "wt", "detune", "warp"] {
+            let lfo = format!(r#""lfo": {{"a": {{"control": "{control}", "rate": 2}}}}"#);
+            let direct = format!(r#"{{"s": "wt_digital_basique", {lfo}}}"#);
+            let banked = format!(r#"{{"s": "basique", "bank": "wt_digital", {lfo}}}"#);
+            let (direct, _, _) = mods(&direct);
+            let (banked, _, _) = mods(&banked);
+            let direct = &direct[0];
+            let banked = &banked[0];
+            match (direct, banked) {
+                (Some(direct), Some(banked)) => {
+                    assert_eq!(
+                        (direct.param_base, direct.min, direct.max),
+                        (banked.param_base, banked.min, banked.max),
+                        "{control} modulates both spellings the same way"
+                    );
+                }
+                (None, None) => {}
+                pair => panic!("{control}: the gate differs between spellings: {pair:?}"),
+            }
+        }
+    }
+
     // Synth pitch modulation uses frequency; samples use detune in cents with base 0.
     #[test]
     fn a_pitch_modulator_rides_detune_on_a_sample_and_frequency_on_a_synth() {
@@ -1991,7 +2020,13 @@ fn source_pitch_rides_detune(object: &serde_json::Map<String, serde_json::Value>
     match object.get("s").and_then(serde_json::Value::as_str) {
         // No sound named at all is the default oscillator.
         None => false,
-        Some(name) => !is_native_synth_sound(name) && !name.starts_with("wt_"),
+        Some(name) => {
+            // The bank prefix goes on first, so a banked table counts as
+            // the `wt_` name it resolves to, exactly as selection does.
+            let banked = bank_prefixed(object, name).ok().flatten();
+            let name = banked.as_deref().unwrap_or(name);
+            !is_native_synth_sound(name) && !name.starts_with("wt_")
+        }
     }
 }
 
@@ -3263,6 +3298,19 @@ pub fn bank_prefixed(
     }
 }
 
+/// The name a wavetable gate tests: the raw `s` with the bank prefix
+/// applied, so `s("basique").bank("wt_digital")` counts as the `wt_` name it
+/// resolves to. Mirrors [`wavetable_controls`]'s own prefixing.
+fn banked_source_name(object: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let name = object.get("s").and_then(serde_json::Value::as_str)?;
+    Some(
+        bank_prefixed(object, name)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| name.to_owned()),
+    )
+}
+
 /// `wt_`-named sounds route to the wavetable oscillator.
 fn wavetable_controls(
     object: &serde_json::Map<String, serde_json::Value>,
@@ -4376,8 +4424,8 @@ fn modulator_controls(
             // Only the wavetable and supersaw oscillators have `detune` and
             // `spread` params. No other source has such a param to ride.
             "detune" | "spread" => {
-                let source = object.get("s").and_then(serde_json::Value::as_str)?;
-                if !source.starts_with("wt_") && source != "supersaw" {
+                let source = banked_source_name(object)?;
+                if !source.starts_with("wt_") && source.as_str() != "supersaw" {
                     return None;
                 }
                 if control == "detune" {
@@ -4395,7 +4443,11 @@ fn modulator_controls(
                         object
                             .get("spread")
                             .and_then(serde_json::Value::as_f64)
-                            .unwrap_or(if source == "supersaw" { 0.6 } else { 0.7 }),
+                            .unwrap_or(if source.as_str() == "supersaw" {
+                                0.6
+                            } else {
+                                0.7
+                            }),
                         false,
                     ))
                 }
@@ -4404,7 +4456,7 @@ fn modulator_controls(
             // same rules as the position pair below - `warpdc` is absent for
             // the same reason `wtdc` is.
             "warp" | "warprate" | "warpsync" | "warpdepth" | "warpskew" => {
-                let source = object.get("s").and_then(serde_json::Value::as_str)?;
+                let source = banked_source_name(object)?;
                 if !source.starts_with("wt_") {
                     return None;
                 }
@@ -4449,7 +4501,7 @@ fn modulator_controls(
             // (a `dc`/`dcoffset` param-name mismatch throws), so neither can
             // a score here.
             "wt" | "wtrate" | "wtsync" | "wtdepth" | "wtskew" => {
-                let source = object.get("s").and_then(serde_json::Value::as_str)?;
+                let source = banked_source_name(object)?;
                 if !source.starts_with("wt_") {
                     return None;
                 }
