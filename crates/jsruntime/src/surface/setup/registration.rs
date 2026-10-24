@@ -158,15 +158,28 @@ pub(super) fn put_back<'js>(
     name: &str,
     original: rquickjs::Value<'js>,
 ) -> rquickjs::Result<()> {
-    target.remove(name)?;
-    if !original.is_undefined() {
-        target.prop(
-            name,
-            rquickjs::object::Property::from(original)
-                .writable()
-                .enumerable()
-                .configurable(),
-        )?;
+    match target.remove(name) {
+        Ok(()) => {
+            if !original.is_undefined() {
+                target.prop(
+                    name,
+                    rquickjs::object::Property::from(original)
+                        .writable()
+                        .enumerable()
+                        .configurable(),
+                )?;
+            }
+        }
+        Err(error) => {
+            if original.is_undefined() {
+                return Err(error);
+            }
+            // The slot stayed: a score locked it non-configurable, and such
+            // a slot refuses deletion. It still takes a new value while it
+            // stays writable, so the engine's name answers again even
+            // though its configurability cannot come back.
+            target.prop(name, rquickjs::object::Property::from(original).writable())?;
+        }
     }
     Ok(())
 }
@@ -196,22 +209,36 @@ pub(crate) fn restore_surface(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
     let taken = record
         .own_props::<String, rquickjs::Array>(rquickjs::object::Filter::new().string())
         .collect::<rquickjs::Result<Vec<_>>>()?;
+    let mut first_failure = None;
     for (name, before) in taken {
-        // Spent either way: what the name meant before this score is either
-        // being put back now, or is what the score itself declared and is
-        // the surface from here on.
-        record.remove(&name)?;
         let method: rquickjs::Value = before.get(DISPLACED_METHOD)?;
         let raw: rquickjs::Value = before.get(DISPLACED_RAW)?;
         let scoped: rquickjs::Value = before.get(DISPLACED_SCOPED)?;
-        if method.is_undefined() && raw.is_undefined() && scoped.is_undefined() {
-            continue;
+        // The record entry is spent only once its writes landed. A restore
+        // that fails after forgetting the displacement leaves the score's
+        // registration installed for good: the next score has nothing left
+        // to put back.
+        let restored = (|| {
+            if method.is_undefined() && raw.is_undefined() && scoped.is_undefined() {
+                return Ok(());
+            }
+            put_back(&proto, &name, method)?;
+            put_back(&proto, &format!("_{name}"), raw)?;
+            put_back(&scope, &name, scoped)
+        })();
+        match restored {
+            Ok(()) => {
+                record.remove(&name)?;
+            }
+            Err(error) => {
+                first_failure.get_or_insert(error);
+            }
         }
-        put_back(&proto, &name, method)?;
-        put_back(&proto, &format!("_{name}"), raw)?;
-        put_back(&scope, &name, scoped)?;
     }
-    Ok(())
+    match first_failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// Take what has been registered so far as the surface every score starts
