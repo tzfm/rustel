@@ -364,6 +364,55 @@ fn zero_speed_sample_is_an_audio_no_op() {
     );
 }
 
+/// Events that create no voice - a sample not installed at onset, a muted
+/// event - must not spend the active-voice ceiling: the valid tone after a
+/// full segment of them still sounds.
+#[test]
+fn events_without_a_voice_do_not_spend_the_voice_ceiling() {
+    let missing = || {
+        OnsetEvent::new(0, 0.0, 1.0, 0.1).with_sample(SampleControls {
+            sample: rustel_audio::SampleId(9_999),
+            playback_rate: 1.0,
+            begin: 0.0,
+            end: 1.0,
+            hold: SampleHold::Slice,
+            muted: false,
+            loop_secs: None,
+            envelope_peak: 1.0,
+            reversed: false,
+            nudge_secs: 0.0,
+            cut: None,
+        })
+    };
+    let muted = || {
+        OnsetEvent::new(0, 0.0, 1.0, 0.1).with_sample(SampleControls {
+            sample: BUNDLED_BD_SAMPLE_ID,
+            playback_rate: 1.0,
+            begin: 0.0,
+            end: 1.0,
+            hold: SampleHold::Slice,
+            muted: true,
+            loop_secs: None,
+            envelope_peak: 1.0,
+            reversed: false,
+            nudge_secs: 0.0,
+            cut: None,
+        })
+    };
+    for voiceless in [missing, muted] {
+        let mut events: Vec<_> = (0..rustel_audio::MAX_ACTIVE_VOICES)
+            .map(|_| voiceless())
+            .collect();
+        events.push(OnsetEvent::new(0, 440.0, 0.8, 0.2));
+        let pcm = render_pcm(&mut ScalarBackend::new(), 48_000, 4_800, &events)
+            .unwrap_or_else(|error| panic!("render: {error}"));
+        assert!(
+            pcm.iter().any(|sample| sample.abs() > 0.001),
+            "the valid tone after a segment of voice-less events must still sound"
+        );
+    }
+}
+
 /// A looped sample is silent for the whole hap while its step is longer than
 /// its loop, and sounds to the end of the hap at a step that fits.
 #[test]

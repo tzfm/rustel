@@ -617,7 +617,6 @@ impl ScalarBackend {
                     }
                     return false;
                 }
-                activated += 1;
                 let mut event = *e;
                 if event.controls.live_controls != [0; 3] {
                     for target in live_control_targets {
@@ -1611,6 +1610,10 @@ impl ScalarBackend {
                     voice.cut_fade_frame = Some(e.onset_frame);
                     voice.stop_secs = voice.stop_secs.min(CUT_FADE_SECS);
                 }
+                // Counted where the voice exists: a missing sample or a
+                // muted event applies its side effects but sounds nothing,
+                // so it must not spend the active-voice ceiling.
+                activated += 1;
                 pressure.activate(&voice);
                 self.voices.push(voice);
                 *missing_reverb_events += missed_stage_reverb;
