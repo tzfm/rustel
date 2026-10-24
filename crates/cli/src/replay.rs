@@ -299,8 +299,24 @@ pub(super) fn run_replay(
                 // Same atomic swap a text editor performs, so the watcher sees
                 // whole files rather than half-written ones.
                 let tmp = target.with_extension("rustel.replay-tmp");
-                if std::fs::write(&tmp, cue.save.source.as_bytes()).is_ok() {
-                    let _ = std::fs::rename(&tmp, &target);
+                let written = std::fs::write(&tmp, cue.save.source.as_bytes())
+                    .and_then(|()| std::fs::rename(&tmp, &target));
+                // A save that never reached the watched score is reported,
+                // never announced: the protocol must not call a cue active
+                // while the file on disk still holds an older save.
+                if let Err(error) = written {
+                    output.event(
+                        LiveDetail::Essential,
+                        serde_json::json!({
+                            "replay_save_failed": {
+                                "t": (cue.save.at * 1000.0).round() / 1000.0,
+                                "save": cue.index + 1,
+                                "of": total_saves,
+                                "error": error.to_string(),
+                            }
+                        }),
+                    );
+                    continue;
                 }
                 // A save the tape marks installed is announced; one it marks
                 // rejected is reported.
