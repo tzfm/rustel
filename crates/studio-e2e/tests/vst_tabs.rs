@@ -437,3 +437,47 @@ fn a_plugins_parameters_are_available_throughout_its_call() {
     wait_for_row(&mut studio, "▾ Rustel Fixture Tone");
     assert!(studio.rows().iter().all(|row| !row.contains("beatgate")));
 }
+
+/// A preset file that lands in the preset folder while the studio runs
+/// reaches the open plugin with no rescan: the watch of the folders reads
+/// them again. The preset the player saved mid-play is there once the
+/// read ends, and the score keeps playing through it.
+#[test]
+fn a_preset_file_saved_while_the_studio_runs_reaches_the_open_plugin() {
+    let mut studio = hermetic();
+    let folder = tempfile::tempdir().expect("plugin folder");
+    let presets = folder.path().join("presets");
+    let of_fixture = presets.join(rustel_vst3_fixture::NAME);
+    std::fs::create_dir_all(&of_fixture).expect("preset folder");
+    std::fs::write(
+        of_fixture.join("Dark Bass.vstpreset"),
+        rustel_vst3_fixture::preset(0.5, 0.0),
+    )
+    .expect("preset file");
+    let plugins = folder.path().join("plugins");
+    rustel_vst3_fixture::install(&plugins);
+    vst::host().set_preset_folder(presets);
+    vst::pin_standard_folders(vec![plugins]);
+
+    // The presets are the half of the plugin the saved file reaches. →
+    // opens the plugin on its parameters, Tab goes to the presets.
+    studio.press(KeyCode::End, KeyModifiers::NONE);
+    open_vst_tab(&mut studio);
+    wait_for_row(&mut studio, "1 of 1 plugins");
+    studio.press(KeyCode::Right, KeyModifiers::NONE);
+    studio.settle();
+    studio.press(KeyCode::Tab, KeyModifiers::NONE);
+    studio.settle();
+    studio.pump_until(LOAD_BUDGET, "the presets of the read", |studio| {
+        studio.rows().iter().any(|row| row.contains("Dark Bass"))
+    });
+
+    std::fs::write(
+        of_fixture.join("Late Save.vstpreset"),
+        rustel_vst3_fixture::preset(0.5, 0.0),
+    )
+    .expect("preset file");
+    studio.pump_until(LOAD_BUDGET, "the preset of the watch", |studio| {
+        studio.rows().iter().any(|row| row.contains("Late Save"))
+    });
+}

@@ -755,6 +755,20 @@ impl App {
                 }
             }
         }
+        // The watch of the preset folders read them again when a file came
+        // in or went out: the open plugin of the vst tab takes the
+        // presets of that read, and the count line moves with it.
+        let version = vst::host().presets_version();
+        if version != self.plugin_presets_version {
+            self.plugin_presets_version = version;
+            if self
+                .reference_panel
+                .as_mut()
+                .is_some_and(|panel| panel.vst.presets_stale())
+            {
+                self.dirty_frame = true;
+            }
+        }
         // The list of background jobs has a row for the scan and a row
         // for each load. A test of the scan gives the list new names.
         let (loads, scan) = (vst::loads(), vst::scan_progress());
@@ -803,6 +817,10 @@ impl App {
             host.resolve(name, false);
         }
         let mut changed = panel.vst.set_plugins(host.plugins());
+        // The count line says where the read of the folders is.
+        changed |= panel
+            .vst
+            .set_scan(vst::scan_progress().map(|scan| (scan.read, scan.bundles)));
         // The host reads the preset folder on its own thread. The tab asks
         // again on the next read of the list until the names are here.
         if let Some(presets) = panel.vst.presets_due().and_then(|name| host.presets(name)) {

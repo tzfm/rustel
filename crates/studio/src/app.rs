@@ -859,6 +859,11 @@ struct App {
     /// Where the plugin scan was at the last turn, while the scan runs.
     #[cfg(feature = "vst")]
     plugin_scan: Option<rustel_runtime::vst::ScanProgress>,
+    /// The reads of the preset folders at the last turn: the watch reads
+    /// them again when a file changed, and the open plugin takes the
+    /// presets of that read.
+    #[cfg(feature = "vst")]
+    plugin_presets_version: u64,
     /// The plugin rows of the memory breakdown, as last measured.
     #[cfg(feature = "vst")]
     plugin_memory: Vec<super::memory::PluginMemory>,
@@ -1648,6 +1653,8 @@ impl App {
             settings_vst_open_presets: Vec::new(),
             #[cfg(feature = "vst")]
             plugin_scan: None,
+            #[cfg(feature = "vst")]
+            plugin_presets_version: 0,
             #[cfg(feature = "vst")]
             plugin_memory: Vec::new(),
             linter: Linter::spawn().map_err(RuntimeError::Io)?,

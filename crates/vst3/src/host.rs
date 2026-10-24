@@ -16,6 +16,7 @@ use rustel_audio::{
 use crate::cache::{self, Cache, Scanned};
 use crate::instance::{CopyState, Instance, Loaded};
 use crate::module::{ClassInfo, Module};
+use crate::watch::Word;
 use crate::{Job, ParamInfo, canonical, scan};
 
 /// The program that loads one bundle in a process of its own for the scan.
@@ -328,6 +329,18 @@ struct State {
     /// The folders with `.vstpreset` files the player added, in any
     /// structure, read after the preset folder.
     preset_extra: Vec<PathBuf>,
+    /// The word to the watch of the preset folders: see
+    /// [`Host::arm_preset_watch`]. A channel that reads as gone ended its
+    /// watch, and the folders are read when the player asks again.
+    preset_watch: Option<Sender<Word>>,
+    /// The folders the watch of the preset folders was asked for, also when
+    /// a missing folder made it watch the folder nearest it that is there:
+    /// see [`Host::arm_preset_watch`].
+    preset_watched: Vec<PathBuf>,
+    /// The reads of the preset folders so far. A caller that holds the
+    /// number of its last read asks again when this moves: the watch read
+    /// the folders, and its answer may have changed.
+    presets_version: u64,
     builds: HashMap<(InsertKey, u32, InsertSlot), Build>,
     /// The builds an engine took, with the cell of each copy: the cell has
     /// the mark while the engine holds the plugin.
@@ -831,13 +844,16 @@ impl Host {
     /// The next ask for a preset reads the preset folders again - a read
     /// that runs now reads them after its end, with the new folder.
     pub fn set_preset_folder(&self, folder: PathBuf) {
-        let mut state = self.state();
-        state.preset_root = Some(folder);
-        state.preset_index.clear();
-        state.presets_read = false;
-        if state.presets_reading {
-            state.presets_again = true;
+        {
+            let mut state = self.state();
+            state.preset_root = Some(folder);
+            state.preset_index.clear();
+            state.presets_read = false;
+            if state.presets_reading {
+                state.presets_again = true;
+            }
         }
+        self.arm_preset_watch();
     }
 
     /// The folders with `.vstpreset` files the player added, in any folder
@@ -849,6 +865,54 @@ impl Host {
             state.preset_extra = folders;
         }
         self.read_presets(true);
+    }
+
+    /// Watches the preset folders: the root, and the folders the player
+    /// added. The events of the file system say when a preset comes in or
+    /// goes out, and the read of the folders follows each quiet behind
+    /// them - no read of the disk with no change, and no ask of the
+    /// player. Each read ends here: a folder that came in takes its watch
+    /// of its own, and the watch of the folders before ends with its word.
+    /// The watch that is on stays on when the folders are the same - a new
+    /// watch takes a moment before the events of the system reach it, and
+    /// a change in that moment would be lost. The watch ends with the
+    /// host.
+    fn arm_preset_watch(&self) {
+        let folders = {
+            let mut state = self.state();
+            let mut folders = state.preset_extra.clone();
+            folders.extend(state.preset_root.iter().cloned());
+            if state.preset_watch.is_some() && state.preset_watched == folders {
+                return;
+            }
+            if let Some(watch) = state.preset_watch.take() {
+                let _ = watch.send(Word::Stop);
+            }
+            folders
+        };
+        if folders.is_empty() {
+            return;
+        }
+        let weak = Arc::downgrade(&self.shared);
+        let alive = weak.clone();
+        let Some(word) = crate::watch::watch_folders(
+            folders.clone(),
+            move || alive.upgrade().is_some(),
+            move || {
+                // The watch holds no handle to the host: the host may end
+                // while it runs, and the read is then the least of the
+                // worries. The weak handle says the host is here at all.
+                let Some(shared) = weak.upgrade() else {
+                    return;
+                };
+                Host { shared }.read_presets(true);
+            },
+        ) else {
+            return;
+        };
+        let mut state = self.state();
+        state.preset_watched = folders;
+        state.preset_watch = Some(word);
     }
 
     /// Takes the read of the preset folders for this caller, on the plugin
@@ -907,6 +971,7 @@ impl Host {
         state
             .known_presets
             .retain(|_, known| matches!(known, KnownPreset::Number(_)));
+        state.presets_version += 1;
     }
 
     /// Reads the preset folders on the plugin thread: a folder on a slow
@@ -963,13 +1028,17 @@ impl Host {
             state
                 .known_presets
                 .retain(|_, known| matches!(known, KnownPreset::Number(_)));
+            state.presets_version += 1;
             state.presets_read = true;
             state.presets_reading = false;
             std::mem::take(&mut state.presets_again)
         };
         if again && let Some((root, extra)) = self.claim_presets_read(true) {
-            self.finish_presets(root, extra);
+            return self.finish_presets(root, extra);
         }
+        // The folders as they are now take the watch of the next change:
+        // a folder that came in has a watch of its own from here.
+        self.arm_preset_watch();
     }
 
     /// Keeps each copy of the plugins in `names` in the audio callback, for
@@ -1319,6 +1388,13 @@ impl Host {
         Some(files.into_iter().map(|(name, _)| name).collect())
     }
 
+    /// The number of the reads of the preset folders so far. A caller that
+    /// holds the number of its last read reads again when this moves: the
+    /// watch read the folders, and the answer may have changed.
+    pub fn presets_version(&self) -> u64 {
+        self.state().presets_version
+    }
+
     /// Copies a `.vstpreset` file into the preset folder of its plugin: the
     /// plugin with the class the file names. A score then plays the preset
     /// by the name of the file. Gives the plugin name and the preset name.
@@ -1365,6 +1441,7 @@ impl Host {
         state
             .known_presets
             .retain(|_, known| matches!(known, KnownPreset::Number(_)));
+        state.presets_version += 1;
         Ok((plugin, preset.into_owned()))
     }
 

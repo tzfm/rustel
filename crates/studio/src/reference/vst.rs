@@ -62,6 +62,10 @@ pub struct VstTab {
     /// The parameter groups of the open plugin, in the order the plugin
     /// gives them: the name and the number of parameters.
     groups: Vec<(String, usize)>,
+    /// Where the read of the plugin folders is, while it runs: the bundles
+    /// read, of all of them. The count line says it, as the samples tab
+    /// says its imports.
+    scan: Option<(usize, usize)>,
     /// The list as drawn. Kept, not derived: a plugin has up to some
     /// thousand parameters, and each frame reads the rows more than one time.
     rows: Vec<PluginRow>,
@@ -297,6 +301,30 @@ impl VstTab {
     pub fn set_presets(&mut self, presets: Vec<String>) {
         self.presets_due = false;
         self.keeping_place(|tab| tab.presets = presets);
+    }
+
+    /// The presets came from a read that is past: the next sync asks the
+    /// host again. The answer says the tab owes the ask.
+    pub fn presets_stale(&mut self) -> bool {
+        if self.open.is_none() || self.presets_due {
+            return false;
+        }
+        self.presets_due = true;
+        true
+    }
+
+    /// Where the read of the plugin folders is, while it runs: the bundles
+    /// read, of all of them.
+    pub fn scan(&self) -> Option<(usize, usize)> {
+        self.scan
+    }
+
+    /// Takes where the read of the plugin folders is, `None` when no read
+    /// runs. The answer says the count line changed.
+    pub fn set_scan(&mut self, scan: Option<(usize, usize)>) -> bool {
+        let changed = self.scan != scan;
+        self.scan = scan;
+        changed
     }
 
     /// Takes a new plugin list from the host. Returns false when the list
@@ -838,5 +866,46 @@ mod tests {
         assert!(tab.set_plugins(unloaded));
         assert_eq!(tab.rows(), [PluginRow::Plugin(0), PluginRow::Plugin(1)]);
         assert_eq!(tab.plugin_to_load(), Some("Synth"));
+    }
+
+    /// The watch of the preset folders read them again: the tab owes the
+    /// open plugin its presets, and the presets that come keep the place
+    /// of the cursor. With no plugin open, no ask is owed.
+    #[test]
+    fn a_read_past_the_one_of_the_tab_asks_for_its_presets_again() {
+        use PluginRow::{Plugin, Preset};
+        let mut tab = VstTab::default();
+        tab.set_plugins(vec![synth()]);
+        assert!(!tab.presets_stale());
+        assert!(tab.expand());
+        tab.set_presets(vec!["Lead".into()]);
+        assert_eq!(tab.presets_due(), None);
+        assert!(tab.show_section(VstSection::Presets));
+        assert!(tab.presets_stale());
+        assert_eq!(tab.presets_due(), Some("Synth"));
+        // A read past the one the tab holds again owes nothing more: the
+        // ask of the first is still owed.
+        assert!(!tab.presets_stale());
+        tab.set_presets(vec!["Lead".into(), "Dark".into()]);
+        assert_eq!(tab.rows(), [Plugin(0), Preset(0), Preset(1)]);
+        assert_eq!(
+            tab.row(tab.selected),
+            Some(Preset(0)),
+            "the cursor keeps its preset"
+        );
+    }
+
+    /// The count line of the tab says where the read of the plugin folders
+    /// is, while it runs, and says nothing when no read runs.
+    #[test]
+    fn the_read_of_the_plugin_folders_says_where_it_is() {
+        let mut tab = VstTab::default();
+        assert_eq!(tab.scan(), None);
+        assert!(tab.set_scan(Some((1, 3))));
+        assert!(!tab.set_scan(Some((1, 3))));
+        assert_eq!(tab.scan(), Some((1, 3)));
+        assert!(tab.set_scan(Some((2, 3))));
+        assert!(tab.set_scan(None));
+        assert_eq!(tab.scan(), None);
     }
 }

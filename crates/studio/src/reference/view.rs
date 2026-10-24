@@ -960,6 +960,15 @@ impl ReferenceView<'_> {
         } else {
             format!("{shown} of {} plugins", plugins.len())
         };
+        // The read of the folders runs on the studio's own turn, so the
+        // count line says where it is, as the samples tab says its imports.
+        let count = match tab.scan() {
+            None => count,
+            Some((read, bundles)) if plugins.is_empty() => {
+                format!("reading the plugin folders · {read} of {bundles} bundles…")
+            }
+            Some((read, bundles)) => format!("{count} · reading {read} of {bundles} bundles…"),
+        };
         buffer.set_stringn(
             inner.x,
             inner.y + 2,
