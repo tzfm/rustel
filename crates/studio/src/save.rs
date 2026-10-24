@@ -245,7 +245,13 @@ where
 /// files - and the changed dates the open list orders by - as they were.
 /// True when it wrote.
 pub(super) fn atomic_write(path: &Path, source: &str) -> io::Result<bool> {
-    if std::fs::read(path).is_ok_and(|kept| kept == source.as_bytes()) {
+    // The length decides before any read: an externally enlarged or sparse
+    // file cannot hold these bytes, and reading it whole only to learn that
+    // would cost the save an unbounded read.
+    let same_length = std::fs::metadata(path)
+        .map(|metadata| metadata.len() == source.as_bytes().len() as u64)
+        .unwrap_or(false);
+    if same_length && std::fs::read(path).is_ok_and(|kept| kept == source.as_bytes()) {
         return Ok(false);
     }
     let parent = path
@@ -317,6 +323,12 @@ mod tests {
             past,
             "a skipped write leaves the changed date alone"
         );
+
+        // An externally enlarged file differs by its length alone, so the
+        // equality read is skipped and the replacement happens without it.
+        std::fs::write(&path, "new score with a longer tail").unwrap();
+        assert!(atomic_write(&path, "new score").unwrap(), "it wrote");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new score");
     }
 
     #[test]
