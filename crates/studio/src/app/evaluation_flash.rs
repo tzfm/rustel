@@ -103,8 +103,8 @@ impl EvalAnimation {
         if run.fade_out.is_zero() {
             return 0.0;
         }
-        let left = 1.0
-            - (elapsed - run.fade_in - run.hold).as_secs_f32() / run.fade_out.as_secs_f32();
+        let left =
+            1.0 - (elapsed - run.fade_in - run.hold).as_secs_f32() / run.fade_out.as_secs_f32();
         let left = left.clamp(0.0, 1.0);
         match self {
             Self::Normal => 0.0,
@@ -200,7 +200,11 @@ impl EvaluationFlash {
             elapsed -= slot * u32::try_from(elapsed.as_millis() / slot_millis).unwrap_or(0);
         }
         let progress = (elapsed.as_secs_f32() / slot.as_secs_f32()).clamp(0.0, 1.0);
-        Some((self.animation, progress, self.animation.intensity(&run, elapsed)))
+        Some((
+            self.animation,
+            progress,
+            self.animation.intensity(&run, elapsed),
+        ))
     }
 
     fn allowed(&self, mode: EvaluationFlashMode) -> bool {
@@ -763,7 +767,9 @@ mod tests {
                     assert_eq!(late, 1.0, "the plain look holds whole to the cut");
                 }
                 assert!(
-                    flash.drawing_at(started + Duration::from_millis(lit_ms + 5)).is_none(),
+                    flash
+                        .drawing_at(started + Duration::from_millis(lit_ms + 5))
+                        .is_none(),
                     "{animation:?} draws nothing once dark"
                 );
             }
@@ -794,9 +800,15 @@ mod tests {
             let flash = app.evaluation_flash.as_ref().unwrap();
 
             let (_, _, start) = flash.drawing_at(started).unwrap();
-            let (_, _, quarter) = flash.drawing_at(started + Duration::from_millis(20)).unwrap();
-            let (_, _, half) = flash.drawing_at(started + Duration::from_millis(40)).unwrap();
-            let (_, _, whole) = flash.drawing_at(started + Duration::from_millis(100)).unwrap();
+            let (_, _, quarter) = flash
+                .drawing_at(started + Duration::from_millis(20))
+                .unwrap();
+            let (_, _, half) = flash
+                .drawing_at(started + Duration::from_millis(40))
+                .unwrap();
+            let (_, _, whole) = flash
+                .drawing_at(started + Duration::from_millis(100))
+                .unwrap();
             assert_eq!(start, 0.0, "the fade begins dark");
             assert!(quarter < half && half < whole, "{quarter} {half} {whole}");
             assert_eq!(whole, 1.0, "the hold is whole");

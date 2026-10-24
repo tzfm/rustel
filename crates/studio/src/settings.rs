@@ -2622,8 +2622,12 @@ impl Row {
             Self::CacheDefaults => "Enter caches every remote pack onto disk",
             Self::RefreshSources => "Enter refetches every remote pack's list",
             Self::SampleCache => "Enter twice empties downloaded samples",
-            Self::BeatLine => "a strip under the header keeps the beat \u{b7} \u{2190}/\u{2192} walks its looks",
-            Self::EvaluationAnimation => "how a run of code flashes \u{b7} fades, zap, steps, glitch, wave",
+            Self::BeatLine => {
+                "a strip under the header keeps the beat \u{b7} \u{2190}/\u{2192} walks its looks"
+            }
+            Self::EvaluationAnimation => {
+                "how a run of code flashes \u{b7} fades, zap, steps, glitch, wave"
+            }
             Self::ReferenceCategory(Category::Osc) => {
                 "osc() and controls only SuperDirt reads · tag:osc lists them anyway"
             }
@@ -2951,9 +2955,7 @@ impl SettingsSheet {
     pub(super) const fn shows_settings(self) -> bool {
         matches!(
             self.page,
-            SettingsPage::Settings
-                | SettingsPage::Appearance
-                | SettingsPage::Reference
+            SettingsPage::Settings | SettingsPage::Appearance | SettingsPage::Reference
         )
     }
 
@@ -3415,9 +3417,7 @@ impl SettingsSheet {
             return SettingsAction::Nothing;
         }
         let choices: Vec<(usize, usize)> = match self.page {
-            SettingsPage::Settings
-            | SettingsPage::Appearance
-            | SettingsPage::Reference => {
+            SettingsPage::Settings | SettingsPage::Appearance | SettingsPage::Reference => {
                 grouped_rows(self.rows())
                     .iter()
                     .enumerate()
@@ -3959,9 +3959,7 @@ impl SettingsSheet {
         };
         let shown = usize::from(rows.height).max(1);
         self.first = match self.page {
-            SettingsPage::Settings
-            | SettingsPage::Appearance
-            | SettingsPage::Reference => {
+            SettingsPage::Settings | SettingsPage::Appearance | SettingsPage::Reference => {
                 self.first_line(shown, &grouped_rows(self.rows()))
             }
             SettingsPage::Keybinds => self.first_line(shown, &keybind_lines(self.keybind_count)),
@@ -4347,8 +4345,7 @@ impl SettingsSheetView<'_> {
     /// Measured over every page of controls, because the sheet is one
     /// height for all of them.
     fn explain_rows(available: Rect) -> u16 {
-        let controls =
-            || ROWS.iter().chain(APPEARANCE_ROWS).chain(REFERENCE_ROWS);
+        let controls = || ROWS.iter().chain(APPEARANCE_ROWS).chain(REFERENCE_ROWS);
         let label = controls()
             .map(|row| row.label().chars().count())
             .max()
@@ -4931,7 +4928,6 @@ mod tests {
         let pages = [
             SettingsPage::Settings,
             SettingsPage::Appearance,
-
             SettingsPage::Mapping,
             SettingsPage::Keybinds,
             SettingsPage::Sources,
@@ -5832,11 +5828,7 @@ mod tests {
         let area = Rect::new(0, 0, 100, 18);
         let mut settings = UiSettings::default();
         let features = TerminalFeatures::default();
-        for page in [
-            SettingsPage::Settings,
-            SettingsPage::Appearance,
-
-        ] {
+        for page in [SettingsPage::Settings, SettingsPage::Appearance] {
             let mut sheet = SettingsSheet {
                 page,
                 ..Default::default()
@@ -6119,11 +6111,7 @@ mod tests {
     fn grouped_controls_draw_labels_and_skip_borders_when_scrolled() {
         let settings = UiSettings::default();
         let features = TerminalFeatures::default();
-        for page in [
-            SettingsPage::Settings,
-            SettingsPage::Appearance,
-
-        ] {
+        for page in [SettingsPage::Settings, SettingsPage::Appearance] {
             let mut sheet = SettingsSheet {
                 page,
                 ..SettingsSheet::default()
@@ -6225,7 +6213,10 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(tail.contains("Sample memory"), "missing the page's last group");
+        assert!(
+            tail.contains("Sample memory"),
+            "missing the page's last group"
+        );
         assert!(
             !tail.contains("Sample cache"),
             "the sample cache controls live on Sources now"
@@ -6673,7 +6664,10 @@ mod tests {
                 sheet.key(KeyCode::Right, &mut settings, &features),
                 SettingsAction::Changed
             );
-            assert_eq!(settings.evaluation_animation, expected, "walked to {expected:?}");
+            assert_eq!(
+                settings.evaluation_animation, expected,
+                "walked to {expected:?}"
+            );
             let text = sheet_text(sheet, &settings, &features, Rect::new(0, 0, 120, 24));
             let row = text
                 .lines()
@@ -6915,7 +6909,10 @@ mod tests {
         let area = Rect::new(0, 0, 120, ROWS.len() as u16 + 10);
         let mut buffer = Buffer::empty(area);
         let sheet = SettingsSheet {
-            selected: ROWS.iter().position(|row| *row == Row::LocalPrebake).unwrap(),
+            selected: ROWS
+                .iter()
+                .position(|row| *row == Row::LocalPrebake)
+                .unwrap(),
             ..SettingsSheet::default()
         };
 
@@ -6982,9 +6979,7 @@ mod tests {
     #[test]
     fn the_shipped_packs_are_listed_after_the_imports_and_cached_from_there() {
         assert!(
-            !ROWS
-                .iter()
-                .any(|row| row.label() == "cache whole library"),
+            !ROWS.iter().any(|row| row.label() == "cache whole library"),
             "the library's download moved to Sources"
         );
 
@@ -7527,9 +7522,7 @@ mod tests {
         assert_eq!(none_imported.source_row_at(area, x, rows.y + 10), Some(4));
 
         // Another page answers nothing, and so does an empty list.
-        let advanced = SettingsSheet {
-            ..sheet
-        };
+        let advanced = SettingsSheet { ..sheet };
         assert_eq!(advanced.source_row_at(area, x, rows.y), None);
         let empty = SettingsSheet {
             source_count: 0,
@@ -8383,7 +8376,11 @@ mod tests {
         for _ in 0..=from {
             sheet.key(KeyCode::Up, &mut settings, &TerminalFeatures::default());
         }
-        assert_eq!(sheet.selected, APPEARANCE_ROWS.len() - 1, "wraps from the top");
+        assert_eq!(
+            sheet.selected,
+            APPEARANCE_ROWS.len() - 1,
+            "wraps from the top"
+        );
         assert_eq!(
             sheet.key(KeyCode::Esc, &mut settings, &TerminalFeatures::default()),
             SettingsAction::Close
