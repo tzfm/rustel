@@ -917,10 +917,22 @@ impl App {
                 self.performance.render_ms()
             },
             caret: self.caret_position(),
-            cycle: inputs
-                .clock
-                .map(|clock| clock.1)
-                .or_else(|| snapshot.map(|value| value.cycle)),
+            cycle: if self.is_stopping()
+                || self.stop_requested
+                || self.snapshot.as_ref().is_some_and(|value| value.playing)
+            {
+                inputs
+                    .clock
+                    .map(|clock| clock.1)
+                    .or_else(|| self.snapshot.as_ref().map(|value| value.cycle))
+            } else {
+                // The stop holds its cycle on the canvas - the clock is
+                // frozen at the moment it stopped, for the picture the
+                // player keeps. The header reads the cycle the next play
+                // starts from, and a play starts at zero: the stopped
+                // header says zero, as it does before the first play.
+                Some(0.0)
+            },
             cps: inputs
                 .clock
                 .map(|clock| clock.2)

@@ -86,6 +86,54 @@ fn a_stop_while_stopping_cuts_the_tail() {
     );
 }
 
+/// A stop pressed while the playback is already stopped is not a stop: no
+/// engine word goes out, the status keeps its word, and the header holds
+/// the picture at rest instead of settling it a second time.
+#[test]
+fn a_stop_while_already_stopped_keeps_the_picture_at_rest() {
+    let mut studio = hermetic();
+
+    // Play and stop, and let the tail finish, so the transport has
+    // really settled once.
+    studio.chord("ctrl+s");
+    studio.settle();
+    studio.chord("ctrl+g");
+    studio.settle();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+    while studio.is_playing() || studio.is_stopping() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the score tail did not finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        studio.pump();
+    }
+    studio.settle();
+
+    let before = studio.status().to_owned();
+    studio.chord("ctrl+g");
+    studio.settle();
+
+    assert!(
+        !studio.is_playing() && !studio.is_stopping(),
+        "the stop at rest moved the transport"
+    );
+    assert_eq!(
+        studio.status(),
+        before,
+        "the stop at rest said a new word over the settled one"
+    );
+    let header = studio
+        .rows()
+        .into_iter()
+        .find(|row| row.contains("bpm"))
+        .expect("the header row carries the tempo");
+    assert!(
+        header.contains("STOPPED"),
+        "the header stays at rest: {header}"
+    );
+}
+
 #[test]
 fn piano_over_a_stopped_scores_tail_settles_the_transport_header() {
     let mut studio = hermetic();
@@ -142,6 +190,15 @@ fn piano_over_a_stopped_scores_tail_settles_the_transport_header() {
         cycle(&header),
         cycle(&later),
         "the stopped score's cycle stays frozen while piano is open"
+    );
+    // The frozen clock is the canvas's, for the picture it holds. The
+    // header reads the cycle the next play starts from: zero, as before
+    // the first play, and not the cycle the score stopped on.
+    assert_eq!(
+        cycle(&later),
+        "0.00",
+        "the stopped header reads zero: {}",
+        later
     );
 }
 

@@ -88,7 +88,7 @@ pub use vocabulary::{
     tuning_vocabulary,
 };
 #[cfg(feature = "vst")]
-pub use vst::{PluginRow, PluginWords, VstTab, key_words, rank_names};
+pub use vst::{PluginRow, PluginWords, VstSection, VstTab, key_words, rank_names};
 
 /// A parameter key in the form a score writes in the object of a call:
 /// a name or a number as is, each other key in single quotes. A score

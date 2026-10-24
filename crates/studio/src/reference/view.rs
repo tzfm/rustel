@@ -936,6 +936,7 @@ impl ReferenceView<'_> {
         );
         let rows = tab.rows();
         let plugins = tab.plugins();
+        let open = tab.open_plugin();
         let shown = rows
             .iter()
             .filter(|row| matches!(row, PluginRow::Plugin(_)))
@@ -944,8 +945,29 @@ impl ReferenceView<'_> {
             "no plugin found · add a folder in settings, vst tab".to_owned()
         } else if rows.is_empty() {
             format!("no plugin named {:?}", tab.query().trim())
+        } else if let Some(open) = open {
+            // The half under the open plugin, named so Tab has something to
+            // flip and the reader can see it did.
+            let half = match tab.section() {
+                VstSection::Params => "parameters",
+                VstSection::Presets => "presets",
+            };
+            format!(
+                "{shown} of {} plugins · {half} of {} · Tab flips",
+                plugins.len(),
+                open.name
+            )
         } else {
             format!("{shown} of {} plugins", plugins.len())
+        };
+        // The read of the folders runs on the studio's own turn, so the
+        // count line says where it is, as the samples tab says its imports.
+        let count = match tab.scan() {
+            None => count,
+            Some((read, bundles)) if plugins.is_empty() => {
+                format!("reading the plugin folders · {read} of {bundles} bundles…")
+            }
+            Some((read, bundles)) => format!("{count} · reading {read} of {bundles} bundles…"),
         };
         buffer.set_stringn(
             inner.x,
@@ -956,7 +978,6 @@ impl ReferenceView<'_> {
         );
         let geometry = self.panel.geometry(inner);
         let list = geometry.list;
-        let open = tab.open_plugin();
         let marker = |open: bool| super::super::terminal::symbol(if open { "▾" } else { "▸" });
         let heading = Style::default()
             .fg(theme.accent)

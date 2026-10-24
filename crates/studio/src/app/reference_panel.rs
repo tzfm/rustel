@@ -170,6 +170,16 @@ impl App {
         } else {
             name
         };
+        // The pick of a plugin name keeps the panel: it reopens on the
+        // presets of the plugin the pick wrote, one Enter from a choice.
+        #[cfg(feature = "vst")]
+        let preset_pick =
+            self.reference_panel
+                .as_ref()
+                .and_then(|panel| match panel.plugin_words() {
+                    Some(crate::reference::PluginWords::Names { .. }) => Some(name.clone()),
+                    _ => None,
+                });
         let entry = self.reference_panel.as_ref().and_then(|panel| {
             (panel.tab == Tab::Reference && panel.vocabulary.is_none())
                 .then(|| match panel.mode {
@@ -228,6 +238,10 @@ impl App {
         if let Some(panel) = documentation {
             self.set_reference_panel(Some(panel));
             self.install_catalogue();
+        }
+        #[cfg(feature = "vst")]
+        if let Some(plugin) = preset_pick {
+            self.open_plugin_presets(plugin);
         }
         self.dirty_frame = true;
         Ok(())
@@ -871,11 +885,24 @@ impl App {
             // whatever it was previewing: one press, not one to stop the sound
             // and another to leave.
             KeyCode::Esc => panel.escape(),
+            // Tab in the vst tab with a plugin open flips the half of the
+            // plugin under its row; anywhere else it moves to the next tab
+            // of the panel.
             KeyCode::Tab => {
+                #[cfg(feature = "vst")]
+                if let Some(said) = panel.tab_key() {
+                    self.status = said.into();
+                }
+                #[cfg(not(feature = "vst"))]
                 panel.toggle_tab();
                 PanelAction::Nothing
             }
             KeyCode::BackTab => {
+                #[cfg(feature = "vst")]
+                if let Some(said) = panel.back_tab_key() {
+                    self.status = said.into();
+                }
+                #[cfg(not(feature = "vst"))]
                 panel.previous_tab();
                 PanelAction::Nothing
             }
