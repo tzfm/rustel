@@ -616,6 +616,7 @@ mod tests {
             load_time: std::time::Duration::ZERO,
             audio_thread: false,
             latency: None,
+            presets: 0,
         }
     }
 

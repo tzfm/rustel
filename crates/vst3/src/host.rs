@@ -194,6 +194,10 @@ pub struct PluginInfo {
     /// copy of each preset at each sample rate counts: see
     /// [`Host::latency`]. `None` before the first copy since the load.
     pub latency: Option<u32>,
+    /// How many preset files the preset folders hold for the plugin, by the
+    /// class id in the header of each file. The count grows when the read
+    /// of the preset folders ends: see [`Host::set_preset_folders`].
+    pub presets: usize,
 }
 
 /// The answer to a preset name.
@@ -311,8 +315,19 @@ struct State {
     /// The answers to the preset names the scores asked for, by plugin
     /// number and compare form of the name.
     known_presets: HashMap<(u32, String), KnownPreset>,
-    /// The preset files of each plugin, by the compare form of its name.
-    preset_lists: HashMap<String, PresetList>,
+    /// The preset files of each plugin, by the lower case class id each
+    /// file names: see [`preset::scan_folders`].
+    preset_index: HashMap<String, Vec<(String, PathBuf)>>,
+    /// True once the preset folders were read. A read in the line of the
+    /// plugin thread turns it back: see [`Host::read_presets`].
+    presets_read: bool,
+    /// A read of the preset folders is in the line of the plugin thread.
+    presets_reading: bool,
+    /// The folders changed while a read ran: one more read follows.
+    presets_again: bool,
+    /// The folders with `.vstpreset` files the player added, in any
+    /// structure, read after the preset folder.
+    preset_extra: Vec<PathBuf>,
     builds: HashMap<(InsertKey, u32, InsertSlot), Build>,
     /// The builds an engine took, with the cell of each copy: the cell has
     /// the mark while the engine holds the plugin.
@@ -694,38 +709,6 @@ fn preset_folder(root: &Path, plugin: &str) -> Option<PathBuf> {
         })
 }
 
-/// Reads the preset files of a plugin from the folder with its name under
-/// `root`: name and path, sorted by name. This reads the disk, so the
-/// plugin thread runs it.
-fn read_presets(root: Option<&Path>, plugin: &str) -> Vec<(String, PathBuf)> {
-    let Some(folder) = root.and_then(|root| preset_folder(root, plugin)) else {
-        return Vec::new();
-    };
-    let mut files: Vec<(String, PathBuf)> = std::fs::read_dir(folder)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("vstpreset"))
-        })
-        .filter_map(|path| Some((path.file_stem()?.to_string_lossy().into_owned(), path)))
-        .collect();
-    files.sort();
-    files
-}
-
-/// The preset files of one plugin as the host last read them.
-#[derive(Default)]
-struct PresetList {
-    files: Vec<(String, PathBuf)>,
-    /// The time of the last read. `None` before the end of the first read.
-    read_at: Option<Instant>,
-    /// A read is in the line of the plugin thread.
-    reading: bool,
-}
-
 struct Shared {
     jobs: Sender<Job>,
     state: Mutex<State>,
@@ -845,8 +828,148 @@ impl Host {
     }
 
     /// The folder with one folder of `.vstpreset` files for each plugin.
+    /// The next ask for a preset reads the preset folders again - a read
+    /// that runs now reads them after its end, with the new folder.
     pub fn set_preset_folder(&self, folder: PathBuf) {
-        self.state().preset_root = Some(folder);
+        let mut state = self.state();
+        state.preset_root = Some(folder);
+        state.preset_index.clear();
+        state.presets_read = false;
+        if state.presets_reading {
+            state.presets_again = true;
+        }
+    }
+
+    /// The folders with `.vstpreset` files the player added, in any folder
+    /// structure: the header of each file says its plugin. The read of the
+    /// preset folders runs again, on the plugin thread.
+    pub fn set_preset_folders(&self, folders: Vec<PathBuf>) {
+        {
+            let mut state = self.state();
+            state.preset_extra = folders;
+        }
+        self.read_presets(true);
+    }
+
+    /// Takes the read of the preset folders for this caller, on the plugin
+    /// thread or in line of it: the root, and the folders the player
+    /// added. With `force`, a read runs again after one that runs now -
+    /// the folders changed. `None` also when a read ran already and
+    /// nothing asks for one more.
+    fn claim_presets_read(&self, force: bool) -> Option<(Option<PathBuf>, Vec<PathBuf>)> {
+        let mut state = self.state();
+        if state.presets_reading {
+            if force {
+                state.presets_again = true;
+            }
+            return None;
+        }
+        if state.presets_read && !force {
+            return None;
+        }
+        state.presets_reading = true;
+        Some((state.preset_root.clone(), state.preset_extra.clone()))
+    }
+
+    /// Reads the folder of one plugin under the preset root again, in the
+    /// job of its load: a preset file the player put there while the
+    /// studio runs counts from the load. The folder is the one with the
+    /// name of the plugin, for the store of drops and saves: the header of
+    /// each file does not say its plugin here. The files of the other
+    /// folders keep the answer of the last full read.
+    fn refresh_preset_folder(&self, plugin: &Scanned) {
+        let root = self.state().preset_root.clone();
+        let Some(root) = root else {
+            return;
+        };
+        if plugin.class.is_empty() {
+            return;
+        }
+        // The folder stays the folder of the plugin when it is gone: the
+        // read then says no file, and the files the folder held leave.
+        let folder = preset_folder(&root, &plugin.name)
+            .unwrap_or_else(|| root.join(folder_name(&plugin.name)));
+        let files = crate::preset::read_folder(&folder);
+        let fresh: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
+        let mut state = self.state();
+        let list = state
+            .preset_index
+            .entry(plugin.class.to_ascii_lowercase())
+            .or_default();
+        // Only the files of this folder give way. A name of both this
+        // folder and a folder the player added keeps the file of this
+        // folder, as a read of the disk puts the root first.
+        list.retain(|(known, path)| !path.starts_with(&folder) && !fresh.contains(known));
+        list.extend(files);
+        list.sort();
+        // A file of the read can answer a preset that was missing before:
+        // a kept miss does not hold its missing past the read.
+        state
+            .known_presets
+            .retain(|_, known| matches!(known, KnownPreset::Number(_)));
+    }
+
+    /// Reads the preset folders on the plugin thread: a folder on a slow
+    /// disk does not hold the caller, and the asks keep the answer of the
+    /// read before until the new read ends. No caller waits.
+    fn read_presets(&self, force: bool) {
+        if let Some((root, extra)) = self.claim_presets_read(force) {
+            let host = self.clone();
+            self.enqueue(move || host.finish_presets(root, extra));
+        }
+    }
+
+    /// The read itself, on the plugin thread: in a job of the line, or in
+    /// the job of a load, which a score asks for a preset right after. A
+    /// read claimed while this one ran follows here at once.
+    ///
+    /// The folders the player added hold any structure, so the header of
+    /// each file names its plugin. The root is the store of rustel, with
+    /// one folder for each plugin, so the folder names the plugin: a file
+    /// of another plugin the player put there reaches the build, which
+    /// refuses it with the reason. A name of the root and of an added
+    /// folder keeps the file of the root.
+    fn finish_presets(&self, root: Option<PathBuf>, extra: Vec<PathBuf>) {
+        let mut index = crate::preset::scan_folders(&extra);
+        let plugins = {
+            let state = self.state();
+            state
+                .entries
+                .iter()
+                .filter(|entry| entry.present && !entry.class.is_empty())
+                .map(|entry| (entry.name.clone(), entry.class.to_ascii_lowercase()))
+                .collect::<Vec<_>>()
+        };
+        if let Some(root) = &root {
+            for (name, class) in plugins {
+                let Some(folder) = preset_folder(root, &name) else {
+                    continue;
+                };
+                let files = crate::preset::read_folder(&folder);
+                let fresh: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
+                let list = index.entry(class).or_default();
+                list.retain(|(known, _)| !fresh.contains(known));
+                list.extend(files);
+            }
+        }
+        for files in index.values_mut() {
+            files.sort();
+        }
+        let again = {
+            let mut state = self.state();
+            state.preset_index = index;
+            // A file of the read can answer a preset that was missing
+            // before: a kept miss does not hold its missing past the read.
+            state
+                .known_presets
+                .retain(|_, known| matches!(known, KnownPreset::Number(_)));
+            state.presets_read = true;
+            state.presets_reading = false;
+            std::mem::take(&mut state.presets_again)
+        };
+        if again && let Some((root, extra)) = self.claim_presets_read(true) {
+            self.finish_presets(root, extra);
+        }
     }
 
     /// Keeps each copy of the plugins in `names` in the audio callback, for
@@ -962,13 +1085,9 @@ impl Host {
         state
             .known_presets
             .retain(|_, known| matches!(known, KnownPreset::Number(_)));
-        // The next request reads each preset folder again.
-        for list in state.preset_lists.values_mut() {
-            list.read_at = list
-                .read_at
-                .map(|at| at.checked_sub(PRESET_RETRY).unwrap_or(at));
-        }
         drop(state);
+        // A new preset file counts from this read of the folders.
+        self.read_presets(true);
         self.make_preset_folders();
         self.scan_soon();
     }
@@ -1178,6 +1297,14 @@ impl Host {
                     load_time: plugin.map_or(Duration::ZERO, |plugin| plugin.load_time),
                     audio_thread: state.audio_thread.contains(&entry.key),
                     latency: latencies.map(|(_, latency)| *latency).max(),
+                    presets: if entry.class.is_empty() {
+                        0
+                    } else {
+                        state
+                            .preset_index
+                            .get(&entry.class.to_ascii_lowercase())
+                            .map_or(0, Vec::len)
+                    },
                 }
             })
             .collect();
@@ -1224,44 +1351,56 @@ impl Host {
         std::fs::create_dir_all(&folder)
             .and_then(|()| std::fs::copy(file, &target))
             .map_err(|error| error.to_string())?;
-        // The next request reads the folder again.
+        // The read of the preset folders knows the new file now: no read of
+        // the disk again. A preset of an added folder with this name gives
+        // way, as a read of the disk puts the root first.
         let mut state = self.state();
-        state.preset_lists.remove(&canonical(&plugin));
+        let files = state
+            .preset_index
+            .entry(class.to_ascii_lowercase())
+            .or_default();
+        files.retain(|(known, _)| known.as_str() != preset.as_ref());
+        files.push((preset.clone().into_owned(), target));
+        files.sort();
         state
             .known_presets
             .retain(|_, known| matches!(known, KnownPreset::Number(_)));
         Ok((plugin, preset.into_owned()))
     }
 
-    /// The preset files of a plugin as last read, and a new read on the
-    /// plugin thread when the last one is older than [`PRESET_RETRY`]. No
-    /// caller waits for the disk.
+    /// The preset files of a plugin, from the read of the preset folders:
+    /// the files whose header names the class of the plugin. `None` while
+    /// the read runs: ask again later. No caller waits for the disk.
     fn preset_list(&self, plugin: &str) -> Option<Vec<(String, PathBuf)>> {
-        let key = canonical(plugin);
-        let mut state = self.state();
-        let root = state.preset_root.clone();
-        let list = state.preset_lists.entry(key.clone()).or_default();
-        let fresh = list.read_at.is_some_and(|at| at.elapsed() < PRESET_RETRY);
-        if !fresh && !list.reading {
-            list.reading = true;
-            let host = self.clone();
-            let plugin = plugin.to_owned();
-            self.enqueue(move || host.store_presets(&plugin, root.as_deref()));
+        let state = self.state();
+        if !state.presets_read {
+            drop(state);
+            self.read_presets(false);
+            return None;
         }
-        list.read_at.map(|_| list.files.clone())
-    }
-
-    /// Reads the preset folder of a plugin and keeps the result. Runs on
-    /// the plugin thread.
-    fn store_presets(&self, plugin: &str, root: Option<&Path>) {
-        let files = read_presets(root, plugin);
-        let mut state = self.state();
-        let list = state.preset_lists.entry(canonical(plugin)).or_default();
-        *list = PresetList {
-            files,
-            read_at: Some(Instant::now()),
-            reading: false,
+        let key = canonical(plugin);
+        let Some(entry) = state.entries.iter().find(|entry| entry.key == key) else {
+            // No plugin of the scan has this name, so no read brings its
+            // presets: the answer stands as none, and no ask waits.
+            return Some(Vec::new());
         };
+        // The class of the plugin comes from the load or the test of its
+        // bundle, so a plugin with no class yet has no answer: ask again.
+        // A plugin past its load with no class keeps none - an entry of an
+        // old scan cache - so no ask waits for one.
+        if entry.class.is_empty() {
+            if matches!(entry.stage, Stage::Found | Stage::Loading) {
+                return None;
+            }
+            return Some(Vec::new());
+        }
+        Some(
+            state
+                .preset_index
+                .get(&entry.class.to_ascii_lowercase())
+                .cloned()
+                .unwrap_or_default(),
+        )
     }
 
     /// The problems since the last call, for the user.
@@ -1315,23 +1454,6 @@ impl Host {
         let mut state = self.state();
         match loaded {
             Ok((plugins, failed)) => {
-                // A score asks for a preset right after the load, so the
-                // preset folders are read here, on the plugin thread.
-                let root = state.preset_root.clone();
-                drop(state);
-                let lists: Vec<_> = plugins
-                    .iter()
-                    .map(|plugin| read_presets(root.as_deref(), plugin.name()))
-                    .collect();
-                state = self.state();
-                for (plugin, files) in plugins.iter().zip(lists) {
-                    let list = PresetList {
-                        files,
-                        read_at: Some(Instant::now()),
-                        reading: false,
-                    };
-                    state.preset_lists.insert(canonical(plugin.name()), list);
-                }
                 // A plugin keeps its row, and so its number, over an unload
                 // and a new load.
                 let loads = plugins.iter().map(Plugin::scanned);
@@ -1365,6 +1487,21 @@ impl Host {
                 if stored {
                     self.save_cache();
                     self.make_preset_folders();
+                }
+                // A score asks for a preset right after the load, so the
+                // first read of the preset folders runs here, in this job,
+                // and no ask waits behind one more job of the line. A
+                // later load reads the folder of each plugin it loaded
+                // again, for a file the player put there while the studio
+                // runs: the load pays for that one folder, as it always
+                // did, and the other folders keep the answer of the last
+                // full read.
+                if let Some((root, extra)) = self.claim_presets_read(false) {
+                    self.finish_presets(root, extra);
+                } else {
+                    for plugin in &scanned {
+                        self.refresh_preset_folder(plugin);
+                    }
                 }
             }
             // The list shows the reason, and `Host::key` gives the reason
@@ -1669,9 +1806,14 @@ impl Host {
             .into_iter()
             .find(|(name, _)| canonical(name) == wanted.1);
         let Some((_, path)) = file else {
-            state
-                .known_presets
-                .insert(wanted, KnownPreset::MissingSince(Instant::now()));
+            // A read of the folders in the line can still bring the file:
+            // the answer says missing now, and the next ask decides again,
+            // for a kept answer would hold the missing past the read.
+            if !state.presets_reading {
+                state
+                    .known_presets
+                    .insert(wanted, KnownPreset::MissingSince(Instant::now()));
+            }
             return FoundPreset::Missing;
         };
         let known = state

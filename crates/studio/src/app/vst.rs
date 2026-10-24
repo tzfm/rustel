@@ -130,6 +130,21 @@ fn plugin_call(source: &str, caret: usize) -> Option<(String, usize)> {
         })
 }
 
+/// The row a letter jumps to on the vst page: the next plugin that begins
+/// with it, from `at` and around the list. The row `at` itself counts as
+/// visited, so the same letter again goes to the next of its plugins.
+/// `None` when no plugin begins with the letter.
+fn jump_row(names: &[&str], at: usize, letter: char) -> Option<usize> {
+    (at + 1..at + 1 + names.len())
+        .find(|row| {
+            names[row % names.len()]
+                .chars()
+                .next()
+                .is_some_and(|first| first.eq_ignore_ascii_case(&letter))
+        })
+        .map(|row| row % names.len())
+}
+
 impl App {
     /// The word list of a plugin call, searched for `query`.
     pub(super) fn plugin_words_panel(&self, words: PluginWords, query: &str) -> ReferencePanel {
@@ -240,10 +255,23 @@ impl App {
         vst::set_user_folders(self.prefs.vst_folders.iter().map(PathBuf::from).collect());
     }
 
+    /// Gives the host the preset folders the player added, and the host
+    /// reads the preset folders again.
+    pub(super) fn adopt_preset_folders(&self) {
+        vst::set_preset_folders(
+            self.prefs
+                .preset_folders
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
+        );
+    }
+
     /// Tells the sheet how far the cursor of the vst page goes.
     pub(super) fn count_vst_folders(&self, sheet: &mut SettingsSheet) {
         sheet.vst_folder_count = self.prefs.vst_folders.len();
         sheet.vst_standard_count = vst::standard_folders().len();
+        sheet.vst_preset_folder_count = self.prefs.preset_folders.len();
         sheet.vst_scanned_count = vst::host().plugins().len();
     }
 
@@ -268,6 +296,12 @@ impl App {
                         .map(|path| folder(path, true)),
                 )
                 .collect(),
+            preset_folders: self
+                .prefs
+                .preset_folders
+                .iter()
+                .map(|path| folder(PathBuf::from(path), false))
+                .collect(),
             scanned: plugins
                 .iter()
                 .map(|plugin| settings::VstScanned {
@@ -282,13 +316,12 @@ impl App {
                         }
                     },
                     audio_thread: plugin.audio_thread,
+                    presets: plugin.presets,
                 })
                 .collect(),
             plugins: plugins.len(),
             scan: self.plugin_scan.clone(),
-            presets: vst::presets_folder()
-                .map(|presets| shorten_home(&presets))
-                .unwrap_or_default(),
+            open_presets: self.settings_vst_open_presets.clone(),
         }
     }
 
@@ -354,11 +387,112 @@ impl App {
         );
     }
 
+    /// The folder the picker gave goes on the list, and the host reads the
+    /// preset folders again. The cursor goes to the new row.
+    pub(super) fn add_preset_folder(&mut self, path: &std::path::Path) {
+        if !path.is_dir() {
+            if let Some((_, picker)) = self.set_prompt.as_mut() {
+                picker.error = Some(format!("cannot use {}: not a folder", path.display()));
+            }
+            return;
+        }
+        self.close_set_prompt();
+        let path = &std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let label = status_file_path(path, self.ui_settings.show_full_paths);
+        let folder = path.to_string_lossy().into_owned();
+        let known = self
+            .prefs
+            .preset_folders
+            .iter()
+            .position(|at| *at == folder);
+        let row = known.unwrap_or(self.prefs.preset_folders.len());
+        if known.is_none() {
+            self.prefs.preset_folders.push(folder);
+            self.save_prefs_soon();
+            self.adopt_preset_folders();
+        }
+        if let Some(sheet) = self.settings_sheet.as_mut() {
+            // The page counts one row more, and the cursor lands on it:
+            // the keys of the page reach the new row.
+            sheet.vst_preset_folder_count = self.prefs.preset_folders.len();
+            sheet.select(
+                settings::VST_CONTROL_COUNT
+                    + self.prefs.vst_folders.len()
+                    + sheet.vst_standard_count
+                    + row,
+            );
+        }
+        self.status = if known.is_some() {
+            format!("{label} is on the list")
+        } else {
+            format!("{label} added")
+        };
+        self.dirty_frame = true;
+    }
+
+    /// `d` on a preset folder the player added.
+    pub(super) fn remove_preset_folder(&mut self, at: usize) {
+        if at >= self.prefs.preset_folders.len() {
+            return;
+        }
+        let gone = PathBuf::from(self.prefs.preset_folders.remove(at));
+        self.save_prefs_soon();
+        self.adopt_preset_folders();
+        self.status = format!(
+            "{} removed",
+            status_file_path(&gone, self.ui_settings.show_full_paths)
+        );
+    }
+
+    /// Enter on a plugin row: the row opens its presets, the names of the
+    /// `.vstpreset` files the folders hold for the plugin. The names come
+    /// with the read of the folders: see [`Self::poll_plugins`].
+    pub(super) fn toggle_vst_presets(&mut self, sheet: &mut SettingsSheet, at: usize) {
+        if sheet.vst_open == Some(at) {
+            sheet.vst_open = None;
+            sheet.vst_presets_due = false;
+        } else {
+            sheet.vst_open = Some(at);
+            sheet.vst_presets_due = true;
+        }
+        sheet.vst_open_count = 0;
+        self.settings_vst_open_presets.clear();
+        self.dirty_frame = true;
+    }
+
+    /// A letter on the vst page: the cursor goes to the next plugin whose
+    /// name begins with it, from the row the cursor holds and around the
+    /// list, so `s` reaches Serum and then the rest of the s's. The names
+    /// come from the host, which the page lists in their order.
+    pub(super) fn jump_vst_plugin(&mut self, sheet: &mut SettingsSheet, letter: char) {
+        let plugins = vst::host().plugins();
+        let names: Vec<&str> = plugins.iter().map(|plugin| plugin.name.as_str()).collect();
+        let Some(last) = names.len().checked_sub(1) else {
+            return;
+        };
+        let base = settings::VST_CONTROL_COUNT
+            + sheet.vst_folder_count
+            + sheet.vst_standard_count
+            + sheet.vst_preset_folder_count;
+        let at = sheet.selected.saturating_sub(base).min(last);
+        match jump_row(&names, at, letter) {
+            Some(row) => sheet.select(base + row),
+            None => {
+                self.status = format!("no plugin begins with '{}'", letter.to_ascii_lowercase())
+            }
+        }
+        self.dirty_frame = true;
+    }
+
+    /// What the status line says while the host reads the plugin folders.
+    /// The end of the read retires it: see [`Self::poll_plugins`].
+    const READING_THE_FOLDERS: &str = "reading the plugin folders";
+
     /// Enter on the scan row. A plugin with an answer in the scan cache
     /// for the files it has now gets no new test, a failed plugin too.
     pub(super) fn scan_vst(&mut self) {
         vst::scan();
-        self.status = "reading the plugin folders".to_owned();
+        self.status = Self::READING_THE_FOLDERS.to_owned();
     }
 
     /// Enter on the rescan row. The scan cache is empty after, so each
@@ -367,7 +501,7 @@ impl App {
     /// of the read.
     pub(super) fn rescan_vst(&mut self) {
         vst::rescan();
-        self.status = "reading the plugin folders".to_owned();
+        self.status = Self::READING_THE_FOLDERS.to_owned();
     }
 
     /// Space on a plugin row: the switch `audio thread only` of the plugin.
@@ -485,6 +619,11 @@ impl App {
         // a read changes the plugin count of the Settings page.
         let scanning = vst::scanning();
         if scanning != self.plugins_scanning {
+            // The read of the folders ended: the line that said it runs
+            // says the count now, when no other word came in between.
+            if self.plugins_scanning && self.status == Self::READING_THE_FOLDERS {
+                self.status = settings::plugins_found(vst::host().plugins().len());
+            }
             self.plugins_scanning = scanning;
             self.dirty_frame = true;
         }
@@ -500,6 +639,23 @@ impl App {
             if let Some(sheet) = self.settings_sheet.as_mut() {
                 self.dirty_frame |= sheet.vst_scanned_count != count;
                 sheet.vst_scanned_count = count;
+                // The host reads the preset folders on its own thread. An
+                // open plugin row asks again on each poll until the names
+                // of its presets are here, and asks once more when a read
+                // changes the count the row holds.
+                if let Some(open) = sheet.vst_open
+                    && let Some(plugin) = vst::host().plugins().get(open)
+                {
+                    sheet.vst_presets_due |= plugin.presets != sheet.vst_open_count;
+                    if sheet.vst_presets_due
+                        && let Some(presets) = vst::host().presets(&plugin.name)
+                    {
+                        self.settings_vst_open_presets = presets;
+                        sheet.vst_open_count = self.settings_vst_open_presets.len();
+                        sheet.vst_presets_due = false;
+                        self.dirty_frame = true;
+                    }
+                }
             }
         }
         // The list of background jobs has a row for the scan and a row
@@ -564,6 +720,19 @@ impl App {
 mod tests {
     use super::*;
     use crate::memory::{self, MemoryFigures};
+
+    #[test]
+    fn a_letter_reaches_the_next_of_its_plugins() {
+        let names = ["Serum", "Surge", "Vital"];
+        // The row the cursor holds counts as visited: the same letter
+        // again goes on, and around the end of the list.
+        assert_eq!(jump_row(&names, 0, 's'), Some(1));
+        assert_eq!(jump_row(&names, 1, 's'), Some(0));
+        assert_eq!(jump_row(&names, 2, 's'), Some(0));
+        assert_eq!(jump_row(&names, 1, 'V'), Some(2));
+        // A letter no plugin begins with reaches none.
+        assert_eq!(jump_row(&names, 1, 'z'), None);
+    }
 
     #[test]
     fn a_plugin_call_contains_its_name_and_nested_values() {
