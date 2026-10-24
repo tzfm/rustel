@@ -10,7 +10,7 @@ static AUDIO_CALLBACK_ALLOCATOR: rustel_audio::tripwire::TripwireAlloc =
     rustel_audio::tripwire::TripwireAlloc;
 
 use crossterm::event::{KeyCode, KeyModifiers};
-use rustel_studio_e2e::{hermetic, hermetic_with_local_bank, row_containing};
+use rustel_studio_e2e::{Hermetic, hermetic, hermetic_with_local_bank, row_containing};
 
 /// The catalogue the library owns reaches the samples tab: the local bank
 /// is listed by name once the tab has read the library in.
@@ -126,6 +126,31 @@ fn enter_inserts_a_sound_where_the_caret_stands() {
     assert_eq!(studio.reference_tab(), None, "the column closed behind it");
 }
 
+/// Space previews the row under the cursor. When the engine still drains
+/// the catalogue the press is answered with a busy line and the audition
+/// is dropped - `settle()` does not wait for the engine, so this sends the
+/// press again, the way a player does, until the preview answers.
+fn space_previews(studio: &mut Hermetic, wanted: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+    loop {
+        studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
+        let status = studio.status();
+        if status == wanted {
+            return;
+        }
+        assert!(
+            status.contains("was not previewed"),
+            "Space answered {status:?}, not {wanted:?}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the preview never landed - last status {status:?}"
+        );
+        studio.pump();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// Space plays the sound under the cursor and says so - a bank's first
 /// variant, written the way a score writes it - and a second Space on the
 /// same row inside the stop window silences it.
@@ -140,8 +165,7 @@ fn space_previews_and_space_again_stops() {
     studio.type_text("testkick");
     studio.settle();
 
-    studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
-    assert_eq!(studio.status(), "preview testkick:0");
+    space_previews(&mut studio, "preview testkick:0");
 
     studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
     assert_eq!(studio.status(), "preview stopped");
@@ -160,8 +184,7 @@ fn esc_first_silences_a_live_preview() {
     studio.wait_for_catalogue();
     studio.type_text("testkick");
     studio.settle();
-    studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
-    assert_eq!(studio.status(), "preview testkick:0");
+    space_previews(&mut studio, "preview testkick:0");
 
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     assert_eq!(studio.reference_tab(), None, "Esc leaves the browser");
