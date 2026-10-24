@@ -329,11 +329,15 @@ fn the_watch_of_the_preset_folders_reads_the_disk_again() {
     wait(&[]);
     assert!(rig.host.presets_version() > version);
     // The quiet stays quiet: no read of the watch with no change behind
-    // it, or the watch would read the disk for good.
-    let settled = rig.host.presets_version();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
+    // it, or the watch would read the disk for good. Windows can say one
+    // event of the removal late, behind the quiet of the rest, so the
+    // reads settle first: a read that follows the last change drains, and
+    // the quiet after it reads nothing.
+    let mut settled = rig.host.presets_version();
+    let drain = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < drain {
         std::thread::sleep(Duration::from_millis(100));
+        settled = rig.host.presets_version();
     }
     assert_eq!(rig.host.presets_version(), settled);
 }

@@ -549,6 +549,14 @@ impl State {
             // copy.
             Some(KnownPreset::MissingSince(_)) if copy.preset.is_none() => 0,
             Some(KnownPreset::MissingSince(_)) => return false,
+            // A call with no preset plays the state the plugin starts in,
+            // and no word yet says otherwise: it asks for that state, not
+            // for each key - a read of the folders that lands between the
+            // word of a turn and a prepare would else build a copy of any
+            // preset for the slot.
+            None if copy.preset.is_none() => {
+                return key == InsertKey { plugin, preset: 0 };
+            }
             None => return true,
         };
         key == InsertKey { plugin, preset }
