@@ -88,12 +88,14 @@ fn beat_cell(
             // A swell rolls along the line once per cycle, breathing with
             // the beat on top of travelling.
             let turn = cycle.rem_euclid(1.0) as f32;
-            let swell =
-                (std::f32::consts::TAU * (across * 2.0 - turn * 2.0)).sin();
+            let swell = (std::f32::consts::TAU * (across * 2.0 - turn * 2.0)).sin();
             let height =
                 (0.5 + 0.5 * swell) * (0.25 + 0.75 * pulse) * if downbeat { 1.0 } else { 0.7 };
             let rung = (height * WAVE_RUNGS.len() as f32) as usize;
-            (WAVE_RUNGS[rung.min(WAVE_RUNGS.len() - 1)], 0.15 + 0.85 * height)
+            (
+                WAVE_RUNGS[rung.min(WAVE_RUNGS.len() - 1)],
+                0.15 + 0.85 * height,
+            )
         }
     }
 }
@@ -154,7 +156,10 @@ mod tests {
             20,
             40,
         );
-        assert!(ahead < 0.2, "half a line ahead of the segment rests: {ahead}");
+        assert!(
+            ahead < 0.2,
+            "half a line ahead of the segment rests: {ahead}"
+        );
         let (_, wrapped) = beat_cell(
             crate::settings::BeatLineStyle::Travel,
             true,
@@ -170,9 +175,7 @@ mod tests {
     #[test]
     fn the_wave_rolls_along_the_line() {
         let cells: Vec<&str> = (0..40)
-            .map(|x| {
-                beat_cell(crate::settings::BeatLineStyle::Wave, true, Some(0.0), x, 40).0
-            })
+            .map(|x| beat_cell(crate::settings::BeatLineStyle::Wave, true, Some(0.0), x, 40).0)
             .collect();
         assert!(
             cells.iter().any(|glyph| *glyph != cells[0]),
@@ -182,10 +185,14 @@ mod tests {
             cells.iter().all(|glyph| WAVE_RUNGS.contains(glyph)),
             "{cells:?}"
         );
-        let (_, on_beat) =
-            beat_cell(crate::settings::BeatLineStyle::Wave, true, Some(0.0), 0, 40);
-        let (_, between) =
-            beat_cell(crate::settings::BeatLineStyle::Wave, true, Some(0.125), 0, 40);
+        let (_, on_beat) = beat_cell(crate::settings::BeatLineStyle::Wave, true, Some(0.0), 0, 40);
+        let (_, between) = beat_cell(
+            crate::settings::BeatLineStyle::Wave,
+            true,
+            Some(0.125),
+            0,
+            40,
+        );
         assert!(on_beat > between, "the swell breathes with the beat");
     }
 

@@ -1967,7 +1967,10 @@ mod tests {
 
         for json in ["{}", r#"{"evaluation_animation":"unknown"}"#] {
             let prefs: StudioPrefs = serde_json::from_str(json).unwrap();
-            assert_eq!(prefs.ui_settings().evaluation_animation, EvalAnimation::Normal);
+            assert_eq!(
+                prefs.ui_settings().evaluation_animation,
+                EvalAnimation::Normal
+            );
         }
         for (mode, key) in [
             (EvalAnimation::Normal, "normal"),

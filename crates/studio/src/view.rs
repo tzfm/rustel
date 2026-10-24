@@ -575,8 +575,8 @@ impl EvaluationPulse {
                 // The damage holds still within a step, so a moment reads
                 // as one corrupted frame, then jumps to the next.
                 let step = (self.progress * 24.0) as u32;
-                let struck = (glitch_scramble(line, step, 999) % 100)
-                    < (45.0 * self.intensity) as u32;
+                let struck =
+                    (glitch_scramble(line, step, 999) % 100) < (45.0 * self.intensity) as u32;
                 let scramble = glitch_scramble(line, step, x / 3);
                 let roll = scramble % 100;
                 let heat = if struck {
@@ -979,12 +979,7 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
         if layout.header.height > 1 {
             frame.render_widget(
                 beat_line::BeatLine { chrome: &chrome },
-                Rect::new(
-                    layout.header.x,
-                    layout.header.y + 1,
-                    layout.header.width,
-                    1,
-                ),
+                Rect::new(layout.header.x, layout.header.y + 1, layout.header.width, 1),
             );
         }
     } else {
@@ -1606,16 +1601,24 @@ mod tests {
     #[test]
     fn the_flash_looks_read_the_same_pulse_differently() {
         use settings::EvalAnimation as Look;
-        let look = |animation, progress, intensity, x, width| EvaluationPulse {
-            animation,
-            progress,
-            intensity,
-        }
-        .look(3, x, width);
+        let look = |animation, progress, intensity, x, width| {
+            EvaluationPulse {
+                animation,
+                progress,
+                intensity,
+            }
+            .look(3, x, width)
+        };
 
         assert_eq!(look(Look::Normal, 0.0, 1.0, 5, 40), FlashLook::Reverse);
-        assert_eq!(look(Look::FadeMedium, 0.5, 0.5, 5, 40), FlashLook::Wash(0.5));
-        assert_eq!(look(Look::FadeSlow, 0.99, 0.01, 5, 40), FlashLook::Wash(0.01));
+        assert_eq!(
+            look(Look::FadeMedium, 0.5, 0.5, 5, 40),
+            FlashLook::Wash(0.5)
+        );
+        assert_eq!(
+            look(Look::FadeSlow, 0.99, 0.01, 5, 40),
+            FlashLook::Wash(0.01)
+        );
         assert_eq!(
             look(Look::FadeFast, 0.99, 0.0, 5, 40),
             FlashLook::Wash(0.0),
