@@ -778,6 +778,24 @@ fn write_live_output_inner<T>(
             let left = scratch[frame * 2];
             let right = scratch[frame * 2 + 1];
             if channels == 1 {
+                // A mono device has no second pair to place a routed orbit
+                // on, so every orbit falls back to the main pair and stays
+                // audible in the mixdown, as the routing contract says.
+                let mut left = left;
+                let mut right = right;
+                if routed {
+                    for (orbit, pair) in pairs.iter().enumerate() {
+                        if *pair == 0 {
+                            continue;
+                        }
+                        let mix = backend.orbit_mix(orbit, count);
+                        if mix.len() < (frame + 1) * 2 {
+                            continue;
+                        }
+                        left += mix[frame * 2] * frame_gains[frame];
+                        right += mix[frame * 2 + 1] * frame_gains[frame];
+                    }
+                }
                 output_frame[0] = T::from_sample((left + right) * 0.5);
             } else if routed {
                 // Orbits go to their pairs; a pair nobody is routed to is
@@ -1753,6 +1771,50 @@ mod tests {
     }
     mod callback_output {
         use super::*;
+
+        /// The only sounding orbit is routed to pair 1, which a mono device
+        /// does not have: the routing contract sends it back to the main
+        /// pair, so it stays audible in the mixdown instead of vanishing.
+        #[test]
+        fn a_routed_orbit_stays_audible_on_a_mono_output() {
+            let _tripwire_guard = tripwire_assertion_guard();
+            let shared = LiveShared::new(1);
+            shared.orbit_pairs[2].store(1, Ordering::Relaxed);
+            assert!(shared.ring.push(AudioEvent {
+                onset_id: 1,
+                generation: 1,
+                target_frame: 0,
+                onset_lead: 0.0,
+                freq_hz: 440.0,
+                gain: 0.8,
+                duration_secs: 0.5,
+                ui_visuals: 0,
+                controls: crate::OscillatorControls {
+                    orbit: 2,
+                    envelope: crate::Envelope {
+                        attack_secs: 0.001,
+                        decay_secs: 0.0,
+                        sustain: 1.0,
+                        release_secs: 0.01,
+                    },
+                    ..Default::default()
+                },
+                sample: None,
+                synth: Some(crate::SynthSource::One),
+                wavetable: None,
+                cut: None,
+            }));
+            let mut backend = LiveScalarBackend::new(48_000, 4).expect("live scalar");
+            let mut meters = LiveCallbackMeters::new(48_000, &shared.realtime_load);
+            let mut output = [0.0f32; 256];
+            tripwire::audio_scope(|| {
+                write_live_output(&mut backend, &mut meters, &mut output, 1, &shared)
+            });
+            assert!(
+                output.iter().any(|sample| *sample > 0.01),
+                "the orbit routed to an absent pair must fall back to the mono main pair"
+            );
+        }
 
         #[test]
         fn callback_load_publication_is_calibrated_and_allocation_free() {
