@@ -1,6 +1,6 @@
 //! Feedback for explicit evaluations, tied to their submitting pane and result.
 
-use super::super::settings::EvaluationFlashMode;
+use super::super::settings::{EvalAnimation, EvaluationFlashMode};
 use super::super::worker::EngineFailure;
 use super::*;
 
@@ -8,6 +8,112 @@ use super::*;
 const SUCCESS_DURATION: Duration = Duration::from_millis(200);
 /// One lit or dark beat of a failure's two pulses.
 const FAILURE_BEAT: Duration = Duration::from_millis(70);
+
+/// One animated run of the flash: how long it takes to arrive, how long it
+/// holds, and how long it takes to leave.
+struct Run {
+    fade_in: Duration,
+    hold: Duration,
+    fade_out: Duration,
+}
+
+impl Run {
+    const fn instant(lit: Duration) -> Self {
+        Self {
+            fade_in: Duration::ZERO,
+            hold: lit,
+            fade_out: Duration::ZERO,
+        }
+    }
+
+    fn total(&self) -> Duration {
+        self.fade_in + self.hold + self.fade_out
+    }
+}
+
+impl EvalAnimation {
+    /// The run one success takes.
+    fn success_run(self) -> Run {
+        match self {
+            Self::Normal => Run::instant(SUCCESS_DURATION),
+            Self::FadeFast => Run {
+                fade_in: Duration::from_millis(40),
+                hold: Duration::from_millis(170),
+                fade_out: Duration::from_millis(130),
+            },
+            Self::FadeMedium => Run {
+                fade_in: Duration::from_millis(80),
+                hold: Duration::from_millis(210),
+                fade_out: Duration::from_millis(350),
+            },
+            Self::FadeSlow => Run {
+                fade_in: Duration::from_millis(120),
+                hold: Duration::from_millis(250),
+                fade_out: Duration::from_millis(670),
+            },
+            Self::Zap => Run {
+                fade_in: Duration::ZERO,
+                hold: Duration::from_millis(60),
+                fade_out: Duration::from_millis(120),
+            },
+            Self::Steps => Run {
+                fade_in: Duration::ZERO,
+                hold: Duration::from_millis(90),
+                fade_out: Duration::from_millis(270),
+            },
+            Self::Swipe => Run {
+                fade_in: Duration::from_millis(30),
+                hold: Duration::from_millis(100),
+                fade_out: Duration::from_millis(500),
+            },
+            Self::Glitch => Run {
+                fade_in: Duration::ZERO,
+                hold: Duration::from_millis(40),
+                fade_out: Duration::from_millis(220),
+            },
+            Self::Wave => Run {
+                fade_in: Duration::from_millis(30),
+                hold: Duration::from_millis(70),
+                fade_out: Duration::from_millis(280),
+            },
+        }
+    }
+
+    /// The run one beat of a failure's double pulse takes: shorter in every
+    /// part, the way a warning reads faster than an acknowledgement.
+    fn failure_run(self) -> Run {
+        let run = self.success_run();
+        Run {
+            fade_in: run.fade_in / 3,
+            hold: FAILURE_BEAT.max(run.hold / 3),
+            fade_out: run.fade_out / 3,
+        }
+    }
+
+    /// How bright the run is `elapsed` in: rising over the fade-in, whole
+    /// across the hold, then leaving on a curve the mode owns.
+    fn intensity(self, run: &Run, elapsed: Duration) -> f32 {
+        if elapsed < run.fade_in {
+            let rise = elapsed.as_secs_f32() / run.fade_in.as_secs_f32();
+            return rise * rise * (3.0 - 2.0 * rise);
+        }
+        if elapsed < run.fade_in + run.hold {
+            return 1.0;
+        }
+        if run.fade_out.is_zero() {
+            return 0.0;
+        }
+        let left = 1.0
+            - (elapsed - run.fade_in - run.hold).as_secs_f32() / run.fade_out.as_secs_f32();
+        let left = left.clamp(0.0, 1.0);
+        match self {
+            Self::Normal => 0.0,
+            Self::FadeFast | Self::FadeMedium | Self::FadeSlow | Self::Swipe => left * left,
+            Self::Zap => left * left * left,
+            Self::Steps | Self::Glitch | Self::Wave => left,
+        }
+    }
+}
 
 /// An explicit evaluation waiting for its outcome: the pane that submitted
 /// it and the request ids it covers, a whole setup chain included.
@@ -25,6 +131,9 @@ pub(super) struct EvaluationFlash {
     pub(super) pane: usize,
     pub(super) success: bool,
     pub(super) started: Instant,
+    /// How the flash moves, read when it began so a change mid-flight does
+    /// not retime a run already under way.
+    animation: EvalAnimation,
     /// The phase last advanced to; `None` before the first advance.
     phase: Option<u8>,
 }
@@ -39,12 +148,24 @@ pub(super) fn outcome_success<T>(result: &Result<T, EngineFailure>) -> Option<bo
 }
 
 impl EvaluationFlash {
+    fn run(&self) -> Run {
+        if self.success {
+            self.animation.success_run()
+        } else {
+            self.animation.failure_run()
+        }
+    }
+
     fn phase_at(&self, now: Instant) -> u8 {
         let elapsed = now.saturating_duration_since(self.started);
+        let slot = self.run().total();
+        if slot.is_zero() {
+            return 3;
+        }
         if self.success {
-            u8::from(elapsed >= SUCCESS_DURATION)
+            u8::from(elapsed >= slot)
         } else {
-            (elapsed.as_millis() / FAILURE_BEAT.as_millis()).min(3) as u8
+            (elapsed.as_millis() / slot.as_millis()).min(3) as u8
         }
     }
 
@@ -58,10 +179,28 @@ impl EvaluationFlash {
     pub(super) fn next_transition(&self) -> Instant {
         self.started
             + if self.success {
-                SUCCESS_DURATION
+                self.run().total()
             } else {
-                FAILURE_BEAT * u32::from(self.phase.unwrap_or(0) + 1)
+                self.run().total() * u32::from(self.phase.unwrap_or(0) + 1)
             }
+    }
+
+    /// The flash as the pane should draw it at `now`: the animation in
+    /// force, how far through its run, and how bright - or `None` while
+    /// dark, which is most of a failure's pattern and all of never.
+    pub(super) fn drawing_at(&self, now: Instant) -> Option<(EvalAnimation, f32, f32)> {
+        if !self.is_lit(now) {
+            return None;
+        }
+        let run = self.run();
+        let slot = run.total();
+        let mut elapsed = now.saturating_duration_since(self.started);
+        if !self.success {
+            let slot_millis = slot.as_millis().max(1);
+            elapsed -= slot * u32::try_from(elapsed.as_millis() / slot_millis).unwrap_or(0);
+        }
+        let progress = (elapsed.as_secs_f32() / slot.as_secs_f32()).clamp(0.0, 1.0);
+        Some((self.animation, progress, self.animation.intensity(&run, elapsed)))
     }
 
     fn allowed(&self, mode: EvaluationFlashMode) -> bool {
@@ -112,6 +251,7 @@ impl App {
             pane,
             success,
             started: now,
+            animation: self.ui_settings.evaluation_animation,
             phase: None,
         };
         if flash.allowed(self.ui_settings.evaluation_flash) {
@@ -143,7 +283,8 @@ impl App {
 
     /// Advances the flash to `now`, asking for a repaint at each pulse
     /// transition and at expiry whatever the frame rate. Returns whether a
-    /// flash is still active.
+    /// flash is still active: while one is, the loop keeps painting at its
+    /// configured frame rate, which is what moves an animation along.
     pub(super) fn advance_evaluation_flash(&mut self, now: Instant) -> bool {
         let Some(flash) = &mut self.evaluation_flash else {
             return false;
@@ -170,7 +311,7 @@ mod tests {
 
         use crate::app::tests::support::{app_over, sounding};
         use crate::app::*;
-        use crate::settings::EvaluationFlashMode;
+        use crate::settings::{EvalAnimation, EvaluationFlashMode};
 
         const BROKEN: &str = "$: s(\"bd\").orbit(3) (((";
         const SCORE: &str = "$: note(60).s(\"sine\")";
@@ -565,6 +706,157 @@ mod tests {
 
             assert!(!app.advance_evaluation_flash(started + Duration::from_millis(200)));
             assert!(app.evaluation_flash.is_none());
+        }
+
+        /// An animation stretches the window the flash is lit over and
+        /// gives the pane a brightness that rises and falls inside it,
+        /// while the plain look stays exactly what it was.
+        #[test]
+        fn an_animated_flash_runs_longer_and_fades_rather_than_cutting() {
+            // The look, how long it stays lit, and the middle of its hold.
+            for (animation, lit_ms, hold_mid_ms) in [
+                (EvalAnimation::Normal, 200, 100),
+                (EvalAnimation::FadeFast, 340, 125),
+                (EvalAnimation::FadeMedium, 640, 185),
+                (EvalAnimation::FadeSlow, 1040, 245),
+                (EvalAnimation::Swipe, 630, 80),
+                (EvalAnimation::Zap, 180, 30),
+                (EvalAnimation::Steps, 360, 45),
+                (EvalAnimation::Glitch, 260, 20),
+                (EvalAnimation::Wave, 380, 65),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut app = app_over(directory.path());
+                app.ui_settings.evaluation_animation = animation;
+                let request_id = evaluate(&mut app, SCORE);
+                answer(&mut app, request_id, Some(true));
+                let started = app.evaluation_flash.as_ref().unwrap().started;
+                let flash = app.evaluation_flash.as_ref().unwrap();
+
+                assert!(
+                    flash.is_lit(started + Duration::from_millis(lit_ms - 1)),
+                    "{animation:?} stays lit to its end"
+                );
+                assert!(
+                    !flash.is_lit(started + Duration::from_millis(lit_ms)),
+                    "{animation:?} ends at {lit_ms}ms"
+                );
+                assert_eq!(
+                    flash.next_transition(),
+                    started + Duration::from_millis(lit_ms),
+                    "{animation:?} hands the loop its end"
+                );
+
+                let (_, _, whole) = flash
+                    .drawing_at(started + Duration::from_millis(hold_mid_ms))
+                    .unwrap_or_else(|| panic!("{animation:?} draws mid-hold"));
+                assert_eq!(whole, 1.0, "{animation:?} is whole across its hold");
+                let (_, _, late) = flash
+                    .drawing_at(started + Duration::from_millis(lit_ms - 20))
+                    .unwrap_or_else(|| panic!("{animation:?} draws near its end"));
+                if animation != EvalAnimation::Normal {
+                    assert!(
+                        late < 0.5,
+                        "{animation:?}: {late} near the end, down from whole"
+                    );
+                } else {
+                    assert_eq!(late, 1.0, "the plain look holds whole to the cut");
+                }
+                assert!(
+                    flash.drawing_at(started + Duration::from_millis(lit_ms + 5)).is_none(),
+                    "{animation:?} draws nothing once dark"
+                );
+            }
+
+            // Normal arrives whole, the moment it starts: no run-in, no
+            // ramp, the look the reverse modifier always made.
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            let request_id = evaluate(&mut app, SCORE);
+            answer(&mut app, request_id, Some(true));
+            let started = app.evaluation_flash.as_ref().unwrap().started;
+            let flash = app.evaluation_flash.as_ref().unwrap();
+            let (animation, _, intensity) = flash.drawing_at(started).unwrap();
+            assert_eq!(animation, EvalAnimation::Normal);
+            assert_eq!(intensity, 1.0);
+        }
+
+        /// A fade rises from nothing: the code is read at the start, then
+        /// the light comes up over it.
+        #[test]
+        fn a_fade_begins_dark_and_climbs() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.ui_settings.evaluation_animation = EvalAnimation::FadeMedium;
+            let request_id = evaluate(&mut app, SCORE);
+            answer(&mut app, request_id, Some(true));
+            let started = app.evaluation_flash.as_ref().unwrap().started;
+            let flash = app.evaluation_flash.as_ref().unwrap();
+
+            let (_, _, start) = flash.drawing_at(started).unwrap();
+            let (_, _, quarter) = flash.drawing_at(started + Duration::from_millis(20)).unwrap();
+            let (_, _, half) = flash.drawing_at(started + Duration::from_millis(40)).unwrap();
+            let (_, _, whole) = flash.drawing_at(started + Duration::from_millis(100)).unwrap();
+            assert_eq!(start, 0.0, "the fade begins dark");
+            assert!(quarter < half && half < whole, "{quarter} {half} {whole}");
+            assert_eq!(whole, 1.0, "the hold is whole");
+        }
+
+        /// A failure keeps its double pulse under every animation, quicker
+        /// in every part: the warning still reads faster than the nod.
+        #[test]
+        fn every_animation_keeps_the_failure_double_pulse() {
+            for animation in [
+                EvalAnimation::Normal,
+                EvalAnimation::FadeFast,
+                EvalAnimation::FadeMedium,
+                EvalAnimation::FadeSlow,
+                EvalAnimation::Zap,
+                EvalAnimation::Steps,
+                EvalAnimation::Glitch,
+                EvalAnimation::Wave,
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut app = app_over(directory.path());
+                app.ui_settings.evaluation_animation = animation;
+                evaluate(&mut app, BROKEN);
+                let started = app.evaluation_flash.as_ref().unwrap().started;
+                let flash = app.evaluation_flash.as_ref().unwrap();
+
+                assert!(
+                    flash.drawing_at(started).is_some(),
+                    "{animation:?} flashes at once"
+                );
+                // The dark gap between the two pulses is real, and the
+                // second pulse relights after it.
+                let gap_start = dark_again(&app, started);
+                let relit = lit_again(&app, gap_start);
+                assert!(gap_start > started, "{animation:?} has a dark gap");
+                assert!(relit > gap_start, "{animation:?} pulses twice");
+                assert!(
+                    flash.is_lit(relit) && !flash.is_lit(gap_start),
+                    "{animation:?}: dark at the gap, lit on the second pulse"
+                );
+            }
+        }
+
+        /// The first instant the flash goes dark after `from`, stepped
+        /// coarsely: the pulses are tens of milliseconds, the step can be
+        /// one.
+        fn dark_again(app: &App, from: Instant) -> Instant {
+            let flash = app.evaluation_flash.as_ref().unwrap();
+            (1..4000)
+                .map(|ms| from + Duration::from_millis(ms))
+                .find(|now| !flash.is_lit(*now))
+                .unwrap_or_else(|| panic!("never dark after {from:?}"))
+        }
+
+        fn lit_again(app: &App, from: Instant) -> Instant {
+            let flash = app.evaluation_flash.as_ref().unwrap();
+            (1..4000)
+                .map(|ms| from + Duration::from_millis(ms))
+                .find(|now| flash.is_lit(*now))
+                .expect("the second pulse comes")
         }
 
         #[test]

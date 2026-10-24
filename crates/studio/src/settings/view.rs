@@ -174,6 +174,8 @@ impl Widget for SettingsSheetView<'_> {
                 Row::BackdropStrength => format!("{}%", self.settings.backdrop_opacity),
                 Row::InterfaceOpacity => format!("{}%", self.settings.interface_opacity),
                 Row::EditorOpacity => format!("{}%", self.settings.editor_opacity),
+                Row::BeatLine => self.settings.beat_line.label().to_owned(),
+                Row::EvaluationAnimation => self.settings.evaluation_animation.label().to_owned(),
                 Row::ShowMenu => on_off(self.settings.show_menu),
                 Row::ShowHeader => on_off(self.settings.show_header),
                 Row::ShowFooter => on_off(self.settings.show_footer),
@@ -761,8 +763,8 @@ pub(super) fn render_permissions(
     // for one line, and a player who cannot see "Enter permits" cannot
     // work the page.
     let keys = match view.permissions.get(view.sheet.selected) {
-        Some(row) if row.allowed() => "Space off · d removes · Tab pages",
-        Some(_) => "Enter permits · Space on/off · d dismisses · Tab pages",
+        Some(row) if row.allowed() => "←/→/Space off · d removes · Tab pages",
+        Some(_) => "Enter permits · ←/→/Space on/off · d dismisses · Tab pages",
         None => "Tab pages",
     };
     let says = match view.permissions.get(view.sheet.selected) {

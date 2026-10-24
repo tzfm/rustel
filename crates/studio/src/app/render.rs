@@ -928,6 +928,7 @@ impl App {
             zen: self.ui_settings.zen,
             show_menu: self.ui_settings.show_menu,
             show_header: self.ui_settings.show_header,
+            beat_line: self.ui_settings.beat_line,
             show_footer: self.ui_settings.show_footer,
             evaluation_flash: inputs.flashing,
             focus_flash: self.focus_rotation_flash_room(),
@@ -1042,6 +1043,16 @@ impl App {
         inputs: &'a FrameInputs,
     ) -> Vec<PaneView<'a>> {
         let audible = self.audible_scene;
+        // The pane draws the flash's animation from this, progress and
+        // brightness included, so the widget itself needs no clock.
+        let flash_pulse = self.evaluation_flash.as_ref().and_then(|flash| {
+            let (animation, progress, intensity) = flash.drawing_at(Instant::now())?;
+            Some(view::EvaluationPulse {
+                animation,
+                progress,
+                intensity,
+            })
+        });
         self.panes
             .iter()
             .zip(maps)
@@ -1084,11 +1095,11 @@ impl App {
                     dirty: scene.dirty,
                     playing: inputs.playing_scene == Some(pane.scene),
                     focused: index == self.focused,
-                    flash: inputs.flashing
-                        && self
-                            .evaluation_flash
+                    flash: flash_pulse.filter(|_| {
+                        self.evaluation_flash
                             .as_ref()
-                            .is_some_and(|flash| flash.pane == index && flash.scene == pane.scene),
+                            .is_some_and(|flash| flash.pane == index && flash.scene == pane.scene)
+                    }),
                     locate_flash: (index == self.focused)
                         .then_some(inputs.locating_caret)
                         .flatten(),

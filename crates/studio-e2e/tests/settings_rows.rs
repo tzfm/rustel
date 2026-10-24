@@ -110,8 +110,8 @@ fn open_sheet(studio: &mut Hermetic) {
     );
 }
 
-/// Open the sheet on the Advanced page.
-fn open_advanced(studio: &mut Hermetic) {
+/// Open the sheet on the appearance page, the second tab.
+fn open_appearance(studio: &mut Hermetic) {
     open_sheet(studio);
     studio.press(KeyCode::Tab, KeyModifiers::NONE);
     studio.settle();
@@ -147,7 +147,7 @@ fn percent(row: &str) -> u32 {
 #[test]
 fn switches_flip_on_every_changing_key() {
     let mut studio = hermetic();
-    open_sheet(&mut studio);
+    open_appearance(&mut studio);
     select_row(&mut studio, "▸ minimap");
 
     let reads_on = |studio: &mut Hermetic| switch_on(studio, "minimap");
@@ -176,7 +176,7 @@ fn switches_flip_on_every_changing_key() {
 #[test]
 fn ladders_step_wrap_both_ways() {
     let mut studio = hermetic();
-    open_sheet(&mut studio);
+    open_appearance(&mut studio);
     select_row(&mut studio, "▸ metric detail");
 
     const RUNGS: [&str; 4] = ["none", "basic", "advanced", "full"];
@@ -224,7 +224,7 @@ fn ladders_step_wrap_both_ways() {
 #[test]
 fn caret_shape_walks_its_six_shapes() {
     let mut studio = hermetic();
-    open_sheet(&mut studio);
+    open_appearance(&mut studio);
     select_row(&mut studio, "▸ caret shape");
     assert_eq!(
         value_of(&mut studio, "caret shape"),
@@ -254,7 +254,7 @@ fn caret_shape_walks_its_six_shapes() {
 #[test]
 fn rendering_steps_only_through_what_the_terminal_can_draw() {
     let mut studio = hermetic();
-    open_advanced(&mut studio);
+    open_appearance(&mut studio);
     select_row(&mut studio, "▸ rendering");
     assert!(
         value_of(&mut studio, "rendering").starts_with("Automatic"),
@@ -288,7 +288,7 @@ fn rendering_steps_only_through_what_the_terminal_can_draw() {
 #[test]
 fn frame_rate_reads_the_arrows_the_other_way_round() {
     let mut studio = hermetic();
-    open_advanced(&mut studio);
+    open_appearance(&mut studio);
     select_row(&mut studio, "▸ frame rate");
 
     let rate = |studio: &mut Hermetic| leading_number(&value_of(studio, "frame rate"));
@@ -308,7 +308,7 @@ fn frame_rate_reads_the_arrows_the_other_way_round() {
 #[test]
 fn max_polyphony_names_the_voice_count() {
     let mut studio = hermetic();
-    open_advanced(&mut studio);
+    open_sheet(&mut studio);
     select_row(&mut studio, "▸ max polyphony");
 
     let voices = |studio: &mut Hermetic| leading_number(&value_of(studio, "max polyphony"));
@@ -336,7 +336,7 @@ fn max_polyphony_names_the_voice_count() {
 #[test]
 fn piano_rows_cycle_and_clamp() {
     let mut studio = hermetic();
-    open_advanced(&mut studio);
+    open_sheet(&mut studio);
 
     select_row(&mut studio, "▸ piano sound");
     assert_eq!(value_of(&mut studio, "piano sound"), "triangle");
@@ -489,7 +489,7 @@ fn master_limiter_default_flips_for_a_fresh_set() {
 #[test]
 fn opacity_rows_clamp_and_are_claimed_across_a_reopen() {
     let mut studio = hermetic();
-    open_sheet(&mut studio);
+    open_appearance(&mut studio);
     select_row(&mut studio, "▸ ui opacity");
     let opacity = |studio: &mut Hermetic| percent(&value_of(studio, "ui opacity"));
 
@@ -540,7 +540,7 @@ fn opacity_rows_clamp_and_are_claimed_across_a_reopen() {
     studio.quit();
     let mut studio = reopen_over(studio);
 
-    open_sheet(&mut studio);
+    open_appearance(&mut studio);
     select_row(&mut studio, "▸ ui opacity");
     assert_eq!(
         percent(&value_of(&mut studio, "ui opacity")),
@@ -744,7 +744,7 @@ fn the_sheet_reaches_its_last_rows_on_a_short_terminal() {
     studio.press(KeyCode::End, KeyModifiers::NONE);
     studio.settle();
     assert!(
-        selected_row(&mut studio).is_some_and(|row| row.contains("full paths")),
+        selected_row(&mut studio).is_some_and(|row| row.contains("drop unused")),
         "End reached the last row: {:?}",
         selected_row(&mut studio)
     );
@@ -775,10 +775,10 @@ fn the_sheet_reaches_its_last_rows_on_a_short_terminal() {
 }
 
 #[test]
-fn settings_and_advanced_keep_their_place_until_studio_restarts() {
+fn settings_and_appearance_keep_their_place_until_studio_restarts() {
     let mut studio = hermetic_sized(120, 24);
     open_sheet(&mut studio);
-    select_row(&mut studio, "▸ caret shape");
+    select_row(&mut studio, "▸ syntax check");
     let selection = |studio: &mut Hermetic| {
         studio
             .rows()
@@ -795,18 +795,18 @@ fn settings_and_advanced_keep_their_place_until_studio_restarts() {
 
     studio.press(KeyCode::Tab, KeyModifiers::NONE);
     select_row(&mut studio, "▸ frame rate");
-    let advanced_position = selection(&mut studio);
+    let appearance_position = selection(&mut studio);
     studio.chord("ctrl+o");
     studio.chord("ctrl+o");
     studio.settle();
-    assert_eq!(selection(&mut studio), advanced_position);
+    assert_eq!(selection(&mut studio), appearance_position);
 
     studio.press(KeyCode::BackTab, KeyModifiers::SHIFT);
     studio.settle();
     assert_eq!(selection(&mut studio), settings_position);
     studio.press(KeyCode::Tab, KeyModifiers::NONE);
     studio.settle();
-    assert_eq!(selection(&mut studio), advanced_position);
+    assert_eq!(selection(&mut studio), appearance_position);
 
     let mut studio = reopen_over(studio);
     open_sheet(&mut studio);
@@ -953,7 +953,7 @@ fn tab_cycles_the_pages_and_wraps() {
     open_sheet(&mut studio);
 
     for expected in [
-        "max polyphony",        // advanced
+        "zen mode",             // appearance
         "not assigned",         // mapping: the slot boxes
         "automatic",            // keybinds: the terminal-profile row
         "fetch imports",        // sources
@@ -961,7 +961,7 @@ fn tab_cycles_the_pages_and_wraps() {
         "OSC / SuperDirt",      // reference
         "native orchestras",    // trust: the switch is on from the start
         "Terminal: rustel-e2e", // about
-        "launch on",            // and back to settings
+        "launch on",            // and back to general
     ] {
         studio.press(KeyCode::Tab, KeyModifiers::NONE);
         studio.settle();

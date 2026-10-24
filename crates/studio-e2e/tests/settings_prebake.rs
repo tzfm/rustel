@@ -13,7 +13,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use rustel_studio_e2e::{PanelKind, hermetic, reopen_over, row_containing};
 
 /// The biggest-sound ceiling is a setting now, not a constant a rebuild
-/// changes: the advanced page's row names the rung and roughly how long
+/// changes: the general page's row names the rung and roughly how long
 /// a take it holds, and ←/→ walk the ladder. What breaks if these fail:
 /// a musician with a long take has no way to raise the ceiling, or the
 /// row promises a size the player then refuses to honour.
@@ -23,10 +23,9 @@ fn the_biggest_sound_is_a_ladder_a_setting_walks() {
     studio.chord("ctrl+o");
     row_containing(&studio.rows(), "Tab pages");
 
-    // Page over to Advanced, where the memory rows live. The walk reads
+    // The memory rows live at the end of the general page. The walk reads
     // the sheet's own selection marker: Right acts on the row the sheet
     // says is selected, not on any row that happens to be visible.
-    studio.press(KeyCode::Tab, KeyModifiers::NONE);
     for _ in 0..30 {
         if studio
             .rows()
@@ -53,7 +52,7 @@ fn the_biggest_sound_is_a_ladder_a_setting_walks() {
             .rows()
             .iter()
             .find(|row| row.contains("biggest sound"))
-            .expect("the row is on the advanced page")
+            .expect("the row is on the general page")
             .clone()
     };
     let row = read(&mut studio);
@@ -130,6 +129,8 @@ fn a_switch_flips_live_and_says_so() {
     let mut studio = hermetic();
 
     studio.chord("ctrl+o");
+    // The highlights row is on the appearance page, the second tab.
+    studio.press(KeyCode::Tab, KeyModifiers::NONE);
     select_row(&mut studio, "highlights");
     row_containing(&studio.rows(), "● on");
 
@@ -424,17 +425,15 @@ fn the_local_prebake_survives_a_reopen() {
     );
 }
 
-/// The audio-out latency row is on the Advanced page, in the "Audio out"
-/// group. ←/→ step the buffer ladder, the readout names the step, Esc keeps
-/// the choice, and a new sheet reads it back. Engine unit tests cover the
-/// ladder's arithmetic.
+/// The audio-out latency row is on the General page, in the "Audio out"
+/// group at its end. ←/→ step the buffer ladder, the readout names the
+/// step, Esc keeps the choice, and a new sheet reads it back. Engine unit
+/// tests cover the ladder's arithmetic.
 #[test]
 fn the_output_latency_row_walks_and_is_kept() {
     let mut studio = hermetic();
 
     studio.chord("ctrl+o");
-    // Page over to Advanced, where the machine rows live.
-    studio.press(KeyCode::Tab, KeyModifiers::NONE);
     select_row(&mut studio, "▸ audio out latency");
 
     let read = |studio: &mut rustel_studio_e2e::Hermetic| {
@@ -470,7 +469,7 @@ fn the_output_latency_row_walks_and_is_kept() {
         "← came back down a rung"
     );
 
-    // Esc keeps the choice and the Advanced page's selected row.
+    // Esc keeps the choice and the General page's selected row.
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     studio.chord("ctrl+o");
     row_containing(&studio.rows(), "▸ audio out latency");
@@ -483,10 +482,10 @@ fn the_output_latency_row_walks_and_is_kept() {
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
 }
 
-/// The frame-rate row on Advanced steps the whole ladder, including the two
-/// steps above sixty. The terminal can limit those rates, so the row shows
-/// the requested rate without a clamp. → is faster, ← is slower, and the
-/// ladder wraps both ways.
+/// The frame-rate row on Appearance steps the whole ladder, including the
+/// two steps above sixty. The terminal can limit those rates, so the row
+/// shows the requested rate without a clamp. → is faster, ← is slower, and
+/// the ladder wraps both ways.
 #[test]
 fn the_frame_rate_row_climbs_past_sixty() {
     let mut studio = hermetic();
@@ -593,7 +592,7 @@ fn the_shipped_packs_are_listed_under_the_imports() {
         "the cache controls lead the page:\n{}",
         rows.join("\n")
     );
-    // The Advanced page no longer carries the row: it moved here.
+    // The General page no longer carries the row: it moved here.
     assert!(
         !rows.iter().any(|row| row.contains("cache whole library")),
         "{}",

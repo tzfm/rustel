@@ -1688,11 +1688,13 @@ mod tests {
             let webcam_row = (0..64)
                 .find(|selected| {
                     let mut sheet = SettingsSheet::default();
+                    sheet.show_page(crate::settings::SettingsPage::Appearance);
                     sheet.selected = *selected;
                     sheet.webcam_row_selected()
                 })
                 .expect("webcam row");
             let mut sheet = SettingsSheet::default();
+            sheet.show_page(crate::settings::SettingsPage::Appearance);
             sheet.selected = webcam_row;
             app.settings_sheet = Some(sheet);
             app.focus = Focus::Panel(PanelKind::Settings);
@@ -1730,16 +1732,16 @@ mod tests {
                 crate::settings::SettingsSheetView::geometry(app.frame).expect("settings geometry");
             app.handle_mouse(MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: panel.x + 14,
+                column: panel.x + 25,
                 row: panel.y,
                 modifiers: KeyModifiers::NONE,
             })
-            .expect("advanced tab click");
+            .expect("sliders tab click");
             assert!(!policy.webcam_status().requested);
 
             // Esc/shortcut close cannot leave a hidden preview worker requested.
             if let Some(sheet) = app.settings_sheet.as_mut() {
-                sheet.show_page(crate::settings::SettingsPage::Settings);
+                sheet.show_page(crate::settings::SettingsPage::Appearance);
                 sheet.select(webcam_row);
                 sheet.webcam_preview = true;
             }
@@ -1751,6 +1753,7 @@ mod tests {
             // Resizing below the sheet's minimum width revokes immediately;
             // the logical panel may remain open, but it is no longer visible.
             let mut sheet = SettingsSheet::default();
+            sheet.show_page(crate::settings::SettingsPage::Appearance);
             sheet.select(webcam_row);
             sheet.webcam_preview = true;
             app.settings_sheet = Some(sheet);
@@ -1784,11 +1787,13 @@ mod tests {
             let webcam_row = (0..64)
                 .find(|selected| {
                     let mut sheet = SettingsSheet::default();
+                    sheet.show_page(crate::settings::SettingsPage::Appearance);
                     sheet.selected = *selected;
                     sheet.webcam_row_selected()
                 })
                 .expect("webcam row");
             let mut sheet = SettingsSheet::default();
+            sheet.show_page(crate::settings::SettingsPage::Appearance);
             sheet.selected = webcam_row;
             app.settings_sheet = Some(sheet);
             app.focus = Focus::Panel(PanelKind::Settings);
@@ -1853,11 +1858,13 @@ mod tests {
             let webcam_row = (0..64)
                 .find(|selected| {
                     let mut sheet = SettingsSheet::default();
+                    sheet.show_page(crate::settings::SettingsPage::Appearance);
                     sheet.selected = *selected;
                     sheet.webcam_row_selected()
                 })
                 .expect("webcam row");
             let mut sheet = SettingsSheet::default();
+            sheet.show_page(crate::settings::SettingsPage::Appearance);
             sheet.selected = webcam_row;
             app.settings_sheet = Some(sheet);
             app.focus = Focus::Panel(PanelKind::Settings);
@@ -1924,11 +1931,13 @@ mod tests {
             let webcam_row = (0..64)
                 .find(|selected| {
                     let mut sheet = SettingsSheet::default();
+                    sheet.show_page(crate::settings::SettingsPage::Appearance);
                     sheet.selected = *selected;
                     sheet.webcam_row_selected()
                 })
                 .expect("webcam row");
             let mut sheet = SettingsSheet::default();
+            sheet.show_page(crate::settings::SettingsPage::Appearance);
             sheet.selected = webcam_row + 2;
             app.settings_sheet = Some(sheet);
             app.focus = Focus::Panel(PanelKind::Settings);
@@ -2014,18 +2023,20 @@ mod tests {
         }
 
         #[test]
-        fn advanced_polyphony_changes_the_live_bus_and_persists_without_restarting() {
+        fn polyphony_changes_the_live_bus_and_persists_without_restarting() {
             let directory = tempfile::tempdir().unwrap();
             let mut app = app_over(directory.path());
             app.frame = Rect::new(0, 0, 120, 40);
             assert_eq!(app.worker.master().max_polyphony(), 128);
-            let mut sheet = SettingsSheet::default();
-            sheet.show_page(crate::settings::SettingsPage::Advanced);
+            let sheet = SettingsSheet::default();
             app.settings_sheet = Some(sheet);
             app.focus = Focus::Panel(PanelKind::Settings);
-            // Past the load mode and the output buffer.
-            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
-            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            // Down to the machine rows at the page's end, onto max
+            // polyphony: past the set rows, the load mode and the output
+            // buffer.
+            for _ in 0..14 {
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            }
             press(&mut app, KeyCode::Right, KeyModifiers::NONE);
             assert_eq!(app.ui_settings.max_polyphony, 192);
             assert_eq!(app.worker.master().max_polyphony(), 192);
@@ -2042,10 +2053,13 @@ mod tests {
             let mut app = app_over(directory.path());
             app.frame = Rect::new(0, 0, 120, 40);
             assert_eq!(app.worker.master().load_mode(), LoadMode::Wait);
-            let mut sheet = SettingsSheet::default();
-            sheet.show_page(crate::settings::SettingsPage::Advanced);
+            let sheet = SettingsSheet::default();
             app.settings_sheet = Some(sheet);
             app.focus = Focus::Panel(PanelKind::Settings);
+            // Down onto the load mode, the first machine row at the end.
+            for _ in 0..12 {
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            }
             press(&mut app, KeyCode::Right, KeyModifiers::NONE);
             assert_eq!(app.ui_settings.load_mode, LoadMode::Async);
             assert_eq!(app.worker.master().load_mode(), LoadMode::Async);

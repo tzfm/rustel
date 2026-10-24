@@ -167,6 +167,9 @@ pub struct StudioPrefs {
     /// Which evaluation outcomes flash: full, on-success, or off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluation_flash: Option<String>,
+    /// How the evaluation flash moves over the code it ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_animation: Option<String>,
     /// A finished recording has its leading and trailing silence cut before
     /// it is saved. On by default: the silence around a take is the count-in
     /// and the wait for the next one, not part of the performance.
@@ -322,6 +325,10 @@ pub struct StudioPrefs {
     pub interface_opacity: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor_opacity: Option<u8>,
+    /// How the beat line under the header moves: off, pulse, travel or
+    /// wave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beat_line: Option<String>,
     /// The File / Edit menu bar along the top. Absent is shown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub show_menu: Option<bool>,
@@ -707,6 +714,11 @@ impl StudioPrefs {
                 .as_deref()
                 .map(super::settings::EvaluationFlashMode::parse)
                 .unwrap_or(defaults.evaluation_flash),
+            evaluation_animation: self
+                .evaluation_animation
+                .as_deref()
+                .map(super::settings::EvalAnimation::parse)
+                .unwrap_or(defaults.evaluation_animation),
             trim_recordings: self.trim_recordings.unwrap_or(defaults.trim_recordings),
             output_latency: self
                 .output_latency
@@ -830,6 +842,11 @@ impl StudioPrefs {
             editor_opacity: self
                 .editor_opacity
                 .map_or(defaults.editor_opacity, |opacity| opacity.min(100)),
+            beat_line: self
+                .beat_line
+                .as_deref()
+                .map(super::settings::BeatLineStyle::parse)
+                .unwrap_or(defaults.beat_line),
             // Deliberately not remembered: the studio always opens with its
             // stage up.
             zen: defaults.zen,
@@ -885,6 +902,7 @@ impl StudioPrefs {
         self.animation = Some(settings.animation);
         self.highlights = Some(settings.highlights);
         self.evaluation_flash = Some(settings.evaluation_flash.key().to_owned());
+        self.evaluation_animation = Some(settings.evaluation_animation.key().to_owned());
         self.trim_recordings = Some(settings.trim_recordings);
         self.highlight_fade = Some(settings.highlight_fade.key().to_owned());
         self.metric_detail = Some(settings.metric_detail.key().to_owned());
@@ -998,6 +1016,7 @@ impl StudioPrefs {
         self.backdrop_opacity = Some(settings.backdrop_opacity);
         self.interface_opacity = Some(settings.interface_opacity);
         self.editor_opacity = Some(settings.editor_opacity);
+        self.beat_line = Some(settings.beat_line.key().to_owned());
     }
 
     /// The learnt shortcuts, restored from the file. The overrides live
@@ -1937,6 +1956,69 @@ mod tests {
             assert_eq!(encoded["evaluation_flash"], key);
             let restored: StudioPrefs = serde_json::from_value(encoded).unwrap();
             assert_eq!(restored.ui_settings().evaluation_flash, mode);
+        }
+    }
+
+    /// The evaluation animation survives the file the same way, and an
+    /// unreadable spelling is the look the studio always had.
+    #[test]
+    fn evaluation_animation_defaults_normal_and_remembers_each_look() {
+        use super::super::settings::EvalAnimation;
+
+        for json in ["{}", r#"{"evaluation_animation":"unknown"}"#] {
+            let prefs: StudioPrefs = serde_json::from_str(json).unwrap();
+            assert_eq!(prefs.ui_settings().evaluation_animation, EvalAnimation::Normal);
+        }
+        for (mode, key) in [
+            (EvalAnimation::Normal, "normal"),
+            (EvalAnimation::FadeFast, "fade-fast"),
+            (EvalAnimation::FadeMedium, "fade-medium"),
+            (EvalAnimation::FadeSlow, "fade-slow"),
+            (EvalAnimation::Zap, "zap"),
+            (EvalAnimation::Steps, "steps"),
+            (EvalAnimation::Glitch, "glitch"),
+            (EvalAnimation::Wave, "wave"),
+        ] {
+            let settings = super::super::settings::UiSettings {
+                evaluation_animation: mode,
+                ..Default::default()
+            };
+            let mut prefs = StudioPrefs::default();
+            prefs.set_ui_settings(&settings);
+            let encoded = serde_json::to_value(&prefs).unwrap();
+            assert_eq!(encoded["evaluation_animation"], key);
+            let restored: StudioPrefs = serde_json::from_value(encoded).unwrap();
+            assert_eq!(restored.ui_settings().evaluation_animation, mode);
+        }
+    }
+
+    /// The beat line survives the file, and an unreadable spelling is the
+    /// off it defaults to. The aberration caps at a hundred on the way in,
+    /// like the opacities.
+    #[test]
+    fn the_beat_line_survives_the_file() {
+        use super::super::settings::BeatLineStyle;
+
+        for json in ["{}", r#"{"beat_line":"unknown"}"#] {
+            let prefs: StudioPrefs = serde_json::from_str(json).unwrap();
+            assert_eq!(prefs.ui_settings().beat_line, BeatLineStyle::Off);
+        }
+        for (style, key) in [
+            (BeatLineStyle::Off, "off"),
+            (BeatLineStyle::Pulse, "pulse"),
+            (BeatLineStyle::Travel, "travel"),
+            (BeatLineStyle::Wave, "wave"),
+        ] {
+            let settings = super::super::settings::UiSettings {
+                beat_line: style,
+                ..Default::default()
+            };
+            let mut prefs = StudioPrefs::default();
+            prefs.claim_opacities(&settings);
+            let encoded = serde_json::to_value(&prefs).unwrap();
+            assert_eq!(encoded["beat_line"], key);
+            let restored: StudioPrefs = serde_json::from_value(encoded).unwrap();
+            assert_eq!(restored.ui_settings().beat_line, style);
         }
     }
 
