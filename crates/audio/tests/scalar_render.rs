@@ -364,6 +364,59 @@ fn zero_speed_sample_is_an_audio_no_op() {
     );
 }
 
+/// A rate above the sample clock advances an LFO by more than a whole
+/// cycle a sample, and a negative rate walks below zero. Both must stay
+/// wrapped in `[0, 1)`: at 72 kHz over a 48 kHz clock the phase walks
+/// 0, 0.5, 0, 0.5 and a full-depth tremolo alternates sample to sample
+/// instead of walking out of its range and sticking.
+#[test]
+fn lfo_phases_wrap_for_rates_above_and_below_the_sample_clock() {
+    let render_with = |rate: f32| {
+        let mut controls = OscillatorControls::default();
+        controls.tremolo = Some(rustel_audio::TremoloControls {
+            frequency_hz: rate,
+            depth: 1.0,
+            skew: 1.0,
+            shape: 0,
+            phase_offset: 0.0,
+            time_secs: 0.0,
+        });
+        let event = OnsetEvent::new(0, 440.0, 0.5, 0.5)
+            .with_optional_synth(Some(rustel_audio::SynthSource::One))
+            .with_controls(controls);
+        render_pcm(&mut ScalarBackend::new(), 48_000, 2_000, &[event])
+            .unwrap_or_else(|error| panic!("render: {error}"))
+    };
+
+    // The aliased 24 kHz alternation still runs well past the first wrap.
+    let aliased = render_with(72_000.0);
+    for frame in (1_000..1_900).step_by(2) {
+        assert!(
+            aliased[frame * 2] < 0.005,
+            "the wrapped phase must keep visiting 0, not drift past the cycle"
+        );
+        assert!(
+            aliased[(frame + 1) * 2] > 0.03,
+            "the wrapped phase must keep visiting 0.5"
+        );
+    }
+
+    // A negative rate stays in the cycle too: wrapped in the positive
+    // direction, its gain keeps moving instead of sticking at a clamp.
+    let negative = render_with(-100.0);
+    let drift = (900..1_500)
+        .map(|frame| negative[frame * 2])
+        .fold(None::<(f32, f32)>, |spread, value| match spread {
+            None => Some((value, value)),
+            Some((low, high)) => Some((low.min(value), high.max(value))),
+        })
+        .expect("samples");
+    assert!(
+        drift.1 - drift.0 > 0.1,
+        "a negative rate must keep moving through its cycle, spread {drift:?}"
+    );
+}
+
 /// A render longer than the backend's pending-event ceiling still sounds
 /// every event: admission follows the output, so the short events drain as
 /// the render advances and the final tone is retained.

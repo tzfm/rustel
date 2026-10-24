@@ -274,8 +274,8 @@ pub(super) fn apply_fx_stage(
                 .tremolo_phase
                 .get_or_insert_with(|| lfo_phase0(tr.time_secs, tr.frequency_hz, tr.phase_offset));
             let raw = lfo_waveshape(tr.shape, phase, tr.skew) * tr.depth;
-            let next = phase + f64::from(tr.frequency_hz) / f64::from(sample_rate);
-            state.tremolo_phase = Some(if next > 1.0 { next - 1.0 } else { next });
+            let next = wrap_phase(phase + f64::from(tr.frequency_hz) / f64::from(sample_rate));
+            state.tremolo_phase = Some(next);
             let gain = base + raw.powf(1.5).clamp(0.0, 1.0);
             // A NaN sum gives the gain its default.
             if gain.is_nan() { 1.0 } else { gain }
@@ -324,8 +324,8 @@ pub(super) fn apply_fx_stage(
                 .phaser_phase
                 .get_or_insert_with(|| lfo_phase0(ph.time_secs, ph.rate_hz, 0.0));
             let raw = (lfo_waveshape(0, phase, 0.5) - 0.5) * lfo_depth;
-            let next = phase + f64::from(ph.rate_hz) / f64::from(sample_rate);
-            state.phaser_phase = Some(if next > 1.0 { next - 1.0 } else { next });
+            let next = wrap_phase(phase + f64::from(ph.rate_hz) / f64::from(sample_rate));
+            state.phaser_phase = Some(next);
             js_clamp(raw, -sweep, sweep)
         } else {
             0.0

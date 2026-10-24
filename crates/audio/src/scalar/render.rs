@@ -2018,10 +2018,7 @@ impl ScalarBackend {
                                     js_clamp(shaped, lfo.min, lfo.max)
                                 };
                                 mod_adds.bucket_at(lfo.fxi, lfo.target, value, lfo.param_base);
-                                *phase += f64::from(rate) / sr;
-                                if *phase > 1.0 {
-                                    *phase -= 1.0;
-                                }
+                                *phase = wrap_phase(*phase + f64::from(rate) / sr);
                             }
                             for env_mod in v.controls.envs.iter().flatten() {
                                 if ModAdds::targets_another_modulator(env_mod.target) != first_pass
@@ -2188,10 +2185,7 @@ impl ScalarBackend {
                             let cents_depth = vb.cents + mod_adds.vib_depth;
                             cents += (std::f64::consts::TAU * v.vibrato_phase).sin() as f32
                                 * cents_depth;
-                            v.vibrato_phase += f64::from(rate) / sr;
-                            if v.vibrato_phase > 1.0 {
-                                v.vibrato_phase -= 1.0;
-                            }
+                            v.vibrato_phase = wrap_phase(v.vibrato_phase + f64::from(rate) / sr);
                         }
                         // In a source's first render quantum the browser reads
                         // its per-frame detune automation from the quantum
@@ -2333,8 +2327,8 @@ impl ScalarBackend {
                                 });
                                 let raw = lfo_waveshape(shape, phase, skew) * tr.depth;
                                 let shaped = raw.powf(1.5).clamp(0.0, 1.0);
-                                let next = phase + f64::from(freq) / sr;
-                                v.tremolo_phase = Some(if next > 1.0 { next - 1.0 } else { next });
+                                let next = wrap_phase(phase + f64::from(freq) / sr);
+                                v.tremolo_phase = Some(next);
                                 // A NaN sum gives the gain its default.
                                 let gain = base + shaped;
                                 if gain.is_nan() { 1.0 } else { gain }
@@ -2366,8 +2360,8 @@ impl ScalarBackend {
                                     .phaser_phase
                                     .get_or_insert_with(|| lfo_phase0(ph.time_secs, rate, 0.0));
                                 let raw = (lfo_waveshape(0, phase, 0.5) - 0.5) * lfo_depth;
-                                let next = phase + f64::from(rate) / sr;
-                                v.phaser_phase = Some(if next > 1.0 { next - 1.0 } else { next });
+                                let next = wrap_phase(phase + f64::from(rate) / sr);
+                                v.phaser_phase = Some(next);
                                 js_clamp(raw, -sweep, sweep)
                             } else {
                                 0.0
@@ -2481,11 +2475,7 @@ impl ScalarBackend {
                                     let value = saw_blep(*phase, dt);
                                     left += value * gain_l;
                                     right += value * gain_r;
-                                    let mut next = *phase + dt;
-                                    if next >= 1.0 {
-                                        next -= 1.0;
-                                    }
-                                    *phase = next;
+                                    *phase = wrap_phase(f64::from(*phase + dt)) as f32;
                                     std::mem::swap(&mut gain_l, &mut gain_r);
                                 }
                                 (left, right)
@@ -2664,10 +2654,7 @@ impl ScalarBackend {
                                     *phase,
                                     tables.selection(freq as f32),
                                 );
-                                *phase += freq / sr;
-                                if *phase >= 1.0 {
-                                    *phase -= 1.0;
-                                }
+                                *phase = wrap_phase(*phase + freq / sr);
                                 // WaveShaper saturation, then the drum's own envelope:
                                 // hold 1 until 20 ms, exponential to 0.001 over decay.
                                 let saturated = sbd_saturation(tri, sbd_saturation_curve);

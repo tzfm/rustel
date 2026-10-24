@@ -773,8 +773,8 @@ impl ScalarBackend {
                 lo.min(lo + controls.lfo_depth),
                 lo.max(lo + controls.lfo_depth),
             );
-            let next = phase + f64::from(rate) / f64::from(sample_rate);
-            *lfo_phase = Some(if next > 1.0 { next - 1.0 } else { next });
+            let next = wrap_phase(phase + f64::from(rate) / f64::from(sample_rate));
+            *lfo_phase = Some(next);
         }
         position += adds.position;
         let position = position.clamp(0.0, 1.0);
@@ -807,8 +807,8 @@ impl ScalarBackend {
                 lo.min(lo + controls.warp_lfo_depth),
                 lo.max(lo + controls.warp_lfo_depth),
             );
-            let next = phase + f64::from(rate) / f64::from(sample_rate);
-            *warp_lfo_phase = Some(if next > 1.0 { next - 1.0 } else { next });
+            let next = wrap_phase(phase + f64::from(rate) / f64::from(sample_rate));
+            *warp_lfo_phase = Some(next);
         }
         let warp = (warp + adds.warp).clamp(0.0, 1.0);
 

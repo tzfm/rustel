@@ -48,6 +48,7 @@ use modulation::lfo_shape;
 use modulation::lfo_waveshape;
 use modulation::lfo_waveshape_f64;
 use modulation::nan_param_default;
+use modulation::wrap_phase;
 use orbit::stereo_pan;
 pub(crate) use render::enable_denormal_flush;
 use std::sync::Arc;
