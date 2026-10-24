@@ -101,6 +101,12 @@ impl ExtensionPatternNode for GlitchNode {
                     }
                     value => value.clone(),
                 };
+                // One output hap per inner hap, across every amount hap;
+                // charge the running total before it grows past the query's
+                // hap budget.
+                if !rustel_core::charge_hap_at(output.len() + 1) {
+                    return Vec::new();
+                }
                 output.push(hap.with_value(|_| value.clone()));
             }
         }

@@ -4810,7 +4810,17 @@ impl Pattern {
                 .collect(),
 
             Node::ExpandHapsNative(pat, f) => {
-                pat.query(state).into_iter().flat_map(|h| f(&h)).collect()
+                // One hap expands into N, so the output can outgrow the
+                // input's own charge; each push is charged as it lands.
+                let mut out = Vec::new();
+                for h in pat.query(state) {
+                    for expanded in f(&h) {
+                        if !push_budgeted(&mut out, expanded) {
+                            return Vec::new();
+                        }
+                    }
+                }
+                out
             }
 
             Node::Collect(pat) => collect_congruent(pat.query(state))

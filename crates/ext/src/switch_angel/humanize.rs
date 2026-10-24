@@ -61,6 +61,12 @@ impl ExtensionPatternNode for HumanizeNode {
                     .unwrap_or(Fraction::ZERO);
                 let velocity_delta = 0.5 * amount * (2.0 * random[1] - 1.0);
                 let moved = hap.with_span(|span| span.with_time(|position| position.add(offset)));
+                // One output hap per inner hap, across every amount hap;
+                // charge the running total before it grows past the query's
+                // hap budget.
+                if !rustel_core::charge_hap_at(output.len() + 1) {
+                    return Vec::new();
+                }
                 output.push(moved.with_value(|value| match value {
                     Value::Object(object) => {
                         let mut object = object.clone();

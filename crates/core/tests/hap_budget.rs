@@ -539,6 +539,28 @@ fn fast_gapped_stacked_pure_patterns_are_charged_per_cycle() {
     );
 }
 
+#[test]
+fn native_hap_expansion_is_charged_per_push() {
+    // `expand_haps_native` turns one hap into N, so the output can outgrow
+    // the input's own charge. The second push must refuse before the vector
+    // exists, and exactly two haps under a budget of two must pass.
+    let doubled = pure(Value::F64(1.0)).expand_haps_native(|hap| vec![hap.clone(), hap.clone()]);
+    rustel_core::reset_haps_materialised();
+    let result = doubled.try_query_state_with_budget(&span(0, 1), 1);
+    assert!(
+        matches!(result, Err(QueryLimit::HapBudget { budget: 1 })),
+        "expanding one hap into two under a budget of 1 must be refused, got {result:?}"
+    );
+    assert!(
+        rustel_core::peak_hap_vector() <= 1,
+        "the over-budget expansion vector existed before the refusal"
+    );
+    let at_limit = doubled
+        .try_query_state_with_budget(&span(0, 1), 2)
+        .expect("two haps fit a budget of two");
+    assert_eq!(at_limit.len(), 2);
+}
+
 // -- cancellation -----------------------------------------------------------
 
 #[test]
