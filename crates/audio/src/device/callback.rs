@@ -929,6 +929,7 @@ pub(super) fn write_output<T>(
     channels: usize,
     total_frames: u64,
     written: &AtomicU64,
+    admission: &mut super::stream::FiniteAdmission,
 ) where
     T: Sample + FromSample<f32>,
 {
@@ -946,6 +947,8 @@ pub(super) fn write_output<T>(
     let mut rendered = 0usize;
     while rendered < frames {
         let count = (frames - rendered).min(BLOCK);
+        let due = start + (rendered + count) as u64;
+        admission.admit_until(backend, admission.horizon(due));
         backend.notify_pending_inserts_early(count);
         backend.process_block(&mut scratch[..count * 2], count);
         for frame in 0..count {
@@ -2226,14 +2229,16 @@ mod tests {
             let mut backend = ScalarBackend::new();
             backend.init(48_000).unwrap();
             backend.note(OnsetEvent::new(0, 440.0, 0.8, 0.1));
+            let mut admission =
+                super::stream::queue_finite_events(&mut backend, &[], 48_000).unwrap();
             let written = AtomicU64::new(0);
             let mut first = [0.0f32; 128 * 2];
-            write_output(&mut backend, &mut first, 2, 130, &written);
+            write_output(&mut backend, &mut first, 2, 130, &written, &mut admission);
             assert_eq!(written.load(Ordering::Acquire), 128);
             assert!(first.iter().any(|sample| sample.abs() > 1e-6));
 
             let mut last = [1.0f32; 128 * 2];
-            write_output(&mut backend, &mut last, 2, 130, &written);
+            write_output(&mut backend, &mut last, 2, 130, &written, &mut admission);
             assert_eq!(written.load(Ordering::Acquire), 130);
             assert!(last[4..].iter().all(|sample| *sample == 0.0));
         }

@@ -364,6 +364,27 @@ fn zero_speed_sample_is_an_audio_no_op() {
     );
 }
 
+/// A render longer than the backend's pending-event ceiling still sounds
+/// every event: admission follows the output, so the short events drain as
+/// the render advances and the final tone is retained.
+#[test]
+fn a_render_past_the_pending_ceiling_keeps_its_final_event() {
+    let spacing = 64u64;
+    let mut events: Vec<_> = (0..rustel_audio::MAX_PENDING_EVENTS as u64)
+        .map(|index| OnsetEvent::new(index * spacing, 440.0, 0.05, 0.001))
+        .collect();
+    let tone_at = rustel_audio::MAX_PENDING_EVENTS as u64 * spacing + 128;
+    events.push(OnsetEvent::new(tone_at, 220.0, 0.8, 0.25));
+    let frames = tone_at as usize + 48_000;
+    let pcm = render_pcm(&mut ScalarBackend::new(), 48_000, frames, &events)
+        .unwrap_or_else(|error| panic!("render: {error}"));
+    let tone = &pcm[tone_at as usize * 2..];
+    assert!(
+        tone.iter().any(|sample| sample.abs() > 0.01),
+        "the tone after a full pending queue of short events must still sound"
+    );
+}
+
 /// Events that create no voice - a sample not installed at onset, a muted
 /// event - must not spend the active-voice ceiling: the valid tone after a
 /// full segment of them still sounds.

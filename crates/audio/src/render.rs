@@ -8,30 +8,19 @@ use crate::backend::{AudioBackend, OnsetEvent};
 
 /// Render `frames` of stereo interleaved `f32` PCM at `sample_rate` using
 /// `backend` and the supplied onset list.
+///
+/// The list is admitted as the output reaches it, in onset order, so a
+/// render longer than the backend's pending-event ceiling still sounds
+/// every event instead of silently dropping the ones past it.
 pub fn render_pcm(
     backend: &mut dyn AudioBackend,
     sample_rate: u32,
     frames: usize,
     events: &[OnsetEvent],
 ) -> Result<Vec<f32>, String> {
-    backend.init(sample_rate)?;
-    backend.reset();
-    for e in events {
-        backend.prepare_note(e)?;
-        backend.note(e.clone());
-    }
-    let mut pcm = vec![0.0f32; frames * 2];
-    // Process in 128-frame blocks (Dough's native block size) for realism.
-    const BLOCK: usize = 128;
-    let mut offset = 0;
-    while offset < frames {
-        let n = (frames - offset).min(BLOCK);
-        let start = offset * 2;
-        let end = start + n * 2;
-        backend.process_block(&mut pcm[start..end], n);
-        offset += n;
-    }
-    Ok(pcm)
+    let mut queued = events.to_vec();
+    queued.sort_by_key(|event| event.onset_frame);
+    render_pcm_events(backend, sample_rate, frames, queued)
 }
 
 /// Render events in onset order as the output reaches them. The iterator may

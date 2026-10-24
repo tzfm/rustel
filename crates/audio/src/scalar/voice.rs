@@ -982,6 +982,28 @@ impl ScalarBackend {
         Some((left, right))
     }
 
+    /// The producer-side half of a finite playback's event list: every
+    /// effect `note` applies before the pending push, so the callback can
+    /// admit the events themselves as the output reaches them and a list
+    /// longer than the pending ceiling still plays in full.
+    pub fn prepare_finite_playback(&mut self, events: &[OnsetEvent]) -> Result<(), String> {
+        // Pools sized for everything the backend can sound, so the
+        // in-callback admission never allocates.
+        let capacity = self.voices.capacity();
+        self.ensure_fx_stage_state_pool(capacity);
+        self.ensure_fm_state_pool(capacity);
+        for event in events {
+            if event.controls.choke_only {
+                // Admitted as a choke by the callback itself.
+                continue;
+            }
+            self.prepare_kabel_event(event)?;
+            self.arm_duck(event);
+            self.leasing_waves |= event.controls.partials.is_some();
+        }
+        Ok(())
+    }
+
     /// Submit only if the preallocated real-time capacity is sufficient.
     /// Returns false rather than allocating inside the callback.
     pub fn try_note_prepared(&mut self, event: OnsetEvent<CompactKabelControls>) -> bool {
