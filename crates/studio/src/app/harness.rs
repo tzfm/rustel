@@ -1165,5 +1165,55 @@ mod tests {
         fn a_made_up_key_is_a_panic_not_a_silent_nothing() {
             let _ = parse_chord("ctrl+makebelieve");
         }
+
+        /// An external edit that lands while a studio save is still in
+        /// flight must not be lost: the watch re-reads once the save's
+        /// completion clears, or the next studio save overwrites the
+        /// external text on disk.
+        #[test]
+        fn an_external_edit_under_a_pending_save_is_still_adopted() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut studio =
+                Studio::open(HarnessOptions::new(directory.path().join("set"))).expect("studio");
+            studio.app.ui_settings.external_changes = crate::settings::ExternalChanges::Sync;
+            // The first look only baselines the file.
+            std::thread::sleep(crate::app::external_changes::POLL);
+            studio.pump();
+
+            let path = directory.path().join("set/first.strudel");
+            std::fs::write(&path, "$: s(\"bd sd\")\n").expect("write");
+            let scene_id = studio.app.scenes.current().id;
+            // A save whose completion has not landed yet. The request id
+            // matches no worker result, so no drain clears it but the test.
+            studio.app.scenes.get_mut(scene_id).unwrap().latest_save =
+                Some(crate::scenes::PendingSave {
+                    request_id: u64::MAX,
+                    source_revision: "pending".into(),
+                });
+            // The watch sees the change, settles, and must refuse without
+            // consuming it.
+            for _ in 0..6 {
+                std::thread::sleep(crate::app::external_changes::POLL);
+                studio.pump();
+            }
+            assert!(
+                !studio.score().contains("bd sd"),
+                "a pending save must still gate the read"
+            );
+            // The completion lands; the retry the refusal kept alive reads
+            // the external text.
+            studio.app.scenes.get_mut(scene_id).unwrap().latest_save = None;
+            for _ in 0..6 {
+                std::thread::sleep(crate::app::external_changes::POLL);
+                studio.pump();
+                if studio.score().contains("bd sd") {
+                    return;
+                }
+            }
+            panic!(
+                "the external edit was never adopted - score {:?}",
+                studio.score()
+            );
+        }
     }
 }
