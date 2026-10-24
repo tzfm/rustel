@@ -595,8 +595,24 @@ pub(crate) fn render_scalar_pcm_with_refusals(
 
 fn check_csound_errors(csound: Option<&crate::csound::State>) -> io::Result<()> {
     let mut errors = csound.map_or_else(Vec::new, crate::csound::State::take_errors);
-    // A starved worker played a gap of silence. Its line fails no render.
-    errors.retain(|error| error != rustel_csound::STARVATION_LINE);
+    // A starved worker played a gap of silence and the render stands. Its
+    // line reaches the reader as each plugin problem does: a warning for a
+    // person, a record for a machine, nothing for a host that turned direct
+    // logging off and owns its diagnostics. See `print_plugin_problems`.
+    errors.retain(|error| {
+        if error != rustel_csound::STARVATION_LINE {
+            return true;
+        }
+        if rustel_voice::direct_diagnostic_logging() {
+            if notice_tally().is_some() {
+                eprintln!("warning: {error}");
+            } else {
+                let record = serde_json::json!({ "csound_failed": { "message": &error } });
+                eprintln!("{record}");
+            }
+        }
+        false
+    });
     if errors.is_empty() {
         Ok(())
     } else {

@@ -19,7 +19,7 @@
 - The mixer no longer shows "no gamepad". The camera warning clears when nothing asks for the camera.
 - New terminal and terminal-warm themes use your terminal's colours.
 - Plugin edits load only the copy that changed. Heavy sets spread plugin chains over several cores.
-- Windows reports underruns, and Csound reports when it falls behind.
+- Windows reports underruns, and Csound reports when it falls behind, in play and in an offline render.
 - Two memory leaks are fixed, in macOS gamepad polling and in the Chords tab.
 - all() returning undefined is an error now.
 - Pattern queries allocate less, and rustelup checks the Linux build packages first..
