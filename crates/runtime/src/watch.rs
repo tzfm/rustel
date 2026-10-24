@@ -522,6 +522,24 @@ impl FileWatch {
 }
 
 fn read_snapshot(path: &Path) -> Snapshot {
+    // The type is checked before opening: on Unix, opening a FIFO for
+    // reading waits for a writer, so the open itself must never be the
+    // first thing that touches an unknown path.
+    match std::fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() => {
+            return Snapshot::Failure {
+                kind: "io".into(),
+                message: format!("watched path {} is not a regular file", path.display()),
+            };
+        }
+        Ok(_) => {}
+        Err(error) => {
+            return Snapshot::Failure {
+                kind: "io".into(),
+                message: format!("cannot read watched file {}: {error}", path.display()),
+            };
+        }
+    }
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(error) => {
@@ -673,5 +691,31 @@ mod changed_source_tests {
             Observation::Changed
         ));
         assert!(watch.take_changed_source().is_none());
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    /// A FIFO with no writer must be refused before the open, which on
+    /// Unix would block the polling thread until a writer appears.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_rejected_without_opening_it() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("score.strudel");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path is a live, NUL-terminated string.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        match read_snapshot(&path) {
+            Snapshot::Failure { kind, message } => {
+                assert_eq!(kind, "io");
+                assert!(message.contains("not a regular file"));
+            }
+            other => panic!("a FIFO must be refused, got {other:?}"),
+        }
     }
 }
