@@ -140,6 +140,29 @@ mod classification_tests {
             &Lookup::Unknown,
         )
         .expect("a banked oscillator name falls back to the oscillator");
+
+        // A dedicated synth name under a bank follows the sample path both
+        // ways: the bank's asset plays when it has one, and the normal
+        // unknown-sound refusal names the bank when it does not.
+        let event = detailed(
+            &json!({ "s": "supersaw", "bank": "my_bank" }),
+            &Lookup::Found,
+        )
+        .expect("the banked asset resolves");
+        assert!(event.sample.is_some(), "the found asset is the sound");
+        assert!(
+            event.synth.is_none(),
+            "the synth the plain name names does not take over"
+        );
+        assert_eq!(
+            refusal(
+                &json!({ "s": "supersaw", "bank": "my_bank" }),
+                &Lookup::Unknown
+            ),
+            VoiceError::UnknownSound(
+                "my_bank_supersaw is not loaded - that layer stays silent, the rest plays".into(),
+            )
+        );
     }
 
     #[test]
@@ -1909,6 +1932,35 @@ pub fn native_synth_yields_to_sample(name: &str) -> bool {
     name == "one"
 }
 
+/// The sound names [`synth_source`] claims as a source of its own, distinct
+/// from the basic oscillator names. Keep the two lists in step.
+const DEDICATED_SYNTH_SOUNDS: &[&str] = &[
+    "one",
+    "white",
+    "pink",
+    "brown",
+    "crackle",
+    "zzfx",
+    "z_sine",
+    "z_sawtooth",
+    "z_triangle",
+    "z_square",
+    "z_tan",
+    "z_noise",
+    "bytebeat",
+    "in",
+    "bus",
+    "supersaw",
+    "pulse",
+    "sbd",
+];
+
+/// True when a sound name names a dedicated synth source, so an explicit
+/// bank that lacks it refuses rather than falling back to an oscillator.
+fn is_dedicated_synth_sound(name: &str) -> bool {
+    DEDICATED_SYNTH_SOUNDS.contains(&name)
+}
+
 /// True when a sound name is generated entirely by the native voice engine.
 ///
 /// These names need no preload when no sample bank claims them. Oscillator
@@ -2440,9 +2492,11 @@ fn resolve_voice_at(
             let synth = if plays_plugin {
                 None
             } else {
-                // A sample named `one` is the sound, not the constant signal.
-                synth_source(object, duration_secs, target_time)?
-                    .filter(|synth| !(sample.is_some() && *synth == rustel_audio::SynthSource::One))
+                // A resolved sample is the sound, not a starting point for
+                // the synth its unbanked name names: `s("supersaw").bank("my_bank")`
+                // plays the bank's supersaw when the bank has one. A sample
+                // named `one` already followed this rule.
+                synth_source(object, duration_secs, target_time)?.filter(|_| sample.is_none())
             };
             // One cycle is one bar of 4 quarter notes.
             let clocked = |plugin: rustel_audio::InsertControls| {
@@ -3591,7 +3645,19 @@ fn sample_controls(
             }
             // Not a sample: the oscillator path decides whether the name
             // means anything (and refuses loudly when it does not).
-            SampleResolution::Unknown => return Ok(None),
+            SampleResolution::Unknown => {
+                // An explicitly banked name a dedicated synth would claim
+                // has no oscillator fallback: the score asked the bank for
+                // that sound, and the bank does not have it. A basic
+                // oscillator name keeps its oscillator, as
+                // `s('sine').bank(...)` always had.
+                if banked_name && is_dedicated_synth_sound(plain) {
+                    return Err(VoiceError::UnknownSound(format!(
+                        "{name} is not loaded - that layer stays silent, the rest plays"
+                    )));
+                }
+                return Ok(None);
+            }
         };
     // A soundfont zone plays at its note's pitch, from its start: `speed`,
     // `begin`/`end`, `unit`, `cut` and `nudge` do not reach it.
