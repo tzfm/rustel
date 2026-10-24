@@ -184,10 +184,14 @@ pub fn deduplicated_global_sources_with_owners(
         .filter_map(|(index, source)| {
             let folder = folder_of_spec(&source.spec)?;
             let path = Path::new(&folder).canonicalize().ok()?;
+            // Not folded to one case: on a filesystem that folds, the
+            // canonical form already spells the folder the one way it is
+            // written, and on one that does not, `Kit` and `kit` are two
+            // folders whose sounds must both survive.
             let key = path
                 .to_string_lossy()
                 .trim_end_matches(['/', '\\'])
-                .to_ascii_lowercase();
+                .to_owned();
             Some((index, key, source.enabled))
         })
         .collect();
@@ -1901,6 +1905,29 @@ impl SampleLibrary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_dedup_keeps_case_distinct_folders_and_folds_same_folder_spellings() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(root.path().join("Kit")).expect("first folder");
+        // On a filesystem that folds case, the second folder IS the first
+        // one and the create fails; on one that does not, both exist.
+        let folded = std::fs::create_dir(root.path().join("kit")).is_err();
+        let sources = ["Kit", "kit"]
+            .into_iter()
+            .map(|name| GlobalSource {
+                spec: root.path().join(name).to_string_lossy().into_owned(),
+                enabled: true,
+            })
+            .collect::<Vec<_>>();
+        let kept = deduplicated_global_sources(&sources);
+        if folded {
+            assert_eq!(kept.len(), 1, "two spellings of one folder stay one source");
+        } else {
+            assert_eq!(kept.len(), 2, "Kit and kit are two folders, not one");
+        }
+    }
+
     #[cfg(test)]
     mod loading_name_tests {
         use super::file_name_of_url;
