@@ -1154,7 +1154,9 @@ impl ScalarBackend {
                         bus.time_frames = ((f64::from(delay.time_secs.clamp(0.0, 1.0))
                             * f64::from(self.sample_rate))
                         .round() as usize)
-                            .clamp(1, self.sample_rate as usize - 1);
+                            // A 1 Hz rate leaves no room above one frame,
+                            // and the clamp stays a range.
+                            .clamp(1, (self.sample_rate as usize).max(2) - 1);
                         bus.feedback = delay.feedback.clamp(0.0, 0.98);
                         bus.active = true;
                         (delay.wet.abs(), orbit)

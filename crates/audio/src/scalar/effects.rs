@@ -36,7 +36,15 @@ impl OrbitDelay {
     #[inline]
     pub(super) fn read(line: &[f32], write: usize, delay_frames: f32) -> f32 {
         let len = line.len();
-        let delay_frames = delay_frames.clamp(128.0, (len - 1) as f32);
+        if len == 0 {
+            return 0.0;
+        }
+        // A sample rate under 16 kHz gives a line shorter than the
+        // 128-frame quantum; the floor yields to the line's own end so the
+        // clamp stays a range.
+        let ceiling = (len - 1) as f32;
+        let floor = 128.0_f32.min(ceiling);
+        let delay_frames = delay_frames.clamp(floor, ceiling);
         let whole = delay_frames.floor() as usize;
         let fraction = delay_frames - whole as f32;
         let newer = (write + len - whole) % len;

@@ -364,6 +364,28 @@ fn zero_speed_sample_is_an_audio_no_op() {
     );
 }
 
+/// An active delay at a sample rate whose delay line is shorter than the
+/// 128-frame quantum, and a delay configured at a 1 Hz rate, both stay
+/// bounded instead of panicking on an inverted clamp.
+#[test]
+fn an_active_delay_stays_bounded_at_low_sample_rates() {
+    let mut controls = OscillatorControls::default();
+    controls.delay = Some(rustel_audio::DelayControls {
+        wet: 0.5,
+        time_secs: 0.25,
+        feedback: 0.3,
+    });
+    let event = OnsetEvent::new(0, 440.0, 0.5, 0.2).with_controls(controls);
+    for rate in [64_u32, 128, 1] {
+        let pcm = render_pcm(&mut ScalarBackend::new(), rate, 512, &[event.clone()])
+            .unwrap_or_else(|error| panic!("render at {rate} Hz: {error}"));
+        assert!(
+            pcm.iter().all(|sample| sample.is_finite()),
+            "delay at {rate} Hz left non-finite samples"
+        );
+    }
+}
+
 /// A rate above the sample clock advances an LFO by more than a whole
 /// cycle a sample, and a negative rate walks below zero. Both must stay
 /// wrapped in `[0, 1)`: at 72 kHz over a 48 kHz clock the phase walks
