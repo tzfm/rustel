@@ -1451,3 +1451,35 @@ fn isobite_plays_the_next_cycle_on_each_structure_event() {
     assert!(report.haps.is_empty());
     assert!(report.query_threw.is_some());
 }
+
+/// A throwing `fmap` callback stops the mapping at the first throw. The
+/// haps after it must not reach user code, exactly as an unwinding
+/// exception would not have run them.
+#[test]
+fn a_throwing_fmap_callback_invokes_no_later_callbacks() {
+    let mut session = Session::new().expect("session");
+    session
+        .evaluate(
+            r#"globalThis.calls = 0;
+            note("c e g").fmap(x => {
+              globalThis.calls += 1;
+              if (globalThis.calls === 1) throw new Error("first value");
+              return x;
+            })"#,
+        )
+        .expect("evaluate");
+    let haps = session.query(Fraction::ZERO, Fraction::ONE).expect("query");
+    assert!(haps.is_empty(), "a throwing callback yields no haps");
+
+    session
+        .evaluate("pure(globalThis.calls)")
+        .expect("evaluate the counter");
+    let haps = session
+        .query(Fraction::ZERO, Fraction::ONE)
+        .expect("query the counter");
+    assert_eq!(
+        haps[0].value.as_f64(),
+        Some(1.0),
+        "only the first value reaches the callback; the count is later"
+    );
+}

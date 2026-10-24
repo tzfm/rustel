@@ -2185,7 +2185,14 @@ fn map_js_haps(
         // Every iteration can enter QuickJS, and a wide query holds tens of
         // thousands of haps. Check inside the loop so callback and GC work
         // cannot keep the producer occupied after cancellation or a deadline.
-        if budget_exhausted() || cancellation_requested() || query_deadline_expired() {
+        // A pending query error is the same stop: a callback that threw must
+        // not expose side effects from the haps after it, exactly as an
+        // unwinding exception would not have run them.
+        if budget_exhausted()
+            || cancellation_requested()
+            || query_deadline_expired()
+            || query_error_pending()
+        {
             return Vec::new();
         }
         let mapped = hap.with_value(|v| {
