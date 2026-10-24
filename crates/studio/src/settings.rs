@@ -3236,12 +3236,6 @@ impl SettingsSheet {
         matches!(self.page, SettingsPage::Vst)
     }
 
-    /// The vst page is a list, as the sources page is: the arrows walk the
-    /// actions, the folders the player added, the standard folders, the
-    /// preset folders, then the plugins the scan found. Only a folder the
-    /// player added is removed. Space on a plugin turns its switch
-    /// `audio thread only` on or off, and Enter lists its presets.
-    #[cfg(feature = "vst")]
     /// How many plugin rows the vst page lists: the ones the standing
     /// filter kept. The App keeps the count; before it has - a fresh
     /// sheet, or one the App has not mirrored yet - the scan's own count
@@ -3255,6 +3249,12 @@ impl SettingsSheet {
         }
     }
 
+    /// The vst page is a list, as the sources page is: the arrows walk the
+    /// actions, the folders the player added, the standard folders, the
+    /// preset folders, then the plugins the scan found. Only a folder the
+    /// player added is removed. Space on a plugin turns its switch
+    /// `audio thread only` on or off, and Enter lists its presets.
+    #[cfg(feature = "vst")]
     fn vst_key(&mut self, code: crossterm::event::KeyCode) -> SettingsAction {
         use crossterm::event::KeyCode;
         let added = self.vst_folder_count;
