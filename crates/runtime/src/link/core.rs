@@ -48,9 +48,14 @@ impl Session {
     pub fn initiate_tempo(&mut self, wanted_bpm: f64, ghost: i64) {
         let micros_per_beat = micros_per_beat(wanted_bpm);
         let beat_now = self.timeline.beat_at(ghost);
-        let beat_origin = beat_now.max(self.timeline.beat_origin + MICRO_BEATS_PER_BEAT);
-        let time_origin = self.timeline.time_at(beat_now)
-            + (beat_origin - beat_now) * micros_per_beat / MICRO_BEATS_PER_BEAT;
+        let beat_origin = beat_now.max(
+            self.timeline
+                .beat_origin
+                .saturating_add(MICRO_BEATS_PER_BEAT),
+        );
+        let time_origin = self.timeline.time_at(beat_now).saturating_add(
+            (beat_origin - beat_now).saturating_mul(micros_per_beat) / MICRO_BEATS_PER_BEAT,
+        );
         self.timeline = Timeline {
             micros_per_beat,
             beat_origin,
@@ -125,7 +130,7 @@ pub fn should_join(
     if current_id == other_id {
         return false;
     }
-    let ghost_diff = other_offset - current_offset;
+    let ghost_diff = other_offset.saturating_sub(current_offset);
     ghost_diff > SESSION_EPSILON_MICROS
         || (ghost_diff.abs() < SESSION_EPSILON_MICROS && other_id < current_id)
 }
@@ -133,6 +138,13 @@ pub fn should_join(
 /// Where a grid is, in cycles of four beats, at a ghost time.
 pub fn cycle_of(timeline: &Timeline, ghost: i64) -> f64 {
     timeline.beat_at(ghost) as f64 / (4.0 * MICRO_BEATS_PER_BEAT as f64)
+}
+
+/// The mean of two clock samples. Halves each sample first, so a pair
+/// near `i64::MAX` averages exactly as `(a + b) / 2` would, which also
+/// rounds toward zero.
+fn mean(a: i64, b: i64) -> i64 {
+    a / 2 + b / 2 + (a % 2 + b % 2) / 2
 }
 
 /// The median of the clock samples a measurement gathered. An empty set
@@ -146,7 +158,7 @@ pub fn median(samples: &mut [i64]) -> Option<i64> {
     Some(if samples.len() % 2 == 1 {
         samples[middle]
     } else {
-        (samples[middle - 1] + samples[middle]) / 2
+        mean(samples[middle - 1], samples[middle])
     })
 }
 
@@ -283,5 +295,13 @@ mod tests {
         assert_eq!(median(&mut [1, 2, 8, 9]), Some(5));
         // Already sorted, reversed, whatever: the answer is the middle.
         assert_eq!(median(&mut [-40, -50, -30]), Some(-40));
+    }
+
+    #[test]
+    fn the_median_averages_a_middle_pair_that_would_overflow() {
+        let mut high = [i64::MAX - 2, i64::MAX - 2, i64::MAX, i64::MAX];
+        assert_eq!(median(&mut high), Some(i64::MAX - 1));
+        let mut low = [i64::MIN, i64::MIN, i64::MIN + 2, i64::MIN + 2];
+        assert_eq!(median(&mut low), Some(i64::MIN + 1));
     }
 }

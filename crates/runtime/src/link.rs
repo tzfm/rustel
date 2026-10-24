@@ -465,13 +465,16 @@ impl Actor {
                 && ghost_time != 0
                 && host_time != 0
             {
+                // Every operand but host_now is peer-supplied, so each
+                // step saturates: an absurd answer is a sample like any
+                // other, not an unwind.
                 measure
                     .samples
-                    .push(ghost_time - (host_now + host_time) / 2);
+                    .push(ghost_time.saturating_sub(host_now.saturating_add(host_time) / 2));
                 if let Some(prev_ghost) = message.prev_ghost_time.filter(|time| *time != 0) {
-                    measure
-                        .samples
-                        .push((ghost_time + prev_ghost) / 2 - host_time);
+                    measure.samples.push(
+                        (ghost_time.saturating_add(prev_ghost) / 2).saturating_sub(host_time),
+                    );
                 }
                 measure.samples.truncate(MEASURE_SAMPLES * 2);
             }
@@ -1145,6 +1148,43 @@ mod tests {
         assert!(actor.measure.is_none(), "no ping before the rest ends");
         actor.maintain_target(now + REMEASURE_AFTER);
         assert!(actor.measure.is_some(), "the founder is measured again");
+    }
+
+    #[test]
+    fn a_pong_with_absurd_times_is_sampled_without_unwinding() {
+        let mut actor = actor();
+        let founder = random_id();
+        actor.session.id = founder;
+        actor.peers.insert(
+            founder,
+            Peer {
+                addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9).into(),
+                session_id: founder,
+                timeline: None,
+                start_stop: None,
+                measure_v4: None,
+                last_seen: Instant::now(),
+            },
+        );
+        let now = Instant::now();
+        actor.maintain_target(now);
+        let endpoint = actor
+            .measure
+            .as_ref()
+            .expect("the founder is measured")
+            .endpoint;
+        actor.hear_pong(
+            wire::StateMessage {
+                pong: true,
+                session_id: Some(founder),
+                ghost_time: Some(i64::MAX),
+                host_time: Some(i64::MIN),
+                prev_ghost_time: Some(i64::MAX),
+            },
+            endpoint,
+            now,
+        );
+        assert!(actor.measure.is_some(), "the measurement continues");
     }
 
     /// Two participants that joined each other's sessions stand without
