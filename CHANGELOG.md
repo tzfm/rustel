@@ -2,6 +2,7 @@
 
 ## Unreleased
 - On a terminal that composes Option+A into text, the Chords and Scales tabs read it as the auto preview toggle. Before, the composed character typed into the search box.
+- A click on the preview fader reads the bar it draws. Before, the click's bar was narrower than the drawn one, so a click on the knob set a gain a few dB higher.
 - Sample and manifest fetches retry a transient 429 or 5xx after a short rest, so a briefly overloaded sample host no longer fails a corpus run.
 
 - Auto evaluate no longer reinstalls a score when the edit adds no instruction. Typing a `$:`, a lane name, or a new line under a playing set leaves the sound alone, so an `oneshot` lane does not fire for it. A press, or a watched file, still applies.
