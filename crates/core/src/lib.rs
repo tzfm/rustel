@@ -2600,8 +2600,8 @@ pub(crate) fn push_budgeted(out: &mut Vec<Hap>, hap: Hap) -> bool {
 ///
 /// Returns `None` once the budget is spent, so callers propagate rather than
 /// truncate.
-pub(crate) fn extend_budgeted(branches: impl IntoIterator<Item = Vec<Hap>>) -> Option<Vec<Hap>> {
-    let mut out: Vec<Hap> = Vec::new();
+pub(crate) fn extend_budgeted<T>(branches: impl IntoIterator<Item = Vec<T>>) -> Option<Vec<T>> {
+    let mut out: Vec<T> = Vec::new();
     for branch in branches {
         if !charge_haps(out.len() + branch.len()) {
             return None;
@@ -5954,20 +5954,32 @@ impl Pattern {
                 Some(resolved)
             }
             // `pure(pattern)`: one hap per cycle, each carrying the same known
-            // inner pattern. Mirrors `Node::Pure`'s query exactly.
-            Node::PurePattern(inner) => Some(
-                state
-                    .span
-                    .span_cycles()
-                    .into_iter()
-                    .map(|subspan| {
-                        ResolvedHap::of(
-                            Hap::new(Some(whole_cycle(subspan.begin)), subspan, Value::Undefined),
-                            inner.clone(),
-                        )
-                    })
-                    .collect(),
-            ),
+            // inner pattern. Mirrors `Node::Pure`'s query exactly, including
+            // its pre-charge: if every inner pattern is silent, the join's
+            // output stays empty and no later vector exists for the generic
+            // check to catch, so the charge belongs here.
+            Node::PurePattern(inner) => {
+                let spans = state.span.span_cycles();
+                if !charge_haps(spans.len()) {
+                    return Some(Vec::new());
+                }
+                note_materialised(spans.len());
+                Some(
+                    spans
+                        .into_iter()
+                        .map(|subspan| {
+                            ResolvedHap::of(
+                                Hap::new(
+                                    Some(whole_cycle(subspan.begin)),
+                                    subspan,
+                                    Value::Undefined,
+                                ),
+                                inner.clone(),
+                            )
+                        })
+                        .collect(),
+                )
+            }
 
             // `fmap(func)` with a user callback. `fmap` is representation-
             // agnostic: whatever the outer hap carries is what `func`
@@ -6065,10 +6077,14 @@ impl Pattern {
             // pattern-of-patterns) otherwise fell through to the plain-query
             // fallback and hit the pattern-valued refusal with no haps at all.
             Node::Stack(children) => Some(
-                children
-                    .iter()
-                    .flat_map(|child| query_stack_child(|| child.resolve_for_join(state)))
-                    .collect(),
+                extend_budgeted(
+                    children
+                        .iter()
+                        .map(|child| query_stack_child(|| child.resolve_for_join(state))),
+                )
+                // A refused concatenation resolves to silence; the refusal
+                // itself travels on the query-wide channel.
+                .unwrap_or_default(),
             ),
             // `fastGap` on a pattern-of-patterns: the join must consume the
             // same compressed outer windows the query path produces, or
@@ -6131,7 +6147,14 @@ impl Pattern {
                         });
                         return Some(Vec::new());
                     };
+                    // The per-cycle results concatenate, so each extend is
+                    // charged: the branches are individually legal while the
+                    // running total is not.
+                    if !charge_haps(resolved_haps.len() + haps.len()) {
+                        return Some(Vec::new());
+                    }
                     resolved_haps.extend(haps);
+                    note_accumulated(resolved_haps.len());
                 }
                 Some(resolved_haps)
             }

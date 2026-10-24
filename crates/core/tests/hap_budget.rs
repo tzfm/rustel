@@ -486,6 +486,59 @@ fn a_squeeze_join_is_bounded_before_it_multiplies() {
     );
 }
 
+// -- pattern-of-patterns resolution ------------------------------------------
+//
+// A join resolves the outer haps first, each carrying its inner pattern. When
+// every inner pattern is silent the join's own output is empty, so no output
+// vector exists for the generic check to charge: the resolution itself must
+// stay under the budget.
+
+#[test]
+fn a_pure_pattern_of_silence_is_charged_before_resolution() {
+    // `pure(pattern)` resolves one carrier per cycle; two cycles under a
+    // budget of one must be refused, not silently resolved and joined into
+    // an empty result.
+    let pattern = rustel_core::pure_pattern(rustel_core::silence()).inner_join();
+    let result = pattern.try_query_state_with_budget(&span(0, 2), 1);
+    assert!(
+        matches!(result, Err(QueryLimit::HapBudget { budget: 1 })),
+        "two resolved carriers under a budget of 1 must be refused, got {result:?}"
+    );
+}
+
+#[test]
+fn stacked_pure_patterns_are_charged_as_they_concatenate() {
+    // Each branch resolves one carrier; the stack's total crosses the budget
+    // only while the branches concatenate.
+    let stacked = rustel_core::stack(vec![
+        rustel_core::pure_pattern(rustel_core::silence()),
+        rustel_core::pure_pattern(rustel_core::silence()),
+    ])
+    .inner_join();
+    let result = stacked.try_query_state_with_budget(&span(0, 1), 1);
+    assert!(
+        matches!(result, Err(QueryLimit::HapBudget { budget: 1 })),
+        "concatenated carriers under a budget of 1 must be refused, got {result:?}"
+    );
+}
+
+#[test]
+fn fast_gapped_stacked_pure_patterns_are_charged_per_cycle() {
+    // The same stack through `fastGap`: its per-cycle extends must charge the
+    // running total the same way.
+    let gapped = rustel_core::stack(vec![
+        rustel_core::pure_pattern(rustel_core::silence()),
+        rustel_core::pure_pattern(rustel_core::silence()),
+    ])
+    .fast_gap(Fraction::ONE)
+    .inner_join();
+    let result = gapped.try_query_state_with_budget(&span(0, 1), 1);
+    assert!(
+        matches!(result, Err(QueryLimit::HapBudget { budget: 1 })),
+        "fast-gapped carriers under a budget of 1 must be refused, got {result:?}"
+    );
+}
+
 // -- cancellation -----------------------------------------------------------
 
 #[test]
