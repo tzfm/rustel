@@ -1411,12 +1411,12 @@ impl ScalarBackend {
                     }
                     Some(stages)
                 };
-                let fm_state = voice_controls.fm.map(|_| {
+                let fm_state = voice_controls.fm.map(|fm| {
                     let mut state = self
                         .fm_state_pool
                         .pop()
                         .expect("prepared FM state pool exhausted");
-                    state.restart(e.onset_frame, self.sample_rate);
+                    state.restart(e.onset_frame, self.sample_rate, &fm, e.freq_hz);
                     state
                 });
                 self.next_voice_id += 1;
