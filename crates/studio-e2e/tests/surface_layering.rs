@@ -26,7 +26,7 @@ fn sheets_take_one_anothers_place() {
 
     studio.chord("ctrl+o");
     assert_eq!(studio.focus(), Some(PanelKind::Settings));
-    row_containing(&studio.rows(), " settings ");
+    row_containing(&studio.rows(), " general ");
 
     // The device panel replaces it outright.
     studio.chord("ctrl+p");
@@ -104,7 +104,7 @@ fn the_set_panel_stays_under_a_sheet_and_returns() {
     let rows = studio.rows();
     let sheet_top = rows
         .iter()
-        .position(|row| row.contains(" settings "))
+        .position(|row| row.contains(" general "))
         .expect("the sheet is up");
     // The sheet is as tall as its rows and sits on the bottom of the frame,
     // so it paints over the sidebar's lower rows. Every tape row at or
@@ -126,7 +126,7 @@ fn the_set_panel_stays_under_a_sheet_and_returns() {
         "the sheet covered the panel's tape rows under it:\n{}",
         rows.join("\n")
     );
-    row_containing(&rows, " settings ");
+    row_containing(&rows, " general ");
 
     // Esc puts the sheet away. A sheet never keeps the keys and never
     // passes them down a ladder: they go to the score, while the panel

@@ -126,15 +126,18 @@ impl StudioRegions {
 }
 
 /// Which of the ordinary chrome rows the layout should carve: the menu bar,
-/// the header, the footer's meter and chip row. Zen hides all of them
-/// regardless of the other three, which are the player's lasting display
-/// preferences - leaving zen restores exactly these, not the factory
-/// defaults.
+/// the header, the beat line under it, the footer's meter and chip row.
+/// Zen hides all of them regardless of the other four, which are the
+/// player's lasting display preferences - leaving zen restores exactly
+/// these, not the factory defaults.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChromeLayout {
     pub zen: bool,
     pub menu: bool,
     pub header: bool,
+    /// The beat line's own row under the header, which the header's
+    /// setting gates: no header, nothing for the line to sit under.
+    pub beat_line: bool,
     pub footer: bool,
 }
 
@@ -145,6 +148,7 @@ impl ChromeLayout {
             zen,
             menu: true,
             header: true,
+            beat_line: false,
             footer: true,
         }
     }
@@ -154,6 +158,7 @@ impl ChromeLayout {
             zen: settings.zen,
             menu: settings.show_menu,
             header: settings.show_header,
+            beat_line: settings.beat_line != super::super::settings::BeatLineStyle::Off,
             footer: settings.show_footer,
         }
     }
@@ -477,7 +482,11 @@ fn layout_regions(
     }
     let menu = menu_row(area, chrome);
     let menu_height = menu.height;
-    let header_height = u16::from(chrome.header && area.height >= 3);
+    // The beat line is the header's second row: it keeps its room whether
+    // the transport runs or rests, so the panes never shift under a beat,
+    // and it yields its row back on a terminal too short to spare one.
+    let header_height = u16::from(chrome.header && area.height >= 3)
+        + u16::from(chrome.header && chrome.beat_line && area.height >= 8);
     let chips_height = u16::from(area.height >= SCENES_MIN_HEIGHT);
     // The footer setting takes only the meter and chip row: the notices,
     // retained piano notes and the status line keep theirs.

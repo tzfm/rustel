@@ -357,6 +357,158 @@ impl EvaluationFlashMode {
     }
 }
 
+/// How the evaluation acknowledgement moves over the code it ran. The
+/// flash itself is a different row: this one shapes what the flash looks
+/// like while it is there.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EvalAnimation {
+    /// On at once, off at once, the way a terminal always has.
+    #[default]
+    Normal,
+    /// Fades in and out, quickly.
+    FadeFast,
+    /// Fades in and out.
+    FadeMedium,
+    /// Fades in and out, slowly.
+    FadeSlow,
+    /// A soft edge sweeps left to right, revealing the code as it fades.
+    Swipe,
+    /// A hard hit that evaporates.
+    Zap,
+    /// Dims through four chunky rungs, the way old hardware stepped.
+    Steps,
+    /// Lines shatter into fast bands of blocks and flips, like signal on
+    /// a bad cable.
+    Glitch,
+    /// A band of light sweeps along each line.
+    Wave,
+}
+
+impl EvalAnimation {
+    const LADDER: [Self; 9] = [
+        Self::Normal,
+        Self::FadeFast,
+        Self::FadeMedium,
+        Self::FadeSlow,
+        Self::Swipe,
+        Self::Zap,
+        Self::Steps,
+        Self::Glitch,
+        Self::Wave,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::FadeFast => "fade fast",
+            Self::FadeMedium => "fade medium",
+            Self::FadeSlow => "fade slow",
+            Self::Swipe => "swipe",
+            Self::Zap => "zap",
+            Self::Steps => "steps",
+            Self::Glitch => "glitch",
+            Self::Wave => "wave",
+        }
+    }
+
+    /// The name the preferences file keeps.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::FadeFast => "fade-fast",
+            Self::FadeMedium => "fade-medium",
+            Self::FadeSlow => "fade-slow",
+            Self::Swipe => "swipe",
+            Self::Zap => "zap",
+            Self::Steps => "steps",
+            Self::Glitch => "glitch",
+            Self::Wave => "wave",
+        }
+    }
+
+    pub fn parse(text: &str) -> Self {
+        Self::LADDER
+            .iter()
+            .copied()
+            .find(|mode| mode.key() == text)
+            .unwrap_or_default()
+    }
+
+    fn step(self, forwards: bool) -> Self {
+        let index = Self::LADDER
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(0);
+        let len = Self::LADDER.len();
+        Self::LADDER[if forwards {
+            (index + 1) % len
+        } else {
+            (index + len - 1) % len
+        }]
+    }
+}
+
+/// How the beat line under the header moves. The line is a thin strip the
+/// width of the screen that keeps the studio's pulse visible from across
+/// the room: it follows the same clock the header's beat dot reads and the
+/// theme's own colours, whatever they are.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BeatLineStyle {
+    /// No strip at all.
+    #[default]
+    Off,
+    /// The whole line breathes on each beat, brightest on the downbeat.
+    Pulse,
+    /// A bright segment travels the line once per cycle.
+    Travel,
+    /// A wave of block heights rolls along the line, swelling on the beat.
+    Wave,
+}
+
+impl BeatLineStyle {
+    const LADDER: [Self; 4] = [Self::Off, Self::Pulse, Self::Travel, Self::Wave];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Pulse => "pulse",
+            Self::Travel => "travel",
+            Self::Wave => "wave",
+        }
+    }
+
+    /// The name the preferences file keeps.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Pulse => "pulse",
+            Self::Travel => "travel",
+            Self::Wave => "wave",
+        }
+    }
+
+    pub fn parse(text: &str) -> Self {
+        Self::LADDER
+            .iter()
+            .copied()
+            .find(|style| style.key() == text)
+            .unwrap_or_default()
+    }
+
+    fn step(self, forwards: bool) -> Self {
+        let index = Self::LADDER
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(0);
+        let len = Self::LADDER.len();
+        Self::LADDER[if forwards {
+            (index + 1) % len
+        } else {
+            (index + len - 1) % len
+        }]
+    }
+}
+
 /// When the editor marks what the syntax checker finds.
 ///
 /// Whatever the mode, an update runs the check itself and refuses a score
@@ -1543,6 +1695,8 @@ pub struct UiSettings {
     pub animation: bool,
     pub highlights: bool,
     pub evaluation_flash: EvaluationFlashMode,
+    /// How the evaluation flash moves over the code it ran.
+    pub evaluation_animation: EvalAnimation,
     /// A finished recording has its leading and trailing silence cut before
     /// it is saved. On by default: the silence around a take is the count-in
     /// and the wait for the next one, not part of the performance.
@@ -1570,7 +1724,7 @@ pub struct UiSettings {
     ///
     /// One switch, on the first page, because "do I want a limiter" is
     /// the whole of the question most of the time. How it sounds and
-    /// where it holds are on Advanced, and on the set's own strip.
+    /// where it holds are on the General page, and on the set's own strip.
     pub master_limiter_on: bool,
     /// How that limiter works when it is switched on.
     ///
@@ -1670,6 +1824,8 @@ pub struct UiSettings {
     /// of picture behind them. Runs the interface's way - a hundred is a
     /// solid code area with the picture strictly behind it.
     pub editor_opacity: u8,
+    /// How the beat line under the header moves, when it is there at all.
+    pub beat_line: BeatLineStyle,
     /// The stage and the status bar hidden: the score fills the frame, open
     /// panels float over it and the visuals docks close. Not written to the
     /// preferences file: opening the studio into a stripped-down window
@@ -1719,6 +1875,7 @@ impl Default for UiSettings {
             animation: true,
             highlights: true,
             evaluation_flash: EvaluationFlashMode::Full,
+            evaluation_animation: EvalAnimation::Normal,
             trim_recordings: true,
             highlight_fade: HighlightFade::Theme,
             metric_detail: MetricDetail::Basic,
@@ -1754,6 +1911,7 @@ impl Default for UiSettings {
             backdrop_opacity: BACKDROP_OPACITY_DEFAULT,
             interface_opacity: INTERFACE_OPACITY_DEFAULT,
             editor_opacity: EDITOR_OPACITY_DEFAULT,
+            beat_line: BeatLineStyle::Off,
             zen: false,
             show_menu: true,
             show_header: true,
@@ -1848,11 +2006,11 @@ enum Row {
     PianoVolume,
     /// Whether a set starts with a brickwall on the output. One switch,
     /// on the first page: a set given one of its own on the desk keeps
-    /// that instead, and how the studio's own sounds is on Advanced.
+    /// that instead, and how the studio's own sounds is on the General page.
     MasterLimiter,
-    /// The character that default works with, on Advanced.
+    /// The character that default works with, on the General page.
     MasterLimiterCharacter,
-    /// The ceiling that default holds, in dBFS, on Advanced.
+    /// The ceiling that default holds, in dBFS, on the General page.
     MasterLimiterCeiling,
     /// Whether that ceiling is brought back up to full scale.
     MasterLimiterMakeup,
@@ -1908,6 +2066,10 @@ enum Row {
     RefreshSources,
     /// Not a setting: how much the sample cache holds, and Enter to empty it.
     SampleCache,
+    /// How the evaluation flash moves over the code it ran.
+    EvaluationAnimation,
+    /// How the beat line under the header moves.
+    BeatLine,
     /// Whether the reference and the suggestions list this category.
     ReferenceCategory(Category),
 }
@@ -2025,7 +2187,8 @@ fn step_limiter_character(
     ladder[next]
 }
 
-/// One press of the arrows, on either opacity.
+/// One press of the arrows, on a percentage row: the opacities, all of
+/// them nought-to-a-hundred knobs.
 fn step_opacity(opacity: u8, forwards: bool) -> u8 {
     if forwards {
         opacity.saturating_add(OPACITY_STEP)
@@ -2036,17 +2199,45 @@ fn step_opacity(opacity: u8, forwards: bool) -> u8 {
 }
 
 /// The first page: what a musician reaches for during a set, most often
-/// first - the clock, the controllers, the look of the screen, the
-/// editor, the set - and nothing that needs the manual.
+/// first - the clock, the controllers, the editor, the set - and nothing
+/// that needs the manual. The machine rows follow at the end: set once and
+/// left, they are still settings, just not ones anybody screens through.
 const ROWS: &[Row] = &[
     Row::Quantise,
     Row::MasterLimiter,
     Row::AutoEvaluate,
     Row::TypingPause,
     Row::ExternalChanges,
+    Row::SyntaxCheck,
+    Row::SetsFolder,
+    Row::RecordingsFolder,
+    Row::GlobalPrebake,
+    Row::LocalPrebake,
+    Row::TrimRecordings,
+    Row::ShowFullPaths,
+    Row::LoadMode,
+    Row::OutputLatency,
+    Row::MaxPolyphony,
+    Row::PianoSound,
+    Row::PianoVolume,
+    Row::MasterLimiterCharacter,
+    Row::MasterLimiterCeiling,
+    Row::MasterLimiterMakeup,
+    Row::SliderSmoothing,
+    Row::FrequencySliderLog,
+    Row::SampleCeiling,
+    Row::PreviewBudget,
+    Row::UnusedSampleIdle,
+];
+
+/// The appearance page: everything about how the studio looks - the chrome,
+/// the editor's marks, where the panels dock, how the terminal draws.
+/// Nothing here changes what the studio does, only how it reads.
+const APPEARANCE_ROWS: &[Row] = &[
     Row::ShowMenu,
     Row::ShowHeader,
     Row::ShowFooter,
+    Row::BeatLine,
     Row::Animation,
     Row::MasterScope,
     Row::MetricDetail,
@@ -2059,46 +2250,21 @@ const ROWS: &[Row] = &[
     Row::Highlights,
     Row::HighlightFade,
     Row::EvaluationFlash,
+    Row::EvaluationAnimation,
     Row::Minimap,
     Row::ShowScrollbars,
     Row::LineNumbers,
     Row::Wrap,
     Row::Brackets,
     Row::CaretShape,
-    Row::SyntaxCheck,
-    Row::SetsFolder,
-    Row::RecordingsFolder,
-    Row::GlobalPrebake,
-    Row::LocalPrebake,
-    Row::TrimRecordings,
-    Row::ShowFullPaths,
-];
-
-/// The second page: what is set once and left - how a play meets sounds
-/// still loading, how the terminal draws, how sliders travel, where the
-/// panels dock, what the sample memory and cache may take.
-const ADVANCED_ROWS: &[Row] = &[
-    Row::LoadMode,
-    Row::OutputLatency,
-    Row::MaxPolyphony,
-    Row::PianoSound,
-    Row::PianoVolume,
-    Row::MasterLimiterCharacter,
-    Row::MasterLimiterCeiling,
-    Row::MasterLimiterMakeup,
-    Row::Rendering,
-    Row::FrameRate,
-    #[cfg(feature = "hydra")]
-    Row::BackdropSmoothing,
-    Row::SliderSmoothing,
-    Row::FrequencySliderLog,
     Row::SetPanelSide,
     Row::MixerEdge,
     Row::VizEdgeOne,
     Row::VizEdgeTwo,
-    Row::SampleCeiling,
-    Row::PreviewBudget,
-    Row::UnusedSampleIdle,
+    Row::Rendering,
+    Row::FrameRate,
+    #[cfg(feature = "hydra")]
+    Row::BackdropSmoothing,
 ];
 
 /// The reference page: which kinds of entry the reference column and the
@@ -2298,6 +2464,8 @@ impl Row {
             Self::SliderSmoothing | Self::FrequencySliderLog => "Sliders",
             Self::SetPanelSide | Self::MixerEdge | Self::VizEdgeOne | Self::VizEdgeTwo => "Panels",
             Self::SampleCeiling | Self::PreviewBudget | Self::UnusedSampleIdle => "Sample memory",
+            Self::EvaluationAnimation => "Editor",
+            Self::BeatLine => "Look",
             Self::PrecacheSources
             | Self::CacheDefaults
             | Self::RefreshSources
@@ -2367,6 +2535,8 @@ impl Row {
             Self::CacheDefaults => "cache all",
             Self::RefreshSources => "refresh all",
             Self::SampleCache => "clear cache",
+            Self::BeatLine => "beat line",
+            Self::EvaluationAnimation => "evaluation animation",
             Self::ReferenceCategory(Category::Osc) => "OSC / SuperDirt",
             Self::ReferenceCategory(Category::Serial) => "serial",
             Self::ReferenceCategory(Category::FmMatrix) => "FM routing matrix",
@@ -2452,6 +2622,8 @@ impl Row {
             Self::CacheDefaults => "Enter caches every remote pack onto disk",
             Self::RefreshSources => "Enter refetches every remote pack's list",
             Self::SampleCache => "Enter twice empties downloaded samples",
+            Self::BeatLine => "a strip under the header keeps the beat \u{b7} \u{2190}/\u{2192} walks its looks",
+            Self::EvaluationAnimation => "how a run of code flashes \u{b7} fades, zap, steps, glitch, wave",
             Self::ReferenceCategory(Category::Osc) => {
                 "osc() and controls only SuperDirt reads · tag:osc lists them anyway"
             }
@@ -2537,7 +2709,9 @@ fn keybind_lines(count: usize) -> Vec<DisplayRow> {
 pub enum SettingsPage {
     #[default]
     Settings,
-    Advanced,
+    /// Everything visual: the chrome, the editor's marks, the panels'
+    /// places, and how the terminal draws.
+    Appearance,
     /// The twelve mapping slots: which knob or stick drives which fader.
     Mapping,
     /// The learnt shortcuts: Enter on a row, press the chord.
@@ -2556,28 +2730,30 @@ pub enum SettingsPage {
 
 /// The tabs in Tab order: the page, its label, and its padded column.
 const TABS: &[(SettingsPage, &str, u16)] = &[
-    (SettingsPage::Settings, "settings", 2),
-    (SettingsPage::Advanced, "advanced", 13),
-    (SettingsPage::Mapping, "sliders", 24),
-    (SettingsPage::Keybinds, "keybinds", 34),
-    (SettingsPage::Sources, "samples", 45),
+    (SettingsPage::Settings, "general", 2),
+    (SettingsPage::Appearance, "appearance", 12),
+    (SettingsPage::Mapping, "sliders", 25),
+    (SettingsPage::Keybinds, "keybinds", 35),
+    (SettingsPage::Sources, "samples", 46),
     #[cfg(feature = "vst")]
-    (SettingsPage::Vst, "vst", 55),
+    (SettingsPage::Vst, "vst", 56),
     #[cfg(feature = "vst")]
-    (SettingsPage::Reference, "reference", 61),
+    (SettingsPage::Reference, "reference", 62),
     #[cfg(not(feature = "vst"))]
     (SettingsPage::Reference, "reference", 56),
     #[cfg(feature = "vst")]
-    (SettingsPage::Permissions, "permissions", 73),
+    (SettingsPage::Permissions, "permissions", 74),
     #[cfg(not(feature = "vst"))]
     (SettingsPage::Permissions, "permissions", 68),
     #[cfg(feature = "vst")]
-    (SettingsPage::About, "about", 87),
+    (SettingsPage::About, "about", 88),
     #[cfg(not(feature = "vst"))]
     (SettingsPage::About, "about", 82),
 ];
 
-/// A narrow title row drops the tab padding and uses one-column gaps.
+/// A narrow title row drops the tab padding and uses one-column gaps, and
+/// drops any tab that cannot fit whole after that: half a label is not a
+/// label. The Tab key still reaches every page at any width.
 fn tab_spans(width: u16) -> Vec<(u16, String, SettingsPage)> {
     let (_, label, start) = TABS[TABS.len() - 1];
     if start + label.len() as u16 + 2 < width {
@@ -2588,10 +2764,12 @@ fn tab_spans(width: u16) -> Vec<(u16, String, SettingsPage)> {
     }
     let mut start = 2;
     TABS.iter()
-        .map(|&(page, label, _)| {
+        .filter_map(|&(page, label, _)| {
             let span = (start, label.to_owned(), page);
             start += label.len() as u16 + 1;
-            span
+            // The next tab's start sits one past this label's last column,
+            // so this test is whether the label clears the right border.
+            (start <= width).then_some(span)
         })
         .collect()
 }
@@ -2773,7 +2951,9 @@ impl SettingsSheet {
     pub(super) const fn shows_settings(self) -> bool {
         matches!(
             self.page,
-            SettingsPage::Settings | SettingsPage::Advanced | SettingsPage::Reference
+            SettingsPage::Settings
+                | SettingsPage::Appearance
+                | SettingsPage::Reference
         )
     }
 
@@ -2792,9 +2972,10 @@ impl SettingsSheet {
         matches!(self.page, SettingsPage::Permissions)
     }
 
-    /// The arrows walk the rows and wrap. Enter permits, Space flips a
-    /// row where it stands, and Delete, Backspace or `d` takes a row
-    /// off the page. Esc and Tab stay the sheet's.
+    /// The arrows walk the rows and wrap. Enter permits, Space or either
+    /// sideways arrow flips a row where it stands, the way every switch
+    /// on the controls pages flips, and Delete, Backspace or `d` takes a
+    /// row off the page. Esc and Tab stay the sheet's.
     fn permissions_key(&mut self, code: crossterm::event::KeyCode) -> SettingsAction {
         use crossterm::event::KeyCode;
         let len = self.permissions_count;
@@ -2812,7 +2993,7 @@ impl SettingsSheet {
                 SettingsAction::Nothing
             }
             KeyCode::Enter => SettingsAction::PermitRow(at),
-            KeyCode::Char(' ') => SettingsAction::ToggleRow(at),
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => SettingsAction::ToggleRow(at),
             KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('d' | 'D') => {
                 SettingsAction::ForgetRow(at)
             }
@@ -3149,7 +3330,7 @@ impl SettingsSheet {
     fn rows(self) -> &'static [Row] {
         match self.page {
             SettingsPage::Settings => ROWS,
-            SettingsPage::Advanced => ADVANCED_ROWS,
+            SettingsPage::Appearance => APPEARANCE_ROWS,
             SettingsPage::Reference => REFERENCE_ROWS,
             SettingsPage::Mapping
             | SettingsPage::Keybinds
@@ -3163,10 +3344,10 @@ impl SettingsSheet {
 
     #[cfg(feature = "hydra")]
     pub(super) fn webcam_row_selected(self) -> bool {
-        // The row is only on the main page. The check reads the active
-        // page's rows, not every row the sheet knows. The preview is then
-        // not requested after a click onto advanced, where the row is not
-        // drawn.
+        // The row is only on the appearance page. The check reads the
+        // active page's rows, not every row the sheet knows. The preview is
+        // then not requested after a click onto advanced, where the row is
+        // not drawn.
         self.shows_settings() && matches!(self.rows().get(self.selected), Some(Row::HydraWebcam))
     }
 
@@ -3234,7 +3415,9 @@ impl SettingsSheet {
             return SettingsAction::Nothing;
         }
         let choices: Vec<(usize, usize)> = match self.page {
-            SettingsPage::Settings | SettingsPage::Advanced | SettingsPage::Reference => {
+            SettingsPage::Settings
+            | SettingsPage::Appearance
+            | SettingsPage::Reference => {
                 grouped_rows(self.rows())
                     .iter()
                     .enumerate()
@@ -3424,6 +3607,12 @@ impl SettingsSheet {
                 }
                 Row::EditorOpacity => {
                     settings.editor_opacity = step_opacity(settings.editor_opacity, forwards);
+                }
+                Row::BeatLine => {
+                    settings.beat_line = settings.beat_line.step(forwards);
+                }
+                Row::EvaluationAnimation => {
+                    settings.evaluation_animation = settings.evaluation_animation.step(forwards);
                 }
                 Row::ShowMenu => set_switch(&mut settings.show_menu),
                 Row::ShowHeader => set_switch(&mut settings.show_header),
@@ -3770,7 +3959,9 @@ impl SettingsSheet {
         };
         let shown = usize::from(rows.height).max(1);
         self.first = match self.page {
-            SettingsPage::Settings | SettingsPage::Advanced | SettingsPage::Reference => {
+            SettingsPage::Settings
+            | SettingsPage::Appearance
+            | SettingsPage::Reference => {
                 self.first_line(shown, &grouped_rows(self.rows()))
             }
             SettingsPage::Keybinds => self.first_line(shown, &keybind_lines(self.keybind_count)),
@@ -4117,7 +4308,14 @@ impl SettingsSheetView<'_> {
         // block needs them, and the sheet must be one height for both
         // pages so the mouse claims stay honest.
         let chrome = 3 + Self::explain_rows(available);
-        let wanted = grouped_rows(ROWS).len() as u16 + chrome;
+        // One height for every page of controls, so the mouse claims stay
+        // honest while paging through them.
+        let wanted = [ROWS, APPEARANCE_ROWS]
+            .into_iter()
+            .map(|rows| grouped_rows(rows).len() as u16)
+            .max()
+            .unwrap_or(0)
+            + chrome;
         let height = wanted.min(available.height.saturating_sub(2));
         if height < Self::MIN_ROWS_SHOWN + chrome || available.width < 60 {
             return None;
@@ -4149,7 +4347,8 @@ impl SettingsSheetView<'_> {
     /// Measured over every page of controls, because the sheet is one
     /// height for all of them.
     fn explain_rows(available: Rect) -> u16 {
-        let controls = || ROWS.iter().chain(ADVANCED_ROWS).chain(REFERENCE_ROWS);
+        let controls =
+            || ROWS.iter().chain(APPEARANCE_ROWS).chain(REFERENCE_ROWS);
         let label = controls()
             .map(|row| row.label().chars().count())
             .max()
@@ -4731,7 +4930,8 @@ mod tests {
     fn settings_navigation_remembers_every_page_and_reopens_the_last() {
         let pages = [
             SettingsPage::Settings,
-            SettingsPage::Advanced,
+            SettingsPage::Appearance,
+
             SettingsPage::Mapping,
             SettingsPage::Keybinds,
             SettingsPage::Sources,
@@ -4770,8 +4970,7 @@ mod tests {
         let mut settings = UiSettings::default();
         let features = TerminalFeatures::default();
         let mut sheet = SettingsSheet {
-            page: SettingsPage::Advanced,
-            selected: ADVANCED_ROWS
+            selected: ROWS
                 .iter()
                 .position(|row| matches!(row, Row::PianoSound))
                 .unwrap(),
@@ -4801,8 +5000,7 @@ mod tests {
         let mut settings = UiSettings::default();
         let features = TerminalFeatures::default();
         let mut sheet = SettingsSheet {
-            page: SettingsPage::Advanced,
-            selected: ADVANCED_ROWS
+            selected: ROWS
                 .iter()
                 .position(|row| matches!(row, Row::MaxPolyphony))
                 .unwrap(),
@@ -4989,6 +5187,16 @@ mod tests {
         rustel_audio::set_sample_pcm_ceiling(rustel_audio::DEFAULT_SAMPLE_PCM_BYTES);
     }
 
+    /// The sheet is one height for every page of controls, and more than
+    /// one test wants a terminal tall enough to draw all of it.
+    fn tallest_page() -> u16 {
+        [ROWS, APPEARANCE_ROWS]
+            .into_iter()
+            .map(|rows| grouped_rows(rows).len() as u16)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The sheet shows the selected row's explanation once: on the row when
     /// it fits, in a block underneath when it does not. One rule row closes
     /// a group and opens the next.
@@ -4996,23 +5204,31 @@ mod tests {
     fn the_sheet_is_no_taller_than_what_it_has_to_say() {
         let settings = UiSettings::default();
         let features = TerminalFeatures::default();
-        let controls = grouped_rows(ROWS).len() as u16;
+        let controls = tallest_page();
 
         // Wide enough for the longest explanation to sit on its own row.
-        let wide = Rect::new(0, 0, 190, 50);
+        let wide = Rect::new(0, 0, 190, controls + 7);
         assert_eq!(SettingsSheetView::explain_rows(wide), 0);
         let (sheet, _) = SettingsSheetView::geometry(wide).expect("a sheet");
         assert_eq!(sheet.height, controls + 3, "border, hints, border");
-        let text = sheet_text(SettingsSheet::default(), &settings, &features, wide);
+        let appearance = SettingsSheet {
+            page: SettingsPage::Appearance,
+            ..SettingsSheet::default()
+        };
+        let text = sheet_text(appearance, &settings, &features, wide);
         assert!(
-            text.contains("├─ Look ─"),
+            text.contains("┌─ Look ─"),
+            "the first group opens with its own row: {text}"
+        );
+        assert!(
+            text.contains("├─ Editor ─"),
             "one rule closes a group and opens the next: {text}"
         );
         assert!(
             !text.contains("└─") || text.matches("└─").count() == 1,
             "and only the last group closes with its own row"
         );
-        let explanation = ROWS[0].explain();
+        let explanation = APPEARANCE_ROWS[0].explain();
         assert_eq!(
             text.matches(explanation).count(),
             1,
@@ -5021,12 +5237,12 @@ mod tests {
 
         // Narrow enough that the row trims the explanation. The block
         // underneath then takes only the rows the wrap needs.
-        let narrow = Rect::new(0, 0, 64, 50);
+        let narrow = Rect::new(0, 0, 64, controls + 10);
         let reserved = SettingsSheetView::explain_rows(narrow);
         assert!((1..=5).contains(&reserved), "{reserved}");
         let (sheet, _) = SettingsSheetView::geometry(narrow).expect("a sheet");
         assert_eq!(sheet.height, controls + 3 + reserved);
-        let text = sheet_text(SettingsSheet::default(), &settings, &features, narrow);
+        let text = sheet_text(appearance, &settings, &features, narrow);
         assert!(
             text.contains(explanation),
             "the block says in full what the row had to trim: {text}"
@@ -5449,7 +5665,7 @@ mod tests {
         sheet.select(0);
         assert!(!sheet.confirm_reset_keybinds);
         let mut sheet = armed;
-        sheet.show_page(SettingsPage::Advanced);
+        sheet.show_page(SettingsPage::Mapping);
         assert!(!sheet.confirm_reset_keybinds);
     }
 
@@ -5616,7 +5832,11 @@ mod tests {
         let area = Rect::new(0, 0, 100, 18);
         let mut settings = UiSettings::default();
         let features = TerminalFeatures::default();
-        for page in [SettingsPage::Settings, SettingsPage::Advanced] {
+        for page in [
+            SettingsPage::Settings,
+            SettingsPage::Appearance,
+
+        ] {
             let mut sheet = SettingsSheet {
                 page,
                 ..Default::default()
@@ -5837,13 +6057,19 @@ mod tests {
     #[test]
     fn the_first_page_asks_one_thing_about_the_limiter() {
         assert!(ROWS.contains(&Row::MasterLimiter));
+        // The switch leads the page; the character rows it means nothing
+        // until answered follow at its end.
+        let switch = ROWS
+            .iter()
+            .position(|row| *row == Row::MasterLimiter)
+            .unwrap();
         for row in [
             Row::MasterLimiterCharacter,
             Row::MasterLimiterCeiling,
             Row::MasterLimiterMakeup,
         ] {
-            assert!(!ROWS.contains(&row), "{row:?} belongs on Advanced");
-            assert!(ADVANCED_ROWS.contains(&row), "{row:?} is missing there");
+            let at = ROWS.iter().position(|item| *item == row).unwrap();
+            assert!(at > switch, "{row:?} follows the switch");
         }
 
         let features = TerminalFeatures::default();
@@ -5869,8 +6095,8 @@ mod tests {
         let off = text(&settings, None);
         assert!(off.contains("master limiter"), "the switch is on page one");
         assert!(
-            !off.contains("-6.0 dBFS"),
-            "and the ceiling it would hold at is not: {off}"
+            off.contains("load mode"),
+            "and the machine rows follow at the page's end: {off}"
         );
 
         // The switch is the studio's default, so the row also shows what
@@ -5893,7 +6119,11 @@ mod tests {
     fn grouped_controls_draw_labels_and_skip_borders_when_scrolled() {
         let settings = UiSettings::default();
         let features = TerminalFeatures::default();
-        for page in [SettingsPage::Settings, SettingsPage::Advanced] {
+        for page in [
+            SettingsPage::Settings,
+            SettingsPage::Appearance,
+
+        ] {
             let mut sheet = SettingsSheet {
                 page,
                 ..SettingsSheet::default()
@@ -5942,39 +6172,48 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        for label in ["Playback", "Look", "Editor", "Set"] {
+        for label in [
+            "Playback",
+            "Live coding",
+            "Editor",
+            "Set",
+            "Audio out",
+            "Computer piano",
+            "Limiter",
+            "Sliders",
+            "Sample memory",
+        ] {
             assert!(text.contains(label), "missing group {label}");
         }
-        for label in ["Privacy", "Panels", "Visuals", "Controllers"] {
+        for label in ["Privacy", "Look", "Rendering", "Visuals", "Controllers"] {
             assert!(
                 !text.contains(label),
                 "{label} is not a first-page group any more"
             );
         }
-        let advanced = render_sheet(
+        let appearance = render_sheet(
             SettingsSheet {
-                page: SettingsPage::Advanced,
+                page: SettingsPage::Appearance,
                 ..SettingsSheet::default()
             },
             &settings,
             &features,
             area,
         );
-        let text = advanced
+        let text = appearance
             .content
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        for label in ["Audio out", "Limiter", "Rendering", "Sliders"] {
-            assert!(text.contains(label), "missing advanced group {label}");
+        for label in ["Look", "Editor", "Panels", "Rendering"] {
+            assert!(text.contains(label), "missing appearance group {label}");
         }
         // The page is longer than a window: the groups at the far end are
         // checked from the far end, which is what a reader scrolling to
         // them sees.
         let scrolled = render_sheet(
             SettingsSheet {
-                page: SettingsPage::Advanced,
-                selected: ADVANCED_ROWS.len() - 1,
+                selected: ROWS.len() - 1,
                 ..SettingsSheet::default()
             },
             &settings,
@@ -5986,9 +6225,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        for label in ["Panels", "Sample memory"] {
-            assert!(tail.contains(label), "missing advanced group {label}");
-        }
+        assert!(tail.contains("Sample memory"), "missing the page's last group");
         assert!(
             !tail.contains("Sample cache"),
             "the sample cache controls live on Sources now"
@@ -6007,8 +6244,8 @@ mod tests {
             ..TerminalFeatures::default()
         };
         let mut sheet = SettingsSheet {
-            page: SettingsPage::Advanced,
-            selected: ADVANCED_ROWS
+            page: SettingsPage::Appearance,
+            selected: APPEARANCE_ROWS
                 .iter()
                 .position(|row| *row == Row::Rendering)
                 .expect("the rendering row"),
@@ -6051,11 +6288,11 @@ mod tests {
             SettingsAction::Changed
         );
         assert!(settings.show_full_paths);
-        sheet.show_page(SettingsPage::Advanced);
+        sheet.show_page(SettingsPage::Appearance);
         assert_eq!(
-            ADVANCED_ROWS[sheet.selected],
+            APPEARANCE_ROWS[sheet.selected],
             Row::Rendering,
-            "returning to Advanced restores the rendering control"
+            "returning to Appearance restores the rendering control"
         );
     }
 
@@ -6067,8 +6304,8 @@ mod tests {
         let mut settings = UiSettings::default();
         let features = TerminalFeatures::default();
         let mut sheet = SettingsSheet {
-            page: SettingsPage::Advanced,
-            selected: ADVANCED_ROWS
+            page: SettingsPage::Appearance,
+            selected: APPEARANCE_ROWS
                 .iter()
                 .position(|row| *row == Row::FrameRate)
                 .expect("the frame-rate row"),
@@ -6179,7 +6416,8 @@ mod tests {
     fn every_change_key_flips_a_switch_rather_than_setting_it() {
         let mut settings = UiSettings::default();
         let mut sheet = SettingsSheet {
-            selected: ROWS
+            page: SettingsPage::Appearance,
+            selected: APPEARANCE_ROWS
                 .iter()
                 .position(|row| *row == Row::LineNumbers)
                 .expect("a plain switch"),
@@ -6210,7 +6448,8 @@ mod tests {
         let mut settings = UiSettings::default();
         assert!(!settings.hydra_webcam);
         let mut sheet = SettingsSheet {
-            selected: ROWS
+            page: SettingsPage::Appearance,
+            selected: APPEARANCE_ROWS
                 .iter()
                 .position(|row| *row == Row::HydraWebcam)
                 .expect("webcam row"),
@@ -6254,7 +6493,8 @@ mod tests {
     fn enter_on_the_webcam_row_opens_a_preview_and_leaves_the_switch_off() {
         let mut settings = UiSettings::default();
         let mut sheet = SettingsSheet {
-            selected: ROWS
+            page: SettingsPage::Appearance,
+            selected: APPEARANCE_ROWS
                 .iter()
                 .position(|row| *row == Row::HydraWebcam)
                 .expect("webcam row"),
@@ -6275,7 +6515,8 @@ mod tests {
     fn a_second_enter_puts_the_picture_away_and_leaves_the_choice_alone() {
         let mut settings = UiSettings::default();
         let mut sheet = SettingsSheet {
-            selected: ROWS
+            page: SettingsPage::Appearance,
+            selected: APPEARANCE_ROWS
                 .iter()
                 .position(|row| *row == Row::HydraWebcam)
                 .expect("webcam row"),
@@ -6321,7 +6562,6 @@ mod tests {
         let mut settings = UiSettings::default();
         assert_eq!(settings.syntax_check, SyntaxCheck::Full);
         assert!(ROWS.contains(&Row::SyntaxCheck));
-        assert!(!ADVANCED_ROWS.contains(&Row::SyntaxCheck));
         assert_eq!(Row::SyntaxCheck.group(), "Editor");
         assert_eq!(Row::SyntaxCheck.label(), "syntax check");
 
@@ -6363,12 +6603,13 @@ mod tests {
     fn evaluation_flash_cycles_all_three_modes_on_the_editor_page() {
         let mut settings = UiSettings::default();
         assert_eq!(settings.evaluation_flash, EvaluationFlashMode::Full);
-        assert!(!ADVANCED_ROWS.contains(&Row::EvaluationFlash));
+        assert!(APPEARANCE_ROWS.contains(&Row::EvaluationFlash));
         assert_eq!(Row::EvaluationFlash.group(), "Editor");
         assert_eq!(Row::EvaluationFlash.label(), "flashing on evaluation");
 
         let mut sheet = SettingsSheet {
-            selected: ROWS
+            page: SettingsPage::Appearance,
+            selected: APPEARANCE_ROWS
                 .iter()
                 .position(|row| *row == Row::EvaluationFlash)
                 .expect("evaluation flash row"),
@@ -6397,11 +6638,116 @@ mod tests {
         }
     }
 
+    /// The flash says whether, the animation says how: a ladder of looks
+    /// on the appearance page, next to the other rows that shape what the
+    /// studio draws over its work.
+    #[test]
+    fn the_evaluation_animation_walks_its_ladder_of_looks() {
+        let mut settings = UiSettings::default();
+        assert_eq!(settings.evaluation_animation, EvalAnimation::Normal);
+        assert!(APPEARANCE_ROWS.contains(&Row::EvaluationAnimation));
+        assert_eq!(Row::EvaluationAnimation.group(), "Editor");
+        assert_eq!(Row::EvaluationAnimation.label(), "evaluation animation");
+        let mut sheet = SettingsSheet {
+            page: SettingsPage::Appearance,
+            selected: APPEARANCE_ROWS
+                .iter()
+                .position(|row| *row == Row::EvaluationAnimation)
+                .expect("evaluation animation row"),
+            ..SettingsSheet::default()
+        };
+        let features = TerminalFeatures::default();
+        // Right walks the whole ladder and wraps; Left steps back one.
+        for expected in [
+            EvalAnimation::FadeFast,
+            EvalAnimation::FadeMedium,
+            EvalAnimation::FadeSlow,
+            EvalAnimation::Swipe,
+            EvalAnimation::Zap,
+            EvalAnimation::Steps,
+            EvalAnimation::Glitch,
+            EvalAnimation::Wave,
+            EvalAnimation::Normal,
+        ] {
+            assert_eq!(
+                sheet.key(KeyCode::Right, &mut settings, &features),
+                SettingsAction::Changed
+            );
+            assert_eq!(settings.evaluation_animation, expected, "walked to {expected:?}");
+            let text = sheet_text(sheet, &settings, &features, Rect::new(0, 0, 120, 24));
+            let row = text
+                .lines()
+                .find(|line| line.contains("evaluation animation"))
+                .expect("selected animation row is visible");
+            assert!(row.contains(expected.label()), "{row}");
+        }
+        assert_eq!(
+            sheet.key(KeyCode::Left, &mut settings, &features),
+            SettingsAction::Changed
+        );
+        assert_eq!(settings.evaluation_animation, EvalAnimation::Wave);
+        // Every spelling survives its own key, and an unknown one is the
+        // default, which is the look the studio always had.
+        for mode in EvalAnimation::LADDER {
+            assert_eq!(EvalAnimation::parse(mode.key()), mode, "{mode:?}");
+        }
+        assert_eq!(EvalAnimation::parse("nonsense"), EvalAnimation::Normal);
+    }
+
+    /// The beat line is a chrome row of its own on the appearance page:
+    /// off by default, and a small ladder of looks either arrow walks.
+    #[test]
+    fn the_beat_line_walks_its_ladder_of_looks() {
+        let mut settings = UiSettings::default();
+        assert_eq!(settings.beat_line, BeatLineStyle::Off);
+        assert!(APPEARANCE_ROWS.contains(&Row::BeatLine));
+        assert_eq!(Row::BeatLine.group(), "Look");
+        assert_eq!(Row::BeatLine.label(), "beat line");
+
+        let mut sheet = SettingsSheet {
+            page: SettingsPage::Appearance,
+            selected: APPEARANCE_ROWS
+                .iter()
+                .position(|row| *row == Row::BeatLine)
+                .expect("beat line row"),
+            ..SettingsSheet::default()
+        };
+        let features = TerminalFeatures::default();
+        for expected in [
+            BeatLineStyle::Pulse,
+            BeatLineStyle::Travel,
+            BeatLineStyle::Wave,
+            BeatLineStyle::Off,
+        ] {
+            assert_eq!(
+                sheet.key(KeyCode::Right, &mut settings, &features),
+                SettingsAction::Changed
+            );
+            assert_eq!(settings.beat_line, expected, "walked to {expected:?}");
+            let text = sheet_text(sheet, &settings, &features, Rect::new(0, 0, 120, 24));
+            let row = text
+                .lines()
+                .find(|line| line.contains("beat line"))
+                .expect("selected beat line row is visible");
+            assert!(row.contains(expected.label()), "{row}");
+        }
+        assert_eq!(
+            sheet.key(KeyCode::Left, &mut settings, &features),
+            SettingsAction::Changed
+        );
+        assert_eq!(settings.beat_line, BeatLineStyle::Wave);
+        for style in BeatLineStyle::LADDER {
+            assert_eq!(BeatLineStyle::parse(style.key()), style, "{style:?}");
+        }
+        assert_eq!(BeatLineStyle::parse("nonsense"), BeatLineStyle::Off);
+    }
+
     #[test]
     fn all_visual_opacities_are_renderer_neutral_and_stay_bounded() {
         let mut settings = UiSettings::default();
         let mut sheet = SettingsSheet {
-            selected: ROWS
+            page: SettingsPage::Appearance,
+            selected: APPEARANCE_ROWS
                 .iter()
                 .position(|row| *row == Row::BackdropStrength)
                 .expect("visuals opacity row"),
@@ -6428,7 +6774,7 @@ mod tests {
         assert_eq!(settings.backdrop_opacity, 100);
         assert_eq!(Row::BackdropStrength.label(), "visuals opacity");
 
-        sheet.selected = ROWS
+        sheet.selected = APPEARANCE_ROWS
             .iter()
             .position(|row| *row == Row::InterfaceOpacity)
             .expect("ui opacity row");
@@ -6440,7 +6786,7 @@ mod tests {
         assert_eq!(settings.interface_opacity, 45);
         assert_eq!(Row::InterfaceOpacity.label(), "ui opacity");
 
-        sheet.selected = ROWS
+        sheet.selected = APPEARANCE_ROWS
             .iter()
             .position(|row| *row == Row::EditorOpacity)
             .expect("editor opacity row");
@@ -6468,7 +6814,8 @@ mod tests {
         for row in [Row::ShowMenu, Row::ShowHeader, Row::ShowFooter] {
             assert_eq!(row.group(), "Look");
             let mut sheet = SettingsSheet {
-                selected: ROWS
+                page: SettingsPage::Appearance,
+                selected: APPEARANCE_ROWS
                     .iter()
                     .position(|item| *item == row)
                     .unwrap_or_else(|| panic!("{} row", row.label())),
@@ -6568,7 +6915,7 @@ mod tests {
         let area = Rect::new(0, 0, 120, ROWS.len() as u16 + 10);
         let mut buffer = Buffer::empty(area);
         let sheet = SettingsSheet {
-            selected: ROWS.len() - 1,
+            selected: ROWS.iter().position(|row| *row == Row::LocalPrebake).unwrap(),
             ..SettingsSheet::default()
         };
 
@@ -6625,17 +6972,17 @@ mod tests {
         assert!(text.contains("Enter opens it"), "{text}");
         assert!(
             !ROWS.contains(&Row::Rendering),
-            "rendering belongs on Advanced: {text}"
+            "rendering belongs on Appearance: {text}"
         );
     }
 
     /// The shipped packs are on the Sources page, after the imports and
     /// drawn apart from them. The library download starts there and shows
-    /// its progress pack by pack. The Advanced page has no row for it.
+    /// its progress pack by pack. No controls page has a row for it.
     #[test]
     fn the_shipped_packs_are_listed_after_the_imports_and_cached_from_there() {
         assert!(
-            !ADVANCED_ROWS
+            !ROWS
                 .iter()
                 .any(|row| row.label() == "cache whole library"),
             "the library's download moved to Sources"
@@ -6942,10 +7289,10 @@ mod tests {
         assert_eq!(changed, settings, "nothing on this page is a setting");
 
         assert!(
-            !ADVANCED_ROWS.contains(&Row::PrecacheSources)
-                && !ADVANCED_ROWS.contains(&Row::CacheDefaults)
-                && !ADVANCED_ROWS.contains(&Row::RefreshSources)
-                && !ADVANCED_ROWS.contains(&Row::SampleCache),
+            !ROWS.contains(&Row::PrecacheSources)
+                && !ROWS.contains(&Row::CacheDefaults)
+                && !ROWS.contains(&Row::RefreshSources)
+                && !ROWS.contains(&Row::SampleCache),
             "the cache controls moved to Sources"
         );
 
@@ -7181,7 +7528,6 @@ mod tests {
 
         // Another page answers nothing, and so does an empty list.
         let advanced = SettingsSheet {
-            page: SettingsPage::Advanced,
             ..sheet
         };
         assert_eq!(advanced.source_row_at(area, x, rows.y), None);
@@ -7292,7 +7638,6 @@ mod tests {
             let area = Rect::new(0, 0, 120, height);
             render_sheet(
                 SettingsSheet {
-                    page: SettingsPage::Advanced,
                     selected,
                     ..SettingsSheet::default()
                 },
@@ -7332,7 +7677,7 @@ mod tests {
         );
 
         // At the end of it, the other way round.
-        let bottom = text_at(20, ADVANCED_ROWS.len() - 1);
+        let bottom = text_at(20, ROWS.len() - 1);
         let tail = counted(&bottom);
         assert!(tail.contains('↑'), "{tail}");
 
@@ -7608,16 +7953,17 @@ mod tests {
         };
         let features = TerminalFeatures::default();
         let theme = Theme::built_in_default();
-        let selected = ROWS
+        let selected = APPEARANCE_ROWS
             .iter()
             .position(|row| *row == Row::HydraWebcam)
             .expect("webcam row");
-        let area = Rect::new(0, 0, 60, ROWS.len() as u16 + 10);
+        let area = Rect::new(0, 0, 60, tallest_page() + 10);
 
         let render = |status| {
             let mut buffer = Buffer::empty(area);
             SettingsSheetView {
                 sheet: SettingsSheet {
+                    page: SettingsPage::Appearance,
                     selected,
                     webcam_preview: true,
                     ..SettingsSheet::default()
@@ -8019,9 +8365,13 @@ mod tests {
         assert_eq!(Quantise::parse("every other tuesday"), Quantise::Off);
         assert_eq!(Quantise::Beat.unit_cycles(), Some(0.25));
         assert_eq!(Quantise::Off.unit_cycles(), None);
-        // The playback group also contains slider smoothing; the next
-        // group begins with the visualizers switch.
-        sheet.selected = ROWS.iter().position(|row| *row == Row::Animation).unwrap();
+        // The Look group on the appearance page holds the visualizers
+        // switch, among the other rows about how the studio reads.
+        sheet.show_page(SettingsPage::Appearance);
+        sheet.selected = APPEARANCE_ROWS
+            .iter()
+            .position(|row| *row == Row::Animation)
+            .unwrap();
         sheet.key(
             KeyCode::Char(' '),
             &mut settings,
@@ -8033,7 +8383,7 @@ mod tests {
         for _ in 0..=from {
             sheet.key(KeyCode::Up, &mut settings, &TerminalFeatures::default());
         }
-        assert_eq!(sheet.selected, ROWS.len() - 1, "wraps from the top");
+        assert_eq!(sheet.selected, APPEARANCE_ROWS.len() - 1, "wraps from the top");
         assert_eq!(
             sheet.key(KeyCode::Esc, &mut settings, &TerminalFeatures::default()),
             SettingsAction::Close
@@ -8055,7 +8405,7 @@ mod tests {
             sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default()),
             SettingsAction::Nothing
         );
-        assert_eq!(sheet.page, SettingsPage::Advanced);
+        assert_eq!(sheet.page, SettingsPage::Appearance);
         sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default());
         assert_eq!(sheet.page, SettingsPage::Mapping);
         sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default());
@@ -8084,7 +8434,17 @@ mod tests {
             permissions_key(KeyCode::Char(' ')),
             SettingsAction::ToggleRow(1)
         );
+        assert_eq!(
+            permissions_key(KeyCode::Left),
+            SettingsAction::ToggleRow(1),
+            "Left flips a trusted row like every other switch"
+        );
         assert_eq!(permissions_key(KeyCode::Down), SettingsAction::Nothing);
+        assert_eq!(
+            permissions_key(KeyCode::Right),
+            SettingsAction::ToggleRow(0),
+            "and so does Right, on the row it lands on"
+        );
         assert_eq!(
             permissions_key(KeyCode::Char('d')),
             SettingsAction::ForgetRow(0)
@@ -8141,7 +8501,7 @@ mod tests {
             &mut settings,
             &TerminalFeatures::default(),
         );
-        assert_eq!(sheet.page, SettingsPage::Advanced);
+        assert_eq!(sheet.page, SettingsPage::Appearance);
         sheet.key(
             KeyCode::BackTab,
             &mut settings,
@@ -8260,27 +8620,28 @@ mod tests {
         let (panel, _) = SettingsSheetView::geometry(area).expect("fits");
         let at = |dx: u16| SettingsSheet::tab_at(area, panel.x + dx, panel.y);
         assert_eq!(at(2), Some(SettingsPage::Settings));
-        assert_eq!(at(13), Some(SettingsPage::Advanced));
-        assert_eq!(at(22), Some(SettingsPage::Advanced));
-        assert_eq!(at(24), Some(SettingsPage::Mapping));
-        assert_eq!(at(32), Some(SettingsPage::Mapping));
-        assert_eq!(at(34), Some(SettingsPage::Keybinds));
-        assert_eq!(at(43), Some(SettingsPage::Keybinds));
-        assert_eq!(at(45), Some(SettingsPage::Sources));
-        assert_eq!(at(53), Some(SettingsPage::Sources));
+        assert_eq!(at(10), Some(SettingsPage::Settings));
+        assert_eq!(at(12), Some(SettingsPage::Appearance));
+        assert_eq!(at(23), Some(SettingsPage::Appearance));
+        assert_eq!(at(25), Some(SettingsPage::Mapping));
+        assert_eq!(at(33), Some(SettingsPage::Mapping));
+        assert_eq!(at(35), Some(SettingsPage::Keybinds));
+        assert_eq!(at(44), Some(SettingsPage::Keybinds));
+        assert_eq!(at(46), Some(SettingsPage::Sources));
+        assert_eq!(at(54), Some(SettingsPage::Sources));
         #[cfg(feature = "vst")]
         {
-            assert_eq!(at(55), Some(SettingsPage::Vst));
-            assert_eq!(at(59), Some(SettingsPage::Vst));
-            assert_eq!(at(60), None);
-            assert_eq!(at(61), Some(SettingsPage::Reference));
-            assert_eq!(at(71), Some(SettingsPage::Reference));
-            assert_eq!(at(72), None);
-            assert_eq!(at(73), Some(SettingsPage::Permissions));
-            assert_eq!(at(85), Some(SettingsPage::Permissions));
-            assert_eq!(at(86), None);
-            assert_eq!(at(87), Some(SettingsPage::About));
-            assert_eq!(at(93), Some(SettingsPage::About));
+            assert_eq!(at(56), Some(SettingsPage::Vst));
+            assert_eq!(at(60), Some(SettingsPage::Vst));
+            assert_eq!(at(61), None);
+            assert_eq!(at(62), Some(SettingsPage::Reference));
+            assert_eq!(at(72), Some(SettingsPage::Reference));
+            assert_eq!(at(73), None);
+            assert_eq!(at(74), Some(SettingsPage::Permissions));
+            assert_eq!(at(86), Some(SettingsPage::Permissions));
+            assert_eq!(at(87), None);
+            assert_eq!(at(88), Some(SettingsPage::About));
+            assert_eq!(at(94), Some(SettingsPage::About));
         }
         #[cfg(not(feature = "vst"))]
         {
@@ -8294,14 +8655,15 @@ mod tests {
             assert_eq!(at(82), Some(SettingsPage::About));
             assert_eq!(at(88), Some(SettingsPage::About));
         }
-        assert_eq!(at(23), None, "the gap between tabs is nobody's");
-        assert_eq!(at(33), None);
-        assert_eq!(at(44), None);
-        assert_eq!(at(54), None);
+        assert_eq!(at(11), None, "the gap between tabs is nobody's");
+        assert_eq!(at(24), None);
+        assert_eq!(at(34), None);
+        assert_eq!(at(45), None);
 
-        // At 80 columns the tabs lose their padding. Each one stays whole,
+        // At 70 columns the tabs lose their padding, and the ones past the
+        // edge are gone rather than half drawn. Each one that stays whole
         // answers to a click on its own label, and the corner stays.
-        let area = Rect::new(0, 0, 80, 40);
+        let area = Rect::new(0, 0, 70, 40);
         let (panel, _) = SettingsSheetView::geometry(area).expect("fits");
         let buffer = render_sheet(
             SettingsSheet::default(),
@@ -8314,16 +8676,14 @@ mod tests {
             .collect();
         assert!(title.ends_with('╮'), "{title}");
         for (label, page) in [
-            ("settings", SettingsPage::Settings),
-            ("advanced", SettingsPage::Advanced),
+            ("general", SettingsPage::Settings),
+            ("appearance", SettingsPage::Appearance),
             ("sliders", SettingsPage::Mapping),
             ("keybinds", SettingsPage::Keybinds),
             ("samples", SettingsPage::Sources),
             #[cfg(feature = "vst")]
             ("vst", SettingsPage::Vst),
             ("reference", SettingsPage::Reference),
-            ("permissions", SettingsPage::Permissions),
-            ("about", SettingsPage::About),
         ] {
             let column = title[..title.find(label).expect(label)].chars().count() as u16;
             for dx in 0..label.len() as u16 {
@@ -8331,6 +8691,15 @@ mod tests {
                 assert_eq!(click, Some(page), "{label} in {title}");
             }
         }
+        assert!(
+            !title.contains("permissions"),
+            "a tab that cannot fit whole is not half drawn: {title}"
+        );
+        assert_eq!(
+            SettingsSheet::tab_at(area, panel.x + 65, panel.y),
+            None,
+            "and it is not click-stripped either"
+        );
     }
 
     /// Every category starts listed. Each row hides one category.
@@ -8358,12 +8727,12 @@ mod tests {
     }
 
     #[test]
-    fn advanced_page_steps_preview_budget_and_idle() {
+    fn the_first_page_steps_preview_budget_and_idle() {
         let mut settings = UiSettings::default();
         let mut sheet = SettingsSheet::default();
         let features = TerminalFeatures::default();
-        sheet.show_page(SettingsPage::Advanced);
-        sheet.selected = ADVANCED_ROWS
+
+        sheet.selected = ROWS
             .iter()
             .position(|row| *row == Row::PreviewBudget)
             .unwrap();
@@ -8374,7 +8743,7 @@ mod tests {
             SettingsAction::Changed
         );
         assert_eq!(settings.preview_budget, PreviewBudget::Standard);
-        sheet.selected = ADVANCED_ROWS
+        sheet.selected = ROWS
             .iter()
             .position(|row| *row == Row::UnusedSampleIdle)
             .unwrap();
@@ -8387,9 +8756,9 @@ mod tests {
 
     #[test]
     fn about_renders_cached_capability_audio_and_safety_facts() {
-        // Two rows taller than the sheet, which is what `geometry` asks for
-        // before it will draw at all.
-        let area = Rect::new(0, 0, 120, ROWS.len() as u16 + 10);
+        // Two rows taller than the tallest page of controls, which is what
+        // `geometry` asks for before it will draw at all.
+        let area = Rect::new(0, 0, 120, tallest_page() + 10);
         let mut buffer = Buffer::empty(area);
         let settings = UiSettings::default();
         let features = TerminalFeatures::default();
@@ -8488,8 +8857,7 @@ mod tests {
         let features = TerminalFeatures::default();
         let settings = UiSettings::default();
         let mut sheet = SettingsSheet::default();
-        // The longest label lives on the advanced page now.
-        sheet.show_page(SettingsPage::Advanced);
+        // The longest label lives on the first page now.
         let index = sheet
             .rows()
             .iter()
@@ -8652,7 +9020,7 @@ mod tests {
             learning: true,
             ..SlotView::default()
         };
-        let area = Rect::new(0, 0, 100, 34);
+        let area = Rect::new(0, 0, 120, 34);
         let mut buffer = Buffer::empty(area);
         SettingsSheetView {
             sheet,
@@ -8702,18 +9070,16 @@ mod tests {
         assert!(text.contains("t reads it another way"), "{text}");
     }
 
-    /// The load mode sits on Advanced with the playback rows, waits by
+    /// The load mode sits with the playback rows on the General page, waits by
     /// default, and either arrow flips it between wait and async.
     #[test]
     fn the_load_mode_row_flips_between_wait_and_async() {
         let mut settings = UiSettings::default();
         assert_eq!(settings.load_mode, LoadMode::Wait);
-        assert!(ADVANCED_ROWS.contains(&Row::LoadMode));
-        assert!(!ROWS.contains(&Row::LoadMode));
+        assert!(ROWS.contains(&Row::LoadMode));
         assert_eq!(Row::LoadMode.group(), "Playback");
         let mut sheet = SettingsSheet {
-            page: SettingsPage::Advanced,
-            selected: ADVANCED_ROWS
+            selected: ROWS
                 .iter()
                 .position(|row| *row == Row::LoadMode)
                 .expect("the row"),

@@ -189,6 +189,9 @@ fn the_minimap_and_the_reference_column_survive_a_resize() {
     // edge and the scrollbar goes away.
     studio.chord("ctrl+o");
     studio.settle();
+    // The minimap's row is on the appearance page, the second tab.
+    studio.press(KeyCode::Tab, KeyModifiers::NONE);
+    studio.settle();
     select_row(&mut studio, "▸ minimap");
     studio.press(KeyCode::Right, KeyModifiers::NONE);
     studio.settle();

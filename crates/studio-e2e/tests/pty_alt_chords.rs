@@ -456,7 +456,7 @@ fn probe_alt_chords_through_a_real_pty() {
     terminal.write(&[0x0f]); // Ctrl+O: the settings sheet
     std::thread::sleep(Duration::from_millis(600));
     // This fresh Studio opens Settings on its first page. Three Tabs land on Keybinds:
-    // settings → advanced → mapping → keybinds. Do not infer the current page
+    // settings → appearance → mapping → keybinds. Do not infer the current page
     // from a diff-painted phrase: an unchanged cell may not be emitted by
     // ConPTY, which used to make this loop skip straight past Keybinds.
     for _ in 0..3 {
