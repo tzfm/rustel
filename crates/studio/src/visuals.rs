@@ -2935,7 +2935,7 @@ fn note_to_midi(name: &str) -> Option<f64> {
 }
 
 fn dim(color: Color, theme: &Theme) -> Color {
-    wash(theme.background, color, 0.55)
+    wash(theme.background, color, 0.45)
 }
 
 fn brighten(color: Color) -> Color {
@@ -5276,6 +5276,19 @@ mod tests {
                 rows(&picture)
             );
         }
+    }
+
+    /// A dim keeps 45% of its colour on a coloured ground, the share the
+    /// painters mixed toward the background before the terminal themes.
+    #[test]
+    fn a_dim_keeps_45_percent_of_its_colour_on_a_coloured_ground() {
+        let mut theme = theme();
+        theme.background = Color::Rgb(20, 20, 20);
+        // 20 + (128 - 20) * 0.45 = 68.6, rounded to 69.
+        assert_eq!(
+            dim(Color::Rgb(128, 128, 128), &theme),
+            Color::Rgb(69, 69, 69)
+        );
     }
 
     #[test]
