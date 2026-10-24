@@ -2748,6 +2748,50 @@ mod tests {
             assert_eq!(app.prefs.auto_preview, Some(false));
         }
 
+        /// A terminal that composes Option chords into text sends å for
+        /// Option+A. The recovery answers on every tab that auditions, and
+        /// leaves the character to the search box everywhere else.
+        #[test]
+        fn an_option_composed_alt_a_answers_on_every_tab_that_auditions() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.keybinds.set_reach(crate::keybinds::Reach {
+                enhanced: false,
+                terminal: "iTerm2".into(),
+            });
+            app.reference_panel = Some(crate::reference::ReferencePanel::browse(&app.reference));
+            app.reference_panel
+                .as_mut()
+                .expect("the browse list")
+                .select_tab(crate::reference::Tab::Chords);
+            app.focus = Focus::Panel(PanelKind::Reference);
+
+            press(&mut app, KeyCode::Char('å'), KeyModifiers::NONE);
+            assert!(app.ui_settings.auto_preview, "{}", app.status);
+            assert!(
+                app.reference_panel
+                    .as_ref()
+                    .expect("the browse list")
+                    .chord_query
+                    .is_empty(),
+                "the character did not type into the search"
+            );
+
+            app.reference_panel
+                .as_mut()
+                .expect("the browse list")
+                .select_tab(crate::reference::Tab::Reference);
+            press(&mut app, KeyCode::Char('å'), KeyModifiers::NONE);
+            assert!(
+                app.ui_settings.auto_preview,
+                "a tab with nothing to preview kept the character for its text"
+            );
+            assert_eq!(
+                app.reference_panel.as_ref().expect("the browse list").query,
+                "å"
+            );
+        }
+
         /// A scale is a thing to hear: → and Space play it, one note after
         /// another.
         #[test]
