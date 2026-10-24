@@ -367,6 +367,13 @@ fn a_completion_in_a_plugin_call_lists_names_keys_and_presets() {
         studio.score(),
         "$: s(\"bd\").vst(\"rustel fixture\", { preset: \"Dark Bass\" })"
     );
+
+    // The host is the one of the process: leave its preset root over a
+    // folder with no files, so a later test counts no preset of this one.
+    // On Windows the loaded plugin holds this test's folder, so its preset
+    // files stay after the test ends.
+    let empty = tempfile::tempdir().expect("empty preset root");
+    vst::host().set_preset_folder(empty.path().to_path_buf());
 }
 
 /// Switching from plugin-name completion to the vst tab keeps the plugin
