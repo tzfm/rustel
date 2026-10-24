@@ -1,7 +1,7 @@
-//! The vst tab: the plugins the host found, and under the open plugin its
-//! parameters, parameter groups and presets. The word lists of a plugin call
-//! are here too: the plugin names, the parameter keys and the preset names
-//! a completion offers.
+//! The vst tab: the plugins the host found, and under the open plugin one
+//! half of it at a time: its parameters and parameter groups, or its
+//! presets. The word lists of a plugin call are here too: the plugin names,
+//! the parameter keys and the preset names a completion offers.
 //!
 //! The tab and the word lists hold a copy of what the host knows and never
 //! call the host. The App reads the host on the turn loop and asks for the
@@ -28,6 +28,17 @@ pub enum PluginRow {
     Preset(usize),
 }
 
+/// The half of an open plugin the tab lists under its row: its parameters,
+/// or its presets. Tab under an open plugin moves to the other half, so
+/// the parameters stand between the player and the presets no longer, and
+/// a search lists the half the cursor is in.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VstSection {
+    #[default]
+    Params,
+    Presets,
+}
+
 /// The state of the vst tab: the plugin list, what is typed, where the
 /// cursor is, and what is open.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -40,6 +51,9 @@ pub struct VstTab {
     /// The parameter groups of the open plugin whose rows are listed, by
     /// name.
     open_groups: BTreeSet<String>,
+    /// The half of the open plugin listed under its row: the parameters or
+    /// the presets.
+    section: VstSection,
     /// The preset names of the open plugin.
     presets: Vec<String>,
     /// The App owes the tab the presets of the open plugin: the plugin
@@ -411,6 +425,53 @@ impl VstTab {
         self.refresh();
     }
 
+    /// The half of the open plugin listed under its row.
+    pub fn section(&self) -> VstSection {
+        self.section
+    }
+
+    /// Opens one half of the open plugin under its row, and the cursor goes
+    /// to the first row of the half. Returns false with nothing under the
+    /// open plugin.
+    pub fn show_section(&mut self, section: VstSection) -> bool {
+        self.section = section;
+        self.refresh();
+        self.select_under()
+    }
+
+    /// Tab under an open plugin: the other half of the plugin goes under its
+    /// row, the search stays, so a search holds in both halves. Returns
+    /// false with no plugin open.
+    pub fn toggle_section(&mut self) -> bool {
+        if self.open.is_none() {
+            return false;
+        }
+        let other = match self.section {
+            VstSection::Params => VstSection::Presets,
+            VstSection::Presets => VstSection::Params,
+        };
+        self.show_section(other)
+    }
+
+    /// The cursor goes to the first row under the open plugin, and the
+    /// search goes with it: the half under the plugin is whole again.
+    /// Returns false when the open plugin lists no row under it.
+    pub fn select_under(&mut self) -> bool {
+        if !self.query.is_empty() {
+            self.query.clear();
+            self.refresh();
+        }
+        let Some(at) = self
+            .rows
+            .iter()
+            .position(|row| !matches!(row, PluginRow::Plugin(_)))
+        else {
+            return false;
+        };
+        self.selected = at;
+        true
+    }
+
     /// The row a list position has, for a click.
     pub fn row(&self, at: usize) -> Option<PluginRow> {
         self.rows.get(at).copied()
@@ -525,39 +586,47 @@ impl VstTab {
             self.groups[last].1 += 1;
         }
 
-        // What the open plugin lists under its row.
+        // What the open plugin lists under its row: one half of it, the
+        // parameters or the presets. Tab moves to the other half, so the
+        // parameters never stand between the player and the presets.
         let mut under = Vec::new();
-        if open.is_some() && query.is_empty() {
-            under.extend(rows_of_group(params, ""));
-            for (index, (name, _)) in self.groups.iter().enumerate() {
-                under.push(PluginRow::Group(index));
-                if self.open_groups.contains(name) {
-                    under.extend(rows_of_group(params, name));
+        if open.is_some() && self.section == VstSection::Params {
+            if query.is_empty() {
+                under.extend(rows_of_group(params, ""));
+                for (index, (name, _)) in self.groups.iter().enumerate() {
+                    under.push(PluginRow::Group(index));
+                    if self.open_groups.contains(name) {
+                        under.extend(rows_of_group(params, name));
+                    }
                 }
+            } else {
+                // A search reads each parameter by its key, its title and its
+                // group, and lists the matches flat, the nearest first.
+                let score = |text: &String| super::super::fuzzy::name_score(query, text);
+                let mut matches: Vec<_> = params
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, param)| {
+                        let best = [&param.key, &param.name, &param.group]
+                            .into_iter()
+                            .filter_map(score)
+                            .max()?;
+                        Some((best, index))
+                    })
+                    .collect();
+                matches.sort_by_key(|(best, _)| std::cmp::Reverse(*best));
+                under.extend(matches.iter().map(|(_, index)| PluginRow::Param(*index)));
             }
-            under.extend((0..self.presets.len()).map(PluginRow::Preset));
         } else if open.is_some() {
-            // A search reads each parameter by its key, its title and its
-            // group, and lists the matches flat, the nearest first.
-            let score = |text: &String| super::super::fuzzy::name_score(query, text);
-            let mut matches: Vec<_> = params
-                .iter()
-                .enumerate()
-                .filter_map(|(index, param)| {
-                    let best = [&param.key, &param.name, &param.group]
-                        .into_iter()
-                        .filter_map(score)
-                        .max()?;
-                    Some((best, index))
-                })
-                .collect();
-            matches.sort_by_key(|(best, _)| std::cmp::Reverse(*best));
-            under.extend(matches.iter().map(|(_, index)| PluginRow::Param(*index)));
+            // The presets of the other half: all of them, or the ones the
+            // search finds.
             under.extend(
                 self.presets
                     .iter()
                     .enumerate()
-                    .filter(|(_, preset)| score(preset).is_some())
+                    .filter(|(_, preset)| {
+                        query.is_empty() || super::super::fuzzy::name_score(query, preset).is_some()
+                    })
                     .map(|(index, _)| PluginRow::Preset(index)),
             );
         }
@@ -647,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn an_open_plugin_lists_parameters_then_groups_then_presets() {
+    fn an_open_plugin_lists_its_parameters_then_its_presets_by_half() {
         use PluginRow::{Group, Param, Plugin, Preset};
         let mut tab = VstTab::default();
         tab.set_plugins(vec![plugin("Echo", Status::Found, Vec::new()), synth()]);
@@ -661,14 +730,7 @@ mod tests {
             tab.groups(),
             [("OSC A".to_owned(), 2), ("Filter 1".to_owned(), 1)]
         );
-        let closed = [
-            Plugin(0),
-            Plugin(1),
-            Param(0),
-            Group(0),
-            Group(1),
-            Preset(0),
-        ];
+        let closed = [Plugin(0), Plugin(1), Param(0), Group(0), Group(1)];
         assert_eq!(tab.rows(), closed);
 
         // → on a group lists its parameters. ← from a parameter closes the
@@ -683,7 +745,6 @@ mod tests {
             Param(1),
             Param(2),
             Group(1),
-            Preset(0),
         ];
         assert_eq!(tab.rows(), open);
         tab.selected = 5;
@@ -693,8 +754,15 @@ mod tests {
         assert_eq!(score_key("gain²"), "'gain²'");
         assert!(tab.collapse());
         assert_eq!((tab.rows(), tab.selected), (&closed[..], 3));
-        tab.selected = 5;
+
+        // Tab moves to the other half of the open plugin, and the cursor
+        // goes to the first row of the half.
+        assert!(tab.toggle_section());
+        assert_eq!(tab.rows(), [Plugin(0), Plugin(1), Preset(0)]);
+        assert_eq!(tab.selected, 2);
         assert_eq!(tab.score_text().as_deref(), Some("preset: \"Lead\""));
+        assert!(tab.toggle_section());
+        assert_eq!((tab.rows(), tab.selected), (&closed[..], 2));
         tab.selected = 1;
         assert_eq!(tab.score_text().as_deref(), Some(".vsti(\"Synth\")"));
         tab.selected = 0;
@@ -703,7 +771,7 @@ mod tests {
 
     #[test]
     fn a_search_lists_the_matching_parameters_of_the_open_plugin_flat() {
-        use PluginRow::{Param, Plugin};
+        use PluginRow::{Param, Plugin, Preset};
         let mut tab = VstTab::default();
         tab.set_plugins(vec![plugin("Echo", Status::Ready, Vec::new()), synth()]);
         tab.move_by(1);
@@ -720,6 +788,15 @@ mod tests {
         tab.edit_query(|query| *query = "echo".into());
         assert_eq!(tab.rows(), [Plugin(0)]);
         assert_eq!(tab.score_text().as_deref(), Some(".vst(\"Echo\")"));
+
+        // The search holds in the other half: Tab with it lists the
+        // presets it finds, and the cursor goes to them.
+        tab.edit_query(|query| *query = "lead".into());
+        assert!(tab.toggle_section());
+        assert_eq!(tab.row(tab.selected), Some(Preset(0)));
+        // The search gone, the half lists all of it under the plugin.
+        assert!(tab.select_under());
+        assert_eq!(tab.selected, 2);
     }
 
     #[test]

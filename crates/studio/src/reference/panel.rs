@@ -318,6 +318,41 @@ impl ReferencePanel {
         self.select_tab(all[(at + 1) % all.len()].0);
     }
 
+    /// The word for the half of the open plugin the vst tab lists.
+    #[cfg(feature = "vst")]
+    fn section_said(&self) -> &'static str {
+        match self.vst.section() {
+            VstSection::Params => "the parameters of the plugin",
+            VstSection::Presets => "the presets of the plugin",
+        }
+    }
+
+    /// Tab in the vst tab with a plugin open flips the half of the plugin
+    /// under its row - the parameters or the presets - and says the half it
+    /// shows. With no plugin open, and on every other tab, Tab goes to the
+    /// next tab of the panel as anywhere.
+    #[cfg(feature = "vst")]
+    pub fn tab_key(&mut self) -> Option<&'static str> {
+        if self.tab == Tab::Vst && self.vst.toggle_section() {
+            Some(self.section_said())
+        } else {
+            self.toggle_tab();
+            None
+        }
+    }
+
+    /// BackTab: the halves of a plugin are two, so the flip is the same one,
+    /// and every other tab goes to the tab before.
+    #[cfg(feature = "vst")]
+    pub fn back_tab_key(&mut self) -> Option<&'static str> {
+        if self.tab == Tab::Vst && self.vst.toggle_section() {
+            Some(self.section_said())
+        } else {
+            self.previous_tab();
+            None
+        }
+    }
+
     pub(crate) fn refresh(&mut self, reference: &Reference) {
         if let Some(vocabulary) = &self.vocabulary {
             let count = vocabulary

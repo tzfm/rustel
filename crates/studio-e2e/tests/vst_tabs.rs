@@ -176,7 +176,13 @@ fn a_plugin_folder_added_on_the_sheet_reaches_the_host_and_can_be_removed() {
     // The cursor went up to the rescan row with the last folder.
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();
-    assert_eq!(studio.status(), "reading the plugin folders");
+    // No folder is left: the read ends in no time, and the line that says
+    // it runs may already say the count it ended with.
+    assert!(
+        studio.status() == "reading the plugin folders" || studio.status() == "0 plugins found",
+        "{}",
+        studio.status()
+    );
     wait_for_row(&mut studio, "0 plugins found");
 }
 
@@ -273,8 +279,10 @@ fn a_completion_in_a_plugin_call_lists_names_keys_and_presets() {
 
     // The bundle is not loaded: its name is in the list for an effect and
     // in the list for an instrument. A part of the name in lower case
-    // finds the row.
-    for call in ["vst", "vsti"] {
+    // finds the row. The pick of the first name opens the presets of the
+    // plugin, which loads the bundle: the instrument list then has the
+    // instrument of the bundle, and the effect list the effect.
+    for (call, plugin) in [("vst", "Rustel Fixture"), ("vsti", "Rustel Fixture Tone")] {
         let text = format!("$: s(\"bd\").{call}(\"fix\")");
         complete_after(&mut studio, &text, "fix");
         assert_eq!(
@@ -283,12 +291,12 @@ fn a_completion_in_a_plugin_call_lists_names_keys_and_presets() {
         );
         wait_for_row(&mut studio, "1 of 1 plugins");
         row_containing(&studio.rows(), "search: fix");
+        if call == "vsti" {
+            wait_for_row(&mut studio, "Rustel Fixture Tone");
+        }
         studio.press(KeyCode::Enter, KeyModifiers::NONE);
         studio.settle();
-        assert_eq!(
-            studio.score(),
-            format!("$: s(\"bd\").{call}(\"Rustel Fixture\")")
-        );
+        assert_eq!(studio.score(), format!("$: s(\"bd\").{call}({plugin:?})"));
     }
 
     // The object of the call: `preset` at once, and the 4 keys of the

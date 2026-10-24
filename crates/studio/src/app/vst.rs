@@ -10,13 +10,13 @@
 //! and starts none.
 
 use rustel_runtime::lint::scan;
-use rustel_runtime::vst::{self, PluginInfo, Status};
+use rustel_runtime::vst::{self, PluginInfo, Status, canonical};
 
 use super::args::parameter_edit;
 use super::sets::shorten_home;
 use super::*;
 use crate::memory::PluginMemory;
-use crate::reference::{PluginRow, PluginWords, VstTab, key_words};
+use crate::reference::{PluginRow, PluginWords, VstSection, VstTab, key_words};
 
 /// How often the reference column reads the plugin list while its vst tab
 /// shows.
@@ -162,14 +162,19 @@ impl App {
         )
     }
 
-    /// Anywhere else in a named plugin call, open its parameters directly.
-    /// Name and preset strings keep their more specific completion lists.
+    /// Anywhere else in a named plugin call, open its parameters directly:
+    /// the plugin of the call opens with the cursor under its row, so one
+    /// Enter picks from it. A plugin still loading keeps the cursor on its
+    /// row, and Enter dives under it when the load lands. Name and preset
+    /// strings keep their more specific completion lists.
     pub(super) fn open_plugin_parameters(&mut self) -> bool {
-        if self.plugin_call_at_caret().is_none() {
+        let Some((name, _)) = self.plugin_call_at_caret() else {
             return false;
-        }
+        };
         let mut panel = ReferencePanel::browse(&self.reference);
         panel.select_tab(Tab::Vst);
+        panel.vst.open_named(name);
+        panel.vst.select_under();
         self.reference_anchor = None;
         self.set_reference_panel(Some(panel));
         self.sync_plugins();
@@ -179,6 +184,23 @@ impl App {
         self.invalidate_maps();
         self.dirty_frame = true;
         true
+    }
+
+    /// The pick of a plugin name wrote the call: the panel stays open, on
+    /// the presets of the plugin, so the next Enter picks one for the call.
+    pub(super) fn open_plugin_presets(&mut self, name: String) {
+        let mut panel = ReferencePanel::browse(&self.reference);
+        panel.select_tab(Tab::Vst);
+        panel.vst.open_named(name);
+        panel.vst.show_section(VstSection::Presets);
+        self.reference_anchor = None;
+        self.set_reference_panel(Some(panel));
+        self.sync_plugins();
+        self.install_catalogue();
+        self.status = "plugin presets - Enter picks one for this call".into();
+        self.focus_panel(PanelKind::Reference);
+        self.invalidate_maps();
+        self.dirty_frame = true;
     }
 
     /// The plugin and the range of the key at the caret, when the caret is
@@ -563,7 +585,10 @@ impl App {
 
     /// The text of a row of the vst tab, as the text goes in at the caret.
     /// The text is no spelling of the word the column opened on, so the
-    /// anchor goes. After a dot the plugin call has its dot.
+    /// anchor goes. Enter on the row of the plugin the call at the caret
+    /// names writes nothing: the name stays as written, and the cursor goes
+    /// under the row, to the half of the plugin the tab holds, where the
+    /// next Enter picks.
     pub(super) fn plugin_text_at_caret(&mut self, text: String) -> Option<String> {
         self.reference_anchor = None;
         let keys = self.reference_panel.as_ref().is_some_and(|panel| {
@@ -584,25 +609,97 @@ impl App {
             self.anchor_reference(&word, ByteOffset(range.start)..ByteOffset(range.end));
             return Some(replacement);
         }
-        let parameter = self.reference_panel.as_ref().is_some_and(|panel| {
-            matches!(
-                panel.vst.row(panel.vst.selected),
-                Some(PluginRow::Param(_) | PluginRow::Preset(_))
-            )
+        // What the cursor holds, what the open plugin is, and what the call
+        // at the caret names: read once, before the cursor moves.
+        let panel = self
+            .reference_panel
+            .as_ref()
+            .filter(|panel| panel.tab == Tab::Vst);
+        let row = panel.and_then(|panel| panel.vst.row(panel.vst.selected));
+        let open_plugin = panel
+            .and_then(|panel| panel.vst.open_plugin())
+            .map(|plugin| {
+                (
+                    plugin.name.clone(),
+                    plugin.instrument,
+                    // A bundle with no load and no test yet has no kind, and
+                    // a score writes no call before the kind is known.
+                    plugin.status == Status::Ready || !plugin.categories.is_empty(),
+                )
+            });
+        let selected = row.and_then(|row| match row {
+            PluginRow::Plugin(index) => panel
+                .and_then(|panel| panel.vst.plugins().get(index))
+                .map(|plugin| plugin.name.clone()),
+            _ => None,
         });
-        if parameter && let Some((_, open)) = self.plugin_call_at_caret() {
-            let Some((range, replacement)) =
-                parameter_edit(&self.editor().source(), open, &text, None)
+        let preset = row.and_then(|row| match row {
+            PluginRow::Preset(index) => panel
+                .and_then(|panel| panel.vst.presets().get(index))
+                .cloned(),
+            _ => None,
+        });
+        let call = self.plugin_call_at_caret();
+        let same = call.as_ref().is_some_and(|(named, _)| {
+            open_plugin
+                .as_ref()
+                .is_some_and(|(name, _, _)| canonical(named) == canonical(name))
+        });
+        // The row of the plugin the call at the caret already names: the
+        // dive under the row. Nothing goes in.
+        if let (Some(selected), Some((named, _))) = (&selected, &call)
+            && canonical(named) == canonical(selected)
+            && self
+                .reference_panel
+                .as_mut()
+                .is_some_and(|panel| panel.vst.select_under())
+        {
+            self.dirty_frame = true;
+            return None;
+        }
+        // A parameter or a preset of the open plugin, with the caret in the
+        // call of that plugin: the object of the call takes it, so Enter on
+        // a preset of the call's plugin changes only the preset.
+        if same
+            && matches!(row, Some(PluginRow::Param(_) | PluginRow::Preset(_)))
+            && let Some((_, open)) = &call
+        {
+            let Some((range, kept)) = parameter_edit(&self.editor().source(), *open, &text, None)
             else {
                 self.status =
                     "plugin parameters need a closed call with a literal options object".into();
                 self.dirty_frame = true;
                 return None;
             };
+            // A preset row picks a whole value: when the call holds a
+            // preset already, the picked one takes its place.
+            let replace = preset.is_some() && kept == self.editor().source()[range.clone()];
+            let replacement = if replace { text.clone() } else { kept };
             let word = self.editor().source()[range.clone()].to_owned();
             self.anchor_reference(&word, ByteOffset(range.start)..ByteOffset(range.end));
             return Some(replacement);
         }
+        // A preset with the caret anywhere else: the whole call, preset and
+        // all, so one pick writes a runnable score. The kind of the plugin
+        // is the callee, and `default` is what a call with no preset plays.
+        let text = if let (Some(preset), false) = (preset.as_ref(), same) {
+            let Some((name, instrument, known)) = &open_plugin else {
+                return None;
+            };
+            if !known {
+                self.status = "the plugin loads: its kind comes with the load".into();
+                self.dirty_frame = true;
+                return None;
+            }
+            let callee = if *instrument { "vsti" } else { "vst" };
+            if preset.eq_ignore_ascii_case("default") {
+                format!(".{callee}({name:?})")
+            } else {
+                format!(".{callee}({name:?}, {{preset: {preset:?}}})")
+            }
+        } else {
+            text
+        };
         let caret = self.editor().primary_selection().head.0;
         Some(match text.strip_prefix('.') {
             Some(call) if self.editor().source()[..caret].ends_with('.') => call.to_owned(),
@@ -825,5 +922,113 @@ mod tests {
         host.unload_unused(&[]);
         host.wait_idle();
         assert!(plugin_memory(&host.plugins()).is_empty());
+    }
+
+    /// The vst tab with one instrument open, over a score. The panel holds
+    /// its own copy of the plugin list, so no host reads happen here.
+    fn vst_app(source: &str, caret: usize) -> App {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (mut app, _) = crate::app::tests::support::plain_app(directory.path(), source);
+        let mut panel = ReferencePanel::browse(&app.reference);
+        panel.select_tab(Tab::Vst);
+        let param = rustel_runtime::vst::ParamInfo {
+            id: 0,
+            name: "Volume".into(),
+            key: "volume".into(),
+            group: String::new(),
+            units: String::new(),
+            default: 0.5,
+            steps: 0,
+            default_text: "0.5".into(),
+            role: Default::default(),
+        };
+        let plugin = PluginInfo {
+            name: "Serum 2".into(),
+            bundle: "/plugins/Serum 2.vst3".into(),
+            vendor: String::new(),
+            categories: "Synth".into(),
+            status: Status::Ready,
+            params: vec![param].into(),
+            instrument: true,
+            running: 0,
+            load_time: std::time::Duration::ZERO,
+            audio_thread: false,
+            latency: None,
+            presets: 2,
+        };
+        panel.vst.set_plugins(vec![plugin]);
+        panel.vst.open_named("Serum 2".into());
+        panel.vst.set_presets(vec!["Default".into(), "Lead".into()]);
+        app.set_reference_panel(Some(panel));
+        app.editor_mut()
+            .set_selection(crate::editor::Selection::caret(ByteOffset(caret)))
+            .expect("the caret");
+        app
+    }
+
+    #[test]
+    fn enter_on_the_plugin_the_call_names_goes_under_the_row() {
+        let source = "$: n(\"c\").vsti(\"Serum 2\", {preset: \"Init\"})\n";
+        let caret = source.find("Serum 2").expect("the name") + 3;
+        let mut app = vst_app(source, caret);
+        let before = app.editor().source().to_owned();
+        let panel = app.reference_panel.as_ref().expect("the vst tab");
+        assert_eq!(
+            panel.vst.row(panel.vst.selected),
+            Some(PluginRow::Plugin(0))
+        );
+        // Enter on the row of the plugin the call names: nothing goes in,
+        // the panel stays, and the cursor goes under the row.
+        assert_eq!(app.plugin_text_at_caret(".vsti(\"Serum 2\")".into()), None);
+        let panel = app.reference_panel.as_ref().expect("the panel stays");
+        assert_eq!(panel.vst.row(panel.vst.selected), Some(PluginRow::Param(0)));
+        assert_eq!(app.editor().source(), before);
+    }
+
+    #[test]
+    fn enter_on_a_preset_of_the_call_changes_only_the_preset() {
+        let source = "$: n(\"c\").vsti(\"Serum 2\", {preset: \"Init\"})\n";
+        let caret = source.find("Serum 2").expect("the name") + 3;
+        let mut app = vst_app(source, caret);
+        let before = app.editor().source().to_owned();
+        let panel = app.reference_panel.as_mut().expect("the vst tab");
+        panel.vst.show_section(VstSection::Presets);
+        // The rows under the plugin are its two presets; the cursor goes to
+        // `Lead`.
+        panel.vst.selected = 2;
+        assert_eq!(panel.vst.row(2), Some(PluginRow::Preset(1)));
+        let said = app.plugin_text_at_caret("preset: \"Lead\"".into());
+        assert_eq!(said.as_deref(), Some("preset: \"Lead\""));
+        // The pair the call holds is the anchor the pick replaces.
+        let anchor = app.reference_anchor.as_ref().expect("the anchor");
+        assert_eq!(anchor.word, "preset: \"Init\"");
+        assert_eq!(app.editor().source(), before);
+    }
+
+    #[test]
+    fn enter_on_a_preset_anywhere_else_writes_the_whole_call() {
+        let source = "$: n(\"c\")\n";
+        let mut app = vst_app(source, source.len() - 1);
+        {
+            let panel = app.reference_panel.as_mut().expect("the vst tab");
+            panel.vst.show_section(VstSection::Presets);
+            panel.vst.selected = 2;
+        }
+        assert_eq!(
+            app.plugin_text_at_caret("preset: \"Lead\"".into())
+                .as_deref(),
+            Some(".vsti(\"Serum 2\", {preset: \"Lead\"})")
+        );
+        // `Default` is what a call with no preset plays: none goes in.
+        app.reference_panel
+            .as_mut()
+            .expect("the vst tab")
+            .vst
+            .selected = 1;
+        assert_eq!(
+            app.plugin_text_at_caret("preset: \"Default\"".into())
+                .as_deref(),
+            Some(".vsti(\"Serum 2\")")
+        );
     }
 }
