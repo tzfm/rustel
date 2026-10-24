@@ -708,34 +708,51 @@ pub(crate) fn restore_surface<'js>(
     let globals = ctx.globals();
     let state = state(ctx)?;
     let saved: rquickjs::Object = state.get(SAVED)?;
+    // One rejected write must not wedge the surface: the next evaluation
+    // restores from this same state, so a failure that leaves the state in
+    // place repeats forever. Every name is attempted, the state is cleared
+    // regardless, and the first failure is reported at the end.
+    let mut first_failure = None;
     for entry in saved.props::<String, rquickjs::Value>() {
-        let (name, original) = entry?;
+        let Ok((name, original)) = entry else {
+            continue;
+        };
         // Delete first, always. While the surface is installed `speed` is an
         // accessor, and assigning to an accessor calls its SETTER - which
         // would record a drawing instruction for a window that is closing.
-        globals.remove(name.as_str())?;
+        if let Err(error) = globals.remove(name.as_str()) {
+            first_failure.get_or_insert(error);
+            continue;
+        }
         // Defined, not assigned: an assignment runs any setter on the
         // prototype chain, and a score turn restores before its deadline
         // starts. The attributes are the ones the engine's `set` gave it.
         if !original.is_undefined() {
-            globals.prop(
+            if let Err(error) = globals.prop(
                 name.as_str(),
                 rquickjs::object::Property::from(original)
                     .writable()
                     .enumerable()
                     .configurable(),
-            )?;
+            ) {
+                first_failure.get_or_insert(error);
+            }
         }
     }
     state.set(SAVED, bare_object(ctx)?)?;
     state.set(ASSIGNED, bare_object(ctx)?)?;
     let mut chains = chains.borrow_mut();
     for name in std::mem::take(&mut chains.protected) {
-        release_host_global(ctx, name)?;
+        if let Err(error) = release_host_global(ctx, name) {
+            first_failure.get_or_insert(error);
+        }
     }
     chains.chains.clear();
     chains.installed = false;
-    Ok(())
+    match first_failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// Build the recorder for one chain.
