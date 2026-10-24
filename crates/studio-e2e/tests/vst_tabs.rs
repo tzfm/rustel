@@ -173,10 +173,16 @@ fn a_plugin_folder_added_on_the_sheet_reaches_the_host_and_can_be_removed() {
         saved_list(studio, "studio.json", "vst_folders").is_empty()
     });
 
-    // The cursor went up to the rescan row with the last folder.
+    // The cursor went up to the rescan row with the last folder. The read of
+    // no folders can end before the status is read: both words say the
+    // Enter ran it.
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();
-    assert_eq!(studio.status(), "reading the plugin folders");
+    let status = studio.status();
+    assert!(
+        status == "reading the plugin folders" || status == "0 plugins found",
+        "Enter on rescan reads the folders: {status}"
+    );
     wait_for_row(&mut studio, "0 plugins found");
 }
 
