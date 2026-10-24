@@ -329,7 +329,6 @@ struct State {
     /// The folders with `.vstpreset` files the player added, in any
     /// structure, read after the preset folder.
     preset_extra: Vec<PathBuf>,
-<<<<<<< HEAD
     /// The word to the watch of the preset folders: see
     /// [`Host::arm_preset_watch`]. A channel that reads as gone ended its
     /// watch, and the folders are read when the player asks again.
@@ -342,8 +341,6 @@ struct State {
     /// number of its last read asks again when this moves: the watch read
     /// the folders, and its answer may have changed.
     presets_version: u64,
-=======
->>>>>>> origin/main
     builds: HashMap<(InsertKey, u32, InsertSlot), Build>,
     /// The builds an engine took, with the cell of each copy: the cell has
     /// the mark while the engine holds the plugin.
@@ -855,7 +852,6 @@ impl Host {
     /// The next ask for a preset reads the preset folders again - a read
     /// that runs now reads them after its end, with the new folder.
     pub fn set_preset_folder(&self, folder: PathBuf) {
-<<<<<<< HEAD
         {
             let mut state = self.state();
             state.preset_root = Some(folder);
@@ -866,15 +862,6 @@ impl Host {
             }
         }
         self.arm_preset_watch();
-=======
-        let mut state = self.state();
-        state.preset_root = Some(folder);
-        state.preset_index.clear();
-        state.presets_read = false;
-        if state.presets_reading {
-            state.presets_again = true;
-        }
->>>>>>> origin/main
     }
 
     /// The folders with `.vstpreset` files the player added, in any folder
@@ -888,7 +875,6 @@ impl Host {
         self.read_presets(true);
     }
 
-<<<<<<< HEAD
     /// Watches the preset folders: the root, and the folders the player
     /// added. The events of the file system say when a preset comes in or
     /// goes out, and the read of the folders follows each quiet behind
@@ -937,8 +923,6 @@ impl Host {
         state.preset_watch = Some(word);
     }
 
-=======
->>>>>>> origin/main
     /// Takes the read of the preset folders for this caller, on the plugin
     /// thread or in line of it: the root, and the folders the player
     /// added. With `force`, a read runs again after one that runs now -
@@ -995,10 +979,7 @@ impl Host {
         state
             .known_presets
             .retain(|_, known| matches!(known, KnownPreset::Number(_)));
-<<<<<<< HEAD
         state.presets_version += 1;
-=======
->>>>>>> origin/main
     }
 
     /// Reads the preset folders on the plugin thread: a folder on a slow
@@ -1055,25 +1036,17 @@ impl Host {
             state
                 .known_presets
                 .retain(|_, known| matches!(known, KnownPreset::Number(_)));
-<<<<<<< HEAD
             state.presets_version += 1;
-=======
->>>>>>> origin/main
             state.presets_read = true;
             state.presets_reading = false;
             std::mem::take(&mut state.presets_again)
         };
         if again && let Some((root, extra)) = self.claim_presets_read(true) {
-<<<<<<< HEAD
             return self.finish_presets(root, extra);
         }
         // The folders as they are now take the watch of the next change:
         // a folder that came in has a watch of its own from here.
         self.arm_preset_watch();
-=======
-            self.finish_presets(root, extra);
-        }
->>>>>>> origin/main
     }
 
     /// Keeps each copy of the plugins in `names` in the audio callback, for

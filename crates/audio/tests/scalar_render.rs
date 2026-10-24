@@ -269,8 +269,10 @@ fn postgain_scales_the_distorted_output_rather_than_the_drive() {
     );
 }
 
-/// An FM modulator first runs in the quantum where its carrier starts, from
-/// phase zero. Two identical FM notes are the same sound wherever they start.
+/// FM modulators run from the start of the render, as in the browser
+/// reference: a note does not restart their phase. Two identical FM notes
+/// are the same sound when the anchored phase the later one reaches comes
+/// around - 125 Hz at harmonicity 4 turns exactly 500 cycles a second.
 #[test]
 fn two_identical_fm_notes_sound_the_same_wherever_they_start() {
     let mut controls = controls(Waveform::Sine, None);
@@ -280,7 +282,7 @@ fn two_identical_fm_notes_sound_the_same_wherever_they_start() {
             &mut ScalarBackend::new(),
             48_000,
             onset as usize + 8_000,
-            &[OnsetEvent::new(onset, 130.81, 1.0, 0.1).with_controls(controls.clone())],
+            &[OnsetEvent::new(onset, 125.0, 1.0, 0.1).with_controls(controls.clone())],
         )
         .expect("render")
     };
@@ -299,46 +301,57 @@ fn two_identical_fm_notes_sound_the_same_wherever_they_start() {
     assert!(worst < 1e-9, "the two notes differ by {worst}");
 }
 
-/// Where in its render quantum a note starts is still audible, because Blink
-/// writes an oscillator's first quantum from its sub-quantum offset while
-/// reading the frequency param from the START of that quantum. So the carrier
-/// hears the quantum's FIRST modulator samples until the quantum ends, and the
-/// modulators are `offset` samples ahead from there on.
+/// A note sounds the modulator phase the render has reached, not a phase of
+/// its own: the second note of one render sits mid-cycle when it starts half
+/// a modulator cycle in, and sounds different from the first, while a note
+/// that starts a whole number of modulator cycles in sounds the same.
 #[test]
-fn an_fm_note_hears_its_modulators_from_the_start_of_its_quantum() {
+fn a_note_sounds_the_modulator_phase_the_render_has_reached() {
     let mut controls = controls(Waveform::Sine, None);
     controls.fm = Some(fm_chain(&[Some((4.0, 2.0))]));
-    let render = |onset: u64| {
+    let render = |second: u64| {
         render_pcm(
             &mut ScalarBackend::new(),
             48_000,
-            onset as usize + 8_000,
-            &[OnsetEvent::new(onset, 130.81, 1.0, 0.1).with_controls(controls.clone())],
+            56_000,
+            &[
+                OnsetEvent::new(0, 125.0, 1.0, 0.1).with_controls(controls.clone()),
+                OnsetEvent::new(second, 125.0, 1.0, 0.1).with_controls(controls.clone()),
+            ],
         )
         .expect("render")
     };
-    let aligned = render(0);
-    let offset = 64u64;
-    let late = render(offset);
-    let skip = offset as usize * 2;
-    // Up to the quantum boundary both notes read the same modulator samples,
-    // counting from zero, so they are the same signal.
-    let head = aligned[..skip]
-        .iter()
-        .zip(&late[skip..skip * 2])
-        .map(|(aligned, late)| (aligned - late).abs())
-        .fold(0.0f32, f32::max);
-    assert!(head < 1e-9, "the first {offset} samples differ by {head}");
-    // At the boundary the late note's modulators jump the offset they were
-    // never charged for, and the two part company.
-    let tail = aligned[skip..4_000 * 2]
-        .iter()
-        .zip(&late[skip * 2..])
-        .map(|(aligned, late)| (aligned - late).abs())
-        .fold(0.0f32, f32::max);
+    let alone = render_pcm(
+        &mut ScalarBackend::new(),
+        48_000,
+        8_000,
+        &[OnsetEvent::new(0, 125.0, 1.0, 0.1).with_controls(controls.clone())],
+    )
+    .expect("render");
     assert!(
-        tail > 0.01,
-        "the modulators did not catch up at the quantum boundary (differ by {tail})"
+        alone.iter().copied().map(f32::abs).fold(0.0, f32::max) > 0.01,
+        "the fixture must actually be sounding"
+    );
+    let worst = |rendered: &[f32], at: usize| {
+        alone[..8_000 * 2]
+            .iter()
+            .zip(&rendered[at..at + 8_000 * 2])
+            .map(|(alone, note)| (alone - note).abs())
+            .fold(0.0f32, f32::max)
+    };
+    // 125 Hz at harmonicity 4 turns 250 whole cycles in half a second: the
+    // second note picks the phase up where the first one left it.
+    let realigned = render(48_000);
+    assert!(
+        worst(&realigned, 48_000 * 2) < 1e-9,
+        "a whole-cycle onset sounds a new note: {}",
+        worst(&realigned, 48_000 * 2)
+    );
+    let half = render(24_000);
+    assert!(
+        worst(&half, 24_000 * 2) > 0.01,
+        "a half-cycle onset restarted the modulator: {}",
+        worst(&half, 24_000 * 2)
     );
 }
 
