@@ -167,6 +167,14 @@ impl App {
     }
 
     pub(super) fn settle_stopped_transport(&mut self) {
+        // A stop word for a transport already stopped settles nothing: it
+        // would reset the advisories and discard the visual update the
+        // held frame is showing - a flicker on a picture at rest. The
+        // snapshot trails a real stop, so its last word still says playing
+        // when the word the stop owes arrives.
+        if !self.stop_requested && !self.is_playing() && !self.is_stopping() {
+            return;
+        }
         self.audio_advisory.reset();
         self.power_advisory.reset();
         self.worker.discard_visual_updates();
@@ -1139,6 +1147,51 @@ mod tests {
             app.snapshot = Some(sounding(true, false));
             let current = app.scenes.current().id;
             assert!(!app.install_would_be_redundant(current, "$: s(\"bd*4\")"));
+        }
+
+        /// A stop pressed while the playback is already stopped is not a
+        /// stop: no engine word goes out, the transport is not asked to
+        /// stop again, and the status keeps whatever it was saying. The
+        /// word would only come back as a second settle - a flicker on a
+        /// picture at rest.
+        #[test]
+        fn a_stop_for_a_transport_already_stopped_says_nothing() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            app.snapshot = Some(sounding(false, false));
+            app.status.clear();
+
+            app.handle_editor_effect(EditorEffect::Stop).expect("stop");
+
+            assert!(!app.stop_requested, "no stop was asked of the engine");
+            assert!(app.status.is_empty(), "the stop said: {}", app.status);
+        }
+
+        /// The second stop word of the engine - a stray Stopped, or the
+        /// snapshot after a settle - settles nothing: the advisories stay,
+        /// the visual update the held frame is showing is not discarded,
+        /// and no frame is redrawn for it.
+        #[test]
+        fn a_second_settle_for_a_settled_transport_redraws_no_frame() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut app = app_over(directory.path());
+            app.snapshot = Some(sounding(true, false));
+            app.handle_editor_effect(EditorEffect::Stop).expect("stop");
+            app.handle_control(StudioControlEvent::Stopped(Box::new(
+                crate::engine::StudioStop::idle(),
+            )));
+
+            assert!(!app.stop_requested, "the settle cleared the request");
+            assert!(!app.is_playing(), "the settle ended the playback");
+            assert!(!app.is_stopping(), "the settle ended the stopping");
+
+            app.dirty_frame = false;
+            app.settle_stopped_transport();
+
+            assert!(
+                !app.dirty_frame,
+                "the second settle redrew a picture at rest"
+            );
         }
     }
 }

@@ -186,6 +186,90 @@ fn a_plugin_folder_added_on_the_sheet_reaches_the_host_and_can_be_removed() {
     wait_for_row(&mut studio, "0 plugins found");
 }
 
+/// `/` filters the plugin rows of the vst page by their letters. While
+/// the letters build the filter, the keys the page binds type into it -
+/// `a` opens no folder prompt - and Enter keeps it standing while the
+/// arrows and Enter act on the rows it kept. Backspace takes the letters
+/// off, and an empty filter goes with them.
+#[test]
+fn a_slash_filters_the_plugin_rows_of_the_settings_page() {
+    let mut studio = hermetic();
+    let folder = tempfile::tempdir().expect("plugin folder");
+    rustel_vst3_fixture::install(folder.path());
+    let path = folder.path().display().to_string();
+
+    // The vst page is the sixth tab, with the fixture's two plugins.
+    studio.chord("ctrl+o");
+    for _ in 0..5 {
+        studio.press(KeyCode::Tab, KeyModifiers::NONE);
+    }
+    studio.settle();
+    studio.press(KeyCode::Char('a'), KeyModifiers::NONE);
+    studio.settle();
+    studio.paste(&path);
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.settle();
+    vst::host().resolve(rustel_vst3_fixture::NAME, true);
+    wait_for_row(&mut studio, "2 plugins found");
+    let plugins = |studio: &mut Hermetic| {
+        studio
+            .rows()
+            .into_iter()
+            .filter(|row| row.contains("Rustel Fixture"))
+            .count()
+    };
+
+    // `/` starts the filter. `a` types into it - no folder prompt opens -
+    // and no plugin name holds an `a`, so the filter says so.
+    studio.press(KeyCode::Char('/'), KeyModifiers::NONE);
+    studio.settle();
+    studio.press(KeyCode::Char('a'), KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    row_containing(&rows, "filter: a▏ · no plugins match");
+    assert!(
+        !studio.status().contains("plugin folder"),
+        "`a` typed into the filter, not the page: {}",
+        studio.status()
+    );
+
+    // Backspace takes the `a` off, and `tone` keeps the Tone plugin alone.
+    studio.press(KeyCode::Backspace, KeyModifiers::NONE);
+    for letter in ['t', 'o', 'n', 'e'] {
+        studio.press(KeyCode::Char(letter), KeyModifiers::NONE);
+    }
+    studio.settle();
+    let rows = studio.rows();
+    row_containing(&rows, "filter: tone▏");
+    assert_eq!(
+        plugins(&mut studio),
+        1,
+        "the filter keeps the Tone plugin alone:\n{}",
+        rows.join("\n")
+    );
+
+    // Enter keeps the filter standing, without its caret.
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.settle();
+    row_containing(&studio.rows(), "filter: tone");
+    assert_eq!(plugins(&mut studio), 1, "the standing filter holds");
+
+    // `/` takes the standing filter back up, and Backspace takes its
+    // letters off - an empty filter goes with them: both plugins are
+    // rows again.
+    studio.press(KeyCode::Char('/'), KeyModifiers::NONE);
+    studio.settle();
+    for _ in 0..5 {
+        studio.press(KeyCode::Backspace, KeyModifiers::NONE);
+    }
+    studio.settle();
+    assert_eq!(plugins(&mut studio), 2, "the empty filter keeps all");
+    assert!(
+        !studio.rows().iter().any(|row| row.contains("filter:")),
+        "the echo line went with the filter"
+    );
+}
+
 /// Open the reference column on its vst tab: the fifth tab.
 fn open_vst_tab(studio: &mut Hermetic) {
     studio.chord("ctrl+d");

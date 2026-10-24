@@ -864,6 +864,14 @@ struct App {
     /// presets of that read.
     #[cfg(feature = "vst")]
     plugin_presets_version: u64,
+    /// The text of the settings vst page's plugin filter. The sheet holds
+    /// only its state, for its rows and its keys.
+    #[cfg(feature = "vst")]
+    vst_filter: settings::VstFilter,
+    /// The plugins the filter kept, by their place in the full scanned
+    /// list. Identity in length while no filter holds.
+    #[cfg(feature = "vst")]
+    vst_shown: Vec<usize>,
     /// The plugin rows of the memory breakdown, as last measured.
     #[cfg(feature = "vst")]
     plugin_memory: Vec<super::memory::PluginMemory>,
@@ -1655,6 +1663,10 @@ impl App {
             plugin_scan: None,
             #[cfg(feature = "vst")]
             plugin_presets_version: 0,
+            #[cfg(feature = "vst")]
+            vst_filter: settings::VstFilter::default(),
+            #[cfg(feature = "vst")]
+            vst_shown: Vec::new(),
             #[cfg(feature = "vst")]
             plugin_memory: Vec::new(),
             linter: Linter::spawn().map_err(RuntimeError::Io)?,

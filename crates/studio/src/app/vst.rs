@@ -16,7 +16,7 @@ use super::args::parameter_edit;
 use super::sets::shorten_home;
 use super::*;
 use crate::memory::PluginMemory;
-use crate::reference::{PluginRow, PluginWords, VstSection, VstTab, key_words};
+use crate::reference::{PluginRow, PluginWords, VstSection, VstTab, key_words, rank_names};
 
 /// How often the reference column reads the plugin list while its vst tab
 /// shows.
@@ -143,6 +143,32 @@ fn jump_row(names: &[&str], at: usize, letter: char) -> Option<usize> {
                 .is_some_and(|first| first.eq_ignore_ascii_case(&letter))
         })
         .map(|row| row % names.len())
+}
+
+/// The plugins a filter of the vst page keeps, by their place in the full
+/// list the scan found: every plugin while no filter holds, and the names
+/// the text ranks otherwise - the ranking the preset search reads, so a
+/// name with a typing error still has a row.
+fn shown_plugins(filter: &settings::VstFilter, names: &[String]) -> Vec<usize> {
+    match filter {
+        settings::VstFilter::Off => (0..names.len()).collect(),
+        settings::VstFilter::Typing(text) | settings::VstFilter::Set(text) if text.is_empty() => {
+            (0..names.len()).collect()
+        }
+        settings::VstFilter::Typing(text) | settings::VstFilter::Set(text) => {
+            rank_names(text, names)
+        }
+    }
+}
+
+/// The names of every plugin the scan found, in the order the page lists
+/// them.
+fn plugin_names() -> Vec<String> {
+    vst::host()
+        .plugins()
+        .iter()
+        .map(|plugin| plugin.name.clone())
+        .collect()
 }
 
 impl App {
@@ -290,11 +316,55 @@ impl App {
     }
 
     /// Tells the sheet how far the cursor of the vst page goes.
-    pub(super) fn count_vst_folders(&self, sheet: &mut SettingsSheet) {
+    pub(super) fn count_vst_folders(&mut self, sheet: &mut SettingsSheet) {
         sheet.vst_folder_count = self.prefs.vst_folders.len();
         sheet.vst_standard_count = vst::standard_folders().len();
         sheet.vst_preset_folder_count = self.prefs.preset_folders.len();
         sheet.vst_scanned_count = vst::host().plugins().len();
+        // The scan may have found or lost plugins since the filter ranked
+        // the list: the standing text ranks the list it has now.
+        self.mirror_vst_rows(sheet);
+    }
+
+    /// The filter of the vst page changed, or the list it ranks did: the
+    /// rows past the folders are the plugins its text kept, the cursor
+    /// stays on a row that shows, and the open row keeps its place among
+    /// them or stands open on none.
+    pub(super) fn mirror_vst_rows(&mut self, sheet: &mut SettingsSheet) {
+        self.vst_shown = shown_plugins(&self.vst_filter, &plugin_names());
+        sheet.vst_filter = match &self.vst_filter {
+            settings::VstFilter::Off => settings::VstFilterState::Off,
+            settings::VstFilter::Typing(_) => settings::VstFilterState::Typing,
+            settings::VstFilter::Set(_) => settings::VstFilterState::Set,
+        };
+        sheet.vst_shown = self.vst_shown.len();
+        sheet.vst_open_listed = self
+            .vst_shown
+            .iter()
+            .position(|&host| sheet.vst_open == Some(host));
+        // The cursor is a row of the vst page only while that page is up:
+        // the sheet counts its folders on every key of every page, and a
+        // clamp against the vst rows would move a cursor walking another
+        // page.
+        if sheet.shows_vst() {
+            let base = settings::VST_CONTROL_COUNT
+                + sheet.vst_folder_count
+                + sheet.vst_standard_count
+                + sheet.vst_preset_folder_count;
+            let len = base + self.vst_shown.len();
+            sheet.selected = sheet.selected.min(len.saturating_sub(1));
+        }
+        self.dirty_frame = true;
+    }
+
+    /// The plugin a listed row of the settings vst page holds, by its
+    /// place in the full scanned list.
+    pub(super) fn vst_plugin_at(&self, at: usize) -> Option<usize> {
+        if self.vst_filter.is_off() {
+            Some(at)
+        } else {
+            self.vst_shown.get(at).copied()
+        }
     }
 
     /// The vst page as the Settings sheet reads the page. Empty while a
@@ -343,6 +413,8 @@ impl App {
                 .collect(),
             plugins: plugins.len(),
             scan: self.plugin_scan.clone(),
+            filter: self.vst_filter.echo(self.vst_shown.len()),
+            shown: self.vst_shown.clone(),
             open_presets: self.settings_vst_open_presets.clone(),
         }
     }
@@ -470,11 +542,18 @@ impl App {
     /// `.vstpreset` files the folders hold for the plugin. The names come
     /// with the read of the folders: see [`Self::poll_plugins`].
     pub(super) fn toggle_vst_presets(&mut self, sheet: &mut SettingsSheet, at: usize) {
-        if sheet.vst_open == Some(at) {
+        // The row the cursor holds is its place among the plugins the
+        // filter kept; the open row is the plugin itself.
+        let Some(row) = self.vst_plugin_at(at) else {
+            return;
+        };
+        if sheet.vst_open == Some(row) {
             sheet.vst_open = None;
+            sheet.vst_open_listed = None;
             sheet.vst_presets_due = false;
         } else {
-            sheet.vst_open = Some(at);
+            sheet.vst_open = Some(row);
+            sheet.vst_open_listed = Some(at);
             sheet.vst_presets_due = true;
         }
         sheet.vst_open_count = 0;
@@ -485,10 +564,17 @@ impl App {
     /// A letter on the vst page: the cursor goes to the next plugin whose
     /// name begins with it, from the row the cursor holds and around the
     /// list, so `s` reaches Serum and then the rest of the s's. The names
-    /// come from the host, which the page lists in their order.
+    /// come from the host - while a filter stands, the ones it kept.
     pub(super) fn jump_vst_plugin(&mut self, sheet: &mut SettingsSheet, letter: char) {
         let plugins = vst::host().plugins();
-        let names: Vec<&str> = plugins.iter().map(|plugin| plugin.name.as_str()).collect();
+        let names: Vec<&str> = if self.vst_filter.is_off() {
+            plugins.iter().map(|plugin| plugin.name.as_str()).collect()
+        } else {
+            self.vst_shown
+                .iter()
+                .filter_map(|host| plugins.get(*host).map(|plugin| plugin.name.as_str()))
+                .collect()
+        };
         let Some(last) = names.len().checked_sub(1) else {
             return;
         };
@@ -733,9 +819,16 @@ impl App {
             .is_some_and(|sheet| sheet.shows_vst())
         {
             let count = vst::host().plugins().len();
+            // The count the filter ranked changed with it: the rows it
+            // keeps are the ones the list holds now.
+            let shown = shown_plugins(&self.vst_filter, &plugin_names());
             if let Some(sheet) = self.settings_sheet.as_mut() {
                 self.dirty_frame |= sheet.vst_scanned_count != count;
                 sheet.vst_scanned_count = count;
+                sheet.vst_shown = shown.len();
+                sheet.vst_open_listed = sheet
+                    .vst_open
+                    .and_then(|open| shown.iter().position(|&host| open == host));
                 // The host reads the preset folders on its own thread. An
                 // open plugin row asks again on each poll until the names
                 // of its presets are here, and asks once more when a read
@@ -754,6 +847,7 @@ impl App {
                     }
                 }
             }
+            self.vst_shown = shown;
         }
         // The watch of the preset folders read them again when a file came
         // in or went out: the open plugin of the vst tab takes the
@@ -847,6 +941,67 @@ mod tests {
         assert_eq!(jump_row(&names, 1, 'V'), Some(2));
         // A letter no plugin begins with reaches none.
         assert_eq!(jump_row(&names, 1, 'z'), None);
+    }
+
+    /// The filter keeps the plugins its text ranks, by their place in the
+    /// full list: every plugin while no filter holds or its text is
+    /// empty, and otherwise the names its letters reach - a part of a
+    /// name is enough, upper case and spaces aside, and the shortest name
+    /// leads, with a name a typing error still reaches behind them.
+    #[test]
+    fn a_filter_keeps_the_plugins_its_text_ranks() {
+        let names: Vec<String> = ["Serum", "Surge XT", "Vital"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let all = vec![0, 1, 2];
+        assert_eq!(shown_plugins(&settings::VstFilter::Off, &names), all);
+        assert_eq!(
+            shown_plugins(&settings::VstFilter::Typing(String::new()), &names),
+            all
+        );
+        // A part of a name is enough, spaces aside, and the shortest
+        // name leads.
+        assert_eq!(
+            shown_plugins(&settings::VstFilter::Typing("e".into()), &names),
+            vec![0, 1],
+            "e reaches serum and surge xt, the shorter first"
+        );
+        assert_eq!(
+            shown_plugins(&settings::VstFilter::Set("sur".into()), &names),
+            vec![1]
+        );
+        assert_eq!(
+            shown_plugins(&settings::VstFilter::Set("vi".into()), &names),
+            vec![2]
+        );
+        assert_eq!(
+            shown_plugins(&settings::VstFilter::Set("zz".into()), &names),
+            Vec::<usize>::new()
+        );
+    }
+
+    /// The open row of a filtered list opens the plugin it holds, by its
+    /// place in the full list, and the row the sheet lists it under is
+    /// the place among the kept.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn an_open_row_of_the_filtered_list_opens_its_plugin() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut app = crate::app::tests::support::app_over(directory.path());
+        let mut sheet = SettingsSheet::default();
+        // The filter kept the third of three plugins.
+        app.vst_filter = settings::VstFilter::Set("vi".into());
+        app.vst_shown = vec![2];
+
+        app.toggle_vst_presets(&mut sheet, 0);
+
+        assert_eq!(sheet.vst_open, Some(2), "the plugin the row holds");
+        assert_eq!(sheet.vst_open_listed, Some(0), "the row the player sees");
+        // The same row again closes it.
+        app.toggle_vst_presets(&mut sheet, 0);
+        assert_eq!(sheet.vst_open, None);
+        assert_eq!(sheet.vst_open_listed, None);
     }
 
     #[test]
