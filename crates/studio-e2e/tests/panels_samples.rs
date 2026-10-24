@@ -297,7 +297,7 @@ fn ctrl_o_on_the_samples_tab_opens_the_settings_sheet() {
     studio.chord("ctrl+o");
     let rows = studio.rows();
     assert!(
-        rows.iter().any(|row| row.contains("bracket match")),
+        rows.iter().any(|row| row.contains("launch on")),
         "the settings sheet opened:\n{}",
         rows.join("\n")
     );

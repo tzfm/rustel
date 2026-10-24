@@ -793,7 +793,7 @@ mod tests {
             "below the band: {sheet:?} {band:?}"
         );
         let tabs = screen.lines().nth(usize::from(sheet.y)).unwrap();
-        assert!(tabs.contains(" advanced "), "the sheet is drawn: {tabs}");
+        assert!(tabs.contains(" appearance "), "the sheet is drawn: {tabs}");
         assert!(screen.contains("script engine"), "in view: {screen}");
     }
 
@@ -827,7 +827,7 @@ mod tests {
             SettingsSheetView::geometry(app.settings_sheet_frame()).expect("the sheet draws");
         assert!(!sheet.intersection(band).is_empty(), "over the band");
         let tabs = screen.lines().nth(usize::from(sheet.y)).unwrap();
-        assert!(tabs.contains(" advanced "), "the sheet is drawn: {tabs}");
+        assert!(tabs.contains(" appearance "), "the sheet is drawn: {tabs}");
     }
 
     /// The set panel laid as a sheet - in zen, or on a narrow split - sits

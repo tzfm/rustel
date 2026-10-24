@@ -249,7 +249,7 @@ at runtime.
 The default playback load mode waits for the first two cycles of sounds. An
 old score keeps playing while a new score loads. Stop cancels a pending update.
 In asynchronous load mode, notes whose sounds are not ready can be skipped.
-Change this option under Settings ▸ Advanced ▸ Playback. The wait includes the
+Change this option under Settings ▸ General ▸ Playback. The wait includes the
 VST3 plugins of the score: see [plugins](plugins.md#load-time-and-memory).
 
 During playback, Studio marks each mini-notation value while its note sounds.
@@ -349,7 +349,7 @@ like a stored sample.
 
 ### Audio out latency
 
-Open Settings ▸ Advanced ▸ Audio out. The **audio out latency** row sets the
+Open Settings ▸ General ▸ Audio out. The **audio out latency** row sets the
 output buffer. Automatic lets the device choose. A smaller buffer reduces
 latency but can cause crackles. A larger buffer gives the device more time.
 The display shows frames, milliseconds, and the size the device accepted.
@@ -646,7 +646,7 @@ bypass it. Backspace removes it. The set remembers this limiter. The default
 limiter setting affects new or unconfigured sets. A score's `.limit(...)` is a
 separate effect.
 
-Advanced audio settings also set the maximum polyphony. More voices can use
+Audio settings on the General page also set the maximum polyphony. More voices can use
 more CPU. A score can override the limit with `setMaxPolyphony(...)`.
 
 ## Visuals
@@ -740,10 +740,30 @@ would otherwise land on the ground itself.
 ## Settings
 
 Press Ctrl+O. Use Tab to change pages, arrows to select or change values, and
-Space to toggle a switch. Settings include playback, rendering, samples,
-controller mapping, key bindings, the kinds of entry the reference lists, and
-the origins trusted for [script imports](#script-imports).
+Space to toggle a switch. The General page covers playback, live coding and
+the set. The other pages cover samples, controller mapping, key bindings, the
+kinds of entry the reference lists, and the origins trusted for
+[script imports](#script-imports).
 The About page reports terminal capabilities.
+
+The Appearance page holds everything visual: the chrome, the editor's marks,
+where the panels dock, and the drawing tier.
+
+The **beat line** row in the Look group adds a thin strip under the header
+that keeps the tempo visible from across the room. It follows the header's
+own beat clock and the theme's colours, and `←/→` walks its looks: `pulse`
+breathes on each beat, brightest on the downbeat, `travel` sends a bright
+segment across once per cycle, and `wave` rolls a swell along the line. It
+rests as a dim flat line while nothing plays.
+
+The `evaluation animation` row, under `flashing on evaluation` in the Editor
+group, shapes the flash a run of code makes when you evaluate it. `normal`
+swaps the lines in and out at once. `fade fast`, `fade medium` and `fade
+slow` fade the swap in and out. `swipe` fades the flash away behind a soft
+edge that sweeps left to right across each line, `zap` hits hard and
+evaporates, `steps` dims through four chunky rungs, `glitch` shatters lines
+into fast bands of blocks and flips, and `wave` sends a band of light along
+each line. The row above says which evaluations flash at all.
 
 The Terminal row at the top of the Keybinds page selects the list of shortcuts
 that Studio avoids because the terminal takes them. Keep it on automatic unless
@@ -788,7 +808,7 @@ session only.
 Use Automatic rendering unless you need a specific mode. Available modes
 depend on terminal glyphs, colors, image support, and reported dimensions.
 An unsupported choice falls back to Automatic. Image rendering can cost more
-than text cells. Reduce the frame rate in Advanced settings if visuals use
+than text cells. Reduce the frame rate in Appearance settings if visuals use
 too much CPU. Check the Log for device or render errors.
 
 ### Vim editor keys

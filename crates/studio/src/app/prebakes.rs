@@ -488,11 +488,11 @@ mod tests {
 
             app.toggle_settings_sheet();
             assert_eq!(app.focus, Focus::Panel(PanelKind::Settings));
-            // Up from the top wraps to the last row (full paths), then trim
-            // recordings, then the local prebake.
-            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
-            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
-            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            // Down to the local prebake row, past the set rows and the
+            // global prebake above it.
+            for _ in 0..9 {
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            }
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
             assert!(app.settings_sheet.is_none(), "the sheet handed over");

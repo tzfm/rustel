@@ -5,6 +5,7 @@
 - A click on the preview fader reads the bar it draws. Before, the click's bar was narrower than the drawn one, so a click on the knob set a gain a few dB higher.
 - Sample and manifest fetches retry a transient 429 or 5xx after a short rest, so a briefly overloaded sample host no longer fails a corpus run.
 
+- Settings has an Appearance page: the visual rows of the first page in one place. The Advanced page is gone, its rows sit at the end of General, and the first tab is renamed General. A beat line under the header keeps the tempo visible in pulse, travel and wave looks, and the evaluation animation row shapes the flash a run of code makes, with fades of three speeds, swipe, zap, steps, glitch and wave.
 - Auto evaluate no longer reinstalls a score when the edit adds no instruction. Typing a `$:`, a lane name, or a new line under a playing set leaves the sound alone, so an `oneshot` lane does not fire for it. A press, or a watched file, still applies.
 - `oneshot()` with no grid plays on the next cycle, the same as `oneshot(1)`. Before, it was silent.
 - A `$:` typed with no chain under it no longer doubles the lane above it. A label with no code changes no sound.
