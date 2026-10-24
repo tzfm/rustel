@@ -4136,7 +4136,7 @@ enum Node {
     /// of throwing at the host boundary: an expression the language can
     /// build must build here too, and it must empty the query rather than
     /// abort the evaluation.
-    QueryError(&'static str),
+    QueryError(Arc<str>),
     /// A resource refusal whose construction is valid but whose query cannot
     /// be answered within the native runtime's bound. The refusal is emitted
     /// here, inside the top-level query boundary; setting the thread-local at
@@ -4631,7 +4631,7 @@ impl Pattern {
             Node::Silence => Vec::new(),
 
             Node::QueryError(message) => {
-                signal_query_error(|| (*message).into());
+                signal_query_error(|| message.to_string());
                 Vec::new()
             }
 
@@ -8051,8 +8051,8 @@ pub const UNREADABLE_MIDI_PORT: &str = "(unreadable port name)";
 /// complaint and calls the non-function later, so the host must build
 /// something rather than throw. See
 /// `crates/jsruntime/tests/bind_ownership.rs`.
-pub fn query_error_pattern(message: &'static str) -> Pattern {
-    Pattern::of(Node::QueryError(message))
+pub fn query_error_pattern(message: impl Into<Arc<str>>) -> Pattern {
+    Pattern::of(Node::QueryError(message.into()))
 }
 
 /// A pure pattern that refuses through the typed resource channel when it is

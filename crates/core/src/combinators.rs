@@ -926,7 +926,7 @@ fn set_control<P: PatOps>(pat: &P, name: &str, value: Value) -> P {
 
 pub fn control<P: PatOps>(pat: &P, value: &Value) -> P {
     let Value::List(values) = crate::materialize_js_value(value) else {
-        return P::pat_query_error("control expects an array of [ccn, ccv]");
+        return P::pat_query_error("control expects an array of [ccn, ccv]".into());
     };
     let ccn = values.first().cloned().unwrap_or(Value::Undefined);
     let ccv = values.get(1).cloned().unwrap_or(Value::Undefined);
@@ -935,7 +935,7 @@ pub fn control<P: PatOps>(pat: &P, value: &Value) -> P {
 
 pub fn sysex<P: PatOps>(pat: &P, value: &Value) -> P {
     let Value::List(values) = crate::materialize_js_value(value) else {
-        return P::pat_query_error("sysex expects an array of [id, data]");
+        return P::pat_query_error("sysex expects an array of [id, data]".into());
     };
     let id = values.first().cloned().unwrap_or(Value::Undefined);
     let data = values.get(1).cloned().unwrap_or(Value::Undefined);
@@ -1067,12 +1067,12 @@ fn rearrange_with<P: PatOps>(pat: &P, indices: P, n: i64) -> P {
     indices.inner_bind(move |value| {
         let index = crate::util::parse_numeral(value).unwrap_or(f64::NAN);
         if !index.is_finite() || index < 0.0 || index.fract() != 0.0 {
-            return P::pat_query_error("rearrange index is out of range");
+            return P::pat_query_error("rearrange index is out of range".into());
         }
         slices
             .get(index as usize)
             .cloned()
-            .unwrap_or_else(|| P::pat_query_error("rearrange index is out of range"))
+            .unwrap_or_else(|| P::pat_query_error("rearrange index is out of range".into()))
             .repeat_cycles(n_fraction)
             .fast(n_fraction)
     })
@@ -1094,7 +1094,7 @@ pub fn scramble<P: PatOps>(pat: &P, n: i64) -> P {
 
 pub fn euclidish<P: PatOps>(pat: &P, pulses: i32, steps: i32, by: Fraction) -> P {
     if pulses < 0 || steps < 1 || pulses > steps {
-        return P::pat_query_error("euclidish expects 0 <= pulses <= steps");
+        return P::pat_query_error("euclidish expects 0 <= pulses <= steps".into());
     }
     if steps > crate::euclid::MAX_EUCLID_STEPS as i32 {
         return P::pat_query_limit(crate::QueryLimit::EuclidSteps {
@@ -1104,7 +1104,7 @@ pub fn euclidish<P: PatOps>(pat: &P, pulses: i32, steps: i32, by: Fraction) -> P
     }
     let from = match crate::euclid::bjorklund(pulses, steps as usize) {
         Ok(mask) => mask,
-        Err(_) => return P::pat_query_error("euclidish mask is invalid"),
+        Err(_) => return P::pat_query_error("euclidish mask is invalid".into()),
     };
     if pulses == 0 {
         return P::pat_silence();
@@ -1339,7 +1339,7 @@ pub fn stack_with<P: PatOps>(patterns: &[P], mode: StackMode) -> P {
         .map(P::pat_steps)
         .collect::<Option<Vec<_>>>()
     else {
-        return P::pat_query_error("aligned stacks require a step count for each pattern");
+        return P::pat_query_error("aligned stacks require a step count for each pattern".into());
     };
     let longest = *steps.iter().max().expect("nonempty stack");
     let mut aligned = Vec::with_capacity(patterns.len());
@@ -1397,7 +1397,7 @@ enum StepwisePlanError {
 fn stepwise_error<P: PatOps>(error: StepwisePlanError) -> P {
     match error {
         StepwisePlanError::Arithmetic => native_fraction_refusal("shrink/grow"),
-        StepwisePlanError::DivisionByZero => P::pat_query_error("Division by Zero"),
+        StepwisePlanError::DivisionByZero => P::pat_query_error("Division by Zero".into()),
         StepwisePlanError::HostMemory => {
             P::pat_query_limit(crate::mark_stepwise_refusal(crate::QueryLimit::HostMemory))
         }
@@ -1796,7 +1796,7 @@ pub fn euclid_with_steps<P: PatOps>(pat: &P, pulses: i32, steps: f64, rotation: 
         return P::pat_silence();
     }
     if !steps.is_finite() {
-        return P::pat_query_error("Invalid array length");
+        return P::pat_query_error("Invalid array length".into());
     }
     let width = steps.abs();
     let cycles = (f64::from(pulses.unsigned_abs()) / width).ceil();
@@ -1808,7 +1808,7 @@ pub fn euclid_with_steps<P: PatOps>(pat: &P, pulses: i32, steps: f64, rotation: 
         });
     }
     if total.fract() != 0.0 {
-        return P::pat_query_error("Invalid array length");
+        return P::pat_query_error("Invalid array length".into());
     }
     let Some(cycles) = Fraction::from_f64(cycles) else {
         return native_fraction_refusal("euclid");
