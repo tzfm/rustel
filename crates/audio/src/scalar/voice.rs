@@ -463,8 +463,25 @@ impl FmState {
         }
     }
 
-    pub(super) fn restart(&mut self, onset_frame: u64, sample_rate: u32) {
-        self.phases.fill(0.0);
+    pub(super) fn restart(
+        &mut self,
+        onset_frame: u64,
+        sample_rate: u32,
+        fm: &crate::backend::FmControls,
+        freq_hz: f32,
+    ) {
+        // Strudel runs its modulator oscillators from context time zero, so
+        // a note mid-render begins mid-cycle: seed each operator with the
+        // phase it has accumulated by the onset.
+        let onset_secs = onset_frame as f64 / f64::from(sample_rate);
+        for (phase, operator) in self.phases.iter_mut().zip(fm.operators.iter()) {
+            *phase = match operator {
+                Some(operator) if operator.waveform.oscillator().is_some() => {
+                    (f64::from(freq_hz * operator.harmonicity) * onset_secs).fract()
+                }
+                _ => 0.0,
+            };
+        }
         self.quantum_skip = (onset_frame % 128) as u8;
         self.noise.fill(NoiseGen::new(sample_rate));
     }
