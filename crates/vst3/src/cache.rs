@@ -124,11 +124,18 @@ impl Cache {
     }
 
     /// Writes the cache file: a new file first, then the name change, so a
-    /// reader never finds a half file.
+    /// reader never finds a half file. The file's own entries come in
+    /// first: another host can have written since this one read the file,
+    /// and its bundles must not vanish behind this write. Where both have
+    /// an answer for one bundle, this cache's own wins.
     pub(crate) fn write(&self, file: &Path) {
+        let mut merged = Self::read(file);
+        for (path, tested) in &self.bundles {
+            merged.bundles.insert(path.clone(), tested.clone());
+        }
         let cache = Self {
             version: VERSION,
-            bundles: self.bundles.clone(),
+            bundles: merged.bundles,
         };
         let Ok(json) = serde_json::to_vec(&cache) else {
             return;
@@ -296,6 +303,50 @@ mod tests {
         let second = stamp(&bundle);
         assert_ne!(first, second);
         assert_eq!(cache.fault(&bundle, second), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_later_writer_keeps_the_entries_of_an_earlier_one() {
+        let root =
+            std::env::temp_dir().join(format!("rustel-vst3-cache-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let one = root.join("One.vst3");
+        let two = root.join("Two.vst3");
+        std::fs::write(&one, [0u8; 16]).unwrap();
+        std::fs::write(&two, [0u8; 16]).unwrap();
+        let file = root.join(FILE_NAME);
+
+        // Two hosts that each read an empty file before either writes: the
+        // second write must not erase the first's answer.
+        let mut first = Cache::read(&file);
+        let mut second = Cache::read(&file);
+        assert!(first.store(
+            &one,
+            stamp(&one),
+            &[Scanned {
+                name: "One".into(),
+                vendor: "Maker".into(),
+                categories: "Fx".into(),
+                class: String::new(),
+                fault: None,
+            }]
+        ));
+        assert!(second.store_fault(&two, stamp(&two), "no audio plugin"));
+        first.write(&file);
+        second.write(&file);
+
+        let merged = Cache::read(&file);
+        assert!(
+            merged.plugins(&one, stamp(&one)).is_some(),
+            "bundle one is kept"
+        );
+        assert_eq!(
+            merged.fault(&two, stamp(&two)),
+            Some("no audio plugin"),
+            "bundle two is kept"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
