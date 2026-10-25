@@ -1007,6 +1007,9 @@ impl SampleLibrary {
     /// `name/1.wav` is what makes the copied bank answer to `name` - and
     /// `n` still picks between them, in the order the bank had.
     ///
+    /// The copy is refused if `name` is not one folder name or the destination
+    /// escapes `root` through a path or link.
+    ///
     /// Only what is already downloaded is copied. A sound whose files have
     /// never been fetched is reported as nothing copied rather than
     /// silently reaching the network in the middle of a file operation.
@@ -1060,9 +1063,40 @@ impl SampleLibrary {
                 urls.len()
             ));
         }
+        let mut components = Path::new(name).components();
+        if !matches!(
+            components.next(),
+            Some(std::path::Component::Normal(component))
+                if component == std::ffi::OsStr::new(name)
+        ) || components.next().is_some()
+        {
+            return Err(format!(
+                "cannot copy {name}: a bank name must be one folder name"
+            ));
+        }
+        std::fs::create_dir_all(root)
+            .map_err(|error| format!("create {}: {error}", root.display()))?;
+        let root = root
+            .canonicalize()
+            .map_err(|error| format!("read {}: {error}", root.display()))?;
         let folder = root.join(name);
+        if std::fs::symlink_metadata(&folder)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(format!(
+                "cannot copy {name}: the bank folder is a symbolic link"
+            ));
+        }
         std::fs::create_dir_all(&folder)
             .map_err(|error| format!("create {}: {error}", folder.display()))?;
+        let folder = folder
+            .canonicalize()
+            .map_err(|error| format!("read {}: {error}", folder.display()))?;
+        if folder.parent() != Some(root.as_path()) {
+            return Err(format!(
+                "cannot copy {name}: the bank folder leaves the destination"
+            ));
+        }
         // Zero-padded, because the scan orders a bank's files by name and
         // `10.wav` sorts before `2.wav`.
         let width = urls.len().to_string().len();
@@ -1076,6 +1110,14 @@ impl SampleLibrary {
                 _ => "wav",
             };
             let into = folder.join(format!("{index:0width$}.{extension}"));
+            if std::fs::symlink_metadata(&into)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                return Err(format!(
+                    "cannot copy {name}: {} is a symbolic link",
+                    into.display()
+                ));
+            }
             std::fs::write(&into, bytes)
                 .map_err(|error| format!("write {}: {error}", into.display()))?;
             copied += 1;
@@ -1385,7 +1427,7 @@ impl SampleLibrary {
             // ordinary MIDI 36 default. This must choose the same key as the
             // voice: MIDI 60 can be another file in a note-keyed bank, whose
             // shape was never decoded by the preview we just heard.
-            Named::Bank(bank) => Some(pick_from_bank(bank, n, 36.0).0),
+            Named::Bank(bank) => pick_from_bank(bank, n, 36.0).map(|(url, _)| url),
             Named::Font(_) => None,
         })??;
         let shape = self

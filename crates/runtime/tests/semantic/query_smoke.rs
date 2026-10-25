@@ -950,6 +950,18 @@ fn vst_names_are_text_and_values_are_patterns() {
         ]
     );
 
+    // A slider that is the value of a key names its id beside the params.
+    let mut session = Session::new().expect("session");
+    session
+        .evaluate(r#"s("saw").vst("My Plugin", { mix: sliderWithID('mix', 0.5) })"#)
+        .expect("a score with a slider on a plugin key");
+    let haps = session.query(Fraction::ZERO, Fraction::ONE).expect("query");
+    let plugin = haps[0].value.as_object().and_then(|map| map.get("vst"));
+    assert_eq!(
+        plugin.map(rustel_core::Value::show).unwrap_or_default(),
+        "{name:My Plugin __rustel_binding:p0 params:{mix:0.5} __rustel_sliders:{mix:mix}}"
+    );
+
     let mut session = Session::new().expect("session");
     assert!(session.evaluate(r#"s("saw").vst({ mix: 1 })"#).is_err());
 

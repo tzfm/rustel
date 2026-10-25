@@ -1,3 +1,5 @@
+use ratatui::buffer::Cell;
+
 use super::*;
 
 /// Whether a glyph is one of the drawing rasters' - a block, a sextant, a
@@ -469,8 +471,11 @@ impl Widget for Backdrop<'_> {
 /// A geometry-neutral acknowledgement that the score was evaluated. Only
 /// visible, non-empty source lines flash: the terminal visualizers and the
 /// unused editor background keep moving without a full-pane white blast.
+/// The pulse says how the flash moves, so no clock is needed here.
 pub(super) struct EvaluationFlash<'a> {
     pub(super) map: &'a ScreenMap,
+    pub(super) theme: &'a Theme,
+    pub(super) pulse: super::EvaluationPulse,
 }
 
 /// A subtle, full-width cue for the caret's logical line, including wrapped
@@ -600,11 +605,56 @@ impl Widget for EvaluationFlash<'_> {
             if end <= area.x {
                 continue;
             }
-            buffer.set_style(
-                Rect::new(area.x, row.screen_y, end - area.x, 1),
-                Style::default().add_modifier(Modifier::REVERSED),
-            );
+            let width = end - area.x;
+            for x in area.x..end {
+                let Some(cell) = buffer.cell_mut((x, row.screen_y)) else {
+                    continue;
+                };
+                match self.pulse.look(row.line, x - area.x, width) {
+                    FlashLook::Off => {}
+                    FlashLook::Reverse => {
+                        cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+                    }
+                    FlashLook::Wash(level) => {
+                        wash(cell, self.theme, level);
+                    }
+                    FlashLook::Glyph(glyph) => {
+                        cell.set_symbol(glyph);
+                    }
+                }
+            }
         }
+    }
+}
+
+/// Blend a cell toward the theme's opposite grounds by `level`: the text
+/// drifts toward the background colour and the ground toward the text
+/// colour, which at whole strength is the swap the reverse modifier makes
+/// and in between is every step of a fade. Terminal-owned colours with no
+/// measurable RGB start from the theme's own grounds.
+fn wash(cell: &mut Cell, theme: &Theme, level: f32) {
+    let (Some(front), Some(back)) = (rgb(theme.foreground), rgb(theme.background)) else {
+        return;
+    };
+    let mix = |from: u8, toward: u8| {
+        (f32::from(from) + (f32::from(toward) - f32::from(from)) * level).round() as u8
+    };
+    let blend = |from: Color, toward: (u8, u8, u8)| match from {
+        Color::Rgb(red, green, blue) => Color::Rgb(
+            mix(red, toward.0),
+            mix(green, toward.1),
+            mix(blue, toward.2),
+        ),
+        _ => Color::Rgb(toward.0, toward.1, toward.2),
+    };
+    cell.fg = blend(cell.fg, back);
+    cell.bg = blend(cell.bg, front);
+}
+
+fn rgb(color: Color) -> Option<(u8, u8, u8)> {
+    match color {
+        Color::Rgb(red, green, blue) => Some((red, green, blue)),
+        _ => None,
     }
 }
 
@@ -746,7 +796,17 @@ mod tests {
             .map(|cell| cell.symbol().to_owned())
             .collect::<Vec<_>>();
 
-        EvaluationFlash { map: &map }.render(area, &mut buffer);
+        let theme = Theme::built_in_default();
+        EvaluationFlash {
+            map: &map,
+            theme: &theme,
+            pulse: super::EvaluationPulse {
+                animation: crate::settings::EvalAnimation::Normal,
+                progress: 0.0,
+                intensity: 1.0,
+            },
+        }
+        .render(area, &mut buffer);
 
         assert_eq!(
             buffer

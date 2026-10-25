@@ -26,6 +26,7 @@ use crate::samples::ScoreSampleAccess;
 
 pub use crate::hydra_input::{
     HydraCameraPicture, HydraInputPolicy, HydraWebcamPreview, HydraWebcamState, HydraWebcamStatus,
+    WEBCAM_BLOCKED_HINT,
 };
 
 // The recording crate intentionally carries only JSON, not a dependency on

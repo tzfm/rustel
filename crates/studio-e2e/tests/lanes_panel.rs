@@ -12,12 +12,12 @@ static AUDIO_CALLBACK_ALLOCATOR: rustel_audio::tripwire::TripwireAlloc =
 use crossterm::event::{KeyCode, KeyModifiers};
 use rustel_studio_e2e::{PanelKind, hermetic};
 
-/// The panel has no chord: F1, `v` drops View, and `e` picks Lanes. A
+/// The panel has no chord: F1, `v` drops View, and `l` picks Lanes. A
 /// toggle row runs its change and closes the bar.
 fn toggle_lanes(studio: &mut rustel_studio_e2e::Hermetic) {
     studio.press(KeyCode::F(1), KeyModifiers::NONE);
     studio.press(KeyCode::Char('v'), KeyModifiers::NONE);
-    studio.press(KeyCode::Char('e'), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('l'), KeyModifiers::NONE);
 }
 
 /// The row of the panel's rule.

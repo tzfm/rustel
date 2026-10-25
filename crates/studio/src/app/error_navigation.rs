@@ -162,7 +162,7 @@ impl App {
         self.arm_focus_rotation_flash(RotationStop::Editor);
     }
 
-    fn focus_editor_for_locator(&mut self) {
+    pub(super) fn focus_editor_for_locator(&mut self) {
         self.help = None;
         self.menu = None;
         self.dismiss_dialogs(None);

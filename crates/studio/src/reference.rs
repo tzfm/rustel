@@ -88,7 +88,22 @@ pub use vocabulary::{
     tuning_vocabulary,
 };
 #[cfg(feature = "vst")]
-pub use vst::{PluginRow, PluginWords, VstTab, key_words};
+pub use vst::{PluginRow, PluginWords, VstSection, VstTab, key_words, rank_names};
+
+/// A parameter key in the form a score writes in the object of a call:
+/// a name or a number as is, each other key in single quotes. A score
+/// reads a key in double quotes as mini-notation.
+pub(crate) fn score_key(key: &str) -> String {
+    let word = |char: char| char.is_ascii_alphanumeric() || char == '_';
+    let name = key.starts_with(|char: char| char.is_ascii_alphabetic() || char == '_')
+        && key.chars().all(word);
+    let number = !key.is_empty() && key.chars().all(|char| char.is_ascii_digit());
+    if name || number {
+        key.to_owned()
+    } else {
+        format!("'{}'", key.replace('\\', "\\\\").replace('\'', "\\'"))
+    }
+}
 
 /// Variant rows an expanded bank shows at most; a soundfont with hundreds
 /// of files is still one sound to a score.
@@ -466,6 +481,9 @@ pub struct ReferencePanel {
     pub selection: Option<PaneSelection>,
     pub tab: Tab,
     pub mode: ReferenceMode,
+    /// Vim command mode for the search box: true when `i` or `a` entered
+    /// Insert. The box takes letters only in Insert.
+    pub(crate) vim_insert: bool,
     pub query: String,
     pub results: Vec<usize>,
     /// The caret is not on a blank line, so a snippet cannot go where it
@@ -662,6 +680,12 @@ pub struct ReferenceView<'a> {
     /// read past: the search caret goes out and the footer says the way
     /// back, because two lit carets is one too many.
     pub focused: bool,
+    /// Vim text modes own the search. Command rests with no caret and a
+    /// hint in the row.
+    pub vim: bool,
+    /// An anchored completion types without Insert, so its caret stays up
+    /// and its row does not ask for `i` or `a`.
+    pub anchored: bool,
     /// The samples tab's pulse row: what the mix is doing, right where the
     /// sounds are auditioned. `None` outside the studio's frame loop.
     pub pulse: Option<SamplesPulse<'a>>,
@@ -775,6 +799,9 @@ pub struct SamplesPulse<'a> {
     pub peak_db: f32,
     /// The preview's own volume, 1.0 being unity.
     pub preview_gain: f32,
+    /// Whether moving through the list plays each row the cursor lands on,
+    /// so the shortcut that turns it off is in reach of the eye.
+    pub auto_preview: bool,
     /// The sounding preview's shape, as peaks 0 through 255, and how far
     /// into it the sound has got, 0 through 1. `None` with nothing being
     /// previewed, or before a first-time sound has finished decoding.
@@ -1960,6 +1987,8 @@ mod tests {
                 ReferenceView {
                     keybinds: &crate::keybinds::Keybinds::default(),
                     focused: true,
+                    vim: false,
+                    anchored: false,
                     pulse: None,
                     sounding_note: None,
                     loading: None,
@@ -2122,6 +2151,8 @@ mod tests {
                 ReferenceView {
                     keybinds: &crate::keybinds::Keybinds::default(),
                     focused: true,
+                    vim: false,
+                    anchored: false,
                     pulse: None,
                     sounding_note: None,
                     loading: None,
@@ -2198,6 +2229,8 @@ mod tests {
                 ReferenceView {
                     keybinds: &crate::keybinds::Keybinds::default(),
                     focused: true,
+                    vim: false,
+                    anchored: false,
                     pulse: None,
                     sounding_note: None,
                     loading: None,
@@ -2223,6 +2256,8 @@ mod tests {
                 ReferenceView {
                     keybinds: &crate::keybinds::Keybinds::default(),
                     focused: true,
+                    vim: false,
+                    anchored: false,
                     pulse: None,
                     sounding_note: None,
                     loading: None,
@@ -2250,6 +2285,8 @@ mod tests {
             ReferenceView {
                 keybinds: &crate::keybinds::Keybinds::default(),
                 focused: true,
+                vim: false,
+                anchored: false,
                 pulse: None,
                 sounding_note: None,
                 loading: None,
@@ -2295,6 +2332,8 @@ mod tests {
                 reference: &reference,
                 theme: &theme,
                 focused: true,
+                vim: false,
+                anchored: false,
                 pulse: None,
                 sounding_note: None,
                 loading: None,
@@ -2732,6 +2771,7 @@ mod tests {
             let pulse = SamplesPulse {
                 peak_db: -18.0,
                 preview_gain: 1.0,
+                auto_preview: false,
                 shape: None,
             };
             let row_text = |buffer: &Buffer, y: u16| {
@@ -2745,6 +2785,8 @@ mod tests {
                 ReferenceView {
                     keybinds: &crate::keybinds::Keybinds::default(),
                     focused: true,
+                    vim: false,
+                    anchored: false,
                     pulse: Some(pulse),
                     sounding_note: None,
                     loading: None,
@@ -2853,6 +2895,8 @@ mod tests {
             ReferenceView {
                 keybinds: &crate::keybinds::Keybinds::default(),
                 focused: true,
+                vim: false,
+                anchored: false,
                 pulse: None,
                 sounding_note: None,
                 loading: None,
@@ -2927,6 +2971,7 @@ mod tests {
             let pulse = SamplesPulse {
                 peak_db: f32::NEG_INFINITY,
                 preview_gain: 1.0,
+                auto_preview: false,
                 shape: None,
             };
 
@@ -2953,6 +2998,8 @@ mod tests {
                         ReferenceView {
                             keybinds: &crate::keybinds::Keybinds::default(),
                             focused: true,
+                            vim: false,
+                            anchored: false,
                             pulse: Some(pulse),
                             sounding_note: None,
                             loading: None,
@@ -3950,6 +3997,8 @@ mod tests {
                 panel: &panel,
                 theme: &Theme::built_in_default(),
                 focused: true,
+                vim: false,
+                anchored: false,
                 pulse: None,
                 sounding_note: None,
                 loading: None,
@@ -4034,6 +4083,8 @@ mod tests {
                     panel: &panel,
                     theme: &theme,
                     focused: true,
+                    vim: false,
+                    anchored: false,
                     pulse: None,
                     sounding_note: None,
                     picture: false,
@@ -4183,7 +4234,7 @@ mod tests {
         fn the_preview_fader_can_land_exactly_on_unity() {
             let inner = Rect::new(0, 0, 40, 10);
             let exact = (inner.x..inner.right())
-                .map(|x| preview_gain_at(inner, x))
+                .map(|x| preview_gain_at(inner, x, Tab::Samples, false))
                 .filter(|gain| *gain == 1.0)
                 .count();
             assert!(exact >= 1, "some column must mean exactly 0 dB");
@@ -4500,6 +4551,8 @@ mod tests {
             ReferenceView {
                 keybinds: &crate::keybinds::Keybinds::default(),
                 focused: true,
+                vim: false,
+                anchored: false,
                 pulse: None,
                 sounding_note: None,
                 loading: None,
@@ -4556,6 +4609,8 @@ mod tests {
             ReferenceView {
                 keybinds: &crate::keybinds::Keybinds::default(),
                 focused: true,
+                vim: false,
+                anchored: false,
                 pulse: None,
                 sounding_note: None,
                 loading: None,
@@ -5026,6 +5081,8 @@ mod tests {
                 panel: &panel,
                 theme: &Theme::built_in_default(),
                 focused: true,
+                vim: false,
+                anchored: false,
                 pulse: None,
                 sounding_note: None,
                 loading: None,
@@ -5057,6 +5114,30 @@ mod tests {
             );
             let inner = inner_area(area);
             assert_eq!(panel.search_cursor(inner), Some((inner.x + 9, inner.y + 1)));
+        }
+
+        #[test]
+        fn the_search_cursor_follows_the_chords_and_scales_queries() {
+            let reference = Reference::load(engine_knows());
+            let mut panel = ReferencePanel::browse(&reference);
+            let area = Rect::new(0, 0, 80, 26);
+            let inner = inner_area(area);
+
+            // A stale reference query must not place the chords caret.
+            panel.query = "stale".into();
+            panel.select_tab(Tab::Chords);
+            panel.chord_query = "maj".into();
+            assert_eq!(
+                panel.search_cursor(inner),
+                Some((inner.x + "search: ".len() as u16 + 3, inner.y + 1))
+            );
+
+            panel.select_tab(Tab::Scales);
+            panel.scale_query = "minor".into();
+            assert_eq!(
+                panel.search_cursor(inner),
+                Some((inner.x + "search: ".len() as u16 + 5, inner.y + 1))
+            );
         }
 
         #[test]
@@ -5374,6 +5455,8 @@ mod tests {
                 ReferenceView {
                     keybinds: &crate::keybinds::Keybinds::default(),
                     focused: true,
+                    vim: false,
+                    anchored: false,
                     pulse: None,
                     sounding_note: None,
                     loading: None,
@@ -5495,6 +5578,8 @@ mod tests {
                 ReferenceView {
                     keybinds: &crate::keybinds::Keybinds::default(),
                     focused: true,
+                    vim: false,
+                    anchored: false,
                     pulse: None,
                     sounding_note: None,
                     loading: None,
@@ -5624,6 +5709,8 @@ mod tests {
                 ReferenceView {
                     keybinds: &crate::keybinds::Keybinds::default(),
                     focused: true,
+                    vim: false,
+                    anchored: false,
                     pulse: None,
                     sounding_note: None,
                     loading: None,
@@ -5998,6 +6085,8 @@ mod tests {
             ReferenceView {
                 keybinds: &crate::keybinds::Keybinds::default(),
                 focused: true,
+                vim: false,
+                anchored: false,
                 pulse: None,
                 sounding_note: None,
                 loading: None,
@@ -6326,6 +6415,8 @@ mod sketch_tab_tests {
         ReferenceView {
             keybinds: &crate::keybinds::Keybinds::default(),
             focused: true,
+            vim: false,
+            anchored: false,
             pulse: None,
             sounding_note: None,
             loading: None,
@@ -6387,12 +6478,23 @@ mod tag_discovery_tests {
     use ratatui::widgets::Widget;
 
     fn drawn(panel: &ReferencePanel, reference: &Reference) -> String {
+        drawn_with(panel, reference, false, false)
+    }
+
+    fn drawn_with(
+        panel: &ReferencePanel,
+        reference: &Reference,
+        vim: bool,
+        anchored: bool,
+    ) -> String {
         let theme = Theme::built_in_default();
         let area = Rect::new(0, 0, 90, 24);
         let mut buffer = ratatui::buffer::Buffer::empty(area);
         ReferenceView {
             keybinds: &crate::keybinds::Keybinds::default(),
             focused: true,
+            vim,
+            anchored,
             pulse: None,
             sounding_note: None,
             loading: None,
@@ -6422,6 +6524,25 @@ mod tag_discovery_tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn a_vim_command_search_asks_for_insert() {
+        let reference = Reference::load_all();
+        let mut panel = ReferencePanel::browse(&reference);
+        let command = drawn_with(&panel, &reference, true, false);
+        assert!(command.contains("search: i or a types"), "{command}");
+
+        panel.set_vim_insert(true);
+        let insert = drawn_with(&panel, &reference, true, false);
+        assert!(!insert.contains("i or a types"), "{insert}");
+
+        // An anchored completion types, so it never asks for Insert.
+        let anchored = drawn_with(&panel, &reference, true, true);
+        assert!(!anchored.contains("i or a types"), "{anchored}");
+
+        let plain = drawn_with(&panel, &reference, false, false);
+        assert!(!plain.contains("i or a types"), "{plain}");
     }
 
     /// An empty search shows a `tag:` hint instead of a redundant result count.
@@ -6488,6 +6609,8 @@ mod tag_discovery_tests {
                 panel: &panel,
                 theme: &theme,
                 focused: false,
+                vim: false,
+                anchored: false,
                 pulse: None,
                 sounding_note: None,
                 picture: false,

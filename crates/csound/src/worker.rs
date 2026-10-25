@@ -71,6 +71,11 @@ struct Channel {
     /// Each slot confirms the end of one cut's stale audio interval.
     /// The callback reuses it only after acquiring the confirmation.
     clean_from: [AtomicU64; COMMAND_CAPACITY as usize],
+    /// The frame where the worker started its orchestra last: 0 for the
+    /// orchestra the insert starts with, the frame of the note that asked
+    /// for a later one. The callback counts a dry frame as starved only from
+    /// one runway past it.
+    started: AtomicU64,
     /// The largest note lead the callback has posted.
     lead: AtomicU64,
     /// The frame an offline render asked for last. The worker renders to
@@ -102,6 +107,7 @@ impl Channel {
             written: AtomicU64::new(0),
             read: AtomicU64::new(0),
             clean_from: std::array::from_fn(|_| AtomicU64::new(u64::MAX)),
+            started: AtomicU64::new(0),
             lead: AtomicU64::new(0),
             wanted: AtomicU64::new(0),
             offline: AtomicBool::new(false),
@@ -414,6 +420,14 @@ impl OrbitInsert for Insert {
                 Command::Score { .. } => unreachable!(),
             }))
             .min();
+        // The worker fills the first runway of an orchestra late: after the
+        // first read, or after the compile a note asked for. Those frames,
+        // and the silence before that note, read dry by design.
+        let warm = self
+            .channel
+            .started
+            .load(Ordering::Acquire)
+            .saturating_add(RUNWAY_FRAMES);
         let mut starved = 0u64;
         for (index, (out_left, out_right)) in left.iter_mut().zip(right.iter_mut()).enumerate() {
             let frame = start + index as u64;
@@ -425,7 +439,7 @@ impl OrbitInsert for Insert {
                 *out_left = sample_left;
                 *out_right = sample_right;
             } else {
-                if frame >= written {
+                if frame >= written && frame >= warm {
                     starved += 1;
                 }
                 *out_left = 0.0;
@@ -515,6 +529,30 @@ impl State {
             if self.channel.stopping.load(Ordering::Acquire) {
                 return;
             }
+            // The bound comes before the commands, so each command the
+            // callback posted before it raised this bound is in the queue
+            // now. The callback posts a block's notes before it moves the
+            // bound for that block.
+            let lead = self.channel.lead.load(Ordering::Acquire);
+            let runway = lead
+                .saturating_sub(CALLBACK_BLOCK)
+                .clamp(MIN_RUNWAY_FRAMES, RUNWAY_FRAMES);
+            let read = self.channel.read.load(Ordering::Acquire);
+            let target = if self.channel.offline.load(Ordering::Acquire) {
+                // The offline render delivers a block's notes before it
+                // asks for the block's frames, so the frontier the worker
+                // holds at that ask never passes a due the block carries.
+                self.channel.wanted.load(Ordering::Acquire)
+            } else if read == 0 {
+                // Nothing has been read yet. The activation posts an
+                // insert's first note before the insert's first collect,
+                // so the frontier stays under whatever due that note
+                // carries. Frames before it are silence the reader reads
+                // for free, also when an always-on instrument plays.
+                self.write
+            } else {
+                read.saturating_add(runway)
+            };
             while let Some(command) = self.channel.drain() {
                 match command {
                     Command::Score { id, due } => {
@@ -549,26 +587,6 @@ impl State {
                     }
                 }
             }
-            let lead = self.channel.lead.load(Ordering::Acquire);
-            let runway = lead
-                .saturating_sub(CALLBACK_BLOCK)
-                .clamp(MIN_RUNWAY_FRAMES, RUNWAY_FRAMES);
-            let read = self.channel.read.load(Ordering::Acquire);
-            let target = if self.channel.offline.load(Ordering::Acquire) {
-                // The offline render delivers a block's notes before it
-                // asks for the block's frames, so the frontier the worker
-                // holds at that ask never passes a due the block carries.
-                self.channel.wanted.load(Ordering::Acquire)
-            } else if read == 0 {
-                // Nothing has been read yet. The activation posts an
-                // insert's first note before the insert's first collect,
-                // so the frontier stays under whatever due that note
-                // carries. Frames before it are silence the reader reads
-                // for free, also when an always-on instrument plays.
-                self.write
-            } else {
-                read.saturating_add(runway)
-            };
             let mut rendered = false;
             while self.write < target {
                 self.step();
@@ -633,21 +651,19 @@ impl State {
     /// Renders one frame into the ring.
     fn step(&mut self) {
         if self.engine.is_none()
-            && self
+            && let Some(onset) = self
                 .pending
                 .iter()
-                .any(|event| matches!(event.action, Action::Score(_)))
+                .find(|event| matches!(event.action, Action::Score(_)))
+                .map(|event| event.frame)
         {
             // A cut took the orchestra, and a note has asked for it again.
             // The rest after the cut pays for the compile: the insert is
             // silent now, and the note has its schedule lead. This runs on
             // the worker, where a slow compile costs a dry ring, not a
             // dropout.
-            match Engine::new(&self.program.sources, self.sample_rate) {
-                Ok(engine) => self.engine = Some(engine),
-                Err(error) => {
-                    self.fail(error);
-                }
+            if let Err(error) = self.start_orchestra(onset) {
+                self.fail(error);
             }
         }
         while self
@@ -658,14 +674,11 @@ impl State {
             match self.pending.remove(0).action {
                 Action::Score(score) => {
                     self.pending_bytes -= score.len();
-                    if self.engine.is_none() {
-                        match Engine::new(&self.program.sources, self.sample_rate) {
-                            Ok(engine) => self.engine = Some(engine),
-                            Err(error) => {
-                                self.fail(error);
-                                continue;
-                            }
-                        }
+                    if self.engine.is_none()
+                        && let Err(error) = self.start_orchestra(self.write)
+                    {
+                        self.fail(error);
+                        continue;
                     }
                     if let Some(engine) = self.engine.as_mut()
                         && let Err(error) = engine.score(&score)
@@ -692,6 +705,15 @@ impl State {
             }
         }
         self.write += 1;
+    }
+
+    /// Builds a fresh orchestra for the note at `onset`. The insert is
+    /// silent until that note, so the note marks the start. The callback
+    /// reads dry past the frontier while the orchestra compiles.
+    fn start_orchestra(&mut self, onset: u64) -> Result<(), String> {
+        self.channel.started.store(onset, Ordering::Release);
+        self.engine = Some(Engine::new(&self.program.sources, self.sample_rate)?);
+        Ok(())
     }
 
     /// Keeps rendering after an error: the event list goes, the orchestra
@@ -781,6 +803,50 @@ mod tests {
             assert_eq!(command, Command::Score { id: at, due: at });
         }
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_command_posted_right_before_the_bound_rises_lands_on_its_frame() {
+        const ROUNDS: u64 = if cfg!(miri) { 4 } else { 100_000 };
+        for offline in [true, false] {
+            let channel = Arc::new(Channel::new());
+            channel.offline.store(offline, Ordering::Release);
+            let shared = Arc::clone(&channel);
+            let worker = thread::spawn(move || {
+                State {
+                    program: Program::without_orchestra(),
+                    sample_rate: 48_000,
+                    channel: shared,
+                    engine: None,
+                    pending: Vec::new(),
+                    pending_bytes: 0,
+                    write: 0,
+                }
+                .run();
+            });
+            // Live, the bound is a runway past the frame read last.
+            let runway = if offline { 0 } else { MIN_RUNWAY_FRAMES };
+            for round in 1..=ROUNDS {
+                let frame = round * CALLBACK_BLOCK;
+                // A cut confirms the frame it ran at, and a note needs the
+                // native library. So a cut on the last frame the raised
+                // bound covers stands for the note.
+                let due = frame + runway - 1;
+                channel.clean_from[0].store(u64::MAX, Ordering::Relaxed);
+                assert!(channel.post(Command::Cut { due, mask: 0 }));
+                if offline {
+                    channel.wanted.store(frame, Ordering::Release);
+                } else {
+                    channel.read.store(frame, Ordering::Release);
+                }
+                while channel.written.load(Ordering::Acquire) <= due {
+                    thread::yield_now();
+                }
+                assert_eq!(channel.clean_from[0].load(Ordering::Acquire), due);
+            }
+            channel.stopping.store(true, Ordering::Release);
+            worker.join().unwrap();
+        }
     }
 
     #[test]
@@ -1020,5 +1086,52 @@ mod tests {
         }
         insert.flush(0);
         assert!(insert.pending_control.is_none());
+    }
+
+    #[test]
+    fn the_first_runway_of_an_orchestra_reads_dry_without_starving() {
+        let channel = Arc::new(Channel::new());
+        // This worker renders nothing, so each frame reads dry.
+        let mut insert = reader(&channel);
+        let starved = |insert: &Insert| insert.counters.starved_frames.load(Ordering::Relaxed);
+        for _ in 0..RUNWAY_FRAMES / CALLBACK_BLOCK {
+            play_block(&mut insert);
+        }
+        assert_eq!(starved(&insert), 0);
+        play_block(&mut insert);
+        assert_eq!(starved(&insert), CALLBACK_BLOCK);
+        // A note after a cut starts the next orchestra at its own frame, one
+        // block past the reader here. The silence before it does not count.
+        channel
+            .started
+            .store(insert.frame + CALLBACK_BLOCK, Ordering::Release);
+        for _ in 0..=RUNWAY_FRAMES / CALLBACK_BLOCK {
+            play_block(&mut insert);
+        }
+        assert_eq!(starved(&insert), CALLBACK_BLOCK);
+        play_block(&mut insert);
+        assert_eq!(starved(&insert), 2 * CALLBACK_BLOCK);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not load the native library")]
+    fn a_note_that_starts_an_orchestra_marks_its_frame() {
+        let channel = Arc::new(Channel::new());
+        let mut state = State {
+            program: Program::without_orchestra(),
+            sample_rate: 48_000,
+            channel: Arc::clone(&channel),
+            engine: None,
+            pending: Vec::new(),
+            pending_bytes: 0,
+            write: 300,
+        };
+        let score = "i \"triangle\" 0 0.1 440 0.2 \"\"\n".to_owned();
+        // The note sounds past the frontier, and the frames before it are
+        // silent.
+        state.schedule(900, Action::Score(score)).unwrap();
+        // The mark comes before the compile, which fails with no library.
+        state.step();
+        assert_eq!(channel.started.load(Ordering::Acquire), 900);
     }
 }

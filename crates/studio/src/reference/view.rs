@@ -96,7 +96,7 @@ pub(super) fn sample_source_line(panel: &ReferencePanel) -> String {
 impl ReferenceView<'_> {
     fn return_hint(&self) -> String {
         self.keybinds
-            .binding(super::super::keybinds::BindAction::Reference)
+            .hint_binding(super::super::keybinds::BindAction::Reference)
             .map_or_else(
                 || "click returns".to_owned(),
                 |binding| format!("{} returns", binding.hint()),
@@ -192,6 +192,16 @@ impl Widget for ReferenceView<'_> {
 }
 
 impl ReferenceView<'_> {
+    /// The search row. In Vim Command an empty row says how to type, so the
+    /// eye is not left with a bare label and a blinking caret.
+    fn search_row(&self, query: &str) -> String {
+        if self.vim && !self.panel.vim_insert() && !self.anchored && query.is_empty() {
+            "search: i or a types".to_owned()
+        } else {
+            format!("search: {query}")
+        }
+    }
+
     /// The example tree and the highlighted code that is about to be copied.
     #[cfg(feature = "hydra")]
     fn render_snippets(&self, inner: Rect, buffer: &mut Buffer) {
@@ -676,7 +686,7 @@ impl ReferenceView<'_> {
         buffer.set_stringn(
             inner.x,
             inner.y + 1,
-            format!("search: {}", self.panel.chord_query),
+            self.search_row(&self.panel.chord_query),
             usize::from(inner.width),
             Style::default().fg(theme.foreground),
         );
@@ -783,6 +793,7 @@ impl ReferenceView<'_> {
             } else {
                 &[
                     "↑↓ move",
+                    "Alt+A auto",
                     "→ opens or plays",
                     "Space plays",
                     "← folds",
@@ -800,7 +811,7 @@ impl ReferenceView<'_> {
         buffer.set_stringn(
             inner.x,
             inner.y + 1,
-            format!("search: {}", self.panel.scale_query),
+            self.search_row(&self.panel.scale_query),
             usize::from(inner.width),
             Style::default().fg(theme.foreground),
         );
@@ -898,6 +909,7 @@ impl ReferenceView<'_> {
             } else {
                 &[
                     "↑↓ move",
+                    "Alt+A auto",
                     "→ opens or plays",
                     "Space plays/stops",
                     "← folds",
@@ -918,12 +930,13 @@ impl ReferenceView<'_> {
         buffer.set_stringn(
             inner.x,
             inner.y + 1,
-            format!("search: {}", tab.query()),
+            self.search_row(tab.query()),
             usize::from(inner.width),
             Style::default().fg(theme.foreground),
         );
         let rows = tab.rows();
         let plugins = tab.plugins();
+        let open = tab.open_plugin();
         let shown = rows
             .iter()
             .filter(|row| matches!(row, PluginRow::Plugin(_)))
@@ -932,8 +945,29 @@ impl ReferenceView<'_> {
             "no plugin found · add a folder in settings, vst tab".to_owned()
         } else if rows.is_empty() {
             format!("no plugin named {:?}", tab.query().trim())
+        } else if let Some(open) = open {
+            // The half under the open plugin, named so Tab has something to
+            // flip and the reader can see it did.
+            let half = match tab.section() {
+                VstSection::Params => "parameters",
+                VstSection::Presets => "presets",
+            };
+            format!(
+                "{shown} of {} plugins · {half} of {} · Tab flips",
+                plugins.len(),
+                open.name
+            )
         } else {
             format!("{shown} of {} plugins", plugins.len())
+        };
+        // The read of the folders runs on the studio's own turn, so the
+        // count line says where it is, as the samples tab says its imports.
+        let count = match tab.scan() {
+            None => count,
+            Some((read, bundles)) if plugins.is_empty() => {
+                format!("reading the plugin folders · {read} of {bundles} bundles…")
+            }
+            Some((read, bundles)) => format!("{count} · reading {read} of {bundles} bundles…"),
         };
         buffer.set_stringn(
             inner.x,
@@ -944,7 +978,6 @@ impl ReferenceView<'_> {
         );
         let geometry = self.panel.geometry(inner);
         let list = geometry.list;
-        let open = tab.open_plugin();
         let marker = |open: bool| super::super::terminal::symbol(if open { "▾" } else { "▸" });
         let heading = Style::default()
             .fg(theme.accent)
@@ -1065,7 +1098,7 @@ impl ReferenceView<'_> {
     /// the count.
     fn render_samples(&self, inner: Rect, buffer: &mut Buffer) {
         let theme = self.theme;
-        let query = format!("search: {}", self.panel.sound_query);
+        let query = self.search_row(&self.panel.sound_query);
         buffer.set_stringn(
             inner.x,
             inner.y + 1,
@@ -1304,7 +1337,7 @@ impl ReferenceView<'_> {
             };
             let style = if selected {
                 Style::default()
-                    .fg(theme.background)
+                    .fg(theme.fill_text())
                     .bg(theme.accent)
                     .add_modifier(Modifier::BOLD)
             } else if matches!(sound_row, SoundRow::Variant(..)) {
@@ -1391,11 +1424,11 @@ impl ReferenceView<'_> {
                 inner.bottom() - 2,
                 &[
                     "↑↓ move",
+                    "Alt+A auto",
                     "→ expand or preview",
                     "← folds",
                     "Space plays/stops",
                     "Esc stops too",
-                    "Alt+A auto-play",
                     "Alt+± volume",
                 ],
                 theme,
@@ -1409,22 +1442,40 @@ impl ReferenceView<'_> {
                 Style::default().fg(theme.muted),
             );
             use super::super::keybinds::BindAction;
-            let hint = |action, does: &str| format!("{} {does}", self.keybinds.hint(action));
+            let hint = |action, does: &str| {
+                let label = self.keybinds.hint(action);
+                (!label.is_empty()).then(|| format!("{label} {does}"))
+            };
             let show = hint(BindAction::ShowFile, "shows file");
             let rename_file = hint(BindAction::RenameFile, "renames file");
             let rename_bank = hint(BindAction::RenameFile, "bank alias");
             let trim = hint(BindAction::TrimSample, "trims");
             let delete = hint(BindAction::DeleteSample, "deletes file");
-            let mut actions = vec![show.as_str()];
+            let mut actions: Vec<&str> = Vec::new();
+            if let Some(text) = show.as_deref() {
+                actions.push(text);
+            }
             if self.panel.selected_bank_is_editable() {
                 match self.panel.rename() {
-                    PanelAction::RenameSample { .. } => actions.push(&rename_file),
-                    PanelAction::RenameBank { .. } => actions.push(&rename_bank),
+                    PanelAction::RenameSample { .. } => {
+                        if let Some(text) = rename_file.as_deref() {
+                            actions.push(text);
+                        }
+                    }
+                    PanelAction::RenameBank { .. } => {
+                        if let Some(text) = rename_bank.as_deref() {
+                            actions.push(text);
+                        }
+                    }
                     _ => {}
                 }
-                actions.push(&trim);
-                if self.panel.selected_sample_file().is_some() {
-                    actions.push(&delete);
+                if let Some(text) = trim.as_deref() {
+                    actions.push(text);
+                }
+                if self.panel.selected_sample_file().is_some()
+                    && let Some(text) = delete.as_deref()
+                {
+                    actions.push(text);
                 }
             }
             actions.extend([
@@ -1441,7 +1492,7 @@ impl ReferenceView<'_> {
 
     fn render_browse(&self, inner: Rect, buffer: &mut Buffer) {
         let theme = self.theme;
-        let query = format!("search: {}", self.panel.query);
+        let query = self.search_row(&self.panel.query);
         buffer.set_stringn(
             inner.x,
             inner.y + 1,
@@ -1615,7 +1666,7 @@ impl ReferenceView<'_> {
             let selected = geometry.first_row + row == self.panel.selected;
             let name_style = if selected {
                 Style::default()
-                    .fg(theme.background)
+                    .fg(theme.fill_text())
                     .bg(theme.accent)
                     .add_modifier(Modifier::BOLD)
             } else {

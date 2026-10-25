@@ -8,7 +8,11 @@ pub(super) const VELOCITY: ControlRow = ControlRow {
         synonyms: &["vel"],
         summary: "Sets the velocity from 0 to 1.",
         description: "Sets the velocity from 0 to 1. Is multiplied together with gain.\n\nDefaults to 1. This is a linear multiplier for any native voice; 0..1 is the usual range. Its scale is independent of the selected source's own normalization.",
-        params: &[],
+        params: &[ReferenceParam {
+            name: "velocity",
+            r#type: "number | Pattern",
+            description: "from 0 to 1, multiplied with gain",
+        }],
         examples: &[
             "s(\"hh*8\")\n.gain(\".4!2 1 .4!2 1 .4 1\")\n.velocity(\".4 1\")",
         ],
@@ -52,7 +56,11 @@ pub(super) const POSTGAIN: ControlRow = ControlRow {
         synonyms: &[],
         summary: "Output gain before per-voice limiting and sends.",
         description: "A linear output multiplier, default 1. It scales the processed voice before limit and the delay, reverb, and audio-bus sends. Applies to every native source.",
-        params: &[],
+        params: &[ReferenceParam {
+            name: "amount",
+            r#type: "number | Pattern",
+            description: "linear output gain; 1 leaves the level as it is",
+        }],
         examples: &[
             "s(\"bd sd [~ bd] sd,hh*8\")\n.compressor(\"-20:20:10:.002:.02\").postgain(1.5)",
         ],

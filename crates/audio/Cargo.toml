@@ -12,7 +12,7 @@ default = []
 # Real device output is opt-in.
 # PulseAudio is enabled alongside CPAL's ordinary Linux host so WSLg can use
 # its native Pulse socket without routing through an ALSA compatibility shim.
-device-audio = ["dep:cpal", "cpal/pulseaudio"]
+device-audio = ["dep:cpal", "cpal/pulseaudio", "dep:audio_thread_priority", "dep:libc"]
 # Deterministic device failures for dependent crates' integration tests.
 test-support = []
 
@@ -25,14 +25,37 @@ rustfft = "6"
 cpal = { version = "=0.18.2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-# MMCSS "Pro Audio" registration for the output callback's thread, and the
-# effective power mode.
+# MMCSS "Pro Audio" registration for the output callback's thread and the
+# plugin workers, the kernel event a plugin worker waits on, the cycles a
+# plugin worker runs and the machine they count on, the cores of the process,
+# the CPU sets a plugin worker selects, and the effective power mode.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_System_Power",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
 ] }
+
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+# The real-time class of a plugin worker, and of the output callback on
+# Linux. Without its `dbus` feature, the crate needs no system library on
+# Linux.
+audio_thread_priority = { version = "0.38", default-features = false, optional = true }
+# The cores of the process, which set the count of plugin workers and the
+# CPUs a plugin worker keeps to on Linux, and the thread time of a plugin
+# worker.
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# The worker probe gives its threads the real-time class of a plugin worker.
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dev-dependencies]
+audio_thread_priority = { version = "0.38", default-features = false }
+
+# The worker probe reads the core under each thread.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Kernel"] }

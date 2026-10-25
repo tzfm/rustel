@@ -439,7 +439,11 @@ impl App {
                     action.label()
                 ),
             );
-            if let Err(error) = self.dispatch_bind_action(action, false) {
+            let result = self
+                .interrupt_key_input()
+                .and_then(|()| self.dispatch_bind_action(action, false));
+            self.refresh_editor_shortcut_hints();
+            if let Err(error) = result {
                 self.set_error(ErrorOwner::Interface, error.to_string());
             }
             return;
@@ -602,7 +606,10 @@ impl App {
                     "pad",
                     format!("{} fires {}", pad.label(), action.label()),
                 );
-                self.dispatch_bind_action(action, false)?;
+                self.interrupt_key_input()?;
+                let result = self.dispatch_bind_action(action, false);
+                self.refresh_editor_shortcut_hints();
+                result?;
                 self.dirty_frame = true;
             }
             return Ok(());
@@ -620,7 +627,10 @@ impl App {
                     self.scenes.scenes()[index].name()
                 ),
             );
-            self.launch_scene(index)?;
+            self.interrupt_key_input()?;
+            let result = self.launch_scene(index);
+            self.refresh_editor_shortcut_hints();
+            result?;
         }
         Ok(())
     }

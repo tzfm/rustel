@@ -55,6 +55,7 @@ impl App {
             | Pointer::Slider { .. }
             | Pointer::MixerFader { .. }
             | Pointer::MixerPanelFader
+            | Pointer::Knobs { .. }
             | Pointer::TimelineBar { .. } => Some(SHAPE_GRABBING),
             Pointer::BlockStart { .. } => Some(SHAPE_EW_RESIZE),
             Pointer::Editor

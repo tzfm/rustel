@@ -265,6 +265,15 @@ impl Studio {
         self.handle(Event::Key(crossterm::event::KeyEvent::new(code, modifiers)));
     }
 
+    /// Send a held key reported by an enhanced keyboard protocol.
+    pub fn repeat(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        self.handle(Event::Key(crossterm::event::KeyEvent::new_with_kind(
+            code,
+            modifiers,
+            crossterm::event::KeyEventKind::Repeat,
+        )));
+    }
+
     /// Send a chord by name: `"ctrl+s"`, `"ctrl+shift+x"`, `"f5"`. A typo is
     /// a panic - a test that names a chord that does not exist is broken,
     /// not merely unsuccessful.
@@ -502,6 +511,11 @@ impl Studio {
         &self.app.status
     }
 
+    /// Clear the status bar so a test can wait for the next notice.
+    pub fn clear_status(&mut self) {
+        self.app.status.clear();
+    }
+
     /// The focused pane's source, exactly as stored.
     pub fn source(&self) -> String {
         self.app.editor().source()
@@ -682,6 +696,13 @@ impl Studio {
         self.app.master.gain_db()
     }
 
+    /// The loudest master sample since the last read, the meter's own
+    /// reading. A test pumps in a wall-clock loop and takes the worst of
+    /// these, the way the meter does across turns.
+    pub fn master_peak(&mut self) -> f32 {
+        self.app.worker.master().take_levels().peak
+    }
+
     /// Replace the focused scene's whole score - the way a paste of a
     /// complete score would, without a test typing it key by key. The
     /// caret ends after the last inserted byte, where a paste leaves it.
@@ -713,6 +734,17 @@ impl Studio {
             )))
             .expect("caret moved");
         self.snapshot();
+    }
+
+    /// The focused scene's caret byte offset - where a search or a motion
+    /// landed, without reading it back off the screen.
+    pub fn caret(&self) -> usize {
+        self.app.editor().primary_selection().head.0
+    }
+
+    /// Whether the score's inline visualizers are switched on.
+    pub fn inline_visualizers(&self) -> bool {
+        self.app.ui_settings.animation
     }
 
     /// The reference panel's tab, when the panel is open - what Tab walks

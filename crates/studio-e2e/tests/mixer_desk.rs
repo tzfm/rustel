@@ -122,8 +122,8 @@ fn the_fader_keys_move_the_selected_strip_and_zero_bring_it_back() {
 }
 
 /// The desk's device feed comes from the frame the harness pins. On a host
-/// with a MIDI keyboard or a gamepad attached, the feed still shows the two
-/// pinned chips and no live device line.
+/// with a MIDI keyboard or a gamepad attached, the feed still shows the
+/// pinned MIDI chip, says nothing of gamepads, and has no live device line.
 #[test]
 fn the_desk_device_feed_is_pinned_to_the_fixture_not_the_host() {
     let mut studio = hermetic();
@@ -132,10 +132,9 @@ fn the_desk_device_feed_is_pinned_to_the_fixture_not_the_host() {
     studio.settle();
 
     row_containing(&studio.rows(), "⌁ no midi");
-    row_containing(&studio.rows(), "▣ no gamepad");
     for row in desk_rows(&mut studio) {
         assert!(
-            !row.contains("gamepad(") && !row.contains("aftertouch"),
+            !row.contains("gamepad") && !row.contains("aftertouch"),
             "a live device line leaked into the desk: {row:?}"
         );
     }

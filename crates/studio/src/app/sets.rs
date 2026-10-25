@@ -528,13 +528,13 @@ impl App {
         let frame = self.frame;
         if let Some((prompt, picker)) = self.set_prompt.as_mut() {
             if let Some(at) = picker.field_at(frame, x, y) {
-                picker.cancel_click();
-                if !picker.typing {
-                    picker.start_typing();
-                }
-                picker.caret_to(at, shift);
+                let double = picker.click_field(at, (x, y), shift, Instant::now());
                 self.focus_panel(PanelKind::Set);
-                self.pointer = Some(Pointer::PromptField);
+                self.pointer = Some(if double {
+                    Pointer::Panel
+                } else {
+                    Pointer::PromptField
+                });
                 self.dirty_frame = true;
                 return true;
             }
@@ -710,11 +710,14 @@ impl App {
                 prompt,
                 SetPrompt::SetsFolder
                     | SetPrompt::RecordingsFolder
+                    | SetPrompt::VimMappingsPath
                     | SetPrompt::AddSampleSource
                     | SetPrompt::EditSampleSource(_)
             );
             #[cfg(feature = "vst")]
-            let settings_prompt = settings_prompt || prompt == SetPrompt::AddVstFolder;
+            let settings_prompt = settings_prompt
+                || prompt == SetPrompt::AddVstFolder
+                || prompt == SetPrompt::AddPresetFolder;
             self.set_prompt_return_focus =
                 Some(if settings_prompt && self.settings_sheet.is_some() {
                     Focus::Panel(PanelKind::Settings)
@@ -729,6 +732,7 @@ impl App {
             prompt,
             SetPrompt::SetsFolder
                 | SetPrompt::RecordingsFolder
+                | SetPrompt::VimMappingsPath
                 | SetPrompt::AddSampleSource
                 | SetPrompt::EditSampleSource(_)
                 | SetPrompt::PickBankToRename
@@ -736,7 +740,9 @@ impl App {
                 | SetPrompt::RenameSample
         );
         #[cfg(feature = "vst")]
-        let over_settings = over_settings || prompt == SetPrompt::AddVstFolder;
+        let over_settings = over_settings
+            || prompt == SetPrompt::AddVstFolder
+            || prompt == SetPrompt::AddPresetFolder;
         if over_settings && self.settings_sheet.is_some() {
             self.dismiss_dialogs_except(&[PanelKind::Set, PanelKind::Settings]);
         } else {
@@ -790,6 +796,13 @@ impl App {
                 picker.offer(&shorten_home(&recordings));
                 picker
             }
+            SetPrompt::VimMappingsPath => {
+                let mut picker =
+                    FilePicker::text("Vim mappings path", "read Vim mappings from this file");
+                picker.label = "path";
+                picker.offer(&self.vim_mappings_path_label());
+                picker
+            }
             SetPrompt::RenameBank => {
                 FilePicker::naming("bank alias", "changes the bank's playable name")
             }
@@ -825,6 +838,11 @@ impl App {
                 FilePicker::new("plugin folder", "reads its plugins", Vec::new(), &root)
                     .choosing_folders()
             }
+            #[cfg(feature = "vst")]
+            SetPrompt::AddPresetFolder => {
+                FilePicker::new("preset folder", "reads its presets", Vec::new(), &root)
+                    .choosing_folders()
+            }
         };
         self.set_prompt = Some((prompt, picker));
         self.focus_panel(PanelKind::Set);
@@ -844,6 +862,9 @@ impl App {
             }
             SetPrompt::RecordingsFolder => {
                 "recordings folder - type a path, or Tab to browse and Enter on . · Esc back".into()
+            }
+            SetPrompt::VimMappingsPath => {
+                "Vim mappings path - type a full path · Enter keeps · Esc back".into()
             }
             SetPrompt::AddSampleSource => {
                 "import samples - a folder, a URL, or github:user/repo · Enter imports · Esc back"
@@ -867,6 +888,10 @@ impl App {
             #[cfg(feature = "vst")]
             SetPrompt::AddVstFolder => {
                 "plugin folder - type a path, or Tab to browse and Enter on . · Esc back".into()
+            }
+            #[cfg(feature = "vst")]
+            SetPrompt::AddPresetFolder => {
+                "preset folder - any structure · Enter on . or a path adds it · Esc back".into()
             }
         };
         self.dirty_frame = true;
@@ -909,6 +934,14 @@ impl App {
                 }
                 SetPrompt::SetsFolder => self.choose_sets_folder(&path),
                 SetPrompt::RecordingsFolder => self.choose_recordings_folder(&path),
+                SetPrompt::VimMappingsPath => {
+                    if path.is_absolute() {
+                        self.close_set_prompt();
+                        self.set_vim_mappings_path(Some(path.to_string_lossy().into_owned()));
+                    } else if let Some((_, picker)) = self.set_prompt.as_mut() {
+                        picker.error = Some("enter a full file path".into());
+                    }
+                }
                 SetPrompt::AddSampleSource => {
                     let spec = path.to_string_lossy().trim().to_owned();
                     self.return_from_source_prompt();
@@ -962,6 +995,8 @@ impl App {
                 }
                 #[cfg(feature = "vst")]
                 SetPrompt::AddVstFolder => self.add_vst_folder(&path),
+                #[cfg(feature = "vst")]
+                SetPrompt::AddPresetFolder => self.add_preset_folder(&path),
             },
         }
         self.dirty_frame = true;
@@ -1482,6 +1517,7 @@ pub(super) enum SetPrompt {
     RenameSet,
     SetsFolder,
     RecordingsFolder,
+    VimMappingsPath,
     /// A folder of samples, or a pack's address, to import for every set.
     AddSampleSource,
     /// Replace one existing source while keeping its row and enabled state.
@@ -1497,6 +1533,10 @@ pub(super) enum SetPrompt {
     /// A folder with VST3 plugins, for the vst page of the settings sheet.
     #[cfg(feature = "vst")]
     AddVstFolder,
+    /// A folder with `.vstpreset` files in any structure, for the vst page
+    /// of the settings sheet.
+    #[cfg(feature = "vst")]
+    AddPresetFolder,
 }
 
 #[cfg(test)]
@@ -2039,6 +2079,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
                 0,
                 false,
             );
@@ -2227,7 +2268,7 @@ mod tests {
                 old,
                 "newest first"
             );
-            // Alt+R renames the selected tape. Ctrl+R keeps the global scene command.
+            // Alt+R renames the selected tape.
             press(&mut app, KeyCode::Char('r'), KeyModifiers::ALT);
             assert!(matches!(
                 app.set_prompt,

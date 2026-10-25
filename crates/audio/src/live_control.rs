@@ -89,7 +89,6 @@ impl Ramp {
         self.set_target(update.value, (secs * sample_rate as f32).round() as u32);
     }
 
-    #[cfg(feature = "device-audio")]
     pub fn target(&self) -> f32 {
         self.target
     }

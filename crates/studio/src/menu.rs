@@ -15,7 +15,7 @@
 //! dead-chord bug that caret notation was introduced to kill. F10, the other
 //! convention, is Mission Control.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -37,6 +37,8 @@ const ACCEL_GAP: u16 = 3;
 pub enum MenuAction {
     /// The mixer along the bottom.
     Mixer,
+    /// The knobs column beside the score.
+    Knobs,
     // File - the set is the file: a folder of scores.
     NewSet,
     NewSession,
@@ -66,6 +68,8 @@ pub enum MenuAction {
     Paste,
     SelectAll,
     ToggleComment,
+    /// Search the focused score with a regular expression.
+    Find,
     FirstError,
     /// The caret's number, turned into a fader.
     SmartAction,
@@ -94,6 +98,8 @@ pub enum MenuAction {
     SetPanel,
     VizPanel,
     VizPanelTwo,
+    /// The inline visualizers under their calls in the score.
+    Visualizers,
     Split,
     HopPane,
     SwitchPanel,
@@ -107,6 +113,8 @@ pub enum MenuAction {
     Wrap,
     // Options
     Settings,
+    GlobalPrebake,
+    LocalPrebake,
     Devices,
     RemoteControl,
     ThemePicker,
@@ -393,6 +401,10 @@ pub struct MenuState {
     /// focus but nothing is dropped down yet - what F1 alone leaves, so that
     /// F1 twice is cheap and closes again.
     path: Vec<Level>,
+    /// The last mnemonic a press matched, whether or not its row could be
+    /// chosen. Held repeats of that letter stay the command instead of
+    /// becoming list keys.
+    last_mnemonic: Option<char>,
 }
 
 impl MenuState {
@@ -401,6 +413,7 @@ impl MenuState {
         Self {
             open: 0,
             path: Vec::new(),
+            last_mnemonic: None,
         }
     }
 
@@ -414,6 +427,7 @@ impl MenuState {
         Self {
             open: title,
             path: vec![Level { index, scroll: 0 }],
+            last_mnemonic: None,
         }
     }
 
@@ -449,6 +463,28 @@ impl MenuState {
         let depth = self.path.len().checked_sub(1)?;
         let items = self.items_at(menus, depth)?;
         Some((items, self.path[depth].index))
+    }
+
+    /// Whether a letter names a title or a row here, whether or not that
+    /// row can be chosen. A greyed command still owns its letter.
+    pub fn letter_is_mnemonic(&self, letter: char, menus: &[Menu]) -> bool {
+        let wanted = letter.to_ascii_lowercase();
+        if self.path.is_empty() {
+            menus.iter().any(|menu| menu.mnemonic() == Some(wanted))
+        } else {
+            self.current(menus)
+                .is_some_and(|(items, _)| items.iter().any(|item| item.mnemonic() == Some(wanted)))
+        }
+    }
+
+    /// Whether a held key continues the mnemonic its press matched, after
+    /// that press opened another level where the letter means nothing.
+    pub fn repeats_mnemonic(&self, key: &KeyEvent) -> bool {
+        key.kind == KeyEventKind::Repeat
+            && matches!(
+                key.code,
+                KeyCode::Char(letter) if self.last_mnemonic == Some(letter.to_ascii_lowercase())
+            )
     }
 
     fn highlighted<'a>(&self, menus: &'a [Menu]) -> Option<&'a MenuItem> {
@@ -652,6 +688,16 @@ impl MenuState {
             .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT)
         {
             return MenuKey::Ignored;
+        }
+        // Remember a mnemonic press so its held repeats stay that command,
+        // even when the press opened a level where the letter means nothing.
+        if key.kind != KeyEventKind::Repeat {
+            self.last_mnemonic = match key.code {
+                KeyCode::Char(letter) if self.letter_is_mnemonic(letter, menus) => {
+                    Some(letter.to_ascii_lowercase())
+                }
+                _ => None,
+            };
         }
         let before = self.mark_of(menus);
         let mut events = Vec::new();
@@ -1023,7 +1069,7 @@ pub fn render_bar(
         let style = if selected {
             Style::default()
                 .bg(theme.accent)
-                .fg(theme.background)
+                .fg(theme.fill_text())
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.foreground)
@@ -1096,7 +1142,7 @@ pub fn render_dropdowns(
             }
             let highlighted = deepest && scroll + row == state.path[depth].index;
             let style = if highlighted {
-                Style::default().bg(theme.accent).fg(theme.background)
+                Style::default().bg(theme.accent).fg(theme.fill_text())
             } else if item.enabled {
                 Style::default().fg(theme.foreground)
             } else {
@@ -1223,6 +1269,8 @@ pub struct MenuContext<'a> {
     pub set_panel: bool,
     /// Which visuals docks are open.
     pub viz_panels: [bool; 2],
+    /// The inline visualizers under their calls are shown.
+    pub visualizers: bool,
     pub split: bool,
     pub zen: bool,
     /// The mixer panel is open.
@@ -1238,6 +1286,9 @@ pub struct MenuContext<'a> {
     /// The memory breakdown is docked, whether or not the terminal has
     /// room to draw it just now.
     pub memory: bool,
+    /// The knobs column is open, whether or not the terminal has room to
+    /// draw it just now.
+    pub knobs: bool,
     /// The numbers down the left edge of the score.
     pub line_numbers: bool,
     /// Long lines continue on the next row.
@@ -1281,7 +1332,7 @@ pub(super) fn scene_shortcut_hint(
     action: super::keybinds::BindAction,
     split: bool,
 ) -> String {
-    let Some(binding) = keybinds.binding(action) else {
+    let Some(binding) = keybinds.hint_binding(action) else {
         return String::new();
     };
     if keybinds.overridden(action) || binding != action.default_binding() {
@@ -1296,12 +1347,13 @@ pub(super) fn scene_shortcut_hint(
             ..binding
         };
         let event = KeyEvent::new(shifted.code, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
-        if keybinds.accepts_legacy_alias(action, &event) {
+        if keybinds.hint_available(event) && keybinds.accepts_legacy_alias(action, &event) {
             return shifted.hint();
         }
     }
     keybinds
         .effective_alias(action)
+        .filter(|alias| keybinds.hint_available(alias.event()))
         .map(|alias| alias.hint())
         .unwrap_or_default()
 }
@@ -1470,6 +1522,12 @@ pub fn menus(cx: &MenuContext) -> Vec<Menu> {
                 'm',
                 hint(BindAction::ToggleComment),
             ),
+            MenuItem::action(
+                MenuAction::Find,
+                "Find\u{2026}",
+                'n',
+                hint(BindAction::Find),
+            ),
             MenuItem::separator(),
             // The one row that turns a number into a fader, or pastes
             // the latest recorded sample - greyed where there is
@@ -1637,6 +1695,15 @@ pub fn menus(cx: &MenuContext) -> Vec<Menu> {
                 'v',
                 hint(BindAction::VisualsTwo),
             ),
+            MenuItem::new(
+                MenuItemKind::Toggle {
+                    id: MenuAction::Visualizers,
+                    on: cx.visualizers,
+                },
+                "Inline visualizers",
+                'e',
+                hint(BindAction::Visualizers),
+            ),
             MenuItem::action(
                 MenuAction::Split,
                 if cx.split {
@@ -1684,7 +1751,7 @@ pub fn menus(cx: &MenuContext) -> Vec<Menu> {
                     on: cx.log,
                 },
                 "Log",
-                'l',
+                'g',
                 with_alias(BindAction::Log),
             ),
             MenuItem::new(
@@ -1711,8 +1778,17 @@ pub fn menus(cx: &MenuContext) -> Vec<Menu> {
                     on: cx.lanes,
                 },
                 "Lanes",
-                'e',
+                'l',
                 hint(BindAction::Lanes),
+            ),
+            MenuItem::new(
+                MenuItemKind::Toggle {
+                    id: MenuAction::Knobs,
+                    on: cx.knobs,
+                },
+                "Knobs",
+                'k',
+                hint(BindAction::Knobs),
             ),
             MenuItem::new(
                 MenuItemKind::Toggle {
@@ -1767,6 +1843,18 @@ pub fn menus(cx: &MenuContext) -> Vec<Menu> {
                 hint(BindAction::Settings),
             )
             .enabled(cx.settings_fits),
+            MenuItem::action(
+                MenuAction::GlobalPrebake,
+                "Global prebake",
+                'g',
+                hint(BindAction::OpenGlobalPrebake),
+            ),
+            MenuItem::action(
+                MenuAction::LocalPrebake,
+                "Local prebake",
+                'l',
+                hint(BindAction::OpenLocalPrebake),
+            ),
             MenuItem::action(
                 MenuAction::Devices,
                 "Devices\u{2026}",
@@ -1840,6 +1928,7 @@ mod tests {
             can_record_session: true,
             set_panel: false,
             viz_panels: [false, false],
+            visualizers: true,
             split: false,
             zen: false,
             mixer: false,
@@ -1847,6 +1936,7 @@ mod tests {
             log: false,
             jobs: false,
             memory: false,
+            knobs: false,
             line_numbers: true,
             wrap: false,
             show_menu: true,
@@ -2134,6 +2224,10 @@ mod tests {
             (BindAction::MasterDown, MenuAction::MasterDown),
             (BindAction::Reference, MenuAction::Reference),
             (BindAction::Docs, MenuAction::Docs),
+            (BindAction::Find, MenuAction::Find),
+            (BindAction::Visualizers, MenuAction::Visualizers),
+            (BindAction::OpenGlobalPrebake, MenuAction::GlobalPrebake),
+            (BindAction::OpenLocalPrebake, MenuAction::LocalPrebake),
             (BindAction::PianoMode, MenuAction::PianoMode),
             (BindAction::SetPanel, MenuAction::SetPanel),
             (BindAction::HopPane, MenuAction::HopPane),
@@ -2185,6 +2279,41 @@ mod tests {
         let outcome = state.key(&chord(KeyCode::Char('S'), KeyModifiers::SHIFT), &menus);
         assert_ne!(outcome, MenuKey::Ignored);
         assert!(state.is_dropped());
+    }
+
+    /// A greyed row still owns its mnemonic, so list navigation must not
+    /// turn it into an arrow.
+    #[test]
+    fn a_greyed_row_still_owns_its_mnemonic() {
+        let context = MenuContext {
+            on_prebake: true,
+            ..context()
+        };
+        let menus = menus(&context);
+        let state = MenuState::dropped_on(&menus, 2);
+        assert!(
+            state.letter_is_mnemonic('l', &menus),
+            "the greyed Learn MIDI pad keeps l"
+        );
+        assert!(!state.letter_is_mnemonic('j', &menus));
+    }
+
+    /// A held title mnemonic stays that title after it opened its menu.
+    #[test]
+    fn a_held_title_mnemonic_stays_that_command() {
+        let menus = menus(&context());
+        let mut state = MenuState::opened();
+        let _ = state.key(&press(KeyCode::Char('h')), &menus);
+        assert_eq!(state.open_title(), 6, "h opened Help");
+        let repeat =
+            KeyEvent::new_with_kind(KeyCode::Char('h'), KeyModifiers::NONE, KeyEventKind::Repeat);
+        assert!(state.repeats_mnemonic(&repeat));
+        assert!(!state.repeats_mnemonic(&KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)));
+        assert!(!state.repeats_mnemonic(&KeyEvent::new_with_kind(
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        )));
     }
 
     /// With a dropdown down, a letter that is not a mnemonic must be eaten.

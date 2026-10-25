@@ -55,10 +55,6 @@ pub const OMITTED_CALLABLES: &[OmittedCallable] = &[
         reason: "requires the browser-only WebAudio FX graph API",
     },
     OmittedCallable {
-        name: "oneshot",
-        reason: "requires a score-evaluation transport-cycle snapshot the host does not yet expose",
-    },
-    OmittedCallable {
         name: "bend",
         reason: "requires atomically publishing an auxiliary named modulation lane from a pattern method",
     },

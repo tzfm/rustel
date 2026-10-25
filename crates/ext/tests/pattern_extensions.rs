@@ -88,6 +88,7 @@ fn every_native_extension_answers_a_query() {
                 PatternCallableBehavior::ReadState { key, call } => {
                     call(&state_for(key), args, Some(&receiver))
                 }
+                PatternCallableBehavior::ReadCycle(call) => call(0.0, args, Some(&receiver)),
                 // The host owns the write; there is no body to call.
                 PatternCallableBehavior::WriteState { .. } => continue,
             };

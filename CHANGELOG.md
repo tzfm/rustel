@@ -1,11 +1,57 @@
 # Changelog
 
 ## Unreleased
+- The plugin list of the Settings vst page takes a filter: `/` starts it, the letters keep the plugins their names reach - a part of a name is enough, as the preset search reads it - Enter keeps it standing and Esc drops it. While it types, the keys the page binds are letters of it, so `a` adds no folder.
+- The header's tempo line reads cycle 0.00 while the studio is stopped, as before the first play. The stop freezes the clock for the canvas the player keeps, and the header kept saying the cycle the score stopped on. A canvas that is already stopped no longer takes a second stop word, and a stop pressed while the playback is already stopped no longer asks the engine to stop again: the word came back as a second settle, which reset the advisories and discarded the visual update the held frame was showing.
+- FM modulators now run from the start of the render, as in the browser reference. Before, each note restarted its modulator phase, so FM notes past the first cycle sounded different from strudel, and dense FM scores came out louder.
+- Copying samples into a set refuses bank names and links that could write outside the set folder.
+- On a terminal that composes Option+A into text, the Chords and Scales tabs read it as the auto preview toggle. Before, the composed character typed into the search box.
+- A click on the preview fader reads the bar it draws. Before, the click's bar was narrower than the drawn one, so a click on the knob set a gain a few dB higher.
+- Sample and manifest fetches retry a transient 429 or 5xx after a short rest, so a briefly overloaded sample host no longer fails a corpus run.
 
+- Settings has an Appearance page: the visual rows of the first page in one place. The Advanced page is gone, its rows sit at the end of General, and the first tab is renamed General. A beat line under the header keeps the tempo visible in pulse, travel and wave looks, and the evaluation animation row shapes the flash a run of code makes, with fades of three speeds, swipe, zap, steps, glitch and wave.
+- Auto evaluate no longer reinstalls a score when the edit adds no instruction. Typing a `$:`, a lane name, or a new line under a playing set leaves the sound alone, so an `oneshot` lane does not fire for it. A press, or a watched file, still applies.
+- `oneshot()` with no grid plays on the next cycle, the same as `oneshot(1)`. Before, it was silent.
+- A `$:` typed with no chain under it no longer doubles the lane above it. A label with no code changes no sound.
+- A rail in the knobs column sounds while it moves, the way a score slider does. Before, the change waited for the typing pause.
+- Each pane in a split has its own colour, and a click on a tab moves the caret to that pane.
+- Studio reloads scores when another program saves them.
+- Vim keys work in many more places: lists, menus, search boxes, find, paste, replace and half-page moves. Default Vim mappings ship under your vimrc.
+- Mac Option keys type their character, so Option+4 on an ISO layout types $.
+- The prebakes open from the Options menu.
+- `register()` can replace any built-in name, as on strudel.cc. The log notes each replacement once, and the built-in comes back when the call is removed.
+- Prebake helpers such as window.bpm = b => setcpm(b/4) now pass. Writing over an engine name gives a hint.
+- The mixer no longer shows "no gamepad". The camera warning clears when nothing asks for the camera.
+- New terminal and terminal-warm themes use your terminal's colours.
+- Plugin edits load only the copy that changed. Heavy sets spread plugin chains over several cores.
+- Windows reports underruns, and Csound reports when it falls behind, in play and in an offline render.
+- Two memory leaks are fixed, in macOS gamepad polling and in the Chords tab.
+- all() returning undefined is an error now.
+- Pattern queries allocate less, and rustelup checks the Linux build packages first..
+- View ▸ Knobs or ^⇧K opens a column of sliders for the numbers of the call under the caret. A move writes the score. Counts stay whole, speeds move in quarters, and vst calls and documented options such as `_pianoroll` or `lfo` get their own rails.
+- A drag or a notch on any slider can land back on a whole number.
+- `getTime()` reads 0 when a score starts from its first cycle: Play after a stop, a restart or a rewind. Before, it kept the old cycle, so a pattern placed with it played late. A failed update that falls back to the last score gives that score its first value again.
+- New `oneshot(grid)` from Switch Angel plays a pattern once, on the next grid line after the update.
+- In Windows Terminal, a syntax error no longer leaves stray coloured cells across the screen. The studio now sends underline colours in the colon form that Windows Terminal reads.
+
+### Sound changes
+
+- `partials` plays up to 2047 partials, or 4095 from a list of 4096, as Firefox does. Before, only the first 32 played, so a 128-partial sawtooth was too dark. The partials use Firefox's band-limited tables and normalization. Eight voices with 128 partials render 128 s of audio in 4.6 s instead of 62 s on a 4-core x86-64 Linux machine.
+- Sawtooth, square and triangle tables have 4096 samples at every sample rate, as in Firefox. At 44.1 kHz and 48 kHz the sound does not change.
+
+## v0.1.5
+
+- A score that stretches every voice no longer overruns the audio device. The stretch vocoder slid its input and output windows one sample at a time, two 8 KiB moves per sample per channel, so a set of stretched voices spent most of its callback moving memory. The vocoder now keeps both as rings and reads each output slot once per overlap cycle. A score of about thirty stretched voices runs under half the callback budget where it overran before, with byte-identical audio.
+- A popup opened from Settings closes when the sheet closes, or when a click lands outside it. Before, a click on the page behind moved the keys to the page, and Esc closed the sheet while the popup stayed up with no key to close it.
 - Csound instruments play and export with `.csound()` and `.csoundm()`. Load orchestras with `loadCSound` or `loadOrc`. Requires double-precision Csound 6.18 or later 6.x. Studio enables native orchestras at startup, and the command line requires `--allow-csound`. See [Csound](https://github.com/tzfm/rustel/blob/main/docs/csound.md).
 - The `room` reverb no longer sums its whole coarse convolution step in one audio callback. Every 2048 frames that step made about one 32-frame callback in 64 miss its deadline, and Studio asked for a larger buffer. Rustel now shares the sum over the 2048 frames before it, so 32- and 64-frame buffers play a score with reverb without overloads. The output moves by a few units in the last place of a float.
 - A note release no longer suppresses a MIDI press that follows within 40 ms. Scene pads and learned action buttons could miss that press.
 - Studio has a Lanes panel. A playhead crosses the score's lanes, with one row for each sound of each lane, named after the lane's label. View ▸ Lanes opens it, `e` moves it between the top and the bottom, and it is closed by default. `lanes()` and `_lanes()` draw the same view in a score. See [Studio](https://github.com/tzfm/rustel/blob/main/docs/studio.md#lanes).
+- Vim mapping replacements can name a Studio action, as `<Action:visualizers>`, so a rebind moves the mapping with it.
+- Inline visualizers in the score can be toggled from View > Inline visualizers, or from a key learned on the Keybinds page.
+- Studio can find text in the focused score with a regular expression. Outside Vim, Ctrl+Shift+Y opens a find bar that searches as you type; Enter walks the matches. In Vim, `/` and `?` search, `n` and `N` repeat with counts, and Ctrl+C leaves Insert mode. See [Vim editor keys](https://github.com/tzfm/rustel/blob/main/docs/studio.md#vim-editor-keys).
+- Studio has optional Vim editor keybindings and external Vim mappings in Settings > Keybinds. Preferences are saved in `studio.json`.
+- File picker and artwork popups support Copy and Cut for selected text. Double-click selects the whole field.
 
 ## v0.1.4
 
@@ -30,6 +76,9 @@
 - A part of a plugin name that is a whole word of a name finds that plugin first, then a part at the start of a word, then a part inside a word. `vsti("TAL")` played Vital, the shortest name with "tal" in it, and `vsti("TAL", { preset: "tal" })` then looked for the preset of Vital. It now plays TAL-NoiseMaker.
 - A plugin call with no `preset` plays `default.vstpreset` from the preset folder of the plugin, when the folder has one.
 - The plugin scan makes a preset folder for each plugin it finds, with the exact plugin name. In Studio, a `.vstpreset` file dropped on the window goes to the folder of its plugin: rustel reads the plugin class in the file. The scan cache keeps the class of each plugin. A cache of an earlier version has none, so rescan once after the upgrade.
+- Presets come from any folder the player adds, in any structure. Settings ▸ VST has an `add preset folder` row: the header of each `.vstpreset` file names its plugin, so no folder naming is needed. The plugin rows of the page say each plugin's preset count, and Enter on a row lists the presets. `~/.rustel/vst` stays the folder a dropped preset is copied into.
+- An open plugin in the vst tab lists in two halves, its parameters and its presets: Tab moves between them, and a search lists the half the cursor is in. Enter on a preset writes the call, or changes only the `preset` in a call of the same plugin. Picking a plugin name with Ctrl-F leaves the panel on the presets of that plugin, and Enter on the row of the plugin a call names goes to its rows.
+- The preset folders are watched while Studio runs: a preset saved or copied in after the scan is in the lists with no rescan and no restart, and the open plugin takes it mid-play. The count line of the vst tab says where the plugin scan is while it runs, as the samples tab says its imports.
 - Two Link participants that joined each other's sessions at once stayed on two grids forever. Neither session had a founder left, and a member measures its clock against the founder of its session. A member whose founder has been silent for ten seconds now re-founds the session where the grid stands, keeping the tempo, the phase and the clock, so a founder announces the session again and the participants merge. A session whose founder left is re-founded the same way.
 
 ### Sound changes

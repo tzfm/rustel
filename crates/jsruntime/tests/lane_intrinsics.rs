@@ -47,8 +47,8 @@ fn rejected_intrinsic_mutation_does_not_poison_the_next_lane_save() {
 }
 
 /// Pins the REPL's `hush()`: it returns silence that still takes pattern
-/// methods, and drops the lanes and `all` transform collected before it while
-/// lanes collected after it play.
+/// methods, and drops the lanes, the muted lanes and the `all` transform
+/// collected before it while lanes collected after it play.
 #[test]
 fn hush_clears_the_lanes_before_it_and_keeps_the_ones_after() {
     let runtime = runtime();
@@ -74,4 +74,21 @@ fn hush_clears_the_lanes_before_it_and_keeps_the_ones_after() {
     );
     assert_eq!(haps.len(), 1, "{haps:?}");
     assert!(haps[0].show().contains("after"), "{}", haps[0].show());
+
+    // A muted lane before hush() is not in the shadow of the score.
+    query(
+        r#"
+          s("bd").vst("fx").p('_gone');
+          hush();
+          s("hh").vst("fx").p('_kept');
+        "#,
+    );
+    let stopped = std::sync::atomic::AtomicBool::new(false);
+    let budget = std::time::Duration::from_secs(1);
+    let cap = rustel_core::DEFAULT_HAP_BUDGET;
+    let shadow = runtime
+        .query_shadow(Fraction::ZERO, Fraction::ONE, budget, cap, &stopped)
+        .expect("shadow");
+    assert_eq!(shadow.len(), 1, "{shadow:?}");
+    assert!(shadow[0].show().contains("hh"), "{}", shadow[0].show());
 }

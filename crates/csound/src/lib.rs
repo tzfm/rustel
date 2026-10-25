@@ -15,12 +15,36 @@ static NEXT_PROGRAM: AtomicU32 = AtomicU32::new(1);
 
 /// Diagnostics of the synthesis workers, which the host reads between
 /// updates: audio frames the callback read as silence because their worker
-/// had not rendered them yet, and commands refused because the worker left
-/// its queue full.
+/// had not rendered them yet, the part of those a line has reported, and
+/// commands refused because the worker left its queue full.
 #[derive(Default)]
 pub struct Counters {
     pub(crate) starved_frames: AtomicU64,
+    starved_reported: AtomicU64,
     pub(crate) refused_commands: AtomicU64,
+}
+
+/// The starved frames a line waits for: about one buffer of silence.
+const STARVED_LINE_FRAMES: u64 = 512;
+
+/// The line a starved worker gives. It reports a gap of silence and fails no
+/// run.
+pub const STARVATION_LINE: &str =
+    "a Csound instrument could not keep up, and a part of its audio played as silence";
+
+/// One fixed line when more than [`STARVED_LINE_FRAMES`] frames starved
+/// since the last line. The host asks at each producer turn, a few
+/// milliseconds apart, so the count runs from the last line and not from
+/// the last ask. The host says a fixed text once for each evaluation.
+fn starvation_line(counters: &Counters) -> Option<String> {
+    let starved = counters.starved_frames.load(Ordering::Relaxed);
+    counters
+        .starved_reported
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reported| {
+            (starved.saturating_sub(reported) > STARVED_LINE_FRAMES).then_some(starved)
+        })
+        .ok()
+        .map(|_| STARVATION_LINE.into())
 }
 
 #[derive(Clone, Debug)]
@@ -134,10 +158,14 @@ impl Program {
         }
     }
 
+    /// Takes the worker diagnostics, with the starvation line when one is due.
     pub fn take_errors(&self) -> Vec<String> {
-        self.errors
+        let mut errors = self
+            .errors
             .lock()
-            .map_or_else(|_| Vec::new(), |mut errors| std::mem::take(&mut *errors))
+            .map_or_else(|_| Vec::new(), |mut errors| std::mem::take(&mut *errors));
+        errors.extend(starvation_line(&self.counters));
+        errors
     }
 
     /// Stores a score string outside the audio callback. Each ID plays once.
@@ -172,9 +200,11 @@ impl Program {
     }
 
     /// Audio frames the callback read as silence because a worker had not
-    /// rendered them yet. A burst after a heavy orchestra starts, or a
-    /// long gap while it plays, says the orchestra costs more than the
-    /// worker's runway buys.
+    /// rendered them yet. The frames up to one runway past the start of an
+    /// orchestra are left out, because they read dry by design. A restarted
+    /// orchestra starts at the note that asked for it. A burst after a heavy
+    /// orchestra starts, or a long gap while it plays, says the orchestra
+    /// costs more than the worker's runway buys.
     pub fn starved_frames(&self) -> u64 {
         self.counters.starved_frames.load(Ordering::Relaxed)
     }
@@ -209,6 +239,22 @@ impl Program {
 }
 
 #[cfg(test)]
+impl Program {
+    /// A program built without a compile, so a test runs without the
+    /// native library until a note asks for an orchestra.
+    fn without_orchestra() -> Self {
+        Self {
+            key: InsertKey::default(),
+            sources: Arc::default(),
+            events: Arc::default(),
+            errors: Arc::default(),
+            instances: Arc::default(),
+            counters: Arc::default(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -230,5 +276,26 @@ mod tests {
         event.p6.clear();
         event.duration = f64::NAN;
         assert!(event.score().is_err());
+    }
+
+    #[test]
+    fn a_starved_worker_gives_one_line() {
+        let program = Program::without_orchestra();
+        let starve = |frames| {
+            program
+                .counters
+                .starved_frames
+                .fetch_add(frames, Ordering::Relaxed);
+        };
+        starve(600);
+        assert_eq!(program.take_errors(), [STARVATION_LINE]);
+        assert!(program.take_errors().is_empty());
+        starve(100);
+        assert!(program.take_errors().is_empty());
+        // The count runs from the line, so a slow trickle still adds up.
+        starve(412);
+        assert!(program.take_errors().is_empty());
+        starve(1);
+        assert_eq!(program.take_errors().len(), 1);
     }
 }

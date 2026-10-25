@@ -109,6 +109,7 @@ impl Widget for SettingsSheetView<'_> {
                 Row::Quantise => self.settings.quantise.label(),
                 Row::AutoEvaluate => on_off(self.settings.auto_evaluate),
                 Row::TypingPause => self.settings.typing_pause.label().to_owned(),
+                Row::ExternalChanges => self.settings.external_changes.label().to_owned(),
                 Row::LoadMode => self.settings.load_mode.label().to_owned(),
                 Row::Animation => on_off(self.settings.animation),
                 Row::Highlights => on_off(self.settings.highlights),
@@ -173,6 +174,8 @@ impl Widget for SettingsSheetView<'_> {
                 Row::BackdropStrength => format!("{}%", self.settings.backdrop_opacity),
                 Row::InterfaceOpacity => format!("{}%", self.settings.interface_opacity),
                 Row::EditorOpacity => format!("{}%", self.settings.editor_opacity),
+                Row::BeatLine => self.settings.beat_line.label().to_owned(),
+                Row::EvaluationAnimation => self.settings.evaluation_animation.label().to_owned(),
                 Row::ShowMenu => on_off(self.settings.show_menu),
                 Row::ShowHeader => on_off(self.settings.show_header),
                 Row::ShowFooter => on_off(self.settings.show_footer),
@@ -626,7 +629,8 @@ pub(super) fn render_keybinds(
     let theme = view.theme;
     let width = usize::from(rows.width);
     let shown = usize::from(rows.height).max(1);
-    let first = view.sheet.first_row(shown, view.bindings.len());
+    let lines = keybind_lines(view.bindings.len());
+    let first = view.sheet.first_line(shown, &lines);
     render_keybind_rows(
         &view.bindings,
         view.sheet.selected,
@@ -637,7 +641,11 @@ pub(super) fn render_keybinds(
     );
     // The count of what is off screen, said rather than left to be found
     // by reaching for it.
-    let hidden_below = view.bindings.len().saturating_sub(first + shown);
+    let hidden_below = lines
+        .iter()
+        .skip(first + shown)
+        .filter(|line| matches!(line, DisplayRow::Control(_)))
+        .count();
     let more = if hidden_below > 0 {
         format!(" · ↓ {hidden_below} more")
     } else {
@@ -755,8 +763,8 @@ pub(super) fn render_permissions(
     // for one line, and a player who cannot see "Enter permits" cannot
     // work the page.
     let keys = match view.permissions.get(view.sheet.selected) {
-        Some(row) if row.allowed() => "Space off · d removes · Tab pages",
-        Some(_) => "Enter permits · Space on/off · d dismisses · Tab pages",
+        Some(row) if row.allowed() => "←/→/Space off · d removes · Tab pages",
+        Some(_) => "Enter permits · ←/→/Space on/off · d dismisses · Tab pages",
         None => "Tab pages",
     };
     let says = match view.permissions.get(view.sheet.selected) {
@@ -804,6 +812,7 @@ pub(super) fn render_keybind_rows(
     let chord_width = bindings
         .iter()
         .skip(KEYBIND_ACTION_START)
+        .take(super::super::keybinds::BindAction::ALL.len())
         .map(|row| row.chord.width())
         .max()
         .unwrap_or(7)
@@ -844,13 +853,16 @@ pub(super) fn render_keybind_rows(
         .max(6)
         + 5;
     let state_x = alternate_x + alternate_width + 2;
-    for (offset, (index, row)) in bindings
-        .iter()
-        .enumerate()
+    for (offset, line) in keybind_lines(bindings.len())
+        .into_iter()
         .skip(first)
         .take(usize::from(rows.height))
         .enumerate()
     {
+        let DisplayRow::Control(index) = line else {
+            continue;
+        };
+        let row = &bindings[index];
         let y = rows.y + offset as u16;
         let selected = index == selected_row;
         let style = if row.confirm || row.learning {
@@ -862,7 +874,11 @@ pub(super) fn render_keybind_rows(
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD)
-        } else if row.learnt {
+        } else if index < KEYBIND_ACTION_START
+            || index == VIM_MAPPINGS_PATH_ROW
+            || index == LIST_NAVIGATION_ROW
+            || row.learnt
+        {
             Style::default().fg(theme.foreground)
         } else {
             Style::default().fg(theme.muted)
@@ -887,9 +903,11 @@ pub(super) fn render_keybind_rows(
             },
             1,
         );
-        // The terminal name is the setting's value, not a short key chord.
-        // Give it the whole row instead of clipping it to the chord column.
-        if index == TERMINAL_PROFILE_ROW {
+        // Settings values use the whole row instead of the chord column.
+        if index < KEYBIND_ACTION_START
+            || index == VIM_MAPPINGS_PATH_ROW
+            || index == LIST_NAVIGATION_ROW
+        {
             cell(2, &format!("{}: {}", row.action, row.chord), width);
             continue;
         }
@@ -1062,6 +1080,9 @@ fn render_sources(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer:
                 draw_group_border(buffer, rows, y, rule, theme);
             }
             SourceLine::Gap => {}
+            // The vst page's own lines: they never draw here.
+            #[cfg(feature = "vst")]
+            SourceLine::Detail | SourceLine::NoPresets | SourceLine::Filter => {}
             SourceLine::Footer => {
                 draw_group_border(buffer, rows, y, GroupRule::Closes, theme);
             }
@@ -1232,17 +1253,28 @@ fn render_sources(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer:
     );
 }
 
-/// The vst page: the two actions, the folders the player added, then the
-/// standard folders, dimmed and tagged, then one row for every plugin the
-/// scan found. Under the list, the plugin count and the preset folder.
+/// The vst page: the actions, the folders the player added, then the
+/// standard folders, dimmed and tagged, then the preset folders, then one
+/// row for every plugin the scan found. Under the list, the plugin count.
 #[cfg(feature = "vst")]
 fn render_vst(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer: &mut Buffer) {
     let theme = view.theme;
     let width = usize::from(rows.width);
     let folders = &view.vst.folders;
     let added = folders.iter().filter(|folder| !folder.standard).count();
+    let standard = folders.len() - added;
+    let preset_folders = &view.vst.preset_folders;
     let scanned = &view.vst.scanned;
-    let lines = vst_lines(added, folders.len() - added, scanned.len());
+    let lines = vst_lines(
+        added,
+        standard,
+        preset_folders.len(),
+        view.sheet.vst_plugins_shown(),
+        view.sheet
+            .vst_open_listed
+            .map(|open| (open, view.vst.open_presets.len())),
+        view.vst.filter.is_some(),
+    );
     let shown = usize::from(rows.height).max(1);
     let first = view.sheet.first_choice(shown, &lines);
     let label_width = VST_CONTROLS
@@ -1260,6 +1292,13 @@ fn render_vst(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer: &mu
             " "
         }
     };
+    // The lines the scroll took off the top still count: the first Detail
+    // the window holds is not the first preset of the open row.
+    let scrolled = first.min(lines.len());
+    let mut detail = lines[..scrolled]
+        .iter()
+        .filter(|line| matches!(line, SourceLine::Detail))
+        .count();
     for (offset, line) in lines.iter().skip(first).take(shown).enumerate() {
         let y = rows.y + offset as u16;
         match line {
@@ -1322,6 +1361,40 @@ fn render_vst(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer: &mu
                     Style::default().fg(theme.muted),
                 );
             }
+            SourceLine::NoPresets => {
+                buffer.set_stringn(
+                    content_x,
+                    y,
+                    "  none yet · Enter on add preset folder adds one",
+                    content_width,
+                    Style::default().fg(theme.muted),
+                );
+            }
+            // The echo of the plugin filter, above the rows it kept.
+            SourceLine::Filter => {
+                let text = view.vst.filter.as_deref().unwrap_or("filter");
+                buffer.set_stringn(
+                    content_x,
+                    y,
+                    format!("  {text}"),
+                    content_width,
+                    Style::default().fg(theme.muted),
+                );
+            }
+            // The lines under an open plugin row, one for each preset the
+            // folders hold for it, in their order under the row.
+            SourceLine::Detail => {
+                let name = view.vst.open_presets.get(detail);
+                let text = name.map_or_else(|| "…".to_owned(), |name| format!("    {name}"));
+                buffer.set_stringn(
+                    content_x,
+                    y,
+                    &text,
+                    content_width,
+                    Style::default().fg(theme.muted),
+                );
+                detail += 1;
+            }
             SourceLine::Row(index) => {
                 let at = index - VST_CONTROL_COUNT;
                 let selected = *index == view.sheet.selected;
@@ -1340,29 +1413,75 @@ fn render_vst(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer: &mu
                         Style::default().fg(theme.foreground)
                     };
                     buffer.set_stringn(content_x, y, &text, content_width, style);
-                } else if let Some(plugin) = scanned.get(at - folders.len()) {
-                    // The plugin rows are read-only, as a standard folder
-                    // is: the scan is what changes them.
-                    let text = format!("{} {} · {}", marker(selected), plugin.name, plugin.state);
+                } else if let Some(folder) = preset_folders.get(at - folders.len()) {
+                    let text = format!("{} {}", marker(selected), folder.path);
                     let style = if selected {
                         Style::default()
                             .fg(theme.accent)
                             .add_modifier(Modifier::BOLD)
-                    } else if plugin.state == "found" {
-                        Style::default().fg(theme.foreground)
                     } else {
-                        Style::default().fg(theme.muted)
+                        Style::default().fg(theme.foreground)
                     };
                     buffer.set_stringn(content_x, y, &text, content_width, style);
+                } else {
+                    let row = at - folders.len() - preset_folders.len();
+                    // The scan adds and removes the plugin rows. A row says
+                    // the presets the folders hold for the plugin, its
+                    // switch `audio thread only` when the switch is on, and
+                    // an open list of presets under it. While a filter
+                    // holds, the row the line carries is its place among
+                    // the kept plugins, not the full list.
+                    let plugin = if view.vst.filter.is_some() {
+                        view.vst
+                            .shown
+                            .get(row)
+                            .and_then(|plugin| scanned.get(*plugin))
+                    } else {
+                        scanned.get(row)
+                    };
+                    if let Some(plugin) = plugin {
+                        let open = view.sheet.vst_open_listed == Some(row);
+                        let presets = if plugin.presets > 0 {
+                            format!(" ({})", plugin.presets)
+                        } else {
+                            String::new()
+                        };
+                        let tag = if plugin.audio_thread {
+                            " · audio thread only"
+                        } else {
+                            ""
+                        };
+                        let (name, state) = (&plugin.name, &plugin.state);
+                        let open = if open { " ▾" } else { "" };
+                        let text =
+                            format!("{} {name} · {state}{presets}{open}{tag}", marker(selected));
+                        let style = if selected {
+                            Style::default()
+                                .fg(theme.accent)
+                                .add_modifier(Modifier::BOLD)
+                        } else if plugin.state == "found" {
+                            Style::default().fg(theme.foreground)
+                        } else {
+                            Style::default().fg(theme.muted)
+                        };
+                        buffer.set_stringn(content_x, y, &text, content_width, style);
+                    }
                 }
             }
         }
         buffer.set_stringn(rows.x, y, "│", 1, border);
         buffer.set_stringn(rows.right() - 1, y, "│", 1, border);
     }
+    // Past the controls, the rows are, in their order, the folders the
+    // player added, the standard folders, the preset folders, and the
+    // plugins the scan found.
     let at = view.sheet.selected;
-    let hint = if at == VST_ADD_ROW {
+    let hint = if view.sheet.vst_filter.is_typing() {
+        "Enter keeps the filter · Esc drops it"
+    } else if at == VST_ADD_ROW {
         "Enter opens the folder prompt"
+    } else if at == VST_PRESET_ADD_ROW {
+        "Enter opens the prompt for a folder of .vstpreset files"
     } else if at == VST_SCAN_ROW {
         "Enter tests new or changed plugins, as after an install"
     } else if at == VST_RESCAN_ROW {
@@ -1371,18 +1490,19 @@ fn render_vst(view: &SettingsSheetView<'_>, panel: Rect, rows: Rect, buffer: &mu
         "d removes this folder"
     } else if at < VST_CONTROL_COUNT + folders.len() {
         "a standard folder stays on the list"
+    } else if at < VST_CONTROL_COUNT + folders.len() + preset_folders.len() {
+        "d removes this folder"
     } else {
-        "the list of every plugin the scan found"
+        "Enter lists the presets · Space turns audio thread only on or off"
     };
     let footer = [
-        plugins_found(view.vst.plugins),
         format!(
-            "presets: {} · one folder of .vstpreset files for each plugin",
-            view.vst.presets
+            "{} · a letter jumps to its plugins",
+            plugins_found(view.vst.plugins)
         ),
         format!("a adds · {hint} · Tab pages · Esc closes"),
     ];
-    for (line, y) in footer.iter().zip(panel.bottom().saturating_sub(4)..) {
+    for (line, y) in footer.iter().zip(panel.bottom().saturating_sub(3)..) {
         buffer.set_stringn(rows.x, y, line, width, Style::default().fg(theme.muted));
     }
 }

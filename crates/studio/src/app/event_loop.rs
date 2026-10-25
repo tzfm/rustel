@@ -258,6 +258,11 @@ impl App {
         self.watch_take();
         self.poll_export();
         self.poll_reveal();
+        self.poll_vim_config(now);
+        self.poll_external_changes(now);
+        if let Err(error) = super::vim::flush_timeout(self) {
+            self.set_error(ErrorOwner::Editor, error.to_string());
+        }
         if self
             .take_notice
             .as_ref()
@@ -357,8 +362,7 @@ impl App {
             }
             let (flashing, now) = self.pump_turn();
             let caret_visible = self
-                .theme
-                .caret_shape(self.ui_settings.caret_shape)
+                .editor_cursor_shape()
                 .visible_after(now.saturating_duration_since(self.caret_activity));
             self.dirty_frame |= caret_visible != self.caret_visible;
             self.caret_visible = caret_visible;
@@ -496,7 +500,7 @@ impl App {
                 self.refresh_cell_pixels(terminal.input_cell_pixels());
                 self.pointer_to_cells(&mut terminal_event);
                 for event_index in 0..MAX_EVENTS_PER_TURN {
-                    if self.accepts_raw_paste() && is_plain_text_key_event(&terminal_event) {
+                    if self.accepts_raw_paste_burst() && is_plain_text_key_event(&terminal_event) {
                         for mut event in read_raw_paste_chunk(
                             terminal_event,
                             &mut raw_paste_continuation,
@@ -573,7 +577,12 @@ impl App {
                 crate::remote::RemoteEvent::Key(key) => {
                     let event = Event::Key(key);
                     self.performance.observe_input(&event, Instant::now());
-                    self.handle_terminal_event(event)?;
+                    // A machine sends normal keys. Read them with the
+                    // usual editing, not the score's Vim modes.
+                    self.remote_key_event = true;
+                    let outcome = self.handle_terminal_event(event);
+                    self.remote_key_event = false;
+                    outcome?;
                     self.input_dirty = true;
                     // Disabling the listener also discards its queued keys.
                     if self.remote.is_none() {

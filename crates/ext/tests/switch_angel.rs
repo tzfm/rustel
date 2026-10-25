@@ -491,7 +491,8 @@ fn glide_carries_the_previous_voice_into_the_next_pitch_envelope() {
     assert!(second[0].value.get("penv").is_some());
 }
 
-/// Built-in names are sealed; extension names are not.
+/// Any built-in name may be replaced, ours or strudel.cc's; the engine's
+/// answers again once the register call is gone.
 mod sealing {
     use super::runtime;
     use rustel_transpiler::TranspileOptions;
@@ -504,16 +505,15 @@ mod sealing {
     }
 
     #[test]
-    fn a_score_may_not_replace_a_builtin_name() {
+    fn a_score_may_replace_a_strudel_builtin() {
         for name in ["fast", "room", "as", "pickRestart", "gain"] {
-            let error = refusal(&format!(
-                r#"register('{name}', (x) => x)
-                   $: s("bd")"#
-            ))
-            .unwrap_or_else(|| panic!("register('{name}') must be refused"));
             assert!(
-                error.contains(&format!("existing built-in '{name}'")),
-                "the refusal identifies the built-in name: {error}"
+                refusal(&format!(
+                    r#"register('{name}', (x) => x)
+                       $: s("bd")"#
+                ))
+                .is_none(),
+                "register('{name}') must be allowed: rustel never blocks a name"
             );
         }
     }

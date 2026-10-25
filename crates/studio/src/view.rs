@@ -46,6 +46,7 @@ use rustel_runtime::{
 };
 
 mod backdrop;
+mod beat_line;
 mod footer;
 mod header;
 mod layout;
@@ -119,6 +120,9 @@ pub enum PanelKind {
     Memory,
     /// The Lanes panel, a band along the top or the bottom.
     Lanes,
+    /// The knobs column, a rail for each numeric parameter of the call
+    /// at the caret.
+    Knobs,
 }
 
 impl PanelKind {
@@ -138,6 +142,7 @@ impl PanelKind {
             Self::Mixer => "mixer",
             Self::Memory => "memory",
             Self::Lanes => "lanes",
+            Self::Knobs => "knobs",
         }
     }
 }
@@ -310,6 +315,10 @@ pub struct SceneChip {
     pub name: String,
     /// On screen right now.
     pub current: bool,
+    /// The pane that shows this scene, if one does. The tab wears that
+    /// pane's colour, and a click on a tab in the other pane moves the caret
+    /// there.
+    pub pane: Option<usize>,
     /// The generation the engine is playing came from this scene.
     pub playing: bool,
     pub dirty: bool,
@@ -368,6 +377,12 @@ pub struct StudioChrome<'a> {
     pub evaluating_for: Option<Duration>,
     pub dirty: bool,
     pub status: &'a str,
+    /// Editor mode or pending command, kept visible beside diagnostics.
+    pub vim_label: Option<&'a str>,
+    /// Vim text modes own the list keys and the text fields.
+    pub vim_text_modes: bool,
+    /// The find bar outside Vim: `FIND /pattern`.
+    pub find_label: Option<&'a str>,
     /// A remote-control listener is active; the status line shows a
     /// clickable `<>` icon.
     pub remote_control: bool,
@@ -398,6 +413,9 @@ pub struct StudioChrome<'a> {
     pub show_menu: bool,
     /// The rustel PLAYING tempo line. Ignored in zen.
     pub show_header: bool,
+    /// How the beat line under the header moves, when the layout gave it
+    /// a row at all. Ignored without a header.
+    pub beat_line: settings::BeatLineStyle,
     /// The footer's meter, orbits and device chips. Off still keeps the
     /// notices and the status line. Ignored in zen, which has no footer.
     pub show_footer: bool,
@@ -479,6 +497,131 @@ pub struct StudioChrome<'a> {
     pub input_peak_db: f32,
 }
 
+/// One moment of the evaluation flash's run: the animation in force, how
+/// far through the run, and how bright.
+#[derive(Clone, Copy)]
+pub struct EvaluationPulse {
+    pub animation: settings::EvalAnimation,
+    /// 0 to 1 across the whole run.
+    pub progress: f32,
+    /// 0 to 1, the envelope at that progress.
+    pub intensity: f32,
+}
+
+/// What one cell of a flashing line does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FlashLook {
+    /// The code shows through untouched.
+    Off,
+    /// Blended toward the theme's opposite grounds by a share.
+    Wash(f32),
+    /// Swapped around, as the flash has always read.
+    Reverse,
+    /// The letter gives way to a glyph standing in for it: the glitch's
+    /// broken-signal blocks.
+    Glyph(&'static str),
+}
+
+/// How wide the swipe's soft edge is, as a share of the line.
+const SWIPE_TRAIL: f32 = 0.3;
+
+impl EvaluationPulse {
+    /// The look of one cell of a line of code, `line` for the glitch's
+    /// per-line scramble and `x` from the row's own start.
+    fn look(self, line: usize, x: u16, width: u16) -> FlashLook {
+        match self.animation {
+            settings::EvalAnimation::Normal => FlashLook::Reverse,
+            settings::EvalAnimation::FadeFast
+            | settings::EvalAnimation::FadeMedium
+            | settings::EvalAnimation::FadeSlow => FlashLook::Wash(self.intensity),
+            settings::EvalAnimation::Swipe => {
+                // The code comes back a column at a time: a soft edge
+                // sweeps left to right, the letters standing revealed
+                // behind it while the rest of the line still carries the
+                // flash, and the whole thing fades as it goes.
+                let across = f32::from(x) / f32::from(width.max(1));
+                let edge = self.progress * (1.0 + SWIPE_TRAIL) - SWIPE_TRAIL;
+                let band = ((across - edge) / SWIPE_TRAIL).clamp(0.0, 1.0);
+                let level = self.intensity * band;
+                if level > 0.95 {
+                    FlashLook::Reverse
+                } else if level > 0.02 {
+                    FlashLook::Wash(level)
+                } else {
+                    FlashLook::Off
+                }
+            }
+            settings::EvalAnimation::Zap => {
+                if self.intensity > 0.55 {
+                    FlashLook::Reverse
+                } else {
+                    FlashLook::Wash(self.intensity)
+                }
+            }
+            settings::EvalAnimation::Steps => {
+                // Four chunky rungs, the way old hardware stepped: whole,
+                // three quarters, a half, a quarter, gone.
+                let rung = (self.intensity * 4.0).floor() / 4.0;
+                if rung >= 1.0 {
+                    FlashLook::Reverse
+                } else {
+                    FlashLook::Wash(rung)
+                }
+            }
+            settings::EvalAnimation::Glitch => {
+                if self.intensity <= 0.0 {
+                    return FlashLook::Off;
+                }
+                // A broken signal, flickering fast: each step strikes some
+                // lines and spares the rest, and a struck line shatters
+                // into bands of blocks and flips where its letters were.
+                // The damage holds still within a step, so a moment reads
+                // as one corrupted frame, then jumps to the next.
+                let step = (self.progress * 24.0) as u32;
+                let struck =
+                    (glitch_scramble(line, step, 999) % 100) < (45.0 * self.intensity) as u32;
+                let scramble = glitch_scramble(line, step, x / 3);
+                let roll = scramble % 100;
+                let heat = if struck {
+                    self.intensity
+                } else {
+                    self.intensity * 0.3
+                };
+                if roll < (20.0 * heat) as u32 {
+                    FlashLook::Reverse
+                } else if roll < (70.0 * heat) as u32 {
+                    const BROKEN: [&str; 6] = ["█", "▓", "▒", "░", "▀", "▄"];
+                    FlashLook::Glyph(BROKEN[((scramble >> 8) % 6) as usize])
+                } else {
+                    FlashLook::Off
+                }
+            }
+            settings::EvalAnimation::Wave => {
+                let center = f32::from(width) * self.progress;
+                let distance = (f32::from(x) - center).abs();
+                let band = (1.0 - (distance / 6.0).min(1.0)).powi(2);
+                let level = self.intensity * band;
+                if band > 0.8 && self.intensity > 0.8 {
+                    FlashLook::Reverse
+                } else if level > 0.03 {
+                    FlashLook::Wash(level)
+                } else {
+                    FlashLook::Off
+                }
+            }
+        }
+    }
+}
+
+/// A stable scramble for the glitch, so a moment's static is the same on
+/// every redraw of it.
+fn glitch_scramble(line: usize, step: u32, block: u16) -> u32 {
+    let mix = (line as u32).wrapping_mul(0x9E37_79B1)
+        ^ step.wrapping_mul(0x85EB_CA6B)
+        ^ u32::from(block).wrapping_mul(0xC2B2_AE35);
+    mix.rotate_left(13) ^ mix.rotate_right(7)
+}
+
 /// One editor pane as drawn this frame.
 pub struct PaneView<'a> {
     pub editor: &'a Editor,
@@ -492,8 +635,9 @@ pub struct PaneView<'a> {
     pub playing: bool,
     /// The caret lives here.
     pub focused: bool,
-    /// The evaluation acknowledgement is drawn over this pane.
-    pub flash: bool,
+    /// The evaluation acknowledgement is drawn over this pane, and where
+    /// its animation stands.
+    pub flash: Option<EvaluationPulse>,
     /// Shift+F3 lights the caret's logical line and contracts a ring toward
     /// its destination. 1.0 is the beginning of the brief flash.
     pub locate_flash: Option<f32>,
@@ -583,7 +727,9 @@ pub struct StudioView<'a> {
     pub library_loading: bool,
     pub strip_mode: &'a SceneStripMode,
     /// The reference column, when it is open.
-    pub reference: Option<(&'a Reference, &'a ReferencePanel)>,
+    /// The open column, and whether an anchored completion is typing into
+    /// it without Insert.
+    pub reference: Option<(&'a Reference, &'a ReferencePanel, bool)>,
     /// Which panel holds the keyboard, if any. It decides where the one lit
     /// caret goes and which footer says the way back.
     pub focused_panel: Option<PanelKind>,
@@ -594,6 +740,9 @@ pub struct StudioView<'a> {
     pub audition_loading: Option<String>,
     /// How loud a sample preview plays, for the samples tab's pulse row.
     pub preview_gain: f32,
+    /// Whether moving through the browser's lists of things to hear plays
+    /// each row, for the pulse row to say.
+    pub auto_preview: bool,
     /// Whether a preview is sounding: a chord's piano recolours its whole
     /// voicing at once, a run its steps, for as long as they sound.
     pub sounding_note: Option<usize>,
@@ -637,6 +786,9 @@ pub struct StudioView<'a> {
     pub mixer: Option<super::viz_panel::MixerFacts>,
     /// The mixer panel, while it is open.
     pub mixer_panel: Option<super::mixer_panel::MixerPanel>,
+    /// The knobs column, while it is open: each frame's reading of the
+    /// call at the caret, and what the hand is doing to it.
+    pub knobs: Option<super::knobs_panel::KnobsData<'a>>,
     /// A drag selection over the mixer's devices block, painted while its
     /// rows are still the ones on screen.
     pub mixer_selection: Option<&'a super::mixer_panel::MixerSelection>,
@@ -793,6 +945,7 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
             zen: chrome.zen,
             menu: chrome.show_menu,
             header: chrome.show_header,
+            beat_line: chrome.beat_line != settings::BeatLineStyle::Off,
             footer: chrome.show_footer,
         },
         view.panes.len(),
@@ -814,6 +967,7 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
         view.log.and_then(|(_, panel)| log_dock(panel, area)),
         view.memory.as_ref().map(|(_, dock)| *dock),
         view.lanes,
+        view.knobs.is_some(),
         u16::from(chrome.error.is_some()) + u16::from(chrome.audio_warning.is_some()),
         chrome.piano_notes.is_some(),
     );
@@ -828,6 +982,12 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
     }
     if !layout.header.is_empty() {
         frame.render_widget(Header { chrome: &chrome }, layout.header);
+        if layout.header.height > 1 {
+            frame.render_widget(
+                beat_line::BeatLine { chrome: &chrome },
+                Rect::new(layout.header.x, layout.header.y + 1, layout.header.width, 1),
+            );
+        }
     } else {
         // No header, no badge: zen mode and a three-row terminal must not
         // keep last frame's hit rect armed over whatever sits there now.
@@ -854,7 +1014,7 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
         if !region.title.is_empty() {
             frame.render_widget(
                 PaneTitle {
-                    keybinds: chrome.keybinds,
+                    index,
                     name: &pane.name,
                     dirty: pane.dirty,
                     playing: pane.playing,
@@ -944,8 +1104,15 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
         {
             frame.render_widget(HorizontalScrollbar { extent, theme }, horizontal_scrollbar);
         }
-        if pane.flash {
-            frame.render_widget(EvaluationFlash { map: pane.map }, editor_area);
+        if let Some(pulse) = pane.flash {
+            frame.render_widget(
+                EvaluationFlash {
+                    map: pane.map,
+                    theme,
+                    pulse,
+                },
+                editor_area,
+            );
         }
         if !region.minimap.is_empty() {
             frame.render_widget(
@@ -986,7 +1153,7 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
     // were raised - the one raised last on top - and the menu, the theme
     // editor and the help paint over those in turn.
     let draw_reference = |frame: &mut Frame<'_>, cursor: &mut Option<CellPoint>| {
-        let Some((reference, panel)) = view.reference else {
+        let Some((reference, panel, anchored)) = view.reference else {
             return;
         };
         if layout.reference.is_empty() {
@@ -1000,11 +1167,14 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
                 panel,
                 theme,
                 focused,
+                vim: chrome.vim_text_modes,
+                anchored,
                 pulse: Some(super::reference::SamplesPulse {
                     // The preview's own tap, not the mix: the meter shows
                     // what the browser is sounding.
                     peak_db: super::reference::audition_peak_db(chrome.audition_audio),
                     preview_gain: view.preview_gain,
+                    auto_preview: view.auto_preview,
                     shape: view.preview_shape,
                 }),
                 sounding_note: view.sounding_note,
@@ -1032,7 +1202,8 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
             },
             layout.reference,
         );
-        if focused {
+        // Command rests with no caret; typing states keep it up.
+        if focused && (!chrome.vim_text_modes || panel.vim_insert() || anchored) {
             *cursor = panel
                 .search_cursor(super::reference::inner_area(layout.reference))
                 .map(|(x, y)| CellPoint::new(x, y));
@@ -1139,6 +1310,24 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
             area,
         );
     }
+    // The knobs column, a fixture at the score's right edge, painted with
+    // the other fixtures and under every sheet.
+    if let Some(knobs) = view.knobs
+        && !layout.knobs.is_empty()
+    {
+        frame.render_widget(
+            super::knobs_panel::KnobsView {
+                name: knobs.name,
+                listed: knobs.listed,
+                knobs: knobs.knobs,
+                panel: knobs.panel,
+                theme,
+                focused: view.focused_panel == Some(PanelKind::Knobs),
+                area: layout.knobs,
+            },
+            area,
+        );
+    }
     // The reference always covers docked visuals. Raising another sheet
     // only changes its position relative to sheets; it must not expose the
     // ends of full-width visual bands behind the reference column.
@@ -1177,7 +1366,14 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
         );
     }
     if let Some(sheet) = view.export {
-        frame.render_widget(ExportSheetView { sheet, theme }, area);
+        frame.render_widget(
+            ExportSheetView {
+                sheet,
+                theme,
+                vim: chrome.vim_text_modes,
+            },
+            area,
+        );
     }
     if let Some((sheet, settings, features)) = view.settings {
         let settings_room = settings_room(area, layout.footer, layout.memory);
@@ -1238,6 +1434,7 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
                 picker,
                 theme,
                 camera: view.theme_camera,
+                vim: chrome.vim_text_modes,
             },
             area,
         );
@@ -1245,8 +1442,22 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
     if view.reference_on_top {
         draw_reference(frame, &mut cursor);
     }
+    let copy_hint = chrome
+        .keybinds
+        .binding(super::keybinds::BindAction::Copy)
+        .map(|key| key.hint());
+    let prompt_active = !view.help_open && chrome.menu.is_none();
     if let Some(picker) = view.set_prompt {
-        frame.render_widget(super::file_picker::FilePickerView { picker, theme }, area);
+        frame.render_widget(
+            super::file_picker::FilePickerView {
+                picker,
+                theme,
+                copy_hint: copy_hint
+                    .as_deref()
+                    .filter(|_| prompt_active && view.focused_panel == Some(PanelKind::Set)),
+            },
+            area,
+        );
     }
     if let Some(viz) = view
         .viz
@@ -1262,13 +1473,24 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
             area,
         );
     }
-    if let Some(picker) = view
+    if let Some((index, picker)) = view
         .viz
         .iter()
-        .flatten()
-        .find_map(|viz| viz.panel.prompt.as_ref())
+        .enumerate()
+        .find_map(|(index, viz)| Some((index, viz.as_ref()?.panel.prompt.as_ref()?)))
     {
-        frame.render_widget(super::file_picker::FilePickerView { picker, theme }, area);
+        frame.render_widget(
+            super::file_picker::FilePickerView {
+                picker,
+                theme,
+                copy_hint: copy_hint.as_deref().filter(|_| {
+                    prompt_active
+                        && view.focused_panel == Some(PanelKind::Viz)
+                        && view.viz_focus == index
+                }),
+            },
+            area,
+        );
     }
     // Error navigation and panel rotation share this one restrained landing
     // accent. The terminal keeps drawing its ordinary caret inside the score.
@@ -1383,6 +1605,127 @@ mod tests {
         Theme::built_in_default()
     }
 
+    /// The flash at its plainest: lit whole, no animation, the look the
+    /// reverse modifier has always made.
+    fn lit_flash() -> Option<EvaluationPulse> {
+        Some(EvaluationPulse {
+            animation: settings::EvalAnimation::Normal,
+            progress: 0.0,
+            intensity: 1.0,
+        })
+    }
+
+    /// Every look shapes the same pulse data differently: the plain one
+    /// swaps the whole run, the fades wash by brightness, zap hits and
+    /// washes, steps dims in quarters, the wave's band travels, and the
+    /// glitch shatters lines into fast bands of blocks and flips.
+    #[test]
+    fn the_flash_looks_read_the_same_pulse_differently() {
+        use settings::EvalAnimation as Look;
+        let look = |animation, progress, intensity, x, width| {
+            EvaluationPulse {
+                animation,
+                progress,
+                intensity,
+            }
+            .look(3, x, width)
+        };
+
+        assert_eq!(look(Look::Normal, 0.0, 1.0, 5, 40), FlashLook::Reverse);
+        assert_eq!(
+            look(Look::FadeMedium, 0.5, 0.5, 5, 40),
+            FlashLook::Wash(0.5)
+        );
+        assert_eq!(
+            look(Look::FadeSlow, 0.99, 0.01, 5, 40),
+            FlashLook::Wash(0.01)
+        );
+        assert_eq!(
+            look(Look::FadeFast, 0.99, 0.0, 5, 40),
+            FlashLook::Wash(0.0),
+            "a spent fade washes nothing, the same as leaving the cell"
+        );
+
+        assert_eq!(look(Look::Zap, 0.2, 1.0, 5, 40), FlashLook::Reverse);
+        assert_eq!(look(Look::Zap, 0.8, 0.4, 5, 40), FlashLook::Wash(0.4));
+
+        assert_eq!(look(Look::Steps, 0.5, 1.0, 5, 40), FlashLook::Reverse);
+        assert_eq!(look(Look::Steps, 0.9, 0.5, 5, 40), FlashLook::Wash(0.5));
+        assert_eq!(look(Look::Steps, 0.99, 0.3, 5, 40), FlashLook::Wash(0.25));
+
+        // The band crosses left to right, and only where it stands.
+        match look(Look::Wave, 0.1, 1.0, 0, 40) {
+            FlashLook::Wash(level) => assert!((level - 0.111).abs() < 0.001, "{level}"),
+            other => panic!("the band's tail washes, got {other:?}"),
+        }
+        assert_eq!(
+            look(Look::Wave, 0.1, 1.0, 39, 40),
+            FlashLook::Off,
+            "ahead of the band is untouched"
+        );
+        assert_eq!(look(Look::Wave, 0.9, 1.0, 39, 40), FlashLook::Wash(0.25));
+
+        // One moment of the glitch mixes its looks across the lines: some
+        // cells flipped, some shattered into blocks, some left as they
+        // are, and the damage lands on some lines and spares others.
+        let glitching = |line: usize, x: u16| {
+            EvaluationPulse {
+                animation: Look::Glitch,
+                progress: 0.5,
+                intensity: 0.8,
+            }
+            .look(line, x, 40)
+        };
+        let scattered: Vec<FlashLook> = (0..6)
+            .flat_map(|line| (0..40).map(move |x| glitching(line, x)))
+            .collect();
+        assert!(scattered.contains(&FlashLook::Reverse), "{scattered:?}");
+        assert!(
+            scattered
+                .iter()
+                .any(|look| matches!(look, FlashLook::Glyph(_))),
+            "{scattered:?}"
+        );
+        assert!(scattered.contains(&FlashLook::Off), "{scattered:?}");
+        assert_eq!(
+            look(Look::Glitch, 0.5, 0.0, 5, 40),
+            FlashLook::Off,
+            "a spent glitch is nothing at all"
+        );
+        // And the damage holds still within one step of the run.
+        let a = look(Look::Glitch, 0.5, 0.8, 17, 40);
+        let b = look(Look::Glitch, 0.52, 0.8, 17, 40);
+        assert_eq!(a, b, "the same step breaks the same way");
+
+        // The swipe reveals from the left: the start of the line is
+        // itself again while the rest still carries the flash, and the
+        // edge travels until the whole line is back.
+        assert_eq!(
+            look(Look::Swipe, 0.5, 1.0, 0, 40),
+            FlashLook::Off,
+            "the leading columns are revealed first"
+        );
+        assert_eq!(
+            look(Look::Swipe, 0.5, 1.0, 39, 40),
+            FlashLook::Reverse,
+            "the tail still carries the whole flash"
+        );
+        assert!(
+            matches!(look(Look::Swipe, 0.5, 1.0, 22, 40), FlashLook::Wash(_)),
+            "the soft edge washes between them"
+        );
+        assert_eq!(
+            look(Look::Swipe, 0.0, 1.0, 0, 40),
+            FlashLook::Reverse,
+            "the run opens with the line whole"
+        );
+        assert_eq!(
+            look(Look::Swipe, 1.0, 1.0, 39, 40),
+            FlashLook::Off,
+            "and closes with all of it revealed"
+        );
+    }
+
     static DEFAULT_KEYBINDS: std::sync::OnceLock<super::super::keybinds::Keybinds> =
         std::sync::OnceLock::new();
 
@@ -1409,6 +1752,9 @@ mod tests {
             evaluating_for: None,
             dirty: false,
             status: "ready",
+            vim_label: None,
+            vim_text_modes: false,
+            find_label: None,
             remote_control: false,
             remote_receiving: false,
             piano: None,
@@ -1424,6 +1770,7 @@ mod tests {
             zen: false,
             show_menu: true,
             show_header: true,
+            beat_line: settings::BeatLineStyle::Off,
             show_footer: true,
             evaluation_flash: false,
             focus_flash: None,
@@ -1882,6 +2229,7 @@ mod tests {
                 band(Edge::Bottom, 13),
                 memory,
                 None,
+                false,
                 0,
                 false,
             )
@@ -2245,6 +2593,7 @@ mod tests {
                 log,
                 None,
                 None,
+                false,
                 0,
                 false,
             )
@@ -2596,6 +2945,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
                 0,
                 false,
             )
@@ -2611,6 +2961,7 @@ mod tests {
             menu: false,
             header: true,
             footer: true,
+            beat_line: false,
         });
         assert!(no_menu.menu.is_empty());
         assert_eq!(no_menu.header.height, 1);
@@ -2626,6 +2977,7 @@ mod tests {
             menu: true,
             header: false,
             footer: true,
+            beat_line: false,
         });
         assert_eq!(no_header.menu.height, 1);
         assert!(no_header.header.is_empty());
@@ -2637,6 +2989,7 @@ mod tests {
             menu: true,
             header: true,
             footer: false,
+            beat_line: false,
         });
         assert_eq!(no_footer.menu.height, 1);
         assert_eq!(no_footer.header.height, 1);
@@ -2651,6 +3004,7 @@ mod tests {
             menu: false,
             header: false,
             footer: false,
+            beat_line: false,
         });
         assert!(zen_over_hidden.menu.is_empty());
         assert!(zen_over_hidden.header.is_empty());
@@ -2676,6 +3030,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
                 notices,
                 piano,
             )
@@ -2686,6 +3041,7 @@ mod tests {
             menu: true,
             header: true,
             footer: false,
+            beat_line: false,
         };
         let shown = ChromeLayout::shown(false);
         for (notices, piano) in [(0, false), (1, false), (2, false), (0, true), (2, true)] {
@@ -2855,6 +3211,7 @@ mod tests {
                         focused_panel: None,
                         help_open: false,
                         preview_gain: 1.0,
+                        auto_preview: false,
                         sounding_note: None,
                         audition_loading: None,
                         snippet_picture: false,
@@ -2874,7 +3231,7 @@ mod tests {
                             dirty: false,
                             playing: true,
                             focused: true,
-                            flash: true,
+                            flash: lit_flash(),
                             locate_flash: None,
                             timeline_focus: false,
                             line_numbers: true,
@@ -2899,6 +3256,7 @@ mod tests {
                         viz_focus: 0,
                         mixer: None,
                         mixer_panel: None,
+                        knobs: None,
                         mixer_selection: None,
                         reference_on_top: false,
                         theme_camera: None,
@@ -2979,6 +3337,7 @@ mod tests {
                         focused_panel: None,
                         help_open: true,
                         preview_gain: 1.0,
+                        auto_preview: false,
                         sounding_note: None,
                         audition_loading: None,
                         snippet_picture: false,
@@ -2998,7 +3357,7 @@ mod tests {
                             dirty: false,
                             playing: true,
                             focused: true,
-                            flash: false,
+                            flash: None,
                             locate_flash: None,
                             timeline_focus: false,
                             line_numbers: true,
@@ -3023,6 +3382,7 @@ mod tests {
                         viz_focus: 0,
                         mixer: None,
                         mixer_panel: None,
+                        knobs: None,
                         mixer_selection: None,
                         reference_on_top: false,
                         theme_camera: None,
@@ -3091,6 +3451,7 @@ mod tests {
                         focused_panel: None,
                         help_open: false,
                         preview_gain: 1.0,
+                        auto_preview: false,
                         sounding_note: None,
                         audition_loading: None,
                         snippet_picture: false,
@@ -3110,7 +3471,7 @@ mod tests {
                             dirty: false,
                             playing: false,
                             focused: true,
-                            flash: false,
+                            flash: None,
                             locate_flash: None,
                             timeline_focus: false,
                             line_numbers: true,
@@ -3135,6 +3496,7 @@ mod tests {
                         viz_focus: 0,
                         mixer: None,
                         mixer_panel: None,
+                        knobs: None,
                         mixer_selection: None,
                         reference_on_top: false,
                         theme_camera: None,
@@ -3206,6 +3568,7 @@ mod tests {
                         focused_panel: None,
                         help_open: false,
                         preview_gain: 1.0,
+                        auto_preview: false,
                         sounding_note: None,
                         audition_loading: None,
                         snippet_picture: false,
@@ -3226,7 +3589,7 @@ mod tests {
                                 dirty: false,
                                 playing: true,
                                 focused: false,
-                                flash: false,
+                                flash: None,
                                 locate_flash: None,
                                 timeline_focus: false,
                                 line_numbers: true,
@@ -3242,7 +3605,7 @@ mod tests {
                                 dirty: true,
                                 playing: false,
                                 focused: true,
-                                flash: false,
+                                flash: None,
                                 locate_flash: None,
                                 timeline_focus: false,
                                 line_numbers: true,
@@ -3254,7 +3617,7 @@ mod tests {
                         panel: None,
                         scenes: &[],
                         strip_mode: &SceneStripMode::Idle,
-                        reference: Some((&reference, &panel)),
+                        reference: Some((&reference, &panel, false)),
                         log: None,
                         jobs: None,
                         memory: None,
@@ -3268,6 +3631,7 @@ mod tests {
                         viz_focus: 0,
                         mixer: None,
                         mixer_panel: None,
+                        knobs: None,
                         mixer_selection: None,
                         reference_on_top: false,
                         theme_camera: None,
@@ -3289,7 +3653,6 @@ mod tests {
         let titles = row(layout.panes[0].title.y);
         assert!(titles.contains("▶ intro"), "{titles}");
         assert!(titles.contains("drop ●"), "{titles}");
-        assert!(titles.contains("F10 switches"), "{titles}");
         assert!(
             !titles.contains("plays"),
             "a title does not play its scene: {titles}"

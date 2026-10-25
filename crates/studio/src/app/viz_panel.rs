@@ -686,12 +686,17 @@ impl App {
             return false;
         };
         let held = if let Some(at) = picker.field_at(frame, x, y) {
-            picker.caret_to(at, shift);
-            Pointer::PromptField
-        } else if picker.contains(frame, x, y) {
-            Pointer::Panel
+            if picker.click_field(at, (x, y), shift, Instant::now()) {
+                Pointer::Panel
+            } else {
+                Pointer::PromptField
+            }
         } else {
-            return false;
+            picker.cancel_click();
+            if !picker.contains(frame, x, y) {
+                return false;
+            }
+            Pointer::Panel
         };
         self.viz_focus = index;
         self.focus_panel(PanelKind::Viz);

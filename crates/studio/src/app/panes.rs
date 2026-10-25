@@ -551,16 +551,18 @@ impl App {
     /// way back to the switch, so the status names that chord, or the
     /// preferences file when Settings has none.
     pub(super) fn toggle_show_menu(&mut self) {
-        self.status = if self.toggle_chrome_row(|settings| &mut settings.show_menu) {
+        let shown = self.toggle_chrome_row(|settings| &mut settings.show_menu);
+        self.refresh_editor_shortcut_hints();
+        self.status = if shown {
             "menu bar shown".into()
-        } else if let Some(chord) = self.keybinds.binding(BindAction::Settings) {
+        } else if let Some(chord) = self.keybinds.hint_binding(BindAction::Settings) {
             format!(
                 "menu bar hidden - {} opens settings to bring it back",
                 chord.hint()
             )
         } else {
             format!(
-                "menu bar hidden - settings has no chord; show_menu in {} brings it back",
+                "menu bar hidden - settings has no available chord; show_menu in {} brings it back",
                 super::super::prefs::PREFS_FILE_NAME
             )
         };
@@ -979,7 +981,7 @@ mod tests {
         }
 
         #[test]
-        fn a_click_on_the_other_panes_tab_keeps_the_caret_and_both_panes() {
+        fn a_click_on_the_other_panes_tab_moves_the_caret_there_and_keeps_both_panes() {
             let directory = tempfile::tempdir().unwrap();
             let mut app = navigation_app(directory.path(), 5, true);
             app.regions.scenes = Rect::new(0, 1, 140, 1);
@@ -1001,13 +1003,20 @@ mod tests {
             click(&mut app, 4);
             click(&mut app, 3);
 
+            // The caret is in the right pane. The third scene is in the left.
             click(&mut app, 2);
-            assert_eq!(app.focused, 1);
+            assert_eq!(app.focused, 0, "the caret went to the pane that has it");
+            assert_eq!(app.scenes.current().id, ids[2]);
             assert_eq!(
                 app.panes.iter().map(|pane| pane.scene).collect::<Vec<_>>(),
-                [ids[2], ids[3]]
+                [ids[2], ids[3]],
+                "and neither pane changed its scene"
             );
-            assert!(app.status.contains("left pane"), "{}", app.status);
+
+            // And back, by the tab of the right pane.
+            click(&mut app, 3);
+            assert_eq!(app.focused, 1);
+            assert_eq!(app.scenes.current().id, ids[3]);
         }
 
         #[test]

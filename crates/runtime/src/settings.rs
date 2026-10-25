@@ -8,6 +8,9 @@ use serde_json::{Map, Value};
 
 const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
 
+/// The key of the plugins whose copies run on the audio thread only.
+const PLUGIN_AUDIO_THREAD: &str = "plugin_audio_thread";
+
 /// Whether automatic update checks are enabled. A missing setting defaults to true.
 pub fn check_updates() -> io::Result<bool> {
     check_updates_at(&settings_path()?)
@@ -16,6 +19,23 @@ pub fn check_updates() -> io::Result<bool> {
 /// Save the update-check preference without changing other user settings.
 pub fn set_check_updates(enabled: bool) -> io::Result<()> {
     set_check_updates_at(&settings_path()?, enabled)
+}
+
+/// The plugins whose copies run on the audio thread only, by the names the
+/// plugin list shows: the switches `audio thread only` of the Studio vst
+/// page. A missing setting is an empty list.
+// Only the plugin host reads the switches: see `crate::vst`.
+#[cfg_attr(not(feature = "vst"), allow(dead_code))]
+pub(crate) fn plugin_audio_thread() -> io::Result<Vec<String>> {
+    plugin_audio_thread_at(&settings_path()?)
+}
+
+/// Save the plugins whose copies run on the audio thread only without
+/// changing other user settings.
+// Only the plugin host saves the switches: see `vst::toggle_audio_thread_only`.
+#[cfg_attr(not(feature = "vst"), allow(dead_code))]
+pub(crate) fn set_plugin_audio_thread(names: &[String]) -> io::Result<()> {
+    set_plugin_audio_thread_at(&settings_path()?, names)
 }
 
 fn settings_path() -> io::Result<PathBuf> {
@@ -37,8 +57,24 @@ fn check_updates_at(path: &Path) -> io::Result<bool> {
 }
 
 fn set_check_updates_at(path: &Path, enabled: bool) -> io::Result<()> {
+    write_setting(path, "check_updates", Value::Bool(enabled))
+}
+
+fn plugin_audio_thread_at(path: &Path) -> io::Result<Vec<String>> {
+    let settings = read_settings(path)?;
+    let names = settings.get(PLUGIN_AUDIO_THREAD).and_then(Value::as_array);
+    let names = names.into_iter().flatten().filter_map(Value::as_str);
+    Ok(names.map(str::to_owned).collect())
+}
+
+fn set_plugin_audio_thread_at(path: &Path, names: &[String]) -> io::Result<()> {
+    write_setting(path, PLUGIN_AUDIO_THREAD, Value::from(names))
+}
+
+/// Save one setting and keep the others.
+fn write_setting(path: &Path, key: &str, value: Value) -> io::Result<()> {
     let mut settings = read_settings(path)?;
-    settings.insert("check_updates".to_owned(), Value::Bool(enabled));
+    settings.insert(key.to_owned(), value);
     let mut bytes = serde_json::to_vec_pretty(&settings).map_err(io::Error::other)?;
     bytes.push(b'\n');
     if bytes.len() as u64 > MAX_SETTINGS_BYTES {
@@ -95,6 +131,15 @@ fn read_settings(path: &Path) -> io::Result<Map<String, Value>> {
     {
         return Err(invalid_settings("check_updates must be true or false"));
     }
+    let listed = |names: &Vec<Value>| names.iter().all(Value::is_string);
+    if settings
+        .get(PLUGIN_AUDIO_THREAD)
+        .is_some_and(|value| !value.as_array().is_some_and(listed))
+    {
+        return Err(invalid_settings(
+            "plugin_audio_thread must be a list of plugin names",
+        ));
+    }
     Ok(settings)
 }
 
@@ -111,11 +156,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config/rustel.json");
         assert!(check_updates_at(&path).unwrap());
+        assert!(plugin_audio_thread_at(&path).unwrap().is_empty());
         assert!(!path.parent().unwrap().exists());
 
         let path = directory.path().join("rustel.json");
         std::fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
         assert!(check_updates_at(&path).unwrap());
+        assert!(plugin_audio_thread_at(&path).unwrap().is_empty());
     }
 
     #[test]
@@ -147,6 +194,16 @@ mod tests {
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
             1
         );
+
+        // A write of the plugins on the audio thread keeps the other settings.
+        let names = ["Serum 2".to_owned(), "OTT".to_owned()];
+        set_plugin_audio_thread_at(&path, &names).unwrap();
+        assert_eq!(plugin_audio_thread_at(&path).unwrap(), names);
+        assert!(check_updates_at(&path).unwrap());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).unwrap()["other"],
+            serde_json::json!({"value": 42})
+        );
     }
 
     #[test]
@@ -160,13 +217,17 @@ mod tests {
             r#"{"check_updates":"false"}"#,
             r#"{"check_updates":null}"#,
             r#"{"check_updates":0}"#,
+            r#"{"plugin_audio_thread":"OTT"}"#,
+            r#"{"plugin_audio_thread":["OTT",1]}"#,
         ] {
             std::fs::write(&path, original).unwrap();
             assert_eq!(
                 check_updates_at(&path).unwrap_err().kind(),
                 io::ErrorKind::InvalidData
             );
+            assert!(plugin_audio_thread_at(&path).is_err());
             assert!(set_check_updates_at(&path, true).is_err());
+            assert!(set_plugin_audio_thread_at(&path, &[]).is_err());
             assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         }
     }

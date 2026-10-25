@@ -156,18 +156,20 @@ fn slider_with_id<'js>(
         values.prop(id.as_str(), Property::from(value).writable().enumerable())?;
     }
 
+    let slider = Rc::from(id.as_str());
     let cell = rquickjs::Class::instance(ctx.clone(), NativeSliderCell { values, id })?
         .into_value()
         .into_function()
         .expect("a callable slider cell is a function");
     configure_function(&cell, "", 0, false)?;
     let (accessor, sidecar) = bridge_callable(&ctx, cell)?;
-    Ok(derive_wrapper(
+    let wrapper = derive_wrapper(
         ctx,
         rustel_core::ref_pattern(accessor).with_slider_binding(binding),
         &[sidecar],
-    )?
-    .into_value())
+    )?;
+    wrapper.borrow_mut().slider = Some(slider);
+    Ok(wrapper.into_value())
 }
 
 fn slider_values<'js>(ctx: Ctx<'js>) -> rquickjs::Result<rquickjs::Value<'js>> {

@@ -104,26 +104,6 @@ impl App {
         true
     }
 
-    /// A click on a scene chip puts the scene in the focused pane. A scene
-    /// the other pane shows stays there, and the caret stays here: a scene
-    /// has one caret, so two panes do not show the same scene.
-    pub(super) fn click_scene_chip(&mut self, index: usize) {
-        let elsewhere = self.scenes.scenes().get(index).and_then(|scene| {
-            let pane = self.panes.iter().position(|pane| pane.scene == scene.id)?;
-            (pane != self.focused).then(|| (pane, scene.name()))
-        });
-        let Some((pane, name)) = elsewhere else {
-            self.select_scene(index);
-            return;
-        };
-        self.status = format!(
-            "{name:?} is open in the {} pane - {} goes there",
-            if pane == 0 { "left" } else { "right" },
-            self.shortcut_or_menu(BindAction::HopPane, "View > Switch pane")
-        );
-        self.dirty_frame = true;
-    }
-
     pub(super) fn step_scene(&mut self, delta: isize) {
         if self.replay_view.is_some() {
             self.status = format!(
@@ -464,6 +444,9 @@ impl App {
                 replay: scene.is_replay(),
                 name: scene.name(),
                 current: index == self.scenes.current_index(),
+                // The chip wears the colour of the pane that shows it. A click
+                // on one in the other pane moves the caret there.
+                pane: self.panes.iter().position(|shown| shown.scene == scene.id),
                 playing: playing_scene == Some(scene.id),
                 dirty: scene.dirty,
                 rewind: scene.rewind,
@@ -705,6 +688,43 @@ mod tests {
 
             // What a click does do: it chooses the scene it landed on.
             assert_eq!(app.scenes.current().id, second);
+        }
+
+        /// Each chip names the pane that shows its scene, so the strip can
+        /// colour a tab by its pane and leave the rest plain.
+        #[test]
+        fn chips_name_the_pane_that_shows_them() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.new_scene(false);
+            app.new_scene(false);
+            app.toggle_split();
+            app.focus_pane(0);
+            let shown = |app: &App, pane: usize| {
+                app.scenes
+                    .get(app.panes[pane].scene)
+                    .expect("the pane's scene")
+                    .name()
+            };
+
+            for focused in [0, 1] {
+                app.focus_pane(focused);
+                let chips = app.scene_chips();
+                let named = |pane: usize| {
+                    chips
+                        .iter()
+                        .find(|chip| chip.pane == Some(pane))
+                        .map(|chip| chip.name.clone())
+                };
+                // A tab names its pane whichever pane has the caret.
+                assert_eq!(named(0), Some(shown(&app, 0)), "caret in pane {focused}");
+                assert_eq!(named(1), Some(shown(&app, 1)), "caret in pane {focused}");
+                assert_eq!(
+                    chips.iter().filter(|chip| chip.pane.is_none()).count(),
+                    1,
+                    "the scene no pane shows has no pane"
+                );
+            }
         }
     }
 }

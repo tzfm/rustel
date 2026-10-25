@@ -20,7 +20,7 @@ pub(super) fn install<'js>(
     query::install(ctx, proto)?;
     tempo::install(runtime, ctx, globals)?;
     visuals::install(ctx, proto, globals)?;
-    lanes::install(ctx, proto, globals)?;
+    lanes::install(runtime, ctx, proto, globals)?;
     timeline::install(runtime, ctx, globals)?;
     Ok(())
 }

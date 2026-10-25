@@ -11,7 +11,7 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::super::theme::{Theme, hsv, mix};
+use super::super::theme::{Theme, hsv, mix, wash};
 use super::super::visuals::Canvas;
 use super::{ART_MAX_LINES, ArtAlignment, ArtStyle, Colouring, Edge, art_text_error};
 
@@ -539,7 +539,7 @@ impl Palette<'_> {
                 let turn = (self.seconds * 0.5 + self.level * 3.0) as usize;
                 let base = ACID[(glyph + band + turn) % ACID.len()];
                 let lit = 0.25 + 0.75 * self.level.clamp(0.0, 1.0);
-                mix(theme.background, base, lit)
+                wash(theme.background, base, lit)
             }
             Colouring::Neon => {
                 let glyph = x / (6 * self.scale.max(1));
@@ -555,7 +555,7 @@ impl Palette<'_> {
                 } else {
                     0.9 + 0.1 * (self.seconds * 6.0).sin()
                 };
-                mix(theme.background, tube, lit)
+                wash(theme.background, tube, lit)
             }
             Colouring::Chrome => {
                 let band = (down * 6.0).fract();
@@ -797,7 +797,7 @@ impl Widget for ArtView<'_> {
                 } else if distance < 5 {
                     mix(colour, Color::Rgb(255, 255, 255), 0.35)
                 } else {
-                    mix(background, colour, 0.75)
+                    wash(background, colour, 0.75)
                 };
             }
             canvas.set(x, y, colour);

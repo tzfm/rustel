@@ -156,6 +156,13 @@ pub(super) fn unwrap_pattern<'js>(value: &rquickjs::Value<'js>) -> Option<(Patte
     None
 }
 
+/// The id of the slider `value` reads, when `value` is the pattern that
+/// `sliderWithID` returned. A pattern built from a slider gives `None`.
+pub(super) fn slider_of(value: &rquickjs::Value<'_>) -> Option<String> {
+    let wrapper = rquickjs::Class::<NativePatternWrapper>::from_object(value.as_object()?)?;
+    wrapper.borrow().slider.as_deref().map(str::to_owned)
+}
+
 /// The per-instance `Pattern.query` data property.
 ///
 /// The constructor assigns its query argument as an OWN writable/enumerable/
@@ -597,6 +604,8 @@ pub(super) fn callback_argument<'js>(
             cells,
             explicit_ownership_complete: false,
             excluded_frame_ids: Rc::new(exclusions.finish()),
+            shadow: None,
+            slider: None,
         },
     )
 }

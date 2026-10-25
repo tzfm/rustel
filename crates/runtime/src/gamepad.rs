@@ -283,15 +283,21 @@ mod framework {
         // since macOS 11.3 the framework keeps a background process's
         // presses to itself unless it asks for them. Once.
         static ASKED_FOR_BACKGROUND_EVENTS: std::sync::Once = std::sync::Once::new();
-        ASKED_FOR_BACKGROUND_EVENTS.call_once(|| {
-            // SAFETY: a class property set on the main thread.
-            unsafe { GCController::setShouldMonitorBackgroundEvents(true) };
+        // Every turn hands Objective-C objects to the framework's autoreleasing
+        // calls - `GCController::controllers` alone leaves an NSArray behind -
+        // and the studio runs no main run loop that would ever drain the pool
+        // they land in. A pool per turn releases them at once.
+        objc2::rc::autoreleasepool(|_| {
+            ASKED_FOR_BACKGROUND_EVENTS.call_once(|| {
+                // SAFETY: a class property set on the main thread.
+                unsafe { GCController::setShouldMonitorBackgroundEvents(true) };
+            });
+            // SAFETY: a mode name the framework itself defines; reading it is
+            // reading a static.
+            let mode = unsafe { kCFRunLoopDefaultMode };
+            CFRunLoop::run_in_mode(mode, 0.0, true);
+            read_all();
         });
-        // SAFETY: a mode name the framework itself defines; reading it is
-        // reading a static.
-        let mode = unsafe { kCFRunLoopDefaultMode };
-        CFRunLoop::run_in_mode(mode, 0.0, true);
-        read_all();
     }
 
     fn name_of(controller: &GCController) -> String {

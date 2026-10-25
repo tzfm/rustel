@@ -23,12 +23,17 @@ fn query(runtime: &JsRuntime) -> Vec<Hap> {
 
 #[test]
 fn direct_gain_lpf_and_lpq_follow_distinct_native_cells() {
-    // A lane label and a plugin call keep the bindings of the line.
+    // A lane label, a plugin call and a muted lane with the same slider keep
+    // the bindings of the line.
     for (lane, plugin) in [
         ("", ""),
         ("$: ", ""),
         ("lead: ", ""),
         ("$: ", ".vsti('tone')"),
+        (
+            "_$: s('saw').gain(sliderWithID('gain', .5)).vsti('tone');\n$: ",
+            ".vsti('tone')",
+        ),
     ] {
         let runtime = runtime();
         evaluate(

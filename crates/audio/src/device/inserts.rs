@@ -80,9 +80,10 @@ impl LiveReverbBatch {
 
     fn observe_inserts(&mut self, event: &crate::AudioEvent) {
         let chain = event.controls.insert_chain();
-        for (stage, effect) in event.controls.effects.iter().enumerate() {
+        for (place, effect) in event.controls.effects.iter().enumerate() {
             if let Some(effect) = effect {
-                self.request_insert(crate::insert::effect_slot(chain, stage), effect.key);
+                let slot = crate::insert::effect_slot(chain, effect.stage(place));
+                self.request_insert(slot, effect.key);
             }
         }
         if let Some(instrument) = event.controls.instrument {
@@ -116,7 +117,26 @@ impl LiveReverbBatch {
         // The callback knows a chain before the first insert of the chain.
         let names = locked(&device.insert_names).clone();
         if let Some(names) = names {
-            device.set_named_insert_chains(&names());
+            let shared = &device.shared;
+            let turn = crate::insert::InsertTurn {
+                refusals: shared.samples.insert_refusals.load(Ordering::Acquire),
+                late_jobs: shared.plugin_late_jobs.load(Ordering::Acquire),
+                inline_jobs: shared.plugin_jobs_inline.load(Ordering::Acquire),
+            };
+            let chains = names(turn);
+            device.set_named_insert_chains(&chains.named);
+            device.release_inserts(&chains.gone);
+        }
+        // The moved values fill the room of the ring. The rest waits in the
+        // source for the next turn.
+        let values = locked(&device.insert_values).clone();
+        if let Some(values) = values {
+            let ring = &device.shared.insert_values;
+            for value in values(ring.capacity() - ring.len()) {
+                if ring.push(value).is_err() {
+                    break;
+                }
+            }
         }
         // A copy that was not ready gets another try on the next turn.
         let waiting = {
@@ -140,7 +160,18 @@ impl LiveReverbBatch {
             .insert_refusals
             .fetch_add(self.refused, Ordering::Relaxed);
         self.refused = 0;
+        device.ship_plugin_pool();
     }
+}
+
+/// The plugin workers an output starts: the count its options ask for,
+/// else the count `env` gives, the value of [`PLUGIN_THREADS_ENV`], else the
+/// cores of the process minus 2.
+pub(super) fn plugin_threads(asked: Option<u16>, env: Option<&str>) -> usize {
+    asked
+        .map(usize::from)
+        .or_else(|| env?.parse().ok())
+        .unwrap_or_else(crate::pool::plugin_workers)
 }
 
 impl LiveScalarDevice {
@@ -274,7 +305,7 @@ impl LiveScalarDevice {
         let provider = locked(&self.insert_provider).clone();
         let Some(provider) = provider else { return };
         if waiting.len() == crate::insert::INSERT_SLOTS
-            || cache.len() == crate::insert::INSERT_SLOTS * 2
+            || cache.len() == crate::insert::INSERT_SLOTS * 3
         {
             self.shared
                 .samples
@@ -292,6 +323,9 @@ impl LiveScalarDevice {
         let Some(insert) = provider(key, self.sample_rate, slot) else {
             return;
         };
+        if insert.any_thread() {
+            self.start_plugin_pool();
+        }
         let pointer = Box::into_raw(insert);
         match installs.push(crate::assets::InsertInstall {
             slot,
@@ -308,6 +342,69 @@ impl LiveScalarDevice {
                 drop(unsafe { Box::from_raw(install.insert) });
             }
         }
+    }
+
+    /// Starts the plugin workers of this output, when it has none, for a
+    /// copy that runs on any thread. The workers take a real-time class for
+    /// the buffer and the rate of the stream.
+    fn start_plugin_pool(&self) {
+        let mut pool = locked(&self.plugin_pool);
+        if pool.is_some() {
+            return;
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(workers) = crate::pool::test_workers() {
+            *pool = crate::pool::PluginPool::start_test_pool(workers, true);
+            return;
+        }
+        let env = std::env::var(PLUGIN_THREADS_ENV).ok();
+        let workers = plugin_threads(self.options.plugin_threads(), env.as_deref());
+        let frames = self
+            .reported_buffer_frames
+            .unwrap_or(self.requested_buffer_frames);
+        *pool = crate::pool::PluginPool::start(workers, frames, self.sample_rate);
+    }
+
+    /// Gives the plugin workers to the backend of the stream, once for each
+    /// backend, with the buffer and the rate of that stream. The workers go
+    /// once one of them has its real-time class. Each turn also gives the
+    /// workers the power mode.
+    fn ship_plugin_pool(&self) {
+        let mut pool = locked(&self.plugin_pool);
+        let Some(pool) = pool.as_mut() else { return };
+        pool.follow_power_mode();
+        if self.plugin_pool_shipped.load(Ordering::Relaxed) || pool.ready_workers() == 0 {
+            return;
+        }
+        let frames = self
+            .reported_buffer_frames
+            .unwrap_or(self.requested_buffer_frames);
+        pool.shared().follow_stream(frames, self.sample_rate);
+        // The flag goes before the workers. A new pool reaches the callback
+        // with its gate closed, and the gate opens at the end of its first
+        // buffer at the earliest. So the callback has the class before its
+        // first job. After a recycle the flag is already set.
+        self.shared.plugin_real_time.store(true, Ordering::Release);
+        let shared = Arc::into_raw(Arc::clone(pool.shared()));
+        match self
+            .shared
+            .samples
+            .pool_installs
+            .push(crate::assets::PoolInstall(shared))
+        {
+            Ok(()) => self.plugin_pool_shipped.store(true, Ordering::Relaxed),
+            Err(install) => {
+                // SAFETY: the count never left this thread.
+                drop(unsafe { Arc::from_raw(install.0) });
+            }
+        }
+    }
+
+    /// The plugin workers that have their real-time class.
+    pub(super) fn ready_plugin_workers(&self) -> u64 {
+        locked(&self.plugin_pool)
+            .as_ref()
+            .map_or(0, |pool| pool.ready_workers() as u64)
     }
 
     /// True when this logical slot has a shipped copy not yet returned.
@@ -577,17 +674,27 @@ impl LiveScalarDevice {
     }
 
     /// Sets the source of the chain names: the output asks the source
-    /// before it takes the inserts of a turn, and gives the answer to
-    /// [`Self::set_named_insert_chains`].
+    /// before it takes the inserts of a turn, with the counts of the
+    /// output, and gives the answer to [`Self::set_named_insert_chains`].
     pub fn set_insert_names(&self, names: Arc<crate::insert::InsertNames>) {
         *locked(&self.insert_names) = Some(names);
     }
 
+    /// Sets the source of the values sliders moved: the output asks the
+    /// source at each turn of inserts, after the names, for as many values as
+    /// its ring has room for. The callback gives each value to its insert at
+    /// the start of its next buffer.
+    pub fn set_insert_values(&self, values: Arc<crate::insert::InsertValues>) {
+        *locked(&self.insert_values) = Some(values);
+    }
+
     /// Names the insert chains the playing score has, 64 at most. The
     /// callback keeps the inserts of a named chain through each silence,
-    /// and gives back the inserts of each other chain after its tail. An
-    /// output that never gets a list keeps the rule by use: a chain leaves
-    /// after 30 seconds with no use.
+    /// and gives back the inserts of each other chain after its tail. A
+    /// named chain with no free bus takes the bus of a chain with no name,
+    /// after a fade of 10 ms. The chain of an orbit keeps its bus. An output
+    /// that never gets a list keeps the rule by use: a chain leaves after 30
+    /// seconds with no use.
     ///
     /// Name a chain before its inserts go to the output, so the callback
     /// knows the chain when its first insert arrives.
@@ -607,6 +714,47 @@ impl LiveScalarDevice {
         }
         self.shared.insert_named_list.fetch_add(1, Ordering::AcqRel);
     }
+
+    /// Asks the callback to give back each copy of `gone` it holds: a copy
+    /// the playing score no longer has. The callback keeps a copy that is
+    /// busy or heard, so the release goes again each second while the
+    /// callback holds the copy. With a full ring the rest go at the next
+    /// turn. The output makes no more tries to ship such a copy.
+    fn release_inserts(&self, gone: &[(crate::insert::InsertSlot, crate::insert::InsertKey)]) {
+        if gone.is_empty() {
+            return;
+        }
+        let cache = locked(&self.insert_cache);
+        let mut waiting = locked(&self.insert_waiting);
+        let mut released = locked(&self.insert_released);
+        let holds = |slot, key| {
+            cache
+                .iter()
+                .any(|(held, cached, _)| (*held, *cached) == (slot, key))
+        };
+        // A copy that came back needs no release.
+        released.retain(|(slot, key, _)| holds(*slot, *key));
+        for &(slot, key) in gone {
+            waiting.retain(|(held, wanted, _)| (*held, *wanted) != (slot, key));
+            if !holds(slot, key) {
+                continue;
+            }
+            let last = released
+                .iter()
+                .position(|(held, cached, _)| (*held, *cached) == (slot, key));
+            if last.is_some_and(|last| released[last].2.elapsed() < Duration::from_secs(1)) {
+                continue;
+            }
+            let release = crate::assets::InsertRelease { slot, key };
+            if self.shared.samples.insert_releases.push(release).is_err() {
+                break;
+            }
+            match last {
+                Some(last) => released[last].2 = Instant::now(),
+                None => released.push((slot, key, Instant::now())),
+            }
+        }
+    }
 }
 
 impl LiveScalarDevice {
@@ -623,6 +771,7 @@ impl LiveScalarDevice {
             .clear();
         locked(&self.insert_cache).clear();
         locked(&self.insert_waiting).clear();
+        locked(&self.insert_released).clear();
         self.kabel_cache
             .lock()
             .expect("producer KabelSalat cache")
@@ -650,6 +799,15 @@ impl LiveScalarDevice {
 mod tests {
     use super::super::tests::*;
     use super::*;
+
+    /// Waits until `ready` gives true. After 10 s the test fails with `what`.
+    fn until(what: &str, ready: impl Fn() -> bool) {
+        let start = std::time::Instant::now();
+        while !ready() {
+            assert!(start.elapsed().as_secs() < 10, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
 
     #[test]
     fn finished_kabel_voices_release_capacity_for_a_larger_patch() {
@@ -767,7 +925,7 @@ mod tests {
 
     /// A batch asks for the inserts of each event it observes: an event
     /// with its worklets prepared by the batch, and an event prepared
-    /// with its window.
+    /// with its window. An effect goes to the slot of its stage.
     #[test]
     fn a_batch_ships_the_inserts_of_each_event_it_observes() {
         struct Quiet(crate::insert::InsertKey);
@@ -784,10 +942,14 @@ mod tests {
             Some(Box::new(Quiet(key)) as Box<dyn crate::insert::OrbitInsert>)
         }));
         let key = |plugin| crate::insert::InsertKey { plugin, preset: 0 };
+        // The effect of plugin 1 has stage 1, and the effect of plugin 2
+        // stage 2.
         let event = |plugin: u32| {
             let mut event = kabel_event(kabel_program(), 1);
             event.controls.insert_chain = Some(u64::from(plugin));
-            event.controls.effects[0] = Some(crate::insert::InsertControls::new(key(plugin)));
+            let mut effect = crate::insert::InsertControls::new(key(plugin));
+            effect.set_stage(plugin as u8);
+            event.controls.effects[0] = Some(effect);
             event
         };
         let mut batch = LiveReverbBatch::default();
@@ -796,7 +958,7 @@ mod tests {
         batch.flush(&device);
         assert_eq!(device.shared.samples.kabel_installs.len(), 1);
         for plugin in [1, 2] {
-            let slot = crate::insert::effect_slot(u64::from(plugin), 0);
+            let slot = crate::insert::effect_slot(u64::from(plugin), plugin as usize);
             assert!(device.holds_insert(slot, key(plugin)), "plugin {plugin}");
         }
         assert_eq!(device.shared.samples.insert_installs.len(), 2);
@@ -1104,7 +1266,8 @@ mod tests {
 
     /// The producer builds an insert one time for an orbit, the running
     /// callback keeps the instance when its output orbit changes,
-    /// and a displaced insert comes back for the producer to free.
+    /// and a displaced insert comes back for the producer to free. A copy
+    /// the score no longer has comes back too.
     #[test]
     fn the_callback_installs_and_returns_the_insert_of_an_orbit() {
         use std::sync::atomic::AtomicUsize;
@@ -1113,6 +1276,7 @@ mod tests {
         struct Seen {
             built: AtomicUsize,
             reject: AtomicBool,
+            busy: AtomicBool,
             processed: [AtomicUsize; 2],
             parameters: [AtomicUsize; 2],
             dropped: AtomicUsize,
@@ -1129,17 +1293,13 @@ mod tests {
             fn process(&mut self, _left: &mut [f32], _right: &mut [f32]) {
                 self.1.processed[self.0.plugin as usize - 1].fetch_add(1, Ordering::Relaxed);
             }
+            fn busy(&self) -> bool {
+                self.1.busy.load(Ordering::Relaxed)
+            }
         }
         impl Drop for Probe {
             fn drop(&mut self) {
                 self.1.dropped.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        fn until(what: &str, ready: impl Fn() -> bool) {
-            let start = std::time::Instant::now();
-            while !ready() {
-                assert!(start.elapsed().as_secs() < 10, "{what}");
-                std::thread::sleep(std::time::Duration::from_millis(2));
             }
         }
 
@@ -1234,7 +1394,10 @@ mod tests {
         event.onset_id += 1;
         event.target_frame = device.clock_frames() + 4_800;
         event.controls.effects[0] = Some(crate::insert::InsertControls::new(key(2)));
-        assert!(device.push(event));
+        // The note ends 60 ms after its onset. Its chain is silent 200 ms
+        // after the onset.
+        let quiet_by = event.target_frame + 9_600;
+        assert!(device.push(event.clone()));
         until("the displaced insert did not come back", || {
             seen.processed[1].load(Ordering::Relaxed) > 0
                 && device.shared.samples.insert_returns.len() == 1
@@ -1246,12 +1409,90 @@ mod tests {
         assert!(device.holds_insert(crate::insert::effect_slot(1, 0), key(2)));
         assert!(!device.holds_insert(crate::insert::effect_slot(1, 0), key(1)));
 
+        // The names source gives a copy the score no longer has. The
+        // callback keeps the copy while it is busy, and the device sends the
+        // release again 1 s later. The device frees the copy that comes back
+        // and forgets its releases.
+        let slot = crate::insert::effect_slot(1, 0);
+        let gone = Arc::new(std::sync::Mutex::new(vec![(slot, key(2))]));
+        device.set_insert_names(Arc::new({
+            let gone = Arc::clone(&gone);
+            move |_| crate::insert::InsertChains {
+                named: vec![1],
+                gone: gone.lock().unwrap().clone(),
+            }
+        }));
+        let releases = &device.shared.samples.insert_releases;
+        assert_eq!(releases.capacity(), crate::insert::INSERT_SLOTS);
+        let sent = || {
+            let released = device.insert_released.lock().unwrap();
+            released.first().map(|(.., at)| *at)
+        };
+        until("the note did not end", || device.clock_frames() >= quiet_by);
+        seen.busy.store(true, Ordering::Relaxed);
+        LiveReverbBatch::default().flush_inserts(&device);
+        let first = sent().expect("a release");
+        until("the callback did not take the release", || {
+            releases.len() == 0
+        });
+        let taken_by = device.clock_frames() + 512;
+        until("the callback did not run", || {
+            device.clock_frames() >= taken_by
+        });
+        assert_eq!(device.shared.samples.insert_returns.len(), 0);
+        // A busy machine stalls the waits above at times. The time of the
+        // release moves to now, so the next turn comes within 1 s of it.
+        let now = Instant::now();
+        device.insert_released.lock().unwrap()[0].2 = now;
+        LiveReverbBatch::default().flush_inserts(&device);
+        assert_eq!(sent(), Some(now), "one release each second");
+        seen.busy.store(false, Ordering::Relaxed);
+        device.insert_released.lock().unwrap()[0].2 = first - Duration::from_secs(1);
+        LiveReverbBatch::default().flush_inserts(&device);
+        assert!(sent() > Some(first));
+        until("the released insert did not come back", || {
+            device.shared.samples.insert_returns.len() == 1
+        });
+        LiveReverbBatch::default().flush_inserts(&device);
+        assert_eq!(seen.dropped.load(Ordering::Relaxed), 2);
+        assert!(!device.holds_insert(slot, key(2)));
+        assert_eq!(sent(), None);
+
+        // A stopped output makes no sound: its callback gives the copy back
+        // at once, also while it is busy.
+        *gone.lock().unwrap() = Vec::new();
+        device.ensure_insert(slot, key(2));
+        let played = seen.processed[1].load(Ordering::Relaxed);
+        event.onset_id += 1;
+        event.target_frame = device.clock_frames() + 4_800;
+        assert!(device.push(event));
+        until("the next copy did not play", || {
+            seen.processed[1].load(Ordering::Relaxed) > played
+        });
+        seen.busy.store(true, Ordering::Relaxed);
+        assert!(device.stop_and_wait(Duration::from_secs(5)));
+        *gone.lock().unwrap() = vec![(slot, key(2))];
+        LiveReverbBatch::default().flush_inserts(&device);
+        until("the stopped output kept the insert", || {
+            device.shared.samples.insert_returns.len() == 1
+        });
+        LiveReverbBatch::default().flush_inserts(&device);
+        assert_eq!(seen.dropped.load(Ordering::Relaxed), 3);
+        assert!(!device.holds_insert(slot, key(2)));
+        device.resume();
+        seen.busy.store(false, Ordering::Relaxed);
+        // The callback holds a waiting copy of key 2 for the steps below.
+        device.ensure_insert(slot, key(2));
+        until("the callback did not take the copy", || {
+            device.shared.samples.insert_installs.len() == 0
+        });
+
         // Stop consumption so the next copy stays in the line during the
         // recycle. A copy that is not ready waits for the next turn.
         device.silent.as_mut().unwrap().stop();
         seen.reject.store(true, Ordering::Relaxed);
         device.ensure_insert(crate::insert::effect_slot(1, 0), key(1));
-        assert_eq!(seen.dropped.load(Ordering::Relaxed), 2);
+        assert_eq!(seen.dropped.load(Ordering::Relaxed), 4);
         assert_eq!(device.shared.samples.insert_installs.len(), 0);
         assert_eq!(
             device
@@ -1264,11 +1505,27 @@ mod tests {
             [(crate::insert::effect_slot(1, 0), key(1))]
         );
         assert!(device.holds_insert(crate::insert::effect_slot(1, 0), key(2)));
+        // A copy the score no longer has waits no more.
+        *gone.lock().unwrap() = vec![(slot, key(1))];
+        LiveReverbBatch::default().flush_inserts(&device);
+        assert!(device.insert_waiting.lock().unwrap().is_empty());
+        device.ensure_insert(slot, key(1));
+        // A full line of releases holds the release of the copy of key 2
+        // to the next turn.
+        *gone.lock().unwrap() = vec![(slot, key(2))];
+        let releases = &device.shared.samples.insert_releases;
+        let stale = crate::assets::InsertRelease { slot, key: key(3) };
+        while releases.push(stale).is_ok() {}
         device.insert_waiting.lock().unwrap()[0].2 = Instant::now() - Duration::from_secs(31);
         let built = seen.built.load(Ordering::Relaxed);
         LiveReverbBatch::default().flush_inserts(&device);
         assert!(device.insert_waiting.lock().unwrap().is_empty());
         assert_eq!(seen.built.load(Ordering::Relaxed), built);
+        assert!(device.insert_released.lock().unwrap().is_empty());
+        releases.pop();
+        LiveReverbBatch::default().flush_inserts(&device);
+        assert_eq!(releases.len(), releases.capacity());
+        assert_eq!(device.insert_released.lock().unwrap().len(), 1);
         seen.reject.store(false, Ordering::Relaxed);
         device.ensure_insert(crate::insert::effect_slot(1, 0), key(1));
         assert_eq!(device.shared.samples.insert_installs.len(), 1);
@@ -1292,6 +1549,26 @@ mod tests {
         device.ensure_insert(crate::insert::effect_slot(1, 0), key(3));
         assert_eq!(seen.built.load(Ordering::Relaxed), built);
         assert_eq!(device.insert_waiting.lock().unwrap().len(), 1);
+        // The device has room for an active, a prepared and a leaving copy
+        // of each slot. Entries with no box fill the room. The device
+        // refuses a copy more.
+        let fill = |copies| {
+            let entry = (crate::insert::effect_slot(2, 0), key(4), 0);
+            device.insert_cache.lock().unwrap().resize(copies, entry);
+        };
+        let refused = device.report().asset_queues.insert_refusals;
+        fill(crate::insert::INSERT_SLOTS * 3 - 1);
+        device.ensure_insert(slot, key(3));
+        assert_eq!(device.report().asset_queues.insert_refusals, refused);
+        assert_eq!(device.insert_waiting.lock().unwrap().len(), 1);
+        fill(crate::insert::INSERT_SLOTS * 3);
+        device.ensure_insert(slot, key(3));
+        assert_eq!(device.report().asset_queues.insert_refusals, refused + 1);
+        assert!(device.insert_waiting.lock().unwrap().is_empty());
+        assert_eq!(
+            device.insert_cache.lock().unwrap().capacity(),
+            crate::insert::INSERT_SLOTS * 3
+        );
 
         assert!(
             device
@@ -1304,10 +1581,14 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(seen.dropped.load(Ordering::Relaxed), 3);
+        assert_eq!(seen.dropped.load(Ordering::Relaxed), 5);
         assert_eq!(device.shared.samples.insert_installs.len(), 0);
         assert!(!device.holds_insert(crate::insert::effect_slot(1, 0), key(1)));
         assert!(device.insert_waiting.lock().unwrap().is_empty());
+        // The releases of the old callback go, and so does their record.
+        assert_eq!(device.shared.samples.insert_releases.len(), 0);
+        assert!(device.insert_released.lock().unwrap().is_empty());
+        *gone.lock().unwrap() = Vec::new();
 
         device
             .recycle_output_to_with(
@@ -1334,6 +1615,267 @@ mod tests {
         assert!(device.holds_insert(slot, key(2)));
     }
 
+    /// A moved value reaches the copy of its key after one turn, and a note
+    /// of its generation or older takes it at activation. A newer note keeps
+    /// its own value. A turn takes the values the ring has room for, and the
+    /// rest come at the next turn. The same with plugin workers.
+    #[test]
+    fn a_slider_value_reaches_the_insert_now_and_each_older_note() {
+        use std::sync::atomic::{AtomicU32, AtomicUsize};
+
+        /// The last value of parameter 0, as bits, the count of values and
+        /// the count of blocks.
+        #[derive(Default)]
+        struct Seen {
+            value: AtomicU32,
+            values: AtomicUsize,
+            processed: AtomicUsize,
+        }
+        struct Probe(crate::insert::InsertKey, Arc<Seen>, bool);
+        impl crate::insert::OrbitInsert for Probe {
+            fn key(&self) -> crate::insert::InsertKey {
+                self.0
+            }
+            fn set_param(&mut self, param: crate::insert::InsertParam, _frames: u32) {
+                if param.id == 0 {
+                    self.1.value.store(param.value.to_bits(), Ordering::Relaxed);
+                }
+                self.1.values.fetch_add(1, Ordering::Release);
+            }
+            fn process(&mut self, _left: &mut [f32], _right: &mut [f32]) {
+                self.1.processed.fetch_add(1, Ordering::Relaxed);
+            }
+            fn any_thread(&self) -> bool {
+                self.2
+            }
+        }
+
+        let _tripwire_guard = tripwire_assertion_guard();
+        for pooled in [false, true] {
+            crate::set_plugin_pool_for_test(pooled.then_some(2));
+            let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
+            let seen = Arc::new(Seen::default());
+            let value = || f32::from_bits(seen.value.load(Ordering::Relaxed));
+            // Acquire pairs with the Release in `set_param`: a value read
+            // after a count is as new as that count.
+            let values = || seen.values.load(Ordering::Acquire);
+            let key = crate::insert::InsertKey {
+                plugin: 1,
+                preset: 0,
+            };
+            let slot = crate::insert::effect_slot(1, 0);
+            device.set_insert_provider(Arc::new({
+                let seen = Arc::clone(&seen);
+                move |key, _, _| Some(Box::new(Probe(key, Arc::clone(&seen), pooled)) as Box<_>)
+            }));
+            // The source gives the values in its line that the ring has room
+            // for.
+            let line = Arc::new(std::sync::Mutex::new(Vec::new()));
+            device.set_insert_values(Arc::new({
+                let line = Arc::clone(&line);
+                move |room| {
+                    let mut line = line.lock().unwrap();
+                    let taken = room.min(line.len());
+                    line.drain(..taken).collect()
+                }
+            }));
+            let moved = |id, value| crate::insert::InsertValue {
+                slot,
+                key,
+                param: crate::insert::InsertParam { id, value },
+                generation: 7,
+            };
+            // A note of `generation` with the value 0.5 for parameter 0.
+            let note = |onset_id, generation| {
+                let mut effect = crate::insert::InsertControls::new(key);
+                assert!(effect.push(crate::insert::InsertParam { id: 0, value: 0.5 }));
+                let mut controls = crate::OscillatorControls {
+                    orbit: 1,
+                    ..Default::default()
+                };
+                controls.effects[0] = Some(effect);
+                AudioEvent {
+                    onset_id,
+                    generation,
+                    target_frame: device.clock_frames() + 4_800,
+                    onset_lead: 0.0,
+                    freq_hz: 220.0,
+                    gain: 0.5,
+                    duration_secs: 0.05,
+                    ui_visuals: 0,
+                    controls,
+                    sample: None,
+                    synth: None,
+                    wavetable: None,
+                    cut: None,
+                }
+            };
+            device.ensure_insert(slot, key);
+            // The turn ships the plugin workers.
+            LiveReverbBatch::default().flush_inserts(&device);
+            assert!(device.push(note(1, 7)));
+            until("the callback did not run the insert", || {
+                seen.processed.load(Ordering::Relaxed) > 0 && value() == 0.5
+            });
+            assert_eq!(device.report().plugin_workers, if pooled { 2 } else { 0 });
+
+            line.lock().unwrap().push(moved(0, 0.25));
+            LiveReverbBatch::default().flush_inserts(&device);
+            until("the value did not reach the insert", || value() == 0.25);
+            let before = values();
+            assert!(device.push(note(2, 7)));
+            until("the note of the generation did not come", || {
+                values() > before
+            });
+            assert_eq!(value(), 0.25);
+            device.set_generation(8, device.clock_frames(), TakeoverCut::None);
+            let before = values();
+            assert!(device.push(note(3, 8)));
+            until("the newer note did not come", || values() > before);
+            assert_eq!(value(), 0.5);
+
+            let before = values();
+            line.lock()
+                .unwrap()
+                .extend((1..=70).map(|id| moved(id, 0.5)));
+            LiveReverbBatch::default().flush_inserts(&device);
+            assert_eq!(line.lock().unwrap().len(), 6);
+            until("the first values did not come", || values() == before + 64);
+            LiveReverbBatch::default().flush_inserts(&device);
+            assert!(line.lock().unwrap().is_empty());
+            until("the last values did not come", || values() == before + 70);
+            // With no callback to take them, the values past the room of the
+            // ring wait in the source.
+            device.silent.take().expect("callback").stop();
+            line.lock()
+                .unwrap()
+                .extend((1..=70).map(|id| moved(id, 0.5)));
+            for _ in 0..2 {
+                LiveReverbBatch::default().flush_inserts(&device);
+            }
+            let ring = &device.shared.insert_values;
+            assert_eq!((ring.len(), line.lock().unwrap().len()), (64, 6));
+            drop(device);
+            crate::set_plugin_pool_for_test(None);
+        }
+    }
+
+    /// A copy that runs on any thread starts the plugin workers before its
+    /// install. A copy that does not, or an output that asks for no
+    /// workers, starts none. Workers with no real-time class stay with the
+    /// producer. Each backend takes the workers once, a recycle ships them to
+    /// the next backend with its buffer, and the device drop joins them.
+    #[test]
+    fn a_box_for_any_thread_starts_the_pool_and_the_device_drop_joins_it() {
+        struct Probe(crate::insert::InsertKey);
+        impl crate::insert::OrbitInsert for Probe {
+            fn key(&self) -> crate::insert::InsertKey {
+                self.0
+            }
+            fn set_param(&mut self, _: crate::insert::InsertParam, _: u32) {}
+            fn process(&mut self, _: &mut [f32], _: &mut [f32]) {}
+            // Plugin 2 runs on any thread.
+            fn any_thread(&self) -> bool {
+                self.0.plugin == 2
+            }
+        }
+        fn probe(
+            key: crate::insert::InsertKey,
+            _: u32,
+            _: crate::insert::InsertSlot,
+        ) -> Option<Box<dyn crate::insert::OrbitInsert>> {
+            Some(Box::new(Probe(key)))
+        }
+        let key = |plugin| crate::insert::InsertKey { plugin, preset: 0 };
+        let _tripwire_guard = tripwire_assertion_guard();
+        // An output that asks for no plugin workers starts none.
+        crate::set_plugin_pool_for_test(None);
+        let options = LiveOutputOptions::default().with_plugin_threads(Some(0));
+        let device =
+            LiveScalarDevice::start_silent_with_options(48_000, 7, options).expect("silent output");
+        device.set_insert_provider(Arc::new(probe));
+        device.ensure_insert(crate::insert::effect_slot(2, 0), key(2));
+        assert!(locked(&device.plugin_pool).is_none());
+        // Workers with no real-time class stay with the producer, and the
+        // callback keeps its priority.
+        *locked(&device.plugin_pool) = crate::pool::PluginPool::start_without_class(1);
+        LiveReverbBatch::default().flush_inserts(&device);
+        assert!(!device.shared.plugin_real_time.load(Ordering::Relaxed));
+        drop(device);
+
+        crate::set_plugin_pool_for_test(Some(2));
+        let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
+        device.silent.take().expect("callback").stop();
+        device.set_insert_provider(Arc::new(probe));
+        let installs = &device.shared.samples.pool_installs;
+        device.ensure_insert(crate::insert::effect_slot(1, 0), key(1));
+        assert!(locked(&device.plugin_pool).is_none());
+        LiveReverbBatch::default().flush_inserts(&device);
+        assert_eq!(installs.len(), 0);
+        device.ensure_insert(crate::insert::effect_slot(2, 0), key(2));
+        let shared = Arc::clone(
+            locked(&device.plugin_pool)
+                .as_ref()
+                .expect("plugin workers")
+                .shared(),
+        );
+        assert_eq!(device.report().plugin_workers, 2);
+        // The workers, the device and this test hold the pool.
+        assert_eq!(Arc::strong_count(&shared), 4);
+
+        // The turn ships the pool, and a backend takes it once. The callback
+        // then takes the class of the workers.
+        LiveReverbBatch::default().flush_inserts(&device);
+        assert_eq!(installs.len(), 1);
+        assert!(device.shared.plugin_real_time.load(Ordering::Relaxed));
+        let mut backend = crate::LiveScalarBackend::new(48_000, 8).unwrap();
+        backend.drain_insert_installs(&device.shared.samples);
+        assert_eq!((installs.len(), Arc::strong_count(&shared)), (0, 5));
+        LiveReverbBatch::default().flush_inserts(&device);
+        assert_eq!(installs.len(), 0);
+        drop(backend);
+
+        // A failed replacement keeps the workers. The next turn ships them,
+        // and the recycle after it drops what no backend took.
+        let fail = |device: &mut LiveScalarDevice| {
+            device.recycle_output_to_with(
+                Some(SILENT_OUTPUT_NAME),
+                |_| unreachable!("silent output needs no discovery"),
+                |_, _| Err(DevicePlaybackError::Unavailable("no output".into())),
+            )
+        };
+        assert!(fail(&mut device).is_err());
+        let installs = &device.shared.samples.pool_installs;
+        LiveReverbBatch::default().flush_inserts(&device);
+        assert_eq!((installs.len(), Arc::strong_count(&shared)), (1, 5));
+        assert!(fail(&mut device).is_err());
+        let installs = &device.shared.samples.pool_installs;
+        assert_eq!((installs.len(), Arc::strong_count(&shared)), (0, 4));
+
+        // The replacement output takes the same workers, which follow its
+        // buffer.
+        device.set_buffer_preference(AudioBufferPreference::Frames(257));
+        device
+            .recycle_output_to_with(
+                Some(SILENT_OUTPUT_NAME),
+                |_| unreachable!("silent output needs no discovery"),
+                |device, _| device.prepare_recycled_output(None),
+            )
+            .expect("replacement output");
+        LiveReverbBatch::default().flush_inserts(&device);
+        until("the next backend did not take the pool", || {
+            device.shared.samples.pool_installs.len() == 0
+        });
+        assert_eq!(Arc::strong_count(&shared), 5);
+        assert_eq!(device.report().plugin_workers, 2);
+        assert_eq!(shared.period(), (257, device.sample_rate()));
+
+        // The drop stops the output, then joins each worker.
+        drop(device);
+        assert_eq!(Arc::strong_count(&shared), 1);
+        crate::set_plugin_pool_for_test(None);
+    }
+
     #[test]
     fn live_reverb_batch_keeps_only_the_final_request_per_orbit() {
         let first = crate::reverb::ReverbParams {
@@ -1356,5 +1898,33 @@ mod tests {
         assert_eq!(batch.requested[0], Some(final_request));
         assert_eq!(batch.requested[1], Some(first));
         assert_eq!(batch.requested.iter().flatten().count(), 2);
+    }
+
+    /// The names source hears the counts of the output at each turn.
+    #[test]
+    fn the_names_source_hears_the_counts_of_the_output() {
+        let device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
+        let turns = Arc::new(std::sync::Mutex::new(Vec::new()));
+        device.set_insert_names(Arc::new({
+            let turns = Arc::clone(&turns);
+            move |turn| {
+                turns.lock().unwrap().push(turn);
+                crate::insert::InsertChains::default()
+            }
+        }));
+        let shared = &device.shared;
+        shared
+            .samples
+            .insert_refusals
+            .fetch_add(1, Ordering::Relaxed);
+        shared.plugin_late_jobs.fetch_add(2, Ordering::Relaxed);
+        shared.plugin_jobs_inline.fetch_add(3, Ordering::Relaxed);
+        LiveReverbBatch::default().flush_inserts(&device);
+        let turn = crate::insert::InsertTurn {
+            refusals: 1,
+            late_jobs: 2,
+            inline_jobs: 3,
+        };
+        assert_eq!(*turns.lock().unwrap(), [turn]);
     }
 }

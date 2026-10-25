@@ -88,6 +88,43 @@ fn controls(waveform: Waveform, pan: Option<f32>) -> OscillatorControls {
     }
 }
 
+/// A list of 128 partials plays every one below Nyquist: a custom sawtooth
+/// at 65.4 Hz keeps its 100th partial 40 dB under the first, as the terms ask.
+#[test]
+fn a_custom_wave_plays_every_partial_of_a_long_list() {
+    let count = 128;
+    let real = vec![0.0f32; count];
+    let imag: Vec<f32> = (1..=count).map(|n| -1.0 / n as f32).collect();
+    let mut controls = controls(Waveform::Sawtooth, None);
+    controls.partials = Some(rustel_audio::register_partials(count, &real, &imag));
+    let frequency = 65.406f32;
+    let event = OnsetEvent::new(0, frequency, 1.0, 1.0).with_controls(controls);
+    let pcm = render_pcm(&mut ScalarBackend::new(), 48_000, 48_000, &[event]).unwrap();
+    let left: Vec<f32> = pcm
+        .iter()
+        .step_by(2)
+        .skip(4_800)
+        .take(38_400)
+        .copied()
+        .collect();
+    // One DFT bin under a Hann window.
+    let level = |hz: f32| {
+        let (mut re, mut im) = (0.0f64, 0.0f64);
+        for (n, sample) in left.iter().enumerate() {
+            let window = 0.5 - 0.5 * (std::f64::consts::TAU * n as f64 / left.len() as f64).cos();
+            let angle = std::f64::consts::TAU * f64::from(hz) * n as f64 / 48_000.0;
+            re += f64::from(*sample) * window * angle.cos();
+            im += f64::from(*sample) * window * angle.sin();
+        }
+        re.hypot(im)
+    };
+    let below_first = 20.0 * (level(frequency * 100.0) / level(frequency)).log10();
+    assert!(
+        (below_first + 40.0).abs() < 0.5,
+        "the 100th partial sits {below_first:.2} dB under the first"
+    );
+}
+
 #[test]
 fn scalar_wav_is_streamed_with_a_correct_non_silent_body() {
     let path = std::env::temp_dir().join(format!(
@@ -232,8 +269,10 @@ fn postgain_scales_the_distorted_output_rather_than_the_drive() {
     );
 }
 
-/// An FM modulator first runs in the quantum where its carrier starts, from
-/// phase zero. Two identical FM notes are the same sound wherever they start.
+/// FM modulators run from the start of the render, as in the browser
+/// reference: a note does not restart their phase. Two identical FM notes
+/// are the same sound when the anchored phase the later one reaches comes
+/// around - 125 Hz at harmonicity 4 turns exactly 500 cycles a second.
 #[test]
 fn two_identical_fm_notes_sound_the_same_wherever_they_start() {
     let mut controls = controls(Waveform::Sine, None);
@@ -243,7 +282,7 @@ fn two_identical_fm_notes_sound_the_same_wherever_they_start() {
             &mut ScalarBackend::new(),
             48_000,
             onset as usize + 8_000,
-            &[OnsetEvent::new(onset, 130.81, 1.0, 0.1).with_controls(controls.clone())],
+            &[OnsetEvent::new(onset, 125.0, 1.0, 0.1).with_controls(controls.clone())],
         )
         .expect("render")
     };
@@ -262,46 +301,57 @@ fn two_identical_fm_notes_sound_the_same_wherever_they_start() {
     assert!(worst < 1e-9, "the two notes differ by {worst}");
 }
 
-/// Where in its render quantum a note starts is still audible, because Blink
-/// writes an oscillator's first quantum from its sub-quantum offset while
-/// reading the frequency param from the START of that quantum. So the carrier
-/// hears the quantum's FIRST modulator samples until the quantum ends, and the
-/// modulators are `offset` samples ahead from there on.
+/// A note sounds the modulator phase the render has reached, not a phase of
+/// its own: the second note of one render sits mid-cycle when it starts half
+/// a modulator cycle in, and sounds different from the first, while a note
+/// that starts a whole number of modulator cycles in sounds the same.
 #[test]
-fn an_fm_note_hears_its_modulators_from_the_start_of_its_quantum() {
+fn a_note_sounds_the_modulator_phase_the_render_has_reached() {
     let mut controls = controls(Waveform::Sine, None);
     controls.fm = Some(fm_chain(&[Some((4.0, 2.0))]));
-    let render = |onset: u64| {
+    let render = |second: u64| {
         render_pcm(
             &mut ScalarBackend::new(),
             48_000,
-            onset as usize + 8_000,
-            &[OnsetEvent::new(onset, 130.81, 1.0, 0.1).with_controls(controls.clone())],
+            56_000,
+            &[
+                OnsetEvent::new(0, 125.0, 1.0, 0.1).with_controls(controls.clone()),
+                OnsetEvent::new(second, 125.0, 1.0, 0.1).with_controls(controls.clone()),
+            ],
         )
         .expect("render")
     };
-    let aligned = render(0);
-    let offset = 64u64;
-    let late = render(offset);
-    let skip = offset as usize * 2;
-    // Up to the quantum boundary both notes read the same modulator samples,
-    // counting from zero, so they are the same signal.
-    let head = aligned[..skip]
-        .iter()
-        .zip(&late[skip..skip * 2])
-        .map(|(aligned, late)| (aligned - late).abs())
-        .fold(0.0f32, f32::max);
-    assert!(head < 1e-9, "the first {offset} samples differ by {head}");
-    // At the boundary the late note's modulators jump the offset they were
-    // never charged for, and the two part company.
-    let tail = aligned[skip..4_000 * 2]
-        .iter()
-        .zip(&late[skip * 2..])
-        .map(|(aligned, late)| (aligned - late).abs())
-        .fold(0.0f32, f32::max);
+    let alone = render_pcm(
+        &mut ScalarBackend::new(),
+        48_000,
+        8_000,
+        &[OnsetEvent::new(0, 125.0, 1.0, 0.1).with_controls(controls.clone())],
+    )
+    .expect("render");
     assert!(
-        tail > 0.01,
-        "the modulators did not catch up at the quantum boundary (differ by {tail})"
+        alone.iter().copied().map(f32::abs).fold(0.0, f32::max) > 0.01,
+        "the fixture must actually be sounding"
+    );
+    let worst = |rendered: &[f32], at: usize| {
+        alone[..8_000 * 2]
+            .iter()
+            .zip(&rendered[at..at + 8_000 * 2])
+            .map(|(alone, note)| (alone - note).abs())
+            .fold(0.0f32, f32::max)
+    };
+    // 125 Hz at harmonicity 4 turns 250 whole cycles in half a second: the
+    // second note picks the phase up where the first one left it.
+    let realigned = render(48_000);
+    assert!(
+        worst(&realigned, 48_000 * 2) < 1e-9,
+        "a whole-cycle onset sounds a new note: {}",
+        worst(&realigned, 48_000 * 2)
+    );
+    let half = render(24_000);
+    assert!(
+        worst(&half, 24_000 * 2) > 0.01,
+        "a half-cycle onset restarted the modulator: {}",
+        worst(&half, 24_000 * 2)
     );
 }
 
@@ -5078,8 +5128,11 @@ impl rustel_audio::OrbitInsert for GainInsert {
 
 #[test]
 fn an_orbit_insert_processes_the_notes_that_ask_for_the_effect() {
-    use rustel_audio::{InsertControls, InsertKey, InsertParam, InsertProvider, OrbitInsert};
+    use rustel_audio::{
+        InsertControls, InsertKey, InsertParam, InsertProvider, OrbitInsert, render_pcm_events,
+    };
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let key = InsertKey {
         plugin: 7,
@@ -5125,6 +5178,17 @@ fn an_orbit_insert_processes_the_notes_that_ask_for_the_effect() {
     for (frame, (wet, dry)) in chained.iter().zip(&dry).enumerate() {
         assert_eq!(*wet, dry * 0.25, "sample {frame}");
     }
+    // With the stages 1 and 0, the note goes through both effects. Two
+    // effects at one stage run that stage one time.
+    let staged = |stages: [u8; 2]| {
+        let mut event = note(1, &[0.5, 0.5]);
+        for (effect, stage) in event.controls.effects.iter_mut().flatten().zip(stages) {
+            effect.set_stage(stage);
+        }
+        render(&[event], Some(&provider))
+    };
+    assert_eq!(staged([1, 0]), (chained, 0));
+    assert_eq!(staged([0, 0]), (halved, 0));
 
     // Only the note that asks goes through the insert. A note on the same
     // orbit with no request, and a note on orbit 2, keep the level.
@@ -5138,6 +5202,35 @@ fn an_orbit_insert_processes_the_notes_that_ask_for_the_effect() {
     let (unserved, missed) = render(&[note(1, &[0.5])], None);
     assert_eq!(unserved, dry);
     assert_eq!(missed, 1);
+
+    // An offline render names each chain: the chain keeps its insert
+    // through 31 seconds of silence, and the provider builds one copy. With
+    // no name a chain leaves after 30 seconds with no use.
+    const RATE: u32 = 8_000;
+    let builds = Arc::new(AtomicUsize::new(0));
+    let counted: Arc<InsertProvider> = {
+        let builds = Arc::clone(&builds);
+        Arc::new(move |wanted, rate, slot| {
+            builds.fetch_add(1, Ordering::Relaxed);
+            provider(wanted, rate, slot)
+        })
+    };
+    let mut late = note(1, &[0.5]);
+    late.onset_frame = u64::from(31 * RATE);
+    for offline in [true, false] {
+        builds.store(0, Ordering::Relaxed);
+        let mut backend = ScalarBackend::new();
+        if offline {
+            backend.render_offline();
+        }
+        backend.set_insert_provider(Arc::clone(&counted));
+        let events = [note(1, &[0.5]), late.clone()];
+        let frames = 32 * RATE as usize;
+        render_pcm_events(&mut backend, RATE, frames, events).expect("render");
+        assert_eq!(backend.missing_insert_events(), 0);
+        let copies = if offline { 1 } else { 2 };
+        assert_eq!(builds.load(Ordering::Relaxed), copies, "offline: {offline}");
+    }
 }
 
 /// An instrument insert with a long silent start: one click 31 seconds into

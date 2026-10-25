@@ -1,8 +1,10 @@
 //! Two small VST3 plugins in one bundle, for the plugin host tests.
 //!
-//! The first is an effect: a gain with a beat gate. The effect has a
-//! processor class and a controller class, as most plugins do. The state is
-//! 16 bytes: the gain and the gate as two little-endian `f64` values.
+//! The first is an effect: a gain with a beat gate and a delay. The effect
+//! has a processor class and a controller class, as most plugins do. The
+//! state is 24 bytes: the gain, the gate and the delay as three
+//! little-endian `f64` values. A state of 16 bytes has the gain and the
+//! gate, and loads with a delay of 0.
 //!
 //! The second is an instrument: one sine for each note, with no input and
 //! no parameters.
@@ -14,7 +16,8 @@
 use std::cell::{Cell, RefCell};
 use std::ffi::{CString, c_char, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use std::{ptr, slice};
 
 use vst3::Steinberg::Vst::*;
@@ -36,6 +39,12 @@ pub const PARAM_GATE: u32 = 101;
 /// Parameter "Bypass": at 0.5 and above, the plugin writes no output, as a
 /// plugin that counts on one block for input and output.
 pub const PARAM_BYPASS: u32 = 102;
+/// Parameter "Delay": the effect delays its output by the value times 4096
+/// frames, to the nearest frame, and gives that delay as its latency. The
+/// delay takes the value the parameter has when the plugin turns on.
+pub const PARAM_DELAY: u32 = 103;
+/// The longest delay of the effect in frames: see [`PARAM_DELAY`].
+const MAX_DELAY: usize = 4096;
 
 const PROCESSOR: TUID = uid(0x52757374, 0x656C4669, 0x78747572, 0x65507263);
 const CONTROLLER: TUID = uid(0x52757374, 0x656C4669, 0x78747572, 0x6543746C);
@@ -89,10 +98,25 @@ pub fn install(folder: &Path) -> PathBuf {
     bundle
 }
 
-/// The bytes of a `.vstpreset` file that sets the gain and the gate.
+/// The bytes of a `.vstpreset` file that sets the gain and the gate. The
+/// state is 16 bytes, so the delay loads as 0.
 pub fn preset(gain: f64, gate: f64) -> Vec<u8> {
-    let mut state = gain.to_le_bytes().to_vec();
-    state.extend(gate.to_le_bytes());
+    preset_file(&[gain, gate])
+}
+
+/// The bytes of a `.vstpreset` file that sets the gain, the gate and the
+/// delay.
+pub fn preset_with_delay(gain: f64, gate: f64, delay: f64) -> Vec<u8> {
+    preset_file(&[gain, gate, delay])
+}
+
+/// The bytes of a `.vstpreset` file with `values` as the state, each one a
+/// little-endian `f64`.
+fn preset_file(values: &[f64]) -> Vec<u8> {
+    let state: Vec<u8> = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
     let mut file = b"VST3".to_vec();
     file.extend(1i32.to_le_bytes());
     file.extend(PROCESSOR_TEXT.as_bytes());
@@ -127,11 +151,12 @@ fn copy_wstring(src: &str, dst: &mut [TChar]) {
     dst[end] = 0;
 }
 
-/// The gain and the gate, shared by the two classes' own copies.
+/// The parameter values, shared by the two classes' own copies.
 struct Values {
     gain: AtomicU64,
     gate: AtomicU64,
     bypass: AtomicU64,
+    delay: AtomicU64,
 }
 
 impl Values {
@@ -140,6 +165,7 @@ impl Values {
             gain: AtomicU64::new(1.0f64.to_bits()),
             gate: AtomicU64::new(0.0f64.to_bits()),
             bypass: AtomicU64::new(0.0f64.to_bits()),
+            delay: AtomicU64::new(0.0f64.to_bits()),
         }
     }
 
@@ -148,6 +174,7 @@ impl Values {
             PARAM_GAIN => Some(&self.gain),
             PARAM_GATE => Some(&self.gate),
             PARAM_BYPASS => Some(&self.bypass),
+            PARAM_DELAY => Some(&self.delay),
             _ => None,
         }
     }
@@ -167,20 +194,25 @@ impl Values {
         }
     }
 
-    /// Reads the two values from a state stream.
+    /// Reads the three values from a state stream. A state of 16 bytes
+    /// loads with a delay of 0.
     unsafe fn read(&self, stream: *mut IBStream) -> tresult {
         let Some(stream) = (unsafe { ComRef::from_raw(stream) }) else {
             return kInvalidArgument;
         };
-        let mut bytes = [0u8; 16];
+        // The bytes a state of 16 bytes does not fill stay 0.
+        let mut bytes = [0u8; 24];
         let mut count = 0;
-        let result = unsafe { stream.read(bytes.as_mut_ptr().cast(), 16, &mut count) };
-        if result != kResultOk || count != 16 {
+        // SAFETY: `bytes` holds the 24 bytes the call writes at most, and
+        // `count` is a valid out-pointer.
+        let result = unsafe { stream.read(bytes.as_mut_ptr().cast(), 24, &mut count) };
+        if result != kResultOk || !matches!(count, 16 | 24) {
             return kResultFalse;
         }
         let value = |at: usize| f64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
         self.set(PARAM_GAIN, value(0));
         self.set(PARAM_GATE, value(8));
+        self.set(PARAM_DELAY, value(16));
         kResultOk
     }
 
@@ -190,15 +222,63 @@ impl Values {
         };
         let mut bytes = self.get(PARAM_GAIN).to_le_bytes().to_vec();
         bytes.extend(self.get(PARAM_GATE).to_le_bytes());
+        bytes.extend(self.get(PARAM_DELAY).to_le_bytes());
         let mut count = 0;
-        unsafe { stream.write(bytes.as_mut_ptr().cast(), 16, &mut count) }
+        // SAFETY: `bytes` holds the 24 bytes the call reads, and `count` is a
+        // valid out-pointer.
+        unsafe { stream.write(bytes.as_mut_ptr().cast(), 24, &mut count) }
+    }
+}
+
+/// The delay of the effect: see [`PARAM_DELAY`].
+struct Delay {
+    /// The frames of the delay, taken when the plugin turns on.
+    frames: usize,
+    /// The place in the ring of the next frame.
+    at: usize,
+    /// The last frames of the two channels. The ring has room for the
+    /// longest delay from the start, so the audio call allocates nothing.
+    ring: Vec<[f32; 2]>,
+}
+
+impl Delay {
+    fn new() -> Self {
+        Self {
+            frames: 0,
+            at: 0,
+            ring: vec![[0.0; 2]; MAX_DELAY],
+        }
+    }
+
+    /// Starts a delay of `frames`, the longest delay at most, with silence
+    /// in the ring.
+    fn start(&mut self, frames: usize) {
+        self.frames = frames.min(MAX_DELAY);
+        self.at = 0;
+        self.ring.fill([0.0; 2]);
+    }
+
+    /// Takes one frame in, and gives the frame that came in `frames`
+    /// frames before it.
+    fn pass(&mut self, frame: [f32; 2]) -> [f32; 2] {
+        if self.frames == 0 {
+            return frame;
+        }
+        let out = std::mem::replace(&mut self.ring[self.at], frame);
+        self.at = (self.at + 1) % self.frames;
+        out
     }
 }
 
 struct Processor {
     values: Values,
+    delay: RefCell<Delay>,
     /// Read one time, with the plugin: the audio call reads no variable.
     prints: bool,
+    /// The spin of each process call: see [`COST_ENV`].
+    cost: Duration,
+    /// See [`PROCESS_MARK_ENV`].
+    mark: Option<ProcessMark>,
 }
 
 /// The final release of the object, wherever it runs: a host that ends the
@@ -221,6 +301,9 @@ impl IPluginBaseTrait for Processor {
 
     unsafe fn terminate(&self) -> tresult {
         thread_mark("end");
+        if let Some(mark) = &self.mark {
+            mark.write();
+        }
         kResultOk
     }
 }
@@ -281,7 +364,11 @@ impl IComponentTrait for Processor {
         kResultOk
     }
 
-    unsafe fn setActive(&self, _state: TBool) -> tresult {
+    unsafe fn setActive(&self, state: TBool) -> tresult {
+        if state != 0 {
+            let frames = self.values.get(PARAM_DELAY) * MAX_DELAY as f64;
+            self.delay.borrow_mut().start(frames.round() as usize);
+        }
         kResultOk
     }
 
@@ -330,7 +417,7 @@ impl IAudioProcessorTrait for Processor {
     }
 
     unsafe fn getLatencySamples(&self) -> u32 {
-        0
+        self.delay.borrow().frames as u32
     }
 
     unsafe fn setupProcessing(&self, _setup: *mut ProcessSetup) -> tresult {
@@ -342,6 +429,8 @@ impl IAudioProcessorTrait for Processor {
     }
 
     unsafe fn process(&self, data: *mut ProcessData) -> tresult {
+        let _running = self.mark.as_ref().map(ProcessMark::enter);
+        spin(self.cost);
         if self.prints {
             print_line();
         }
@@ -399,6 +488,7 @@ impl IAudioProcessorTrait for Processor {
         let channel = |buses: &AudioBusBuffers, channel: usize| unsafe {
             *buses.__field0.channelBuffers32.add(channel)
         };
+        let mut delay = self.delay.borrow_mut();
         let mut next_point = 0;
         for frame in 0..frames {
             while next_point < gain_count && gain_points[next_point].0 <= frame {
@@ -408,10 +498,12 @@ impl IAudioProcessorTrait for Processor {
             let open = clock
                 .is_none_or(|(start, step)| (start + frame as f64 * step).rem_euclid(1.0) < 0.5);
             let level = if open { gain } else { 0.0 };
-            for side in 0..2 {
-                unsafe {
-                    *channel(output, side).add(frame) = *channel(input, side).add(frame) * level;
-                }
+            // SAFETY: each channel holds the samples of the block, and the
+            // checks above found 2 channels on each bus.
+            let samples = [0, 1].map(|side| unsafe { *channel(input, side).add(frame) } * level);
+            for (side, sample) in delay.pass(samples).into_iter().enumerate() {
+                // SAFETY: as above.
+                unsafe { *channel(output, side).add(frame) = sample };
             }
         }
         kResultOk
@@ -460,7 +552,7 @@ impl IEditControllerTrait for Controller {
     }
 
     unsafe fn getParameterCount(&self) -> i32 {
-        3
+        4
     }
 
     unsafe fn getParameterInfo(&self, index: i32, info: *mut ParameterInfo) -> tresult {
@@ -468,6 +560,7 @@ impl IEditControllerTrait for Controller {
             0 => (PARAM_GAIN, "Gain", 1.0),
             1 => (PARAM_GATE, "Beat Gate", 0.0),
             2 => (PARAM_BYPASS, "Bypass", 0.0),
+            3 => (PARAM_DELAY, "Delay", 0.0),
             _ => return kInvalidArgument,
         };
         let info = unsafe { &mut *info };
@@ -475,7 +568,7 @@ impl IEditControllerTrait for Controller {
         copy_wstring(title, &mut info.title);
         copy_wstring(title, &mut info.shortTitle);
         copy_wstring("", &mut info.units);
-        info.stepCount = i32::from(id != PARAM_GAIN);
+        info.stepCount = i32::from(matches!(id, PARAM_GATE | PARAM_BYPASS));
         info.defaultNormalizedValue = default;
         info.unitId = 0;
         info.flags = ParameterInfo_::ParameterFlags_::kCanAutomate;
@@ -555,6 +648,10 @@ struct Tone {
     voices: RefCell<Vec<ToneVoice>>,
     /// The process calls so far: see [`TONE_DEAF_CALLS`].
     calls: Cell<u32>,
+    /// The spin of each process call: see [`COST_ENV`].
+    cost: Duration,
+    /// See [`PROCESS_MARK_ENV`].
+    mark: Option<ProcessMark>,
 }
 
 impl Drop for Tone {
@@ -571,6 +668,8 @@ impl Tone {
             // call.
             voices: RefCell::new(Vec::with_capacity(128)),
             calls: Cell::new(0),
+            cost: process_cost(),
+            mark: ProcessMark::new(),
         }
     }
 
@@ -611,6 +710,9 @@ impl IPluginBaseTrait for Tone {
 
     unsafe fn terminate(&self) -> tresult {
         thread_mark("end");
+        if let Some(mark) = &self.mark {
+            mark.write();
+        }
         kResultOk
     }
 }
@@ -728,6 +830,8 @@ impl IAudioProcessorTrait for Tone {
     }
 
     unsafe fn process(&self, data: *mut ProcessData) -> tresult {
+        let _running = self.mark.as_ref().map(ProcessMark::enter);
+        spin(self.cost);
         let data = unsafe { &*data };
         if data.numOutputs != 1 || data.numSamples <= 0 {
             return kResultOk;
@@ -850,7 +954,10 @@ impl IPluginFactoryTrait for Factory {
                 thread_mark("make");
                 ComWrapper::new(Processor {
                     values: Values::new(),
+                    delay: RefCell::new(Delay::new()),
                     prints: std::env::var_os(PRINT_ENV).is_some(),
+                    cost: process_cost(),
+                    mark: ProcessMark::new(),
                 })
                 .to_com_ptr::<FUnknown>()
             }
@@ -938,10 +1045,22 @@ pub const BROKEN_TONE_ENV: &str = "RUSTEL_VST3_FIXTURE_BROKEN_TONE";
 /// read the lines, so the variable is set for a test process only.
 pub const THREAD_MARK_ENV: &str = "RUSTEL_VST3_FIXTURE_MARK_THREAD";
 
+/// With this variable set to a number, each process call of the effect and
+/// the instrument spins that many microseconds, as the call of a heavy
+/// plugin does.
+pub const COST_ENV: &str = "RUSTEL_VST3_FIXTURE_COST";
+
+/// With this variable set to a path, each copy of the effect and the
+/// instrument notes the thread of each process call, 16 threads at most,
+/// and whether a call started while another call of the copy ran. At
+/// `terminate` the copy appends one line to the file:
+/// `process threads 2, overlap no`, or `overlap yes`. The plugin host's
+/// tests read the line.
+pub const PROCESS_MARK_ENV: &str = "RUSTEL_VST3_FIXTURE_MARK_PROCESS";
+
 /// Writes the mark of one moment of the lifecycle, naming the thread that
 /// runs it.
 fn thread_mark(step: &str) {
-    use std::io::Write as _;
     let Some(mark) = std::env::var_os(THREAD_MARK_ENV) else {
         return;
     };
@@ -950,14 +1069,126 @@ fn thread_mark(step: &str) {
     } else {
         "other"
     };
+    append_line(Path::new(&mark), &format!("{step} {thread}"));
+}
+
+/// Appends one line to a mark file. A file that does not open gets no line.
+fn append_line(file: &Path, line: &str) {
+    use std::io::Write as _;
     let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&mark)
+        .open(file)
     else {
         return;
     };
-    let _ = writeln!(file, "{step} {thread}");
+    let _ = writeln!(file, "{line}");
+}
+
+/// The spin of each process call of a new copy: see [`COST_ENV`].
+fn process_cost() -> Duration {
+    let micros = std::env::var(COST_ENV)
+        .ok()
+        .and_then(|text| text.parse().ok());
+    Duration::from_micros(micros.unwrap_or(0))
+}
+
+/// Spins for `cost`, as a plugin with that much work in each call.
+fn spin(cost: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < cost {
+        std::hint::spin_loop();
+    }
+}
+
+/// The threads of the process calls of one copy: see [`PROCESS_MARK_ENV`].
+/// The record holds atomics only, so it stays true when two threads run
+/// one copy at the same time. On Linux and macOS the first call on a thread
+/// allocates thread storage: see [`thread_number`]. No other call
+/// allocates.
+struct ProcessMark {
+    file: PathBuf,
+    /// The number of each thread that ran a process call, 0 in a free
+    /// place.
+    threads: [AtomicU64; 16],
+    /// The process calls that run now.
+    running: AtomicU32,
+    overlap: AtomicBool,
+}
+
+impl ProcessMark {
+    /// The mark of a new copy, when the variable names a file.
+    fn new() -> Option<Self> {
+        Some(Self {
+            file: std::env::var_os(PROCESS_MARK_ENV)?.into(),
+            threads: Default::default(),
+            running: AtomicU32::new(0),
+            overlap: AtomicBool::new(false),
+        })
+    }
+
+    /// Notes a process call on the calling thread. The call ends when the
+    /// value drops.
+    fn enter(&self) -> InProcess<'_> {
+        // Each change of one atomic reads the last value: a call that
+        // starts before another call ends reads its count.
+        if self.running.fetch_add(1, Ordering::Relaxed) > 0 {
+            self.overlap.store(true, Ordering::Relaxed);
+        }
+        let thread = thread_number();
+        for place in &self.threads {
+            match place.compare_exchange(0, thread, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(known) if known == thread => break,
+                Err(_) => {}
+            }
+        }
+        InProcess(&self.running)
+    }
+
+    /// Appends the line of the copy to the file. The plugin thread runs
+    /// this after the last process call: the copy came back to it through
+    /// a channel, so the reads see each call.
+    fn write(&self) {
+        let taken = |place: &&AtomicU64| place.load(Ordering::Relaxed) != 0;
+        let threads = self.threads.iter().filter(taken).count();
+        let overlap = if self.overlap.load(Ordering::Relaxed) {
+            "yes"
+        } else {
+            "no"
+        };
+        append_line(
+            &self.file,
+            &format!("process threads {threads}, overlap {overlap}"),
+        );
+    }
+}
+
+/// A process call that runs: see [`ProcessMark::enter`].
+struct InProcess<'a>(&'a AtomicU32);
+
+impl Drop for InProcess<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A number for the calling thread, from 1. A number never comes again,
+/// also after its thread ends. The value lives in the thread storage of
+/// the plugin library. On Windows the system makes that storage before the
+/// first call, so the call allocates nothing. On Linux and macOS the system
+/// allocates it at its first use on each thread.
+fn thread_number() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    thread_local! {
+        static NUMBER: Cell<u64> = const { Cell::new(0) };
+    }
+    NUMBER.with(|number| {
+        if number.get() == 0 {
+            number.set(NEXT.fetch_add(1, Ordering::Relaxed));
+        }
+        number.get()
+    })
 }
 
 /// True when the system's main thread runs this call.
@@ -1010,4 +1241,74 @@ extern "system" fn GetPluginFactory() -> *mut IPluginFactory {
         .to_com_ptr::<IPluginFactory2>()
         .map(|factory| factory.upcast::<IPluginFactory>())
         .map_or(ptr::null_mut(), |factory| factory.into_raw())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustel_audio::tripwire::{self, TripwireAlloc, Violations};
+
+    #[global_allocator]
+    static ALLOCATOR: TripwireAlloc = TripwireAlloc;
+
+    /// Calls in turn mark no overlap, and a thread counts one time. A call
+    /// that starts while another call runs marks an overlap.
+    #[test]
+    fn a_call_inside_another_call_marks_an_overlap() {
+        let mark = ProcessMark {
+            file: PathBuf::new(),
+            threads: Default::default(),
+            running: AtomicU32::new(0),
+            overlap: AtomicBool::new(false),
+        };
+        let elsewhere = || std::thread::scope(|scope| drop(scope.spawn(|| drop(mark.enter()))));
+        drop(mark.enter());
+        drop(mark.enter());
+        elsewhere();
+        assert!(!mark.overlap.load(Ordering::Relaxed));
+        let running = mark.enter();
+        elsewhere();
+        drop(running);
+        assert!(mark.overlap.load(Ordering::Relaxed));
+        let taken = |place: &&AtomicU64| place.load(Ordering::Relaxed) != 0;
+        assert_eq!(mark.threads.iter().filter(taken).count(), 3);
+    }
+
+    /// A delay of 0 gives each frame back at once. A delay gives each frame
+    /// back after its frames, with silence first. A new start empties the
+    /// ring, and a delay stops at the longest delay. A pass allocates and
+    /// frees nothing, also when the ring turns.
+    #[test]
+    fn the_delay_gives_each_frame_back_after_its_frames() {
+        let run = |delay: &mut Delay, values: &[f32]| -> Vec<[f32; 2]> {
+            values
+                .iter()
+                .map(|value| delay.pass([*value, -value]))
+                .collect()
+        };
+        let mut delay = Delay::new();
+        assert_eq!(run(&mut delay, &[1.0]), [[1.0, -1.0]]);
+        delay.start(2);
+        let out = run(&mut delay, &[1.0, 2.0, 3.0]);
+        assert_eq!(out, [[0.0, 0.0], [0.0, 0.0], [1.0, -1.0]]);
+        // The ring holds 2 frames, and the next place is not the first.
+        delay.start(1);
+        assert_eq!(run(&mut delay, &[4.0, 5.0]), [[0.0, 0.0], [4.0, -4.0]]);
+        delay.start(MAX_DELAY + 1);
+        let out = run(&mut delay, &[1.0; MAX_DELAY + 1]);
+        assert!(out[..MAX_DELAY].iter().all(|frame| *frame == [0.0, 0.0]));
+        assert_eq!(out[MAX_DELAY], [1.0, -1.0]);
+        delay.start(1024);
+        let before = Violations::capture();
+        let last = tripwire::audio_scope(|| {
+            let mut last = [0.0; 2];
+            for frame in 0..2048 {
+                last = delay.pass([frame as f32, -(frame as f32)]);
+            }
+            last
+        });
+        let delta = Violations::capture().since(before);
+        assert!(delta.clean(), "the delay allocated or freed: {delta:?}");
+        assert_eq!(last, [1023.0, -1023.0]);
+    }
 }

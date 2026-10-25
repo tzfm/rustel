@@ -212,6 +212,8 @@ pub struct ExportSheet {
     /// Digits typed into the number under the caret, until they are taken.
     typed: String,
     pub target: PathBuf,
+    /// Vim Command mode until `i` or `a` asks to type.
+    pub(crate) vim_insert: bool,
 }
 
 /// What a key did to the sheet.
@@ -235,6 +237,7 @@ impl ExportSheet {
             field: Field::Length,
             typed: String::new(),
             target: PathBuf::new(),
+            vim_insert: false,
         };
         sheet.target = directory.join(sheet.filename(unix_seconds));
         sheet
@@ -249,6 +252,20 @@ impl ExportSheet {
             .strip_suffix(rustel_runtime::product::SESSION_FILE_SUFFIX)
             .unwrap_or(&tape);
         format!("{base}.{}", self.settings.extension())
+    }
+
+    pub(crate) fn vim_insert(&self) -> bool {
+        self.vim_insert
+    }
+
+    pub(crate) fn set_vim_insert(&mut self, insert: bool) {
+        self.vim_insert = insert;
+    }
+
+    /// Space toggles a choice on these lines. On a number or the path it
+    /// is text, so Command keeps it out until Insert.
+    pub(crate) fn space_changes_a_choice(&self) -> bool {
+        matches!(self.field, Field::Length | Field::Format | Field::Limiter)
     }
 
     fn silence(&self) -> bool {
@@ -291,6 +308,7 @@ impl ExportSheet {
     /// label is unambiguous in a way a whole row is not.
     pub fn click(&mut self, hit: Hit) {
         self.commit_typed();
+        self.vim_insert = false;
         match hit {
             Hit::Length { silence } => {
                 self.field = Field::Length;
@@ -317,6 +335,7 @@ impl ExportSheet {
 
     pub fn tab(&mut self, backwards: bool) {
         self.commit_typed();
+        self.vim_insert = false;
         self.field = if backwards {
             self.field.previous(self.silence())
         } else {
@@ -818,6 +837,8 @@ fn render(
 pub struct ExportSheetView<'a> {
     pub sheet: &'a ExportSheet,
     pub theme: &'a Theme,
+    /// Vim text modes own the fields and the list keys.
+    pub vim: bool,
 }
 
 impl ExportSheetView<'_> {
@@ -947,7 +968,7 @@ impl Widget for ExportSheetView<'_> {
         let paint_radio = |buffer: &mut Buffer, rect: Rect, text: &str, on: bool, active: bool| {
             let mut style = Style::default().fg(if on { theme.foreground } else { theme.muted });
             if active {
-                style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                style = style.add_modifier(Modifier::BOLD);
             }
             buffer.set_stringn(
                 rect.x,
@@ -960,7 +981,7 @@ impl Widget for ExportSheetView<'_> {
         let value_style = |active: bool| {
             let style = Style::default().fg(theme.foreground);
             if active {
-                style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                style.add_modifier(Modifier::BOLD)
             } else {
                 style
             }
@@ -1050,11 +1071,26 @@ impl Widget for ExportSheetView<'_> {
             usize::from(panel.right().saturating_sub(2).saturating_sub(details_x)),
             Style::default().fg(theme.muted),
         );
+        // The active field carries the same marker as the other sheets.
+        let active_y = match sheet.field {
+            Field::Length => panel.y + 1,
+            Field::First | Field::Second => panel.y + 2,
+            Field::Format => panel.y + 3,
+            Field::Limiter => panel.y + 4,
+            Field::Target => panel.y + 5,
+        };
+        buffer.set_string(
+            panel.x + 1,
+            active_y,
+            super::terminal::symbol("▸"),
+            Style::default().fg(theme.accent),
+        );
         // target: a text field, with the caret up while it is the one typed into
         label(buffer, panel.y + 5, "to     ");
         let editing = sheet.field == Field::Target;
+        let typing = editing && (!self.vim || sheet.vim_insert());
         let mut path = sheet.target.display().to_string();
-        if editing {
+        if typing {
             path.push_str(super::terminal::symbol("▏"));
         }
         let room = usize::from(layout.target.width);
@@ -1065,10 +1101,21 @@ impl Widget for ExportSheetView<'_> {
             room,
             value_style(editing),
         );
+        let hint = if self.vim {
+            if sheet.vim_insert() {
+                "VIM INSERT · Esc returns to Command · Enter renders"
+            } else if sheet.space_changes_a_choice() {
+                "VIM NORMAL · j/k moves · h/l changes · Space toggles · i types · Enter renders · Esc closes"
+            } else {
+                "VIM NORMAL · j/k moves · h/l changes · i types · Enter renders · Esc closes"
+            }
+        } else {
+            "Tab or click moves · ←/→ or typing changes · Enter renders · Esc closes"
+        };
         buffer.set_stringn(
             x,
             panel.bottom().saturating_sub(2),
-            "Tab or click moves · ←/→ or typing changes · Enter renders · Esc closes",
+            hint,
             width,
             Style::default().fg(theme.muted),
         );
@@ -1300,20 +1347,24 @@ mod tests {
         );
         sheet.key(KeyCode::Tab, false);
         let area = Rect::new(0, 0, 100, 20);
-        let mut buffer = Buffer::empty(area);
-        ExportSheetView {
-            sheet: &sheet,
-            theme: &theme,
-        }
-        .render(area, &mut buffer);
-        let text = (0..area.height)
-            .map(|y| {
-                (0..area.width)
-                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let render = |sheet: &ExportSheet, vim: bool| {
+            let mut buffer = Buffer::empty(area);
+            ExportSheetView {
+                sheet,
+                theme: &theme,
+                vim,
+            }
+            .render(area, &mut buffer);
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let text = render(&sheet, false);
         assert!(text.contains("export - drums"), "{text}");
         assert!(text.contains("● 16 cycles"), "{text}");
         assert!(text.contains("○ until silence"), "{text}");
@@ -1321,6 +1372,15 @@ mod tests {
         assert_eq!(text.contains("mp3"), MP3_EXPORT, "{text}");
         assert!(text.contains("limiter  ● off   ○ on"), "{text}");
         assert!(text.contains("drums-1970-01-01T00-00-00.wav"), "{text}");
+
+        let command = render(&sheet, true);
+        assert!(command.contains("VIM NORMAL"), "{command}");
+        assert!(command.contains("j/k moves"), "{command}");
+        assert!(command.contains("i types"), "{command}");
+        sheet.set_vim_insert(true);
+        let insert = render(&sheet, true);
+        assert!(insert.contains("VIM INSERT"), "{insert}");
+        assert!(insert.contains("Esc returns to Command"), "{insert}");
     }
 
     #[test]

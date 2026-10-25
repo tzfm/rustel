@@ -56,6 +56,7 @@ impl App {
             Focus::Panel(PanelKind::Set) => HelpContext::Set,
             Focus::Panel(PanelKind::Viz) => HelpContext::Viz,
             Focus::Panel(PanelKind::Mixer) => HelpContext::Mixer,
+            Focus::Panel(PanelKind::Knobs) => HelpContext::Knobs,
             Focus::Editor => HelpContext::Editor,
             Focus::Timeline => HelpContext::Timeline,
         }
@@ -110,7 +111,14 @@ impl App {
         if self.menu.is_some() {
             let menus = self.menus();
             let mut state = self.menu.take().expect("menu is some");
-            let outcome = state.key_with_area(key, &menus, self.menu_row(), self.frame);
+            // Vim list keys own j k h l in the menus while the mode is
+            // on, so h moves left instead of opening Help. Other letters
+            // keep their mnemonics.
+            let outcome = if let Some(alias) = self.list_navigation_alias(key) {
+                state.key_with_area(&alias, &menus, self.menu_row(), self.frame)
+            } else {
+                state.key_with_area(key, &menus, self.menu_row(), self.frame)
+            };
             if matches!(outcome, super::super::menu::MenuKey::Ignored) {
                 // A modified key is nobody's mnemonic; let the chord
                 // table have it, with the menu still down.
@@ -134,6 +142,7 @@ impl App {
         // Help is modal only for input, not for application state. Esc
         // closes it; navigation scrolls its lower list; everything else
         // is swallowed so it cannot act on the preserved surface below.
+        let alias = self.list_navigation_alias(key);
         if let Some(help) = self.help.as_mut() {
             if key.code == KeyCode::Esc {
                 self.help = None;
@@ -141,7 +150,11 @@ impl App {
                 self.sync_settings_webcam_preview();
                 self.dirty_frame = true;
             } else {
-                let _ = help.scroll_key(key.code, self.frame, self.capabilities);
+                if !help.scroll_key(key.code, self.frame, self.capabilities)
+                    && let Some(alias) = alias
+                {
+                    let _ = help.scroll_key(alias.code, self.frame, self.capabilities);
+                }
                 self.dirty_frame = true;
             }
             return true;
@@ -158,7 +171,23 @@ impl App {
                 Event::Key(key) if key.kind == KeyEventKind::Repeat => {
                     let menus = self.menus();
                     let mut state = self.menu.take().expect("menu is some");
-                    let outcome = state.key_with_area(key, &menus, self.menu_row(), self.frame);
+                    // A held letter is the command its press named, or a
+                    // list key. It must not become some other row's
+                    // mnemonic after the level changes under it.
+                    let outcome = if matches!(key.code, KeyCode::Char(_)) {
+                        if state.repeats_mnemonic(key) {
+                            super::super::menu::MenuKey::Consumed
+                        } else {
+                            self.list_navigation_alias(key).map_or(
+                                super::super::menu::MenuKey::Consumed,
+                                |alias| {
+                                    state.key_with_area(&alias, &menus, self.menu_row(), self.frame)
+                                },
+                            )
+                        }
+                    } else {
+                        state.key_with_area(key, &menus, self.menu_row(), self.frame)
+                    };
                     state.follow_scroll(&menus, self.menu_row(), self.frame, true);
                     self.menu = Some(state);
                     if let super::super::menu::MenuKey::Events(events) = outcome {
@@ -178,10 +207,18 @@ impl App {
     /// the wheel, clicks and pastes - belongs to the overlay. `true` while
     /// help is open.
     pub(super) fn help_event(&mut self, terminal_event: &Event) -> bool {
+        let alias = match terminal_event {
+            Event::Key(key) if key.kind == KeyEventKind::Repeat => self.list_navigation_alias(key),
+            _ => None,
+        };
         if let Some(help) = self.help.as_mut() {
             match terminal_event {
                 Event::Key(key) if key.kind == KeyEventKind::Repeat => {
-                    let _ = help.scroll_key(key.code, self.frame, self.capabilities);
+                    if !help.scroll_key(key.code, self.frame, self.capabilities)
+                        && let Some(alias) = alias
+                    {
+                        let _ = help.scroll_key(alias.code, self.frame, self.capabilities);
+                    }
                     self.dirty_frame = true;
                 }
                 Event::Mouse(mouse) => match mouse.kind {
@@ -249,13 +286,16 @@ impl App {
             keybinds: &self.keybinds,
             can_undo: editor.can_undo(),
             can_redo: editor.can_redo(),
-            // Mirror the editor's own guard, which joins every non-empty
-            // range rather than looking only at the primary caret.
-            has_selection: editor
-                .selections()
-                .ranges()
-                .iter()
-                .any(|range| !range.is_empty()),
+            has_selection: self
+                .focused_file_picker()
+                .map(|picker| picker.typing && picker.selection().is_some())
+                .unwrap_or_else(|| {
+                    editor
+                        .selections()
+                        .ranges()
+                        .iter()
+                        .any(|range| !range.is_empty())
+                }),
             can_smart_action: self.smart_action_offers(),
             scene_rewinds: self.scenes.current_rewinds(),
             can_add_scene: self.scenes.score_count() < super::super::scenes::MAX_SCENES,
@@ -272,10 +312,12 @@ impl App {
             can_record_session: self.options.recording.is_some(),
             set_panel: self.set_panel.is_some(),
             viz_panels: [self.viz_docks[0].is_some(), self.viz_docks[1].is_some()],
+            visualizers: self.ui_settings.animation,
             split: self.panes.len() > 1,
             zen: self.ui_settings.zen,
             mixer: self.mixer_panel.is_some(),
             lanes: self.lanes_dock.is_some(),
+            knobs: self.knobs_panel.is_some(),
             log: self.log_panel.is_some(),
             memory: self.memory_dock.is_some(),
             jobs: self.jobs_panel.is_some(),
@@ -416,8 +458,10 @@ impl App {
             Do::PianoMode => self.toggle_piano_mode(),
             Do::VizPanel => self.toggle_viz_dock(0),
             Do::VizPanelTwo => self.toggle_viz_dock(1),
+            Do::Visualizers => self.toggle_visualizers(),
             Do::Mixer => self.toggle_mixer_panel(),
             Do::Lanes => self.toggle_lanes_panel(),
+            Do::Knobs => self.toggle_knobs_panel(),
             Do::SetLimiter => self.set_limiter_slot(!self.has_limiter_slot()),
             Do::NewSet => self.new_set(),
             Do::NewSession => self.new_session(),
@@ -446,11 +490,22 @@ impl App {
             }
             Do::Undo => self.dispatch_editor(Command::Undo)?,
             Do::Redo => self.dispatch_editor(Command::Redo)?,
-            Do::Cut => self.dispatch_editor(Command::Cut)?,
-            Do::Copy => self.dispatch_editor(Command::Copy)?,
-            Do::Paste => self.dispatch_editor(Command::Paste)?,
-            Do::SelectAll => self.dispatch_editor(Command::SelectAll)?,
+            Do::Cut => {
+                self.dispatch_bind_action(BindAction::Cut, false)?;
+            }
+            Do::Copy => {
+                self.dispatch_bind_action(BindAction::Copy, false)?;
+            }
+            Do::Paste => {
+                self.dispatch_bind_action(BindAction::Paste, false)?;
+            }
+            Do::SelectAll => {
+                self.dispatch_bind_action(BindAction::SelectAll, false)?;
+            }
             Do::ToggleComment => self.dispatch_editor(Command::ToggleComment)?,
+            Do::Find => {
+                self.dispatch_bind_action(BindAction::Find, false)?;
+            }
             Do::FirstError => self.jump_to_first_error(),
             Do::SmartAction => self.open_smart_action(),
             Do::Update => self.dispatch_editor(Command::Evaluate)?,
@@ -557,6 +612,8 @@ impl App {
                     self.focus_panel(PanelKind::Settings);
                 }
             }
+            Do::GlobalPrebake => self.open_prebake(PrebakeScope::Global),
+            Do::LocalPrebake => self.open_prebake(PrebakeScope::Local),
             Do::KeyboardReference => {
                 if self.help.is_none() {
                     self.toggle_help();
