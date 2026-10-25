@@ -333,8 +333,6 @@ impl App {
                 {
                     self.generator_preview_pending = false;
                 }
-                self.log
-                    .push(LogLevel::Debug, "transport", "stop - the set goes quiet");
                 self.pending_evaluation = None;
                 self.stop_replays();
                 // A stop is a stop: the engine cancels the armed launch, and
@@ -342,41 +340,83 @@ impl App {
                 self.forget_arming();
                 self.landing_name = None;
                 self.next_launch = Launch::Now;
-                // The snapshot can trail the key by a frame. The local flag
-                // makes even two rapid presses distinct: first drain, second
-                // cut every remaining voice and effect tail now.
-                let cutting = self.stop_requested || self.is_stopping();
-                // The worker stops on an atomic now; the snapshot that says so
-                // arrives up to 100ms later. Forgetting here means a Stop
-                // followed immediately by Update restarts, instead of the
-                // update being read as redundant against a score that is
-                // already on its way out.
-                self.installed_revision = None;
-                self.stop_requested = true;
-                // Scheduling stops on the first press even while existing
-                // voices and effects drain. Freeze the transport picture at
-                // that instant so the cycle counter and beat light do not
-                // imply that the score is still advancing through its tail.
-                self.visual.stop();
-                // Is what is stopping the set at all? A stop of a tape
-                // being heard again, or of a preview sounding under the
-                // score, is not an event of the set the recorder is
-                // writing, so it must not grow that tape.
-                let stopping_the_set = self.replay_view.is_none();
+                // A stop for a transport already stopped has nothing to
+                // stop: the engine word would only come back as a second
+                // settle, which resets the advisories and discards the
+                // visual update the held frame is showing - a flicker on a
+                // picture at rest.
+                let mut said: Option<String> = None;
+                if self.is_playing() || self.is_stopping() || self.stop_requested {
+                    self.log
+                        .push(LogLevel::Debug, "transport", "stop - the set goes quiet");
+                    // The snapshot can trail the key by a frame. The local flag
+                    // makes even two rapid presses distinct: first drain, second
+                    // cut every remaining voice and effect tail now.
+                    let cutting = self.stop_requested || self.is_stopping();
+                    // The worker stops on an atomic now; the snapshot that says so
+                    // arrives up to 100ms later. Forgetting here means a Stop
+                    // followed immediately by Update restarts, instead of the
+                    // update being read as redundant against a score that is
+                    // already on its way out.
+                    self.installed_revision = None;
+                    self.stop_requested = true;
+                    // Scheduling stops on the first press even while existing
+                    // voices and effects drain. Freeze the transport picture at
+                    // that instant so the cycle counter and beat light do not
+                    // imply that the score is still advancing through its tail.
+                    self.visual.stop();
+                    // Is what is stopping the set at all? A stop of a tape
+                    // being heard again, or of a preview sounding under the
+                    // score, is not an event of the set the recorder is
+                    // writing, so it must not grow that tape.
+                    let stopping_the_set = self.replay_view.is_none();
+                    #[cfg(feature = "hydra")]
+                    let stopping_the_set = stopping_the_set && self.snippet_preview.is_none();
+                    if cutting {
+                        self.worker.force_stop();
+                    } else {
+                        self.worker.request_stop();
+                    }
+                    // What a stop installs is silence; the tape says so where
+                    // it happened, so a replay goes quiet there too.
+                    if !cutting && stopping_the_set && self.recorder.is_some() {
+                        let at = self.recorder_started.elapsed().as_secs_f64();
+                        if let Some(recorder) = self.recorder.as_mut() {
+                            recorder.record_save_via(
+                                at,
+                                SaveStatus::Installed,
+                                rustel_runtime::session_log::STOP_SOURCE,
+                                None,
+                                Some("stop"),
+                            );
+                        }
+                    }
+                    said = Some(if cutting {
+                        "stopping now".to_owned()
+                    } else {
+                        format!(
+                            "stopping - letting the tail ring out ({} again cuts it)",
+                            self.keybinds.hint(BindAction::Stop)
+                        )
+                    });
+                } else if self.preview_armed.is_some() {
+                    // The browser's audition sounds under its own voice, not
+                    // the transport: its stop still says the word, though the
+                    // engine's transport has nothing to stop. The silence
+                    // below is the whole of the work, and a second press
+                    // finds nothing left to cut.
+                    said = Some(format!(
+                        "stopping - letting the tail ring out ({} again cuts it)",
+                        self.keybinds.hint(BindAction::Stop)
+                    ));
+                }
                 // The same window: a preview was playing under a score
                 // that is on its way out, so there is nothing to put back
                 // and nothing to hang the next one on.
                 #[cfg(feature = "hydra")]
-                let stopping_the_set = stopping_the_set && self.snippet_preview.is_none();
-                #[cfg(feature = "hydra")]
                 {
                     self.snippet_preview = None;
                     self.snippet_heard = false;
-                }
-                if cutting {
-                    self.worker.force_stop();
-                } else {
-                    self.worker.request_stop();
                 }
                 // A stop is a stop, and that includes the sample sounding
                 // under the browser. The audition has no transport of its
@@ -385,28 +425,9 @@ impl App {
                 // that clock would otherwise keep counting through the
                 // silence.
                 self.silence_preview();
-                // What a stop installs is silence; the tape says so where
-                // it happened, so a replay goes quiet there too.
-                if !cutting && stopping_the_set && self.recorder.is_some() {
-                    let at = self.recorder_started.elapsed().as_secs_f64();
-                    if let Some(recorder) = self.recorder.as_mut() {
-                        recorder.record_save_via(
-                            at,
-                            SaveStatus::Installed,
-                            rustel_runtime::session_log::STOP_SOURCE,
-                            None,
-                            Some("stop"),
-                        );
-                    }
+                if let Some(said) = said {
+                    self.status = said;
                 }
-                self.status = if cutting {
-                    "stopping now".into()
-                } else {
-                    format!(
-                        "stopping - letting the tail ring out ({} again cuts it)",
-                        self.keybinds.hint(BindAction::Stop)
-                    )
-                };
             }
         }
         Ok(())

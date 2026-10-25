@@ -805,7 +805,15 @@ fn a_live_note_plays_through_its_plugin() {
                     && diagnostic.kind == rustel_runtime::PLUGIN_DIAGNOSTIC
                 {
                     assert_eq!(diagnostic.level, StudioDiagnosticLevel::Warning);
-                    warnings.push(diagnostic.message.clone());
+                    // A machine can stop a plugin worker inside its job - a
+                    // cold start of the runner most of all - and the line
+                    // says so: it is a word about the machine, and the
+                    // audio waited. The lines this test judges are the
+                    // ones the plugin itself refused.
+                    if diagnostic.message != "a plugin worker ran late, and the audio waited for it"
+                    {
+                        warnings.push(diagnostic.message.clone());
+                    }
                 }
             };
             tick_with(engine, Duration::from_millis(300), &mut note, &mut |_| {

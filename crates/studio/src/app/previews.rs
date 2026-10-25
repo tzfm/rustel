@@ -2895,11 +2895,19 @@ mod tests {
             );
             assert!(app.status.contains("again cuts it"));
 
-            // Do not wait for a worker snapshot: two rapid real shortcut presses
-            // still mean graceful, then immediate.
+            // With the transport at rest the audition was the only voice,
+            // and the first press stopped it: a second press has nothing
+            // left to cut, so the word that already said the stop stands.
+            // The graceful-then-immediate pair belongs to the transport,
+            // whose tail a second press really does cut.
             app.handle_editor_effect(EditorEffect::Stop)
                 .expect("second stop");
-            assert_eq!(app.status, "stopping now");
+            assert!(
+                app.status
+                    .starts_with("stopping - letting the tail ring out"),
+                "nothing sounds, so the standing word stays: {}",
+                app.status
+            );
             // Those two are the whole of what the browser draws the bar from -
             // the shape and the clock that started it - so with neither there
             // is no progress left to draw however long the clock runs.

@@ -1506,9 +1506,9 @@ impl ScalarBackend {
                     // the owning node evaluates it - which an oscillator
                     // skips entirely while it is still before its start
                     // time. So a modulator first runs in the quantum where
-                    // its carrier starts, from phase zero, and two
-                    // identical FM notes a second apart are bit-identical
-                    // because of it.
+                    // its carrier starts, at the phase it reached from the
+                    // render start, and notes a whole modulator cycle apart
+                    // are bit-identical because of it.
                     fm_state,
                     pitch_quantum_skip: {
                         // The onset's offset within its 128-frame quantum:
