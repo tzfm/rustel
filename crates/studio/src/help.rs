@@ -12,7 +12,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::widgets::Widget;
 use unicode_width::UnicodeWidthStr;
 
-use super::editor::KeyboardCapabilities;
+use super::editor::{EditorKeybindings, KeyboardCapabilities};
 use super::keybinds::{BindAction, KeyCombo, Keybinds};
 use super::theme::Theme;
 
@@ -39,7 +39,7 @@ pub enum HelpContext {
     Settings,
     SettingsAbout,
     SettingsSources,
-    SettingsTrust,
+    SettingsPermissions,
     #[cfg(feature = "vst")]
     SettingsVst,
     Log,
@@ -52,6 +52,8 @@ pub enum HelpContext {
     Mixer,
     /// The memory breakdown, docked along the top or the bottom.
     Memory,
+    /// The knobs column beside the score.
+    Knobs,
 }
 
 impl HelpContext {
@@ -72,7 +74,7 @@ impl HelpContext {
             Self::Settings => "settings",
             Self::SettingsAbout => "settings · about",
             Self::SettingsSources => "settings · samples",
-            Self::SettingsTrust => "settings · trust",
+            Self::SettingsPermissions => "settings · permissions",
             #[cfg(feature = "vst")]
             Self::SettingsVst => "settings · vst",
             Self::Log => "log",
@@ -83,13 +85,17 @@ impl HelpContext {
             Self::Viz => "visuals panel",
             Self::Mixer => "mixer",
             Self::Memory => "memory breakdown",
+            Self::Knobs => "knobs",
         }
     }
 
     /// A summary names a panel chord as `{timeline}`, `{rename}` or
     /// `{show}`. The sheet fills in the chord the table holds.
-    fn summary(self) -> &'static str {
+    fn summary(self, keybinds: &Keybinds) -> &'static str {
         match self {
+            Self::Editor if keybinds.editor_keybindings() == EditorKeybindings::Vim => {
+                "Built-in Vim bindings. Custom mappings can override these keys."
+            }
             Self::Editor => "Type normally; this is a modeless source editor.",
             Self::SceneRename => "The scene name is being edited; the score stays untouched.",
             Self::SceneLearn => "The current scene is waiting for a MIDI pad press.",
@@ -112,12 +118,12 @@ impl HelpContext {
             Self::SettingsSources => {
                 "Fetch imports, cache all remote packs, refresh their lists, and clear the cache; then your folders and the studio's packs. r aliases a bank on a user import; c caches a remote pack."
             }
-            Self::SettingsTrust => {
-                "The origins a score imports scripts from with await import('https://...'). Each row reads on or off, and an origin the studio has seen stays listed until it closes."
+            Self::SettingsPermissions => {
+                "The origins a score imports scripts from with await import('https://...'), and the native orchestra switch. Each row reads on or off. The studio keeps origin trusts; the orchestra switch lasts one run."
             }
             #[cfg(feature = "vst")]
             Self::SettingsVst => {
-                "The folders with your VST3 plugins, then the standard folders of the system. The plugin host reads all of them. Rescan after you install a plugin."
+                "The folders with your VST3 plugins, then the standard folders of the system. The plugin host reads all of them. Rescan after you install a plugin. A plugin that breaks on another thread stays on the audio thread with its audio thread only switch on. Space on a plugin row turns its switch on or off."
             }
             Self::Log => {
                 "The newest studio messages are at the bottom of the log. v shows the running commentary underneath them."
@@ -147,6 +153,11 @@ impl HelpContext {
                 "Where the header's mem goes: the parts that add up to it, each against \
                  the limit that holds it, docked along the bottom or the top beside the \
                  score. It stays while you work, and the settings sheet stands clear of it."
+            }
+            Self::Knobs => {
+                "The numbers of the call under the caret, as sliders. The arrows write \
+                 the score as they move, and the far left takes an optional entry out. \
+                 Press Enter to type an exact value. A plugin keeps the knobs you add to it."
             }
         }
     }
@@ -219,6 +230,17 @@ impl HelpContext {
                     "top or bottom / taller or shorter / back to the score / hide",
                 ),
             ],
+            Self::Knobs => [
+                ("↑/↓ · ←/→", "choose a knob / move it, Shift for one step"),
+                (
+                    "Enter · a · r · ⌫",
+                    "type a value / add a knob / suggested knobs back / take a knob out",
+                ),
+                (
+                    "Home · End · Esc",
+                    "bottom or off / top / back to the score",
+                ),
+            ],
             Self::Set => [
                 (
                     "Up/Down · Enter",
@@ -275,7 +297,10 @@ impl HelpContext {
                     "arrows · PgUp/PgDn · Tab",
                     "navigate, fold/open, change tab",
                 ),
-                ("Enter · Space · Esc", "use · preview · go back/close"),
+                (
+                    "Alt+A · Enter · Space · Esc",
+                    "auto preview · use · preview · go back/close",
+                ),
             ],
             Self::Settings => [
                 ("Up / Down", "choose a setting"),
@@ -301,10 +326,10 @@ impl HelpContext {
                     "cache this remote pack · other pages · close",
                 ),
             ],
-            Self::SettingsTrust => [
+            Self::SettingsPermissions => [
                 (
                     "Enter · ←/→ · Space",
-                    "trust a refused origin · turn its trust on or off",
+                    "permit a refused origin · turn a row on or off",
                 ),
                 (
                     "d · Delete",
@@ -316,7 +341,10 @@ impl HelpContext {
             Self::SettingsVst => [
                 ("a / +", "add a folder with VST3 plugins"),
                 ("Enter · d", "do the selected action · remove the folder"),
-                ("Tab · Esc", "other pages · close"),
+                (
+                    "Space · Tab · Esc",
+                    "turn audio thread only on or off · other pages · close",
+                ),
             ],
             Self::Log => [
                 (
@@ -357,6 +385,16 @@ impl HelpContext {
         let hint = |action| shortcut_with_alias(keybinds, action);
         let append = |prefix: &str, action| join_hints([prefix.to_owned(), hint(action)], " · ");
         match self {
+            Self::Editor if keybinds.editor_keybindings() == EditorKeybindings::Vim => {
+                rows = [
+                    ("i · Esc".to_owned(), "Insert mode / Normal mode"),
+                    (
+                        "hjkl · dd".to_owned(),
+                        "move / delete a line in Normal mode",
+                    ),
+                    (":42 Enter".to_owned(), "go to line 42 in Normal mode"),
+                ];
+            }
             Self::Editor => {
                 rows[0].0 = hint(BindAction::Evaluate);
                 rows[1].0 = hint(BindAction::Stop);
@@ -409,6 +447,17 @@ fn shortcut_with_alias(keybinds: &Keybinds, action: BindAction) -> String {
         hints.push(alias.hint());
     }
     join_hints(hints, " / ")
+}
+
+/// The learned chord when the action has one, else the menu path that
+/// reaches it. A shipped-unbound action still reads as reachable.
+fn shortcut_or_menu(keybinds: &Keybinds, action: BindAction, menu: &str) -> String {
+    let shortcut = shortcut_with_alias(keybinds, action);
+    if shortcut.is_empty() {
+        menu.to_owned()
+    } else {
+        shortcut
+    }
 }
 
 fn join_hints(hints: impl IntoIterator<Item = String>, separator: &str) -> String {
@@ -476,6 +525,10 @@ fn shortcut_rows_with_keybinds(
             hint(BindAction::ToggleComment),
             "comment or uncomment lines",
         ),
+        HelpRow::new(
+            hint(BindAction::Find),
+            "find text: a regular expression; Enter next, Esc closes",
+        ),
         HelpRow::new(hint(BindAction::Docs), "docs for the function at the caret"),
         HelpRow::new(
             shortcut_with_alias(keybinds, BindAction::Reference),
@@ -493,8 +546,20 @@ fn shortcut_rows_with_keybinds(
         ),
         HelpRow::new(hint(BindAction::Settings), "open settings"),
         HelpRow::new(
-            "Options > Settings > prebakes",
-            "open the selected global/local prebake",
+            shortcut_or_menu(
+                keybinds,
+                BindAction::OpenGlobalPrebake,
+                "Options > Global prebake",
+            ),
+            "open the global prebake",
+        ),
+        HelpRow::new(
+            shortcut_or_menu(
+                keybinds,
+                BindAction::OpenLocalPrebake,
+                "Options > Local prebake",
+            ),
+            "open the local prebake",
         ),
         HelpRow::new(hint(BindAction::ThemePicker), "open the theme picker"),
         HelpRow::new(hint(BindAction::SetPanel), "show or hide the set panel"),
@@ -527,7 +592,17 @@ fn shortcut_rows_with_keybinds(
             shortcut_with_alias(keybinds, BindAction::DuplicateScene),
             "duplicate the current scene",
         ),
-        HelpRow::new(hint(BindAction::RenameScene), "rename the current scene"),
+        HelpRow::new(
+            {
+                let rename = hint(BindAction::RenameScene);
+                if rename.is_empty() {
+                    "Scene > Rename scene".to_owned()
+                } else {
+                    rename
+                }
+            },
+            "rename the current scene",
+        ),
         HelpRow::new(
             hint(BindAction::CloseScene),
             "write and close the current scene",
@@ -813,7 +888,7 @@ impl Widget for HelpView<'_> {
             inner.y + 2,
             format!(
                 "NOW  {}",
-                super::keybinds::shortcut_label(self.context.summary())
+                super::keybinds::shortcut_label(self.context.summary(self.keybinds))
                     .replace("{timeline}", &self.keybinds.hint(BindAction::FocusTimeline))
                     .replace("{rename}", &self.keybinds.hint(BindAction::RenameFile))
                     .replace("{show}", &self.keybinds.hint(BindAction::ShowFile))
@@ -1057,7 +1132,7 @@ mod tests {
     }
 
     #[test]
-    fn the_global_list_does_not_advertise_the_unimplemented_find_prompt() {
+    fn the_global_list_advertises_the_find_prompt() {
         for capabilities in [
             KeyboardCapabilities::legacy(),
             KeyboardCapabilities::enhanced(),
@@ -1065,7 +1140,8 @@ mod tests {
             assert!(
                 shortcut_rows(capabilities)
                     .iter()
-                    .all(|row| !row.action.contains("find in"))
+                    .any(|row| row.action.contains("find text")),
+                "the find prompt is missing from the shortcut list"
             );
         }
     }

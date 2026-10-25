@@ -53,6 +53,7 @@ pub(super) enum RotationStop {
     Log,
     Memory,
     Reference,
+    Knobs,
 }
 
 impl App {
@@ -70,6 +71,7 @@ impl App {
             PanelKind::Viz => self.viz_docks.iter().any(Option::is_some),
             PanelKind::Mixer => self.mixer_panel.is_some(),
             PanelKind::Memory => self.memory_dock.is_some(),
+            PanelKind::Knobs => self.knobs_panel.is_some(),
         }
     }
 
@@ -188,6 +190,9 @@ impl App {
         if self.reference_panel.is_some() {
             stops.push(RotationStop::Reference);
         }
+        if self.knobs_panel.is_some() && !self.regions.knobs.is_empty() {
+            stops.push(RotationStop::Knobs);
+        }
         if stops.len() == 1 {
             self.status = "nothing open to walk the keyboard round - just the score".into();
             self.dirty_frame = true;
@@ -202,6 +207,7 @@ impl App {
             Focus::Panel(PanelKind::Log) => Some(RotationStop::Log),
             Focus::Panel(PanelKind::Memory) => Some(RotationStop::Memory),
             Focus::Panel(PanelKind::Reference) => Some(RotationStop::Reference),
+            Focus::Panel(PanelKind::Knobs) => Some(RotationStop::Knobs),
             // A panel outside the rotation - a sheet - has
             // no place in this order; walking from it starts the rotation
             // over at its first stop rather than guessing where it fits.
@@ -268,6 +274,12 @@ impl App {
                 self.status = "keyboard on the reference".into();
                 self.arm_focus_rotation_flash(RotationStop::Reference);
             }
+            RotationStop::Knobs => {
+                self.focus = Focus::Editor;
+                self.focus_panel(PanelKind::Knobs);
+                self.status = "keyboard on the knobs".into();
+                self.arm_focus_rotation_flash(RotationStop::Knobs);
+            }
         }
     }
 
@@ -305,6 +317,7 @@ impl App {
             RotationStop::Log => self.regions.log,
             RotationStop::Memory => self.regions.memory,
             RotationStop::Reference => self.regions.reference,
+            RotationStop::Knobs => self.regions.knobs,
         };
         (!room.is_empty()).then_some(room)
     }
@@ -352,6 +365,7 @@ impl App {
             // the panel.
             self.armed_slider = None;
             self.focus = Focus::Panel(kind);
+            super::vim::focus_changed(self);
             self.dirty_frame = true;
             #[cfg(feature = "hydra")]
             self.sync_settings_webcam_preview();
@@ -374,6 +388,7 @@ impl App {
         self.slider_precision = None;
         self.smart_action = None;
         self.replay_edit = None;
+        self.editor_mut().find_cancel();
         if !keep.contains(&PanelKind::Set) && self.set_prompt.is_some() {
             self.close_set_prompt();
         }
@@ -473,6 +488,12 @@ impl App {
                     self.save_prefs_soon();
                     self.invalidate_maps();
                     self.status = "mixer hidden".into();
+                }
+            }
+            PanelKind::Knobs => {
+                if self.knobs_panel.is_some() {
+                    self.close_knobs_panel();
+                    self.status = "knobs hidden".into();
                 }
             }
         }

@@ -32,7 +32,11 @@ pub mod meter;
 #[cfg(windows)]
 pub mod mmcss;
 mod output_options;
+mod partials;
 mod periodic_wave;
+// Only a device output starts plugin workers.
+#[cfg_attr(not(feature = "device-audio"), allow(dead_code))]
+mod pool;
 pub mod power_mode;
 pub mod pressure;
 #[cfg(feature = "device-audio")]
@@ -59,10 +63,10 @@ pub use backend::{
     DelayControls, DuckControls, DuckTarget, EnvMod, Envelope, EnvelopeParam, FilterControls,
     FilterEnvelope, FilterLfoKind, FilterStages, FmControls, FmOperator, FmRoute, FmWave, FxStage,
     KabelControls, LfoMod, MAX_BUSES, MAX_DUCK_TARGETS, MAX_FM_OPERATORS, MAX_FM_ROUTES,
-    MAX_FX_STAGES, MAX_PARTIALS, MAX_VOICE_MODS, ModTarget, ModulatorParam, OnsetEvent,
-    OscillatorControls, PartialsControls, PhaserControls, PitchEnvControls, PulseWidthLfoControls,
-    ReverbControls, ShapeControls, StaticBiquad, SynthSource, TransientControls, TremoloControls,
-    VibratoControls, VowelControls, Waveform, WavetableControls, fm_operator_slot,
+    MAX_FX_STAGES, MAX_VOICE_MODS, ModTarget, ModulatorParam, OnsetEvent, OscillatorControls,
+    PartialsControls, PhaserControls, PitchEnvControls, PulseWidthLfoControls, ReverbControls,
+    ShapeControls, StaticBiquad, SynthSource, TransientControls, TremoloControls, VibratoControls,
+    VowelControls, Waveform, WavetableControls, fm_operator_slot,
 };
 pub use buffer::{AudioBufferError, AudioBufferPreference, AudioBufferRange};
 pub use convolution_kernel::{ConvolutionKernelKind, selected_convolution_kernel_kind};
@@ -79,9 +83,9 @@ pub use device_facts::{
 pub use dispatch::DspDispatch;
 pub use distortion::{DISTORTION_ALGORITHMS, DistortControls};
 pub use insert::{
-    EFFECT_CHAIN, INSERT_SLOTS, InsertControls, InsertKey, InsertNames, InsertNote, InsertParam,
-    InsertProvider, InsertSlot, MAX_INSERT_BUSES, MAX_INSERT_PARAMS, OrbitInsert, effect_slot,
-    instrument_slot,
+    EFFECT_CHAIN, INSERT_SLOTS, InsertChains, InsertControls, InsertKey, InsertNames, InsertNote,
+    InsertParam, InsertProvider, InsertSlot, InsertTurn, InsertValue, InsertValues,
+    MAX_INSERT_BUSES, MAX_INSERT_PARAMS, NO_STAGE, OrbitInsert, effect_slot, instrument_slot,
 };
 pub use limiter::{Character as LimiterCharacter, DEFAULT_THRESHOLD_DB, Limiter};
 pub use live::{
@@ -92,13 +96,17 @@ pub use meter::{
     linear_to_db,
 };
 pub use output_options::LiveOutputOptions;
+pub use partials::{played_partials, register_partials};
+#[cfg(any(test, feature = "test-support"))]
+pub use pool::set_plugin_pool_for_test;
 pub use pressure::{RealtimePool, RealtimePressureSnapshot};
 #[cfg(feature = "device-audio")]
 pub use realtime::RealtimeLoadSnapshot;
 pub use render::{
     RENDER_CANCELLED, RenderControl, RenderLimiter, RenderTick, SilenceStop, WavSampleFormat,
-    render_pcm, write_pcm16_wav, write_pcm16_wav_controlled, write_pcm16_wav_reporting,
-    write_wav_controlled, write_wav_reporting,
+    render_pcm, render_pcm_events, write_pcm16_wav, write_pcm16_wav_controlled,
+    write_pcm16_wav_reporting, write_wav_controlled, write_wav_events_controlled,
+    write_wav_reporting,
 };
 pub use ring::{AudioEvent, QueuedAudioEvent, Ring};
 pub use sample::{

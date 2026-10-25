@@ -4,6 +4,10 @@
 //! Consumers build their own UI or machine-readable output directly from
 //! the records, without a separate JSON catalogue to keep in sync.
 
+pub mod numbers;
+
+pub use numbers::{REFERENCE_NUMBERS, ReferenceNumber, reference_number};
+
 /// One documented argument.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReferenceParam {

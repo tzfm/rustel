@@ -284,13 +284,45 @@ pub fn event_to_input_with_binds(
     binds: &dyn Fn(&KeyEvent) -> Option<Command>,
     moved: &dyn Fn(&KeyEvent) -> bool,
 ) -> Option<EditorInput> {
-    match event {
+    match composed_text_event(event) {
         Event::Key(key) => {
             key_to_command_with_binds(key, capabilities, binds, moved).map(EditorInput::Command)
         }
         Event::Mouse(mouse) => Some(EditorInput::Mouse(mouse)),
         Event::Paste(text) => Some(EditorInput::Command(Command::PasteText(text))),
         Event::FocusGained | Event::FocusLost | Event::Resize(_, _) => None,
+        Event::KeyWithText { key, .. } => {
+            key_to_command_with_binds(key, capabilities, binds, moved).map(EditorInput::Command)
+        }
+    }
+}
+
+/// Use the text the terminal reports for a composed key.
+///
+/// A composed key carries its text, such as Option+4 making `$`. One
+/// character becomes the key a plain press would make. A longer string
+/// becomes a paste. A release keeps the physical key.
+pub fn composed_text_event(event: Event) -> Event {
+    match event {
+        Event::KeyWithText { key, text }
+            if key.kind != KeyEventKind::Release && matches!(key.code, KeyCode::Char(_)) =>
+        {
+            let mut characters = text.chars();
+            match (characters.next(), characters.next()) {
+                (Some(character), None) if !character.is_control() => {
+                    Event::Key(KeyEvent::new_with_kind_and_state(
+                        KeyCode::Char(character),
+                        KeyModifiers::NONE,
+                        key.kind,
+                        key.state,
+                    ))
+                }
+                (Some(_), Some(_)) => Event::Paste(text),
+                _ => Event::Key(key),
+            }
+        }
+        Event::KeyWithText { key, .. } => Event::Key(key),
+        other => other,
     }
 }
 

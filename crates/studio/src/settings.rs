@@ -25,7 +25,7 @@ use rustel_runtime::{
 use super::keybinds::BindAction;
 
 use super::devices::draw_border;
-use super::editor::KeyboardCapabilities;
+use super::editor::{EditorKeybindings, KeyboardCapabilities};
 use super::engine::StudioDeviceInfo;
 use super::graphics::{RenderingMode, Tier};
 use super::prebake::{PrebakeRow, PrebakeScope};
@@ -357,6 +357,158 @@ impl EvaluationFlashMode {
     }
 }
 
+/// How the evaluation acknowledgement moves over the code it ran. The
+/// flash itself is a different row: this one shapes what the flash looks
+/// like while it is there.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EvalAnimation {
+    /// On at once, off at once, the way a terminal always has.
+    #[default]
+    Normal,
+    /// Fades in and out, quickly.
+    FadeFast,
+    /// Fades in and out.
+    FadeMedium,
+    /// Fades in and out, slowly.
+    FadeSlow,
+    /// A soft edge sweeps left to right, revealing the code as it fades.
+    Swipe,
+    /// A hard hit that evaporates.
+    Zap,
+    /// Dims through four chunky rungs, the way old hardware stepped.
+    Steps,
+    /// Lines shatter into fast bands of blocks and flips, like signal on
+    /// a bad cable.
+    Glitch,
+    /// A band of light sweeps along each line.
+    Wave,
+}
+
+impl EvalAnimation {
+    const LADDER: [Self; 9] = [
+        Self::Normal,
+        Self::FadeFast,
+        Self::FadeMedium,
+        Self::FadeSlow,
+        Self::Swipe,
+        Self::Zap,
+        Self::Steps,
+        Self::Glitch,
+        Self::Wave,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::FadeFast => "fade fast",
+            Self::FadeMedium => "fade medium",
+            Self::FadeSlow => "fade slow",
+            Self::Swipe => "swipe",
+            Self::Zap => "zap",
+            Self::Steps => "steps",
+            Self::Glitch => "glitch",
+            Self::Wave => "wave",
+        }
+    }
+
+    /// The name the preferences file keeps.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::FadeFast => "fade-fast",
+            Self::FadeMedium => "fade-medium",
+            Self::FadeSlow => "fade-slow",
+            Self::Swipe => "swipe",
+            Self::Zap => "zap",
+            Self::Steps => "steps",
+            Self::Glitch => "glitch",
+            Self::Wave => "wave",
+        }
+    }
+
+    pub fn parse(text: &str) -> Self {
+        Self::LADDER
+            .iter()
+            .copied()
+            .find(|mode| mode.key() == text)
+            .unwrap_or_default()
+    }
+
+    fn step(self, forwards: bool) -> Self {
+        let index = Self::LADDER
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(0);
+        let len = Self::LADDER.len();
+        Self::LADDER[if forwards {
+            (index + 1) % len
+        } else {
+            (index + len - 1) % len
+        }]
+    }
+}
+
+/// How the beat line under the header moves. The line is a thin strip the
+/// width of the screen that keeps the studio's pulse visible from across
+/// the room: it follows the same clock the header's beat dot reads and the
+/// theme's own colours, whatever they are.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BeatLineStyle {
+    /// No strip at all.
+    #[default]
+    Off,
+    /// The whole line breathes on each beat, brightest on the downbeat.
+    Pulse,
+    /// A bright segment travels the line once per cycle.
+    Travel,
+    /// A wave of block heights rolls along the line, swelling on the beat.
+    Wave,
+}
+
+impl BeatLineStyle {
+    const LADDER: [Self; 4] = [Self::Off, Self::Pulse, Self::Travel, Self::Wave];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Pulse => "pulse",
+            Self::Travel => "travel",
+            Self::Wave => "wave",
+        }
+    }
+
+    /// The name the preferences file keeps.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Pulse => "pulse",
+            Self::Travel => "travel",
+            Self::Wave => "wave",
+        }
+    }
+
+    pub fn parse(text: &str) -> Self {
+        Self::LADDER
+            .iter()
+            .copied()
+            .find(|style| style.key() == text)
+            .unwrap_or_default()
+    }
+
+    fn step(self, forwards: bool) -> Self {
+        let index = Self::LADDER
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(0);
+        let len = Self::LADDER.len();
+        Self::LADDER[if forwards {
+            (index + 1) % len
+        } else {
+            (index + len - 1) % len
+        }]
+    }
+}
+
 /// When the editor marks what the syntax checker finds.
 ///
 /// Whatever the mode, an update runs the check itself and refuses a score
@@ -391,6 +543,60 @@ impl SyntaxCheck {
             Self::Full => "full",
             Self::OnUpdate => "on-update",
             Self::Off => "off",
+        }
+    }
+
+    pub fn parse(text: &str) -> Self {
+        Self::LADDER
+            .iter()
+            .copied()
+            .find(|mode| mode.key() == text)
+            .unwrap_or_default()
+    }
+
+    fn step(self, forwards: bool) -> Self {
+        let index = Self::LADDER
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(0);
+        let len = Self::LADDER.len();
+        Self::LADDER[if forwards {
+            (index + 1) % len
+        } else {
+            (index + len - 1) % len
+        }]
+    }
+}
+
+/// What the studio does when another program saves the open score's file.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ExternalChanges {
+    /// The file is read when it is opened, and never watched.
+    #[default]
+    Off,
+    /// The editor takes the saved text.
+    Sync,
+    /// The editor takes the saved text, and the score plays it.
+    SyncAndEvaluate,
+}
+
+impl ExternalChanges {
+    const LADDER: [Self; 3] = [Self::Off, Self::Sync, Self::SyncAndEvaluate];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Sync => "sync",
+            Self::SyncAndEvaluate => "sync & eval",
+        }
+    }
+
+    /// The name the preferences file keeps.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Sync => "sync",
+            Self::SyncAndEvaluate => "sync-eval",
         }
     }
 
@@ -1460,6 +1666,11 @@ pub struct UiSettings {
     /// Shortcut conflict profile. None follows the detected terminal; an
     /// override changes shortcut defaults without claiming extra capabilities.
     pub terminal_profile: Option<String>,
+    pub editor_keybindings: EditorKeybindings,
+    pub vim_mappings_path: Option<String>,
+    /// Whether plain j k h l move lists and menus while Vim editor keys
+    /// are on. The arrows always work.
+    pub vim_list_navigation: bool,
     pub rendering: RenderingMode,
     /// How often the screen is repainted while something moves.
     pub frame_rate: FrameRate,
@@ -1473,6 +1684,9 @@ pub struct UiSettings {
     pub auto_evaluate: bool,
     /// How long typing must pause before it does.
     pub typing_pause: TypingPause,
+    /// What the studio does when another program saves the open score's
+    /// file. Off by default: reading the file again is opted into.
+    pub external_changes: ExternalChanges,
     pub load_mode: LoadMode,
     /// MIDI clock out, by port; none to send none.
     pub clock_out: Option<String>,
@@ -1481,6 +1695,8 @@ pub struct UiSettings {
     pub animation: bool,
     pub highlights: bool,
     pub evaluation_flash: EvaluationFlashMode,
+    /// How the evaluation flash moves over the code it ran.
+    pub evaluation_animation: EvalAnimation,
     /// A finished recording has its leading and trailing silence cut before
     /// it is saved. On by default: the silence around a take is the count-in
     /// and the wait for the next one, not part of the performance.
@@ -1508,7 +1724,7 @@ pub struct UiSettings {
     ///
     /// One switch, on the first page, because "do I want a limiter" is
     /// the whole of the question most of the time. How it sounds and
-    /// where it holds are on Advanced, and on the set's own strip.
+    /// where it holds are on the General page, and on the set's own strip.
     pub master_limiter_on: bool,
     /// How that limiter works when it is switched on.
     ///
@@ -1564,6 +1780,10 @@ pub struct UiSettings {
     /// What the examples tab hands over: one `$:` a voice, or the same
     /// voices folded into a single `$: stack(...)`.
     pub examples_stack: bool,
+    /// Whether moving through the browser's lists of things to hear - the
+    /// samples, chords and scales tabs - plays each row the cursor lands on.
+    /// Off by default: sound on every arrow is opted into.
+    pub auto_preview: bool,
     /// Whether Hydra's backdrop averages the pixels it scales down, or picks
     /// one of them. Costs the same either way; it is purely how it looks.
     pub backdrop_smoothing: bool,
@@ -1604,6 +1824,8 @@ pub struct UiSettings {
     /// of picture behind them. Runs the interface's way - a hundred is a
     /// solid code area with the picture strictly behind it.
     pub editor_opacity: u8,
+    /// How the beat line under the header moves, when it is there at all.
+    pub beat_line: BeatLineStyle,
     /// The stage and the status bar hidden: the score fills the frame, open
     /// panels float over it and the visuals docks close. Not written to the
     /// preferences file: opening the studio into a stripped-down window
@@ -1637,18 +1859,23 @@ impl Default for UiSettings {
     fn default() -> Self {
         Self {
             terminal_profile: None,
+            editor_keybindings: EditorKeybindings::Default,
+            vim_mappings_path: None,
+            vim_list_navigation: true,
             rendering: RenderingMode::Automatic,
             frame_rate: FrameRate::default(),
             show_full_paths: false,
             quantise: Quantise::Off,
             auto_evaluate: false,
             typing_pause: TypingPause::Medium,
+            external_changes: ExternalChanges::Off,
             load_mode: LoadMode::Wait,
             clock_out: None,
             clock_in: None,
             animation: true,
             highlights: true,
             evaluation_flash: EvaluationFlashMode::Full,
+            evaluation_animation: EvalAnimation::Normal,
             trim_recordings: true,
             highlight_fade: HighlightFade::Theme,
             metric_detail: MetricDetail::Basic,
@@ -1673,6 +1900,7 @@ impl Default for UiSettings {
             syntax_check: SyntaxCheck::Full,
             log_verbose: false,
             examples_stack: false,
+            auto_preview: false,
             backdrop_smoothing: false,
             slider_smoothing: false,
             frequency_slider_log: true,
@@ -1683,6 +1911,7 @@ impl Default for UiSettings {
             backdrop_opacity: BACKDROP_OPACITY_DEFAULT,
             interface_opacity: INTERFACE_OPACITY_DEFAULT,
             editor_opacity: EDITOR_OPACITY_DEFAULT,
+            beat_line: BeatLineStyle::Off,
             zen: false,
             show_menu: true,
             show_header: true,
@@ -1758,6 +1987,8 @@ enum Row {
     AutoEvaluate,
     /// How long typing must pause before it does.
     TypingPause,
+    /// What happens when another program saves the open score's file.
+    ExternalChanges,
     /// How a start or an edit meets sounds still loading.
     LoadMode,
     Animation,
@@ -1775,11 +2006,11 @@ enum Row {
     PianoVolume,
     /// Whether a set starts with a brickwall on the output. One switch,
     /// on the first page: a set given one of its own on the desk keeps
-    /// that instead, and how the studio's own sounds is on Advanced.
+    /// that instead, and how the studio's own sounds is on the General page.
     MasterLimiter,
-    /// The character that default works with, on Advanced.
+    /// The character that default works with, on the General page.
     MasterLimiterCharacter,
-    /// The ceiling that default holds, in dBFS, on Advanced.
+    /// The ceiling that default holds, in dBFS, on the General page.
     MasterLimiterCeiling,
     /// Whether that ceiling is brought back up to full scale.
     MasterLimiterMakeup,
@@ -1835,6 +2066,10 @@ enum Row {
     RefreshSources,
     /// Not a setting: how much the sample cache holds, and Enter to empty it.
     SampleCache,
+    /// How the evaluation flash moves over the code it ran.
+    EvaluationAnimation,
+    /// How the beat line under the header moves.
+    BeatLine,
     /// Whether the reference and the suggestions list this category.
     ReferenceCategory(Category),
 }
@@ -1952,7 +2187,8 @@ fn step_limiter_character(
     ladder[next]
 }
 
-/// One press of the arrows, on either opacity.
+/// One press of the arrows, on a percentage row: the opacities, all of
+/// them nought-to-a-hundred knobs.
 fn step_opacity(opacity: u8, forwards: bool) -> u8 {
     if forwards {
         opacity.saturating_add(OPACITY_STEP)
@@ -1963,16 +2199,45 @@ fn step_opacity(opacity: u8, forwards: bool) -> u8 {
 }
 
 /// The first page: what a musician reaches for during a set, most often
-/// first - the clock, the controllers, the look of the screen, the
-/// editor, the set - and nothing that needs the manual.
+/// first - the clock, the controllers, the editor, the set - and nothing
+/// that needs the manual. The machine rows follow at the end: set once and
+/// left, they are still settings, just not ones anybody screens through.
 const ROWS: &[Row] = &[
     Row::Quantise,
     Row::MasterLimiter,
     Row::AutoEvaluate,
     Row::TypingPause,
+    Row::ExternalChanges,
+    Row::SyntaxCheck,
+    Row::SetsFolder,
+    Row::RecordingsFolder,
+    Row::GlobalPrebake,
+    Row::LocalPrebake,
+    Row::TrimRecordings,
+    Row::ShowFullPaths,
+    Row::LoadMode,
+    Row::OutputLatency,
+    Row::MaxPolyphony,
+    Row::PianoSound,
+    Row::PianoVolume,
+    Row::MasterLimiterCharacter,
+    Row::MasterLimiterCeiling,
+    Row::MasterLimiterMakeup,
+    Row::SliderSmoothing,
+    Row::FrequencySliderLog,
+    Row::SampleCeiling,
+    Row::PreviewBudget,
+    Row::UnusedSampleIdle,
+];
+
+/// The appearance page: everything about how the studio looks - the chrome,
+/// the editor's marks, where the panels dock, how the terminal draws.
+/// Nothing here changes what the studio does, only how it reads.
+const APPEARANCE_ROWS: &[Row] = &[
     Row::ShowMenu,
     Row::ShowHeader,
     Row::ShowFooter,
+    Row::BeatLine,
     Row::Animation,
     Row::MasterScope,
     Row::MetricDetail,
@@ -1985,46 +2250,21 @@ const ROWS: &[Row] = &[
     Row::Highlights,
     Row::HighlightFade,
     Row::EvaluationFlash,
+    Row::EvaluationAnimation,
     Row::Minimap,
     Row::ShowScrollbars,
     Row::LineNumbers,
     Row::Wrap,
     Row::Brackets,
     Row::CaretShape,
-    Row::SyntaxCheck,
-    Row::SetsFolder,
-    Row::RecordingsFolder,
-    Row::GlobalPrebake,
-    Row::LocalPrebake,
-    Row::TrimRecordings,
-    Row::ShowFullPaths,
-];
-
-/// The second page: what is set once and left - how a play meets sounds
-/// still loading, how the terminal draws, how sliders travel, where the
-/// panels dock, what the sample memory and cache may take.
-const ADVANCED_ROWS: &[Row] = &[
-    Row::LoadMode,
-    Row::OutputLatency,
-    Row::MaxPolyphony,
-    Row::PianoSound,
-    Row::PianoVolume,
-    Row::MasterLimiterCharacter,
-    Row::MasterLimiterCeiling,
-    Row::MasterLimiterMakeup,
-    Row::Rendering,
-    Row::FrameRate,
-    #[cfg(feature = "hydra")]
-    Row::BackdropSmoothing,
-    Row::SliderSmoothing,
-    Row::FrequencySliderLog,
     Row::SetPanelSide,
     Row::MixerEdge,
     Row::VizEdgeOne,
     Row::VizEdgeTwo,
-    Row::SampleCeiling,
-    Row::PreviewBudget,
-    Row::UnusedSampleIdle,
+    Row::Rendering,
+    Row::FrameRate,
+    #[cfg(feature = "hydra")]
+    Row::BackdropSmoothing,
 ];
 
 /// The reference page: which kinds of entry the reference column and the
@@ -2050,17 +2290,21 @@ const SOURCES_CONTROLS: &[Row] = &[
 /// How many selectable rows precede the imports on Sources.
 pub(super) const SOURCE_CONTROL_COUNT: usize = SOURCES_CONTROLS.len();
 
-/// The two actions at the top of the vst page, before the folders: the
-/// label and the explanation of each.
+/// The actions at the top of the vst page, before the folders: the label
+/// and the explanation of each.
 #[cfg(feature = "vst")]
-const VST_CONTROLS: [(&str, &str); 3] = [
+const VST_CONTROLS: [(&str, &str); 4] = [
     (
         "add folder",
         "opens a prompt for a folder with VST3 plugins",
     ),
     (
+        "add preset folder",
+        "opens a prompt for a folder with .vstpreset files, any structure",
+    ),
+    (
         "scan",
-        "reads every folder and tests new or changed plugins",
+        "reads every folder, tests new or changed plugins, and reads the preset folders",
     ),
     (
         "rescan",
@@ -2072,15 +2316,24 @@ pub(super) const VST_CONTROL_COUNT: usize = VST_CONTROLS.len();
 #[cfg(feature = "vst")]
 const VST_ADD_ROW: usize = 0;
 #[cfg(feature = "vst")]
-const VST_SCAN_ROW: usize = 1;
+const VST_PRESET_ADD_ROW: usize = 1;
 #[cfg(feature = "vst")]
-const VST_RESCAN_ROW: usize = 2;
+const VST_SCAN_ROW: usize = 2;
+#[cfg(feature = "vst")]
+const VST_RESCAN_ROW: usize = 3;
 
 /// The terminal profile belongs with the bindings it determines.
 pub(super) const TERMINAL_PROFILE_ROW: usize = 0;
-pub(super) const KEYBIND_ACTION_START: usize = 1;
+pub(super) const EDITOR_KEYBINDINGS_ROW: usize = 1;
+pub(super) const KEYBIND_ACTION_START: usize = 2;
 /// The final keybind row is an action, after every binding.
 pub(super) const RESET_KEYBINDS_ROW: usize = KEYBIND_ACTION_START + BindAction::ALL.len();
+pub(super) const VIM_MAPPINGS_PATH_ROW: usize = RESET_KEYBINDS_ROW + 1;
+pub(super) const LIST_NAVIGATION_ROW: usize = VIM_MAPPINGS_PATH_ROW + 1;
+
+pub(super) fn keybind_count(settings: &UiSettings) -> usize {
+    RESET_KEYBINDS_ROW + 1 + 2 * usize::from(settings.editor_keybindings == EditorKeybindings::Vim)
+}
 
 pub(super) fn keybind_action_at(row: usize) -> Option<BindAction> {
     row.checked_sub(KEYBIND_ACTION_START)
@@ -2172,7 +2425,7 @@ impl Row {
     fn group(self) -> &'static str {
         match self {
             Self::Quantise | Self::MasterLimiter | Self::LoadMode => "Playback",
-            Self::AutoEvaluate | Self::TypingPause => "Live coding",
+            Self::AutoEvaluate | Self::TypingPause | Self::ExternalChanges => "Live coding",
 
             // The one latency knob: what the OUTPUT costs is a
             // machine-level choice, set once like a DAW's buffer size.
@@ -2217,6 +2470,8 @@ impl Row {
             Self::SliderSmoothing | Self::FrequencySliderLog => "Sliders",
             Self::SetPanelSide | Self::MixerEdge | Self::VizEdgeOne | Self::VizEdgeTwo => "Panels",
             Self::SampleCeiling | Self::PreviewBudget | Self::UnusedSampleIdle => "Sample memory",
+            Self::EvaluationAnimation => "Editor",
+            Self::BeatLine => "Look",
             Self::PrecacheSources
             | Self::CacheDefaults
             | Self::RefreshSources
@@ -2233,6 +2488,7 @@ impl Row {
             Self::Quantise => "launch on",
             Self::AutoEvaluate => "auto evaluate",
             Self::TypingPause => "typing pause",
+            Self::ExternalChanges => "watch external changes",
             Self::LoadMode => "load mode",
             Self::Animation => "visualizers",
             Self::Highlights => "highlights",
@@ -2285,6 +2541,8 @@ impl Row {
             Self::CacheDefaults => "cache all",
             Self::RefreshSources => "refresh all",
             Self::SampleCache => "clear cache",
+            Self::BeatLine => "beat line",
+            Self::EvaluationAnimation => "evaluation animation",
             Self::ReferenceCategory(Category::Osc) => "OSC / SuperDirt",
             Self::ReferenceCategory(Category::Serial) => "serial",
             Self::ReferenceCategory(Category::FmMatrix) => "FM routing matrix",
@@ -2312,6 +2570,9 @@ impl Row {
             Self::Quantise => "every play waits for this line · off plays now",
             Self::AutoEvaluate => "a paused edit applies itself while the set plays",
             Self::TypingPause => "how long typing rests before the edit applies",
+            Self::ExternalChanges => {
+                "sync: the editor takes another program's save \u{b7} sync & eval: and plays it"
+            }
             Self::LoadMode => "wait: plays once its sounds load · async: skips late notes",
             Self::Animation => "pianoroll, scope and friends draw",
             Self::Highlights => "sounding events marked in the score",
@@ -2367,6 +2628,12 @@ impl Row {
             Self::CacheDefaults => "Enter caches every remote pack onto disk",
             Self::RefreshSources => "Enter refetches every remote pack's list",
             Self::SampleCache => "Enter twice empties downloaded samples",
+            Self::BeatLine => {
+                "a strip under the header keeps the beat \u{b7} \u{2190}/\u{2192} walks its looks"
+            }
+            Self::EvaluationAnimation => {
+                "how a run of code flashes \u{b7} fades, zap, steps, glitch, wave"
+            }
             Self::ReferenceCategory(Category::Osc) => {
                 "osc() and controls only SuperDirt reads · tag:osc lists them anyway"
             }
@@ -2429,11 +2696,32 @@ fn grouped_rows(rows: &[Row]) -> Vec<DisplayRow> {
     display
 }
 
+fn keybind_lines(count: usize) -> Vec<DisplayRow> {
+    let mut lines = Vec::with_capacity(count + 1);
+    for index in 0..count {
+        if index == KEYBIND_ACTION_START {
+            if count > VIM_MAPPINGS_PATH_ROW {
+                lines.push(DisplayRow::Control(VIM_MAPPINGS_PATH_ROW));
+            }
+            if count > LIST_NAVIGATION_ROW {
+                lines.push(DisplayRow::Control(LIST_NAVIGATION_ROW));
+            }
+            lines.push(DisplayRow::Gap);
+        }
+        if index != VIM_MAPPINGS_PATH_ROW && index != LIST_NAVIGATION_ROW {
+            lines.push(DisplayRow::Control(index));
+        }
+    }
+    lines
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SettingsPage {
     #[default]
     Settings,
-    Advanced,
+    /// Everything visual: the chrome, the editor's marks, the panels'
+    /// places, and how the terminal draws.
+    Appearance,
     /// The twelve mapping slots: which knob or stick drives which fader.
     Mapping,
     /// The learnt shortcuts: Enter on a row, press the chord.
@@ -2445,35 +2733,37 @@ pub enum SettingsPage {
     Vst,
     /// Which kinds of entry the reference and the suggestions offer.
     Reference,
-    /// The origins a score imports scripts from, and the ones refused so far.
-    Trust,
+    /// What a score may reach: import origins, and native orchestras.
+    Permissions,
     About,
 }
 
 /// The tabs in Tab order: the page, its label, and its padded column.
 const TABS: &[(SettingsPage, &str, u16)] = &[
-    (SettingsPage::Settings, "settings", 2),
-    (SettingsPage::Advanced, "advanced", 13),
-    (SettingsPage::Mapping, "sliders", 24),
-    (SettingsPage::Keybinds, "keybinds", 34),
-    (SettingsPage::Sources, "samples", 45),
+    (SettingsPage::Settings, "general", 2),
+    (SettingsPage::Appearance, "appearance", 12),
+    (SettingsPage::Mapping, "sliders", 25),
+    (SettingsPage::Keybinds, "keybinds", 35),
+    (SettingsPage::Sources, "samples", 46),
     #[cfg(feature = "vst")]
-    (SettingsPage::Vst, "vst", 55),
+    (SettingsPage::Vst, "vst", 56),
     #[cfg(feature = "vst")]
-    (SettingsPage::Reference, "reference", 61),
+    (SettingsPage::Reference, "reference", 62),
     #[cfg(not(feature = "vst"))]
     (SettingsPage::Reference, "reference", 56),
     #[cfg(feature = "vst")]
-    (SettingsPage::Trust, "trust", 73),
+    (SettingsPage::Permissions, "permissions", 74),
     #[cfg(not(feature = "vst"))]
-    (SettingsPage::Trust, "trust", 68),
+    (SettingsPage::Permissions, "permissions", 68),
     #[cfg(feature = "vst")]
-    (SettingsPage::About, "about", 81),
+    (SettingsPage::About, "about", 88),
     #[cfg(not(feature = "vst"))]
-    (SettingsPage::About, "about", 76),
+    (SettingsPage::About, "about", 82),
 ];
 
-/// A narrow title row drops the tab padding and uses one-column gaps.
+/// A narrow title row drops the tab padding and uses one-column gaps, and
+/// drops any tab that cannot fit whole after that: half a label is not a
+/// label. The Tab key still reaches every page at any width.
 fn tab_spans(width: u16) -> Vec<(u16, String, SettingsPage)> {
     let (_, label, start) = TABS[TABS.len() - 1];
     if start + label.len() as u16 + 2 < width {
@@ -2484,10 +2774,12 @@ fn tab_spans(width: u16) -> Vec<(u16, String, SettingsPage)> {
     }
     let mut start = 2;
     TABS.iter()
-        .map(|&(page, label, _)| {
+        .filter_map(|&(page, label, _)| {
             let span = (start, label.to_owned(), page);
             start += label.len() as u16 + 1;
-            span
+            // The next tab's start sits one past this label's last column,
+            // so this test is whether the label clears the right border.
+            (start <= width).then_some(span)
         })
         .collect()
 }
@@ -2537,9 +2829,9 @@ pub struct SettingsSheet {
     /// How many keybind rows the keybinds page is showing, for the same
     /// reason as `source_count`.
     pub keybind_count: usize,
-    /// How many origins the trust page is showing: the trusted ones, then
-    /// the ones refused in this studio.
-    pub trust_count: usize,
+    /// How many rows the permissions page is showing: the trusted origins,
+    /// then the ones refused in this studio.
+    pub permissions_count: usize,
     /// How many folders the player added on the vst page, for the same
     /// reason as `source_count`.
     #[cfg(feature = "vst")]
@@ -2548,10 +2840,38 @@ pub struct SettingsSheet {
     /// as one. A standard folder is read-only.
     #[cfg(feature = "vst")]
     pub vst_standard_count: usize,
-    /// How many plugins the scan found follow the folders. The rows are
-    /// read-only: the scan is what changes them.
+    /// How many plugins the scan found follow the folders. The scan adds and
+    /// removes the rows. Each row has the switch `audio thread only`.
     #[cfg(feature = "vst")]
     pub vst_scanned_count: usize,
+    /// How many preset folders the player added follow the standard folders.
+    #[cfg(feature = "vst")]
+    pub vst_preset_folder_count: usize,
+    /// The scanned row whose presets the page lists under it, by its place
+    /// in the scanned list. `None` while no row is open.
+    #[cfg(feature = "vst")]
+    pub vst_open: Option<usize>,
+    /// How many presets the open row lists under it: the page keeps the
+    /// names.
+    #[cfg(feature = "vst")]
+    pub vst_open_count: usize,
+    /// The App owes the sheet the presets of the open row: the row opened,
+    /// or the host read the preset folders again.
+    #[cfg(feature = "vst")]
+    pub vst_presets_due: bool,
+    /// Where the plugin filter stands. The App owns its text and mirrors
+    /// its state here.
+    #[cfg(feature = "vst")]
+    pub vst_filter: VstFilterState,
+    /// How many plugin rows the page lists: every one the scan found, or
+    /// the ones the standing filter kept. The App keeps the count.
+    #[cfg(feature = "vst")]
+    pub vst_shown: usize,
+    /// The open plugin row's place among the rows the page lists - `None`
+    /// while no row is open, or when the filter dropped the plugin it
+    /// holds. The row itself is [`SettingsSheet::vst_open`].
+    #[cfg(feature = "vst")]
+    pub vst_open_listed: Option<usize>,
     /// The first line of the page drawn, kept from key to key so walking
     /// through the middle of a page leaves it still. The page keeps a margin
     /// of rows around the selection; see [`super::scroll`].
@@ -2584,6 +2904,8 @@ pub enum SettingsAction {
     ChooseSetsFolder,
     /// Enter on the recordings folder row: the sheet hands over to a picker.
     ChooseRecordingsFolder,
+    EditVimMappingsPath,
+    ResetVimMappingsPath,
     /// Enter on the sample cache row: empty it. Armed by a first Enter;
     /// the second Enter is the one that empties.
     ClearSampleCache,
@@ -2624,6 +2946,18 @@ pub enum SettingsAction {
     /// `d` on a folder the player added: take the folder off the list.
     #[cfg(feature = "vst")]
     RemoveVstFolder(usize),
+    /// The vst page: the sheet hands over to a picker for a folder with
+    /// `.vstpreset` files, in any folder structure.
+    #[cfg(feature = "vst")]
+    AddPresetFolder,
+    /// `d` on a preset folder the player added: take the folder off the
+    /// list, and the host reads the preset folders again.
+    #[cfg(feature = "vst")]
+    RemovePresetFolder(usize),
+    /// Enter on a scanned row: list the presets the folders hold for the
+    /// plugin under its row, or close the list.
+    #[cfg(feature = "vst")]
+    ToggleVstPresets(usize),
     /// Enter on the scan row: read every plugin folder again, and test the
     /// plugins with no answer in the scan cache.
     #[cfg(feature = "vst")]
@@ -2632,6 +2966,20 @@ pub enum SettingsAction {
     /// again.
     #[cfg(feature = "vst")]
     RescanVst,
+    /// Space on a plugin row: turn the switch `audio thread only` of the
+    /// plugin on or off. The number is the place of the plugin in the list
+    /// of plugins.
+    #[cfg(feature = "vst")]
+    ToggleAudioThread(usize),
+    /// A letter on the vst page: jump to the next plugin whose name
+    /// begins with it, from the row the cursor holds and around the list.
+    #[cfg(feature = "vst")]
+    JumpVst(char),
+    /// A key of the vst page's plugin filter: the App owns its text and
+    /// takes the key to it. The key is the whole press, so Enter, Esc and
+    /// Backspace reach the text as letters of their own meaning.
+    #[cfg(feature = "vst")]
+    FilterVst(crossterm::event::KeyCode),
     /// Enter on a keybind row: wait for a chord, and make it this
     /// action's. The chord itself arrives through the app's learn state.
     LearnKeybind(BindAction),
@@ -2639,13 +2987,13 @@ pub enum SettingsAction {
     /// back. Space is not among them - it types spaces, and a reflexive
     /// press on a row must not clear a binding.
     ClearKeybind(BindAction),
-    /// Enter on a trust row: trust the origin, if it is a refused one.
-    TrustImport(usize),
-    /// Space on a trust row: trust a refused origin, or turn a trusted one
-    /// off where it stands, so it can be turned back on later.
-    ToggleImport(usize),
-    /// Delete, Backspace or `d` on a trust row: take the origin off the page.
-    ForgetImport(usize),
+    /// Enter on a row: permit it, if it is a refused one.
+    PermitRow(usize),
+    /// Space on a row: permit a refused one, or turn a permitted one off
+    /// where it stands, so it can be turned back on later.
+    ToggleRow(usize),
+    /// Delete, Backspace or `d` on a row: take it off the page.
+    ForgetRow(usize),
     /// Ask before replacing all overrides with this terminal's defaults.
     AskResetKeybinds,
     /// The second Enter on the reset row confirmed replacing all overrides.
@@ -2662,7 +3010,7 @@ impl SettingsSheet {
     pub(super) const fn shows_settings(self) -> bool {
         matches!(
             self.page,
-            SettingsPage::Settings | SettingsPage::Advanced | SettingsPage::Reference
+            SettingsPage::Settings | SettingsPage::Appearance | SettingsPage::Reference
         )
     }
 
@@ -2676,18 +3024,18 @@ impl SettingsSheet {
         matches!(self.page, SettingsPage::Keybinds)
     }
 
-    /// The trust page: a list of origins.
-    pub(super) const fn shows_trust(self) -> bool {
-        matches!(self.page, SettingsPage::Trust)
+    /// The permissions page: a list of rows.
+    pub(super) const fn shows_permissions(self) -> bool {
+        matches!(self.page, SettingsPage::Permissions)
     }
 
-    /// The arrows walk the origins and wrap. Enter trusts. A row has two
-    /// states, so Left, Right and Space each flip its trust where it stands,
-    /// and Delete, Backspace or `d` takes an origin off the page. Esc and Tab
-    /// stay the sheet's.
-    fn trust_key(&mut self, code: crossterm::event::KeyCode) -> SettingsAction {
+    /// The arrows walk the rows and wrap. Enter permits, Space or either
+    /// sideways arrow flips a row where it stands, the way every switch
+    /// on the controls pages flips, and Delete, Backspace or `d` takes a
+    /// row off the page. Esc and Tab stay the sheet's.
+    fn permissions_key(&mut self, code: crossterm::event::KeyCode) -> SettingsAction {
         use crossterm::event::KeyCode;
-        let len = self.trust_count;
+        let len = self.permissions_count;
         if len == 0 {
             return SettingsAction::Ignored;
         }
@@ -2701,10 +3049,10 @@ impl SettingsSheet {
                 self.select((at + 1) % len);
                 SettingsAction::Nothing
             }
-            KeyCode::Enter => SettingsAction::TrustImport(at),
-            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => SettingsAction::ToggleImport(at),
+            KeyCode::Enter => SettingsAction::PermitRow(at),
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => SettingsAction::ToggleRow(at),
             KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('d' | 'D') => {
-                SettingsAction::ForgetImport(at)
+                SettingsAction::ForgetRow(at)
             }
             _ => SettingsAction::Ignored,
         }
@@ -2888,18 +3236,66 @@ impl SettingsSheet {
         matches!(self.page, SettingsPage::Vst)
     }
 
+    /// How many plugin rows the vst page lists: the ones the standing
+    /// filter kept. The App keeps the count; before it has - a fresh
+    /// sheet, or one the App has not mirrored yet - the scan's own count
+    /// stands in while no filter holds.
+    #[cfg(feature = "vst")]
+    pub fn vst_plugins_shown(&self) -> usize {
+        if self.vst_shown == 0 && self.vst_filter == VstFilterState::Off {
+            self.vst_scanned_count
+        } else {
+            self.vst_shown
+        }
+    }
+
     /// The vst page is a list, as the sources page is: the arrows walk the
-    /// two actions, the folders the player added, the standard folders,
-    /// then the plugins the scan found. Only a folder the player added is
-    /// removed.
+    /// actions, the folders the player added, the standard folders, the
+    /// preset folders, then the plugins the scan found. Only a folder the
+    /// player added is removed. Space on a plugin turns its switch
+    /// `audio thread only` on or off, and Enter lists its presets.
     #[cfg(feature = "vst")]
     fn vst_key(&mut self, code: crossterm::event::KeyCode) -> SettingsAction {
         use crossterm::event::KeyCode;
         let added = self.vst_folder_count;
-        let len = VST_CONTROL_COUNT + added + self.vst_standard_count + self.vst_scanned_count;
+        let folders = VST_CONTROL_COUNT + added + self.vst_standard_count;
+        let scanned = folders + self.vst_preset_folder_count;
+        // The rows past the folders are the plugins the page lists: every
+        // one the scan found, or the ones the standing filter kept.
+        let len = scanned + self.vst_plugins_shown();
         let at = self.selected.min(len - 1);
         let on_added = at >= VST_CONTROL_COUNT && at < VST_CONTROL_COUNT + added;
+        let on_preset = at >= folders && at < scanned;
         match code {
+            // `/` starts a filter of the plugin list, or takes a standing
+            // one back up to type.
+            KeyCode::Char('/') if !self.vst_filter.is_typing() => SettingsAction::FilterVst(code),
+            // While the letters build it, every key the page binds is a
+            // letter of it: `a` adds no folder, `d` and Backspace take
+            // none off, Space switches no plugin, and `/` types a slash.
+            // Enter keeps the filter standing and hands the rows back,
+            // and Esc drops it whole - the first Esc ends it, the next
+            // closes the sheet as ever.
+            KeyCode::Char(_)
+            | KeyCode::Enter
+            | KeyCode::Backspace
+            | KeyCode::Delete
+            | KeyCode::Esc
+                if self.vst_filter.is_typing() =>
+            {
+                SettingsAction::FilterVst(code)
+            }
+            // The arrows end the typing - the filter stands - and move
+            // through the rows the standing text kept.
+            KeyCode::Up if self.vst_filter.is_typing() => {
+                self.selected = (at + len - 1) % len;
+                SettingsAction::FilterVst(code)
+            }
+            KeyCode::Down if self.vst_filter.is_typing() => {
+                self.selected = (at + 1) % len;
+                SettingsAction::FilterVst(code)
+            }
+            KeyCode::Char(' ') if at >= scanned => SettingsAction::ToggleAudioThread(at - scanned),
             KeyCode::Up => {
                 self.selected = (at + len - 1) % len;
                 SettingsAction::Nothing
@@ -2910,15 +3306,26 @@ impl SettingsSheet {
             }
             KeyCode::Char('a' | '+') => SettingsAction::AddVstFolder,
             KeyCode::Enter if at == VST_ADD_ROW => SettingsAction::AddVstFolder,
+            KeyCode::Enter if at == VST_PRESET_ADD_ROW => SettingsAction::AddPresetFolder,
             KeyCode::Enter if at == VST_SCAN_ROW => SettingsAction::ScanVst,
             KeyCode::Enter if at == VST_RESCAN_ROW => SettingsAction::RescanVst,
+            KeyCode::Enter if at >= scanned => SettingsAction::ToggleVstPresets(at - scanned),
             KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace if on_added => {
                 SettingsAction::RemoveVstFolder(at - VST_CONTROL_COUNT)
             }
-            // The page takes the key, so the score does not.
-            KeyCode::Enter | KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
-                SettingsAction::Nothing
+            KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace if on_preset => {
+                SettingsAction::RemovePresetFolder(at - folders)
             }
+            // A letter jumps to the next plugin that begins with it, from
+            // the row the cursor holds and around: `s` reaches Serum and
+            // the rest of the s's. The arms above took `d` on the rows it
+            // removes, and `a` adds a folder everywhere, so `A` reaches
+            // the a's.
+            KeyCode::Char(letter) if letter.is_alphanumeric() && !matches!(letter, 'a' | '+') => {
+                SettingsAction::JumpVst(letter)
+            }
+            // The page takes the key, so the score does not.
+            KeyCode::Enter | KeyCode::Delete | KeyCode::Backspace => SettingsAction::Nothing,
             _ => SettingsAction::Ignored,
         }
     }
@@ -2945,12 +3352,21 @@ impl SettingsSheet {
             self.confirm_reset_keybinds = false;
         }
         match code {
-            KeyCode::Up if len > 0 => {
-                self.selected = (at + len - 1) % len;
-                SettingsAction::Nothing
-            }
-            KeyCode::Down if len > 0 => {
-                self.selected = (at + 1) % len;
+            KeyCode::Up | KeyCode::Down if len > 0 => {
+                let order: Vec<_> = keybind_lines(len)
+                    .into_iter()
+                    .filter_map(|line| match line {
+                        DisplayRow::Control(row) => Some(row),
+                        _ => None,
+                    })
+                    .collect();
+                let position = order.iter().position(|row| *row == at).unwrap_or(0);
+                let next = if code == KeyCode::Up {
+                    (position + order.len() - 1) % order.len()
+                } else {
+                    (position + 1) % order.len()
+                };
+                self.selected = order[next];
                 SettingsAction::Nothing
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Enter
@@ -2969,6 +3385,20 @@ impl SettingsSheet {
                     SettingsAction::Nothing
                 }
             }
+            KeyCode::Left | KeyCode::Right | KeyCode::Enter
+                if len > 0 && at == EDITOR_KEYBINDINGS_ROW =>
+            {
+                settings.editor_keybindings.cycle();
+                SettingsAction::Changed
+            }
+            KeyCode::Delete | KeyCode::Backspace if len > 0 && at == EDITOR_KEYBINDINGS_ROW => {
+                if settings.editor_keybindings != EditorKeybindings::Default {
+                    settings.editor_keybindings = EditorKeybindings::Default;
+                    SettingsAction::Changed
+                } else {
+                    SettingsAction::Nothing
+                }
+            }
             KeyCode::Enter if len > 0 && at == RESET_KEYBINDS_ROW => {
                 if self.confirm_reset_keybinds {
                     self.confirm_reset_keybinds = false;
@@ -2976,6 +3406,26 @@ impl SettingsSheet {
                 } else {
                     self.confirm_reset_keybinds = true;
                     SettingsAction::AskResetKeybinds
+                }
+            }
+            KeyCode::Enter if at == VIM_MAPPINGS_PATH_ROW && len > at => {
+                SettingsAction::EditVimMappingsPath
+            }
+            KeyCode::Delete | KeyCode::Backspace if at == VIM_MAPPINGS_PATH_ROW && len > at => {
+                SettingsAction::ResetVimMappingsPath
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ')
+                if at == LIST_NAVIGATION_ROW && len > at =>
+            {
+                settings.vim_list_navigation = !settings.vim_list_navigation;
+                SettingsAction::Changed
+            }
+            KeyCode::Delete | KeyCode::Backspace if at == LIST_NAVIGATION_ROW && len > at => {
+                if settings.vim_list_navigation {
+                    SettingsAction::Nothing
+                } else {
+                    settings.vim_list_navigation = true;
+                    SettingsAction::Changed
                 }
             }
             KeyCode::Enter if len > 0 => match action {
@@ -2993,12 +3443,12 @@ impl SettingsSheet {
     fn rows(self) -> &'static [Row] {
         match self.page {
             SettingsPage::Settings => ROWS,
-            SettingsPage::Advanced => ADVANCED_ROWS,
+            SettingsPage::Appearance => APPEARANCE_ROWS,
             SettingsPage::Reference => REFERENCE_ROWS,
             SettingsPage::Mapping
             | SettingsPage::Keybinds
             | SettingsPage::Sources
-            | SettingsPage::Trust
+            | SettingsPage::Permissions
             | SettingsPage::About => &[],
             #[cfg(feature = "vst")]
             SettingsPage::Vst => &[],
@@ -3007,10 +3457,10 @@ impl SettingsSheet {
 
     #[cfg(feature = "hydra")]
     pub(super) fn webcam_row_selected(self) -> bool {
-        // The row is only on the main page. The check reads the active
-        // page's rows, not every row the sheet knows. The preview is then
-        // not requested after a click onto advanced, where the row is not
-        // drawn.
+        // The row is only on the appearance page. The check reads the
+        // active page's rows, not every row the sheet knows. The preview is
+        // then not requested after a click onto advanced, where the row is
+        // not drawn.
         self.shows_settings() && matches!(self.rows().get(self.selected), Some(Row::HydraWebcam))
     }
 
@@ -3078,7 +3528,7 @@ impl SettingsSheet {
             return SettingsAction::Nothing;
         }
         let choices: Vec<(usize, usize)> = match self.page {
-            SettingsPage::Settings | SettingsPage::Advanced | SettingsPage::Reference => {
+            SettingsPage::Settings | SettingsPage::Appearance | SettingsPage::Reference => {
                 grouped_rows(self.rows())
                     .iter()
                     .enumerate()
@@ -3097,10 +3547,15 @@ impl SettingsSheet {
                 })
                 .collect(),
             #[cfg(feature = "vst")]
+            // The filter's echo line counts as a line wherever it shows;
+            // its text is the page's to draw, not this row map's.
             SettingsPage::Vst => vst_lines(
                 self.vst_folder_count,
                 self.vst_standard_count,
-                self.vst_scanned_count,
+                self.vst_preset_folder_count,
+                self.vst_plugins_shown(),
+                self.vst_open_listed.map(|open| (open, self.vst_open_count)),
+                self.vst_filter != VstFilterState::Off,
             )
             .iter()
             .enumerate()
@@ -3109,10 +3564,17 @@ impl SettingsSheet {
                 _ => None,
             })
             .collect(),
-            SettingsPage::Keybinds => (0..self.keybind_count)
+            SettingsPage::Keybinds => keybind_lines(self.keybind_count)
+                .iter()
+                .enumerate()
+                .filter_map(|(line, row)| match row {
+                    DisplayRow::Control(index) => Some((line, *index)),
+                    _ => None,
+                })
+                .collect(),
+            SettingsPage::Permissions => (0..self.permissions_count)
                 .map(|index| (index, index))
                 .collect(),
-            SettingsPage::Trust => (0..self.trust_count).map(|index| (index, index)).collect(),
             SettingsPage::Mapping => {
                 let columns = usize::from(MAPPING_COLUMNS);
                 let step = (shown / usize::from(SLOT_HEIGHT)).max(1) * columns;
@@ -3194,6 +3656,9 @@ impl SettingsSheet {
                 Row::TypingPause => {
                     settings.typing_pause = settings.typing_pause.step(forwards);
                 }
+                Row::ExternalChanges => {
+                    settings.external_changes = settings.external_changes.step(forwards);
+                }
                 Row::LoadMode => settings.load_mode = settings.load_mode.step(),
                 Row::Animation => set_switch(&mut settings.animation),
                 Row::Highlights => set_switch(&mut settings.highlights),
@@ -3259,6 +3724,12 @@ impl SettingsSheet {
                 Row::EditorOpacity => {
                     settings.editor_opacity = step_opacity(settings.editor_opacity, forwards);
                 }
+                Row::BeatLine => {
+                    settings.beat_line = settings.beat_line.step(forwards);
+                }
+                Row::EvaluationAnimation => {
+                    settings.evaluation_animation = settings.evaluation_animation.step(forwards);
+                }
                 Row::ShowMenu => set_switch(&mut settings.show_menu),
                 Row::ShowHeader => set_switch(&mut settings.show_header),
                 Row::ShowFooter => set_switch(&mut settings.show_footer),
@@ -3309,7 +3780,10 @@ impl SettingsSheet {
             return self.mapping_key(code);
         }
         #[cfg(feature = "vst")]
-        if self.shows_vst() && !matches!(code, KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab) {
+        if self.shows_vst()
+            && (!matches!(code, KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab)
+                || self.vst_filter.is_typing())
+        {
             return self.vst_key(code);
         }
         // The keybinds page keeps Esc and Tab for the sheet - a page you
@@ -3320,8 +3794,10 @@ impl SettingsSheet {
         {
             return self.keybind_key(code, settings);
         }
-        if self.shows_trust() && !matches!(code, KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab) {
-            return self.trust_key(code);
+        if self.shows_permissions()
+            && !matches!(code, KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab)
+        {
+            return self.permissions_key(code);
         }
         match code {
             KeyCode::Esc => {
@@ -3602,11 +4078,11 @@ impl SettingsSheet {
         };
         let shown = usize::from(rows.height).max(1);
         self.first = match self.page {
-            SettingsPage::Settings | SettingsPage::Advanced | SettingsPage::Reference => {
+            SettingsPage::Settings | SettingsPage::Appearance | SettingsPage::Reference => {
                 self.first_line(shown, &grouped_rows(self.rows()))
             }
-            SettingsPage::Keybinds => self.first_row(shown, self.keybind_count),
-            SettingsPage::Trust => self.first_row(shown, self.trust_count),
+            SettingsPage::Keybinds => self.first_line(shown, &keybind_lines(self.keybind_count)),
+            SettingsPage::Permissions => self.first_row(shown, self.permissions_count),
             SettingsPage::Sources => {
                 self.first_sources(shown, self.source_count, self.default_count)
             }
@@ -3616,7 +4092,10 @@ impl SettingsSheet {
                 &vst_lines(
                     self.vst_folder_count,
                     self.vst_standard_count,
-                    self.vst_scanned_count,
+                    self.vst_preset_folder_count,
+                    self.vst_plugins_shown(),
+                    self.vst_open_listed.map(|open| (open, self.vst_open_count)),
+                    self.vst_filter != VstFilterState::Off,
                 ),
             ),
             SettingsPage::Mapping => self.mapping_first(rows),
@@ -3670,11 +4149,11 @@ impl SettingsSheet {
                 },
             ));
         }
-        // The trust page's hint wraps to a second line on a wide terminal,
+        // The permissions page's hint wraps to a second line on a wide terminal,
         // and a cut hint loses either its keys or its warning of what a
         // trusted script does. The list is short; one row of it pays for
         // the whole hint.
-        if self.shows_trust() {
+        if self.shows_permissions() {
             return Some((
                 panel,
                 Rect {
@@ -3683,8 +4162,7 @@ impl SettingsSheet {
                 },
             ));
         }
-        // Two footer rows on the vst page: the plugin count and the preset
-        // folder.
+        // Two footer rows on the vst page: the plugin count and the hint.
         #[cfg(feature = "vst")]
         if self.shows_vst() {
             return Some((
@@ -3734,14 +4212,17 @@ impl SettingsSheet {
             return None;
         }
         let shown = usize::from(rows.height).max(1);
-        let first = self.first_row(shown, self.keybind_count);
-        let index = first + usize::from(y - rows.y);
-        (index < self.keybind_count).then_some(index)
+        let lines = keybind_lines(self.keybind_count);
+        let first = self.first_line(shown, &lines);
+        match lines.get(first + usize::from(y - rows.y)) {
+            Some(DisplayRow::Control(index)) => Some(*index),
+            _ => None,
+        }
     }
 
-    /// The origin under a point, while the trust page is up.
-    pub fn trust_row_at(self, available: Rect, x: u16, y: u16) -> Option<usize> {
-        if !self.shows_trust() {
+    /// The row under a point, while the permissions page is up.
+    pub fn permission_row_at(self, available: Rect, x: u16, y: u16) -> Option<usize> {
+        if !self.shows_permissions() {
             return None;
         }
         let (_, rows) = self.geometry_for(available)?;
@@ -3749,8 +4230,8 @@ impl SettingsSheet {
             return None;
         }
         let shown = usize::from(rows.height).max(1);
-        let index = self.first_row(shown, self.trust_count) + usize::from(y - rows.y);
-        (index < self.trust_count).then_some(index)
+        let index = self.first_row(shown, self.permissions_count) + usize::from(y - rows.y);
+        (index < self.permissions_count).then_some(index)
     }
 
     /// The source under a point, while the sources page is up: an import
@@ -3781,7 +4262,10 @@ impl SettingsSheet {
         let lines = vst_lines(
             self.vst_folder_count,
             self.vst_standard_count,
-            self.vst_scanned_count,
+            self.vst_preset_folder_count,
+            self.vst_plugins_shown(),
+            self.vst_open_listed.map(|open| (open, self.vst_open_count)),
+            self.vst_filter != VstFilterState::Off,
         );
         self.choice_at(available, x, y, &lines)
     }
@@ -3917,8 +4401,9 @@ pub struct SettingsSheetView<'a> {
     pub mappings: [SlotView; MAPPING_SLOTS],
     /// The shortcut rows, as the keybinds page reads them.
     pub bindings: Vec<KeybindRow>,
-    /// The origins of the trust page: the trusted ones, then the refused.
-    pub trust: Vec<TrustRow>,
+    /// The rows of the permissions page: the trusted origins, then the
+    /// refused, then the orchestra switch.
+    pub permissions: Vec<PermissionRow>,
     /// The plugin folders and the two facts under them, as the vst page
     /// reads them.
     #[cfg(feature = "vst")]
@@ -3945,7 +4430,14 @@ impl SettingsSheetView<'_> {
         // block needs them, and the sheet must be one height for both
         // pages so the mouse claims stay honest.
         let chrome = 3 + Self::explain_rows(available);
-        let wanted = grouped_rows(ROWS).len() as u16 + chrome;
+        // One height for every page of controls, so the mouse claims stay
+        // honest while paging through them.
+        let wanted = [ROWS, APPEARANCE_ROWS]
+            .into_iter()
+            .map(|rows| grouped_rows(rows).len() as u16)
+            .max()
+            .unwrap_or(0)
+            + chrome;
         let height = wanted.min(available.height.saturating_sub(2));
         if height < Self::MIN_ROWS_SHOWN + chrome || available.width < 60 {
             return None;
@@ -3977,7 +4469,7 @@ impl SettingsSheetView<'_> {
     /// Measured over every page of controls, because the sheet is one
     /// height for all of them.
     fn explain_rows(available: Rect) -> u16 {
-        let controls = || ROWS.iter().chain(ADVANCED_ROWS).chain(REFERENCE_ROWS);
+        let controls = || ROWS.iter().chain(APPEARANCE_ROWS).chain(REFERENCE_ROWS);
         let label = controls()
             .map(|row| row.label().chars().count())
             .max()
@@ -4153,14 +4645,30 @@ impl SlotGrid {
     }
 }
 
-/// One origin of the trust page.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TrustRow {
-    /// As the engine names it, such as `https://glossing.dev`.
-    pub origin: String,
-    /// Whether scores import scripts from it. A refused origin is on the
-    /// page until the studio closes, so the player trusts it with one key.
-    pub allowed: bool,
+/// One row of the permissions page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PermissionRow {
+    /// An origin the score imports scripts from, as the engine names it,
+    /// such as `https://glossing.dev`.
+    Origin {
+        origin: String,
+        /// Whether scores import scripts from it. A refused origin is on
+        /// the page until the studio closes, so the player trusts it with
+        /// one key.
+        allowed: bool,
+    },
+    /// The native orchestra switch. It lasts one studio run: the studio
+    /// does not keep it, and the next start turns it on.
+    Csound { allowed: bool },
+}
+
+impl PermissionRow {
+    /// Whether the row's permission is on.
+    pub fn allowed(&self) -> bool {
+        match self {
+            Self::Origin { allowed, .. } | Self::Csound { allowed } => *allowed,
+        }
+    }
 }
 
 /// One action's binding, as its row should read.
@@ -4198,12 +4706,35 @@ fn keybinds_footer_hint(
     if sheet.selected == TERMINAL_PROFILE_ROW {
         return "Left/Right: choose · Enter: next · Del: automatic".to_owned();
     }
+    if sheet.selected == EDITOR_KEYBINDINGS_ROW {
+        return "Left/Right: choose · Enter: next · Del: default".to_owned();
+    }
+    if sheet.selected == VIM_MAPPINGS_PATH_ROW {
+        return "Enter: change path · Del: use default · Esc: close".to_owned();
+    }
+    if sheet.selected == LIST_NAVIGATION_ROW {
+        return "j k h l as arrows · Left/Right or Enter: on/off · Del: on".to_owned();
+    }
     if sheet.selected == RESET_KEYBINDS_ROW {
         let profile = terminal_profile_label(settings, features);
         if sheet.confirm_reset_keybinds {
             return format!("Reset all to {profile} defaults? Enter: confirm · Esc: cancel");
         }
         return format!("Enter: reset all to {profile} defaults · Esc: close");
+    }
+    if settings.editor_keybindings == EditorKeybindings::Vim {
+        match keybind_action_at(sheet.selected) {
+            Some(BindAction::Docs) => {
+                return "Vim: gd (default mapping) · Ctrl+D pages down · Enter: rebind".to_owned();
+            }
+            Some(BindAction::Wrap) => {
+                return "Vim: no chord · Ctrl+U pages up · Enter: rebind".to_owned();
+            }
+            Some(BindAction::RenameScene) => {
+                return "Vim: no chord · Ctrl+R redoes · Enter: rebind".to_owned();
+            }
+            _ => {}
+        }
     }
     "Enter: rebind a key or a control · Del: terminal default · Tab: pages · Esc: close".to_owned()
 }
@@ -4224,6 +4755,19 @@ enum SourceLine {
     NoImports,
     /// A source row, by its cursor index in the combined list.
     Row(usize),
+    /// A preset name under the open plugin row of the vst page. The view
+    /// reads the names from the page: the sheet keeps only their count
+    /// for its cursor math. Not a row of the cursor.
+    #[cfg(feature = "vst")]
+    Detail,
+    /// No preset folders yet: the empty state of the vst page's preset
+    /// folder group.
+    #[cfg(feature = "vst")]
+    NoPresets,
+    /// The echo of the vst page's plugin filter, above the rows it kept.
+    /// The page holds the text; not a row of the cursor.
+    #[cfg(feature = "vst")]
+    Filter,
 }
 
 /// Which boxed section a sources-page or vst-page header names.
@@ -4238,6 +4782,8 @@ enum SourceSection {
     PluginFolders,
     #[cfg(feature = "vst")]
     StandardFolders,
+    #[cfg(feature = "vst")]
+    PresetFolders,
     #[cfg(feature = "vst")]
     Scanned,
 }
@@ -4254,6 +4800,8 @@ impl SourceSection {
             Self::PluginFolders => "your folders",
             #[cfg(feature = "vst")]
             Self::StandardFolders => "standard folders",
+            #[cfg(feature = "vst")]
+            Self::PresetFolders => "preset folders",
             #[cfg(feature = "vst")]
             Self::Scanned => "scanned plugins",
         }
@@ -4275,29 +4823,75 @@ fn source_lines(imported: usize, shipped: usize) -> Vec<SourceLine> {
     )
 }
 
-/// The lines of the vst page in order: the two actions, the folders the
-/// player added (or the empty-state line), the standard folders, then one
-/// row for every plugin the scan found.
+/// The lines of the vst page in order: the actions, the folders the player
+/// added (or the empty-state line), the standard folders, the preset
+/// folders, then one row for every plugin the scan found, with the presets
+/// of the open row under it.
 #[cfg(feature = "vst")]
-fn vst_lines(added: usize, standard: usize, scanned: usize) -> Vec<SourceLine> {
-    use SourceSection::{PluginFolders, Plugins, Scanned, StandardFolders};
-    let mut lines = section_lines(
-        [Plugins, PluginFolders, StandardFolders],
-        VST_CONTROL_COUNT,
-        added,
-        standard,
-    );
-    if scanned > 0 {
-        let folders = VST_CONTROL_COUNT + added + standard;
-        lines.pop();
+fn vst_lines(
+    added: usize,
+    standard: usize,
+    presets: usize,
+    scanned: usize,
+    open: Option<(usize, usize)>,
+    filter: bool,
+) -> Vec<SourceLine> {
+    use SourceSection::{PluginFolders, Plugins, PresetFolders, Scanned, StandardFolders};
+    let mut lines = Vec::new();
+    lines.push(SourceLine::Header {
+        section: Plugins,
+        first: true,
+    });
+    lines.extend((0..VST_CONTROL_COUNT).map(SourceLine::Control));
+    lines.push(SourceLine::Gap);
+    lines.push(SourceLine::Header {
+        section: PluginFolders,
+        first: false,
+    });
+    if added == 0 {
+        lines.push(SourceLine::NoImports);
+    }
+    let at = VST_CONTROL_COUNT;
+    lines.extend((at..at + added).map(SourceLine::Row));
+    if standard > 0 {
+        lines.push(SourceLine::Gap);
+        lines.push(SourceLine::Header {
+            section: StandardFolders,
+            first: false,
+        });
+        lines.extend((at + added..at + added + standard).map(SourceLine::Row));
+    }
+    lines.push(SourceLine::Gap);
+    lines.push(SourceLine::Header {
+        section: PresetFolders,
+        first: false,
+    });
+    if presets == 0 {
+        lines.push(SourceLine::NoPresets);
+    }
+    let at = at + added + standard;
+    lines.extend((at..at + presets).map(SourceLine::Row));
+    if scanned > 0 || filter {
         lines.push(SourceLine::Gap);
         lines.push(SourceLine::Header {
             section: Scanned,
             first: false,
         });
-        lines.extend((folders..folders + scanned).map(SourceLine::Row));
-        lines.push(SourceLine::Footer);
+        if filter {
+            lines.push(SourceLine::Filter);
+        }
+        let at = at + presets;
+        for index in 0..scanned {
+            lines.push(SourceLine::Row(at + index));
+            if let Some(count) = open
+                .filter(|(open, _)| *open == index)
+                .map(|(_, count)| count)
+            {
+                lines.extend(std::iter::repeat_n(SourceLine::Detail, count));
+            }
+        }
     }
+    lines.push(SourceLine::Footer);
     lines
 }
 
@@ -4337,13 +4931,126 @@ fn section_lines(
     lines
 }
 
-/// The vst page as the page reads: the plugin folders in cursor order, one
-/// row for every plugin the scan found, and the two facts under the list.
+/// The filter of the vst page's plugin list, as the App holds its text.
+/// `/` starts the typing, every letter builds it - even the keys the
+/// page's rows bind - Enter keeps it standing, and Esc drops it whole.
+/// The App owns the text; the sheet holds only its [`VstFilterState`].
+#[cfg(feature = "vst")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum VstFilter {
+    #[default]
+    Off,
+    /// The letters are still building it; the arrows and Enter end them.
+    Typing(String),
+    /// Enter kept it: the list stays filtered until `/` takes it back up.
+    Set(String),
+}
+
+#[cfg(feature = "vst")]
+impl VstFilter {
+    /// While the letters build it, the page's keys are its text.
+    pub fn is_typing(&self) -> bool {
+        matches!(self, VstFilter::Typing(_))
+    }
+
+    /// While no filter holds, the page lists every plugin.
+    pub fn is_off(&self) -> bool {
+        matches!(self, VstFilter::Off)
+    }
+
+    /// The key a filter takes while it types, and the filter it leaves:
+    /// a letter builds it, `/` types a slash, Enter keeps it standing,
+    /// Backspace and Delete take a letter off - and an empty filter goes
+    /// with them - Esc drops the whole filter, and the arrows end the
+    /// typing and keep it standing.
+    pub fn typed(self, code: crossterm::event::KeyCode) -> VstFilter {
+        use crossterm::event::KeyCode;
+        match (self, code) {
+            (_, KeyCode::Esc) => VstFilter::Off,
+            (VstFilter::Typing(text), KeyCode::Backspace | KeyCode::Delete) => {
+                let mut text = text;
+                if text.pop().is_none() {
+                    VstFilter::Off
+                } else {
+                    VstFilter::Typing(text)
+                }
+            }
+            (VstFilter::Typing(mut text), KeyCode::Char(letter)) => {
+                text.push(letter);
+                VstFilter::Typing(text)
+            }
+            (VstFilter::Set(text), KeyCode::Char('/')) => VstFilter::Typing(text),
+            (VstFilter::Off, KeyCode::Char('/')) => VstFilter::Typing(String::new()),
+            (typing, _) => kept(typing),
+        }
+    }
+
+    /// The echo line of the filter, above the rows it kept: the text and
+    /// its caret while it types, and a word when the text keeps no
+    /// plugin.
+    pub fn echo(&self, shown: usize) -> Option<String> {
+        let echo = |text: &str, caret: &str| {
+            if !text.is_empty() && shown == 0 {
+                format!("filter: {text}{caret} · no plugins match")
+            } else {
+                format!("filter: {text}{caret}")
+            }
+        };
+        match self {
+            VstFilter::Off => None,
+            VstFilter::Typing(text) => Some(echo(text, "▏")),
+            VstFilter::Set(text) => Some(echo(text, "")),
+        }
+    }
+}
+
+/// A typing Enter or the arrows ended: the text stands as the filter, or
+/// nothing stands when it is empty.
+#[cfg(feature = "vst")]
+fn kept(filter: VstFilter) -> VstFilter {
+    match filter {
+        VstFilter::Typing(text) if text.is_empty() => VstFilter::Off,
+        VstFilter::Typing(text) => VstFilter::Set(text),
+        standing => standing,
+    }
+}
+
+/// Where the vst page's plugin filter stands, as the sheet holds it for
+/// its key routing and its row math. The App owns the text and mirrors
+/// its state here.
+#[cfg(feature = "vst")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VstFilterState {
+    /// No filter: the page lists every plugin.
+    #[default]
+    Off,
+    /// A filter stands: the page lists the plugins its text kept.
+    Set,
+    /// The letters are building it: the page's keys are its text.
+    Typing,
+}
+
+#[cfg(feature = "vst")]
+impl VstFilterState {
+    /// While the letters build it, the page's keys are its text.
+    pub fn is_typing(self) -> bool {
+        matches!(self, VstFilterState::Typing)
+    }
+}
+
+/// The vst page as the page reads: the plugin folders and the preset
+/// folders in cursor order, one row for every plugin the scan found, and
+/// the plugin count under the list.
 #[cfg(feature = "vst")]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VstPage {
     /// The folders the player added, then the standard folders.
     pub folders: Vec<VstFolder>,
+    /// The folders with `.vstpreset` files the player added.
+    pub preset_folders: Vec<VstFolder>,
+    /// The presets of the plugin row the page lists open, by name. Empty
+    /// while the host reads the folders: see [`SettingsSheet::vst_open`].
+    pub open_presets: Vec<String>,
     /// Every plugin the host found, in the order the page lists them.
     pub scanned: Vec<VstScanned>,
     /// The number of plugins the host found in all folders.
@@ -4352,12 +5059,16 @@ pub struct VstPage {
     /// says it, so the page itself shows the scan the header badge stands
     /// for.
     pub scan: Option<rustel_runtime::vst::ScanProgress>,
-    /// The folder with one folder of `.vstpreset` files for each plugin.
-    pub presets: String,
+    /// The echo of the plugin filter, above the rows it kept: the text
+    /// and its caret while it types. `None` while no filter holds.
+    pub filter: Option<String>,
+    /// The plugins the page lists, by their place in the full scanned
+    /// list. The page reads it only while a filter holds.
+    pub shown: Vec<usize>,
 }
 
-/// One plugin the scan found, as its row reads: the name, and where the
-/// plugin is now.
+/// One plugin the scan found, as its row reads: the name, where the plugin
+/// is now, and its switch.
 #[cfg(feature = "vst")]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VstScanned {
@@ -4365,6 +5076,12 @@ pub struct VstScanned {
     /// The state of the plugin in this studio: `found` before its first
     /// load, then `loading`, `ready`, or `failed`.
     pub state: String,
+    /// The switch `audio thread only`: the copies of the plugin stay on the
+    /// audio thread.
+    pub audio_thread: bool,
+    /// How many preset files the preset folders hold for the plugin. The
+    /// row says the number only when it is not zero.
+    pub presets: usize,
 }
 
 /// One plugin folder, as its row reads.
@@ -4517,7 +5234,7 @@ mod tests {
     fn settings_navigation_remembers_every_page_and_reopens_the_last() {
         let pages = [
             SettingsPage::Settings,
-            SettingsPage::Advanced,
+            SettingsPage::Appearance,
             SettingsPage::Mapping,
             SettingsPage::Keybinds,
             SettingsPage::Sources,
@@ -4551,13 +5268,213 @@ mod tests {
         );
     }
 
+    /// A letter on the vst page jumps to a plugin, and the keys the page
+    /// binds stay bound: `a` adds a folder from any row, and `d` takes a
+    /// folder off only on the rows that hold one.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn a_letter_jumps_and_the_bound_keys_of_the_vst_page_stay() {
+        let mut settings = UiSettings::default();
+        let features = TerminalFeatures::default();
+        let mut sheet = SettingsSheet::default();
+        sheet.show_page(SettingsPage::Vst);
+        sheet.vst_folder_count = 1;
+        sheet.vst_standard_count = 1;
+        sheet.vst_preset_folder_count = 1;
+        sheet.vst_scanned_count = 3;
+        let mut key = |sheet: &mut SettingsSheet, code| sheet.key(code, &mut settings, &features);
+        // The rows before the plugins: the folder the player added, then
+        // the standard folder, then the preset folder.
+        sheet.selected = VST_CONTROL_COUNT;
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char('d')),
+            SettingsAction::RemoveVstFolder(0)
+        );
+        // `a` keeps its add from every row, and a letter no row binds
+        // jumps to the plugins.
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char('a')),
+            SettingsAction::AddVstFolder
+        );
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char('s')),
+            SettingsAction::JumpVst('s')
+        );
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char('S')),
+            SettingsAction::JumpVst('S')
+        );
+        // On a plugin row no folder sits under, `d` is a letter too.
+        sheet.selected = VST_CONTROL_COUNT + 3 + 1;
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char('d')),
+            SettingsAction::JumpVst('d')
+        );
+    }
+
+    /// `/` filters the plugin list by its letters, and while the letters
+    /// build the filter every key the page binds is a letter of it: `a`
+    /// adds no folder, `d` removes none, and Space switches no plugin.
+    /// Enter keeps the filter standing, and Esc - which the sheet owes
+    /// back once the filter is gone - drops it whole.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn a_slash_filters_the_plugins_and_the_bound_keys_type() {
+        let mut settings = UiSettings::default();
+        let features = TerminalFeatures::default();
+        let mut sheet = SettingsSheet::default();
+        sheet.show_page(SettingsPage::Vst);
+        sheet.vst_folder_count = 1;
+        sheet.vst_standard_count = 1;
+        sheet.vst_preset_folder_count = 1;
+        sheet.vst_scanned_count = 3;
+        sheet.vst_shown = 3;
+        // The App owns the text and mirrors its state into the sheet;
+        // this is its half, run beside the sheet's.
+        let mut filter = VstFilter::default();
+        let mut key = |sheet: &mut SettingsSheet, code| {
+            let action = sheet.key(code, &mut settings, &features);
+            filter = std::mem::take(&mut filter).typed(code);
+            sheet.vst_filter = match &filter {
+                VstFilter::Off => VstFilterState::Off,
+                VstFilter::Typing(_) => VstFilterState::Typing,
+                VstFilter::Set(_) => VstFilterState::Set,
+            };
+            action
+        };
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char('/')),
+            SettingsAction::FilterVst(KeyCode::Char('/'))
+        );
+        for letter in ['a', 'd', ' ', 's'] {
+            assert_eq!(
+                key(&mut sheet, KeyCode::Char(letter)),
+                SettingsAction::FilterVst(KeyCode::Char(letter)),
+                "{letter} is a letter of the filter"
+            );
+        }
+        assert_eq!(sheet.vst_filter, VstFilterState::Typing);
+        // Enter keeps the filter standing, and the letters jump again.
+        assert_eq!(
+            key(&mut sheet, KeyCode::Enter),
+            SettingsAction::FilterVst(KeyCode::Enter)
+        );
+        assert_eq!(sheet.vst_filter, VstFilterState::Set);
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char('s')),
+            SettingsAction::JumpVst('s')
+        );
+        // `/` takes the standing filter back up, and Esc drops it whole;
+        // once it is gone, Esc owes the sheet back its close.
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char('/')),
+            SettingsAction::FilterVst(KeyCode::Char('/'))
+        );
+        assert_eq!(sheet.vst_filter, VstFilterState::Typing);
+        assert_eq!(
+            key(&mut sheet, KeyCode::Esc),
+            SettingsAction::FilterVst(KeyCode::Esc)
+        );
+        assert_eq!(sheet.vst_filter, VstFilterState::Off);
+        assert_eq!(key(&mut sheet, KeyCode::Esc), SettingsAction::Close);
+    }
+
+    /// While a filter stands, the cursor walks the plugins it kept and no
+    /// others, and the rows the keys address are places among the kept.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn a_standing_filter_walks_the_plugins_it_kept() {
+        let mut settings = UiSettings::default();
+        let features = TerminalFeatures::default();
+        let mut sheet = SettingsSheet::default();
+        sheet.show_page(SettingsPage::Vst);
+        sheet.vst_folder_count = 1;
+        sheet.vst_standard_count = 1;
+        sheet.vst_preset_folder_count = 1;
+        sheet.vst_scanned_count = 3;
+        // The filter kept one of the three.
+        sheet.vst_filter = VstFilterState::Set;
+        sheet.vst_shown = 1;
+        let mut key = |sheet: &mut SettingsSheet, code| sheet.key(code, &mut settings, &features);
+        // The one row that shows is the last of the page: Down wraps to
+        // the first, and not into the plugins the filter dropped.
+        sheet.selected = VST_CONTROL_COUNT + 3;
+        assert_eq!(
+            key(&mut sheet, KeyCode::Down),
+            SettingsAction::Nothing,
+            "Down stays on the page"
+        );
+        assert_eq!(sheet.selected, 0, "Down wraps within the rows that show");
+        // Enter and Space address the kept row's place, for the App to
+        // find the plugin it holds.
+        sheet.selected = VST_CONTROL_COUNT + 3;
+        assert_eq!(
+            key(&mut sheet, KeyCode::Enter),
+            SettingsAction::ToggleVstPresets(0)
+        );
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char(' ')),
+            SettingsAction::ToggleAudioThread(0)
+        );
+    }
+
+    /// The filter's own key math: a letter builds it, Backspace takes one
+    /// off and an empty one goes, the arrows and Enter end the typing and
+    /// keep the text standing, and the echo says when nothing matches.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn the_filter_takes_its_keys_and_says_what_it_keeps() {
+        use crossterm::event::KeyCode;
+        let filter = VstFilter::default();
+        let filter = filter.typed(KeyCode::Char('/'));
+        assert_eq!(filter, VstFilter::Typing(String::new()));
+        let filter = filter.typed(KeyCode::Char('s')).typed(KeyCode::Char('e'));
+        assert_eq!(filter, VstFilter::Typing("se".into()));
+        // The arrows and Enter end the typing and keep the text standing.
+        assert_eq!(
+            filter.clone().typed(KeyCode::Down),
+            VstFilter::Set("se".into())
+        );
+        let filter = filter.typed(KeyCode::Enter);
+        assert_eq!(filter, VstFilter::Set("se".into()));
+        // `/` takes a standing filter back up with its text.
+        assert_eq!(
+            filter.typed(KeyCode::Char('/')),
+            VstFilter::Typing("se".into())
+        );
+        // Backspace takes a letter off, and an empty filter goes with it.
+        let filter = VstFilter::Typing("se".into());
+        assert_eq!(
+            filter.typed(KeyCode::Backspace),
+            VstFilter::Typing("s".into())
+        );
+        assert_eq!(
+            VstFilter::Typing(String::new()).typed(KeyCode::Backspace),
+            VstFilter::Off
+        );
+        // The echo: the caret while it types, the text when it stands,
+        // and a word when the text keeps no plugin.
+        assert_eq!(
+            VstFilter::Typing("se".into()).echo(1),
+            Some("filter: se▏".to_owned())
+        );
+        assert_eq!(
+            VstFilter::Set("se".into()).echo(1),
+            Some("filter: se".to_owned())
+        );
+        assert_eq!(
+            VstFilter::Set("zz".into()).echo(0),
+            Some("filter: zz · no plugins match".to_owned())
+        );
+        assert_eq!(VstFilter::Off.echo(3), None);
+    }
+
     #[test]
     fn advanced_piano_controls_select_sound_and_bound_volume() {
         let mut settings = UiSettings::default();
         let features = TerminalFeatures::default();
         let mut sheet = SettingsSheet {
-            page: SettingsPage::Advanced,
-            selected: ADVANCED_ROWS
+            selected: ROWS
                 .iter()
                 .position(|row| matches!(row, Row::PianoSound))
                 .unwrap(),
@@ -4587,8 +5504,7 @@ mod tests {
         let mut settings = UiSettings::default();
         let features = TerminalFeatures::default();
         let mut sheet = SettingsSheet {
-            page: SettingsPage::Advanced,
-            selected: ADVANCED_ROWS
+            selected: ROWS
                 .iter()
                 .position(|row| matches!(row, Row::MaxPolyphony))
                 .unwrap(),
@@ -4775,6 +5691,16 @@ mod tests {
         rustel_audio::set_sample_pcm_ceiling(rustel_audio::DEFAULT_SAMPLE_PCM_BYTES);
     }
 
+    /// The sheet is one height for every page of controls, and more than
+    /// one test wants a terminal tall enough to draw all of it.
+    fn tallest_page() -> u16 {
+        [ROWS, APPEARANCE_ROWS]
+            .into_iter()
+            .map(|rows| grouped_rows(rows).len() as u16)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The sheet shows the selected row's explanation once: on the row when
     /// it fits, in a block underneath when it does not. One rule row closes
     /// a group and opens the next.
@@ -4782,23 +5708,31 @@ mod tests {
     fn the_sheet_is_no_taller_than_what_it_has_to_say() {
         let settings = UiSettings::default();
         let features = TerminalFeatures::default();
-        let controls = grouped_rows(ROWS).len() as u16;
+        let controls = tallest_page();
 
         // Wide enough for the longest explanation to sit on its own row.
-        let wide = Rect::new(0, 0, 190, 50);
+        let wide = Rect::new(0, 0, 190, controls + 7);
         assert_eq!(SettingsSheetView::explain_rows(wide), 0);
         let (sheet, _) = SettingsSheetView::geometry(wide).expect("a sheet");
         assert_eq!(sheet.height, controls + 3, "border, hints, border");
-        let text = sheet_text(SettingsSheet::default(), &settings, &features, wide);
+        let appearance = SettingsSheet {
+            page: SettingsPage::Appearance,
+            ..SettingsSheet::default()
+        };
+        let text = sheet_text(appearance, &settings, &features, wide);
         assert!(
-            text.contains("├─ Look ─"),
+            text.contains("┌─ Look ─"),
+            "the first group opens with its own row: {text}"
+        );
+        assert!(
+            text.contains("├─ Editor ─"),
             "one rule closes a group and opens the next: {text}"
         );
         assert!(
             !text.contains("└─") || text.matches("└─").count() == 1,
             "and only the last group closes with its own row"
         );
-        let explanation = ROWS[0].explain();
+        let explanation = APPEARANCE_ROWS[0].explain();
         assert_eq!(
             text.matches(explanation).count(),
             1,
@@ -4807,12 +5741,12 @@ mod tests {
 
         // Narrow enough that the row trims the explanation. The block
         // underneath then takes only the rows the wrap needs.
-        let narrow = Rect::new(0, 0, 64, 50);
+        let narrow = Rect::new(0, 0, 64, controls + 10);
         let reserved = SettingsSheetView::explain_rows(narrow);
         assert!((1..=5).contains(&reserved), "{reserved}");
         let (sheet, _) = SettingsSheetView::geometry(narrow).expect("a sheet");
         assert_eq!(sheet.height, controls + 3 + reserved);
-        let text = sheet_text(SettingsSheet::default(), &settings, &features, narrow);
+        let text = sheet_text(appearance, &settings, &features, narrow);
         assert!(
             text.contains(explanation),
             "the block says in full what the row had to trim: {text}"
@@ -4880,7 +5814,7 @@ mod tests {
             sources: Vec::new(),
             mappings: Default::default(),
             bindings: Vec::new(),
-            trust: Vec::new(),
+            permissions: Vec::new(),
             #[cfg(feature = "vst")]
             vst: VstPage::default(),
         }
@@ -5114,13 +6048,14 @@ mod tests {
                 mappings: Default::default(),
                 bindings: vec![
                     KeybindRow::default(),
+                    KeybindRow::default(),
                     KeybindRow {
                         action: "First error",
                         learning: true,
                         ..Default::default()
                     },
                 ],
-                trust: Vec::new(),
+                permissions: Vec::new(),
                 #[cfg(feature = "vst")]
                 vst: VstPage::default(),
             };
@@ -5167,7 +6102,7 @@ mod tests {
             sheet.key(KeyCode::Delete, &mut settings, &features),
             SettingsAction::Nothing
         );
-        sheet.key(KeyCode::Down, &mut settings, &features);
+        sheet.select(KEYBIND_ACTION_START);
         assert_eq!(
             sheet.key(KeyCode::Enter, &mut settings, &features),
             SettingsAction::LearnKeybind(BindAction::ALL[0])
@@ -5234,8 +6169,92 @@ mod tests {
         sheet.select(0);
         assert!(!sheet.confirm_reset_keybinds);
         let mut sheet = armed;
-        sheet.show_page(SettingsPage::Advanced);
+        sheet.show_page(SettingsPage::Mapping);
         assert!(!sheet.confirm_reset_keybinds);
+    }
+
+    #[test]
+    fn the_vim_list_navigation_row_toggles_and_delete_restores_on() {
+        let features = TerminalFeatures::default();
+        let area = Rect::new(0, 0, 120, 40);
+        let mut settings = UiSettings {
+            editor_keybindings: EditorKeybindings::Vim,
+            ..UiSettings::default()
+        };
+        assert!(settings.vim_list_navigation, "Vim starts with list keys on");
+        let mut sheet = SettingsSheet {
+            page: SettingsPage::Keybinds,
+            selected: LIST_NAVIGATION_ROW,
+            keybind_count: keybind_count(&settings),
+            ..SettingsSheet::default()
+        };
+        assert_eq!(
+            sheet.key_in_frame(KeyCode::Enter, &mut settings, &features, area),
+            SettingsAction::Changed
+        );
+        assert!(!settings.vim_list_navigation);
+        assert_eq!(
+            sheet.key_in_frame(KeyCode::Delete, &mut settings, &features, area),
+            SettingsAction::Changed
+        );
+        assert!(settings.vim_list_navigation, "Delete restores the default");
+        assert!(
+            keybinds_footer_hint(sheet, &settings, &features).contains("on/off"),
+            "the footer names the toggle"
+        );
+        assert_eq!(
+            keybind_count(&settings),
+            RESET_KEYBINDS_ROW + 3,
+            "reset, Vim mappings path, list navigation"
+        );
+        let lines = keybind_lines(keybind_count(&settings));
+        assert_eq!(
+            lines[KEYBIND_ACTION_START],
+            DisplayRow::Control(VIM_MAPPINGS_PATH_ROW),
+            "the Vim rows sit together below the editor keys"
+        );
+        assert_eq!(
+            lines[KEYBIND_ACTION_START + 1],
+            DisplayRow::Control(LIST_NAVIGATION_ROW)
+        );
+        assert_eq!(lines[KEYBIND_ACTION_START + 2], DisplayRow::Gap);
+        settings.editor_keybindings = EditorKeybindings::Default;
+        assert_eq!(
+            keybind_count(&settings),
+            RESET_KEYBINDS_ROW + 1,
+            "the Vim rows are not shown with Default keys"
+        );
+    }
+
+    #[test]
+    fn the_vim_layer_names_the_docs_and_wrap_changes() {
+        let settings = UiSettings {
+            editor_keybindings: EditorKeybindings::Vim,
+            ..Default::default()
+        };
+        let features = TerminalFeatures::default();
+        let row = |action| {
+            KEYBIND_ACTION_START
+                + BindAction::ALL
+                    .iter()
+                    .position(|candidate| *candidate == action)
+                    .expect("action row")
+        };
+        let mut sheet = SettingsSheet {
+            page: SettingsPage::Keybinds,
+            selected: row(BindAction::Docs),
+            keybind_count: keybind_count(&settings),
+            ..Default::default()
+        };
+        assert!(
+            keybinds_footer_hint(sheet, &settings, &features).contains("Ctrl+D pages down"),
+            "the Docs row names the key it gave up"
+        );
+        sheet.selected = row(BindAction::Wrap);
+        assert!(
+            keybinds_footer_hint(sheet, &settings, &features).contains("Ctrl+U pages up"),
+            "the Wrap row names the key it gave up"
+        );
     }
 
     #[test]
@@ -5266,8 +6285,8 @@ mod tests {
     fn keybind_pages_follow_the_visible_height_and_clamp_at_each_end() {
         let mut settings = UiSettings::default();
         let features = TerminalFeatures::default();
-        for height in [18, 35] {
-            let area = Rect::new(0, 0, 100, height);
+        for (width, height) in [(60, 14), (100, 18), (100, 35)] {
+            let area = Rect::new(0, 0, width, height);
             let mut sheet = SettingsSheet {
                 page: SettingsPage::Keybinds,
                 keybind_count: RESET_KEYBINDS_ROW + 1,
@@ -5275,18 +6294,29 @@ mod tests {
             };
             let (_, rows) = sheet.geometry_for(area).unwrap();
             let shown = usize::from(rows.height);
+            assert_eq!(sheet.keybind_row_at(area, rows.x, rows.y), Some(0));
+            assert_eq!(sheet.keybind_row_at(area, rows.x, rows.y + 1), Some(1));
+            assert_eq!(sheet.keybind_row_at(area, rows.x, rows.y + 2), None);
+            assert_eq!(sheet.keybind_row_at(area, rows.x, rows.y + 3), Some(2));
             assert_eq!(
                 sheet.key_in_frame(KeyCode::PageDown, &mut settings, &features, area),
                 SettingsAction::Nothing
             );
-            assert_eq!(sheet.selected, shown);
-            assert!((sheet.first..sheet.first + shown).contains(&sheet.selected));
+            assert_eq!(sheet.selected, shown - 1);
+            assert!(
+                (rows.y..rows.bottom())
+                    .any(|y| sheet.keybind_row_at(area, rows.x, y) == Some(sheet.selected))
+            );
             sheet.key_in_frame(KeyCode::PageUp, &mut settings, &features, area);
             assert_eq!(sheet.selected, 0);
             sheet.key_in_frame(KeyCode::PageUp, &mut settings, &features, area);
             assert_eq!(sheet.selected, 0, "PageUp cannot wrap to the bottom");
             sheet.key_in_frame(KeyCode::End, &mut settings, &features, area);
             assert_eq!(sheet.selected, RESET_KEYBINDS_ROW);
+            assert!(
+                (rows.y..rows.bottom())
+                    .any(|y| sheet.keybind_row_at(area, rows.x, y) == Some(RESET_KEYBINDS_ROW))
+            );
             sheet.confirm_reset_keybinds = true;
             sheet.hold_scroll = true;
             sheet.key_in_frame(KeyCode::PageDown, &mut settings, &features, area);
@@ -5306,7 +6336,7 @@ mod tests {
         let area = Rect::new(0, 0, 100, 18);
         let mut settings = UiSettings::default();
         let features = TerminalFeatures::default();
-        for page in [SettingsPage::Settings, SettingsPage::Advanced] {
+        for page in [SettingsPage::Settings, SettingsPage::Appearance] {
             let mut sheet = SettingsSheet {
                 page,
                 ..Default::default()
@@ -5449,6 +6479,11 @@ mod tests {
                 ..Default::default()
             },
             KeybindRow {
+                action: "Editor keybindings",
+                chord: "Default".into(),
+                ..Default::default()
+            },
+            KeybindRow {
                 action: "Evaluate",
                 chord: "^Enter".into(),
                 also: "F5".into(),
@@ -5477,7 +6512,7 @@ mod tests {
             },
         ];
         for width in [35, 70, 100] {
-            let area = Rect::new(3, 2, width, bindings.len() as u16);
+            let area = Rect::new(3, 2, width, bindings.len() as u16 + 1);
             let mut buffer = Buffer::empty(area);
             render_keybind_rows(&bindings, 0, 0, area, &Theme::default(), &mut buffer);
             let lines: Vec<String> = (area.y..area.bottom())
@@ -5487,7 +6522,14 @@ mod tests {
                         .collect()
                 })
                 .collect();
-            let chord = lines[1][..lines[1].find("^Enter").unwrap()].width();
+            assert!(lines[KEYBIND_ACTION_START].trim().is_empty());
+            let lines: Vec<_> = lines
+                .into_iter()
+                .filter(|line| !line.trim().is_empty())
+                .collect();
+            let evaluate = &lines[KEYBIND_ACTION_START];
+            let overridden = &lines[KEYBIND_ACTION_START + 1];
+            let chord = evaluate[..evaluate.find("^Enter").unwrap()].width();
             for (line, row) in lines.iter().zip(&bindings).skip(KEYBIND_ACTION_START) {
                 assert_eq!(
                     line[..line.find(&row.chord).unwrap()].width(),
@@ -5497,10 +6539,10 @@ mod tests {
             }
             if width >= 70 {
                 assert_eq!(
-                    lines[1][..lines[1].find("default").unwrap()].width(),
-                    lines[2][..lines[2].find("overridden").unwrap()].width()
+                    evaluate[..evaluate.find("default").unwrap()].width(),
+                    overridden[..overridden.find("overridden").unwrap()].width()
                 );
-                assert!(lines[1].contains("also F5"));
+                assert!(evaluate.contains("also F5"));
             }
         }
     }
@@ -5515,13 +6557,19 @@ mod tests {
     #[test]
     fn the_first_page_asks_one_thing_about_the_limiter() {
         assert!(ROWS.contains(&Row::MasterLimiter));
+        // The switch leads the page; the character rows it means nothing
+        // until answered follow at its end.
+        let switch = ROWS
+            .iter()
+            .position(|row| *row == Row::MasterLimiter)
+            .unwrap();
         for row in [
             Row::MasterLimiterCharacter,
             Row::MasterLimiterCeiling,
             Row::MasterLimiterMakeup,
         ] {
-            assert!(!ROWS.contains(&row), "{row:?} belongs on Advanced");
-            assert!(ADVANCED_ROWS.contains(&row), "{row:?} is missing there");
+            let at = ROWS.iter().position(|item| *item == row).unwrap();
+            assert!(at > switch, "{row:?} follows the switch");
         }
 
         let features = TerminalFeatures::default();
@@ -5547,8 +6595,8 @@ mod tests {
         let off = text(&settings, None);
         assert!(off.contains("master limiter"), "the switch is on page one");
         assert!(
-            !off.contains("-6.0 dBFS"),
-            "and the ceiling it would hold at is not: {off}"
+            off.contains("load mode"),
+            "and the machine rows follow at the page's end: {off}"
         );
 
         // The switch is the studio's default, so the row also shows what
@@ -5571,7 +6619,7 @@ mod tests {
     fn grouped_controls_draw_labels_and_skip_borders_when_scrolled() {
         let settings = UiSettings::default();
         let features = TerminalFeatures::default();
-        for page in [SettingsPage::Settings, SettingsPage::Advanced] {
+        for page in [SettingsPage::Settings, SettingsPage::Appearance] {
             let mut sheet = SettingsSheet {
                 page,
                 ..SettingsSheet::default()
@@ -5620,39 +6668,48 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        for label in ["Playback", "Look", "Editor", "Set"] {
+        for label in [
+            "Playback",
+            "Live coding",
+            "Editor",
+            "Set",
+            "Audio out",
+            "Computer piano",
+            "Limiter",
+            "Sliders",
+            "Sample memory",
+        ] {
             assert!(text.contains(label), "missing group {label}");
         }
-        for label in ["Privacy", "Panels", "Visuals", "Controllers"] {
+        for label in ["Privacy", "Look", "Rendering", "Visuals", "Controllers"] {
             assert!(
                 !text.contains(label),
                 "{label} is not a first-page group any more"
             );
         }
-        let advanced = render_sheet(
+        let appearance = render_sheet(
             SettingsSheet {
-                page: SettingsPage::Advanced,
+                page: SettingsPage::Appearance,
                 ..SettingsSheet::default()
             },
             &settings,
             &features,
             area,
         );
-        let text = advanced
+        let text = appearance
             .content
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        for label in ["Audio out", "Limiter", "Rendering", "Sliders"] {
-            assert!(text.contains(label), "missing advanced group {label}");
+        for label in ["Look", "Editor", "Panels", "Rendering"] {
+            assert!(text.contains(label), "missing appearance group {label}");
         }
         // The page is longer than a window: the groups at the far end are
         // checked from the far end, which is what a reader scrolling to
         // them sees.
         let scrolled = render_sheet(
             SettingsSheet {
-                page: SettingsPage::Advanced,
-                selected: ADVANCED_ROWS.len() - 1,
+                selected: ROWS.len() - 1,
                 ..SettingsSheet::default()
             },
             &settings,
@@ -5664,9 +6721,10 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        for label in ["Panels", "Sample memory"] {
-            assert!(tail.contains(label), "missing advanced group {label}");
-        }
+        assert!(
+            tail.contains("Sample memory"),
+            "missing the page's last group"
+        );
         assert!(
             !tail.contains("Sample cache"),
             "the sample cache controls live on Sources now"
@@ -5685,8 +6743,8 @@ mod tests {
             ..TerminalFeatures::default()
         };
         let mut sheet = SettingsSheet {
-            page: SettingsPage::Advanced,
-            selected: ADVANCED_ROWS
+            page: SettingsPage::Appearance,
+            selected: APPEARANCE_ROWS
                 .iter()
                 .position(|row| *row == Row::Rendering)
                 .expect("the rendering row"),
@@ -5729,11 +6787,11 @@ mod tests {
             SettingsAction::Changed
         );
         assert!(settings.show_full_paths);
-        sheet.show_page(SettingsPage::Advanced);
+        sheet.show_page(SettingsPage::Appearance);
         assert_eq!(
-            ADVANCED_ROWS[sheet.selected],
+            APPEARANCE_ROWS[sheet.selected],
             Row::Rendering,
-            "returning to Advanced restores the rendering control"
+            "returning to Appearance restores the rendering control"
         );
     }
 
@@ -5745,8 +6803,8 @@ mod tests {
         let mut settings = UiSettings::default();
         let features = TerminalFeatures::default();
         let mut sheet = SettingsSheet {
-            page: SettingsPage::Advanced,
-            selected: ADVANCED_ROWS
+            page: SettingsPage::Appearance,
+            selected: APPEARANCE_ROWS
                 .iter()
                 .position(|row| *row == Row::FrameRate)
                 .expect("the frame-rate row"),
@@ -5857,7 +6915,8 @@ mod tests {
     fn every_change_key_flips_a_switch_rather_than_setting_it() {
         let mut settings = UiSettings::default();
         let mut sheet = SettingsSheet {
-            selected: ROWS
+            page: SettingsPage::Appearance,
+            selected: APPEARANCE_ROWS
                 .iter()
                 .position(|row| *row == Row::LineNumbers)
                 .expect("a plain switch"),
@@ -5888,7 +6947,8 @@ mod tests {
         let mut settings = UiSettings::default();
         assert!(!settings.hydra_webcam);
         let mut sheet = SettingsSheet {
-            selected: ROWS
+            page: SettingsPage::Appearance,
+            selected: APPEARANCE_ROWS
                 .iter()
                 .position(|row| *row == Row::HydraWebcam)
                 .expect("webcam row"),
@@ -5932,7 +6992,8 @@ mod tests {
     fn enter_on_the_webcam_row_opens_a_preview_and_leaves_the_switch_off() {
         let mut settings = UiSettings::default();
         let mut sheet = SettingsSheet {
-            selected: ROWS
+            page: SettingsPage::Appearance,
+            selected: APPEARANCE_ROWS
                 .iter()
                 .position(|row| *row == Row::HydraWebcam)
                 .expect("webcam row"),
@@ -5953,7 +7014,8 @@ mod tests {
     fn a_second_enter_puts_the_picture_away_and_leaves_the_choice_alone() {
         let mut settings = UiSettings::default();
         let mut sheet = SettingsSheet {
-            selected: ROWS
+            page: SettingsPage::Appearance,
+            selected: APPEARANCE_ROWS
                 .iter()
                 .position(|row| *row == Row::HydraWebcam)
                 .expect("webcam row"),
@@ -5999,7 +7061,6 @@ mod tests {
         let mut settings = UiSettings::default();
         assert_eq!(settings.syntax_check, SyntaxCheck::Full);
         assert!(ROWS.contains(&Row::SyntaxCheck));
-        assert!(!ADVANCED_ROWS.contains(&Row::SyntaxCheck));
         assert_eq!(Row::SyntaxCheck.group(), "Editor");
         assert_eq!(Row::SyntaxCheck.label(), "syntax check");
 
@@ -6041,12 +7102,13 @@ mod tests {
     fn evaluation_flash_cycles_all_three_modes_on_the_editor_page() {
         let mut settings = UiSettings::default();
         assert_eq!(settings.evaluation_flash, EvaluationFlashMode::Full);
-        assert!(!ADVANCED_ROWS.contains(&Row::EvaluationFlash));
+        assert!(APPEARANCE_ROWS.contains(&Row::EvaluationFlash));
         assert_eq!(Row::EvaluationFlash.group(), "Editor");
         assert_eq!(Row::EvaluationFlash.label(), "flashing on evaluation");
 
         let mut sheet = SettingsSheet {
-            selected: ROWS
+            page: SettingsPage::Appearance,
+            selected: APPEARANCE_ROWS
                 .iter()
                 .position(|row| *row == Row::EvaluationFlash)
                 .expect("evaluation flash row"),
@@ -6075,11 +7137,119 @@ mod tests {
         }
     }
 
+    /// The flash says whether, the animation says how: a ladder of looks
+    /// on the appearance page, next to the other rows that shape what the
+    /// studio draws over its work.
+    #[test]
+    fn the_evaluation_animation_walks_its_ladder_of_looks() {
+        let mut settings = UiSettings::default();
+        assert_eq!(settings.evaluation_animation, EvalAnimation::Normal);
+        assert!(APPEARANCE_ROWS.contains(&Row::EvaluationAnimation));
+        assert_eq!(Row::EvaluationAnimation.group(), "Editor");
+        assert_eq!(Row::EvaluationAnimation.label(), "evaluation animation");
+        let mut sheet = SettingsSheet {
+            page: SettingsPage::Appearance,
+            selected: APPEARANCE_ROWS
+                .iter()
+                .position(|row| *row == Row::EvaluationAnimation)
+                .expect("evaluation animation row"),
+            ..SettingsSheet::default()
+        };
+        let features = TerminalFeatures::default();
+        // Right walks the whole ladder and wraps; Left steps back one.
+        for expected in [
+            EvalAnimation::FadeFast,
+            EvalAnimation::FadeMedium,
+            EvalAnimation::FadeSlow,
+            EvalAnimation::Swipe,
+            EvalAnimation::Zap,
+            EvalAnimation::Steps,
+            EvalAnimation::Glitch,
+            EvalAnimation::Wave,
+            EvalAnimation::Normal,
+        ] {
+            assert_eq!(
+                sheet.key(KeyCode::Right, &mut settings, &features),
+                SettingsAction::Changed
+            );
+            assert_eq!(
+                settings.evaluation_animation, expected,
+                "walked to {expected:?}"
+            );
+            let text = sheet_text(sheet, &settings, &features, Rect::new(0, 0, 120, 24));
+            let row = text
+                .lines()
+                .find(|line| line.contains("evaluation animation"))
+                .expect("selected animation row is visible");
+            assert!(row.contains(expected.label()), "{row}");
+        }
+        assert_eq!(
+            sheet.key(KeyCode::Left, &mut settings, &features),
+            SettingsAction::Changed
+        );
+        assert_eq!(settings.evaluation_animation, EvalAnimation::Wave);
+        // Every spelling survives its own key, and an unknown one is the
+        // default, which is the look the studio always had.
+        for mode in EvalAnimation::LADDER {
+            assert_eq!(EvalAnimation::parse(mode.key()), mode, "{mode:?}");
+        }
+        assert_eq!(EvalAnimation::parse("nonsense"), EvalAnimation::Normal);
+    }
+
+    /// The beat line is a chrome row of its own on the appearance page:
+    /// off by default, and a small ladder of looks either arrow walks.
+    #[test]
+    fn the_beat_line_walks_its_ladder_of_looks() {
+        let mut settings = UiSettings::default();
+        assert_eq!(settings.beat_line, BeatLineStyle::Off);
+        assert!(APPEARANCE_ROWS.contains(&Row::BeatLine));
+        assert_eq!(Row::BeatLine.group(), "Look");
+        assert_eq!(Row::BeatLine.label(), "beat line");
+
+        let mut sheet = SettingsSheet {
+            page: SettingsPage::Appearance,
+            selected: APPEARANCE_ROWS
+                .iter()
+                .position(|row| *row == Row::BeatLine)
+                .expect("beat line row"),
+            ..SettingsSheet::default()
+        };
+        let features = TerminalFeatures::default();
+        for expected in [
+            BeatLineStyle::Pulse,
+            BeatLineStyle::Travel,
+            BeatLineStyle::Wave,
+            BeatLineStyle::Off,
+        ] {
+            assert_eq!(
+                sheet.key(KeyCode::Right, &mut settings, &features),
+                SettingsAction::Changed
+            );
+            assert_eq!(settings.beat_line, expected, "walked to {expected:?}");
+            let text = sheet_text(sheet, &settings, &features, Rect::new(0, 0, 120, 24));
+            let row = text
+                .lines()
+                .find(|line| line.contains("beat line"))
+                .expect("selected beat line row is visible");
+            assert!(row.contains(expected.label()), "{row}");
+        }
+        assert_eq!(
+            sheet.key(KeyCode::Left, &mut settings, &features),
+            SettingsAction::Changed
+        );
+        assert_eq!(settings.beat_line, BeatLineStyle::Wave);
+        for style in BeatLineStyle::LADDER {
+            assert_eq!(BeatLineStyle::parse(style.key()), style, "{style:?}");
+        }
+        assert_eq!(BeatLineStyle::parse("nonsense"), BeatLineStyle::Off);
+    }
+
     #[test]
     fn all_visual_opacities_are_renderer_neutral_and_stay_bounded() {
         let mut settings = UiSettings::default();
         let mut sheet = SettingsSheet {
-            selected: ROWS
+            page: SettingsPage::Appearance,
+            selected: APPEARANCE_ROWS
                 .iter()
                 .position(|row| *row == Row::BackdropStrength)
                 .expect("visuals opacity row"),
@@ -6106,7 +7276,7 @@ mod tests {
         assert_eq!(settings.backdrop_opacity, 100);
         assert_eq!(Row::BackdropStrength.label(), "visuals opacity");
 
-        sheet.selected = ROWS
+        sheet.selected = APPEARANCE_ROWS
             .iter()
             .position(|row| *row == Row::InterfaceOpacity)
             .expect("ui opacity row");
@@ -6118,7 +7288,7 @@ mod tests {
         assert_eq!(settings.interface_opacity, 45);
         assert_eq!(Row::InterfaceOpacity.label(), "ui opacity");
 
-        sheet.selected = ROWS
+        sheet.selected = APPEARANCE_ROWS
             .iter()
             .position(|row| *row == Row::EditorOpacity)
             .expect("editor opacity row");
@@ -6146,7 +7316,8 @@ mod tests {
         for row in [Row::ShowMenu, Row::ShowHeader, Row::ShowFooter] {
             assert_eq!(row.group(), "Look");
             let mut sheet = SettingsSheet {
-                selected: ROWS
+                page: SettingsPage::Appearance,
+                selected: APPEARANCE_ROWS
                     .iter()
                     .position(|item| *item == row)
                     .unwrap_or_else(|| panic!("{} row", row.label())),
@@ -6246,7 +7417,10 @@ mod tests {
         let area = Rect::new(0, 0, 120, ROWS.len() as u16 + 10);
         let mut buffer = Buffer::empty(area);
         let sheet = SettingsSheet {
-            selected: ROWS.len() - 1,
+            selected: ROWS
+                .iter()
+                .position(|row| *row == Row::LocalPrebake)
+                .unwrap(),
             ..SettingsSheet::default()
         };
 
@@ -6282,7 +7456,7 @@ mod tests {
             sources: Vec::new(),
             mappings: Default::default(),
             bindings: Vec::new(),
-            trust: Vec::new(),
+            permissions: Vec::new(),
             #[cfg(feature = "vst")]
             vst: VstPage::default(),
             #[cfg(feature = "hydra")]
@@ -6303,19 +7477,17 @@ mod tests {
         assert!(text.contains("Enter opens it"), "{text}");
         assert!(
             !ROWS.contains(&Row::Rendering),
-            "rendering belongs on Advanced: {text}"
+            "rendering belongs on Appearance: {text}"
         );
     }
 
     /// The shipped packs are on the Sources page, after the imports and
     /// drawn apart from them. The library download starts there and shows
-    /// its progress pack by pack. The Advanced page has no row for it.
+    /// its progress pack by pack. No controls page has a row for it.
     #[test]
     fn the_shipped_packs_are_listed_after_the_imports_and_cached_from_there() {
         assert!(
-            !ADVANCED_ROWS
-                .iter()
-                .any(|row| row.label() == "cache whole library"),
+            !ROWS.iter().any(|row| row.label() == "cache whole library"),
             "the library's download moved to Sources"
         );
 
@@ -6399,7 +7571,7 @@ mod tests {
                     sources: sources.to_vec(),
                     mappings: Default::default(),
                     bindings: Vec::new(),
-                    trust: Vec::new(),
+                    permissions: Vec::new(),
                     #[cfg(feature = "vst")]
                     vst: VstPage::default(),
                 }
@@ -6620,10 +7792,10 @@ mod tests {
         assert_eq!(changed, settings, "nothing on this page is a setting");
 
         assert!(
-            !ADVANCED_ROWS.contains(&Row::PrecacheSources)
-                && !ADVANCED_ROWS.contains(&Row::CacheDefaults)
-                && !ADVANCED_ROWS.contains(&Row::RefreshSources)
-                && !ADVANCED_ROWS.contains(&Row::SampleCache),
+            !ROWS.contains(&Row::PrecacheSources)
+                && !ROWS.contains(&Row::CacheDefaults)
+                && !ROWS.contains(&Row::RefreshSources)
+                && !ROWS.contains(&Row::SampleCache),
             "the cache controls moved to Sources"
         );
 
@@ -6663,7 +7835,7 @@ mod tests {
             sources: Vec::new(),
             mappings: Default::default(),
             bindings: Vec::new(),
-            trust: Vec::new(),
+            permissions: Vec::new(),
             #[cfg(feature = "vst")]
             vst: VstPage::default(),
         }
@@ -6858,10 +8030,7 @@ mod tests {
         assert_eq!(none_imported.source_row_at(area, x, rows.y + 10), Some(4));
 
         // Another page answers nothing, and so does an empty list.
-        let advanced = SettingsSheet {
-            page: SettingsPage::Advanced,
-            ..sheet
-        };
+        let advanced = SettingsSheet { ..sheet };
         assert_eq!(advanced.source_row_at(area, x, rows.y), None);
         let empty = SettingsSheet {
             source_count: 0,
@@ -6970,7 +8139,6 @@ mod tests {
             let area = Rect::new(0, 0, 120, height);
             render_sheet(
                 SettingsSheet {
-                    page: SettingsPage::Advanced,
                     selected,
                     ..SettingsSheet::default()
                 },
@@ -7010,7 +8178,7 @@ mod tests {
         );
 
         // At the end of it, the other way round.
-        let bottom = text_at(20, ADVANCED_ROWS.len() - 1);
+        let bottom = text_at(20, ROWS.len() - 1);
         let tail = counted(&bottom);
         assert!(tail.contains('↑'), "{tail}");
 
@@ -7286,16 +8454,17 @@ mod tests {
         };
         let features = TerminalFeatures::default();
         let theme = Theme::built_in_default();
-        let selected = ROWS
+        let selected = APPEARANCE_ROWS
             .iter()
             .position(|row| *row == Row::HydraWebcam)
             .expect("webcam row");
-        let area = Rect::new(0, 0, 60, ROWS.len() as u16 + 10);
+        let area = Rect::new(0, 0, 60, tallest_page() + 10);
 
         let render = |status| {
             let mut buffer = Buffer::empty(area);
             SettingsSheetView {
                 sheet: SettingsSheet {
+                    page: SettingsPage::Appearance,
                     selected,
                     webcam_preview: true,
                     ..SettingsSheet::default()
@@ -7318,7 +8487,7 @@ mod tests {
                 sources: Vec::new(),
                 mappings: Default::default(),
                 bindings: Vec::new(),
-                trust: Vec::new(),
+                permissions: Vec::new(),
                 #[cfg(feature = "vst")]
                 vst: VstPage::default(),
                 capabilities: KeyboardCapabilities::legacy(),
@@ -7423,7 +8592,7 @@ mod tests {
             sources: Vec::new(),
             mappings: Default::default(),
             bindings: Vec::new(),
-            trust: Vec::new(),
+            permissions: Vec::new(),
             #[cfg(feature = "vst")]
             vst: VstPage::default(),
             theme: &Theme::built_in_default(),
@@ -7697,9 +8866,13 @@ mod tests {
         assert_eq!(Quantise::parse("every other tuesday"), Quantise::Off);
         assert_eq!(Quantise::Beat.unit_cycles(), Some(0.25));
         assert_eq!(Quantise::Off.unit_cycles(), None);
-        // The playback group also contains slider smoothing; the next
-        // group begins with the visualizers switch.
-        sheet.selected = ROWS.iter().position(|row| *row == Row::Animation).unwrap();
+        // The Look group on the appearance page holds the visualizers
+        // switch, among the other rows about how the studio reads.
+        sheet.show_page(SettingsPage::Appearance);
+        sheet.selected = APPEARANCE_ROWS
+            .iter()
+            .position(|row| *row == Row::Animation)
+            .unwrap();
         sheet.key(
             KeyCode::Char(' '),
             &mut settings,
@@ -7711,7 +8884,11 @@ mod tests {
         for _ in 0..=from {
             sheet.key(KeyCode::Up, &mut settings, &TerminalFeatures::default());
         }
-        assert_eq!(sheet.selected, ROWS.len() - 1, "wraps from the top");
+        assert_eq!(
+            sheet.selected,
+            APPEARANCE_ROWS.len() - 1,
+            "wraps from the top"
+        );
         assert_eq!(
             sheet.key(KeyCode::Esc, &mut settings, &TerminalFeatures::default()),
             SettingsAction::Close
@@ -7733,7 +8910,7 @@ mod tests {
             sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default()),
             SettingsAction::Nothing
         );
-        assert_eq!(sheet.page, SettingsPage::Advanced);
+        assert_eq!(sheet.page, SettingsPage::Appearance);
         sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default());
         assert_eq!(sheet.page, SettingsPage::Mapping);
         sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default());
@@ -7748,23 +8925,34 @@ mod tests {
         }
         assert_eq!(sheet.page, SettingsPage::Reference);
         sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default());
-        assert_eq!(sheet.page, SettingsPage::Trust);
-        // The trust page walks its origins and names the one a key acts on.
-        sheet.trust_count = 2;
-        let mut trust_key = |code| sheet.key(code, &mut settings, &TerminalFeatures::default());
-        assert_eq!(trust_key(KeyCode::Up), SettingsAction::Nothing);
-        // Left and Right flip the row as Space does, like a settings row.
-        assert_eq!(trust_key(KeyCode::Right), SettingsAction::ToggleImport(1));
-        assert_eq!(trust_key(KeyCode::Left), SettingsAction::ToggleImport(1));
-        assert_eq!(trust_key(KeyCode::Enter), SettingsAction::TrustImport(1));
+        assert_eq!(sheet.page, SettingsPage::Permissions);
+        // The permissions page walks its rows and names the one a key acts on.
+        sheet.permissions_count = 2;
+        let mut permissions_key =
+            |code| sheet.key(code, &mut settings, &TerminalFeatures::default());
+        assert_eq!(permissions_key(KeyCode::Up), SettingsAction::Nothing);
         assert_eq!(
-            trust_key(KeyCode::Char(' ')),
-            SettingsAction::ToggleImport(1)
+            permissions_key(KeyCode::Enter),
+            SettingsAction::PermitRow(1)
         );
-        assert_eq!(trust_key(KeyCode::Down), SettingsAction::Nothing);
         assert_eq!(
-            trust_key(KeyCode::Char('d')),
-            SettingsAction::ForgetImport(0)
+            permissions_key(KeyCode::Char(' ')),
+            SettingsAction::ToggleRow(1)
+        );
+        assert_eq!(
+            permissions_key(KeyCode::Left),
+            SettingsAction::ToggleRow(1),
+            "Left flips a trusted row like every other switch"
+        );
+        assert_eq!(permissions_key(KeyCode::Down), SettingsAction::Nothing);
+        assert_eq!(
+            permissions_key(KeyCode::Right),
+            SettingsAction::ToggleRow(0),
+            "and so does Right, on the row it lands on"
+        );
+        assert_eq!(
+            permissions_key(KeyCode::Char('d')),
+            SettingsAction::ForgetRow(0)
         );
         sheet.key(KeyCode::Tab, &mut settings, &TerminalFeatures::default());
         assert_eq!(sheet.page, SettingsPage::About);
@@ -7779,7 +8967,7 @@ mod tests {
             &mut settings,
             &TerminalFeatures::default(),
         );
-        assert_eq!(sheet.page, SettingsPage::Trust);
+        assert_eq!(sheet.page, SettingsPage::Permissions);
         sheet.key(
             KeyCode::BackTab,
             &mut settings,
@@ -7818,7 +9006,7 @@ mod tests {
             &mut settings,
             &TerminalFeatures::default(),
         );
-        assert_eq!(sheet.page, SettingsPage::Advanced);
+        assert_eq!(sheet.page, SettingsPage::Appearance);
         sheet.key(
             KeyCode::BackTab,
             &mut settings,
@@ -7827,14 +9015,14 @@ mod tests {
         assert_eq!(sheet.page, SettingsPage::Settings);
     }
 
-    /// The trust page's hint leads with its keys and keeps its whole
+    /// The permissions page's hint leads with its keys and keeps its whole
     /// text. The keys closed the hint before, so a terminal narrow
     /// enough to wrap it cut them off the page, and a player who cannot
-    /// see "Enter trusts" cannot work the page.
+    /// see "Enter permits" cannot work the page.
     #[test]
-    fn the_trust_page_hint_leads_with_its_keys_and_stays_whole() {
+    fn the_permissions_page_hint_leads_with_its_keys_and_stays_whole() {
         let sheet = SettingsSheet {
-            page: SettingsPage::Trust,
+            page: SettingsPage::Permissions,
             ..Default::default()
         };
         for (width, height) in [(120, 35), (80, 24), (60, 14)] {
@@ -7848,7 +9036,7 @@ mod tests {
             let mut buffer = Buffer::empty(area);
             SettingsSheetView {
                 sheet: SettingsSheet {
-                    trust_count: 1,
+                    permissions_count: 1,
                     ..sheet
                 },
                 settings: &settings,
@@ -7869,7 +9057,7 @@ mod tests {
                 sources: Vec::new(),
                 mappings: Default::default(),
                 bindings: Vec::new(),
-                trust: vec![TrustRow {
+                permissions: vec![PermissionRow::Origin {
                     origin: "https://example.com".to_owned(),
                     allowed: false,
                 }],
@@ -7895,7 +9083,7 @@ mod tests {
                 .join(" ");
             let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
             let keys = flat
-                .find("Enter trusts")
+                .find("Enter permits")
                 .unwrap_or_else(|| panic!("the keys are on the page at {width}x{height}"));
             let explain = flat
                 .find("a score loads a script")
@@ -7937,27 +9125,28 @@ mod tests {
         let (panel, _) = SettingsSheetView::geometry(area).expect("fits");
         let at = |dx: u16| SettingsSheet::tab_at(area, panel.x + dx, panel.y);
         assert_eq!(at(2), Some(SettingsPage::Settings));
-        assert_eq!(at(13), Some(SettingsPage::Advanced));
-        assert_eq!(at(22), Some(SettingsPage::Advanced));
-        assert_eq!(at(24), Some(SettingsPage::Mapping));
-        assert_eq!(at(32), Some(SettingsPage::Mapping));
-        assert_eq!(at(34), Some(SettingsPage::Keybinds));
-        assert_eq!(at(43), Some(SettingsPage::Keybinds));
-        assert_eq!(at(45), Some(SettingsPage::Sources));
-        assert_eq!(at(53), Some(SettingsPage::Sources));
+        assert_eq!(at(10), Some(SettingsPage::Settings));
+        assert_eq!(at(12), Some(SettingsPage::Appearance));
+        assert_eq!(at(23), Some(SettingsPage::Appearance));
+        assert_eq!(at(25), Some(SettingsPage::Mapping));
+        assert_eq!(at(33), Some(SettingsPage::Mapping));
+        assert_eq!(at(35), Some(SettingsPage::Keybinds));
+        assert_eq!(at(44), Some(SettingsPage::Keybinds));
+        assert_eq!(at(46), Some(SettingsPage::Sources));
+        assert_eq!(at(54), Some(SettingsPage::Sources));
         #[cfg(feature = "vst")]
         {
-            assert_eq!(at(55), Some(SettingsPage::Vst));
-            assert_eq!(at(59), Some(SettingsPage::Vst));
-            assert_eq!(at(60), None);
-            assert_eq!(at(61), Some(SettingsPage::Reference));
-            assert_eq!(at(71), Some(SettingsPage::Reference));
-            assert_eq!(at(72), None);
-            assert_eq!(at(73), Some(SettingsPage::Trust));
-            assert_eq!(at(79), Some(SettingsPage::Trust));
-            assert_eq!(at(80), None);
-            assert_eq!(at(81), Some(SettingsPage::About));
-            assert_eq!(at(87), Some(SettingsPage::About));
+            assert_eq!(at(56), Some(SettingsPage::Vst));
+            assert_eq!(at(60), Some(SettingsPage::Vst));
+            assert_eq!(at(61), None);
+            assert_eq!(at(62), Some(SettingsPage::Reference));
+            assert_eq!(at(72), Some(SettingsPage::Reference));
+            assert_eq!(at(73), None);
+            assert_eq!(at(74), Some(SettingsPage::Permissions));
+            assert_eq!(at(86), Some(SettingsPage::Permissions));
+            assert_eq!(at(87), None);
+            assert_eq!(at(88), Some(SettingsPage::About));
+            assert_eq!(at(94), Some(SettingsPage::About));
         }
         #[cfg(not(feature = "vst"))]
         {
@@ -7965,20 +9154,21 @@ mod tests {
             assert_eq!(at(56), Some(SettingsPage::Reference));
             assert_eq!(at(66), Some(SettingsPage::Reference));
             assert_eq!(at(67), None);
-            assert_eq!(at(68), Some(SettingsPage::Trust));
-            assert_eq!(at(74), Some(SettingsPage::Trust));
-            assert_eq!(at(75), None);
-            assert_eq!(at(76), Some(SettingsPage::About));
+            assert_eq!(at(68), Some(SettingsPage::Permissions));
+            assert_eq!(at(80), Some(SettingsPage::Permissions));
+            assert_eq!(at(81), None);
             assert_eq!(at(82), Some(SettingsPage::About));
+            assert_eq!(at(88), Some(SettingsPage::About));
         }
-        assert_eq!(at(23), None, "the gap between tabs is nobody's");
-        assert_eq!(at(33), None);
-        assert_eq!(at(44), None);
-        assert_eq!(at(54), None);
+        assert_eq!(at(11), None, "the gap between tabs is nobody's");
+        assert_eq!(at(24), None);
+        assert_eq!(at(34), None);
+        assert_eq!(at(45), None);
 
-        // At 80 columns the tabs lose their padding. Each one stays whole,
+        // At 70 columns the tabs lose their padding, and the ones past the
+        // edge are gone rather than half drawn. Each one that stays whole
         // answers to a click on its own label, and the corner stays.
-        let area = Rect::new(0, 0, 80, 40);
+        let area = Rect::new(0, 0, 70, 40);
         let (panel, _) = SettingsSheetView::geometry(area).expect("fits");
         let buffer = render_sheet(
             SettingsSheet::default(),
@@ -7991,16 +9181,16 @@ mod tests {
             .collect();
         assert!(title.ends_with('╮'), "{title}");
         for (label, page) in [
-            ("settings", SettingsPage::Settings),
-            ("advanced", SettingsPage::Advanced),
+            ("general", SettingsPage::Settings),
+            ("appearance", SettingsPage::Appearance),
             ("sliders", SettingsPage::Mapping),
             ("keybinds", SettingsPage::Keybinds),
             ("samples", SettingsPage::Sources),
             #[cfg(feature = "vst")]
             ("vst", SettingsPage::Vst),
             ("reference", SettingsPage::Reference),
-            ("trust", SettingsPage::Trust),
-            ("about", SettingsPage::About),
+            #[cfg(not(feature = "vst"))]
+            ("permissions", SettingsPage::Permissions),
         ] {
             let column = title[..title.find(label).expect(label)].chars().count() as u16;
             for dx in 0..label.len() as u16 {
@@ -8008,6 +9198,30 @@ mod tests {
                 assert_eq!(click, Some(page), "{label} in {title}");
             }
         }
+        // A column narrower the permissions tab no longer fits whole, so it
+        // is gone rather than half drawn, and it is not click-stripped
+        // either.
+        let area = Rect::new(0, 0, 69, 40);
+        let (panel, _) = SettingsSheetView::geometry(area).expect("fits");
+        let buffer = render_sheet(
+            SettingsSheet::default(),
+            &UiSettings::default(),
+            &TerminalFeatures::default(),
+            area,
+        );
+        let title: String = (panel.x..panel.right())
+            .map(|x| buffer[(x, panel.y)].symbol())
+            .collect();
+        assert!(title.ends_with('╮'), "{title}");
+        assert!(
+            !title.contains("permissions"),
+            "a tab that cannot fit whole is not half drawn: {title}"
+        );
+        assert_eq!(
+            SettingsSheet::tab_at(area, panel.x + 61, panel.y),
+            None,
+            "and it is not click-stripped either"
+        );
     }
 
     /// Every category starts listed. Each row hides one category.
@@ -8035,12 +9249,12 @@ mod tests {
     }
 
     #[test]
-    fn advanced_page_steps_preview_budget_and_idle() {
+    fn the_first_page_steps_preview_budget_and_idle() {
         let mut settings = UiSettings::default();
         let mut sheet = SettingsSheet::default();
         let features = TerminalFeatures::default();
-        sheet.show_page(SettingsPage::Advanced);
-        sheet.selected = ADVANCED_ROWS
+
+        sheet.selected = ROWS
             .iter()
             .position(|row| *row == Row::PreviewBudget)
             .unwrap();
@@ -8051,7 +9265,7 @@ mod tests {
             SettingsAction::Changed
         );
         assert_eq!(settings.preview_budget, PreviewBudget::Standard);
-        sheet.selected = ADVANCED_ROWS
+        sheet.selected = ROWS
             .iter()
             .position(|row| *row == Row::UnusedSampleIdle)
             .unwrap();
@@ -8064,9 +9278,9 @@ mod tests {
 
     #[test]
     fn about_renders_cached_capability_audio_and_safety_facts() {
-        // Two rows taller than the sheet, which is what `geometry` asks for
-        // before it will draw at all.
-        let area = Rect::new(0, 0, 120, ROWS.len() as u16 + 10);
+        // Two rows taller than the tallest page of controls, which is what
+        // `geometry` asks for before it will draw at all.
+        let area = Rect::new(0, 0, 120, tallest_page() + 10);
         let mut buffer = Buffer::empty(area);
         let settings = UiSettings::default();
         let features = TerminalFeatures::default();
@@ -8102,7 +9316,7 @@ mod tests {
             sources: Vec::new(),
             mappings: Default::default(),
             bindings: Vec::new(),
-            trust: Vec::new(),
+            permissions: Vec::new(),
             #[cfg(feature = "vst")]
             vst: VstPage::default(),
             sheet: SettingsSheet {
@@ -8165,8 +9379,7 @@ mod tests {
         let features = TerminalFeatures::default();
         let settings = UiSettings::default();
         let mut sheet = SettingsSheet::default();
-        // The longest label lives on the advanced page now.
-        sheet.show_page(SettingsPage::Advanced);
+        // The longest label lives on the first page now.
         let index = sheet
             .rows()
             .iter()
@@ -8329,7 +9542,7 @@ mod tests {
             learning: true,
             ..SlotView::default()
         };
-        let area = Rect::new(0, 0, 100, 34);
+        let area = Rect::new(0, 0, 120, 34);
         let mut buffer = Buffer::empty(area);
         SettingsSheetView {
             sheet,
@@ -8352,7 +9565,7 @@ mod tests {
             sources: Vec::new(),
             mappings,
             bindings: Vec::new(),
-            trust: Vec::new(),
+            permissions: Vec::new(),
             #[cfg(feature = "vst")]
             vst: VstPage::default(),
             capabilities: KeyboardCapabilities::legacy(),
@@ -8379,18 +9592,16 @@ mod tests {
         assert!(text.contains("t reads it another way"), "{text}");
     }
 
-    /// The load mode sits on Advanced with the playback rows, waits by
+    /// The load mode sits with the playback rows on the General page, waits by
     /// default, and either arrow flips it between wait and async.
     #[test]
     fn the_load_mode_row_flips_between_wait_and_async() {
         let mut settings = UiSettings::default();
         assert_eq!(settings.load_mode, LoadMode::Wait);
-        assert!(ADVANCED_ROWS.contains(&Row::LoadMode));
-        assert!(!ROWS.contains(&Row::LoadMode));
+        assert!(ROWS.contains(&Row::LoadMode));
         assert_eq!(Row::LoadMode.group(), "Playback");
         let mut sheet = SettingsSheet {
-            page: SettingsPage::Advanced,
-            selected: ADVANCED_ROWS
+            selected: ROWS
                 .iter()
                 .position(|row| *row == Row::LoadMode)
                 .expect("the row"),
@@ -8420,6 +9631,8 @@ mod tests {
         let settings = UiSettings::default();
         let features = TerminalFeatures::default();
         let theme = Theme::default();
+        // The page lists four groups: a taller frame fits the plugins of
+        // the scan under the folders.
         let vst = VstPage {
             folders: vec![
                 VstFolder {
@@ -8435,19 +9648,26 @@ mod tests {
                 VstScanned {
                     name: "Tone".into(),
                     state: "ready".into(),
+                    audio_thread: false,
+                    presets: 0,
                 },
                 VstScanned {
                     name: "Kick".into(),
                     state: "found".into(),
+                    audio_thread: true,
+                    presets: 2,
                 },
             ],
+            preset_folders: Vec::new(),
+            open_presets: Vec::new(),
             plugins: 2,
             scan: Some(rustel_runtime::vst::ScanProgress {
                 read: 3,
                 bundles: 124,
                 plugin: "Shell › Comp".into(),
             }),
-            presets: "~/Music/presets".into(),
+            filter: None,
+            shown: Vec::new(),
         };
         let mut sheet = SettingsSheet {
             page: SettingsPage::Vst,
@@ -8456,7 +9676,7 @@ mod tests {
             vst_scanned_count: 2,
             ..Default::default()
         };
-        let frame = Rect::new(0, 0, 120, 24);
+        let frame = Rect::new(0, 0, 120, 32);
         let mut buffer = Buffer::empty(frame);
         SettingsSheetView {
             sheet,
@@ -8481,7 +9701,7 @@ mod tests {
             sources: Vec::new(),
             mappings: Default::default(),
             bindings: Vec::new(),
-            trust: Vec::new(),
+            permissions: Vec::new(),
             vst: vst.clone(),
         }
         .render(frame, &mut buffer);
@@ -8494,19 +9714,47 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("scanned plugins"), "{text}");
+        assert!(text.contains("preset folders"), "{text}");
+        assert!(
+            text.contains("none yet · Enter on add preset folder adds one"),
+            "{text}"
+        );
         assert!(text.contains("Tone · ready"), "{text}");
-        assert!(text.contains("Kick · found"), "{text}");
+        assert!(!text.contains("Tone · ready ·"), "{text}");
+        assert!(
+            text.contains("Kick · found (2) · audio thread only"),
+            "{text}"
+        );
         assert!(
             text.contains("scanning · 3 of 124 bundles · Shell › Comp"),
             "{text}"
         );
         // The rows are part of the walk: six Downs from the first action
-        // reach the last plugin, and the hint under the list says so.
+        // reach the last plugin, and the hint under the list says so. Space
+        // on a plugin turns its switch on or off, and does nothing on a
+        // folder.
         let mut walked = UiSettings::default();
-        for _ in 0..6 {
-            sheet.key(crossterm::event::KeyCode::Down, &mut walked, &features);
+        let mut walk = |sheet: &mut SettingsSheet, code| sheet.key(code, &mut walked, &features);
+        let (down, space) = (KeyCode::Down, KeyCode::Char(' '));
+        for _ in 0..4 {
+            walk(&mut sheet, down);
         }
-        assert_eq!(sheet.selected, 6);
+        // The folders the player added and the standard folders take no
+        // switch.
+        assert_eq!(walk(&mut sheet, space), SettingsAction::Ignored);
+        walk(&mut sheet, down);
+        assert_eq!(walk(&mut sheet, space), SettingsAction::Ignored);
+        walk(&mut sheet, down);
+        assert_eq!(
+            walk(&mut sheet, space),
+            SettingsAction::ToggleAudioThread(0)
+        );
+        walk(&mut sheet, down);
+        assert_eq!(sheet.selected, 7);
+        assert_eq!(
+            walk(&mut sheet, space),
+            SettingsAction::ToggleAudioThread(1)
+        );
         let mut buffer = Buffer::empty(frame);
         SettingsSheetView {
             sheet,
@@ -8531,7 +9779,7 @@ mod tests {
             sources: Vec::new(),
             mappings: Default::default(),
             bindings: Vec::new(),
-            trust: Vec::new(),
+            permissions: Vec::new(),
             vst,
         }
         .render(frame, &mut buffer);
@@ -8544,7 +9792,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            text.contains("the list of every plugin the scan found"),
+            text.contains("Enter lists the presets · Space turns audio thread only on or off"),
+            "{text}"
+        );
+        assert!(
+            text.contains("2 plugins found · a letter jumps to its plugins"),
             "{text}"
         );
         assert!(text.contains("▸ Kick"), "{text}");

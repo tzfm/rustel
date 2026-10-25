@@ -191,6 +191,9 @@ pub struct LiveFileProducer {
     query_tail_window: ContinuationWindow,
     prebake_state: PrebakeState,
     pending: VecDeque<QueuedAudioEvent>,
+    csound: Option<crate::csound::State>,
+    /// A future onset can hold the ring before a later, earlier onset.
+    queued_through: f64,
     pending_publication: Option<rustel_audio::KabelPublication>,
     /// One past the latest target any scheduled event has carried. Monotone;
     /// the engine freezes it when the library forgets a sample, since
@@ -334,6 +337,8 @@ impl LiveFileProducer {
             query_tail_window: ContinuationWindow::default(),
             prebake_state: PrebakeState::Ready,
             pending: VecDeque::new(),
+            csound: None,
+            queued_through: 0.0,
             pending_publication: None,
             scheduled_through_frame: 0,
             generation_needs_prefill: true,
@@ -419,6 +424,8 @@ impl LiveFileProducer {
             query_tail_window: ContinuationWindow::default(),
             prebake_state: PrebakeState::Ready,
             pending: VecDeque::new(),
+            csound: None,
+            queued_through: 0.0,
             pending_publication: None,
             scheduled_through_frame: 0,
             generation_needs_prefill: true,
@@ -542,6 +549,9 @@ impl LiveFileProducer {
         started: Instant,
         result: &Result<LiveProducerStep, RuntimeError>,
     ) {
+        session
+            .csound
+            .retain_queued(self.pending.iter().map(|event| &event.controls));
         let mut record = session.take_pending_producer_turn();
         record.producer_backlog_depth = u32::try_from(self.pending.len()).unwrap_or(u32::MAX);
         record.producer_backlog_capacity = u32::try_from(MAX_PENDING_BACKLOG).unwrap_or(u32::MAX);
@@ -686,7 +696,7 @@ impl LiveFileProducer {
     ) -> Result<LiveProducerStep, RuntimeError> {
         session.consume_audio_confirmations();
         if session.transport().is_stopped() {
-            self.pending.clear();
+            self.clear_pending();
             self.pending_publication = None;
             return Ok(LiveProducerStep {
                 watch: WatchPoll::Stopped,
@@ -707,7 +717,8 @@ impl LiveFileProducer {
                         backpressured = true;
                         break;
                     }
-                    self.pending.pop_front();
+                    let admitted = self.pending.pop_front().expect("pending front exists");
+                    self.record_admitted(session, &admitted.event, sample_rate, &mut schedule_now);
                     if self.pending.is_empty() {
                         self.pending_publication = None;
                     }
@@ -917,6 +928,10 @@ impl LiveFileProducer {
         )?;
         if let Some(started) = continuation_started {
             let elapsed = started.elapsed();
+            // A look at the plugin copies ahead caps itself by the cover, so
+            // no reserve holds its time: see `Session::plugin_turn`.
+            #[cfg(feature = "vst")]
+            let elapsed = elapsed.saturating_sub(session.take_look_ahead_time());
             self.continuation_window.record(elapsed);
         }
         Ok(step)
@@ -946,7 +961,7 @@ impl LiveFileProducer {
     /// unpublished cutover with its backlog, conversion latch, deferred
     /// rollback and loading-deferred line cut.
     fn supersede_cutover(&mut self, installed: crate::ReloadEvent) {
-        self.pending.clear();
+        self.clear_pending();
         self.pending_publication = None;
         self.pending_generation = Some(installed.generation_after);
         self.pending_reload_event = Some(installed);
@@ -1007,7 +1022,33 @@ impl LiveFileProducer {
         self.parked_hold = None;
     }
 
+    fn clear_pending(&mut self) {
+        if let Some(csound) = &self.csound {
+            for event in &self.pending {
+                csound.discard(&event.controls);
+            }
+        }
+        self.pending.clear();
+    }
+
+    fn record_admitted(
+        &mut self,
+        session: &Session,
+        event: &rustel_audio::AudioEvent,
+        sample_rate: u32,
+        render_frontier: impl FnOnce() -> f64,
+    ) {
+        self.queued_through = self
+            .queued_through
+            .max(event.target_frame as f64 / f64::from(sample_rate));
+        session
+            .csound
+            .admit(event, sample_rate, self.queued_through, render_frontier);
+    }
+
     fn sync_panic_recovery(&mut self, session: &Session) {
+        session.csound.track_live_events();
+        self.csound = Some(session.csound.clone());
         if self.recovery_epoch != session.recovery_epoch() {
             // A host can submit another command before its next producer
             // step. Its new replacement already discarded the old backlog.
@@ -1038,7 +1079,11 @@ impl LiveFileProducer {
     /// its completion event to the recovery generation; otherwise this is an
     /// invisible same-graph cutover, not a synthetic save.
     pub fn arm_output_recovery_requery(&mut self, generation_before: u64, generation_after: u64) {
-        self.pending.clear();
+        self.clear_pending();
+        self.queued_through = 0.0;
+        if let Some(csound) = &self.csound {
+            csound.reap_completed(f64::INFINITY);
+        }
         self.pending_publication = None;
         self.starving_since = None;
         self.generation_needs_prefill = true;
@@ -1294,6 +1339,25 @@ impl LiveFileProducer {
     pub fn shield_reload_with_clock_and_preparation(
         &mut self,
         session: &mut Session,
+        schedule_now: impl FnMut() -> f64,
+        sample_rate: u32,
+        prepare: impl FnMut(
+            &[rustel_audio::AudioEvent],
+        ) -> Result<rustel_audio::KabelPublication, RuntimeError>,
+        install: impl FnMut(&[rustel_audio::AudioEvent]),
+        push: impl FnMut(QueuedAudioEvent) -> bool,
+    ) -> Result<bool, RuntimeError> {
+        self.sync_panic_recovery(session);
+        let csound = session.csound.clone();
+        let result =
+            self.shield_reload_inner(session, schedule_now, sample_rate, prepare, install, push);
+        csound.retain_queued(self.pending.iter().map(|event| &event.controls));
+        result
+    }
+
+    fn shield_reload_inner(
+        &mut self,
+        session: &mut Session,
         mut schedule_now: impl FnMut() -> f64,
         sample_rate: u32,
         mut prepare: impl FnMut(
@@ -1302,7 +1366,6 @@ impl LiveFileProducer {
         mut install: impl FnMut(&[rustel_audio::AudioEvent]),
         mut push: impl FnMut(QueuedAudioEvent) -> bool,
     ) -> Result<bool, RuntimeError> {
-        self.sync_panic_recovery(session);
         session.consume_audio_confirmations();
         if self.generation_needs_prefill || self.pending_generation.is_some() {
             return Ok(false);
@@ -1319,7 +1382,8 @@ impl LiveFileProducer {
                     );
                     return Ok(false);
                 }
-                self.pending.pop_front();
+                let admitted = self.pending.pop_front().expect("pending front exists");
+                self.record_admitted(session, &admitted.event, sample_rate, &mut schedule_now);
                 if self.pending.is_empty() {
                     self.pending_publication = None;
                 }
@@ -1425,7 +1489,8 @@ impl LiveFileProducer {
                     second_saturated = true;
                     break;
                 }
-                self.pending.pop_front();
+                let admitted = self.pending.pop_front().expect("pending front exists");
+                self.record_admitted(session, &admitted.event, sample_rate, &mut schedule_now);
                 if self.pending.is_empty() {
                     self.pending_publication = None;
                 }
@@ -1579,7 +1644,7 @@ impl LiveFileProducer {
     ) -> Result<LiveProducerStep, RuntimeError> {
         session.consume_audio_confirmations();
         if session.transport().is_stopped() {
-            self.pending.clear();
+            self.clear_pending();
             self.pending_publication = None;
             return Ok(LiveProducerStep {
                 watch: WatchPoll::Stopped,
@@ -1684,7 +1749,7 @@ impl LiveFileProducer {
             if matches!(prebake_watch, WatchPoll::Event(_)) {
                 self.pending_prebake_report = None;
             }
-            self.pending.clear();
+            self.clear_pending();
             self.pending_publication = None;
             return Ok(LiveProducerStep {
                 watch,
@@ -1730,7 +1795,8 @@ impl LiveFileProducer {
                     backpressured = true;
                     break;
                 }
-                self.pending.pop_front();
+                let admitted = self.pending.pop_front().expect("pending front exists");
+                self.record_admitted(session, &admitted.event, sample_rate, &mut schedule_now);
                 if self.pending.is_empty() {
                     self.pending_publication = None;
                 }
@@ -2498,7 +2564,8 @@ impl LiveFileProducer {
                         backpressured = true;
                         break;
                     }
-                    self.pending.pop_front();
+                    let admitted = self.pending.pop_front().expect("pending front exists");
+                    self.record_admitted(session, &admitted.event, sample_rate, &mut schedule_now);
                     if self.pending.is_empty() {
                         self.pending_publication = None;
                     }
@@ -2541,6 +2608,14 @@ impl LiveFileProducer {
         self.scheduled_through_frame = self.scheduled_through_frame.max(last);
     }
 
+    /// Releases native score data after the completed intake clock passes it.
+    /// Pass `completed_intake_frames()` and the device sample rate.
+    pub fn reap_completed_output(&self, completed_frames: u64, sample_rate: u32) {
+        if let Some(csound) = &self.csound {
+            csound.reap_completed(completed_frames as f64 / f64::from(sample_rate.max(1)));
+        }
+    }
+
     /// One past the latest target any scheduled event has carried.
     pub fn scheduled_through_frame(&self) -> u64 {
         self.scheduled_through_frame
@@ -2566,6 +2641,12 @@ impl LiveFileProducer {
                 .map(|table| table.table)
                 .or_else(|| event.sample.map(|sample| sample.sample))
         })
+    }
+}
+
+impl Drop for LiveFileProducer {
+    fn drop(&mut self) {
+        self.clear_pending();
     }
 }
 

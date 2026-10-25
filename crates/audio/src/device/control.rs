@@ -53,6 +53,7 @@ impl LiveShared {
             ring: Arc::new(Ring::new(LIVE_RING_CAPACITY)),
             immediate: Arc::new(Ring::new(64)),
             live_controls: Arc::new(crate::assets::AssetRing::new()),
+            insert_values: Arc::new(crate::assets::AssetRing::new()),
             max_polyphony: Arc::new(AtomicUsize::new(crate::MAX_POLYPHONY)),
             confirmations: crate::confirmation::ConfirmationChannel::new(),
             analysis: Arc::new(LiveAnalysisTap::with_sides()),
@@ -89,6 +90,7 @@ impl LiveShared {
             line_arm: Arc::new(AtomicU64::new(0)),
             cut_sounding: Arc::new(AtomicBool::new(false)),
             frames: Arc::new(AtomicU64::new(0)),
+            completed_intake_frame: Arc::new(AtomicU64::new(0)),
             rendering_until_frame: Arc::new(AtomicU64::new(0)),
             playback_origin_nanos: Arc::new(AtomicU64::new(UNSET_STREAM_INSTANT_NANOS)),
             buffer_playback_nanos: Arc::new(AtomicU64::new(0)),
@@ -113,6 +115,10 @@ impl LiveShared {
             callback_xruns: Arc::new(AtomicU64::new(0)),
             callback_scope_misses: Arc::new(AtomicU64::new(0)),
             cutover_race_blocks: Arc::new(AtomicU64::new(0)),
+            plugin_jobs_inline: Arc::new(AtomicU64::new(0)),
+            plugin_join_wait_nanos: Arc::new(AtomicU64::new(0)),
+            plugin_late_jobs: Arc::new(AtomicU64::new(0)),
+            plugin_real_time: Arc::new(AtomicBool::new(false)),
             meter: Arc::new(crate::meter::MasterMeterShared::new()),
             score_sources_active: Arc::new(AtomicBool::new(false)),
             score_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -164,6 +170,10 @@ impl LiveShared {
                 leaked: self.samples.leaked.load(Ordering::Acquire),
             },
             cutover_race_blocks: self.cutover_race_blocks.load(Ordering::Acquire),
+            plugin_workers: 0,
+            plugin_jobs_inline: self.plugin_jobs_inline.load(Ordering::Acquire),
+            plugin_join_wait_nanos: self.plugin_join_wait_nanos.load(Ordering::Acquire),
+            plugin_late_jobs: self.plugin_late_jobs.load(Ordering::Acquire),
         }
     }
 
@@ -226,6 +236,11 @@ impl LiveShared {
             old_sample_rate,
             new_sample_rate,
         );
+        let completed_intake_frame = rebase_frame_rate(
+            self.completed_intake_frame.load(Ordering::Acquire),
+            old_sample_rate,
+            new_sample_rate,
+        );
         let takeover_frame = rebase_frame_rate(
             self.takeover_frame.load(Ordering::Acquire),
             old_sample_rate,
@@ -245,9 +260,14 @@ impl LiveShared {
                 .store((line << 2) | (line_arm & 0b11), Ordering::Release);
         }
         self.frames.store(frames, Ordering::Release);
+        self.completed_intake_frame
+            .store(completed_intake_frame, Ordering::Release);
         // The old callback has joined: there is no remaining in-flight
         // reservation to carry into the new frame domain.
         self.rendering_until_frame.store(frames, Ordering::Release);
+        for ring in [&self.ring, &self.immediate] {
+            ring.publish_frontier(frames, frames, new_sample_rate);
+        }
         self.playback_origin_nanos
             .store(UNSET_STREAM_INSTANT_NANOS, Ordering::Release);
         self.buffer_playback_nanos.store(0, Ordering::Release);
@@ -991,6 +1011,13 @@ impl LiveScalarDevice {
     /// Zero before the first callback is deliberately conservative.
     pub fn clock_frames(&self) -> u64 {
         self.shared.clock_frames()
+    }
+
+    /// End of the latest completed DSP chunk that admitted scheduled events.
+    /// Holds during Stop and its release ramp, even as the output clock runs.
+    /// This tracks event intake, not host copies or audible playback.
+    pub fn completed_intake_frames(&self) -> u64 {
+        self.shared.completed_intake_frame.load(Ordering::Acquire)
     }
 
     /// Render frontier including the DSP chunk currently being written.

@@ -46,12 +46,18 @@ impl StudioEngine {
         }
     }
 
+    /// How long before its line a launch fires: the schedule lead, the
+    /// longer of the continuity margin and the floor the takeover keeps past
+    /// its clock read, and [`LAUNCH_HEADROOM_SECS`] for the evaluation. With
+    /// the margin alone, the floor took the time of the evaluation, and a
+    /// slow fire landed past its line and lost the notes before it.
     pub(super) fn launch_headroom(&self) -> f64 {
+        let floor = rustel_runtime::LIVE_REPLACEMENT_MIN_HEADROOM.as_secs_f64();
         self.live
             .as_ref()
             .map(|live| {
                 live.device.schedule_lead_seconds()
-                    + live.device.continuity_margin_seconds()
+                    + live.device.continuity_margin_seconds().max(floor)
                     + LAUNCH_HEADROOM_SECS
             })
             .unwrap_or(LAUNCH_HEADROOM_SECS)
@@ -81,9 +87,11 @@ impl StudioEngine {
         self.arm_launch_at(now, source, mini, unit_cycles, rewind)
     }
 
-    /// [`Self::arm_launch`] decided at one device time, `now`: every guard
-    /// and every answer reads it, never the clock again, so an answer cannot
-    /// disagree with the guard that chose it.
+    /// [`Self::arm_launch`] decided at one device time, `now`: every guard,
+    /// the answer to a repeat press and the line of a new launch read it, so
+    /// an answer cannot disagree with the guard that chose it. The prepare of
+    /// the plugin copies takes time, and a late prepare moves the line. So
+    /// the countdown of a new launch reads the clock after the prepare.
     fn arm_launch_at(
         &mut self,
         now: f64,
@@ -171,10 +179,6 @@ impl StudioEngine {
         // it names.
         self.warm_incoming(source);
         self.look_up_imports_of(source);
-        // In the wait mode, the plugin copies of the launch build during the
-        // countdown too, for the cycles it plays first.
-        #[cfg(feature = "vst")]
-        self.prepare_live(source, mini, if rewind { 0.0 } else { boundary_cycle });
         self.pending_launch = Some(PendingLaunch {
             source: source.to_owned(),
             mini,
@@ -185,7 +189,13 @@ impl StudioEngine {
             preview: std::mem::take(&mut self.next_install_preview),
             followed: self.new_in_text(source, mini),
             waited: false,
+            #[cfg(feature = "vst")]
+            prepared: false,
         });
+        // The plugin copies of the launch build during the countdown too,
+        // for the cycles it plays first.
+        #[cfg(feature = "vst")]
+        self.prepare_launch();
         self.ask_for_waited();
         // The launch now promises a boundary on this timeline.
         self.live
@@ -193,6 +203,9 @@ impl StudioEngine {
             .expect("checked")
             .initial_start_generation = None;
         self.launch_outcome = None;
+        // The countdown counts from the clock after the prepare.
+        #[cfg(feature = "vst")]
+        let now = self.device_time();
         let info = self.launch_info_at(now);
         debug_assert!(info.is_some(), "a freshly armed launch has a countdown");
         Ok(info)
@@ -444,6 +457,10 @@ impl StudioEngine {
         let now = live.device.clock_seconds();
         let boundary_time = self.pending_line_time(pending, now);
         if now < boundary_time - self.launch_headroom() {
+            // A launch armed while a new score waited for its first window
+            // prepares now.
+            #[cfg(feature = "vst")]
+            self.prepare_launch();
             return;
         }
         if self.launch_waits_for_sounds(now) {
@@ -511,7 +528,7 @@ impl StudioEngine {
             Ok(None) => {
                 let preview = std::mem::take(&mut self.next_install_preview);
                 self.pending_launch = Some(PendingLaunch { preview, ..pending });
-                self.launch_takes_next_line(self.device_time(), "plugins");
+                self.launch_takes_next_line(self.device_time(), &launch_wait_message(false, true));
             }
             Err(error) => {
                 // The launch does not go in play: the session ends its wait.
@@ -602,6 +619,20 @@ mod tests {
         assert_eq!(next_boundary(5.0, 4.0, 0.1), 8.0);
         assert_eq!(next_boundary(7.9, 4.0, 0.5), 12.0);
         assert_eq!(next_boundary(1.0, 0.0, 0.0), 2.0, "a bad unit is a cycle");
+    }
+
+    /// A launch fires early enough that its evaluation keeps
+    /// LAUNCH_HEADROOM_SECS past the floor of its takeover. With the margin
+    /// alone in the head-room, the floor took that time, and a fire slower
+    /// than the schedule lead landed past its line.
+    #[test]
+    fn the_head_room_of_a_launch_keeps_its_evaluation_time_past_the_floor() {
+        let engine = silent_engine_with_pattern(rustel_core::silence());
+        let device = &engine.live.as_ref().expect("playing").device;
+        let floor = rustel_runtime::LIVE_REPLACEMENT_MIN_HEADROOM.as_secs_f64();
+        assert!(device.continuity_margin_seconds() < floor);
+        let spare = engine.launch_headroom() - device.schedule_lead_seconds() - floor;
+        assert!((spare - LAUNCH_HEADROOM_SECS).abs() < 1e-9, "{spare}");
     }
 
     /// A quantised rewind whose incoming score still loads a sample must
@@ -1424,6 +1455,28 @@ mod tests {
             "the restart lands on the next beat line: {}",
             next.seconds_left
         );
+        engine.supersede_launch();
+        let _ = engine.take_launch_outcome();
+
+        // A press whose arm runs past its fire time keeps its line: a score
+        // with no plugin has nothing to prepare.
+        let headroom = engine.launch_headroom();
+        let next_line = |engine: &StudioEngine| {
+            let now = clock_now(engine);
+            let cycle = engine.session.cycle_at_time(now);
+            now + (next_boundary(cycle, 0.25, 0.0) - cycle) / engine.session.cps()
+        };
+        hold_clock(&engine, false);
+        hold_clock_until(&engine, |engine| {
+            next_line(engine) - clock_now(engine) < headroom
+        });
+        let line = next_line(&engine);
+        engine
+            .arm_launch_at(line - headroom - 0.001, "s(\"saw\")", false, 0.25, false)
+            .expect("arm")
+            .expect("armed");
+        let pending = engine.pending_launch.as_ref().expect("armed");
+        assert!((pending.boundary_time - line).abs() < 1e-6 && !pending.waited);
         engine.supersede_launch();
         let _ = engine.take_launch_outcome();
         hold_clock(&engine, false);

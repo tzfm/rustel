@@ -77,6 +77,13 @@ pub(super) static DEFAULT_QUERY_CANCELLATION: std::sync::atomic::AtomicBool =
 /// URL when the source gave one.
 pub type SamplesEffects = Vec<(String, Option<String>)>;
 
+/// An orchestra requested during score or setup evaluation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CsoundSource {
+    Code(String),
+    Url(String),
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct EffectPolicy(u8);
 
@@ -92,10 +99,17 @@ impl EffectPolicy {
     #[cfg(feature = "hydra")]
     pub(super) const HYDRA: u8 = 1 << 4;
     pub(super) const GAMEPAD: u8 = 1 << 5;
-    pub(super) const SETUP: Self = Self(Self::SAMPLES | Self::PRELOAD);
+    pub(super) const CSOUND: u8 = 1 << 6;
+    pub(super) const SETUP: Self = Self(Self::SAMPLES | Self::PRELOAD | Self::CSOUND);
     #[cfg(not(feature = "hydra"))]
-    pub(super) const SCORE: Self =
-        Self(Self::SAMPLES | Self::PRELOAD | Self::TEMPO | Self::MIDI_INPUT | Self::GAMEPAD);
+    pub(super) const SCORE: Self = Self(
+        Self::SAMPLES
+            | Self::PRELOAD
+            | Self::TEMPO
+            | Self::MIDI_INPUT
+            | Self::GAMEPAD
+            | Self::CSOUND,
+    );
     #[cfg(feature = "hydra")]
     pub(super) const SCORE: Self = Self(
         Self::SAMPLES
@@ -103,7 +117,8 @@ impl EffectPolicy {
             | Self::TEMPO
             | Self::MIDI_INPUT
             | Self::HYDRA
-            | Self::GAMEPAD,
+            | Self::GAMEPAD
+            | Self::CSOUND,
     );
 
     pub(super) fn allows(self, effect: u8) -> bool {
@@ -344,6 +359,12 @@ pub struct ScoreEffects {
     pub cps: Option<f64>,
     pub samples: SamplesEffects,
     pub preload: Vec<String>,
+    /// Orchestra requests in score order, applied before Csound events play.
+    pub csound: Vec<CsoundSource>,
+    /// The plugin name of each plugin call the score ran, one time each, in
+    /// call order. A name in a comment, or in a branch that does not run,
+    /// is not here. The host loads these plugins before a note asks.
+    pub plugins: Vec<String>,
     /// Start the host's gamepad poller only if this score is committed.
     pub gamepad: bool,
     pub(super) midi_inputs: MidiInputCandidate,
@@ -370,6 +391,7 @@ impl ScoreEffects {
         self.cps.is_none()
             && self.samples.is_empty()
             && self.preload.is_empty()
+            && self.csound.is_empty()
             && !self.gamepad
             && self.midi_inputs.bindings.is_empty()
     }

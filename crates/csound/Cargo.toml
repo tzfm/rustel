@@ -1,0 +1,16 @@
+[package]
+name = "rustel-csound"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Native Csound instruments for the Rustel audio engine"
+
+[dependencies]
+rustel-audio = { path = "../audio" }
+libloading = "0.8"
+
+[dev-dependencies]
+rustel-audio = { path = "../audio", features = ["test-support"] }
+tempfile = "3"

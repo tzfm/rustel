@@ -1,14 +1,20 @@
 # Compatibility limits
 
-This page lists missing or inactive features compared with strudel.cc.
+This page lists native support limits and missing or inactive features
+compared with strudel.cc.
 Studio's reference describes each call and its limits.
+
+## Native support with limits
+
+| Feature | Limit |
+| --- | --- |
+| KabelSalat graphs | Graphs run natively with `K`, `worklet`, `S` and `audioin`. MIDI, CC and pointer nodes have no native input and report an error. See [KabelSalat graphs](kabelsalat.md) for the supported API and resource limits. |
+| Csound | Native instruments are supported. Requires double-precision Csound 6.18 or later 6.x. One-shot commands require `--allow-csound`. Studio enables native orchestras at startup. Audio uses the host sample rate, stereo output and `ksmps=1`. See [Csound](csound.md) for loading, instruments and routing. |
 
 ## Unsupported features
 
 | Feature | Limit |
 | --- | --- |
-| KabelSalat external inputs | Graphs run natively with `K`, `worklet`, `S` and `audioin`. MIDI, CC and pointer nodes have no native input and report an error. See [KabelSalat graphs](kabelsalat.md) for the supported API and resource limits. |
-| Csound: `loadOrc` | Orchestra loading is not implemented. The call reports an error. |
 | `getDuration`, `getDur` | Sample-duration lookup is not implemented. These calls report an error. |
 | `mondo` and `tidal` template tags | These alternative languages are not registered. |
 | `mqtt` | MQTT output is not implemented. |
@@ -26,7 +32,7 @@ These names remain available, but the named feature is inactive.
 | `aliasBank` | Does not register bank aliases of your own. The default aliases are applied anyway. |
 | `registerSynthSounds` | Does not register additional synths. |
 | `loadSoundfont` | Returns an empty object without loading a soundfont. |
-| `.webaudio()`, `.csound()`, `.tone()`, `.webdirt()`, `.speak()`, `.wave()`, `.soundfont()`, `.dough()`, `.fscope()` | Return the pattern unchanged. They do not select an output, produce speech, load a font, or open a frequency scope. |
+| `.webaudio()`, `.tone()`, `.webdirt()`, `.speak()`, `.wave()`, `.soundfont()`, `.dough()`, `.fscope()` | Return the pattern unchanged. They do not select an output, produce speech, load a font, or open a frequency scope. |
 | `.onSchedule()`, `.onTrigger()`, `.onTriggerTime()` | Return the pattern without calling the callback. |
 | `addEventListener`, `removeEventListener` | Accept the call. Rustel has no browser events, and the listener is never called. |
 | `theme`, `fontFamily`, `fontSize` | Do not change Studio's appearance. |

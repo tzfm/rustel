@@ -9,6 +9,7 @@ use super::*;
 mod callable;
 mod compat;
 mod core_utils;
+mod csound;
 #[cfg(feature = "extensions")]
 mod extensions;
 /// Recording a visuals sketch. Compiled only with the `hydra` feature; the
@@ -42,6 +43,7 @@ pub fn reference_entries() -> impl Iterator<Item = &'static rustel_core::referen
         .iter()
         .chain(slider::REFERENCE_ENTRIES.iter())
         .chain(generators::REFERENCE_ENTRIES.iter())
+        .chain(csound::REFERENCE_ENTRIES.iter())
         .chain(native_surface::bindings::REFERENCE_ENTRIES.iter())
         .chain(pattern_bindings::REFERENCE_ENTRIES.iter())
         .chain(surface::REFERENCE_ENTRIES.iter())
@@ -112,7 +114,7 @@ impl JsRuntime {
             kabelsalat::install(&ctx).map_err(|error| error.to_string())?;
             generators::install(self, ctx.clone(), &surface)?;
             #[cfg(feature = "extensions")]
-            extensions::install(&ctx, &surface.proto, &surface.globals)?;
+            extensions::install(self, &ctx, &surface.proto, &surface.globals)?;
             pattern_bindings::install(ctx.clone(), &surface)?;
             let registration_seal = install_user_setup_surface(
                 &ctx,
@@ -121,6 +123,7 @@ impl JsRuntime {
                 &surface.install_canonical_shrink_grow,
             )?;
             native_surface::install(&ctx, &surface.proto, &surface.globals)?;
+            csound::install(self, &ctx, &surface.globals)?;
             core_utils::install(&ctx, &surface.globals)?;
             unsupported::install(self, &ctx, &surface.globals)?;
             compat::install(self, &ctx, &surface.proto, &surface.globals)?;

@@ -1397,6 +1397,12 @@ struct SampleAccessArgs {
     /// no script loads.
     #[arg(long = "allow-import-origin", value_name = "ORIGIN")]
     import_origins: Vec<String>,
+    /// Permit native Csound orchestra code, including file and process access.
+    #[arg(long = "allow-csound")]
+    csound: bool,
+    /// Permit loadOrc() to read orchestra files beneath this directory.
+    #[arg(long = "allow-local-orchestras", value_name = "DIR")]
+    local_orchestras: Option<PathBuf>,
     /// Permit score-chosen OSC destinations other than loopback.
     /// Repeatable. The value must be an IP literal; names are not resolved
     /// on the music thread.
@@ -1424,10 +1430,19 @@ fn with_sample_access(
             .map_err(RuntimeError::Message)?;
     }
     config.score_sample_access = access;
+    if args.csound {
+        config.score_import_access.permit_csound();
+    }
     for origin in &args.import_origins {
         config
             .score_import_access
             .permit_origin(origin)
+            .map_err(RuntimeError::Message)?;
+    }
+    if let Some(root) = &args.local_orchestras {
+        config
+            .score_import_access
+            .permit_local_root(root)
             .map_err(RuntimeError::Message)?;
     }
     #[cfg(feature = "osc")]
@@ -4806,6 +4821,37 @@ mod live_output_contract_tests {
             live_engine_pressure_detail(&pressure, now + Duration::from_secs(20), &mut last_notice,),
             LiveDetail::Debug
         );
+
+        // An output on Windows counts an underrun from its playback clock,
+        // and the warning shows it as one the device reports. A buffer of
+        // 256 frames lasts 5.3 ms, and the device plays it 10 ms after its
+        // callback. The clock runs 30 ms ahead at the 16th buffer, where the
+        // load meter publishes.
+        let mut manual =
+            rustel_audio::device::ManualLiveOutput::new(48_000, 1).expect("manual output");
+        let mut buffer = [0.0f32; 256 * 2];
+        for index in 0..16 {
+            let ahead = if index == 15 { 30_000_000 } else { 0 };
+            manual.render_at(&mut buffer, index * 5_333_333 + ahead, 10_000_000);
+        }
+        let report = manual.device().report();
+        assert_eq!(report.callback_xruns, 1);
+        let pressure = rustel_runtime::EnginePressureMonitor::default().sample(
+            report,
+            rustel_runtime::ProducerLoadSnapshot::default(),
+            256,
+        );
+        let event = live_engine_pressure_event(
+            pressure,
+            rustel_runtime::EnginePressureReportContext::default(),
+        );
+        let line = output
+            .render(
+                live_engine_pressure_detail(&pressure, now, &mut None),
+                &event,
+            )
+            .expect("the default CLI warns");
+        assert!(line.contains("audio device underrun"), "{line}");
     }
 
     #[test]
@@ -6414,7 +6460,7 @@ mod tests {
             live_output_options(&session, None),
         )
         .expect("silent output");
-        session.attach_plugins(&device);
+        session.attach_instruments(&device);
         let mut producer = build_live_producer(
             &score,
             WatchLanguage::JavaScript,

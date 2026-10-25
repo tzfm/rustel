@@ -911,6 +911,12 @@ impl ScalarBackend {
         self.allow_inline_reverb = false;
     }
 
+    /// Marks this backend as driven by an offline render, which waits for
+    /// inserts that render ahead. The live callback never waits.
+    pub fn render_offline(&mut self) {
+        self.offline = true;
+    }
+
     /// Hand a stage reverb, generated off the audio thread, to the pool.
     /// Returns the box when the byte budget refuses it so the CALLER can free
     /// off the audio thread - dropping here would free IR partitions under the

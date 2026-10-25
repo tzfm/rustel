@@ -7,6 +7,7 @@
 
 use super::focus::FOCUS_ROTATION_FLASH_DURATION;
 use super::*;
+use crate::knobs_panel;
 
 /// How a TachyonFX theme draws this frame - over the finished cells or as a
 /// picture behind them - and how strongly it may show through the score and
@@ -21,6 +22,8 @@ struct NativeVisual {
 /// studio in one pass before any of them is put together.
 struct FrameInputs {
     status: String,
+    vim_label: Option<String>,
+    find_label: Option<String>,
     piano_notes: Option<String>,
     error: Option<String>,
     stopping: bool,
@@ -243,7 +246,8 @@ impl App {
         // pictures painted for it - so it is never seen half-drawn.
         let _ = super::super::graphics::take_images();
         terminal.set_cursor_color(self.theme.caret())?;
-        terminal.set_cursor_shape(self.theme.caret_shape(self.ui_settings.caret_shape))?;
+        self.sync_editor_keybindings();
+        terminal.set_cursor_shape(self.editor_cursor_shape())?;
         terminal.begin_frame();
         // The paint callback always runs - `draw` renders the buffer, then
         // flushes - so its verdict comes back through the cell, and a compose
@@ -322,6 +326,7 @@ impl App {
         out: &mut ratatui::Frame<'_>,
         started: Instant,
     ) -> Result<(), RuntimeError> {
+        self.sync_editor_keybindings();
         // Per-frame state the paint reads. It is computed here and not in
         // `draw`, because the test backend enters at this function and never
         // runs `draw`. The contract in this function's doc needs both the
@@ -504,6 +509,7 @@ impl App {
                 .as_ref()
                 .and_then(|panel| view::log_dock(panel, terminal_area)),
             self.memory_dock.map(|dock| dock.dock(terminal_area)),
+            self.knobs_panel.is_some(),
             self.footer_notice_rows(),
             self.has_piano_notes(),
         );
@@ -513,6 +519,10 @@ impl App {
             Focus::Panel(PanelKind::Set) => regions.sidebar_hidden && self.set_prompt.is_none(),
             Focus::Panel(PanelKind::Viz) => regions.viz[self.viz_focus].is_empty(),
             Focus::Panel(PanelKind::Log) => self.log_is_docked() && regions.log.is_empty(),
+            // A terminal too narrow for the column leaves its region empty:
+            // the keyboard goes back to the score rather than to rails that
+            // are not on screen.
+            Focus::Panel(PanelKind::Knobs) => regions.knobs.is_empty(),
             _ => false,
         };
         if hidden_focus {
@@ -534,6 +544,11 @@ impl App {
         // the room it got, and its key claim rests on it.
         self.mixer_unlaid = false;
         self.memory_unlaid = false;
+        // The knobs column as well, and its rows are read for the room it
+        // got: the scroll follows the selection into whatever height the
+        // body left the column.
+        self.knobs_unlaid = false;
+        self.refresh_knobs(regions.knobs);
         if let Some(panel) = self.set_panel.as_mut() {
             panel.sync_marks(&self.scenes);
             if !regions.sidebar_hidden
@@ -767,6 +782,8 @@ impl App {
         (
             FrameInputs {
                 status,
+                vim_label: self.editor().vim_label(),
+                find_label: self.editor().find_footer_label(),
                 piano_notes,
                 error,
                 stopping,
@@ -857,6 +874,9 @@ impl App {
                 .map(|since| started.saturating_duration_since(since)),
             dirty: scene.dirty,
             status: &inputs.status,
+            vim_label: inputs.vim_label.as_deref(),
+            vim_text_modes: super::vim::enabled(self),
+            find_label: inputs.find_label.as_deref(),
             remote_control: {
                 #[cfg(feature = "remote-control")]
                 {
@@ -897,10 +917,22 @@ impl App {
                 self.performance.render_ms()
             },
             caret: self.caret_position(),
-            cycle: inputs
-                .clock
-                .map(|clock| clock.1)
-                .or_else(|| snapshot.map(|value| value.cycle)),
+            cycle: if self.is_stopping()
+                || self.stop_requested
+                || self.snapshot.as_ref().is_some_and(|value| value.playing)
+            {
+                inputs
+                    .clock
+                    .map(|clock| clock.1)
+                    .or_else(|| self.snapshot.as_ref().map(|value| value.cycle))
+            } else {
+                // The stop holds its cycle on the canvas - the clock is
+                // frozen at the moment it stopped, for the picture the
+                // player keeps. The header reads the cycle the next play
+                // starts from, and a play starts at zero: the stopped
+                // header says zero, as it does before the first play.
+                Some(0.0)
+            },
             cps: inputs
                 .clock
                 .map(|clock| clock.2)
@@ -908,6 +940,7 @@ impl App {
             zen: self.ui_settings.zen,
             show_menu: self.ui_settings.show_menu,
             show_header: self.ui_settings.show_header,
+            beat_line: self.ui_settings.beat_line,
             show_footer: self.ui_settings.show_footer,
             evaluation_flash: inputs.flashing,
             focus_flash: self.focus_rotation_flash_room(),
@@ -1022,12 +1055,27 @@ impl App {
         inputs: &'a FrameInputs,
     ) -> Vec<PaneView<'a>> {
         let audible = self.audible_scene;
+        // The pane draws the flash's animation from this, progress and
+        // brightness included, so the widget itself needs no clock.
+        let flash_pulse = self.evaluation_flash.as_ref().and_then(|flash| {
+            let (animation, progress, intensity) = flash.drawing_at(Instant::now())?;
+            Some(view::EvaluationPulse {
+                animation,
+                progress,
+                intensity,
+            })
+        });
         self.panes
             .iter()
             .zip(maps)
             .enumerate()
             .filter_map(|(index, (pane, map))| {
                 let scene = self.scenes.get(pane.scene)?;
+                let caret_shape = if scene.editor.accepts_typed_text() {
+                    self.ui_settings.caret_shape
+                } else {
+                    super::super::terminal::CaretShape::SteadyBlock
+                };
                 let decorations = if Some(pane.scene) == audible && settings::highlights() {
                     Decorations {
                         active: &self.marks,
@@ -1035,7 +1083,7 @@ impl App {
                         sliders: &chip_sets[index],
                         errors: &inputs.lint_ranges[index],
                         brackets: &inputs.bracket_ranges[index],
-                        caret_shape: self.ui_settings.caret_shape,
+                        caret_shape,
                         overridden: &inputs.overridden_ranges[index],
                     }
                 } else {
@@ -1043,7 +1091,7 @@ impl App {
                         sliders: &chip_sets[index],
                         errors: &inputs.lint_ranges[index],
                         brackets: &inputs.bracket_ranges[index],
-                        caret_shape: self.ui_settings.caret_shape,
+                        caret_shape,
                         overridden: &inputs.overridden_ranges[index],
                         ..Decorations::default()
                     }
@@ -1059,11 +1107,11 @@ impl App {
                     dirty: scene.dirty,
                     playing: inputs.playing_scene == Some(pane.scene),
                     focused: index == self.focused,
-                    flash: inputs.flashing
-                        && self
-                            .evaluation_flash
+                    flash: flash_pulse.filter(|_| {
+                        self.evaluation_flash
                             .as_ref()
-                            .is_some_and(|flash| flash.pane == index && flash.scene == pane.scene),
+                            .is_some_and(|flash| flash.pane == index && flash.scene == pane.scene)
+                    }),
                     locate_flash: (index == self.focused)
                         .then_some(inputs.locating_caret)
                         .flatten(),
@@ -1094,7 +1142,7 @@ impl App {
             sources: self.source_rows(),
             mappings: self.mapping_slot_views(),
             keybind_rows: self.keybind_rows(),
-            trust_rows: self.trust_rows(),
+            permission_rows: self.permission_rows(),
             #[cfg(feature = "vst")]
             vst_page: self.vst_page(),
             latency: self.latency_report(),
@@ -1144,6 +1192,7 @@ impl App {
                 || overlays.replay_edit.is_some()
                 || self.piano.open,
             preview_gain: self.preview_gain,
+            auto_preview: self.ui_settings.auto_preview,
             // Which note of a previewed run should be lit: the step the
             // clock has reached since it started.
             sounding_note: self.sounding_preview_note(),
@@ -1183,7 +1232,7 @@ impl App {
             reference: self
                 .reference_panel
                 .as_ref()
-                .map(|panel| (&self.reference, panel)),
+                .map(|panel| (&self.reference, panel, self.reference_anchor.is_some())),
             #[cfg(feature = "hydra")]
             snippet_picture: self.hydra_shelf_last.is_some(),
             #[cfg(not(feature = "hydra"))]
@@ -1221,6 +1270,16 @@ impl App {
             viz_focus: self.viz_focus,
             mixer: self.mixer_facts(),
             mixer_panel: self.mixer_panel,
+            knobs: self
+                .knobs_panel
+                .as_ref()
+                .zip(self.knobs_rows.as_ref())
+                .map(|(panel, rows)| crate::knobs_panel::KnobsData {
+                    name: rows.name.as_deref(),
+                    listed: rows.listed,
+                    knobs: &rows.knobs,
+                    panel,
+                }),
             mixer_selection: self.mixer_selection.as_ref(),
             reference_on_top: self.reference_on_top(),
             #[cfg(feature = "hydra")]
@@ -1662,6 +1721,21 @@ impl App {
         }
         if let Some((anchor, rows, caret)) = &overlays.smart {
             smart_action::render(frame, &self.theme, *anchor, rows, *caret);
+        }
+        // The knobs column's edit form draws its caret the way the quick
+        // action's does: over the panel, in place of the score's caret,
+        // which the keyboard is not on while the form is up. The form
+        // draws only while the column has the keyboard, so a keyboard
+        // that has moved away takes its caret with it.
+        if overlays.help.is_none()
+            && self.menu.is_none()
+            && self.focus == Focus::Panel(PanelKind::Knobs)
+            && let Some((x, y)) = self
+                .knobs_panel
+                .as_ref()
+                .and_then(|panel| knobs_panel::edit_caret(panel, self.regions.knobs))
+        {
+            frame.set_cursor_position((x, y));
         }
         // Absolutely last: help covers the theme editor, every other
         // panel, toasts, the cell-Hydra wash, and stage pictures alike.

@@ -8,6 +8,8 @@
 mod atomic_file;
 mod capabilities;
 mod capability_report;
+mod csound;
+pub use csound::CsoundSnapshot;
 /// Shared configuration, session, and sample-cache directory rules.
 pub mod config_dir;
 #[cfg(feature = "device-audio")]
@@ -161,6 +163,8 @@ pub use session::{
     SessionDiagnostic, VOICE_NOTICE_DIAGNOSTIC, WindowSound,
 };
 
+#[cfg(feature = "device-audio")]
+pub use session::LIVE_REPLACEMENT_MIN_HEADROOM;
 #[cfg(any(test, feature = "test-support"))]
 pub use session::SessionPanicPoint;
 #[cfg(all(feature = "vst", feature = "device-audio"))]

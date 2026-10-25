@@ -360,7 +360,8 @@ fn a_drop_into_a_text_prompt_stays_text() {
     let mut studio = hermetic();
     let starter = studio.set_directory().join("first.strudel");
 
-    studio.chord("ctrl+r");
+    studio.press(KeyCode::F(1), KeyModifiers::NONE);
+    studio.type_text("sr");
     studio.settle();
     let path = starter.display().to_string();
     studio.paste(&path);
@@ -415,6 +416,7 @@ fn an_imported_drop_survives_a_reopen() {
     let mut studio = reopen_over(studio);
 
     studio.chord("ctrl+o");
+    // The sources page is the fifth tab.
     for _ in 0..4 {
         studio.press(KeyCode::Tab, KeyModifiers::NONE);
     }

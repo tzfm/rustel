@@ -8,6 +8,7 @@ pub struct LiveOutputOptions {
     dispatch: DspDispatch,
     buffer_preference: AudioBufferPreference,
     sample_resampling_mode: SampleResamplingMode,
+    plugin_threads: Option<u16>,
 }
 
 impl LiveOutputOptions {
@@ -44,5 +45,18 @@ impl LiveOutputOptions {
     /// Sample interpolation used to prepare the live backend.
     pub const fn sample_resampling_mode(self) -> SampleResamplingMode {
         self.sample_resampling_mode
+    }
+
+    /// Set the plugin workers of the output. 0 runs each plugin on the audio
+    /// callback. With `None`, `RUSTEL_PLUGIN_THREADS` sets the count, else
+    /// the cores of the process minus 2. An output has 8 workers at most.
+    pub const fn with_plugin_threads(mut self, threads: Option<u16>) -> Self {
+        self.plugin_threads = threads;
+        self
+    }
+
+    /// The plugin workers the options ask for.
+    pub const fn plugin_threads(self) -> Option<u16> {
+        self.plugin_threads
     }
 }

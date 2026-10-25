@@ -87,7 +87,11 @@ impl App {
         self.dismiss_dialogs(Some(PanelKind::Theme));
         self.theme_picker = Some(ThemePicker::open(&self.theme));
         self.focus_panel(PanelKind::Theme);
-        self.status = "theme - type to search · ←/→/↑/↓ preview · Enter keep · Esc back".into();
+        self.status = if super::vim::enabled(self) {
+            "theme - j/k browse · i types · Enter keep · Esc back".into()
+        } else {
+            "theme - type to search · ←/→/↑/↓ preview · Enter keep · Esc back".into()
+        };
         self.dirty_frame = true;
     }
 
@@ -1153,11 +1157,20 @@ impl App {
                 return true;
             }
             // Deleting asks twice: the first d names what would go, the
-            // second lets it. Built-ins have no file and refuse politely.
+            // second lets it. A theme the studio ships has no file behind
+            // its name, so the first d says that and never arms: only a
+            // theme of the player's own is a file there is to remove.
             KeyCode::Char('d' | 'D') if primary => {
                 let Some(name) = picker.selected_name().map(str::to_owned) else {
                     return true;
                 };
+                if Theme::built_in_names().any(|known| known == name) {
+                    picker.deleting = None;
+                    self.status =
+                        format!("theme {name} ships with the studio and cannot be deleted");
+                    self.dirty_frame = true;
+                    return true;
+                }
                 if picker.deleting.as_deref() == Some(name.as_str()) {
                     picker.deleting = None;
                     match super::super::theme::delete_named(&name) {
@@ -1271,6 +1284,12 @@ mod tests {
                 (2, 2),
                 (1, 1),
             ];
+            // The sweep reads the theme directory, which another test may
+            // be scoping elsewhere: hold the shared lock so the sweep sees
+            // one directory for its whole run.
+            let _theme_dir = crate::theme::test_env::THEME_DIR_LOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             let names = crate::theme::Theme::available_names();
             for required in ["forest", "rustel-live"] {
                 assert!(names.iter().any(|name| name == required));
@@ -1453,9 +1472,8 @@ mod tests {
             app.preview_theme();
             assert_eq!(app.theme.name, before, "Up previews the previous theme");
 
-            // ←/→ do not: they belong to the randomize row, where the list is
-            // infinite in both directions and the arrows are drawn on the row
-            // itself to say so.
+            // ←/→ do not walk the list: they belong to the randomize row
+            // and to the terminal family, where they step between variants.
             press(&mut app, KeyCode::Right, KeyModifiers::NONE);
             assert_eq!(
                 app.theme.name, before,
@@ -1515,6 +1533,97 @@ mod tests {
                 !Theme::built_in_names().any(|known| known == sheet.name),
                 "never a built-in's name: {}",
                 sheet.name
+            );
+        }
+
+        /// The picker's modified d deletes only a theme of the player's
+        /// own, and asks twice before it does. A theme the studio ships
+        /// has no file behind its name, so the first d says that rather
+        /// than arming a delete whose second press would go looking for a
+        /// file that is not there.
+        #[test]
+        fn a_built_in_theme_is_never_armed_for_deletion() {
+            let _theme_dir = THEME_DIR_LOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let directory = tempfile::tempdir().expect("temp dir");
+            let themes = directory.path().join("themes");
+            std::fs::create_dir_all(&themes).expect("theme directory");
+            std::fs::write(themes.join("a-yours.json"), "{}").expect("theme file");
+            let _scoped = ScopedThemeDir::set(&themes);
+            let mut app = app_over(directory.path());
+            app.toggle_theme_picker();
+
+            // The picker opens on the studio's own default theme.
+            let opened_on = app
+                .theme_picker
+                .as_ref()
+                .expect("picker open")
+                .selected_name()
+                .expect("a row is selected")
+                .to_owned();
+            assert!(
+                Theme::built_in_names().any(|known| known == opened_on),
+                "the picker opens on a built-in: {opened_on}"
+            );
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert!(
+                app.status.contains("cannot be deleted"),
+                "the first press says why: {}",
+                app.status
+            );
+            // The second press - a capital one, both spellings arm nothing -
+            // is the same refusal, not a file hunt.
+            press(&mut app, KeyCode::Char('D'), KeyModifiers::CONTROL);
+            assert!(
+                app.status.contains("cannot be deleted"),
+                "the second press refuses the same way: {}",
+                app.status
+            );
+
+            // A theme of the player's own is a file, and the same keys
+            // take it, twice asked. Walk to its row the way a reader
+            // would.
+            let rows = app
+                .theme_picker
+                .as_ref()
+                .expect("picker open")
+                .match_count();
+            for _ in 0..=rows {
+                if app
+                    .theme_picker
+                    .as_ref()
+                    .expect("picker open")
+                    .selected_name()
+                    .is_some_and(|name| name == "a-yours")
+                {
+                    break;
+                }
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            }
+            assert_eq!(
+                app.theme_picker
+                    .as_ref()
+                    .expect("picker open")
+                    .selected_name(),
+                Some("a-yours"),
+                "walking the list reaches the file's row"
+            );
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert!(app.status.contains("again"), "asks first: {}", app.status);
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            // The same press reopens the picker on what is left and
+            // previews it, so the status the deletion set is already
+            // overwritten. The file and the list are the record.
+            assert!(!themes.join("a-yours.json").is_file(), "the file is gone");
+            assert!(
+                !app.theme_picker
+                    .as_ref()
+                    .expect("picker reopened on what is left")
+                    .names
+                    .iter()
+                    .any(|name| name == "a-yours"),
+                "the reopened list has no row for it"
             );
         }
 
@@ -1587,6 +1696,7 @@ mod tests {
                 rolled: false,
                 scroll: std::cell::Cell::new(0),
                 hold_scroll: false,
+                vim_insert: false,
             });
             app.focus = Focus::Panel(PanelKind::Theme);
             press(&mut app, KeyCode::Down, KeyModifiers::NONE);
@@ -1637,6 +1747,7 @@ mod tests {
                 rolled: false,
                 scroll: std::cell::Cell::new(0),
                 hold_scroll: false,
+                vim_insert: false,
             });
             let (_, list) = mouse_app
                 .theme_picker
@@ -1684,6 +1795,7 @@ mod tests {
                 rolled: false,
                 scroll: std::cell::Cell::new(0),
                 hold_scroll: false,
+                vim_insert: false,
             });
             app.focus = Focus::Panel(PanelKind::Theme);
             press(&mut app, KeyCode::Down, KeyModifiers::NONE);
@@ -1701,37 +1813,18 @@ mod tests {
             assert_eq!(app.theme.name, "strudel");
         }
 
-        /// Holds `RUSTEL_THEME_DIR` for the scope of one test and puts back
-        /// whatever was there before.
-        ///
-        /// The restore also runs when the test panics, so later tests keep the
-        /// theme directory that the suite started with. Tests here run one at a
-        /// time, so the process-wide variable is not raced.
-        struct ScopedThemeDir(Option<std::ffi::OsString>);
-
-        impl ScopedThemeDir {
-            fn set(directory: &std::path::Path) -> Self {
-                let previous = std::env::var_os("RUSTEL_THEME_DIR");
-                // SAFETY: `--test-threads=1`; read on this thread only.
-                unsafe { std::env::set_var("RUSTEL_THEME_DIR", directory) };
-                Self(previous)
-            }
-        }
-
-        impl Drop for ScopedThemeDir {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    // SAFETY: as above.
-                    Some(previous) => unsafe { std::env::set_var("RUSTEL_THEME_DIR", previous) },
-                    None => unsafe { std::env::remove_var("RUSTEL_THEME_DIR") },
-                }
-            }
-        }
+        /// The shared guard and scoped directory for the process-wide
+        /// theme directory variable live beside the variable's reader in
+        /// `theme.rs`, so every test that touches it takes the same lock.
+        use crate::theme::test_env::{ScopedThemeDir, THEME_DIR_LOCK};
 
         /// A taken name is refused and a free variation is offered in its
         /// place. The existing theme is not overwritten.
         #[test]
         fn a_conflicting_save_name_is_turned_into_a_free_suggestion() {
+            let _theme_dir = THEME_DIR_LOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             let directory = tempfile::tempdir().expect("temp dir");
             // The suggestion depends on the names that the theme directory
             // already holds. Use an empty directory, so a `rustel-dark-2.json` in

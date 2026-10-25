@@ -351,11 +351,26 @@ impl StudioEngine {
         }
     }
 
-    /// Replace the origins of the Trust page. The next evaluation imports
+    /// Replace the origins of the permissions page. The next evaluation imports
     /// scripts from them and from the origins the session config trusts.
     pub fn set_import_origins(&mut self, origins: &[String]) {
-        self.session
-            .set_score_import_access(import_access(&self.config.session, origins));
+        self.config.import_origins = origins.to_vec();
+        self.session.set_score_import_access(import_access(
+            &self.config.session,
+            &self.config.import_origins,
+            self.config.csound_allowed,
+        ));
+    }
+
+    /// Flip the permissions page's orchestra switch. The next evaluation
+    /// reads it, and a playing orchestra keeps sounding until then.
+    pub fn set_csound(&mut self, allowed: bool) {
+        self.config.csound_allowed = allowed;
+        self.session.set_score_import_access(import_access(
+            &self.config.session,
+            &self.config.import_origins,
+            allowed,
+        ));
     }
 
     /// Preview RAM policy from the settings sheet. Zero budget means no
@@ -832,7 +847,10 @@ impl StudioEngine {
     /// a tab, the score in play, an armed launch or a held edit. A plugin
     /// call keeps its plugin by a part of the name too. Another string
     /// keeps a plugin by its whole name only: see
-    /// [`rustel_runtime::vst::whole_names`].
+    /// [`rustel_runtime::vst::whole_names`]. Each chain of the score keeps
+    /// its plugins too, also after a Stop: see
+    /// [`rustel_runtime::Session::plugin_names`]. So a plugin from a setup
+    /// text, an import or a name the score computes stays loaded.
     /// The host keeps each plugin with a running copy, so an unload waits
     /// for the output of its score to close. A stop parks the output with
     /// the copies of its score. The sweep closes a parked output that holds
@@ -863,6 +881,7 @@ impl StudioEngine {
         }
         // Another string keeps a plugin by its whole name only.
         keep.extend(rustel_runtime::vst::whole_names(&strings));
+        keep.extend(self.session.plugin_names());
         // The close sends the copies to the plugin thread before the unload.
         // Piano mode, a key that rings out or a score tail keeps the output
         // open. Its copies keep their plugins loaded.
@@ -1045,6 +1064,38 @@ impl StudioEngine {
 mod tests {
     use super::*;
     use crate::engine::tests::*;
+
+    #[test]
+    fn csound_toggles_keep_current_import_permissions() {
+        let revoked = "https://revoked.example";
+        let granted = "https://granted.example";
+        let blocked = "https://blocked.example";
+        let mut engine = StudioEngine::new(StudioConfig {
+            import_origins: vec![revoked.to_owned()],
+            ..StudioConfig::default()
+        })
+        .expect("engine");
+        engine.set_import_origins(&[granted.to_owned()]);
+
+        for allowed in [false, true] {
+            engine.set_csound(allowed);
+            for (origin, refused) in [(revoked, revoked), (granted, blocked)] {
+                // All origins are checked before fetching either script.
+                let source = format!(
+                    "await import('{origin}/helper.js'); await import('{blocked}/helper.js')"
+                );
+                let error = engine
+                    .session
+                    .evaluate_prebake(&source)
+                    .expect_err("an origin remains blocked");
+                assert!(
+                    matches!(&error, RuntimeError::UntrustedImport { origin } if origin == refused),
+                    "{error}"
+                );
+            }
+        }
+    }
+
     mod sample_reclamation {
         use super::*;
 
@@ -1845,6 +1896,8 @@ mod tests {
             preview: false,
             followed: Vec::new(),
             waited: false,
+            #[cfg(feature = "vst")]
+            prepared: true,
         });
         assert!(
             protected_afresh(&mut engine).contains(&SampleId(74)),

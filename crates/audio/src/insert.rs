@@ -8,9 +8,10 @@
 //! Each logical chain has effect slots and one instrument slot. The chain
 //! takes the notes that ask for an effect: such a note sends its dry signal
 //! through the effects in call order, and a note on the same orbit with no
-//! such request stays dry. The instrument slot holds an insert that makes
-//! sound from notes. The instrument goes through the chain when its note
-//! asks for an effect too.
+//! such request stays dry. The stage of an effect is the effect slot that
+//! serves it, by default its place in the note. The instrument slot holds
+//! an insert that makes sound from notes. The instrument goes through the
+//! chain when its note asks for an effect too.
 //!
 //! ```text
 //!   voice/instrument -> gain --+-> dry -> [VST effects] -> postgain --+
@@ -27,6 +28,9 @@ pub const EFFECT_CHAIN: usize = 4;
 pub const MAX_INSERT_BUSES: usize = 64;
 /// Physical slots reserved before rendering.
 pub const INSERT_SLOTS: usize = (EFFECT_CHAIN + 1) * MAX_INSERT_BUSES;
+/// No stage. An effect with no stage takes the stage of its place in the
+/// note, and a list of stages ends here.
+pub const NO_STAGE: u8 = u8::MAX;
 
 /// A logical chain and its effect or instrument position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -85,6 +89,19 @@ pub struct InsertParam {
     pub value: f32,
 }
 
+/// A value a slider moved: a parameter value of the copy of `key` in
+/// `slot`. The output gives the copy the value at once, and each note in
+/// its queue of `generation` or older takes the value.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InsertValue {
+    pub slot: InsertSlot,
+    pub key: InsertKey,
+    pub param: InsertParam,
+    /// The generation of the score at the move. A note of a newer
+    /// generation keeps its own value.
+    pub generation: u64,
+}
+
 /// A note for an insert that makes sound from notes, such as a synth plugin.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InsertNote {
@@ -104,6 +121,8 @@ pub struct InsertControls {
     pub key: InsertKey,
     params: [InsertParam; MAX_INSERT_PARAMS],
     param_count: u8,
+    /// The stage of the chain that serves this effect: see [`Self::stage`].
+    stage: u8,
     /// The position of the note in quarter notes, and the quarter notes in
     /// one minute. A tempo of 0 means the note has no clock.
     beats: f64,
@@ -111,6 +130,7 @@ pub struct InsertControls {
     /// The note for an insert that makes the sound. 0 frames means the
     /// insert gets no note.
     note: InsertNote,
+    score: Option<u64>,
 }
 
 impl InsertControls {
@@ -119,6 +139,7 @@ impl InsertControls {
             key,
             params: [InsertParam { id: 0, value: 0.0 }; MAX_INSERT_PARAMS],
             param_count: 0,
+            stage: NO_STAGE,
             beats: 0.0,
             tempo: 0.0,
             note: InsertNote {
@@ -126,6 +147,7 @@ impl InsertControls {
                 velocity: 0.0,
                 frames: 0,
             },
+            score: None,
         }
     }
 
@@ -139,6 +161,16 @@ impl InsertControls {
     /// The note for the insert, if the insert makes the sound.
     pub fn note(&self) -> Option<InsertNote> {
         (self.note.frames > 0).then_some(self.note)
+    }
+
+    /// Selects a score event prepared by the host outside the callback.
+    pub fn with_score(mut self, score: u64) -> Self {
+        self.score = Some(score);
+        self
+    }
+
+    pub fn score(&self) -> Option<u64> {
+        self.score
     }
 
     /// Gives the note its place in the music, so an effect with a tempo
@@ -170,6 +202,23 @@ impl InsertControls {
     pub fn params(&self) -> &[InsertParam] {
         &self.params[..usize::from(self.param_count)]
     }
+
+    /// Sets the stage of the chain that serves this effect: see
+    /// [`Self::stage`].
+    pub fn set_stage(&mut self, stage: u8) {
+        self.stage = stage;
+    }
+
+    /// The stage of the chain that serves this effect, the effect at
+    /// `place` in the note: the stage the effect got, else the place. A
+    /// stage not below [`EFFECT_CHAIN`], such as [`NO_STAGE`], gives the
+    /// place.
+    pub fn stage(&self, place: usize) -> usize {
+        match usize::from(self.stage) {
+            stage if stage < EFFECT_CHAIN => stage,
+            _ => place,
+        }
+    }
 }
 
 /// A stereo effect in one chain.
@@ -183,6 +232,14 @@ pub trait OrbitInsert: Send {
     /// Sets a parameter value `frames` from now.
     fn set_param(&mut self, param: InsertParam, frames: u32);
 
+    /// Sets a parameter value now. Each value of the parameter that waits
+    /// for a later frame takes the value too. A slider moves a value this
+    /// way, and the insert does its own smoothing. The default sets the
+    /// value now only.
+    fn set_param_now(&mut self, param: InsertParam) {
+        self.set_param(param, 0);
+    }
+
     /// Puts each parameter a note before set back to its value at the start
     /// of the insert, `frames` from now. The engine calls this before the
     /// values of each note, so a note sounds as its own values say. A
@@ -195,7 +252,10 @@ pub trait OrbitInsert: Send {
 
     /// Starts one block. The default completes it synchronously. An insert
     /// that runs on a different thread returns before its output is ready,
-    /// and the other chains run in that time.
+    /// and the other chains run in that time. An insert that answers true to
+    /// [`Self::any_thread`] gets this call and `collect` on a plugin worker
+    /// of the output or on the callback, and the callback joins the block in
+    /// the same sub-block.
     /// Call `collect` with these same slices before another operation on
     /// this insert. An insert has one pending block at most.
     fn submit(&mut self, left: &mut [f32], right: &mut [f32]) {
@@ -205,6 +265,17 @@ pub trait OrbitInsert: Send {
     /// Completes the submitted block. Synchronous inserts need no work.
     fn collect(&mut self, _left: &mut [f32], _right: &mut [f32]) {}
 
+    /// Waits until the next `frames` frames are ready to collect. An
+    /// offline render calls this before `collect`: it reads as fast as
+    /// the host can, and an insert that renders ahead on its own thread
+    /// would starve. The audio callback never calls it.
+    fn flush(&mut self, _frames: usize) {}
+
+    /// Prepares the first `frames` frames before device playback starts.
+    /// Initial notes arrive first. This may wait on the caller, but keeps
+    /// the playback position at zero and returns to live rendering.
+    fn prime(&mut self, _frames: usize) {}
+
     /// Sets the musical clock: `frames` from now, the position is `beats`
     /// quarter notes and the tempo is `tempo` quarter notes in one minute.
     fn sync(&mut self, _beats: f64, _tempo: f32, _frames: u32) {}
@@ -213,15 +284,37 @@ pub trait OrbitInsert: Send {
     /// length of the note.
     fn note(&mut self, _note: InsertNote, _frames: u32) {}
 
+    /// Starts a prepared score event `frames` from now.
+    fn score(&mut self, _score: u64, _frames: u32) {}
+
     /// Ends each note `frames` from now: a note that sounds then, and a
     /// note that starts before then. A rewind cuts the engine voices at the
     /// same frame.
     fn cut_notes(&mut self, _frames: u32) {}
 
+    /// True when the insert renders on its own thread ahead of the
+    /// callback. The engine then hands such an insert each note when the
+    /// event is admitted, a schedule lead before the frame it sounds, so
+    /// the insert has the note ready at its own frame. The activation of
+    /// the onset delivers the note again, and a prepared score plays once,
+    /// so nothing sounds twice.
+    fn renders_ahead(&self) -> bool {
+        false
+    }
+
     /// True while the insert holds a note, or a value for a later frame.
     /// The engine keeps such an insert awake, also when its output is
     /// silent.
     fn busy(&self) -> bool {
+        false
+    }
+
+    /// True when the blocks of this insert run on any thread. The engine
+    /// then makes the block calls (`submit`, `collect` and `busy`) on the
+    /// audio callback or on a plugin worker of the output, one thread at a
+    /// time. Between the start of a block and its join, the engine makes no
+    /// other call on the insert. Each other call stays on the callback.
+    fn any_thread(&self) -> bool {
         false
     }
 
@@ -235,10 +328,39 @@ pub trait OrbitInsert: Send {
 pub type InsertProvider =
     dyn Fn(InsertKey, u32, InsertSlot) -> Option<Box<dyn OrbitInsert>> + Send + Sync;
 
-/// Gives the chains the playing score has now: see
-/// `LiveScalarDevice::set_named_insert_chains`. The output asks before it
-/// takes the inserts of a turn.
-pub type InsertNames = dyn Fn() -> Vec<u64> + Send + Sync;
+/// The counts of a live output at a turn of its producer: see
+/// [`InsertNames`]. Each count is a total since the output started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InsertTurn {
+    /// The copies and the notes of a chain the output had no bus for.
+    pub refusals: u64,
+    /// The plugin jobs that ran late while the callback waited for them.
+    pub late_jobs: u64,
+    /// The plugin jobs the callback ran itself.
+    pub inline_jobs: u64,
+}
+
+/// What the names source gives the output at a turn: see [`InsertNames`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InsertChains {
+    /// The chains the playing score has: see
+    /// `LiveScalarDevice::set_named_insert_chains`.
+    pub named: Vec<u64>,
+    /// The copies of these chains that the playing score no longer has, by
+    /// slot and key. The callback gives such a copy back when it is not busy
+    /// and its stage is not heard.
+    pub gone: Vec<(InsertSlot, InsertKey)>,
+}
+
+/// Gives the chains the playing score has now, and the copies it no longer
+/// has. The output asks before it takes the inserts of a turn, and gives the
+/// counts of the turn.
+pub type InsertNames = dyn Fn(InsertTurn) -> InsertChains + Send + Sync;
+
+/// Gives the values sliders moved since the output asked last, in the order
+/// of the moves, `room` values at most. The source keeps the rest for the
+/// next turn. The output asks at each turn, after the names.
+pub type InsertValues = dyn Fn(usize) -> Vec<InsertValue> + Send + Sync;
 
 #[cfg(test)]
 mod tests {
@@ -246,10 +368,19 @@ mod tests {
 
     #[test]
     fn a_note_carries_sixteen_parameter_values_and_refuses_one_more() {
+        // The stage fits in the room the fields leave, so the event keeps
+        // its size.
+        assert_eq!(std::mem::size_of::<InsertControls>(), 184);
         let mut controls = InsertControls::new(InsertKey {
             plugin: 3,
             preset: 0,
         });
+        // An effect with no stage takes the stage of its place.
+        assert_eq!(controls.stage(2), 2);
+        controls.set_stage(1);
+        assert_eq!(controls.stage(2), 1);
+        controls.set_stage(EFFECT_CHAIN as u8);
+        assert_eq!(controls.stage(2), 2);
         for id in 0..MAX_INSERT_PARAMS as u32 {
             assert!(controls.push(InsertParam { id, value: 0.5 }));
         }

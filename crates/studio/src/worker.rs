@@ -229,8 +229,11 @@ enum EngineCommand {
         budget_bytes: usize,
         idle: Duration,
     },
-    /// The origins of the Trust page, after the player changed them.
+    /// The origins of the permissions page, after the player changed them.
     SetImportOrigins(Vec<String>),
+    /// The orchestra switch of the permissions page, after the player
+    /// flipped it.
+    SetCsound(bool),
     /// What the performer can reach without a wait: the tabs whose sounds
     /// no memory policy may drop, and those kept by recency.
     SetLiveMaterial(super::engine::LiveMaterial),
@@ -692,6 +695,14 @@ impl StudioWorker {
             && self
                 .commands
                 .try_send(EngineCommand::SetImportOrigins(origins))
+                .is_ok()
+    }
+
+    pub fn try_set_csound(&self, allowed: bool) -> bool {
+        !self.shutdown_requested.load(Ordering::Acquire)
+            && self
+                .commands
+                .try_send(EngineCommand::SetCsound(allowed))
                 .is_ok()
     }
 
@@ -1698,6 +1709,10 @@ fn process_command(
         }
         EngineCommand::SetImportOrigins(origins) => {
             engine.set_import_origins(&origins);
+            false
+        }
+        EngineCommand::SetCsound(allowed) => {
+            engine.set_csound(allowed);
             false
         }
         EngineCommand::SetLiveMaterial(material) => {
@@ -2950,6 +2965,7 @@ mod tests {
             audible_generation: None,
             confirmed_audio_generation: None,
             source_revision: None,
+            csound: Default::default(),
             cps: 0.5,
             device_time: 0.0,
             cycle: 0.0,
@@ -3727,5 +3743,62 @@ mod tests {
                 ..
             })
         )));
+    }
+
+    /// An edit the session holds for its plugin copies keeps the last score
+    /// playing. The worker arms its request, and answers it when the edit
+    /// lands.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn a_held_plugin_edit_is_answered_when_it_lands() {
+        use super::super::engine::load_mode_tests::{fixture_plugins, start_with_plugins, studio};
+        use super::super::settings::LoadMode;
+        let _plugins = fixture_plugins();
+        let library = Arc::new(rustel_runtime::samples::SampleLibrary::empty());
+        let mut engine = studio(LoadMode::Wait, &library);
+        let playing = "$: s(\"sine\")";
+        start_with_plugins(&mut engine, playing);
+        // The load of the plugin takes 600 ms, so the edit waits for its
+        // copy.
+        // SAFETY: one fixture test runs at a time, and the plugin thread has
+        // no work. So no other thread reads the variable now.
+        unsafe { std::env::set_var(rustel_vst3_fixture::SLOW_ENV, "600") };
+        let edit = "$: s(\"sine\").vst(\"rustel fixture\")";
+        let mut armed = None;
+        let mut pending = VecDeque::new();
+        let mut outcomes = Vec::new();
+        let command = EngineCommand::Evaluate {
+            request_id: 1,
+            editor_revision: 1,
+            command_epoch: 0,
+            source: Arc::from(edit),
+            mini: false,
+            launch: Launch::Now,
+            rewind: false,
+            preview: false,
+        };
+        press(&mut engine, command, &mut armed, &mut pending);
+        collect_outcomes(&mut pending, &mut outcomes);
+        assert!(armed.is_some() && outcomes.is_empty(), "{outcomes:?}");
+        assert_eq!(engine.active_source(), Some(playing));
+        drive_worker(
+            &mut engine,
+            &mut armed,
+            &mut pending,
+            &mut outcomes,
+            |_, _, _, outcomes| !outcomes.is_empty(),
+        );
+        rustel_runtime::vst::host().wait_idle();
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_ENV) };
+        let [outcome] = outcomes.as_slice() else {
+            panic!("one answer: {outcomes:?}");
+        };
+        assert_eq!(outcome.request_id, 1);
+        assert!(!outcome.result.as_ref().expect("the edit lands").held);
+        assert_eq!(engine.active_source(), Some(edit));
+        assert!(armed.is_none());
+        drop(engine);
+        rustel_runtime::vst::pin_standard_folders(Vec::new());
     }
 }

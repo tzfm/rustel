@@ -436,11 +436,18 @@ impl Waker {
 pub struct Transport {
     stopped: AtomicBool,
     generation: AtomicU64,
+    stops: AtomicU64,
 }
 
 impl Transport {
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
+        self.stops.fetch_add(1, Ordering::SeqCst);
+    }
+    /// How many times the transport has stopped. A reading taken before a
+    /// stop differs from every reading taken after it, even after a start.
+    pub fn stops(&self) -> u64 {
+        self.stops.load(Ordering::SeqCst)
     }
     pub fn start(&self) {
         self.stopped.store(false, Ordering::SeqCst);

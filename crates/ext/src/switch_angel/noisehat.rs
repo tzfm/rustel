@@ -26,14 +26,19 @@ pub(super) const REFERENCE: ReferenceEntry = simple_reference!(
             description: "the shape that drives the decay; defaults to a triangle, sped up 4×.",
         },
         ReferenceParam {
+            name: "unused",
+            r#type: "any",
+            description: "ignored; it keeps min and max in the fourth and fifth places.",
+        },
+        ReferenceParam {
             name: "min",
             r#type: "number | Pattern",
-            description: "shortest decay in seconds; defaults to .05. It is the fourth positional argument - the third is ignored.",
+            description: "shortest decay in seconds; defaults to .05.",
         },
         ReferenceParam {
             name: "max",
             r#type: "number | Pattern",
-            description: "longest decay in seconds; defaults to .12. It is the fifth positional argument.",
+            description: "longest decay in seconds; defaults to .12.",
         },
     ],
     examples: ["noisehat()", "noisehat(32)"],

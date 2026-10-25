@@ -55,6 +55,7 @@ impl App {
             | Pointer::Slider { .. }
             | Pointer::MixerFader { .. }
             | Pointer::MixerPanelFader
+            | Pointer::Knobs { .. }
             | Pointer::TimelineBar { .. } => Some(SHAPE_GRABBING),
             Pointer::BlockStart { .. } => Some(SHAPE_EW_RESIZE),
             Pointer::Editor
@@ -257,11 +258,11 @@ impl App {
             let mut sheet = sheet;
             sheet.source_count = self.prefs.sample_sources.len();
             sheet.default_count = self.shipped_sources.len();
-            sheet.trust_count = self.prefs.import_origins.len() + self.blocked_imports.len();
+            sheet.permissions_count = self.permission_row_count();
             if SettingsSheet::tab_at(settings_frame, x, y).is_some()
                 || sheet.shows_settings() && sheet.row_at_for(settings_frame, x, y).is_some()
                 || sheet.source_row_at(settings_frame, x, y).is_some()
-                || sheet.trust_row_at(settings_frame, x, y).is_some()
+                || sheet.permission_row_at(settings_frame, x, y).is_some()
             {
                 return POINTER;
             }

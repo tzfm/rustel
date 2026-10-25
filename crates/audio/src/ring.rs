@@ -6,9 +6,11 @@
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
+use std::sync::{Mutex, PoisonError};
 
 use crate::backend::{CompactKabelControls, KabelControls};
+use crate::partials::WaveLeases;
 use crate::{DecodedSample, OscillatorControls, SampleControls, SampleId};
 
 /// Scheduling metadata travels beside, rather than inside, the musical event.
@@ -162,6 +164,14 @@ pub struct Ring {
     /// on first use. Zero means "not yet claimed".
     producer: AtomicU64,
     consumer: AtomicU64,
+    /// The chunk the consumer renders, `rendering_from..rendering_until`
+    /// frames at `rendering_rate`; see [`Ring::publish_frontier`]. Zero until
+    /// the consumer publishes one.
+    rendering_from: AtomicU64,
+    rendering_until: AtomicU64,
+    rendering_rate: AtomicU32,
+    /// The custom waves of pushed notes. Only the producer locks it.
+    waves: Mutex<WaveLeases>,
 }
 
 // SAFETY: single producer / single consumer with atomic index publication,
@@ -170,13 +180,15 @@ pub struct Ring {
 unsafe impl Sync for Ring {}
 unsafe impl Send for Ring {}
 
-/// Hash of the current thread's id - `ThreadId` has no stable integer form.
+/// A token for the current thread, taken from a counter on first use.
+/// `ThreadId` has no stable integer form.
 fn this_thread() -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::thread::current().id().hash(&mut hasher);
-    // Never zero, so the slot's "unclaimed" value stays distinguishable.
-    hasher.finish() | 1
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    thread_local! {
+        // Never zero, so the slot's "unclaimed" value stays distinguishable.
+        static TOKEN: u64 = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    TOKEN.with(|token| *token)
 }
 
 /// Claim a role for this thread. `false` means another thread already holds
@@ -219,7 +231,25 @@ impl Ring {
             role_conflicts: AtomicUsize::new(0),
             producer: AtomicU64::new(0),
             consumer: AtomicU64::new(0),
+            rendering_from: AtomicU64::new(0),
+            rendering_until: AtomicU64::new(0),
+            rendering_rate: AtomicU32::new(0),
+            waves: Mutex::default(),
         }
+    }
+
+    /// Consumer side: publish the chunk about to render, frames `from..until`
+    /// at `sample_rate`, before taking its events. Every frame before `from`
+    /// is rendered, and an event taken now starts before `until`. The
+    /// producer holds a pushed note's custom wave until a published `from`
+    /// passes the note's last frame.
+    pub(crate) fn publish_frontier(&self, from: u64, until: u64, sample_rate: u32) {
+        self.rendering_rate.store(sample_rate, Ordering::Relaxed);
+        self.rendering_from.store(from, Ordering::Relaxed);
+        self.rendering_until.store(until, Ordering::Relaxed);
+        // Pairs with the fence after a push: either this chunk's drain sees
+        // the push, or the producer reads this chunk.
+        fence(Ordering::SeqCst);
     }
 
     pub fn capacity(&self) -> usize {
@@ -304,13 +334,42 @@ impl Ring {
             self.refused.fetch_add(1, Ordering::Relaxed);
             return false;
         }
+        let mut e = e.map_kabel(CompactKabelControls::from);
+        let leased = e
+            .event
+            .controls
+            .partials
+            .as_mut()
+            .and_then(crate::partials::lease)
+            .map(|wave| {
+                let event = &e.event;
+                let hold = crate::partials::hold_frames(
+                    event.duration_secs,
+                    event.controls.envelope.release_secs,
+                    event.target_frame,
+                    crate::scalar::kabel_controls(&event.controls)
+                        .map(|kabel| kabel.end_secs)
+                        .reduce(f64::max),
+                    self.rendering_rate.load(Ordering::Relaxed),
+                );
+                (wave, event.target_frame, hold)
+            });
         // SAFETY: sole producer; slot unpublished until Release store.
         unsafe {
-            (*self.buf.get())[tail & self.mask].write(e.map_kabel(CompactKabelControls::from));
+            (*self.buf.get())[tail & self.mask].write(e);
         }
         self.tail.store(tail.wrapping_add(1), Ordering::Release);
         let d = tail.wrapping_add(1).wrapping_sub(head);
         self.peak_depth.fetch_max(d, Ordering::Relaxed);
+        let mut waves = self.waves.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((wave, start, hold)) = leased {
+            // Pairs with the fence in `publish_frontier`. A late note starts
+            // when the consumer takes it, before the chunk end read here.
+            fence(Ordering::SeqCst);
+            let until = self.rendering_until.load(Ordering::Relaxed);
+            waves.hold(wave, start.max(until).saturating_add(hold));
+        }
+        waves.release_before(self.rendering_from.load(Ordering::Relaxed));
         true
     }
 
@@ -414,6 +473,33 @@ mod tests {
             synth: None,
             cut: None,
         }
+    }
+
+    /// A pushed note holds its custom wave until the consumer starts a chunk
+    /// past the note's last frame, also after the registry lets the wave go.
+    #[test]
+    fn a_pushed_note_holds_its_wave_until_the_consumer_passes_it() {
+        // A term no other test registers, so the wave is this test's alone.
+        let mut partials = crate::register_partials(1, &[0.0], &[0.123_456_7]);
+        let ring = Ring::new(4);
+        ring.publish_frontier(0, 128, 48_000);
+        let mut note = ev(0);
+        note.controls.partials = Some(partials);
+        assert!(ring.push(note));
+        crate::partials::forget(&partials);
+        let wave = ring
+            .pop()
+            .and_then(|note| note.controls.partials)
+            .and_then(|partials| partials.wave)
+            .expect("a leased wave");
+        let wave = wave.wave();
+        assert!(wave.sample(0.25, wave.selection(440.0, 48_000.0)) > 0.1);
+        // The note lasts 0.11 s. Once the consumer is past it, the next push
+        // lets the wave go.
+        ring.publish_frontier(48_000, 48_128, 48_000);
+        assert!(ring.push(ev(1)));
+        assert_eq!(ring.waves.lock().unwrap().len(), 0);
+        assert!(crate::partials::lease(&mut partials).is_none());
     }
 
     #[test]

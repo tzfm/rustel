@@ -13,7 +13,7 @@
 //! | completion lists at the caret (Ctrl+Space, Tab) | `completion.rs`, `string_roles.rs`, `bank_context.rs` |
 //! | hearing a chord, scale, sound or snippet | `previews.rs` |
 //! | the Settings sheet | `settings_sheet.rs` |
-//! | its Trust page: origins for script imports | `import_trust.rs` |
+//! | its Permissions page: origins and orchestras | `permissions.rs` |
 //! | the theme picker, editor and save sheet | `theme_sheets.rs` |
 //! | the export sheet | `export_sheet.rs` |
 //! | the top menu and help | `menu_bar.rs` |
@@ -25,6 +25,7 @@
 //! | sets and the set panel (^B) | `sets.rs` |
 //! | tapes, the replay tab and timeline | `replay_tabs.rs`, `replay_edit.rs`, `replay_pointer.rs`, `sessions.rs` |
 //! | inline sliders in the score | `slider.rs`, `slider_precision.rs` |
+//! | the knobs column beside the score | `knobs.rs` |
 //! | the visuals docks | `viz_panel.rs` |
 //! | Hydra visuals behind the score | `hydra_backdrop.rs`, `stage_pixels.rs` |
 //! | split panes, scrollbars, minimap, zen, wrap | `panes.rs` |
@@ -54,6 +55,7 @@
 //! | building and painting a frame | `render.rs` |
 //! | what an edit sets off | `editing.rs` |
 //! | evaluating the score, auto evaluate, and the engine's events | `evaluation.rs` |
+//! | reloading the open score when another program saves it | `external_changes.rs` |
 //! | saving scenes, preferences and the manifest | `persistence.rs` |
 //! | quitting, play state, the errors shown | `transport.rs` |
 //!
@@ -86,7 +88,7 @@ use super::editor::{
     ByteOffset, Clipboard, Command, DEFAULT_MAX_DOCUMENT_BYTES, Edit, EditOrigin, Editor,
     EditorEffect, EditorInput, HistoryMoment, KeyboardCapabilities, MemoryClipboard,
     PlatformClipboard, Revision, TerminalEventBatch, Transaction, VirtualRowSpec,
-    event_to_input_with_binds, is_plain_text_key_event, key_to_command,
+    composed_text_event, event_to_input_with_binds, is_plain_text_key_event, key_to_command,
 };
 use super::engine::{DiagnosticAlert, Launch, LiveMaterial, StudioDiagnostic};
 use super::engine::{StudioConfig, StudioDeviceInfo, StudioDiagnosticLevel, StudioSnapshot};
@@ -116,7 +118,8 @@ use super::save::{SaveRequest, SaveResult, SaveWorker};
 use super::scenes::{PendingSave, SceneError, SceneId, SceneSet, SetLimiter};
 use super::set_panel::{SetLine, SetPanel};
 use super::settings::{
-    self, OutputLatency, SettingsAction, SettingsNavigation, SettingsSheet, SyntaxCheck, UiSettings,
+    self, ExternalChanges, OutputLatency, SettingsAction, SettingsNavigation, SettingsSheet,
+    SyntaxCheck, UiSettings,
 };
 use super::terminal::TerminalSession;
 use super::terminal::{TerminalFeatures, cell_pixels_now};
@@ -146,6 +149,7 @@ use rustel_runtime::session_log::{
 use rustel_runtime::ui_events::{UiLayout, UiVisual, source_revision, visual_layout};
 use rustel_runtime::{ProcessMonitor, ProcessStats, RuntimeError, SessionConfig};
 
+mod args;
 mod audio_advisory;
 mod bank_context;
 mod completion;
@@ -157,12 +161,14 @@ mod evaluation;
 mod evaluation_flash;
 mod event_loop;
 mod export_sheet;
+mod external_changes;
+mod find;
 mod focus;
 mod hydra_backdrop;
-mod import_trust;
 mod jobs_panel;
 mod key_bindings;
 mod keyboard;
+mod knobs;
 mod link;
 mod list_keys;
 mod loading_line;
@@ -172,6 +178,7 @@ mod menu_bar;
 mod mixer;
 mod mouse;
 mod panes;
+mod permissions;
 mod persistence;
 mod piano_mode;
 mod pointer_shape;
@@ -204,6 +211,7 @@ mod stage_pixels;
 mod string_roles;
 mod theme_sheets;
 mod transport;
+mod vim;
 mod viz_panel;
 #[cfg(feature = "vst")]
 mod vst;
@@ -280,14 +288,22 @@ struct LiveTextMark {
     saved: u64,
 }
 
+/// FNV-1a over the saved revision text. The mark holds this hash instead of
+/// a copy of the text.
+fn stable_hash(text: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 impl LiveTextMark {
     fn of(scene: &super::scenes::Scene) -> Self {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        scene.saved_source_revision.hash(&mut hasher);
         Self {
             edits: scene.editor.revision(),
-            saved: hasher.finish(),
+            saved: stable_hash(&scene.saved_source_revision),
         }
     }
 }
@@ -622,6 +638,10 @@ fn run_once(options: StudioOptions) -> Result<Session, RuntimeError> {
             preview_budget_bytes: sample_settings.preview_budget.bytes(),
             unused_sample_idle: sample_settings.unused_sample_idle.duration(),
             import_origins: prefs.import_origins.clone(),
+            // `csound_allowed` stays at its default: on, because an
+            // installed Csound library is the studio's opt-in. The
+            // permissions page takes it back for a run, and the one-shot
+            // commands keep `--allow-csound`.
             ..StudioConfig::default()
         },
         #[cfg(feature = "hydra")]
@@ -839,9 +859,26 @@ struct App {
     /// Where the plugin scan was at the last turn, while the scan runs.
     #[cfg(feature = "vst")]
     plugin_scan: Option<rustel_runtime::vst::ScanProgress>,
+    /// The reads of the preset folders at the last turn: the watch reads
+    /// them again when a file changed, and the open plugin takes the
+    /// presets of that read.
+    #[cfg(feature = "vst")]
+    plugin_presets_version: u64,
+    /// The text of the settings vst page's plugin filter. The sheet holds
+    /// only its state, for its rows and its keys.
+    #[cfg(feature = "vst")]
+    vst_filter: settings::VstFilter,
+    /// The plugins the filter kept, by their place in the full scanned
+    /// list. Identity in length while no filter holds.
+    #[cfg(feature = "vst")]
+    vst_shown: Vec<usize>,
     /// The plugin rows of the memory breakdown, as last measured.
     #[cfg(feature = "vst")]
     plugin_memory: Vec<super::memory::PluginMemory>,
+    /// The presets of the settings vst page's open plugin row, as the host
+    /// last read them: see [`SettingsSheet::vst_open`].
+    #[cfg(feature = "vst")]
+    settings_vst_open_presets: Vec<String>,
     linter: Linter,
     /// The newest finding per scene, in the coordinates of the revision
     /// it was checked at.
@@ -923,6 +960,10 @@ struct App {
     limiter_mode_due: Option<(rustel_audio::LimiterCharacter, Instant)>,
     manifest_changed_at: Instant,
     last_edit_at: Instant,
+    /// The open score's file as the external watch last saw it, and when
+    /// it last looked. See `external_changes.rs`.
+    external_watch: Option<external_changes::ExternalWatch>,
+    external_watch_checked_at: Instant,
     /// The word the reference column was opened on, so the name chosen
     /// there replaces it rather than landing beside it.
     reference_anchor: Option<ReferenceAnchor>,
@@ -976,6 +1017,20 @@ struct App {
     /// The mixer panel - the desk along the top or the bottom - while it
     /// is open. Sticky like the set panel: Esc leaves it standing.
     mixer_panel: Option<MixerPanel>,
+    /// The knobs column - a rail for each numeric parameter of the call
+    /// at the caret - while it is open. Sticky like the mixer: Esc leaves
+    /// it standing.
+    knobs_panel: Option<super::knobs_panel::KnobsPanel>,
+    /// Opened since the last draw, like `mixer_unlaid`: until a draw lays
+    /// the column, its keys must not fall through to the score.
+    knobs_unlaid: bool,
+    /// The call at the caret as the panel last read it, kept until the
+    /// scene, the text or the caret changes. The parse is the heavy part,
+    /// with the faders the transpiler's own reading, so it is done once
+    /// per change, not once per frame.
+    knobs_parse: Option<knobs::KnobsParse>,
+    /// The rows the painter draws this frame, assembled from the parse.
+    knobs_rows: Option<knobs::KnobsRows>,
     /// A drag selection over the mixer's devices block - the MIDI log and
     /// the pads - kept with the rows it was drawn on, for `c` to copy.
     mixer_selection: Option<MixerSelection>,
@@ -996,6 +1051,12 @@ struct App {
     /// The learnt keyboard shortcuts. Built from the preferences once and
     /// re-learnt from there, so every surface asks the same table.
     keybinds: super::keybinds::Keybinds,
+    vim_config: crate::vim_config::VimConfig,
+    /// Plain keys waiting for an insert mapping in a Vim text surface.
+    vim_insert_pending: String,
+    /// This key came from remote control. A machine sends normal keys, not
+    /// Vim modes, so the score reads it with its usual editing.
+    remote_key_event: bool,
     /// The value each control change last said and when it said it, keyed
     /// by number and channel, so a bound row reads the crossings of the
     /// line at 64 rather than every message: a knob swept across fires
@@ -1177,10 +1238,25 @@ struct App {
     /// the next update to say the same.
     update_failure: Option<(SceneId, Revision)>,
     /// The origins whose script imports the engine refused in this studio,
-    /// newest last. The Trust page offers them, so nobody types an origin.
+    /// newest last. The permissions page offers them, so nobody types an origin.
     blocked_imports: Vec<String>,
-    /// The Trust page changed and the engine does not have the list yet.
+    /// Whether native orchestras run in this studio. The switch starts on -
+    /// an installed library is the opt-in - and the permissions page flips
+    /// it for the run. The studio keeps neither state, so the next start is
+    /// on again.
+    csound_allowed: bool,
+    /// A score asked for an orchestra and the engine refused it, so the
+    /// permissions page offers the switch.
+    csound_refused: bool,
+    /// The permissions page flipped the switch and the engine does not
+    /// have it yet.
+    csound_owed: bool,
+    /// The permissions page changed and the engine does not have the list yet.
     import_origins_owed: bool,
+    /// A permit unblocked a refused update and the studio owes its re-run.
+    /// It waits for the engine to hold the permission, so the re-run cannot
+    /// be refused by the state it is running to use.
+    refused_update_owed: bool,
     /// Latest refused revision for each scene with an unresolved log alert.
     evaluation_alerts: HashMap<SceneId, Revision>,
     /// A diagnostic copied into the ordinary status line by the navigation
@@ -1405,9 +1481,6 @@ struct App {
     /// while it is still `None`: a sound heard for the first time is being
     /// decoded at the moment it is asked for.
     preview_shape: Option<(std::sync::Arc<[u8]>, f64)>,
-    /// Whether walking the samples list auditions each sound as the cursor
-    /// lands on it.
-    preview_autoplay: bool,
     /// How long the studio has had sound, in seconds, and when that was
     /// last counted.
     ///
@@ -1532,6 +1605,9 @@ impl App {
         let theme_camera_confirmed = theme.camera_enabled().then(|| theme.name.clone());
         let prefs = StudioPrefs::load();
         let mixer = MixerState::new(prefs.input_gain_tenths_db);
+        // The switch starts on, as the engine's does: an installed library
+        // is the opt-in, and the permissions page owns the switch from here.
+        let csound_at_start = true;
         let mut app = Self {
             output_latency_pending: true,
             cli_output_latency: options.output_buffer_frames.map(OutputLatency::from_frames),
@@ -1582,7 +1658,15 @@ impl App {
             #[cfg(feature = "vst")]
             plugin_loads: Vec::new(),
             #[cfg(feature = "vst")]
+            settings_vst_open_presets: Vec::new(),
+            #[cfg(feature = "vst")]
             plugin_scan: None,
+            #[cfg(feature = "vst")]
+            plugin_presets_version: 0,
+            #[cfg(feature = "vst")]
+            vst_filter: settings::VstFilter::default(),
+            #[cfg(feature = "vst")]
+            vst_shown: Vec::new(),
             #[cfg(feature = "vst")]
             plugin_memory: Vec::new(),
             linter: Linter::spawn().map_err(RuntimeError::Io)?,
@@ -1630,6 +1714,8 @@ impl App {
             limiter_mode_due: None,
             manifest_changed_at: now,
             last_edit_at: now - LINT_DEBOUNCE,
+            external_watch: None,
+            external_watch_checked_at: now,
             reference_anchor: None,
             slider_tape_due: None,
             fader_tape_due: None,
@@ -1655,12 +1741,19 @@ impl App {
             viz_unlaid: [false; DOCKS],
             mixer_unlaid: false,
             mixer_panel: None,
+            knobs_panel: None,
+            knobs_unlaid: false,
+            knobs_parse: None,
+            knobs_rows: None,
             mixer_selection: None,
             pixel_budget: super::graphics::PIXEL_CEILING,
             pixel_budget_said: false,
             mapping_learn: None,
             keybind_learn: None,
             keybinds: prefs.keybinds(),
+            vim_config: crate::vim_config::VimConfig::default(),
+            vim_insert_pending: String::new(),
+            remote_key_event: false,
             midi_cc_last: HashMap::new(),
             note_pressed_at: HashMap::new(),
             mapping_lit: [None; MAPPING_SLOTS],
@@ -1722,7 +1815,11 @@ impl App {
             inflight: HashMap::new(),
             update_failure: None,
             blocked_imports: Vec::new(),
+            csound_allowed: csound_at_start,
+            csound_refused: false,
+            csound_owed: false,
             import_origins_owed: false,
+            refused_update_owed: false,
             evaluation_alerts: HashMap::new(),
             lint_status: None,
             pending_evaluation: None,
@@ -1842,7 +1939,6 @@ impl App {
             #[cfg(feature = "hydra")]
             snippet_under_cursor: None,
             stop_requested: false,
-            preview_autoplay: false,
             marks: Vec::new(),
             #[cfg(feature = "hydra")]
             snippet_marks: Vec::new(),
@@ -1879,7 +1975,10 @@ impl App {
         app.adopt_global_sources();
         app.refresh_catalogue();
         #[cfg(feature = "vst")]
-        app.adopt_vst_folders();
+        {
+            app.adopt_vst_folders();
+            app.adopt_preset_folders();
+        }
         // Laid out the way the set was left: the same scores in the same
         // panes, with the caret in the pane that had it.
         app.restore_panes();
@@ -1913,6 +2012,10 @@ impl App {
     }
 
     fn editor_accepts_raw_paste(&self) -> bool {
+        #[cfg(feature = "remote-control")]
+        if self.remote_panel_open {
+            return false;
+        }
         // A paste batches into the document exactly when the document
         // receives the typed text. An open panel does not prevent this. A
         // focused panel does, because the paste belongs to its search box.
@@ -2049,6 +2152,9 @@ impl App {
         if self.prefs.mixer_panel == Some(true) {
             self.open_mixer_panel(false);
         }
+        if self.prefs.knobs_panel == Some(true) {
+            self.open_knobs_panel(false);
+        }
         self.restore_sticky_log();
     }
 
@@ -2126,6 +2232,7 @@ impl App {
             mixer,
             log,
             memory,
+            self.knobs_panel.is_some(),
             self.footer_notice_rows(),
             self.has_piano_notes(),
         )

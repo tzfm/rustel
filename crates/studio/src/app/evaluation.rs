@@ -285,10 +285,23 @@ impl App {
     /// same way. What it never owes is the flash: that confirms a press,
     /// and nobody pressed anything.
     pub(super) fn auto_evaluate(&mut self) {
+        self.apply_paused_edit(false);
+    }
+
+    /// Apply a score another program saved into the open file. The watch
+    /// mode is the decision to play, so this runs while the transport is
+    /// stopped too. A stop already under way still wins.
+    pub(super) fn apply_external_change(&mut self) {
+        self.apply_paused_edit(true);
+    }
+
+    /// `external` names the caller that asked: a typed pause waits for the
+    /// set to play, a watched file does not.
+    fn apply_paused_edit(&mut self, external: bool) {
         // The snapshot trails a Stop press by up to 100 ms, so the local
         // flag holds the apply until it catches up.
-        if !self.ui_settings.auto_evaluate
-            || !self.is_playing()
+        if (!external && !self.ui_settings.auto_evaluate)
+            || (!external && !self.is_playing())
             || self.is_stopping()
             || self.stop_requested
             || self.current_prebake().is_some()
@@ -307,6 +320,39 @@ impl App {
         // an answer for the gesture alone.
         if self.install_would_be_redundant(id, &source) {
             self.rebind_unchanged_score(id, revision, Arc::clone(&source));
+            return;
+        }
+        // A paused edit that adds no instruction is not an update: the set
+        // keeps playing as it was, so a lane that fires on each update -
+        // `oneshot` - does not fire for a label half typed. The text is
+        // still the player's words, so the file takes it. A watched file,
+        // or a press, is a decision made on purpose and always applies. A
+        // byte-identical text is the install check's to answer, not this
+        // one: what it knows about the installed revision, this cannot.
+        // And while any evaluation of this scene is unsent or unanswered -
+        // a launch armed for its line, or an edit the worker holds until
+        // its sounds are ready - the skip stands down: that edit is a
+        // decision this one must supersede, not land over.
+        if !external
+            && !self.options.mini
+            && self.armed_revision.is_none()
+            && self.pending_evaluation.is_none()
+            && self.inflight.is_empty()
+            && matches!(self.next_launch, Launch::Now)
+            && self.is_playing()
+            && !self.is_stopping()
+            && self.audible_scene == Some(id)
+            && self.evaluated_source.as_deref().is_some_and(|playing| {
+                playing != source.as_ref() && rustel_transpiler::same_instructions(playing, &source)
+            })
+        {
+            self.log.push(
+                LogLevel::Debug,
+                "transport",
+                "auto update skipped - the edit adds no instruction".to_owned(),
+            );
+            self.write_scene(id, revision, Arc::clone(&source));
+            self.bind_live_sliders(id, revision, &source);
             return;
         }
         // Already armed for its line: pressing again would only cancel and
@@ -329,7 +375,75 @@ impl App {
             LogLevel::Debug,
             "transport",
             format!(
-                "auto update - {} ({} bytes)",
+                "{} - {} ({} bytes)",
+                if external {
+                    "external update"
+                } else {
+                    "auto update"
+                },
+                self.scenes.current().name(),
+                source.len()
+            ),
+        );
+        self.silence_preview();
+        self.playing_pane = Some(self.focused);
+        // The file is what you hear, whoever asked for the update. A
+        // watched file already holds this text: writing it again could
+        // overwrite a newer save that landed while it was read.
+        if !external {
+            self.write_scene(id, revision, Arc::clone(&source));
+        }
+        self.queue_evaluation(revision, source);
+    }
+
+    /// Run the update a permission just unblocked, without a keypress: the
+    /// score or setup that was refused runs again by itself, so permitting
+    /// is the whole walk, not half of one.
+    ///
+    /// Like the auto apply, it owes no flash - nobody pressed anything. And
+    /// it runs only what is still the refused text, on screen: an edit since
+    /// the refusal owns the next run, and so does a tab the player has
+    /// moved to.
+    pub(super) fn retry_refused_update(&mut self) {
+        if self.current_replay().is_some() {
+            return;
+        }
+        // A refused setup re-runs the way its tab presses Ctrl+S - its own
+        // check, keep, and chain - when the refused text is still the one
+        // in front of the player.
+        if let Some(scope) = self.current_prebake() {
+            let scene = self.scenes.current();
+            let source: Arc<str> = Arc::from(scene.editor.source());
+            let refused = self.prebake_rejected[scope.index()].as_deref()
+                == Some(source_revision(&source).as_str());
+            let revision = scene.editor.revision();
+            if refused {
+                self.update_prebake(scope, revision, source);
+            }
+            return;
+        }
+        let Some((scene, revision)) = self.update_failure else {
+            return;
+        };
+        // The refused score is the buffer, unchanged since, and still in
+        // front of the player. Anything else already has an owner: the next
+        // edit, the next press, or the tab the player moved to.
+        let current = self.scenes.current();
+        let refused =
+            current.id == scene && current.is_score() && current.editor.revision() == revision;
+        if !refused {
+            return;
+        }
+        let source: Arc<str> = Arc::from(current.editor.source());
+        self.refresh_set_samples();
+        if self.refuse_unclean(revision, &source) {
+            return;
+        }
+        self.log.push(
+            LogLevel::Debug,
+            "transport",
+            format!(
+                "re-running the refused update - {} ({} bytes)",
                 self.scenes.current().name(),
                 source.len()
             ),
@@ -337,8 +451,8 @@ impl App {
         self.silence_preview();
         self.playing_pane = Some(self.focused);
         // The file is what you hear, whoever asked for the update.
-        self.write_scene(id, revision, Arc::clone(&source));
-        self.queue_evaluation(revision, source);
+        self.write_scene(scene, revision, Arc::clone(&source));
+        self.queue_evaluation_for(scene, revision, source, true);
     }
 
     /// Queue an evaluation against a named scene rather than the focused
@@ -953,6 +1067,7 @@ impl App {
                     self.log.push_with(LogLevel::Error, "update", full, alert);
                     let footer = self
                         .note_untrusted_import(&failure)
+                        .or_else(|| self.note_csound_refusal(&failure))
                         .unwrap_or_else(|| player_facing_error(&failure.message));
                     self.errors.set(ErrorOwner::Evaluation, footer);
                     self.update_failure =
@@ -1407,6 +1522,152 @@ mod tests {
                 "the elapsed pause is spent stopped, not saved up"
             );
         }
+
+        /// A studio that is playing this text, as an install would leave it.
+        fn playing_this(app: &mut App, scene: SceneId, score: &str) {
+            app.snapshot = Some(sounding(true, false));
+            app.audible_scene = Some(scene);
+            app.installed_revision = Some(source_revision(score));
+            app.evaluated_source = Some(std::sync::Arc::from(score));
+        }
+
+        /// Run the typing pause out and pump until `done` observes what the
+        /// apply left - the worker of an idle studio keeps reporting the set
+        /// stopped, and a pause spent that way has to be owed again.
+        fn past_the_pause(app: &mut App, done: impl Fn(&App) -> bool) {
+            let elapsed =
+                app.ui_settings.typing_pause.duration() + std::time::Duration::from_millis(50);
+            app.last_edit_at = std::time::Instant::now()
+                .checked_sub(elapsed)
+                .expect("backdate the edit");
+            for _ in 0..200 {
+                app.snapshot = Some(sounding(true, false));
+                app.pump_turn();
+                if done(app) {
+                    return;
+                }
+                app.auto_evaluate_due = true;
+            }
+            panic!("the apply never landed");
+        }
+
+        /// A paused edit that adds no instruction sends nothing to the
+        /// engine: a lane that fires on each update, such as `oneshot`,
+        /// does not fire for a label half typed. The file still takes the
+        /// words, and a press of the same text still applies - the player
+        /// asked for that one.
+        #[test]
+        fn a_paused_edit_with_no_new_instruction_sends_nothing() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene) = playing_app(directory.path(), true);
+            playing_this(&mut app, scene, "$: s(\"bd\")\n");
+
+            app.scenes.current_mut().editor =
+                Editor::new("$: s(\"bd\")\n$:").expect("type the label");
+            app.auto_evaluate_due = true;
+            let skipped = |app: &App| {
+                app.log
+                    .lines()
+                    .iter()
+                    .any(|line| line.text.contains("auto update skipped"))
+            };
+            past_the_pause(&mut app, skipped);
+            assert!(
+                queued_by(&app, scene).is_empty(),
+                "no update left for a label half typed"
+            );
+            let file = directory.path().join("first.strudel");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::fs::read_to_string(&file).ok().as_deref() != Some("$: s(\"bd\")\n$:") {
+                app.pump_turn();
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the file never took the words"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+
+            let request_id = app.next_request_id;
+            let pressed = app.editor().source();
+            app.handle_editor_effect(EditorEffect::Evaluate {
+                revision: app.editor().revision(),
+                source: ropey::Rope::from_str(&pressed),
+            })
+            .expect("press the same text");
+            assert_eq!(
+                app.next_request_id,
+                request_id + 1,
+                "a press is owed its update, whatever the text"
+            );
+        }
+
+        /// The skip is only for edits that add nothing: a change to the
+        /// score still applies itself through the pause.
+        #[test]
+        fn a_paused_edit_that_changes_instructions_still_applies() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene) = playing_app(directory.path(), true);
+            playing_this(&mut app, scene, "$: s(\"bd\")\n");
+
+            app.scenes.current_mut().editor =
+                Editor::new("$: s(\"bd\").gain(.1)\n").expect("change the score");
+            app.auto_evaluate_due = true;
+            past_the_pause(&mut app, |app| !queued_by(app, scene).is_empty());
+            assert!(
+                !queued_by(&app, scene).is_empty(),
+                "a real change was queued"
+            );
+        }
+
+        /// While a launch waits armed for its line, the skip stands down:
+        /// the armed score is a decision the edit must supersede, not land
+        /// over.
+        #[test]
+        fn a_paused_edit_while_another_score_is_armed_still_applies() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene) = playing_app(directory.path(), true);
+            playing_this(&mut app, scene, "$: s(\"bd\")\n");
+            app.armed_revision = Some(source_revision("$: s(\"cp\")\n"));
+
+            app.scenes.current_mut().editor =
+                Editor::new("$: s(\"bd\")\n$:").expect("type the label");
+            app.auto_evaluate_due = true;
+            past_the_pause(&mut app, |app| !queued_by(app, scene).is_empty());
+            assert!(
+                !queued_by(&app, scene).is_empty(),
+                "an armed launch must be superseded, not landed over"
+            );
+        }
+
+        /// An edit the worker holds until its sounds are ready is the same
+        /// decision: while it is in flight, the skip stands down.
+        #[test]
+        fn a_paused_edit_while_an_update_is_held_still_applies() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene) = playing_app(directory.path(), true);
+            playing_this(&mut app, scene, "$: s(\"bd\")\n");
+            app.inflight.insert(
+                app.next_request_id,
+                PendingEvaluation {
+                    request_id: app.next_request_id,
+                    scene,
+                    editor_revision: Revision(7),
+                    source: std::sync::Arc::from("$: s(\"cp\")\n"),
+                    launch: Launch::Now,
+                    rewind: false,
+                    record: true,
+                },
+            );
+
+            app.scenes.current_mut().editor =
+                Editor::new("$: s(\"bd\")\n$:").expect("type the label");
+            app.auto_evaluate_due = true;
+            past_the_pause(&mut app, |app| !queued_by(app, scene).is_empty());
+            assert!(
+                !queued_by(&app, scene).is_empty(),
+                "a held update must be superseded, not landed over"
+            );
+        }
     }
 
     mod evaluation {
@@ -1684,7 +1945,7 @@ mod tests {
 
             // Enter on a refused row of the same origin adds nothing.
             app.blocked_imports.push(origin.to_owned());
-            app.trust_import(1);
+            app.permit_row(1);
             assert_eq!(app.prefs.import_origins, [origin]);
             assert!(app.blocked_imports.is_empty());
         }

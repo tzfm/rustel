@@ -35,7 +35,9 @@ mod shield_hold;
 mod ui_state;
 pub use loading::LoadingCue;
 pub(crate) use loading::import_alert;
-use loading::{Followed, LoadState};
+#[cfg(all(test, feature = "vst"))]
+pub(super) use loading::tests::load_mode_tests;
+use loading::{Followed, LoadState, launch_wait_message};
 use shield_hold::ShieldHold;
 use ui_state::StudioUiState;
 
@@ -267,9 +269,14 @@ pub struct StudioConfig {
     /// input does, so a hermetic studio never opens the runner's
     /// microphone (nor, on macOS, asks for permission to).
     pub open_default_input: bool,
-    /// The origins of the Trust page, which scores import scripts from.
+    /// The origins of the permissions page, which scores import scripts from.
     /// They add to the origins that `session` already trusts.
     pub import_origins: Vec<String>,
+    /// Whether native orchestras run. The studio turns them on at start -
+    /// an installed library is the opt-in - and the permissions page can
+    /// flip the switch during a run. The default is the studio's rule, so
+    /// every way of opening one agrees.
+    pub csound_allowed: bool,
 }
 
 impl Default for StudioConfig {
@@ -289,21 +296,25 @@ impl Default for StudioConfig {
             watch_pads: true,
             open_default_input: true,
             import_origins: Vec::new(),
+            csound_allowed: true,
         }
     }
 }
 
-/// The origins that `session` trusts for script imports, and `origins` of
-/// the Trust page added to them.
+/// The origins that `session` trusts for script imports, `origins` of the
+/// permissions page added to them, and the page's orchestra switch over
+/// whatever the flag set.
 pub(super) fn import_access(
     session: &SessionConfig,
     origins: &[String],
+    csound: bool,
 ) -> rustel_runtime::ScoreImportAccess {
     let mut access = session.score_import_access.clone();
     for origin in origins {
         // The page keeps only origins that the runtime named.
         let _ = access.permit_origin(origin);
     }
+    access.set_csound(csound);
     access
 }
 
@@ -548,6 +559,8 @@ pub fn try_send_update(
 /// zero, no device. Tests build one and set only the fields they are about.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StudioSnapshot {
+    /// Accepted orchestra sources and URL cache for an isolated export.
+    pub csound: rustel_runtime::CsoundSnapshot,
     pub playing: bool,
     /// A Stop has been requested and the last voices are ringing out; the
     /// device is still open and `playing` remains true until they have.
@@ -941,8 +954,12 @@ struct PendingLaunch {
     /// What its text needs; in wait mode it lands on the first line after
     /// all of it has loaded.
     followed: Vec<Followed>,
-    /// A line has passed while its sounds were loading.
+    /// A line has passed while the launch waited.
     waited: bool,
+    /// The launch prepared the plugin copies of its text, or needs no
+    /// prepare: see [`StudioEngine::prepare_launch`].
+    #[cfg(feature = "vst")]
+    prepared: bool,
 }
 
 /// A launch that has fired: its evaluation is done, the new generation is
@@ -1043,8 +1060,8 @@ pub struct LaunchInfo {
     pub seconds_left: f64,
 }
 
-/// Head-room a reload needs before its takeover: the schedule lead, the
-/// continuity margin, and a little for the evaluation itself.
+/// The time a launch keeps for its evaluation, on top of the schedule lead
+/// and the floor of its takeover: see `StudioEngine::launch_headroom`.
 const LAUNCH_HEADROOM_SECS: f64 = 0.08;
 /// How often a moving slider re-queries the horizon. Shorter than the
 /// horizon itself, so the ear never waits a whole cover for a change;
@@ -1645,7 +1662,11 @@ impl StudioEngine {
         let preview_budget_bytes = config.preview_budget_bytes;
         let unused_sample_idle = config.unused_sample_idle;
         let mut session = Session::with_config(config.session.clone())?;
-        session.set_score_import_access(import_access(&config.session, &config.import_origins));
+        session.set_score_import_access(import_access(
+            &config.session,
+            &config.import_origins,
+            config.csound_allowed,
+        ));
         session.set_query_hap_budget(STUDIO_QUERY_HAP_BUDGET)?;
         let master = Arc::new(StudioMasterBus::default());
         master.set_max_polyphony(config.session.max_polyphony);
@@ -1947,6 +1968,7 @@ impl StudioEngine {
             device_time
         };
         StudioSnapshot {
+            csound: self.session.csound_snapshot(),
             playing: self.live.is_some(),
             stopping: self.is_stopping(),
             session_generation: self.session.generation(),
@@ -2086,6 +2108,10 @@ impl StudioEngine {
             return Ok(StudioTick::Idle);
         }
         if let Some(live) = self.live.as_mut() {
+            live.producer.reap_completed_output(
+                live.device.completed_intake_frames(),
+                live.device.sample_rate(),
+            );
             let refusals = live.device.report().asset_queues.fx_reverb_refusals;
             if let Some(diagnostic) =
                 fx_reverb_refusal_diagnostic(refusals, &mut live.last_fx_reverb_refusals)
@@ -3756,6 +3782,8 @@ pub(super) mod tests {
             preview: false,
             followed: Vec::new(),
             waited: false,
+            #[cfg(feature = "vst")]
+            prepared: true,
         });
     }
 

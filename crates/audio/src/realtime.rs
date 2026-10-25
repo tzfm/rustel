@@ -48,6 +48,14 @@ pub struct RealtimeLoadSnapshot {
     pub consecutive_over_budget: u64,
     /// Longest callback render time since this stream rate became active.
     pub max_callback_busy_nanos: u64,
+    /// Time plugin workers ran jobs since this stream rate became active.
+    pub worker_busy_nanos: u64,
+    /// Time the callbacks spun for a plugin worker since then.
+    pub join_wait_nanos: u64,
+    /// Plugin jobs the callbacks ran themselves since then.
+    pub inline_jobs: u64,
+    /// Plugin jobs that ran late while a callback waited, since then.
+    pub late_jobs: u64,
 }
 
 /// Single-callback-writer, producer-reader atomic record.
@@ -70,6 +78,10 @@ pub(crate) struct RealtimeLoadPublisher {
     callbacks_over_125_percent: AtomicU64,
     consecutive_over_budget: AtomicU64,
     max_callback_busy_nanos: AtomicU64,
+    worker_busy_nanos: AtomicU64,
+    join_wait_nanos: AtomicU64,
+    inline_jobs: AtomicU64,
+    late_jobs: AtomicU64,
 }
 
 impl RealtimeLoadPublisher {
@@ -93,6 +105,10 @@ impl RealtimeLoadPublisher {
             callbacks_over_125_percent: AtomicU64::new(0),
             consecutive_over_budget: AtomicU64::new(0),
             max_callback_busy_nanos: AtomicU64::new(0),
+            worker_busy_nanos: AtomicU64::new(0),
+            join_wait_nanos: AtomicU64::new(0),
+            inline_jobs: AtomicU64::new(0),
+            late_jobs: AtomicU64::new(0),
         }
     }
 
@@ -135,6 +151,13 @@ impl RealtimeLoadPublisher {
             .store(snapshot.consecutive_over_budget, Ordering::Relaxed);
         self.max_callback_busy_nanos
             .store(snapshot.max_callback_busy_nanos, Ordering::Relaxed);
+        self.worker_busy_nanos
+            .store(snapshot.worker_busy_nanos, Ordering::Relaxed);
+        self.join_wait_nanos
+            .store(snapshot.join_wait_nanos, Ordering::Relaxed);
+        self.inline_jobs
+            .store(snapshot.inline_jobs, Ordering::Relaxed);
+        self.late_jobs.store(snapshot.late_jobs, Ordering::Relaxed);
         self.sequence
             .store(stable.wrapping_add(2), Ordering::Release);
     }
@@ -171,6 +194,10 @@ impl RealtimeLoadPublisher {
                 callbacks_over_125_percent: self.callbacks_over_125_percent.load(Ordering::Acquire),
                 consecutive_over_budget: self.consecutive_over_budget.load(Ordering::Acquire),
                 max_callback_busy_nanos: self.max_callback_busy_nanos.load(Ordering::Acquire),
+                worker_busy_nanos: self.worker_busy_nanos.load(Ordering::Acquire),
+                join_wait_nanos: self.join_wait_nanos.load(Ordering::Acquire),
+                inline_jobs: self.inline_jobs.load(Ordering::Acquire),
+                late_jobs: self.late_jobs.load(Ordering::Acquire),
             };
             if self.sequence.load(Ordering::Acquire) == sequence {
                 self.acknowledged.fetch_max(sequence, Ordering::Release);
@@ -218,6 +245,10 @@ pub(crate) struct RealtimeLoadMeter {
     callbacks_over_125_percent: u64,
     consecutive_over_budget: u64,
     max_callback_busy_nanos: u64,
+    worker_busy_nanos: u64,
+    join_wait_nanos: u64,
+    inline_jobs: u64,
+    late_jobs: u64,
     acknowledged_publication: u64,
 }
 
@@ -240,14 +271,21 @@ impl RealtimeLoadMeter {
             callbacks_over_125_percent: 0,
             consecutive_over_budget: 0,
             max_callback_busy_nanos: 0,
+            worker_busy_nanos: 0,
+            join_wait_nanos: 0,
+            inline_jobs: 0,
+            late_jobs: 0,
             acknowledged_publication: publisher.acknowledged(),
         }
     }
 
+    /// One callback of `callback_frames` that took `busy_nanos`, with the
+    /// figures of its plugin jobs.
     pub(crate) fn observe(
         &mut self,
         callback_frames: usize,
         busy_nanos: u64,
+        plugins: crate::pool::PoolFigures,
         sample_rate_hz: u32,
         publisher: &RealtimeLoadPublisher,
     ) {
@@ -315,6 +353,10 @@ impl RealtimeLoadMeter {
         } else {
             0
         };
+        self.worker_busy_nanos = self.worker_busy_nanos.saturating_add(plugins.worker_nanos);
+        self.join_wait_nanos = self.join_wait_nanos.saturating_add(plugins.join_wait_nanos);
+        self.inline_jobs = self.inline_jobs.saturating_add(plugins.inline_jobs);
+        self.late_jobs = self.late_jobs.saturating_add(plugins.late_jobs);
 
         if self
             .total_callbacks
@@ -343,6 +385,10 @@ impl RealtimeLoadMeter {
             callbacks_over_125_percent: self.callbacks_over_125_percent,
             consecutive_over_budget: self.consecutive_over_budget,
             max_callback_busy_nanos: self.max_callback_busy_nanos,
+            worker_busy_nanos: self.worker_busy_nanos,
+            join_wait_nanos: self.join_wait_nanos,
+            inline_jobs: self.inline_jobs,
+            late_jobs: self.late_jobs,
         }
     }
 }
@@ -365,6 +411,7 @@ fn update_ewma(current: &mut u64, sample: u64, denominator: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pool::PoolFigures;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -374,7 +421,13 @@ mod tests {
         let publisher = RealtimeLoadPublisher::new();
         let mut meter = RealtimeLoadMeter::new(sample_rate, &publisher);
         for _ in 0..REALTIME_LOAD_PUBLISH_INTERVAL {
-            meter.observe(frames, busy_nanos, sample_rate, &publisher);
+            meter.observe(
+                frames,
+                busy_nanos,
+                PoolFigures::default(),
+                sample_rate,
+                &publisher,
+            );
         }
         publisher.try_snapshot().expect("load publication")
     }
@@ -400,8 +453,8 @@ mod tests {
     fn fast_and_slow_windows_use_their_declared_weights() {
         let publisher = RealtimeLoadPublisher::new();
         let mut meter = RealtimeLoadMeter::new(48_000, &publisher);
-        meter.observe(480, 5_000_000, 48_000, &publisher);
-        meter.observe(480, 9_000_000, 48_000, &publisher);
+        meter.observe(480, 5_000_000, PoolFigures::default(), 48_000, &publisher);
+        meter.observe(480, 9_000_000, PoolFigures::default(), 48_000, &publisher);
         let snapshot = meter.snapshot();
         assert_eq!(snapshot.fast_load_basis_points, 6_000);
         assert_eq!(snapshot.slow_load_basis_points, 5_125);
@@ -422,22 +475,44 @@ mod tests {
     fn changing_sample_rate_starts_a_fresh_window() {
         let publisher = RealtimeLoadPublisher::new();
         let mut meter = RealtimeLoadMeter::new(48_000, &publisher);
+        let plugins = PoolFigures {
+            inline_jobs: 3,
+            join_wait_nanos: 20_000,
+            worker_nanos: 400_000,
+            late_jobs: 1,
+        };
         for _ in 0..REALTIME_LOAD_PUBLISH_INTERVAL {
-            meter.observe(480, 5_000_000, 48_000, &publisher);
+            meter.observe(480, 5_000_000, plugins, 48_000, &publisher);
         }
+        let first = publisher.try_snapshot().expect("48 kHz");
+        assert_eq!(first.total_period_nanos, 160_000_000);
         assert_eq!(
-            publisher.try_snapshot().expect("48 kHz").total_period_nanos,
-            160_000_000
+            (
+                first.inline_jobs,
+                first.join_wait_nanos,
+                first.worker_busy_nanos,
+                first.late_jobs
+            ),
+            (48, 320_000, 6_400_000, 16)
         );
 
         for _ in 0..REALTIME_LOAD_PUBLISH_INTERVAL {
-            meter.observe(441, 2_000_000, 44_100, &publisher);
+            meter.observe(441, 2_000_000, PoolFigures::default(), 44_100, &publisher);
         }
         let changed = publisher.try_snapshot().expect("44.1 kHz");
         assert_eq!(changed.sample_rate_hz, 44_100);
         assert_eq!(changed.total_callbacks, REALTIME_LOAD_PUBLISH_INTERVAL);
         assert_eq!(changed.total_busy_nanos, 32_000_000);
         assert_eq!(changed.total_period_nanos, 160_000_000);
+        assert_eq!(
+            (
+                changed.inline_jobs,
+                changed.join_wait_nanos,
+                changed.worker_busy_nanos,
+                changed.late_jobs
+            ),
+            (0, 0, 0, 0)
+        );
     }
 
     #[test]
@@ -448,7 +523,7 @@ mod tests {
             .into_iter()
             .chain(std::iter::repeat_n(1_000_000, 15))
         {
-            meter.observe(480, busy, 48_000, &publisher);
+            meter.observe(480, busy, PoolFigures::default(), 48_000, &publisher);
         }
         assert_eq!(
             publisher
@@ -459,7 +534,7 @@ mod tests {
         );
 
         for _ in 0..REALTIME_LOAD_PUBLISH_INTERVAL {
-            meter.observe(480, 1_000_000, 48_000, &publisher);
+            meter.observe(480, 1_000_000, PoolFigures::default(), 48_000, &publisher);
         }
         assert_eq!(
             publisher
@@ -503,6 +578,10 @@ mod tests {
                     callbacks_over_125_percent: value,
                     consecutive_over_budget: value,
                     max_callback_busy_nanos: value,
+                    worker_busy_nanos: value,
+                    join_wait_nanos: value,
+                    inline_jobs: value,
+                    late_jobs: value,
                     ..RealtimeLoadSnapshot::default()
                 });
             }
@@ -527,6 +606,10 @@ mod tests {
             assert_eq!(snapshot.callbacks_over_125_percent, value);
             assert_eq!(snapshot.consecutive_over_budget, value);
             assert_eq!(snapshot.max_callback_busy_nanos, value);
+            assert_eq!(snapshot.worker_busy_nanos, value);
+            assert_eq!(snapshot.join_wait_nanos, value);
+            assert_eq!(snapshot.inline_jobs, value);
+            assert_eq!(snapshot.late_jobs, value);
         };
         while !done.load(Ordering::Acquire) {
             if let Some(snapshot) = publisher.try_snapshot() {

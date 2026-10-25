@@ -21,8 +21,9 @@ update fails, the last good score keeps playing. An update that changes nothing
 leaves the file, and its changed date, alone, so a set you only opened and played
 stays as it was.
 
-Use one editor for each score file. Studio does not detect external file
-changes or merge them with unsaved edits.
+Use one editor for each score file. Studio does not merge external edits with
+unsaved edits. See [External changes](#external-changes) to follow saves from
+another program.
 
 ## Shortcuts
 
@@ -40,15 +41,18 @@ Use these alternatives if the terminal or operating system takes a shortcut.
 | Stop | ^.; ^G or F8 |
 | Undo / redo | ^Z / ^⇧Z or ^Y |
 | Comment / uncomment | ^/ or ^7 |
+| Find in the score | ^⇧Y; Ctrl+Shift+F2 where the terminal keeps it |
 | Devices | ^P |
 | Master volume | ^⇧↑ / ^⇧↓; Ctrl+F12 / Ctrl+F11 |
 | Slider under the caret | Alt+↑ / Alt+↓ |
 | Quick action at the caret | ^J |
+| Knobs column | ^⇧K; View ▸ Knobs |
 | Zen mode | ^K or F11 |
 | Word wrap | ^U |
 | Previous / next scene | ^[ / ^]; F6 / F7 |
 | New scene / duplicate | ^N / F3 |
-| Rename / close scene | ^R / ^W |
+| Rename scene | ^R; Scene > Rename scene |
+| Close scene | ^W |
 | Record a take | ^⇧R or Shift+F11 |
 | Record an input sample | ^H |
 | Log | F9; Shift+F9 docks it |
@@ -66,11 +70,26 @@ Use these alternatives if the terminal or operating system takes a shortcut.
 | Focus the other pane | F10 or ^⇧E |
 | Quit | ^Q twice |
 
+Ctrl+Shift+Y opens a find bar for the score. It starts empty. Type a
+regular expression; the bar selects the first match as you type. Enter moves
+to the next match and keeps the bar open. Backspace on an empty bar leaves it
+open. Esc or a click elsewhere closes it. Some terminals keep this chord for
+themselves; Settings > Keybinds shows the fallback.
+
+With Vim editor keys on, Ctrl+Shift+Y and Edit > Find open the Vim search
+prompt. Enter searches once and closes it. `n` and `N` walk the matches.
+
+Vim changes Ctrl+R and Ctrl+[ in the score editor. See [Settings](#settings)
+for Vim controls.
+
 In a split view, use **Ctrl+Shift+[ / Ctrl+Shift+]** to change scenes. F6 and F7
 also work. Each pane has its own caret and scroll position. A scene shows in one
-pane at a time. A click on the tab of a scene in the other pane keeps the caret
-in your pane, and F10 moves the caret to the other pane. A split does not create
-a second player.
+pane at a time. Each pane has its own colour: the first wears the theme's
+accent, and the second wears another accent. The pane's tab and its title both
+wear it, filled where the caret is and on a dim fill where it is not. Tabs that
+are nowhere open stay muted. A click on the tab of a scene in the other pane
+moves the caret to that pane, as F10 does. A split does not create a second
+player.
 
 F1 opens keyboard help when the menu bar is hidden. Menus show available
 actions and shortcuts. Press Esc to return to the editor. To cancel the first
@@ -109,8 +128,9 @@ selected scene to play it. The scene strip marks the playing scene with `▶`
 and unsaved edits with `●`.
 
 Use Ctrl+N for a new scene or F3 to duplicate the current scene. These actions
-create files. Ctrl+R renames the scene and its file. Ctrl+W closes the tab and
-saves its edits. It does not delete the file. If Studio cannot save the edits,
+create files. Scene > Rename scene renames the scene and its file. Rename has
+no default shortcut. You can assign one in Settings > Keybinds. Ctrl+W closes
+the tab and saves its edits. It does not delete the file. If Studio cannot save the edits,
 the tab stays open. Closing a scene also forgets its pad assignment and rewind
 setting.
 
@@ -135,6 +155,12 @@ until you update a score or stop it.
 New sets go in `<rustel-config>/sets/` by default. Change the default folder in
 Settings. This affects new sets; it does not move existing sets.
 
+In file picker and artwork popups, drag or hold Shift with movement keys to
+select text. Double-click selects the whole field. Copy, Cut, Paste, and
+Select all use your configured shortcuts.
+The selected field shows its Copy shortcut. A terminal's native Copy command
+uses the terminal's own selection.
+
 ### The set panel
 
 Press Ctrl+B. Use the arrows to select a score or session, then Enter to open
@@ -148,14 +174,22 @@ tape. Keep a separate backup of sets you want to preserve.
 ### Prebakes
 
 A prebake runs setup code before scores. Open the global or local prebake from
-Settings. The global file is `<rustel-config>/prebake.strudel`. The local prebake
+Options > Global prebake or Options > Local prebake, or from Settings. Learn a
+key for either on Settings > Keybinds. The global file is
+`<rustel-config>/prebake.strudel`. The local prebake
 is stored in the set. Studio runs the global code first, then the local code.
 
 Update checks and saves the prebake, then applies it to the playing score. It
 does not start playback when Studio is stopped. Use `globalThis` or `register`
 to share helpers with scores. A top-level `const` is local to its setup run.
 Sample loading is allowed in a prebake. Transport changes, live MIDI input,
-and `initHydra` must stay in scores.
+and `initHydra` must stay in scores. A prebake may still define a helper that
+wraps them, such as `window.bpm = b => setcpm(b/4)`: the call runs in the
+score that calls the helper.
+
+A write that replaces a name the engine owns, such as `window.note = …`, runs
+and is kept. The footer names the write once, so you know what every score
+after it means by that name.
 
 ### Script imports
 
@@ -165,10 +199,23 @@ setup code before the text with the import.
 
 Studio loads a script only from an origin you trust. The first update of such
 a score stops with `https://glossing.dev is not trusted`. Press Ctrl+O, go to
-the Trust page, and press Enter on the origin. Then update the score again.
+the Permissions page, and press Enter on the origin: the refused update runs
+again by itself, so the score loads with no second keypress.
 Each origin reads `on` or `off`: Space flips a row in place, so you can take
 a trust back without the origin leaving the page. Studio keeps the trusted
 origins in `studio.json`. Press `d` on an origin to remove the origin.
+
+### Native orchestras
+
+The Permissions page also holds the `native orchestras` switch, which starts
+on each run. Csound playback requires the library. Space turns the switch
+off for the run, and a score that loads an orchestra while it is off stops
+with `Csound is not permitted`. Press Enter on the switch and the refused
+update runs again by itself. Studio does not save this switch. See
+[Csound](csound.md) for what an orchestra can do.
+
+Turning the switch off blocks later orchestra use. A playing orchestra
+continues until you stop playback or accept another score.
 
 The first update after you trust an origin fetches the script. The update
 waits for the fetch, 8 seconds at most. Studio fetches each script one time
@@ -202,7 +249,7 @@ at runtime.
 The default playback load mode waits for the first two cycles of sounds. An
 old score keeps playing while a new score loads. Stop cancels a pending update.
 In asynchronous load mode, notes whose sounds are not ready can be skipped.
-Change this option under Settings ▸ Advanced ▸ Playback. The wait includes the
+Change this option under Settings ▸ General ▸ Playback. The wait includes the
 VST3 plugins of the score: see [plugins](plugins.md#load-time-and-memory).
 
 During playback, Studio marks each mini-notation value while its note sounds.
@@ -252,6 +299,26 @@ or cycle holds it for the line the row names, and the header shows the
 Auto evaluate works while the set plays. A stopped set stays stopped, so
 Ctrl+S remains how playback starts.
 
+### External changes
+
+Another program can edit score files in the set. Choose watch external changes
+in Settings ▸ Live coding. Off is the default.
+
+`sync` watches the score in the active tab. It puts the file's text in the
+editor and leaves the playing score alone.
+
+`sync & eval` watches every `.strudel` file in the set folder and every open
+score. When a file is saved, Studio opens its tab, or selects it if it is
+already open, and evaluates the text as an update would. It plays even when the
+set is stopped.
+
+Studio checks each watched file's size and modification time ten times a second
+and reads it after a change stays put for one check. A save made by Studio
+itself is ignored.
+
+A save from another program that changes the text replaces the open editor's
+text, including edits that are not saved yet. Studio does not merge the two.
+
 ### Stopping
 
 The first Stop lets envelopes and effect tails finish. The transport shows
@@ -282,7 +349,7 @@ like a stored sample.
 
 ### Audio out latency
 
-Open Settings ▸ Advanced ▸ Audio out. The **audio out latency** row sets the
+Open Settings ▸ General ▸ Audio out. The **audio out latency** row sets the
 output buffer. Automatic lets the device choose. A smaller buffer reduces
 latency but can cause crackles. A larger buffer gives the device more time.
 The display shows frames, milliseconds, and the size the device accepted.
@@ -407,6 +474,12 @@ Open the Samples tab in Reference to browse banks. Right expands a bank and
 Left folds it. Space starts or stops a preview. Enter inserts or copies the
 selection; check the footer for the current action.
 
+Alt+A turns on auto preview. The up and down arrows then play each row the
+cursor lands on. It works on the Samples, Chords and Scales tabs. Studio keeps
+the choice in `studio.json`, so it stays on for the next session. Press Alt+A
+again to turn it off. The foot of the list names the shortcut beside the move
+keys, and the volume row says `auto on` or `auto off`.
+
 Drag and drop an audio file or folder into the terminal window running Studio
 to import samples. You can also add folders and packs in Settings ▸ Samples.
 Samples in the set folder are discovered automatically. Use File ▸ Copy
@@ -439,8 +512,10 @@ A live change updates the code and is recorded in the session tape.
 A slider placed directly on `gain`, `lpf` or `lpq` also moves notes already
 sounding. An exact move takes 5 ms. With slider smoothing on in Settings, a
 mouse move takes 35 ms. With a lowpass envelope on the same note, such as
-`lpenv` or `lpattack`, an `lpf` slider changes from the next note. Any other
-control changes from the next note.
+`lpenv` or `lpattack`, an `lpf` slider changes from the next note. A slider
+that is the value of a plugin key moves the parameter value at once: see
+[plugins](plugins.md#names-and-values). Any other control changes from the
+next note.
 
 Ctrl+J opens the quick action at the caret. On a number, it can create a slider.
 On a slider, it can change or remove the control. These source edits require
@@ -450,6 +525,106 @@ The sliders page in Settings can bind a MIDI knob or controller axis to a
 slider. The keybinds page can bind a button to any studio action, Update and
 Stop included. See [hardware](hardware.md) for setup. Terminals that report
 pixel positions give finer mouse control; other terminals use cell positions.
+A drag lands on a whole number when the cell or the pixel under the pointer
+holds one that the slider's steps reach.
+
+## Knobs
+
+View ▸ Knobs or ^⇧K opens a column beside the score. It reads the call the
+caret is in, and its top row names that call. Its numbers show as sliders:
+each plain numeric argument, each `slider(...)` argument, and each numeric
+entry of an options object. A plain argument goes by the name the reference
+gives it, such as `frequency` for `lpf(800)`. A different call under the
+caret moves the rails with it. The column stays while you edit. Esc returns
+the keyboard to the score, and ^⇧K closes the column. A terminal that cannot
+tell ^⇧K from ^K uses View ▸ Knobs.
+
+Options objects belong to calls that take them, such as
+`set({ cutoff: 800, resonance: 5 })` and `vst("Name", { mix: 0.5 })`. An
+audio control such as `lpf` takes a number: `lpf(800)` has a rail, and
+`lpf({ cutoff: 800 })` has none, because the engine refuses that note.
+
+A rail writes the score in place as you move it. While the set plays and
+auto evaluate is on, the change sounds at once, the way a score's own
+slider sounds. A stopped set, or auto evaluate off, keeps the typing pause.
+If the score already holds a `slider(value, min, max, step)`, the rail moves
+its value argument and keeps the call. The score is the master. The column
+only edits what is written.
+
+A number with no `slider(...)` gets bounds the studio works out:
+
+- A plugin parameter travels 0 to 1, the numbers a `vst` call takes.
+- A function or a control travels the numbers its reference gives it. A
+  count moves in whole numbers: `seg(16)`, `ply(3)`, `chop(8)` and
+  `euclid(3, 8)` never land between two. A speed such as `fast(1.5)` moves
+  in quarters, a place in the cycle such as `off(0.125)` in sixteenths, a
+  chance such as `degradeBy(0.3)` in hundredths, and `lpf` from 20 to 20000
+  Hz on a log scale. A number past the travel, such as `seg(128)`, widens
+  it.
+- Any other number up to 1 travels 0 to 1. A larger number travels from 0
+  to a round number at least twice its value, in whole steps when it is a
+  whole number. A negative number travels the same way below zero.
+
+The bounds stay put while the caret stays in the call, so a value pushed to
+the top does not widen its rail. Each rail keeps its row too: an entry that
+goes off, comes back or moves in the object does not push the others. Press
+Enter to set your own bounds. The studio keeps them for that call name and
+parameter.
+
+← and → move a rail one notch, as the score's own sliders move. A notch is
+one step on a rail of up to 200 steps. On a longer rail it is about a
+hundredth of the travel, in 1, 2 or 5 steps times a power of ten, and on a
+log rail a hundredth of the travel. A notch stops on its own grid, so a
+value with a fraction, such as 16.3, comes back to 16.5 and 17. Shift+← and
+Shift+→ move one step. A drag lands on a whole number when the cell or the
+pixel under the pointer holds one that the rail's steps reach. It holds the
+rail it started on: the pointer can leave the column, and the rail follows
+it until you let go.
+
+The far left of a rail is an off stop. On an object entry it takes the entry
+out of the score and leaves its comments where they are. Backspace or
+Delete does the same. The column's last two rows name the keys: the first
+for the rail under the hand, the second for the call. The rail dims at the off stop, and a move right writes the entry back
+as it was. If you edit the call while the entry is off, the entry comes back
+at the front of the object. A plain numeric argument has no off stop,
+because the call needs it. Home moves it to the bottom of its rail.
+
+Press Enter to type an exact value, with min, max and step in the same form. A
+value below min or above max moves that bound to it. The form writes what the
+score keeps: a plain number changes the literal, and on a
+`slider(...)` argument it rewrites the call's own bounds.
+
+On a `vst(...)` or `vsti(...)` call, press `a` for the plugin's parameter list.
+It opens over the score beside the column. Type to search, and press Enter or
+click a name to add it as a rail at its default value. The wheel and the
+trackpad scroll the list. Plugin values show and write three decimals at
+most. The choice is kept in the studio's settings, so the same plugin shows
+the same rails in every set. Delete in the list forgets a kept choice, and
+Delete on a kept rail that is off takes it off the column.
+
+Before you choose, a plugin call shows up to 10 suggested rails, off until
+you move one. A host cannot see a plugin's window, so the studio ranks what
+the plugin tells it: the dry/wet mix first when the plugin names one, then
+the continuous parameters in the plugin's own order, then its switches and
+lists, which are mostly modes and settings. A bypass, a program change and
+the MIDI controller stand-ins some plugins add are left out. The first rail
+you add or take off starts your own list from the suggestions you kept.
+Press `r` twice to drop your list and get the suggestions back. Any other key
+between the two keeps your list. Values in the score stay as they are.
+
+A call whose options the reference documents, such as `_pianoroll`,
+`scope`, `spectrum`, `lfo` and `env`, shows up to 10 of its documented keys
+as rails, in the order of the reference. A key the score does not hold is
+off until you move it. It comes on at the value the call already uses, so
+the sound and the picture stay the same until the next move. For a painter,
+that is the value the terminal uses. A key with no such value, such as
+`sync` of `lfo`, is in the `a` list only, and it comes on at the middle of
+its travel. A key written by its alias, such as `a` for the `attack` of
+`env`, or in another case, is that key. Press `a` for the full list. Enter
+or a click adds a key, and a call with nothing in it, such as
+`_pianoroll()`, gets the object. A key the score already holds stays as it
+is. A key that takes text, such as a colour, a key the terminal ignores,
+and the FX stage index `fxi` have no rail.
 
 ## Mixer and limiter
 
@@ -471,7 +646,7 @@ bypass it. Backspace removes it. The set remembers this limiter. The default
 limiter setting affects new or unconfigured sets. A score's `.limit(...)` is a
 separate effect.
 
-Advanced audio settings also set the maximum polyphony. More voices can use
+Audio settings on the General page also set the maximum polyphony. More voices can use
 more CPU. A score can override the limit with `setMaxPolyphony(...)`.
 
 ## Visuals
@@ -480,9 +655,11 @@ The View menu opens the two visuals docks. Use `e` to change a dock's edge and
 `+` or `-` to resize it. Use its controls to choose a scope, spectrum, events,
 mixer, or another visual. Follow the footer for actions in the selected view.
 
-Scores can also contain inline visualizers. Visual settings control their
-appearance and opacity. See [Hydra](hydra.md) for shader visuals and backgrounds.
-Visuals stop advancing when playback stops.
+Scores can also contain inline visualizers. Use the visualizers switch in
+Settings, or View > Inline visualizers, to show or hide them. Bind a key for
+Inline visualizers on the Settings > Keybinds page. Visual settings control
+their appearance and opacity. See [Hydra](hydra.md) for shader visuals and
+backgrounds. Visuals stop advancing when playback stops.
 
 ## Themes
 
@@ -546,13 +723,47 @@ the theme picker:
 Themes can also use shader effects. A theme cannot grant camera access.
 Webcam input is off by default and needs explicit consent in Settings.
 
+Every colour also accepts `reset` for the terminal default and `ansiN` for
+palette slot N, so a theme can wear the palette the terminal already carries.
+The built-in `terminal` theme is exactly that: a studio that looks like the
+rest of your terminal, Kitty scheme or Noctalia template included. It takes
+the bright slot 12 for its accent. Its sibling, `terminal-warm`, moves the
+accent and the selection to slot 1, so a palette whose bright slot reads badly
+as an accent has another to wear. Two things follow from a colour the studio
+cannot measure. A theme that keeps `reset` as its ground should set
+`event_mark` to `underline`, as `terminal` does, because a tint has no ground
+to tint. And the filled chips write the palette's black, slot 0, so they read
+best on a palette whose black is dark. A painter that fades a colour toward
+such a ground keeps the colour whole, since a fade with nothing to blend into
+would otherwise land on the ground itself.
+
 ## Settings
 
 Press Ctrl+O. Use Tab to change pages, arrows to select or change values, and
-Space to toggle a switch. Settings include playback, rendering, samples,
-controller mapping, key bindings, the kinds of entry the reference lists, and
-the origins trusted for [script imports](#script-imports).
+Space to toggle a switch. The General page covers playback, live coding and
+the set. The other pages cover samples, controller mapping, key bindings, the
+kinds of entry the reference lists, and the origins trusted for
+[script imports](#script-imports).
 The About page reports terminal capabilities.
+
+The Appearance page holds everything visual: the chrome, the editor's marks,
+where the panels dock, and the drawing tier.
+
+The **beat line** row in the Look group adds a thin strip under the header
+that keeps the tempo visible from across the room. It follows the header's
+own beat clock and the theme's colours, and `←/→` walks its looks: `pulse`
+breathes on each beat, brightest on the downbeat, `travel` sends a bright
+segment across once per cycle, and `wave` rolls a swell along the line. It
+rests as a dim flat line while nothing plays.
+
+The `evaluation animation` row, under `flashing on evaluation` in the Editor
+group, shapes the flash a run of code makes when you evaluate it. `normal`
+swaps the lines in and out at once. `fade fast`, `fade medium` and `fade
+slow` fade the swap in and out. `swipe` fades the flash away behind a soft
+edge that sweeps left to right across each line, `zap` hits hard and
+evaporates, `steps` dims through four chunky rungs, `glitch` shatters lines
+into fast bands of blocks and flips, and `wave` sends a band of light along
+each line. The row above says which evaluations flash at all.
 
 The Terminal row at the top of the Keybinds page selects the list of shortcuts
 that Studio avoids because the terminal takes them. Keep it on automatic unless
@@ -567,6 +778,12 @@ To change a shortcut, select its row, press Enter, then press the new chord.
 Del restores the default. The panel shortcuts Alt+O, Alt+R, Alt+D and Alt+T
 are at the end of the list. The panel footers show the chord you set.
 
+In iTerm2, Option set to Normal composes a character. Studio knows the
+characters the profile sends and recovers the Option panel shortcut where
+the focused surface uses it. Option+T then focuses the tape timeline, and
+the composed character types normally everywhere else. Set Option to Esc+
+if you want the raw Alt key instead.
+
 The vst page lists the folders the plugin host reads for VST3 plugins: your
 folders first, then the standard folders of the system. Press `a` to add a
 folder and `d` to remove one of yours. Enter on `scan` reads every folder and
@@ -575,7 +792,13 @@ Enter on `rescan` empties the scan cache and tests each plugin again. While a
 scan runs, the `scan` row names the plugin in its test. The page shows the number of plugins found and the preset
 folder, `<rustel-config>/vst`, with one folder of `.vstpreset` files for each
 plugin. A row for each plugin ends the page, with its state, and with its
-fault when it failed.
+fault when it failed. Space on a plugin row turns its switch
+`audio thread only` on or off, for a plugin that breaks on another thread.
+The row then ends in `audio thread only`. Before the load or the test of its
+plugin, a row has the name of its bundle and takes no switch. A plugin copy
+that loads after the change follows the switch. Studio keeps the switches in
+`<rustel-config>/rustel.json`, so `rustel play` follows them too. See
+[plugins](plugins.md#where-the-audio-runs).
 
 Studio saves preferences in `<rustel-config>/studio.json`. The default config
 folder is `~/.rustel`, including `%USERPROFILE%\.rustel` on Windows.
@@ -585,8 +808,172 @@ session only.
 Use Automatic rendering unless you need a specific mode. Available modes
 depend on terminal glyphs, colors, image support, and reported dimensions.
 An unsupported choice falls back to Automatic. Image rendering can cost more
-than text cells. Reduce the frame rate in Advanced settings if visuals use
+than text cells. Reduce the frame rate in Appearance settings if visuals use
 too much CPU. Check the Log for device or render errors.
+
+### Vim editor keys
+
+The Editor keybindings row selects Default or Vim. Default keeps the usual
+editor controls. Vim starts in Normal mode. Press `i` to insert text and Esc,
+Ctrl+[ or Ctrl+C to return to Normal mode. The status line shows the mode
+beside warnings and errors. Vim uses a steady block in Normal and Visual and
+a steady bar in Insert. The caret shape setting applies outside Vim. Studio
+saves this choice in `studio.json`.
+
+Vim supports `hjkl`, word motions (`w`, `b`, `e`), `0`, `^`, `$`, `gg`, and `G`.
+Use `dd` to delete a line or `:42` then Enter to go to line 42. Counts work
+with motions and edits, such as `3j` and `2dd`. Use `a`, `I`, `A`, `o`, and `O`
+to enter Insert mode, `d`, `c`, and `y` with a motion to delete, change, or
+copy text, and `p` or `P` to put it back. A yank or delete fills the
+register and the system clipboard, so `p` pastes the newest copy from any
+surface. `r` then a character replaces the character under the cursor, and
+a count replaces that many. `D` deletes to the end of the line.
+`C` changes that text. `v` selects characters and `V` selects lines.
+A selection made with the mouse or with Shift+arrows enters Visual. `d`,
+`c`, `y`, `x`, `X`, `D`, `C`, `Y`, `p`, and `P` act on it. Backspace or
+Delete deletes it, and `r` then a character replaces every selected
+character. Esc returns to Normal. `u` undoes an edit. Ctrl+R in Normal or Visual mode redoes it.
+`:redo` then Enter also redoes an edit. Ctrl+D and Ctrl+U move half a page
+down and up. A count moves that many lines.
+
+`/` searches forward and `?` backward. Edit > Find opens `/`. Type a regular
+expression and press Enter. `n` repeats the search and `N` repeats it in the
+other direction; both take counts, such as `2n`. A count on the search also
+works: `3/foo` lands on the third match. An empty pattern repeats the last
+search. The search wraps and is case-sensitive. It uses the Rust regex syntax
+in [regex](https://docs.rs/regex/latest/regex/#syntax), so `\$` finds a literal
+dollar sign and `\d+` finds digits. Backreferences and look-around are not
+supported. Zero-width matches are skipped.
+
+Text objects select or edit text between separators. `vi(` selects inside
+parentheses, and `vi"` selects inside double quotes. Use `a` instead of `i`
+to include the separators, such as `va(`. These objects also work with `d`,
+`c`, and `y`, such as `ci"` to replace a string. Supported separators are
+`()`, `[]`, `{}`, `<>`, single quotes, double quotes, and backticks.
+
+Vim keys take priority while the editor has focus. Unclaimed keys keep their
+Studio action. A pending Vim command or mapping owns the next key. While Vim
+keys are on, Docs answers to `gd` through a default mapping, and Wrap has no
+default chord. Ctrl+D and Ctrl+U page instead. Settings > Keybinds shows
+these Vim defaults. A vimrc line for `gd` replaces the Docs mapping. A learnt
+chord replaces the withdrawn table chords, and a learnt chord on Ctrl+D or
+Ctrl+U wins over the page motion. Settings, prompts, and other panels keep
+their usual controls, except the list keys below. Menus show the shortcuts
+available in the current context. In Insert mode, Ctrl+R is reserved for
+register entry, which is not supported. Pasted text stays literal. On
+terminals without bracketed paste, enter Insert mode before pasting.
+
+The Vim list keys row in the Vim section of Settings > Keybinds is on by
+default. Plain `j`, `k`, `h`, and `l` move lists, menus, and help as the
+arrows do. Ctrl+D and Ctrl+U page every list panel. A panel command keeps
+its meaning. The other menu letters do too. While the row is on, these four
+letters navigate menus even when they spell a menu mnemonic. Turn the row
+off to keep them for text fields and menu mnemonics. The arrows always work.
+
+A search box in the reference column starts in Command mode while the list
+keys are on. `j`, `k`, `h`, and `l` walk the list, and the other letters stay
+out of the search. Press `i` or `a` to type in the search, then Esc to return
+to Command. Space still auditions the selected row. An anchored completion
+starts in Insert mode.
+
+The theme picker and the export sheet use the same modes. `j` and `k` move
+the list or the form, `i` or `a` type, and Esc returns to Command. On the
+export sheet, `h` and `l` change a choice or a number, and Space toggles a
+choice. In Command mode, `p` pastes the clipboard into the search or form
+and enters Insert. Insert mappings from your vimrc and the shipped defaults
+apply in these fields too. The shipped `jk` mapping leaves Insert in the
+search.
+
+### Custom Vim mappings
+
+The first time you enable Vim, Studio creates `~/.rustel/vimrc` if it does not
+exist. `RUSTEL_CONFIG_DIR` changes that folder. Built-in bindings remain active
+until a map line overrides them. Studio also ships default mappings beneath
+your file. Your file overrides them line for line. The shipped mappings
+include `U` update, `Q` stop, `J` and `K` for `$` labels, `M` for `_`, `jk`
+to leave Insert, `gcl` and `gc` to comment, and `gf` for the Reference. The
+shipped `<Space>` chords are `V` visualizers, `O` set panel, `H` and `L`
+previous and next scene, `P` local prebake, `I` panels, and `1` and `2`
+visual set one and two.
+
+Edit the file in your own editor. The Vim mappings path row appears below
+Editor keybindings when Vim is enabled. Press Enter to set a full file path,
+or Del to restore the default path. Studio saves the path in `studio.json`
+and keeps it when you switch between Default and Vim. The file can be a
+dedicated Vimscript file or a copy of your Vim or Neovim mappings. The file
+name and extension do not matter; Studio reads map lines from the file.
+
+For example, this file searches the score with `J` and `K`, types an
+underscore with `M`, toggles the inline visualizers with Space V, and leaves
+Insert mode with `jk`:
+
+```vim
+nnoremap U <Action:update>
+nnoremap Q <Action:stop>
+nnoremap <Space>V <Action:visualizers>
+nnoremap J /\$<CR>
+nnoremap K ?\$<CR>
+nnoremap M i_<C-c>l
+nnoremap X hx
+inoremap jk <Esc>
+```
+
+Studio reads these map commands: `noremap`, `map`, `nnoremap`, `inoremap`,
+`vnoremap`, `xnoremap`, and `onoremap`. `noremap` and `map` apply to Normal,
+Visual, and Operator-pending mode. Before the left-hand side, Studio ignores
+the flags `<silent>`, `<nowait>`, `<buffer>`, `<unique>`, `<special>`, and
+`<script>`.
+
+Each map takes a key sequence and a replacement. Replacement keys use the
+built-in commands and do not expand other mappings. Use uppercase letters for
+Shift, `<C-r>` for Ctrl+R, `<A-x>` for Alt+X, and `<S-Tab>` for Shift+Tab.
+Named keys include `<Esc>`, `<CR>`, `<Enter>`, `<Tab>`, `<BS>`, `<Del>`,
+`<Space>`, `<lt>`, arrow keys, `<Home>`, `<End>`, `<PageUp>`, `<PageDown>`,
+and `<F1>` through `<F24>`. Use `<lt>` for a literal `<`. `<Nop>` disables
+the input sequence in that mode. Your terminal must send the keys to Studio
+for a mapping to work.
+
+Studio skips a line it cannot use: Ex commands (`:...`), plugin commands,
+function callbacks, `<leader>`, `<Plug>`, and unknown key notation. Write
+your actual leader key, such as `<Space>V`, instead of `<leader>V`.
+
+A replacement can call a Studio action: `<Action:update>`, `<Action:stop>`,
+`<Action:visualizers>`, `<Action:find>`, or a label from the Keybinds page
+such as `<Action:toggle inline visualizers>`. The action follows its binding,
+so a rebind moves the mapping with it. Pointing the map at the action's key
+also works, but it stops following if the key changes. An unknown action name
+skips the line.
+
+The stable names for `<Action:...>` are:
+
+- Transport: `update`, `stop`, `rewind-update`
+- Menus and surfaces: `menu-bar`, `help`, `settings`, `global-prebake`,
+  `local-prebake`, `devices`, `theme`,
+  `reference`, `docs`, `piano-mode`, `set-panel`, `mixer`, `visuals-one`,
+  `visuals-two`, `visualizers`, `log`, `log-sticky`, `focus-panels`, `jobs`,
+  `memory`, `export`, `smart-action`, `split`, `hop-pane`
+- Editor: `undo`, `redo`, `copy`, `cut`, `paste`, `select-all`, `comment`,
+  `find`, `first-error`
+- Scenes: `new-scene`, `duplicate-scene`, `record-take`, `record-sample`,
+  `rename-scene`, `close-scene`, `learn-pad`, `forget-pad`, `scene-rewind`,
+  `previous-scene`, `next-scene`
+- View: `word-wrap`, `zen-mode`, `master-up`, `master-down`, `open-set`, `quit`
+- Panels: `show-file`, `rename-file`, `delete-sample`, `trim-sample`,
+  `focus-timeline`
+
+Names are case-insensitive. The label shown on the Keybinds page also works.
+
+Studio does not run the file as Vimscript; it only reads map lines.
+Conditions and function bodies are not evaluated: a map line inside `if` or
+`function` is read the same way. Comments start with `"` on their own line.
+
+Studio reloads external edits automatically between commands. An incomplete
+key sequence waits up to one second, then uses the matching shorter mapping
+or the original keys. A missing file uses built-in bindings. Studio never
+overwrites an existing mapping file.
+
+This is a native subset of Vim. It does not load plugins or run Vimscript, and
+named registers are not supported.
 
 ### On a bare Linux console
 
@@ -615,7 +1002,8 @@ The default address is `127.0.0.1:9247`. Studio generates a new token each time
 you enable remote control, unless you set a token of your own. Use the
 remote-control panel to reveal or copy it. A client must authenticate before
 it can send keys or request the screen. An authenticated client has full
-control of the Studio interface.
+control of the Studio interface. Keys from a client use normal editing,
+even when Vim editor keys are on.
 
 Studio also writes each generated token to a file named
 `rustel-studio-remote-<random>.token` in the system temporary directory. The

@@ -370,34 +370,16 @@ impl Session {
     /// with the variants its onsets pick there: what the score is about to
     /// play, names it builds in JavaScript among them. Empty when the query
     /// did not finish.
-    ///
-    /// The plugins of the window load too, for the score of a live output.
-    /// This part needs no sample library.
     pub fn kick_sample_loads_within(
         &mut self,
         from_cycle: f64,
         cycles: f64,
         ceiling: Duration,
     ) -> Vec<(String, crate::sounds::Variants)> {
-        let library = self.samples.clone();
-        // A session with no sample library still has the plugins of its
-        // live output.
-        #[cfg(feature = "vst")]
-        let plugins = self.plugins_live();
-        #[cfg(not(feature = "vst"))]
-        let plugins = false;
-        if library.is_none() && !plugins {
-            return Vec::new();
-        }
-        let haps = self.window_haps(from_cycle, cycles, ceiling);
-        // A plugin loads as a sample does: before the first note asks.
-        #[cfg(feature = "vst")]
-        if plugins {
-            self.ensure_plugins(&haps);
-        }
-        let Some(library) = library else {
+        let Some(library) = self.samples.clone() else {
             return Vec::new();
         };
+        let haps = self.window_haps(from_cycle, cycles, ceiling);
         let mut resolved: std::collections::BTreeMap<String, std::collections::BTreeSet<i64>> =
             std::collections::BTreeMap::new();
         for sound in Self::sounds_in(&haps) {
@@ -443,51 +425,113 @@ impl Session {
     /// output holds on its slot is ready. A start that waits for its sounds
     /// waits while the count is above 0, and the caller decides how long.
     /// The call makes the host build each copy it counts, and waits for
-    /// nothing. A call less than [`PLUGIN_LOOK_EVERY`] after the look of the
-    /// same score gives the count of that look. A session with no live
-    /// output waits for no copy: the count is 0, with no call to the
-    /// plugin host.
+    /// nothing. The copies of the lanes that do not play load too, after
+    /// the others, and do not count. A call less than [`PLUGIN_LOOK_EVERY`]
+    /// after the look of the same score gives the count of that look. A
+    /// session with no live output waits for no copy: the count is 0, with
+    /// no call to the plugin host.
     #[cfg(feature = "vst")]
-    pub fn plugins_pending(&self, from_cycle: f64, cycles: f64, ceiling: Duration) -> usize {
+    pub fn plugins_pending(&mut self, from_cycle: f64, cycles: f64, ceiling: Duration) -> usize {
         if !self.plugins_live() {
             return 0;
         }
         let now = Instant::now();
         let generation = self.generation();
-        if let Some((looked, of, pending)) = self.plugin_look.get()
+        if let Some((looked, of, pending)) = self.plugin_look
             && of == generation
             && now.duration_since(looked) < PLUGIN_LOOK_EVERY
         {
             return pending;
         }
         // The notes of a look do not play now, so their console lines go.
+        // The lanes that do not play get the rest of the time.
         let haps = self
             .js
             .with_logs_dropped(|| self.window_haps(from_cycle, cycles, ceiling));
-        let pending = self.ensure_plugins(&haps);
-        self.plugin_look.set(Some((now, generation, pending)));
+        let (begin, end) = Self::window(from_cycle, cycles);
+        let shadow = self.shadow_haps(begin, end, now + ceiling);
+        let pending = self.ensure_plugins(&haps, &shadow.unwrap_or_default());
+        self.plugin_look = Some((now, generation, pending));
         pending
     }
 
     /// Makes the plugin host build each plugin copy that the haps of the
     /// score in play need, at the rate of the output: see
-    /// [`crate::vst::ensure`]. Gives the count of the copies not ready.
+    /// [`Self::ensure_wants`]. `shadow` has the haps of the lanes that do not
+    /// play. Gives the count of the copies of lanes that play and that are
+    /// not ready.
     #[cfg(feature = "vst")]
-    fn ensure_plugins(&self, haps: &[crate::HapJson]) -> usize {
+    pub(super) fn ensure_plugins(
+        &mut self,
+        haps: &[crate::HapJson],
+        shadow: &[crate::HapJson],
+    ) -> usize {
+        let wants = crate::vst::wants(&self.chains, &self.lanes, &self.csound, haps, shadow);
+        self.ensure_wants(&wants).len()
+    }
+
+    /// Makes the plugin host build each copy in `wants` that is not ready,
+    /// at the rate of the output: see [`crate::vst::ensure`]. Each copy the
+    /// host cannot make gives its reason as a plugin line, also for a lane
+    /// that does not play. Then the plugins the last evaluation ran start
+    /// their load, after these copies. Gives the copies of lanes that play
+    /// and that are not ready.
+    #[cfg(feature = "vst")]
+    pub(super) fn ensure_wants<'a>(
+        &mut self,
+        wants: &'a [crate::vst::Want],
+    ) -> Vec<&'a crate::vst::Want> {
         let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
-        let wants = crate::vst::wants(haps, |value| crate::vst::live_chain(&self.chains, value));
-        crate::vst::ensure(&wants, rate).len()
+        let (pending, lines) = crate::vst::ensure(wants, rate);
+        self.report_plugin_lines(lines);
+        self.load_ran_plugins();
+        pending
     }
 
     /// The haps the active score has from `from_cycle` for `cycles`. Empty
     /// when the query does not finish within `ceiling`.
     fn window_haps(&self, from_cycle: f64, cycles: f64, ceiling: Duration) -> Vec<crate::HapJson> {
-        let begin = Fraction::from_f64(from_cycle.max(0.0)).unwrap_or(Fraction::ZERO);
-        let span = Fraction::from_f64(cycles.max(1.0)).unwrap_or(Fraction::int(2));
+        let (begin, end) = Self::window(from_cycle, cycles);
         let ceiling = Instant::now() + ceiling;
-        rustel_core::with_query_deadline(ceiling, || self.query_report(begin, begin.add(span)))
+        rustel_core::with_query_deadline(ceiling, || self.query_report(begin, end))
             .map(|report| report.haps)
             .unwrap_or_default()
+    }
+
+    /// The haps of the lanes of the active score that do not play now, its
+    /// muted lanes and the lanes a solo drops, from `begin` to `end`. Each
+    /// hap has the lane and the plugins it has when it plays: see
+    /// [`JsRuntime::query_shadow`]. `None` when the query does not end
+    /// before `deadline`, or when it passes the hap cap: see
+    /// [`Self::set_query_hap_budget`].
+    #[cfg(feature = "vst")]
+    pub(super) fn shadow_haps(
+        &self,
+        begin: Fraction,
+        end: Fraction,
+        deadline: Instant,
+    ) -> Option<Vec<crate::HapJson>> {
+        // A score of a session with no plugin call in an evaluation has no
+        // shadow: such a session asks the score nothing here.
+        if !self.ran_plugin_calls {
+            return Some(Vec::new());
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        let shadow = rustel_core::with_query_deadline(deadline, || {
+            self.query_bounded(|cancellation| {
+                let cap = self.scheduler.query_hap_budget();
+                self.js.query_shadow(begin, end, left, cap, cancellation)
+            })
+        });
+        shadow.ok().map(|haps| haps_to_json(&haps))
+    }
+
+    /// The cycles from `from_cycle` for `cycles`: one cycle at least, from
+    /// cycle 0 at the earliest.
+    fn window(from_cycle: f64, cycles: f64) -> (Fraction, Fraction) {
+        let begin = Fraction::from_f64(from_cycle.max(0.0)).unwrap_or(Fraction::ZERO);
+        let span = Fraction::from_f64(cycles.max(1.0)).unwrap_or(Fraction::int(2));
+        (begin, begin.add(span))
     }
 
     fn sounds_in(haps: &[crate::HapJson]) -> Vec<WindowSound> {

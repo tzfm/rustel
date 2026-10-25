@@ -70,6 +70,7 @@ pub(super) struct RecoveryPrebake {
 struct RecoveryCheckpoint {
     source: Option<(Arc<str>, bool)>,
     prebakes: Arc<Vec<RecoveryPrebake>>,
+    csound: crate::CsoundSnapshot,
     settings: RuntimeSettings,
     cps: f64,
     cycle: f64,
@@ -197,10 +198,17 @@ impl Session {
             .audible_source
             .as_ref()
             .map_or(settings, |source| source.settings.clone());
+        let csound = self.csound_snapshot();
+        #[cfg(feature = "device-audio")]
+        let csound = self
+            .audible_source
+            .as_ref()
+            .map_or(csound, |source| source.csound.clone());
         RecoveryCheckpoint {
             source,
             settings,
             prebakes: self.recovery_prebakes.clone(),
+            csound,
             cps,
             cycle,
             query_hap_budget: self.scheduler.query_hap_budget(),
@@ -242,22 +250,26 @@ impl Session {
             .set_query_hap_budget(checkpoint.query_hap_budget);
         fresh.scheduler.set_trace_enabled(checkpoint.trace_enabled);
         fresh.samples = self.samples.clone();
+        fresh.csound = self.csound.clone();
         fresh.direct_diagnostic_logging = self.direct_diagnostic_logging;
         fresh.audio_input_channels = self.audio_input_channels;
         fresh.schedule_lead = self.schedule_lead;
         fresh.continuity_margin = self.continuity_margin;
         // The replayed score takes over on a frame of the same device.
         fresh.live_sample_rate = self.live_sample_rate;
-        // The output keeps its plugins and its rate. Its names source reads
-        // the chains of this session, so the rebuilt session keeps the same
-        // chains. Each lane keeps its number, so the replayed score has the
-        // chains it had.
+        // The output keeps its plugins and its rate. Its names source and its
+        // values source read the chains of this session, so the rebuilt
+        // session keeps the same chains, with the flag of their slider links.
+        // Each lane keeps its number, so the replayed score has the chains it
+        // had. A plugin call of an evaluation before stays known.
         #[cfg(feature = "vst")]
         {
             let live = self.plugins_live.load(std::sync::atomic::Ordering::Relaxed);
             fresh.plugins_live = AtomicBool::new(live);
             fresh.plugin_rate = std::mem::take(&mut self.plugin_rate);
+            fresh.ran_plugin_calls = self.ran_plugin_calls;
             fresh.chains = self.chains.clone();
+            fresh.slider_links = self.slider_links.clone();
             fresh.lanes = std::mem::take(&mut self.lanes);
         }
         // An edit that waits for its plugin copies waits on, with its plan in
@@ -318,6 +330,8 @@ impl Session {
                     replayed_voicings = Some(self.js.snapshot_published_runtime_settings());
                 }
             }
+            // Setup may replay older orchestra definitions.
+            self.restore_csound_snapshot(&checkpoint.csound);
             // Match the old lease identity, never a private token from another realm.
             if let Some(replayed) = replayed_voicings
                 && replayed.host_voicing_identity().is_some()
@@ -352,8 +366,10 @@ impl Session {
                     source: source.clone(),
                     mini: *mini,
                     settings: self.js.snapshot_published_runtime_settings(),
+                    csound: self.csound_snapshot(),
                     cps: checkpoint.cps,
                     cycle_zero_time: now - checkpoint.cycle / checkpoint.cps,
+                    evaluated_cycle: self.installed_cycle,
                 });
             }
             return Ok(checkpoint.source.is_some());
@@ -369,6 +385,7 @@ impl Session {
         let mut fallback = checkpoint;
         if fallback.source.take().is_none() {
             fallback.prebakes = Arc::default();
+            fallback.csound = crate::CsoundSnapshot::default();
         }
         self.rebuild_after_panic(now, fallback)?;
         Ok(false)
@@ -425,6 +442,14 @@ mod tests {
             SessionPanicPoint::Install,
         ] {
             let mut session = playing_session();
+            // A score before ran a plugin call. The replay runs none, and
+            // the rebuilt session still knows the call.
+            #[cfg(feature = "vst")]
+            {
+                let plugin = format!("{GOOD}.vst('Delay')");
+                session.evaluate(&plugin).expect("plugin score");
+                session.evaluate(GOOD).expect("initial score");
+            }
             let transport = session.transport();
             let generation = session.generation();
             let cycle = session.cycle_at_time(0.5);
@@ -434,6 +459,11 @@ mod tests {
                 .expect_err("candidate panics");
             assert_panic(error, &format!("{point:?}"));
             assert_eq!(session.active_source(), Some(GOOD));
+            #[cfg(feature = "vst")]
+            assert!(
+                session.ran_plugin_calls(),
+                "the rebuilt session lost its plugin call"
+            );
             assert!(Arc::ptr_eq(&session.transport(), &transport));
             assert!(!transport.is_stopped());
             assert!(session.generation() > generation);
@@ -496,6 +526,14 @@ mod tests {
             super::super::tests::plugin_note(&session)["__rustel_lane"],
             "#0",
             "the rebuilt session lost its lanes"
+        );
+        #[cfg(feature = "vst")]
+        assert!(
+            Arc::ptr_eq(
+                &session.slider_links,
+                &crate::vst::slider_links(&session.chains)
+            ),
+            "the rebuilt session lost the slider links of its chains"
         );
         #[cfg(feature = "vst")]
         assert!(
@@ -633,6 +671,25 @@ mod tests {
                     .expect("good source still schedules")
                     .is_empty()
             );
+        }
+        // The commit seam reads the lanes of a candidate that do not play,
+        // and the read panics 2 times. The score in play stays.
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        {
+            let _plugins = super::super::tests::fixture_plugins();
+            let mut session = playing_session();
+            let relaxed = std::sync::atomic::Ordering::Relaxed;
+            session.plugins_live.store(true, relaxed);
+            session.plugin_rate.store(48_000, relaxed);
+            let candidate = format!("$: {CANDIDATE}\n_$: {GOOD}.vst('rustel fixture')");
+            let stopped = AtomicBool::new(false);
+            for now in [0.1, 0.2] {
+                session.schedule_through(now, now).expect("cover");
+                session.inject_panic_for_test(SessionPanicPoint::Query);
+                let reload = session.reload_live(&candidate, false, &stopped, || now + 0.05);
+                reload.expect_err("the read of the muted lane panics");
+                assert_eq!(session.active_source(), Some(GOOD));
+            }
         }
     }
 
@@ -1008,6 +1065,33 @@ mod tests {
         session.reload_at(GOOD, false, 0.5).expect("next edit");
     }
 
+    #[test]
+    fn recovery_discards_an_orchestra_after_its_permission_is_revoked() {
+        let mut config = SessionConfig::default();
+        config.score_import_access.permit_csound();
+        let mut session = Session::with_config(config).expect("session");
+        if let Err(error) = session.evaluate_prebake("loadCSound`instr recoveryVoice\nendin`") {
+            if std::env::var_os("RUSTEL_CSOUND_LIBRARY").is_none()
+                && error.to_string().contains("Csound 6 is not available")
+            {
+                return;
+            }
+            panic!("load orchestra: {error}");
+        }
+        session
+            .evaluate("note('c4').csound('recoveryVoice')")
+            .expect("source uses orchestra");
+        session.set_score_import_access(crate::ScoreImportAccess::default());
+        let error = session
+            .with_panic_recovery::<()>(0.5, |_| panic!("host query panic"))
+            .expect_err("host panic is caught");
+        assert!(error.to_string().contains("fresh Session ready"), "{error}");
+        assert_eq!(session.active_source(), None);
+        assert!(session.recovery_prebakes.is_empty());
+        assert_eq!(session.csound_snapshot(), crate::CsoundSnapshot::default());
+        session.reload_at(GOOD, false, 0.5).expect("next edit");
+    }
+
     use super::*;
     use crate::session::tests::*;
     #[cfg(all(feature = "vst", feature = "device-audio"))]
@@ -1267,9 +1351,54 @@ mod tests {
             "s:bd"
         );
 
+        match rustel_csound::Program::compile(&[]) {
+            Ok(_) => {
+                let mut config = SessionConfig::default();
+                config.score_import_access.permit_csound();
+                let mut session = Session::with_config(config).expect("native session");
+                session
+                    .evaluate_prebake(
+                        "loadCSound`instr probe\naOut init .025\nouts aOut,aOut\nendin`",
+                    )
+                    .expect("audible definition");
+                session
+                    .evaluate("note('c4').csound('probe')")
+                    .expect("audible reference");
+                session
+                    .mark_audible_generation(session.generation())
+                    .expect("retain audible orchestra");
+                let audible = session.csound_snapshot();
+                session
+                    .reload_at(
+                        "loadCSound`instr probe\naOut init .1\nouts aOut,aOut\nendin`\nsilence",
+                        false,
+                        0.1,
+                    )
+                    .expect("unconfirmed orchestra");
+                assert_ne!(session.csound_snapshot(), audible);
+                assert_eq!(
+                    session
+                        .rollback_to_previous_source(0.2)
+                        .expect("restore audible orchestra"),
+                    RollbackAttempt::Applied
+                );
+                assert_eq!(session.csound_snapshot(), audible);
+            }
+            Err(error)
+                if std::env::var_os("RUSTEL_CSOUND_LIBRARY").is_none()
+                    && error.contains("Csound 6 is not available") => {}
+            Err(error) => panic!("configured native Csound failed: {error}"),
+        }
+
+        // The session has a live output, so a chain counts the turns of its
+        // producer. No turn runs here: a lane that leaves keeps its chain.
         #[cfg(feature = "vst")]
         {
+            let _plugins = fixture_plugins();
             let mut session = Session::new().expect("session");
+            let relaxed = std::sync::atomic::Ordering::Relaxed;
+            session.plugins_live.store(true, relaxed);
+            session.plugin_rate.store(48_000, relaxed);
             let source = r#"$: s("sine").vst("Delay").orbit(1)"#;
             session.evaluate(source).expect("audible plugin source");
             session
@@ -1277,7 +1406,6 @@ mod tests {
                 .expect("retain playing source");
             let chain = plugin_chain(&session);
             let moved = source.replace("orbit(1)", "orbit(2)");
-            assert_eq!(session.plugin_calls_for_source(&moved)[0].orbit, Some(2));
             session.reload_at(&moved, false, 0.1).expect("move to two");
             assert_eq!(plugin_chain(&session), chain);
             // A cancelled text with a different lane. Then an edit of the
@@ -1312,13 +1440,9 @@ mod tests {
             assert_eq!(plugin_note(&session)["__rustel_lane"], "#0");
             assert_eq!(plugin_chain(&session), chain);
 
-            // A live output, and a plugin with no copy ready. An edit waits,
-            // and a rollback in the same state plays at once. The commit of
-            // the rollback reads a clock past the cover, so it comes last.
-            let _plugins = fixture_plugins();
-            let relaxed = std::sync::atomic::Ordering::Relaxed;
-            session.plugins_live.store(true, relaxed);
-            session.plugin_rate.store(48_000, relaxed);
+            // A plugin with no copy ready. An edit waits, and a rollback in
+            // the same state plays at once. The commit of the rollback reads
+            // a clock past the cover, so it comes last.
             let edit = format!("{source}\n$: note(\"c3\").s(\"sine\").vst(\"rustel fixture\")");
             let reserve = Duration::from_millis(1);
             let stopped = AtomicBool::new(false);

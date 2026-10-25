@@ -157,6 +157,7 @@ impl ManualLiveOutput {
             backend,
             meters,
             gate,
+            underruns: PlaybackUnderruns::new(buffer_frames, sample_rate),
             _same_thread: std::marker::PhantomData,
         })
     }
@@ -169,6 +170,22 @@ impl ManualLiveOutput {
     pub fn render(&mut self, output: &mut [f32]) {
         let shared = &self.device.shared;
         self.gate.render_or_silence(output, |output| {
+            write_live_output(&mut self.backend, &mut self.meters, output, 2, shared);
+        });
+    }
+
+    /// Render as an output on Windows does when its playback clock gives
+    /// `playback_nanos` for this buffer, from the first buffer on, and the
+    /// buffer plays `latency_nanos` after its callback. The output counts its
+    /// underruns from the clock.
+    pub fn render_at(&mut self, output: &mut [f32], playback_nanos: u64, latency_nanos: u64) {
+        let shared = &self.device.shared;
+        self.gate.render_or_silence(output, |output| {
+            shared
+                .buffer_playback_nanos
+                .store(playback_nanos, Ordering::Release);
+            self.underruns
+                .observe(playback_nanos, latency_nanos, output.len() / 2, shared);
             write_live_output(&mut self.backend, &mut self.meters, output, 2, shared);
         });
     }
@@ -240,6 +257,7 @@ impl LiveScalarDevice {
     pub fn report(&self) -> LiveDeviceReport {
         let mut report = self.shared.report(self.stream_id);
         report.playhead_nanos = self.clock_nanos();
+        report.plugin_workers = self.ready_plugin_workers();
         let violations = tripwire::Violations::capture()
             .since(self.tripwire_baseline)
             .since(self.tripwire_canaries);
@@ -403,6 +421,111 @@ impl CallbackProAudio {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl CallbackRealTime {
+    /// The class for a stream of `frames` at `rate`.
+    pub(super) fn new(frames: u32, rate: u32) -> Self {
+        Self {
+            frames,
+            rate,
+            asked: false,
+            promoted: None,
+        }
+    }
+
+    /// Promotes the calling thread at the first call that finds
+    /// `workers_ready` set. A worker with the class proves that the system
+    /// gives the class to the process, so the call meets no refusal, whose
+    /// error the crate allocates. Until then the thread keeps its priority.
+    pub(super) fn promote_once(&mut self, workers_ready: &AtomicBool) {
+        if !self.asked && workers_ready.load(Ordering::Acquire) {
+            self.asked = true;
+            self.promoted =
+                audio_thread_priority::promote_current_thread_to_real_time(self.frames, self.rate)
+                    .ok()
+                    .map(|handle| (handle, std::thread::current().id()));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for CallbackRealTime {
+    fn drop(&mut self) {
+        if let Some((handle, thread)) = self.promoted.take()
+            && thread == std::thread::current().id()
+        {
+            let _ = audio_thread_priority::demote_current_thread_from_real_time(handle);
+        }
+    }
+}
+
+#[cfg(any(windows, feature = "test-support"))]
+impl PlaybackUnderruns {
+    /// The count of a stream of `buffer_frames` at `sample_rate`.
+    pub(super) fn new(buffer_frames: u32, sample_rate: u32) -> Self {
+        let sample_rate = u64::from(sample_rate.max(1));
+        Self {
+            sample_rate,
+            buffer_nanos: (u64::from(buffer_frames) * 1_000_000_000 / sample_rate) as i64,
+            submitted: 0,
+            ahead: None,
+            base: 0,
+            rising: Some(0),
+            latency: 0,
+        }
+    }
+
+    /// Reads the clock at a buffer of `frames` that plays `playback_nanos`
+    /// after the first buffer and `latency_nanos` after its callback. An
+    /// underrun adds 1 to the xruns of `shared`. A stream that reported an
+    /// error counts none.
+    pub(super) fn observe(
+        &mut self,
+        playback_nanos: u64,
+        latency_nanos: u64,
+        frames: usize,
+        shared: &LiveShared,
+    ) {
+        // At a change of the default device, Windows moves the stream to the
+        // new device. cpal then reports an error. The gap of that move is no
+        // underrun.
+        if shared.failed.load(Ordering::Acquire) {
+            return;
+        }
+        let submitted_nanos =
+            (u128::from(self.submitted) * 1_000_000_000 / u128::from(self.sample_rate)) as i64;
+        self.submitted += frames as u64;
+        let ahead = (playback_nanos as i64).saturating_sub(submitted_nanos);
+        // The first buffer has no rise to read.
+        let rise = self
+            .ahead
+            .map_or(i64::MAX, |last| ahead.saturating_sub(last));
+        self.ahead = Some(ahead);
+        self.latency = self.latency.max(latency_nanos as i64);
+        // WASAPI calls back at its device period, also with a larger buffer.
+        let frames_nanos = (frames as u64 * 1_000_000_000 / self.sample_rate) as i64;
+        if let Some(from) = self.rising {
+            // The clock holds still once it moves a quarter of the time of
+            // these frames or less. A clock that moves ahead for longer than
+            // the latency and 2 buffers plays silence.
+            if rise <= frames_nanos / 4 {
+                self.base = ahead;
+                self.rising = None;
+            } else if submitted_nanos - from <= self.latency.saturating_add(2 * self.buffer_nanos) {
+                self.base = ahead;
+            } else {
+                self.rising = None;
+            }
+        } else if ahead > self.base.saturating_add(2 * self.buffer_nanos) {
+            shared.callback_xruns.fetch_add(1, Ordering::Relaxed);
+            self.rising = Some(submitted_nanos);
+        } else {
+            // 1/1024 of the time of these frames: about 1 ms a second.
+            self.base = ahead.min(self.base.saturating_add(frames_nanos / 1024));
+        }
+    }
+}
+
 pub(super) fn write_live_output<T>(
     backend: &mut LiveScalarBackend,
     meters: &mut LiveCallbackMeters,
@@ -447,20 +570,15 @@ fn write_live_output_inner<T>(
     backend.drain_sample_installs(&shared.samples);
     backend.retire_kabel_programs(&shared.samples, &shared.ring, &shared.immediate);
     backend.drain_reverb_installs(&shared.samples);
+    // The producer names a chain before it ships the first insert of the
+    // chain, so the names go first.
+    take_named_insert_chains(backend, shared);
     backend.drain_insert_installs(&shared.samples);
-    // A new list of named chains, when the producer does not write it now.
-    let list = shared.insert_named_list.load(Ordering::Acquire);
-    if list != backend.named_insert_list() && list.is_multiple_of(2) {
-        let mut named = [u64::MAX; crate::insert::MAX_INSERT_BUSES];
-        for (name, slot) in named.iter_mut().zip(shared.insert_named.iter()) {
-            *name = slot.load(Ordering::Acquire);
-        }
-        if shared.insert_named_list.load(Ordering::Acquire) == list {
-            backend.set_named_insert_chains(list, &named);
-        }
-    }
     for update in shared.live_controls.drain_available() {
         backend.set_live_control(update);
+    }
+    for value in shared.insert_values.drain_available() {
+        backend.set_insert_value(value);
     }
     let mut scratch = [0.0f32; BLOCK * 2];
     let mut rendered = 0usize;
@@ -491,6 +609,13 @@ fn write_live_output_inner<T>(
         shared
             .rendering_until_frame
             .store(end_frame, Ordering::Release);
+        for ring in [&shared.ring, &shared.immediate] {
+            ring.publish_frontier(
+                start.saturating_add(rendered as u64),
+                end_frame,
+                meters.sample_rate,
+            );
+        }
         backend.set_max_polyphony(shared.max_polyphony.load(Ordering::Relaxed));
         let visual_analysis_mask = shared.visual_analysis_mask.load(Ordering::Acquire);
         let visual_generation_floor = shared
@@ -504,6 +629,9 @@ fn write_live_output_inner<T>(
             *gain = f32::from_bits(slot.load(Ordering::Relaxed));
         }
         backend.set_orbit_gains(&orbit_gains);
+        // A list the producer wrote during this callback goes before the
+        // inserts this block takes.
+        take_named_insert_chains(backend, shared);
         // Bound admission before reading Stop. Events published after a
         // concurrent stop/resume belong to the next running block.
         let ring_end = shared.ring.published_end();
@@ -535,6 +663,11 @@ fn write_live_output_inner<T>(
             stop_state != OUTPUT_RUNNING,
             Some(&shared.samples),
         );
+        if backend.intake_is_running() {
+            shared
+                .completed_intake_frame
+                .store(end_frame, Ordering::Release);
+        }
         report.accepted += immediate.accepted;
         report.refused += immediate.refused;
         // Visuals follow the score independently of listening volume and
@@ -688,6 +821,12 @@ fn write_live_output_inner<T>(
         // certify the actual generation selected for the sub-block.
         backend.confirmation_copied(start.saturating_add(rendered as u64), end_frame);
         rendered += count;
+        // The gate of the plugin workers opens when the time so far passes
+        // 80% of the time of the frames so far. So a heavy start posts its
+        // jobs from its next sub-block.
+        backend.end_pool_sub_block(rendered, || {
+            (shared.clock_base.elapsed().as_nanos() as u64).saturating_sub(entered_nanos)
+        });
     }
     shared
         .frames
@@ -701,10 +840,25 @@ fn write_live_output_inner<T>(
     // clock and publishing atomics allocate nothing inside the callback.
     let now_nanos = shared.clock_base.elapsed().as_nanos() as u64;
     let busy_nanos = now_nanos.saturating_sub(entered_nanos);
+    // The plugin workers park until the next buffer, the load of this one
+    // moves their gate, and the figures of its jobs go to the report.
+    let plugins = backend.end_pool_buffer(frame_count, busy_nanos);
+    if let Some(plugins) = plugins {
+        shared
+            .plugin_jobs_inline
+            .fetch_add(plugins.inline_jobs, Ordering::Relaxed);
+        shared
+            .plugin_join_wait_nanos
+            .fetch_add(plugins.join_wait_nanos, Ordering::Relaxed);
+        shared
+            .plugin_late_jobs
+            .fetch_add(plugins.late_jobs, Ordering::Relaxed);
+    }
     if measure_load {
         meters.load.observe(
             frame_count,
             busy_nanos,
+            plugins.unwrap_or_default(),
             meters.sample_rate,
             &shared.realtime_load,
         );
@@ -735,6 +889,22 @@ fn write_live_output_inner<T>(
     }
 }
 
+/// Takes a new list of named chains, when the producer does not write it
+/// now: see [`LiveScalarDevice::set_named_insert_chains`].
+fn take_named_insert_chains(backend: &mut LiveScalarBackend, shared: &LiveShared) {
+    let list = shared.insert_named_list.load(Ordering::Acquire);
+    if list == backend.named_insert_list() || !list.is_multiple_of(2) {
+        return;
+    }
+    let mut named = [u64::MAX; crate::insert::MAX_INSERT_BUSES];
+    for (name, slot) in named.iter_mut().zip(shared.insert_named.iter()) {
+        *name = slot.load(Ordering::Acquire);
+    }
+    if shared.insert_named_list.load(Ordering::Acquire) == list {
+        backend.set_named_insert_chains(list, &named);
+    }
+}
+
 pub(super) fn write_output<T>(
     backend: &mut ScalarBackend,
     output: &mut [T],
@@ -758,6 +928,7 @@ pub(super) fn write_output<T>(
     let mut rendered = 0usize;
     while rendered < frames {
         let count = (frames - rendered).min(BLOCK);
+        backend.notify_pending_inserts_early(count);
         backend.process_block(&mut scratch[..count * 2], count);
         for frame in 0..count {
             let output_frame =
@@ -1623,7 +1794,7 @@ mod tests {
                 stretch: Some(2.0),
                 ..Default::default()
             };
-            assert!(shared.ring.push(AudioEvent {
+            let event = AudioEvent {
                 onset_id: 1,
                 generation: 1,
                 target_frame: 0,
@@ -1637,7 +1808,8 @@ mod tests {
                 synth: None,
                 wavetable: None,
                 cut: None,
-            }));
+            };
+            assert!(shared.ring.push(event.clone()));
             let mut backend = LiveScalarBackend::new(48_000, 4).expect("live scalar");
             let mut meters = test_meter();
             let mut output = [0.0f32; 128 * 2];
@@ -1646,6 +1818,7 @@ mod tests {
             });
             let pressure = backend.pressure_observation();
             assert_eq!(pressure.active_voices, 1);
+            assert_eq!(shared.completed_intake_frame.load(Ordering::Acquire), 128);
             assert_eq!(
                 pressure.active_pool_leases[crate::pressure::RealtimePool::Stretch.index()],
                 1
@@ -1654,12 +1827,20 @@ mod tests {
             assert!(tripwire::allocator_is_armed());
             let before = tripwire::Violations::capture();
             shared.request_stop();
+            shared.stop.resume();
+            assert!(shared.ring.push(AudioEvent {
+                onset_id: 2,
+                target_frame: 128,
+                ..event
+            }));
             // The 10 ms ramp spans four 128-frame callbacks. The last one
             // resets the voices and returns the lease.
             for _ in 0..4 {
                 tripwire::audio_scope(|| {
                     write_live_output(&mut backend, &mut meters, &mut output, 2, &shared)
                 });
+                assert_eq!(shared.completed_intake_frame.load(Ordering::Acquire), 128);
+                assert_eq!(shared.ring.len(), 1);
             }
             let violations = tripwire::Violations::capture().since(before);
             assert!(
@@ -1673,6 +1854,14 @@ mod tests {
                 pressure.active_pool_leases[crate::pressure::RealtimePool::Stretch.index()],
                 0
             );
+            assert_eq!(shared.clock_frames(), 640);
+            tripwire::audio_scope(|| {
+                write_live_output(&mut backend, &mut meters, &mut output, 2, &shared)
+            });
+            assert_eq!(shared.completed_intake_frame.load(Ordering::Acquire), 768);
+            assert_eq!(shared.ring.len(), 0);
+            assert_eq!(backend.pressure_observation().active_voices, 1);
+            assert!(tripwire::Violations::capture().since(before).clean());
         }
 
         #[test]
@@ -2149,6 +2338,175 @@ mod tests {
                 report.accepted_events, 1,
                 "exactly one onset should have fit: {report:?}"
             );
+        }
+
+        /// An output on Windows counts an underrun when its playback clock
+        /// runs more than 2 buffers ahead of the frames it submitted. A gap
+        /// counts once, also when a device with a long latency shows it over
+        /// 10 buffers. The start, also on such a device and with a buffer of
+        /// 2048 frames, a stop, a parked output in a long silence, the start
+        /// of a new stream and a failed stream count none. The gaps of a set
+        /// over its budget add up and count, also from the start of a stream
+        /// and with a buffer longer than the device period. The clocks copy
+        /// the ones a WASAPI output gives.
+        #[cfg(feature = "test-support")]
+        #[test]
+        fn a_gap_in_the_playback_clock_counts_one_underrun() {
+            /// Renders a buffer of 10 ms for each step, with the clock the
+            /// step's microseconds ahead of the frames, and gives the count.
+            /// The device plays each buffer `latency` microseconds after its
+            /// callback.
+            fn play(
+                manual: &mut ManualLiveOutput,
+                latency: u64,
+                ahead: impl IntoIterator<Item = u64>,
+            ) -> u64 {
+                let frames = u64::from(manual.device().sample_rate()) / 100;
+                let mut output = vec![0.0f32; frames as usize * 2];
+                for ahead in ahead {
+                    let buffers = manual.device().clock_frames() / frames;
+                    manual.render_at(
+                        &mut output,
+                        buffers * 10_000_000 + ahead * 1_000,
+                        latency * 1_000,
+                    );
+                }
+                manual.device().report().callback_xruns
+            }
+            let options = LiveOutputOptions::default()
+                .with_buffer_preference(crate::AudioBufferPreference::Frames(480));
+            let mut manual =
+                ManualLiveOutput::new_with_samples_and_options(48_000, 7, &[], options)
+                    .expect("manual output");
+            // The device plays each buffer 32 ms after its callback, and it
+            // starts to play 25 ms after the first buffer.
+            assert_eq!(
+                play(&mut manual, 32_000, [0, 15_200, 25_200, 25_300, 25_400]),
+                0
+            );
+            // A gap of 29 ms shows over 3 buffers. It counts once, also while
+            // the clock stays ahead.
+            assert_eq!(play(&mut manual, 32_000, [35_300, 43_800, 54_300]), 1);
+            assert_eq!(play(&mut manual, 32_000, [54_300; 100]), 1);
+            // A gap of 19 ms counts none.
+            assert_eq!(play(&mut manual, 32_000, [73_300; 100]), 1);
+            // After a long gap the device takes 2 buffers to play again.
+            assert_eq!(
+                play(&mut manual, 32_000, [133_300, 143_800, 154_300, 154_300]),
+                2
+            );
+            // A set over its budget leaves a gap of 2 ms in each buffer. The
+            // gaps add up and count.
+            assert_eq!(
+                play(
+                    &mut manual,
+                    32_000,
+                    (1..=20).map(|step| 154_300 + step * 2_000)
+                ),
+                3
+            );
+            // A stop parks the output, and 100 s of silence follow. The clock
+            // of the device runs 400 ppm slower than the system clock: 40 ms
+            // in all.
+            manual.device().stop();
+            assert_eq!(
+                play(
+                    &mut manual,
+                    32_000,
+                    (0..10_000).map(|step| 194_300 + step * 4)
+                ),
+                3
+            );
+            assert!(manual.device().report().stop_acknowledged);
+            manual.device().resume();
+            // The base follows a clock that falls back, so a gap of 25 ms from
+            // there counts.
+            assert_eq!(play(&mut manual, 32_000, [224_300; 4]), 3);
+            assert_eq!(play(&mut manual, 32_000, [249_300]), 4);
+            // A recycle gives a new stream with a new callback. The output
+            // keeps its count. The new callback reads the clock from its own
+            // first buffer, so its start adds none.
+            manual.underruns = PlaybackUnderruns::new(480, 48_000);
+            assert_eq!(
+                play(&mut manual, 32_000, [0, 15_200, 25_200, 25_300, 25_400]),
+                4
+            );
+            assert_eq!(play(&mut manual, 32_000, [54_300]), 5);
+            // A set far over its budget leaves a gap of 5 ms in each buffer,
+            // so the clock never holds still. The base holds after the latency
+            // and 2 buffers, and the gaps add up and count.
+            assert_eq!(
+                play(
+                    &mut manual,
+                    32_000,
+                    (1..=100).map(|step| 54_300 + step * 5_000)
+                ),
+                15
+            );
+            // A stall of 40 ms that shows over 3 buffers counts once.
+            assert_eq!(play(&mut manual, 32_000, [554_300; 10]), 15);
+            assert_eq!(
+                play(&mut manual, 32_000, [569_300, 584_300, 594_300, 594_300]),
+                16
+            );
+            // A stream that starts in such a set counts too. The base follows
+            // its clock for the latency and 2 buffers first.
+            manual.underruns = PlaybackUnderruns::new(480, 48_000);
+            assert_eq!(
+                play(&mut manual, 32_000, (0..11).map(|step| step * 5_000)),
+                17
+            );
+            // WASAPI calls back each 480 frames, also with a buffer of 2048
+            // frames. A gap of 3 ms each second adds up and counts once in a
+            // minute.
+            manual.underruns = PlaybackUnderruns::new(2048, 48_000);
+            assert_eq!(
+                play(
+                    &mut manual,
+                    32_000,
+                    (0..6_000).map(|step| step / 100 * 3_000)
+                ),
+                18
+            );
+            // A Bluetooth headset on a buffer of 2048 frames: the callback
+            // still brings 480 frames, and the clock runs 10 ms further ahead
+            // in each of its first 15 buffers. Its start counts none.
+            manual.underruns = PlaybackUnderruns::new(2048, 48_000);
+            assert_eq!(
+                play(
+                    &mut manual,
+                    170_000,
+                    (0..20).map(|step| step.min(15) * 10_000)
+                ),
+                18
+            );
+            // A Bluetooth headset plays each buffer 170 ms after its callback.
+            // Its clock runs 10 ms further ahead in each of its first 15
+            // buffers, and its start counts none. A gap of 100 ms shows over
+            // 10 buffers there and counts once.
+            manual.underruns = PlaybackUnderruns::new(480, 48_000);
+            assert_eq!(
+                play(
+                    &mut manual,
+                    170_000,
+                    (0..20).map(|step| step.min(15) * 10_000)
+                ),
+                18
+            );
+            assert_eq!(
+                play(
+                    &mut manual,
+                    170_000,
+                    (1..=12).map(|step| 150_000 + step.min(10) * 10_000)
+                ),
+                19
+            );
+            // A change of the default device fails the stream. Windows then
+            // moves the stream to the new device. The gap of that move counts
+            // none.
+            assert_eq!(play(&mut manual, 170_000, [250_000; 4]), 19);
+            manual.device().fail_output_stream_for_test();
+            assert_eq!(play(&mut manual, 170_000, [350_000; 4]), 19);
         }
     }
     mod confirmation {
@@ -2893,5 +3251,62 @@ mod tests {
             assert_eq!(backend.pressure_observation().active_voices, 1);
             assert!(output.iter().any(|sample| sample.abs() > 0.001));
         }
+    }
+
+    /// A turn of the producer names a chain, then ships its first copy. The
+    /// callback takes the names first, so the copy that finds no free bus
+    /// starts the fade of a chain with no name. The bus of that chain is
+    /// free after the fade, and its copy goes back.
+    #[test]
+    fn a_copy_finds_the_name_its_turn_wrote_before_it() {
+        struct Probe;
+        impl crate::insert::OrbitInsert for Probe {
+            fn key(&self) -> crate::insert::InsertKey {
+                crate::insert::InsertKey::default()
+            }
+            fn set_param(&mut self, _: crate::insert::InsertParam, _: u32) {}
+            fn process(&mut self, _: &mut [f32], _: &mut [f32]) {}
+        }
+        let install = |chain: u64| crate::assets::InsertInstall {
+            slot: crate::insert::effect_slot(chain, 0),
+            sample_rate: 48_000,
+            insert: Box::into_raw(Box::new(Probe) as Box<dyn crate::insert::OrbitInsert>),
+        };
+        let shared = LiveShared::new(1);
+        let mut backend = LiveScalarBackend::new(48_000, 4).expect("live scalar");
+        let mut meters = test_meter();
+        let mut output = [0.0f32; 128 * 2];
+        let mut render = |backend: &mut LiveScalarBackend| {
+            tripwire::audio_scope(|| {
+                write_live_output(backend, &mut meters, &mut output, 2, &shared)
+            });
+        };
+        // The copies of 64 chains hold each bus.
+        for chain in 100..164 {
+            assert!(shared.samples.insert_installs.push(install(chain)).is_ok());
+        }
+        render(&mut backend);
+        // The list of the turn, as the producer writes it, then the copy.
+        shared.insert_named_list.fetch_add(1, Ordering::AcqRel);
+        for (at, slot) in shared.insert_named.iter().enumerate() {
+            slot.store(if at == 0 { 9000 } else { u64::MAX }, Ordering::Release);
+        }
+        shared.insert_named_list.fetch_add(1, Ordering::AcqRel);
+        assert!(shared.samples.insert_installs.push(install(9000)).is_ok());
+        render(&mut backend);
+        assert_eq!(
+            shared.samples.insert_returns.len(),
+            1,
+            "the copy with no bus"
+        );
+        // The fade lasts 480 frames.
+        for _ in 0..5 {
+            render(&mut backend);
+        }
+        assert_eq!(
+            shared.samples.insert_returns.len(),
+            2,
+            "the copy of the chain that faded"
+        );
     }
 }

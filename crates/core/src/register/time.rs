@@ -435,14 +435,14 @@ const SWING_BY: crate::reference::ReferenceEntry = crate::reference::ReferenceEn
     description: "The function `swingBy x n` breaks each cycle into `n` slices, and then delays events in the second half of each slice by the amount `x`, which is relative to the size of the (half) slice. So if `x` is 0 it does nothing, `0.5` delays for half the note duration, and 1 will wrap around to doing nothing again. The end result is a shuffle or swing-like rhythm",
     params: &[
         crate::reference::ReferenceParam {
-            name: "subdivision",
+            name: "amount",
             r#type: "number",
-            description: "",
+            description: "how far events in the second half of each slice move, relative to the half slice",
         },
         crate::reference::ReferenceParam {
-            name: "offset",
+            name: "subdivision",
             r#type: "number",
-            description: "",
+            description: "number of slices per cycle",
         },
     ],
     examples: &["s(\"hh*8\").swingBy(1/3, 4)"],

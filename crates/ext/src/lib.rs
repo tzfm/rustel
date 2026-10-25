@@ -9,7 +9,7 @@ pub mod rustel;
 pub mod switch_angel;
 pub mod undefined_aeon;
 
-use rustel_core::reference::ReferenceEntry;
+use rustel_core::reference::{ReferenceEntry, ReferenceNumber};
 use rustel_core::register::{Origin, Registry};
 use rustel_core::{Pattern, Value};
 
@@ -30,6 +30,9 @@ pub struct Extension {
     pattern_callables: &'static [PatternCallable],
     value_callables: &'static [ValueCallable],
     reference_groups: &'static [&'static [ReferenceEntry]],
+    /// The travel and step a slider gives each numeric parameter of the
+    /// collection's entries.
+    reference_numbers: &'static [ReferenceNumber],
 }
 
 /// Every extension collection compiled into this binary.
@@ -106,6 +109,8 @@ pub enum PatternCallableBehavior {
     WriteState {
         key: &'static str,
     },
+    /// Receives the cycle that `getTime()` returns at the call.
+    ReadCycle(fn(f64, &[Pattern], Option<&Pattern>) -> Pattern),
 }
 
 /// One native pattern-returning global and/or Pattern method.
@@ -164,9 +169,32 @@ pub fn reference_entries() -> impl Iterator<Item = &'static ReferenceEntry> {
         .flat_map(|group| group.iter())
 }
 
+/// The travel and step the extensions give the numeric parameters of their
+/// entries.
+pub fn reference_numbers() -> impl Iterator<Item = &'static ReferenceNumber> {
+    EXTENSIONS
+        .iter()
+        .flat_map(|extension| extension.reference_numbers.iter())
+}
+
+/// The travel and step the extensions give one parameter of one of their
+/// entries.
+pub fn reference_number(entry: &str, parameter: &str) -> Option<&'static ReferenceNumber> {
+    reference_numbers().find(|number| number.entry == entry && number.parameter == parameter)
+}
+
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+
+    /// Every number an extension gives is a travel a slider can move
+    /// along, with whole numbers as stops.
+    #[test]
+    fn every_extension_number_is_a_travel() {
+        for number in reference_numbers() {
+            assert!(number.is_travel(), "{}.{}", number.entry, number.parameter);
+        }
+    }
 
     #[test]
     fn upstream_core_has_no_extension_names_and_the_combined_registry_does() {

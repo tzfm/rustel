@@ -12,7 +12,6 @@ pub(crate) const BIND_FUNC: &[ReferenceParam] = &[ReferenceParam {
 const OUTPUT_PASSTHROUGHS: ReferenceEntry = ReferenceEntry {
     name: "webaudio",
     synonyms: &[
-        "csound",
         "tone",
         "webdirt",
         "speak",

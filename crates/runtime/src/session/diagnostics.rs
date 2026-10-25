@@ -68,13 +68,29 @@ impl Session {
         }
         // A problem of the plugin thread has no note to report through, so
         // its line joins here. Only the session of the live output takes the
-        // lines of the host. A session with no live output leaves them.
+        // lines of the host and of the output. A session with no live output
+        // leaves them. The chains of this session give the lanes with no
+        // room for a chain.
         #[cfg(feature = "vst")]
-        if self.plugins_live() {
-            for message in crate::vst::take_errors() {
-                let record = serde_json::json!({ "vst_skipped": { "message": &message } });
-                self.report_plugin_line(message, record);
+        {
+            if self.plugins_live() {
+                self.report_plugin_lines(crate::vst::take_errors());
+                self.report_plugin_lines(crate::vst::take_output_lines(&self.chains));
             }
+            self.report_plugin_lines(crate::vst::take_problems(&self.chains));
+        }
+        for message in self.csound.take_errors() {
+            let record = serde_json::json!({ "csound_failed": { "message": &message } });
+            self.report_plugin_line(message, record);
+        }
+    }
+
+    /// Queues each line as a plugin line: see [`Self::report_plugin_line`].
+    #[cfg(feature = "vst")]
+    pub(super) fn report_plugin_lines(&mut self, lines: Vec<String>) {
+        for message in lines {
+            let record = serde_json::json!({ "vst_skipped": { "message": &message } });
+            self.report_plugin_line(message, record);
         }
     }
 

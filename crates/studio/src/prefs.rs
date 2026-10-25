@@ -49,6 +49,14 @@ pub struct StudioPrefs {
     /// Shortcut conflict profile override; absent means automatic detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_keybindings: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vim_mappings_path: Option<String>,
+    /// Whether j k h l move lists while Vim editor keys are on. Absent
+    /// means on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vim_list_navigation: Option<bool>,
     /// How often the screen repaints while a set plays: `60`, `30`, `15`
     /// or `8`. Absent is sixty, which is what a machine with cores to
     /// spare should have.
@@ -68,6 +76,10 @@ pub struct StudioPrefs {
     /// How long typing must pause first: `250ms`, `500ms`, `1s` or `2s`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub typing_pause: Option<String>,
+    /// What another program's save of the open score does: `off`, `sync`
+    /// or `sync-eval`. Absent is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_changes: Option<String>,
     /// `wait` or `async`. `strudel-like` still reads as async.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_mode: Option<String>,
@@ -155,6 +167,9 @@ pub struct StudioPrefs {
     /// Which evaluation outcomes flash: full, on-success, or off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluation_flash: Option<String>,
+    /// How the evaluation flash moves over the code it ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_animation: Option<String>,
     /// A finished recording has its leading and trailing silence cut before
     /// it is saved. On by default: the silence around a take is the count-in
     /// and the wait for the next one, not part of the performance.
@@ -235,12 +250,30 @@ pub struct StudioPrefs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(alias = "generator_stack")]
     pub examples_stack: Option<bool>,
+    /// The browser's lists of things to hear play each row the cursor
+    /// lands on: the samples, chords and scales tabs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_preview: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backdrop_smoothing: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slider_smoothing: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frequency_slider_log: Option<bool>,
+    /// The bounds a knob's form set for it, keyed by the call and the
+    /// parameter: `set:cutoff` for an object entry, `ring:#0` for the
+    /// first positional argument. Text rather than numbers, so the file
+    /// keeps what the form wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knob_ranges: Option<std::collections::BTreeMap<String, KnobRange>>,
+    /// The parameters chosen for a plugin's knobs panel: plugin name →
+    /// the keys the score writes. The same plugin shows the same rails
+    /// in every set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vst_knobs: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    /// The knobs column is open, and comes back open at the next launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knobs_panel: Option<bool>,
     /// The twelve mapping slots, in order: the MIDI knob (`cc74/ch2`) or
     /// the gamepad axis (`x1`) that drives each one, `off` for a slot
     /// nobody has bound. Slot `n` drives the `n`th slider of whatever
@@ -292,6 +325,10 @@ pub struct StudioPrefs {
     pub interface_opacity: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor_opacity: Option<u8>,
+    /// How the beat line under the header moves: off, pulse, travel or
+    /// wave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beat_line: Option<String>,
     /// The File / Edit menu bar along the top. Absent is shown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub show_menu: Option<bool>,
@@ -310,6 +347,10 @@ pub struct StudioPrefs {
     /// them before the standard folders of the system.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vst_folders: Vec<String>,
+    /// Folders with `.vstpreset` files the player added, in any folder
+    /// structure: the header of each file says its plugin.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preset_folders: Vec<String>,
     /// Whether an imported source is fetched into the cache in the
     /// background rather than on the first note that needs it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -419,6 +460,14 @@ pub(super) fn names_below(folder: &std::path::Path, path: &std::path::Path) -> O
 
 /// The most sets Open recent offers.
 pub const RECENT_SETS: usize = 8;
+
+/// One remembered bound of a knob, as its form wrote it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct KnobRange {
+    pub min: String,
+    pub max: String,
+    pub step: String,
+}
 
 impl Default for StudioPrefs {
     fn default() -> Self {
@@ -619,6 +668,15 @@ impl StudioPrefs {
                 .as_deref()
                 .and_then(super::terminal::conflicts::canonical_profile)
                 .map(str::to_owned),
+            editor_keybindings: self
+                .editor_keybindings
+                .as_deref()
+                .and_then(super::editor::EditorKeybindings::from_key)
+                .unwrap_or(defaults.editor_keybindings),
+            vim_mappings_path: self.vim_mappings_path.clone(),
+            vim_list_navigation: self
+                .vim_list_navigation
+                .unwrap_or(defaults.vim_list_navigation),
             show_full_paths: self.show_full_paths.unwrap_or(defaults.show_full_paths),
             rendering: self
                 .rendering
@@ -641,6 +699,11 @@ impl StudioPrefs {
                 .as_deref()
                 .map(super::settings::TypingPause::parse)
                 .unwrap_or(defaults.typing_pause),
+            external_changes: self
+                .external_changes
+                .as_deref()
+                .map(super::settings::ExternalChanges::parse)
+                .unwrap_or(defaults.external_changes),
             load_mode: self
                 .load_mode
                 .as_deref()
@@ -655,6 +718,11 @@ impl StudioPrefs {
                 .as_deref()
                 .map(super::settings::EvaluationFlashMode::parse)
                 .unwrap_or(defaults.evaluation_flash),
+            evaluation_animation: self
+                .evaluation_animation
+                .as_deref()
+                .map(super::settings::EvalAnimation::parse)
+                .unwrap_or(defaults.evaluation_animation),
             trim_recordings: self.trim_recordings.unwrap_or(defaults.trim_recordings),
             output_latency: self
                 .output_latency
@@ -738,6 +806,7 @@ impl StudioPrefs {
                 .unwrap_or(defaults.syntax_check),
             log_verbose: self.log_verbose.unwrap_or(defaults.log_verbose),
             examples_stack: self.examples_stack.unwrap_or(defaults.examples_stack),
+            auto_preview: self.auto_preview.unwrap_or(defaults.auto_preview),
             slider_smoothing: self.slider_smoothing.unwrap_or(defaults.slider_smoothing),
             frequency_slider_log: self
                 .frequency_slider_log
@@ -777,6 +846,11 @@ impl StudioPrefs {
             editor_opacity: self
                 .editor_opacity
                 .map_or(defaults.editor_opacity, |opacity| opacity.min(100)),
+            beat_line: self
+                .beat_line
+                .as_deref()
+                .map(super::settings::BeatLineStyle::parse)
+                .unwrap_or(defaults.beat_line),
             // Deliberately not remembered: the studio always opens with its
             // stage up.
             zen: defaults.zen,
@@ -818,16 +892,21 @@ impl StudioPrefs {
             .as_deref()
             .and_then(super::terminal::conflicts::canonical_profile)
             .map(str::to_owned);
+        self.editor_keybindings = Some(settings.editor_keybindings.key().to_owned());
+        self.vim_mappings_path = settings.vim_mappings_path.clone();
+        self.vim_list_navigation = Some(settings.vim_list_navigation);
         self.frame_rate = Some(settings.frame_rate.key().to_owned());
         self.clock_out = settings.clock_out.clone();
         self.clock_in = settings.clock_in.clone();
         self.quantise = Some(settings.quantise.key());
         self.auto_evaluate = Some(settings.auto_evaluate);
         self.typing_pause = Some(settings.typing_pause.key().to_owned());
+        self.external_changes = Some(settings.external_changes.key().to_owned());
         self.load_mode = Some(settings.load_mode.key().to_owned());
         self.animation = Some(settings.animation);
         self.highlights = Some(settings.highlights);
         self.evaluation_flash = Some(settings.evaluation_flash.key().to_owned());
+        self.evaluation_animation = Some(settings.evaluation_animation.key().to_owned());
         self.trim_recordings = Some(settings.trim_recordings);
         self.highlight_fade = Some(settings.highlight_fade.key().to_owned());
         self.metric_detail = Some(settings.metric_detail.key().to_owned());
@@ -886,6 +965,7 @@ impl StudioPrefs {
         self.syntax_check_mode = Some(settings.syntax_check.key().to_owned());
         self.log_verbose = Some(settings.log_verbose);
         self.examples_stack = Some(settings.examples_stack);
+        self.auto_preview = Some(settings.auto_preview);
         self.backdrop_smoothing = Some(settings.backdrop_smoothing);
         self.slider_smoothing = Some(settings.slider_smoothing);
         self.frequency_slider_log = Some(settings.frequency_slider_log);
@@ -940,6 +1020,7 @@ impl StudioPrefs {
         self.backdrop_opacity = Some(settings.backdrop_opacity);
         self.interface_opacity = Some(settings.interface_opacity);
         self.editor_opacity = Some(settings.editor_opacity);
+        self.beat_line = Some(settings.beat_line.key().to_owned());
     }
 
     /// The learnt shortcuts, restored from the file. The overrides live
@@ -1753,6 +1834,26 @@ mod tests {
     }
 
     #[test]
+    fn auto_preview_defaults_off_and_is_remembered() {
+        let legacy: StudioPrefs = serde_json::from_str("{}").unwrap();
+        assert!(
+            !legacy.ui_settings().auto_preview,
+            "sound on every arrow is opted into"
+        );
+        for enabled in [true, false] {
+            let settings = super::super::settings::UiSettings {
+                auto_preview: enabled,
+                ..legacy.ui_settings()
+            };
+            let mut prefs = StudioPrefs::default();
+            prefs.set_ui_settings(&settings);
+            let restored: StudioPrefs =
+                serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+            assert_eq!(restored.ui_settings().auto_preview, enabled);
+        }
+    }
+
+    #[test]
     fn reference_categories_keep_only_hidden_tags() {
         use super::super::reference::Category;
         let legacy: StudioPrefs = serde_json::from_str("{}").unwrap();
@@ -1814,6 +1915,26 @@ mod tests {
     }
 
     #[test]
+    fn vim_list_navigation_defaults_on_and_remembers_off() {
+        let legacy: StudioPrefs = serde_json::from_str("{}").unwrap();
+        assert!(
+            legacy.ui_settings().vim_list_navigation,
+            "an old preferences file means list keys on"
+        );
+        for value in [false, true] {
+            let settings = super::super::settings::UiSettings {
+                vim_list_navigation: value,
+                ..legacy.ui_settings()
+            };
+            let mut prefs = StudioPrefs::default();
+            prefs.set_ui_settings(&settings);
+            let restored: StudioPrefs =
+                serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+            assert_eq!(restored.ui_settings().vim_list_navigation, value);
+        }
+    }
+
+    #[test]
     fn evaluation_flash_defaults_full_and_remembers_each_mode() {
         use super::super::settings::EvaluationFlashMode;
 
@@ -1839,6 +1960,72 @@ mod tests {
             assert_eq!(encoded["evaluation_flash"], key);
             let restored: StudioPrefs = serde_json::from_value(encoded).unwrap();
             assert_eq!(restored.ui_settings().evaluation_flash, mode);
+        }
+    }
+
+    /// The evaluation animation survives the file the same way, and an
+    /// unreadable spelling is the look the studio always had.
+    #[test]
+    fn evaluation_animation_defaults_normal_and_remembers_each_look() {
+        use super::super::settings::EvalAnimation;
+
+        for json in ["{}", r#"{"evaluation_animation":"unknown"}"#] {
+            let prefs: StudioPrefs = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                prefs.ui_settings().evaluation_animation,
+                EvalAnimation::Normal
+            );
+        }
+        for (mode, key) in [
+            (EvalAnimation::Normal, "normal"),
+            (EvalAnimation::FadeFast, "fade-fast"),
+            (EvalAnimation::FadeMedium, "fade-medium"),
+            (EvalAnimation::FadeSlow, "fade-slow"),
+            (EvalAnimation::Zap, "zap"),
+            (EvalAnimation::Steps, "steps"),
+            (EvalAnimation::Glitch, "glitch"),
+            (EvalAnimation::Wave, "wave"),
+        ] {
+            let settings = super::super::settings::UiSettings {
+                evaluation_animation: mode,
+                ..Default::default()
+            };
+            let mut prefs = StudioPrefs::default();
+            prefs.set_ui_settings(&settings);
+            let encoded = serde_json::to_value(&prefs).unwrap();
+            assert_eq!(encoded["evaluation_animation"], key);
+            let restored: StudioPrefs = serde_json::from_value(encoded).unwrap();
+            assert_eq!(restored.ui_settings().evaluation_animation, mode);
+        }
+    }
+
+    /// The beat line survives the file, and an unreadable spelling is the
+    /// off it defaults to. The aberration caps at a hundred on the way in,
+    /// like the opacities.
+    #[test]
+    fn the_beat_line_survives_the_file() {
+        use super::super::settings::BeatLineStyle;
+
+        for json in ["{}", r#"{"beat_line":"unknown"}"#] {
+            let prefs: StudioPrefs = serde_json::from_str(json).unwrap();
+            assert_eq!(prefs.ui_settings().beat_line, BeatLineStyle::Off);
+        }
+        for (style, key) in [
+            (BeatLineStyle::Off, "off"),
+            (BeatLineStyle::Pulse, "pulse"),
+            (BeatLineStyle::Travel, "travel"),
+            (BeatLineStyle::Wave, "wave"),
+        ] {
+            let settings = super::super::settings::UiSettings {
+                beat_line: style,
+                ..Default::default()
+            };
+            let mut prefs = StudioPrefs::default();
+            prefs.claim_opacities(&settings);
+            let encoded = serde_json::to_value(&prefs).unwrap();
+            assert_eq!(encoded["beat_line"], key);
+            let restored: StudioPrefs = serde_json::from_value(encoded).unwrap();
+            assert_eq!(restored.ui_settings().beat_line, style);
         }
     }
 

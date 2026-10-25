@@ -9,8 +9,10 @@
 //! plausible-sounding approximations.
 
 mod bus_names;
+mod csound;
 
 pub use bus_names::BusNames;
+pub use csound::CsoundRequest;
 
 #[cfg(test)]
 mod classification_tests {
@@ -859,7 +861,7 @@ mod tests {
     /// sentence.
     #[test]
     fn record_only_notices_carry_a_readable_message() {
-        let partials = vec![1.0; rustel_audio::MAX_PARTIALS + 1];
+        let partials = vec![1.0; 2048];
         let voices = [
             serde_json::json!({ "s": "sawtooth", "partials": partials }),
             serde_json::json!({ "s": "sine", "room": 0.5, "ir": "nowhere" }),
@@ -876,12 +878,7 @@ mod tests {
         assert_eq!(
             messages,
             [
-                format!(
-                    "{} partials requested; the first {} play",
-                    rustel_audio::MAX_PARTIALS + 1,
-                    rustel_audio::MAX_PARTIALS
-                )
-                .as_str(),
+                "2048 partials requested; the first 2047 play",
                 "impulse response 'nowhere' is not a known sound; the generated reverb plays",
             ]
         );
@@ -2199,6 +2196,11 @@ pub trait SampleLookup {
     fn insert_speech(&self, _request: &SpeechRequest<'_>) -> Result<SampleResolution, String> {
         Ok(SampleResolution::Unknown)
     }
+
+    /// Prepares a Csound score event outside the audio callback.
+    fn csound(&self, _request: &CsoundRequest<'_>) -> Result<rustel_audio::InsertControls, String> {
+        Err("this host has no Csound support".into())
+    }
 }
 
 /// What a note asks of a plugin, in the names the score wrote.
@@ -2460,6 +2462,7 @@ fn resolve_voice_at(
         }));
     }
     let mut plays_plugin = false;
+    let mut plays_csound = false;
     let (frequency, gain, controls, sample, wavetable, synth) = match value {
         serde_json::Value::Number(midi) => (
             midi_to_hz(
@@ -2483,15 +2486,21 @@ fn resolve_voice_at(
         serde_json::Value::Object(object) => {
             let slotted = with_bus_slots(object, samples)?;
             let object = slotted.as_ref().unwrap_or(object);
-            let gain = optional_f64(object.get("gain"), "gain")?.unwrap_or(0.8);
-            let velocity = optional_f64(object.get("velocity"), "velocity")?.unwrap_or(1.0);
+            plays_csound = object.contains_key("csound") || object.contains_key("csoundm");
+            let (gain, velocity) = if plays_csound {
+                (1.0, 1.0)
+            } else {
+                (
+                    optional_f64(object.get("gain"), "gain")?.unwrap_or(0.8),
+                    optional_f64(object.get("velocity"), "velocity")?.unwrap_or(1.0),
+                )
+            };
             let postgain = optional_f64(object.get("postgain"), "postgain")?.unwrap_or(1.0);
             let pan = optional_f64(object.get("pan"), "pan")?
                 .map(|pan| checked_f32(pan.clamp(0.0, 1.0), "pan"))
                 .transpose()?;
-            // With `.vsti()` the plugin makes the sound: the note needs no
-            // sample, wavetable or synth of the engine.
-            plays_plugin = object.contains_key("vsti");
+            // An external instrument needs no native sound source.
+            plays_plugin = plays_csound || object.contains_key("vsti");
             // A `talkit` hap speaks its own sound the same way: the host
             // renders the text and the sampler plays the result.
             let speech = if plays_plugin {
@@ -2536,7 +2545,9 @@ fn resolve_voice_at(
             };
             // Resolved BEFORE the modulators: an `fmh` modulator rides an
             // operator frequency, which is a multiple of this.
-            let frequency = if sample.is_some() {
+            let frequency = if plays_csound {
+                csound::frequency(object)?
+            } else if sample.is_some() {
                 0.0
             } else {
                 match optional_f64(object.get("freq"), "freq")? {
@@ -2589,7 +2600,7 @@ fn resolve_voice_at(
             // explicit `freq` is transposed too, and a sample keeps the 0.0
             // that marks it as pitched by playback rate.
             let frequency = match optional_f64(object.get("octave"), "octave")? {
-                Some(octave) if frequency != 0.0 => {
+                Some(octave) if frequency != 0.0 && !plays_csound => {
                     checked_frequency(frequency * 2f64.powf(octave))?
                 }
                 _ => frequency,
@@ -2712,10 +2723,14 @@ fn resolve_voice_at(
                 orbit: orbit as u8,
                 insert_chain: None,
                 effects: effect_controls(object, samples).map(|effect| effect.map(clocked)),
-                instrument: object
-                    .get("vsti")
-                    .and_then(|plugin| plugin_controls(plugin, "vsti", samples))
-                    .map(clocked),
+                instrument: if plays_csound {
+                    None
+                } else {
+                    object
+                        .get("vsti")
+                        .and_then(|plugin| plugin_controls(plugin, "vsti", samples))
+                        .map(clocked)
+                },
                 lfos,
                 envs,
                 phaser: phaser_controls(object, target_time)?,
@@ -2774,7 +2789,9 @@ fn resolve_voice_at(
 
     // An instrument plugin makes the sound of the note. The plugin gets the
     // pitch, velocity and length. The engine applies gain to its output.
-    let (gain, controls) = if plays_plugin {
+    let (gain, controls) = if plays_csound {
+        (1.0, controls)
+    } else if plays_plugin {
         let mut controls = controls;
         controls.instrument = controls.instrument.map(|instrument| {
             instrument.with_note(rustel_audio::InsertNote {
@@ -2812,7 +2829,7 @@ fn resolve_voice_at(
         )
         .into());
     }
-    if sample.is_none() && frequency >= f64::from(sample_rate) / 2.0 {
+    if !plays_csound && sample.is_none() && frequency >= f64::from(sample_rate) / 2.0 {
         return Err(format!(
             "onset {onset_id} frequency {frequency}Hz reaches or exceeds the {sample_rate}Hz Nyquist limit"
         ).into());
@@ -2822,6 +2839,7 @@ fn resolve_voice_at(
     // trails a render-quantum one by, so the shifted voice lands where the
     // reference's does. Separate `.FX()` stretch stages keep their delay.
     // A compensated onset before the render begins starts at time zero.
+    let source_time = target_time;
     let target_time = if value.get("stretch").is_some_and(|value| !value.is_null()) {
         let lag_secs =
             f64::from(rustel_audio::stretch::QUANTUM_LAG_FRAMES) / f64::from(sample_rate);
@@ -2843,6 +2861,19 @@ fn resolve_voice_at(
     if !onset_frame.is_finite() || onset_frame < 0.0 || onset_frame > u64::MAX as f64 {
         return Err(
             format!("onset {onset_id} has an unrepresentable target time {target_time}").into(),
+        );
+    }
+    let mut controls = controls;
+    if plays_csound {
+        controls.instrument = Some(
+            samples
+                .csound(&CsoundRequest {
+                    value: value.as_object().expect("checked control map"),
+                    frequency,
+                    duration_secs,
+                    target_time: source_time,
+                })?
+                .with_clock(musical_time * cps * 4.0, (cps * 240.0) as f32),
         );
     }
     let event = rustel_audio::OnsetEvent::new(
@@ -5611,7 +5642,7 @@ fn modulator_controls(
 /// `partials`: an array of magnitudes, or a count of all-1 magnitudes
 /// (`n` doubles as that count on synth sounds), scaled by the base
 /// waveform's Fourier terms and rotated by optional `phases`.
-/// The result is peak-normalized like createPeriodicWave's default.
+/// The wave normalizes like createPeriodicWave's default.
 fn partials_controls(
     object: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Option<rustel_audio::PartialsControls>, String> {
@@ -5634,13 +5665,22 @@ fn partials_controls(
     let Some(raw) = raw else {
         return Ok(None);
     };
-    let mags: Vec<f64> = match raw {
-        serde_json::Value::Array(items) => {
-            items.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect()
-        }
+    let (requested, mags): (usize, Vec<f64>) = match raw {
+        serde_json::Value::Array(items) => (
+            items.len(),
+            items
+                .iter()
+                .take(rustel_audio::played_partials(items.len()))
+                .map(|v| v.as_f64().unwrap_or(0.0))
+                .collect(),
+        ),
         other => match other.as_f64() {
             Some(count) if count >= 1.0 => {
-                vec![1.0; (count as usize).min(rustel_audio::MAX_PARTIALS)]
+                let requested = count as usize;
+                (
+                    requested,
+                    vec![1.0; rustel_audio::played_partials(requested)],
+                )
             }
             _ => return Ok(None),
         },
@@ -5648,17 +5688,17 @@ fn partials_controls(
     if mags.is_empty() {
         return Ok(None);
     }
-    if mags.len() > rustel_audio::MAX_PARTIALS {
+    if mags.len() < requested {
         report_notice(
             format!(
                 "{} partials requested; the first {} play",
-                mags.len(),
-                rustel_audio::MAX_PARTIALS
+                requested,
+                mags.len()
             ),
             serde_json::json!({
                 "partials_truncated": {
-                    "requested": mags.len(),
-                    "kept": rustel_audio::MAX_PARTIALS
+                    "requested": requested,
+                    "kept": mags.len()
                 }
             }),
         );
@@ -5669,10 +5709,9 @@ fn partials_controls(
         }
         _ => Vec::new(),
     };
-    let mut real = [0.0f32; rustel_audio::MAX_PARTIALS];
-    let mut imag = [0.0f32; rustel_audio::MAX_PARTIALS];
-    let len = mags.len().min(rustel_audio::MAX_PARTIALS);
-    for (k, mag) in mags.iter().take(len).enumerate() {
+    let mut real = Vec::with_capacity(mags.len());
+    let mut imag = Vec::with_capacity(mags.len());
+    for (k, mag) in mags.iter().enumerate() {
         let n = (k + 1) as f64;
         let (r, i) = match kind.as_str() {
             "sawtooth" | "saw" => (0.0, -1.0 / n),
@@ -5690,30 +5729,15 @@ fn partials_controls(
             r = c * r0 - s * i0;
             i = s * r0 + c * i0;
         }
-        real[k] = r as f32;
-        imag[k] = i as f32;
-    }
-    // createPeriodicWave normalizes to peak 1 by default.
-    let mut peak = 0.0f64;
-    for step in 0..2048 {
-        let phi = step as f64 / 2048.0;
-        let mut sum = 0.0f64;
-        for k in 0..len {
-            let angle = std::f64::consts::TAU * (k + 1) as f64 * phi;
-            sum += f64::from(real[k]) * angle.cos() + f64::from(imag[k]) * angle.sin();
-        }
-        peak = peak.max(sum.abs());
+        real.push(r as f32);
+        imag.push(i as f32);
     }
     // A list whose every magnitude is zero still builds a periodic wave in
     // the browser: an all-zero table, so the note is silent rather than a
     // stock waveform. `randL` hands one over at cycle zero.
-    let norm = if peak > 0.0 { (1.0 / peak) as f32 } else { 0.0 };
-    Ok(Some(rustel_audio::PartialsControls {
-        real,
-        imag,
-        len: len as u8,
-        norm,
-    }))
+    Ok(Some(rustel_audio::register_partials(
+        requested, &real, &imag,
+    )))
 }
 
 /// The transient shaper's controls, shared by the main chain and by each

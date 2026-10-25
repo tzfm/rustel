@@ -191,8 +191,10 @@ fn turning_visualizers_off_gives_the_rows_back() {
 
     // Off, through the settings sheet, by the drawn row's own label.
     // The sheet marks its selection with '▸', so walk until it sits on
-    // the visualizers row, then flip it leftwards.
+    // the visualizers row, then flip it leftwards. The row is on the
+    // appearance page, the second tab.
     studio.chord("ctrl+o");
+    studio.press(KeyCode::Tab, KeyModifiers::NONE);
     let mut reached = false;
     for _ in 0..30 {
         if studio

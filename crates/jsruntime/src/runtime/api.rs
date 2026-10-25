@@ -1488,6 +1488,63 @@ impl JsRuntime {
         Ok(haps)
     }
 
+    /// The notes of the lanes of the active score that do not play: its
+    /// muted lanes and the lanes a solo drops. Each note has the lane tag
+    /// and the plugin bindings it has when it plays. A host builds the plugin
+    /// copies of these notes before they play. Empty when no plugin call ran
+    /// in the evaluation of the score, or when the evaluation had no time
+    /// left for the shadow. `budget`, `hap_budget` and `cancellation` bound
+    /// the query as in [`Self::query_cancellable_with_hap_budget`]. The
+    /// console lines of the query go, and a throw in it is in no report.
+    pub fn query_shadow(
+        &self,
+        begin: Fraction,
+        end: Fraction,
+        budget: std::time::Duration,
+        hap_budget: u64,
+        cancellation: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<Hap>, QueryError> {
+        let _settings = self.core_settings.bind();
+        let threw = self.query_threw.borrow_mut().take();
+        let previous = self.hap_budget.replace(hap_budget);
+        let haps = self.with_logs_dropped(|| {
+            self.with_bounded_query_turn(budget, cancellation, true, || {
+                self.query_shadow_inner(begin, end)
+            })
+        });
+        self.hap_budget.set(previous);
+        *self.query_threw.borrow_mut() = threw;
+        let _ = rustel_core::take_query_contained_throw();
+        let _ = rustel_core::take_query_callback_failure();
+        haps
+    }
+
+    fn query_shadow_inner(&self, begin: Fraction, end: Fraction) -> Result<Vec<Hap>, QueryError> {
+        self.sync_host_voicing_default()?;
+        with_ctx(&self.ctx, |ctx| -> Result<Vec<Hap>, QueryError> {
+            let active: rquickjs::Value = host_active(&ctx)
+                .map_err(|error| QueryError::Message(error.to_string()))?
+                .get(0)
+                .map_err(|error| QueryError::Message(error.to_string()))?;
+            let shadow = rquickjs::Class::<NativePatternWrapper>::from_value(&active)
+                .ok()
+                .and_then(|wrapper| wrapper.borrow().shadow.clone());
+            let Some(shadow) = shadow else {
+                return Ok(Vec::new());
+            };
+            let pattern = shadow.borrow().pattern.clone();
+            // The shadow owns the callbacks of its lanes.
+            let _scope = WrapperQueryScope::push(&ctx, shadow)
+                .map_err(|error| QueryError::Message(error.to_string()))?;
+            let frame = BridgeFrame::new(self.ids.clone());
+            let _bridge = BridgeScope::push(&frame);
+            rustel_core::with_callback_host(self, || {
+                self.query_sorted_recording_throw(&pattern, begin, end)
+            })
+            .map_err(QueryError::from)
+        })
+    }
+
     /// Preserve a thrown error for the report while returning an empty window.
     /// Store the outcome after the query so an outer query replaces any nested
     /// query's outcome.

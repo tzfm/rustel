@@ -37,6 +37,30 @@ fn row_with(studio: &mut Hermetic, label: &str) -> String {
         .unwrap_or_else(|| panic!("no row reads {label:?}:\n{}", studio.rows().join("\n")))
 }
 
+/// Open the sheet and walk to the permissions page, wherever the sheet
+/// left it - the sheet keeps its page across closes, so a second visit
+/// does not start on the first one. The orchestra switch is on that page
+/// from the studio's first breath, so the page always draws it.
+fn open_permissions(studio: &mut Hermetic) {
+    studio.chord("ctrl+o");
+    studio.settle();
+    for _ in 0..10 {
+        if studio
+            .rows()
+            .iter()
+            .any(|row| row.contains("native orchestras"))
+        {
+            return;
+        }
+        studio.press(KeyCode::BackTab, KeyModifiers::SHIFT);
+        studio.pump();
+    }
+    panic!(
+        "no page reads native orchestras:\n{}",
+        studio.rows().join("\n")
+    );
+}
+
 /// The selected row, by its marker - inside the sheet, not the header's
 /// scene chips, which wear the same `▸`.
 fn selected_row(studio: &mut Hermetic) -> Option<String> {
@@ -86,8 +110,8 @@ fn open_sheet(studio: &mut Hermetic) {
     );
 }
 
-/// Open the sheet on the Advanced page.
-fn open_advanced(studio: &mut Hermetic) {
+/// Open the sheet on the appearance page, the second tab.
+fn open_appearance(studio: &mut Hermetic) {
     open_sheet(studio);
     studio.press(KeyCode::Tab, KeyModifiers::NONE);
     studio.settle();
@@ -123,7 +147,7 @@ fn percent(row: &str) -> u32 {
 #[test]
 fn switches_flip_on_every_changing_key() {
     let mut studio = hermetic();
-    open_sheet(&mut studio);
+    open_appearance(&mut studio);
     select_row(&mut studio, "▸ minimap");
 
     let reads_on = |studio: &mut Hermetic| switch_on(studio, "minimap");
@@ -152,7 +176,7 @@ fn switches_flip_on_every_changing_key() {
 #[test]
 fn ladders_step_wrap_both_ways() {
     let mut studio = hermetic();
-    open_sheet(&mut studio);
+    open_appearance(&mut studio);
     select_row(&mut studio, "▸ metric detail");
 
     const RUNGS: [&str; 4] = ["none", "basic", "advanced", "full"];
@@ -200,7 +224,7 @@ fn ladders_step_wrap_both_ways() {
 #[test]
 fn caret_shape_walks_its_six_shapes() {
     let mut studio = hermetic();
-    open_sheet(&mut studio);
+    open_appearance(&mut studio);
     select_row(&mut studio, "▸ caret shape");
     assert_eq!(
         value_of(&mut studio, "caret shape"),
@@ -230,7 +254,7 @@ fn caret_shape_walks_its_six_shapes() {
 #[test]
 fn rendering_steps_only_through_what_the_terminal_can_draw() {
     let mut studio = hermetic();
-    open_advanced(&mut studio);
+    open_appearance(&mut studio);
     select_row(&mut studio, "▸ rendering");
     assert!(
         value_of(&mut studio, "rendering").starts_with("Automatic"),
@@ -264,7 +288,7 @@ fn rendering_steps_only_through_what_the_terminal_can_draw() {
 #[test]
 fn frame_rate_reads_the_arrows_the_other_way_round() {
     let mut studio = hermetic();
-    open_advanced(&mut studio);
+    open_appearance(&mut studio);
     select_row(&mut studio, "▸ frame rate");
 
     let rate = |studio: &mut Hermetic| leading_number(&value_of(studio, "frame rate"));
@@ -284,7 +308,7 @@ fn frame_rate_reads_the_arrows_the_other_way_round() {
 #[test]
 fn max_polyphony_names_the_voice_count() {
     let mut studio = hermetic();
-    open_advanced(&mut studio);
+    open_sheet(&mut studio);
     select_row(&mut studio, "▸ max polyphony");
 
     let voices = |studio: &mut Hermetic| leading_number(&value_of(studio, "max polyphony"));
@@ -312,7 +336,7 @@ fn max_polyphony_names_the_voice_count() {
 #[test]
 fn piano_rows_cycle_and_clamp() {
     let mut studio = hermetic();
-    open_advanced(&mut studio);
+    open_sheet(&mut studio);
 
     select_row(&mut studio, "▸ piano sound");
     assert_eq!(value_of(&mut studio, "piano sound"), "triangle");
@@ -465,7 +489,7 @@ fn master_limiter_default_flips_for_a_fresh_set() {
 #[test]
 fn opacity_rows_clamp_and_are_claimed_across_a_reopen() {
     let mut studio = hermetic();
-    open_sheet(&mut studio);
+    open_appearance(&mut studio);
     select_row(&mut studio, "▸ ui opacity");
     let opacity = |studio: &mut Hermetic| percent(&value_of(studio, "ui opacity"));
 
@@ -516,7 +540,7 @@ fn opacity_rows_clamp_and_are_claimed_across_a_reopen() {
     studio.quit();
     let mut studio = reopen_over(studio);
 
-    open_sheet(&mut studio);
+    open_appearance(&mut studio);
     select_row(&mut studio, "▸ ui opacity");
     assert_eq!(
         percent(&value_of(&mut studio, "ui opacity")),
@@ -720,7 +744,7 @@ fn the_sheet_reaches_its_last_rows_on_a_short_terminal() {
     studio.press(KeyCode::End, KeyModifiers::NONE);
     studio.settle();
     assert!(
-        selected_row(&mut studio).is_some_and(|row| row.contains("full paths")),
+        selected_row(&mut studio).is_some_and(|row| row.contains("drop unused")),
         "End reached the last row: {:?}",
         selected_row(&mut studio)
     );
@@ -751,10 +775,10 @@ fn the_sheet_reaches_its_last_rows_on_a_short_terminal() {
 }
 
 #[test]
-fn settings_and_advanced_keep_their_place_until_studio_restarts() {
+fn settings_and_appearance_keep_their_place_until_studio_restarts() {
     let mut studio = hermetic_sized(120, 24);
     open_sheet(&mut studio);
-    select_row(&mut studio, "▸ caret shape");
+    select_row(&mut studio, "▸ syntax check");
     let selection = |studio: &mut Hermetic| {
         studio
             .rows()
@@ -771,27 +795,28 @@ fn settings_and_advanced_keep_their_place_until_studio_restarts() {
 
     studio.press(KeyCode::Tab, KeyModifiers::NONE);
     select_row(&mut studio, "▸ frame rate");
-    let advanced_position = selection(&mut studio);
+    let appearance_position = selection(&mut studio);
     studio.chord("ctrl+o");
     studio.chord("ctrl+o");
     studio.settle();
-    assert_eq!(selection(&mut studio), advanced_position);
+    assert_eq!(selection(&mut studio), appearance_position);
 
     studio.press(KeyCode::BackTab, KeyModifiers::SHIFT);
     studio.settle();
     assert_eq!(selection(&mut studio), settings_position);
     studio.press(KeyCode::Tab, KeyModifiers::NONE);
     studio.settle();
-    assert_eq!(selection(&mut studio), advanced_position);
+    assert_eq!(selection(&mut studio), appearance_position);
 
     let mut studio = reopen_over(studio);
     open_sheet(&mut studio);
 }
 
 /// A score that imports a script from an origin nobody trusted is refused,
-/// and the footer names the Trust page. The page offers the origin as a
-/// switch: Enter trusts it, Space turns the trust off where the row stands,
-/// and the next studio still trusts it.
+/// and the footer names the permissions page. The page offers the origin as
+/// a switch: Enter trusts it and the studio re-runs the refused update by
+/// itself, Space turns the trust off where the row stands, and the next
+/// studio still trusts it.
 #[test]
 fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
     let mut studio = hermetic();
@@ -800,14 +825,13 @@ fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
     studio.settle();
     assert_eq!(
         studio.errors().as_deref(),
-        Some("https://scripts.invalid is not trusted - Settings → Trust lets its scripts run"),
+        Some(
+            "https://scripts.invalid is not trusted - Settings → Permissions lets its scripts run"
+        ),
     );
 
-    open_sheet(&mut studio);
-    for _ in 0..2 {
-        studio.press(KeyCode::BackTab, KeyModifiers::SHIFT);
-    }
-    studio.settle();
+    open_permissions(&mut studio);
+    select_row(&mut studio, "▸ https://scripts.invalid");
     let refused = row_with(&mut studio, "https://scripts.invalid");
     assert!(
         refused.contains("▸") && refused.contains("off"),
@@ -816,7 +840,14 @@ fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();
     assert!(row_with(&mut studio, "https://scripts.invalid").contains("  on"));
-    assert_eq!(studio.errors(), None, "the refusal left with the trust");
+    // The trust re-ran the refused update by itself, so the footer can only
+    // hold the fetch of the newly trusted origin - never the refusal.
+    if let Some(error) = studio.errors() {
+        assert!(
+            !error.contains("is not trusted"),
+            "the refusal left with the trust: {error}"
+        );
+    }
     // Space takes the trust back, and the row stays to give it again.
     studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
     studio.settle();
@@ -833,16 +864,85 @@ fn a_refused_import_origin_is_trusted_with_one_key_and_kept() {
     studio.pump();
     studio.quit();
     let mut studio = reopen_over(studio);
-    open_sheet(&mut studio);
-    for _ in 0..2 {
-        studio.press(KeyCode::BackTab, KeyModifiers::SHIFT);
-    }
-    studio.settle();
+    open_permissions(&mut studio);
+    select_row(&mut studio, "▸ https://scripts.invalid");
     assert!(row_with(&mut studio, "https://scripts.invalid").contains("  on"));
-    // `d` takes the origin off the page.
+    // `d` takes the origin off the page; the orchestra switch stays. The
+    // status line still names the origin - it reports the removal - so the
+    // check reads the row shape: a row is the origin, two spaces, its state.
     studio.press(KeyCode::Char('d'), KeyModifiers::NONE);
     studio.settle();
-    assert!(studio.rows().join("\n").contains("none yet"));
+    assert!(
+        studio
+            .rows()
+            .into_iter()
+            .all(|row| !row.contains("scripts.invalid  ")),
+        "no row carries the origin as its label:\n{}",
+        studio.rows().join("\n")
+    );
+    assert!(row_with(&mut studio, "native orchestras").contains("  on"));
+}
+
+/// An orchestra score plays with no flag and no keypress: an installed
+/// library is the studio's opt-in. Space takes the switch off for the run,
+/// the next save of an edited score stops with the refusal that names the
+/// page, Enter puts the switch back and the studio re-runs the refused
+/// update by itself, and the next studio starts with it on again.
+#[test]
+fn the_orchestra_switch_starts_on_and_space_takes_it_back_for_a_run() {
+    let mut studio = hermetic();
+    studio.set_score("loadCSound`instr voice\nendin`\n$: note(\"c3\").csound(\"voice\")");
+    studio.chord("ctrl+s");
+    studio.settle();
+    // No permission refusal. A machine without the native library reports
+    // the library's own absence, never the permission's.
+    match studio.errors() {
+        None => {}
+        Some(error) => assert!(error.contains("Csound 6 is not available"), "{error}"),
+    }
+
+    open_permissions(&mut studio);
+    assert!(row_with(&mut studio, "native orchestras").contains("  on"));
+
+    studio.press(KeyCode::Char(' '), KeyModifiers::NONE);
+    studio.settle();
+    assert!(row_with(&mut studio, "native orchestras").contains("  off"));
+
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.settle();
+    // An edit makes the save a new generation - the first one is still
+    // sounding, whatever the machine's library said about it - so the press
+    // must not land as a repeat of it.
+    studio.set_score("loadCSound`instr voice\nendin`\n$: note(\"d3\").csound(\"voice\")");
+    studio.chord("ctrl+s");
+    studio.settle();
+    assert_eq!(
+        studio.errors().as_deref(),
+        Some("Csound is not permitted - Settings → Permissions lets native orchestras run"),
+    );
+
+    open_permissions(&mut studio);
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.settle();
+    assert!(row_with(&mut studio, "native orchestras").contains("  on"));
+    // The permission re-ran the refused update by itself. A machine with
+    // the native library installs it and says so; a machine without one
+    // reports the library's own absence. The refusal itself is gone either
+    // way.
+    match studio.errors() {
+        None => assert!(
+            studio.status().contains("playing from the top")
+                || studio.status().contains("swaps in on the next cycle"),
+            "the re-run installed: {}",
+            studio.status()
+        ),
+        Some(error) => assert!(error.contains("Csound 6 is not available"), "{error}"),
+    }
+
+    studio.quit();
+    let mut studio = reopen_over(studio);
+    open_permissions(&mut studio);
+    assert!(row_with(&mut studio, "native orchestras").contains("  on"));
 }
 
 /// Tab walks the strip's pages in order and wraps - each page
@@ -853,15 +953,15 @@ fn tab_cycles_the_pages_and_wraps() {
     open_sheet(&mut studio);
 
     for expected in [
-        "max polyphony",        // advanced
+        "zen mode",             // appearance
         "not assigned",         // mapping: the slot boxes
         "automatic",            // keybinds: the terminal-profile row
         "fetch imports",        // sources
         "add folder",           // vst
         "OSC / SuperDirt",      // reference
-        "none yet",             // trust
+        "native orchestras",    // trust: the switch is on from the start
         "Terminal: rustel-e2e", // about
-        "launch on",            // and back to settings
+        "launch on",            // and back to general
     ] {
         studio.press(KeyCode::Tab, KeyModifiers::NONE);
         studio.settle();

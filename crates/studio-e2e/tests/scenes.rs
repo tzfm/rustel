@@ -141,27 +141,32 @@ fn ctrl_shift_n_duplicates_and_a_prebake_refuses() {
     );
 }
 
-/// Ctrl+R renames the scene, its file follows, and Esc cancels without
+/// The menu renames the scene, its file follows, and Esc cancels without
 /// touching anything.
 #[test]
-fn ctrl_r_renames_and_esc_cancels() {
+fn the_menu_renames_and_esc_cancels() {
     let mut studio = hermetic();
     let set = studio.set_directory().to_path_buf();
 
-    studio.chord("ctrl+r");
+    studio.press(KeyCode::F(1), KeyModifiers::NONE);
+    studio.type_text("sr");
     assert_eq!(
         studio.status(),
         "renaming - type the new name, Enter keeps it, Esc cancels"
     );
 
-    // Esc first: nothing happens.
+    let source = studio.source().to_owned();
+    studio.type_text("zz");
+    assert_eq!(studio.source(), source);
+    assert_eq!(studio.scene_names(), vec!["first"]);
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     assert_eq!(studio.scene_names(), vec!["first"]);
     assert!(set.join("first.strudel").is_file());
 
     // Then the real rename: the old file goes, the new one is there, and
     // the queued save lands at the renamed path.
-    studio.chord("ctrl+r");
+    studio.press(KeyCode::F(1), KeyModifiers::NONE);
+    studio.type_text("sr");
     studio.type_text("intro");
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(studio.status(), "renamed \"first\" to \"intro\"");
@@ -288,7 +293,8 @@ fn the_manifest_remembers_the_set() {
     let set = studio.set_directory().to_path_buf();
 
     studio.set_score("$: s(\"bd\")");
-    studio.chord("ctrl+r");
+    studio.press(KeyCode::F(1), KeyModifiers::NONE);
+    studio.type_text("sr");
     studio.type_text("kept");
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();

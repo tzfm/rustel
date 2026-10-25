@@ -99,15 +99,9 @@ pub(super) fn snap_value(value: f64, min: f64, max: f64, step: f64) -> f64 {
     snapped.clamp(min, max)
 }
 
-/// Preserve the actual number: the text and the engine must receive the
-/// same value, including fractional steps above one and very fine steps.
-pub(super) fn format_value(value: f64) -> String {
-    if value == 0.0 {
-        "0".to_owned()
-    } else {
-        value.to_string()
-    }
-}
+/// The number form's writer, kept under the path the app has always
+/// called it by.
+pub(super) use crate::number_form::format_value;
 
 /// Count decimal places in the shortest representation, including its
 /// exponent. A step of .25 needs two places, regardless of its magnitude;
@@ -240,9 +234,22 @@ impl App {
     /// caret inside the call, deleting stays character-wise: mid-edit the
     /// numbers are the interface.
     pub(super) fn delete_slider_call(&mut self, command: &Command) -> Result<bool, RuntimeError> {
+        let Some(range) = self.slider_delete_range(command) else {
+            return Ok(false);
+        };
+        self.dispatch_editor(Command::ReplaceRange {
+            from: range.start,
+            to: range.end,
+            text: String::new(),
+        })?;
+        self.status = "slider removed - undo brings it back whole".to_owned();
+        Ok(true)
+    }
+
+    pub(super) fn slider_delete_range(&self, command: &Command) -> Option<Range<ByteOffset>> {
         let selection = self.editor().primary_selection();
         if !selection.is_empty() {
-            return Ok(false);
+            return None;
         }
         let caret = selection.head.0;
         let scene = self.scenes.current().id;
@@ -258,18 +265,9 @@ impl App {
                 .live_chips(scene)
                 .into_iter()
                 .find(|chip| chip.call.start == caret),
-            _ => return Ok(false),
+            _ => return None,
         };
-        let Some(chip) = target else {
-            return Ok(false);
-        };
-        self.dispatch_editor(Command::ReplaceRange {
-            from: ByteOffset(chip.call.start),
-            to: ByteOffset(chip.call.end),
-            text: String::new(),
-        })?;
-        self.status = "slider removed - undo brings it back whole".to_owned();
-        Ok(true)
+        target.map(|chip| ByteOffset(chip.call.start)..ByteOffset(chip.call.end))
     }
 
     /// A scene's live controls, resolved into its current text.
@@ -542,12 +540,17 @@ impl App {
             .flatten()
             .map(|(width, _)| width);
         let ratio = track.ratio(x, self.pointer_subcell, cell_width);
-        self.set_slider_with_smoothing(
-            scene,
-            &chip,
-            chip.travel.at(ratio, chip.span.min, chip.span.max),
-            self.ui_settings.slider_smoothing,
+        let span = &chip.span;
+        let resolution = track.resolution(cell_width);
+        let value = pointer_value(
+            chip.travel,
+            ratio,
+            resolution,
+            span.min,
+            span.max,
+            span.step,
         );
+        self.set_slider_with_smoothing(scene, &chip, value, self.ui_settings.slider_smoothing);
     }
 
     /// The pill's track on screen: its first column and its width in
@@ -795,6 +798,15 @@ pub(super) struct SliderTrack {
 }
 
 impl SliderTrack {
+    /// The distance, as a ratio of the track, between two places the
+    /// terminal reports: a cell apart, or a pixel apart where it reports
+    /// pixels.
+    pub(super) fn resolution(self, cell_width: Option<u16>) -> f64 {
+        let cells = f64::from(self.width.saturating_sub(1).max(1));
+        let pixels = f64::from(cell_width.filter(|width| *width > 0).unwrap_or(1));
+        1.0 / (cells * pixels)
+    }
+
     pub(super) fn ratio(self, x: u16, subcell: f64, cell_width: Option<u16>) -> f64 {
         // The handle fills a character cell. Its centre travels between
         // the centres of the first and last cells, just like a web thumb.
@@ -807,18 +819,6 @@ impl SliderTrack {
 }
 
 impl SliderSpan {
-    /// One wheel notch or coarse keyboard nudge. The declared step for a coarse
-    /// slider, a hundredth of the range for a fine one, so a `0.001` step
-    /// does not take a thousand notches to cross.
-    pub(super) fn notch(&self) -> f64 {
-        let range = self.max - self.min;
-        if range / self.step <= 200.0 {
-            self.step
-        } else {
-            (range / 100.0 / self.step).round().max(1.0) * self.step
-        }
-    }
-
     pub(super) fn clamp(&self, value: f64) -> f64 {
         snap_value(value, self.min, self.max, self.step)
     }
@@ -830,18 +830,112 @@ impl SliderSpan {
 /// endless encoder all move it.
 pub(super) fn slider_stepped(chip: &LiveChip, notches: f64) -> f64 {
     let span = &chip.span;
-    if chip.travel == Travel::Logarithmic {
-        let ratio = chip.travel.ratio(span.value, span.min, span.max);
-        let target = chip.travel.at(ratio + notches / 100.0, span.min, span.max);
+    rail_stepped(
+        chip.travel,
+        span.value,
+        span.min,
+        span.max,
+        span.step,
+        notches,
+    )
+}
+
+/// One wheel notch or coarse keyboard nudge. The declared step for a coarse
+/// slider, about a hundredth of the range for a fine one, so a `0.001` step
+/// does not take a thousand notches to cross. The notch is a round number
+/// of steps - 1, 2 or 5 times a power of ten - so its stops are round
+/// numbers too.
+pub(super) fn rail_notch(min: f64, max: f64, step: f64) -> f64 {
+    let range = max - min;
+    if range / step <= 200.0 {
+        return step;
+    }
+    let steps = (range / 100.0 / step).max(1.0);
+    let decade = 10f64.powf(steps.log10().floor());
+    let distance = |multiple: f64| (multiple / steps).ln().abs();
+    let round = [1.0, 2.0, 5.0, 10.0]
+        .map(|multiple| multiple * decade)
+        .into_iter()
+        .min_by(|a, b| distance(*a).total_cmp(&distance(*b)))
+        .unwrap_or(1.0);
+    round * step
+}
+
+/// [`slider_stepped`] for any rail: the knobs column moves its rails the
+/// way the score's own sliders move.
+pub(super) fn rail_stepped(
+    travel: Travel,
+    value: f64,
+    min: f64,
+    max: f64,
+    step: f64,
+    notches: f64,
+) -> f64 {
+    if travel == Travel::Logarithmic {
+        let ratio = travel.ratio(value, min, max);
+        let target = travel.at(ratio + notches / 100.0, min, max);
         // Even a coarse declared step must advance at the low end.
         if notches > 0.0 {
-            target.max(span.value + span.step)
+            target.max(value + step)
         } else {
-            target.min(span.value - span.step)
+            target.min(value - step)
         }
     } else {
-        span.value + notches * span.notch()
+        // A notch moves to the next stop on the notch's own grid, so a
+        // value off the grid, such as 16.3, comes back to 16.5 and 17
+        // rather than keeping its fraction for ever. The grid counts from
+        // 0, so whole numbers are stops, when the rail's own steps pass
+        // through 0. Otherwise it counts from the rail's minimum, where
+        // the steps start: a stop between two steps would snap back to
+        // where the move began.
+        let notch = rail_notch(min, max, step);
+        let steps_from_zero = min / step;
+        let anchor = if (steps_from_zero - steps_from_zero.round()).abs() < 1e-9 {
+            0.0
+        } else {
+            min
+        };
+        let place = (value - anchor) / notch;
+        let stop = place.round();
+        let from = if (place - stop).abs() < 1e-6 {
+            stop
+        } else if notches > 0.0 {
+            place.floor()
+        } else {
+            place.ceil()
+        };
+        anchor + (from + notches) * notch
     }
+}
+
+/// The value a pointer at `ratio` along a rail sets: the rail's value
+/// there, on its own steps. `resolution` is the distance, as a ratio,
+/// between two places the terminal reports - a cell, or a pixel. A whole
+/// number inside the place under the pointer wins when the rail's steps
+/// reach it, so a drag can always land back on 16 and never settles on
+/// 15.99 beside it. A place finer than one whole number keeps the rail's
+/// fractions.
+pub(super) fn pointer_value(
+    travel: Travel,
+    ratio: f64,
+    resolution: f64,
+    min: f64,
+    max: f64,
+    step: f64,
+) -> f64 {
+    let ratio = ratio.clamp(0.0, 1.0);
+    let at = travel.at(ratio, min, max);
+    let half = resolution / 2.0;
+    let low = travel.at((ratio - half).max(0.0), min, max);
+    let high = travel.at((ratio + half).min(1.0), min, max);
+    let whole = at.round();
+    let inside = whole == at || (low < whole && whole < high);
+    let target = if inside && snap_value(whole, min, max, step) == whole {
+        whole
+    } else {
+        at
+    };
+    snap_value(target, min, max, step)
 }
 
 /// Where one of the layout's sliders sits in the editor's current text.
@@ -1466,6 +1560,57 @@ mod tests {
             );
         }
 
+        /// A notch is a round number of steps, and it moves to the next
+        /// stop on its own grid: a value with a fraction comes back to a
+        /// whole number, and a whole number comes back to itself.
+        #[test]
+        fn a_notch_is_round_and_lands_back_on_whole_numbers() {
+            assert_eq!(slider::rail_notch(0.0, 250.0, 1.0), 2.0);
+            assert_eq!(slider::rail_notch(0.0, 50.0, 0.1), 0.5);
+            let step = |value: f64, notches: f64| {
+                slider::rail_stepped(Travel::Linear, value, 0.0, 50.0, 0.1, notches)
+            };
+            assert_eq!(step(16.3, 1.0), 16.5);
+            assert_eq!(step(16.5, 1.0), 17.0);
+            assert_eq!(step(17.0, -1.0), 16.5);
+            assert_eq!(step(16.3, -1.0), 16.0);
+            let coarse = |value: f64, notches: f64| {
+                slider::rail_stepped(Travel::Linear, value, 0.0, 250.0, 1.0, notches)
+            };
+            assert_eq!(coarse(coarse(16.0, 1.0), -1.0), 16.0);
+            // Steps that start at 0.1 never pass through 0: the notch counts
+            // from 0.1 too, so a move left is a move, not a snap back.
+            let odd = |value: f64, notches: f64| {
+                let moved = slider::rail_stepped(Travel::Linear, value, 0.1, 0.9, 0.2, notches);
+                slider::snap_value(moved, 0.1, 0.9, 0.2)
+            };
+            assert_eq!(odd(0.5, -1.0), 0.3);
+            assert_eq!(odd(0.5, 1.0), 0.7);
+        }
+
+        /// A pointer lands on a whole number whenever the cell under it
+        /// holds one, so a rail of 50 over 23 cells writes no 15.85. A
+        /// cell finer than one whole number keeps the rail's fractions.
+        #[test]
+        fn a_pointer_lands_on_a_whole_number_its_cell_holds() {
+            let cell = 1.0 / 22.0;
+            let value = |ratio: f64, min: f64, max: f64, step: f64| {
+                slider::pointer_value(Travel::Linear, ratio, cell, min, max, step)
+            };
+            assert_eq!(value(0.317, 0.0, 50.0, 0.1), 16.0);
+            for cell in 0..23 {
+                let landed = value(f64::from(cell) / 22.0, 0.0, 50.0, 0.1);
+                assert_eq!(landed.fract(), 0.0, "cell {cell} landed on {landed}");
+            }
+            assert_eq!(value(0.5, 0.0, 1.0, 0.01), 0.5);
+            // A whole number the slider's steps miss is no stop: the pointer
+            // takes the step nearest to it instead.
+            assert_eq!(value(0.485, 0.0, 10.0, 0.3), 4.8);
+            assert_eq!(value(0.6, 0.0, 10.0, 0.3), 6.0);
+            let hertz = slider::pointer_value(Travel::Logarithmic, 0.41, cell, 20.0, 20000.0, 0.01);
+            assert_eq!(hertz.fract(), 0.0);
+        }
+
         #[test]
         fn slider_values_are_written_back_with_the_precision_of_their_step() {
             assert_eq!(slider::format_value(0.25), "0.25");
@@ -1481,11 +1626,11 @@ mod tests {
                 step: 0.001,
                 value: 0.5,
             };
-            assert!((span.notch() - 0.01).abs() < 1e-9);
+            assert!((slider::rail_notch(span.min, span.max, span.step) - 0.01).abs() < 1e-9);
             assert_eq!(span.clamp(1.7), 1.0);
             assert!((span.clamp(0.2504) - 0.25).abs() < 1e-9);
             let coarse = SliderSpan { step: 0.05, ..span };
-            assert!((coarse.notch() - 0.05).abs() < 1e-9);
+            assert!((slider::rail_notch(coarse.min, coarse.max, coarse.step) - 0.05).abs() < 1e-9);
         }
 
         #[test]
@@ -2119,31 +2264,33 @@ mod tests {
                 x + 2,
                 row,
             );
-            assert_eq!(value(&app, scene, call), 1142.11);
-            assert!(app.status.starts_with("1142.11 · mouse: cells"));
+            // A cell holds hundreds of hertz here, so it lands on a whole one.
+            assert_eq!(value(&app, scene, call), 1142.0);
+            assert!(app.status.starts_with("1142 · mouse: cells"));
             mouse(
                 &mut app,
                 MouseEventKind::Drag(MouseButton::Left),
                 x + 3,
                 row,
             );
-            assert_eq!(value(&app, scene, call), 1663.16);
-            assert!(app.status.starts_with("1663.16 · mouse: cells"));
+            assert_eq!(value(&app, scene, call), 1663.0);
+            assert!(app.status.starts_with("1663 · mouse: cells"));
             mouse(&mut app, MouseEventKind::Up(MouseButton::Left), x + 3, row);
 
             // A terminal supplying pixels provides distinct positions within
             // that same character. A ten-pixel cell has its center at index 4.5.
+            // A pixel still spans about 52 Hz, so each lands on a whole one.
             let (x, _, row) = lay_out(&mut app, scene, call);
             app.features.pixel_mouse = true;
             let pixel_cell_start = (x + 3) * 10;
             let pixel_row = row * 20 + 9;
             let mut previous = None;
             for (offset, expected) in [
-                (2, 1532.89),
+                (2, 1533.0),
                 (3, 1585.0),
-                (4, 1637.11),
-                (5, 1689.21),
-                (6, 1741.32),
+                (4, 1637.0),
+                (5, 1689.0),
+                (6, 1741.0),
             ] {
                 let kind = if previous.is_none() {
                     MouseEventKind::Down(MouseButton::Left)
@@ -2175,7 +2322,7 @@ mod tests {
             );
 
             assert_eq!(app.armed_slider, Some((scene, call)));
-            for (key, expected) in [(KeyCode::Right, 1741.33), (KeyCode::Left, 1741.32)] {
+            for (key, expected) in [(KeyCode::Right, 1741.01), (KeyCode::Left, 1741.0)] {
                 app.handle_terminal_event(Event::Key(KeyEvent::new(key, KeyModifiers::SHIFT)))
                     .expect("fine adjustment handled");
                 assert_eq!(
@@ -2550,8 +2697,10 @@ mod tests {
                     x + middle_cell,
                     row,
                 );
+                // A place on this rail spans more than one hertz, so the
+                // pointer lands on the whole hertz inside it.
                 let ratio = f64::from(middle_cell) / f64::from(width - 1);
-                let expected = (100.0 * 100_f64.powf(ratio) * 100.0).round() / 100.0;
+                let expected = (100.0 * 100_f64.powf(ratio)).round();
                 assert_value(&app, scene, call, expected);
                 mouse(
                     &mut app,
@@ -2580,7 +2729,7 @@ mod tests {
                     assert_eq!(pixel / 9, column);
                     mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), pixel, y);
                     let ratio = f64::from(pixel - first) / f64::from(last - first);
-                    let expected = (100.0 * 100_f64.powf(ratio) * 100.0).round() / 100.0;
+                    let expected = (100.0 * 100_f64.powf(ratio)).round();
                     assert_value(&app, scene, call, expected);
                     let current = value(&app, scene, call);
                     assert!(current > previous, "every pixel changes frequency");

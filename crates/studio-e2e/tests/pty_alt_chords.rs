@@ -456,7 +456,7 @@ fn probe_alt_chords_through_a_real_pty() {
     terminal.write(&[0x0f]); // Ctrl+O: the settings sheet
     std::thread::sleep(Duration::from_millis(600));
     // This fresh Studio opens Settings on its first page. Three Tabs land on Keybinds:
-    // settings → advanced → mapping → keybinds. Do not infer the current page
+    // settings → appearance → mapping → keybinds. Do not infer the current page
     // from a diff-painted phrase: an unchanged cell may not be emitted by
     // ConPTY, which used to make this loop skip straight past Keybinds.
     for _ in 0..3 {
@@ -466,7 +466,7 @@ fn probe_alt_chords_through_a_real_pty() {
     // Walk by what the page shows rather than by Alt+O's position. More
     // rows may be added around it, and that must not turn this
     // terminal-input probe into a count of today's settings list.
-    let rows = rustel_studio::keybinds::BindAction::ALL.len() + 2; // terminal profile and reset-all rows
+    let rows = rustel_studio::keybinds::BindAction::ALL.len() + 3;
     // The input bytes are the same across platforms, but macOS displays
     // the Option symbol while Linux and Windows display Alt.
     let reveal_shortcut = if cfg!(target_os = "macos") {
@@ -558,14 +558,15 @@ fn probe_alt_chords_through_a_real_pty() {
     );
 
     // Alt+A as Windows Terminal delivers it: ESC a (sanity: the other Alt
-    // chord, proven in the same encoding).
+    // chord, proven in the same encoding). The status line is the witness:
+    // the footer shows the shortcut whether or not it is on.
     let mark = terminal.buffer.lock().unwrap().len();
     terminal.write(&[0x1b, b'a']);
     std::thread::sleep(Duration::from_millis(800));
     let frame = terminal.text();
     let after = &frame[mark..];
     assert!(
-        after.contains("samples") && contains_plain(&frame, "auto-play"),
+        after.contains("auto-play on"),
         "Alt+A produced no reaction:\n{}",
         terminal.diagnostics()
     );

@@ -130,6 +130,9 @@ pub struct LiveScalarBackend {
     /// later blocks must not re-fire it. Reset at every flip so a second
     /// launch's arm can fire fresh.
     line_arm_fired: bool,
+    /// The insert refusals of the scalar backend the asset channel has: see
+    /// [`Self::drain_insert_installs`].
+    published_refusals: u64,
     #[cfg(feature = "device-audio")]
     confirmation_stopped: bool,
     #[cfg(feature = "device-audio")]
@@ -147,7 +150,13 @@ impl LiveScalarBackend {
         frames: usize,
     ) -> LiveBlockReport {
         let mut report = LiveBlockReport::default();
-        for offset in 0..frames.min(64) {
+        let admitted = frames.min(64);
+        ring.publish_frontier(
+            start_frame,
+            start_frame.saturating_add(admitted as u64),
+            self.sample_rate,
+        );
+        for offset in 0..admitted {
             let Some(event) = ring.pop() else { break };
             if self.scalar.try_note_prepared_with_confirmation(
                 OnsetEvent::new(
@@ -195,6 +204,13 @@ impl LiveScalarBackend {
     pub fn set_live_control(&mut self, update: crate::live_control::LiveControlUpdate) {
         self.scalar.set_live_control(update);
     }
+
+    /// Moves a parameter value of an insert: see
+    /// [`ScalarBackend::set_insert_value`].
+    pub fn set_insert_value(&mut self, value: crate::insert::InsertValue) {
+        self.scalar.set_insert_value(value);
+    }
+
     /// Preparation only: the caller reclaims displaced PCM before this backend
     /// is moved into an audio callback.
     #[cfg(feature = "device-audio")]
@@ -276,9 +292,26 @@ impl LiveScalarBackend {
     }
 
     /// Stage prepared inserts between audio blocks and return displaced
-    /// copies to the producer. A full return ring defers new installs.
+    /// copies to the producer. A full return ring defers new installs. The
+    /// plugin workers of the output come first, then the releases of the
+    /// copies the score no longer has: see [`ScalarBackend::release_insert`].
+    /// After the installs, the channel gets the insert refusals since it got
+    /// them last: of the copies, and of the notes the blocks had no bus for.
     #[cfg_attr(not(feature = "device-audio"), allow(dead_code))]
     pub(crate) fn drain_insert_installs(&mut self, channel: &crate::assets::SampleChannel) {
+        if let Some(install) = channel.pool_installs.pop() {
+            // SAFETY: the producer gave this count of the `Arc` to the ring,
+            // and the pop gives it to this callback.
+            let shared = unsafe { std::sync::Arc::from_raw(install.0) };
+            self.scalar.set_plugin_pool(shared);
+        }
+        // A stopped output past its ramp makes no sound. A copy a release
+        // gives back goes back in this drain.
+        let stopped = self.stop_ramp_complete();
+        for release in channel.insert_releases.drain_available() {
+            self.scalar
+                .release_insert(release.slot, release.key, stopped);
+        }
         loop {
             if channel.insert_returns.len() == channel.insert_returns.capacity() {
                 return;
@@ -306,16 +339,11 @@ impl LiveScalarBackend {
             let insert = unsafe { Box::from_raw(install.insert) };
             // An insert prepared before the output changed its rate goes
             // back to the producer. The producer ships a new one.
-            let refused_before = self.scalar.insert_refusals();
             let displaced = if install.sample_rate == self.scalar.sample_rate() {
                 self.scalar.prepare_insert(install.slot, insert)
             } else {
                 Some(insert)
             };
-            channel.insert_refusals.fetch_add(
-                self.scalar.insert_refusals() - refused_before,
-                std::sync::atomic::Ordering::Relaxed,
-            );
             if let Some(displaced) = displaced {
                 let returned = crate::assets::ReturnedInsert(Box::into_raw(displaced));
                 // Only this callback fills the ring, and a slot was free.
@@ -326,6 +354,12 @@ impl LiveScalarBackend {
                 }
             }
         }
+        let refusals = self.scalar.insert_refusals();
+        channel.insert_refusals.fetch_add(
+            refusals - self.published_refusals,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.published_refusals = refusals;
     }
 
     /// Prepare one graph per worklet before this backend enters the callback.
@@ -601,6 +635,7 @@ impl LiveScalarBackend {
             restart_floor: None,
             line_arm_drop_from: None,
             line_arm_fired: false,
+            published_refusals: 0,
             #[cfg(feature = "device-audio")]
             confirmation_stopped: false,
             #[cfg(feature = "device-audio")]
@@ -644,6 +679,34 @@ impl LiveScalarBackend {
             .is_some_and(|rendered| rendered >= self.stop_ramp_frames())
     }
 
+    #[cfg(feature = "device-audio")]
+    pub(crate) fn intake_is_running(&self) -> bool {
+        self.stop_fade_pos.is_none()
+    }
+
+    /// Ends a sub-block of a buffer of the callback, `frames` into the
+    /// buffer. `busy` gives the time the callback took so far. The gate of
+    /// the plugin workers stays as it was through a stop.
+    #[cfg(feature = "device-audio")]
+    pub(crate) fn end_pool_sub_block(&self, frames: usize, busy: impl FnOnce() -> u64) {
+        if self.stop_fade_pos.is_none() {
+            self.scalar.end_pool_sub_block(frames, busy);
+        }
+    }
+
+    /// Ends a buffer of the callback of `frames` that took `busy_nanos`, and
+    /// gives the figures of its plugin jobs. The gate of the plugin workers
+    /// stays as it was through a stop, so a Start keeps it.
+    #[cfg(feature = "device-audio")]
+    pub(crate) fn end_pool_buffer(
+        &mut self,
+        frames: usize,
+        busy_nanos: u64,
+    ) -> Option<crate::pool::PoolFigures> {
+        let stopped = self.stop_fade_pos.is_some();
+        self.scalar.end_pool_buffer(frames, busy_nanos, stopped)
+    }
+
     /// Consume one stereo block at an absolute sample-clock position.
     ///
     /// Besides the event `ring`, it reads the producer's side of the
@@ -673,6 +736,11 @@ impl LiveScalarBackend {
         flip: LiveFlipAtomics<'_>,
         stopped: &AtomicBool,
     ) -> LiveBlockReport {
+        ring.publish_frontier(
+            start_frame,
+            start_frame.saturating_add(frames as u64),
+            self.sample_rate,
+        );
         let events = ring.drain_queued_available();
         self.process_block_with_events(
             output,
@@ -968,24 +1036,31 @@ impl LiveScalarBackend {
             if event.target_frame < start_frame {
                 report.late += 1;
             }
+            let onset = OnsetEvent::new(
+                event.target_frame,
+                event.freq_hz,
+                event.gain,
+                event.duration_secs,
+            )
+            .with_onset_lead(event.onset_lead)
+            .with_generation(event.generation)
+            .with_ui_visuals(event.ui_visuals)
+            .with_controls(event.controls)
+            .with_optional_sample(event.sample)
+            .with_optional_wavetable(event.wavetable)
+            .with_optional_synth(event.synth)
+            .with_cut(event.cut);
             if self.scalar.try_note_prepared_with_confirmation(
-                OnsetEvent::new(
-                    event.target_frame,
-                    event.freq_hz,
-                    event.gain,
-                    event.duration_secs,
-                )
-                .with_onset_lead(event.onset_lead)
-                .with_generation(event.generation)
-                .with_ui_visuals(event.ui_visuals)
-                .with_controls(event.controls)
-                .with_optional_sample(event.sample)
-                .with_optional_wavetable(event.wavetable)
-                .with_optional_synth(event.synth)
-                .with_cut(event.cut),
+                onset,
                 event.confirmation,
                 event.expected_sample_identity,
             ) {
+                // An insert that renders ahead of the callback has the
+                // frame of this onset ready before the callback asks for
+                // it, so it needs the note now, at admission, a schedule
+                // lead before it sounds. Every other insert hears the note
+                // at activation and ignores this.
+                self.scalar.notify_inserts_early(&onset, start_frame);
                 report.accepted += 1;
             } else {
                 report.refused += 1;
@@ -1423,6 +1498,57 @@ mod tests {
         assert!(processed.load(Ordering::Relaxed) > 0);
     }
 
+    /// A note whose chain finds no free bus is a refusal. The next drain
+    /// gives the channel the refusals since the drain before.
+    #[test]
+    fn the_refusal_of_a_note_reaches_the_channel_at_the_next_drain() {
+        use crate::assets::SampleChannel;
+        use crate::insert::{InsertControls, InsertKey, InsertParam, OrbitInsert};
+
+        struct Probe(InsertKey);
+        impl OrbitInsert for Probe {
+            fn key(&self) -> InsertKey {
+                self.0
+            }
+            fn set_param(&mut self, _: InsertParam, _: u32) {}
+            fn process(&mut self, _: &mut [f32], _: &mut [f32]) {}
+        }
+
+        let mut live = LiveScalarBackend::new(48_000, 8).expect("live backend");
+        let channel = SampleChannel::new();
+        let ring = Ring::new(8);
+        let words = Words::new();
+        let key = InsertKey {
+            plugin: 1,
+            preset: 0,
+        };
+        for chain in 0..crate::insert::MAX_INSERT_BUSES as u64 {
+            let slot = crate::insert::effect_slot(100 + chain, 0);
+            assert!(
+                live.scalar
+                    .install_insert(slot, Box::new(Probe(key)))
+                    .is_none()
+            );
+        }
+        let mut event = note(1, 1, 0);
+        event.controls.insert_chain = Some(9000);
+        event.controls.effects[0] = Some(InsertControls::new(key));
+        assert!(ring.push(event));
+        for block in 0..2 {
+            live.process_block_with_events(
+                &mut [0.0; BLOCK * 2],
+                BLOCK,
+                (block * BLOCK) as u64,
+                ring.drain_queued_available(),
+                words.flip(),
+                words.stopped.load(Ordering::Acquire),
+                Some(&channel),
+            );
+        }
+        assert_eq!(live.scalar.insert_refusals(), 1);
+        assert_eq!(channel.insert_refusals.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn a_replacement_insert_waits_for_its_first_onset() {
         use crate::assets::{InsertInstall, ReturnedInsert, SampleChannel};
@@ -1473,7 +1599,7 @@ mod tests {
             event.controls.effects[0] = Some(InsertControls::new(old));
             assert!(ring.push(event));
 
-            for block in 0..=4 {
+            for block in 0..=6 {
                 let onset = (3 * BLOCK) as u64;
                 if block == 1 {
                     let insert =
@@ -1548,9 +1674,12 @@ mod tests {
                         "the old insert processes until an accepted replacement onset"
                     );
                     assert_eq!(new_frames.load(Ordering::Relaxed), 0);
+                } else if block < 5 {
+                    // The old insert fades out in 5 ms beside the new one.
+                    assert!(old_frames.load(Ordering::Relaxed) > before);
+                    assert!(new_frames.load(Ordering::Relaxed) > 0);
                 } else {
                     assert_eq!(old_frames.load(Ordering::Relaxed), before);
-                    assert!(new_frames.load(Ordering::Relaxed) > 0);
                 }
                 assert_eq!(old_drops.load(Ordering::Relaxed), 0);
                 assert_eq!(new_drops.load(Ordering::Relaxed), 0);
@@ -1584,6 +1713,72 @@ mod tests {
             assert_eq!(new_drops.load(Ordering::Relaxed), 1);
             assert_eq!(unused_drops.load(Ordering::Relaxed), unused);
         }
+    }
+
+    /// A drain takes the releases before it gives back the copies, so a
+    /// copy a release takes goes back in the same drain. The callback keeps
+    /// a busy copy, also in the stop ramp. A stopped output past its stop
+    /// ramp makes no sound, and its callback takes the busy copy at once.
+    #[test]
+    fn a_release_gives_the_copy_back_in_the_same_drain() {
+        use crate::assets::{InsertRelease, SampleChannel};
+        use crate::insert::{InsertKey, InsertParam, OrbitInsert};
+
+        struct Busy(InsertKey);
+        impl OrbitInsert for Busy {
+            fn key(&self) -> InsertKey {
+                self.0
+            }
+            fn set_param(&mut self, _: InsertParam, _: u32) {}
+            fn process(&mut self, _: &mut [f32], _: &mut [f32]) {}
+            fn busy(&self) -> bool {
+                true
+            }
+        }
+
+        let mut live = LiveScalarBackend::new(48_000, 8).expect("live backend");
+        let channel = SampleChannel::new();
+        let ring = Ring::new(8);
+        let words = Words::new();
+        let key = InsertKey {
+            plugin: 1,
+            preset: 0,
+        };
+        let slot = crate::insert::effect_slot(1, 0);
+        let busy = Box::new(Busy(key));
+        assert!(live.scalar.install_insert(slot, busy).is_none());
+        let release = || {
+            let release = InsertRelease { slot, key };
+            assert!(channel.insert_releases.push(release).is_ok());
+        };
+        release();
+        live.drain_insert_installs(&channel);
+        assert_eq!(channel.insert_releases.len(), 0);
+        assert_eq!(channel.insert_returns.len(), 0, "a busy copy");
+        // The stop ramp takes 480 frames.
+        for block in 0..4 {
+            live.process_block_with_events(
+                &mut [0.0; BLOCK * 2],
+                BLOCK,
+                (block * BLOCK) as u64,
+                ring.drain_queued_available(),
+                words.flip(),
+                true,
+                Some(&channel),
+            );
+            if block == 0 {
+                // A release in the ramp leaves the busy copy in place.
+                assert!(!live.stop_ramp_complete());
+                release();
+                live.drain_insert_installs(&channel);
+                assert_eq!(channel.insert_returns.len(), 0, "in the stop ramp");
+            }
+        }
+        assert!(live.stop_ramp_complete());
+        release();
+        live.drain_insert_installs(&channel);
+        assert_eq!(channel.insert_returns.len(), 1);
+        assert_eq!(live.scalar.orbit_insert_key(slot), None);
     }
 
     /// The one flip body every site calls: it names the generation it

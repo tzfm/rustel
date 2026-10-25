@@ -3,6 +3,10 @@
 use super::*;
 use rustel_jsruntime::ImportScope;
 
+/// What a rollback evaluates its retained score with: the runtime settings,
+/// the Csound state, and the cycle `getTime()` returned when it first ran.
+type ScoreSeed<'a> = (&'a RuntimeSettings, &'a crate::CsoundSnapshot, f64);
+
 impl Session {
     /// Compile mini-notation via the Rust parser and install it.
     pub fn evaluate_mini(&mut self, source: &str) -> Result<(), RuntimeError> {
@@ -87,6 +91,7 @@ impl Session {
         // just as ordinary score evaluation does.
         self.ensure_voicings()?;
         self.js.set_cps(self.scheduler.cps());
+        self.js.set_cycle_time(self.evaluation_cycle());
         self.load_script_imports(source, cancellation, ImportScope::Shared)
             .inspect_err(|_| self.js.show_last_good_imports())?;
         // Setup code is not the active editor document. Locations created
@@ -133,6 +138,10 @@ impl Session {
         // before the score, which is exactly when the files should start
         // arriving. Registrations and preloads enter one ordered loader job
         // so an override is visible before its preload resolves.
+        let csound = self
+            .csound
+            .stage(&effects.csound, &self.config.score_import_access)?;
+        self.csound.commit(csound);
         self.apply_sample_effects(effects.samples, effects.preload);
         self.retain_recovery_prebake(source, None);
         Ok(())
@@ -229,6 +238,18 @@ impl Session {
                 Err(other) => return Err(other),
             };
             for effects in effects {
+                let csound = match self
+                    .csound
+                    .stage(&effects.csound, &self.config.score_import_access)
+                {
+                    Ok(csound) => csound,
+                    Err(error) => {
+                        self.import_errors
+                            .insert(specifier.clone(), Arc::from(error.to_string()));
+                        return Err(error);
+                    }
+                };
+                self.csound.commit(csound);
                 self.apply_sample_effects(effects.samples, effects.preload);
             }
         }
@@ -559,14 +580,33 @@ impl Session {
         no_pattern: NoPatternPolicy,
         allow_mini_fallback: bool,
     ) -> Result<(), RuntimeError> {
-        let evaluated = self.evaluate_score_cancellable(
+        // A restarting score reads cycle 0 while it evaluates. A candidate
+        // that fails leaves the score that keeps playing holding the window
+        // of the running timeline, until a restart or a stop clears it.
+        let prior_window = if restart_transport {
+            self.newest_window.take()
+        } else {
+            self.newest_window
+        };
+        let evaluated = match self.evaluate_score_cancellable(
             source,
             budget,
             cancellation,
             allow_mini_fallback,
             no_pattern,
-        )?;
-        self.install_evaluated_score(evaluated, source, now, restart_transport, None)
+        ) {
+            Ok(evaluated) => evaluated,
+            Err(error) => {
+                self.newest_window = prior_window;
+                return Err(error);
+            }
+        };
+        let installed =
+            self.install_evaluated_score(evaluated, source, now, restart_transport, None);
+        if installed.is_err() {
+            self.newest_window = prior_window;
+        }
+        installed
     }
 
     pub(super) fn evaluate_score_cancellable(
@@ -587,6 +627,19 @@ impl Session {
         )
     }
 
+    /// The cycle that `getTime()` returns while score or setup code runs:
+    /// the newest window's cycle when the code joins the running timeline,
+    /// and 0 when its score starts from its own first cycle. That is after
+    /// a stop, before a restart, and for a reload that starts from zero.
+    fn evaluation_cycle(&self) -> f64 {
+        match self.newest_window {
+            Some((cycle, stops)) if !self.next_from_zero && stops == self.transport.stops() => {
+                cycle
+            }
+            _ => 0.0,
+        }
+    }
+
     fn evaluate_score_cancellable_seeded(
         &mut self,
         source: &str,
@@ -594,7 +647,7 @@ impl Session {
         cancellation: &AtomicBool,
         allow_mini_fallback: bool,
         no_pattern: NoPatternPolicy,
-        seed: Option<&RuntimeSettings>,
+        seed: Option<ScoreSeed<'_>>,
     ) -> Result<EvaluatedScore, RuntimeError> {
         #[cfg(any(test, feature = "test-support"))]
         self.panic_if_injected(SessionPanicPoint::Evaluation);
@@ -605,6 +658,12 @@ impl Session {
         self.ensure_bindings()?;
         self.ensure_voicings()?;
         self.js.set_cps(self.scheduler.cps());
+        let cycle = seed.map_or_else(|| self.evaluation_cycle(), |(_, _, cycle)| cycle);
+        self.js.set_cycle_time(cycle);
+        #[cfg(feature = "device-audio")]
+        {
+            self.evaluated_cycle = cycle;
+        }
         let evaluated = self
             .load_script_imports(source, Some(cancellation), ImportScope::Score)
             .and_then(|()| {
@@ -632,7 +691,7 @@ impl Session {
         cancellation: &AtomicBool,
         allow_mini_fallback: bool,
         no_pattern: NoPatternPolicy,
-        seed: Option<&RuntimeSettings>,
+        seed: Option<ScoreSeed<'_>>,
     ) -> Result<EvaluatedScore, RuntimeError> {
         // A bounded first-install probe may reject the score after JavaScript
         // has published its slider and voicing candidates. Save the empty
@@ -652,14 +711,14 @@ impl Session {
             ..TranspileOptions::default()
         };
         let evaluated = match seed {
-            Some(seed) => self
+            Some((settings, _, _)) => self
                 .js
                 .evaluate_score_candidate_with_effects_cancellable_seeded(
                     source,
                     &options,
                     budget,
                     cancellation,
-                    seed,
+                    settings,
                 ),
             None => self.js.evaluate_score_candidate_with_effects_cancellable(
                 source,
@@ -669,11 +728,11 @@ impl Session {
             ),
         };
         // The label rewrite found a different count of labeled statements
-        // and wrote places. No note carries the lane numbers of this read,
-        // so the commit keeps the lanes of the score in play.
+        // and wrote places. The notes of this text carry places, and not
+        // the lane numbers of this read.
         #[cfg(feature = "vst")]
         if matches!(&evaluated, Ok((output, ..)) if output.lanes_by_place) {
-            self.lanes.forget_read();
+            self.lanes.wrote_places();
         }
         match evaluated {
             // `effects.hydra` is taken below, and only the visuals build has
@@ -691,11 +750,44 @@ impl Session {
                 {
                     self.staged_hydra = Some(effects.hydra.take().unwrap_or_default());
                 }
+                // Each door that evaluates a text comes here. The plugins of
+                // the calls the score ran load at the next look at the plugin
+                // copies, after the copies of the lanes that play.
+                #[cfg(feature = "vst")]
+                self.keep_ran_plugins(&effects.plugins);
+                let csound = match seed {
+                    Some((_, snapshot, _)) => self.csound.stage_from_snapshot(
+                        snapshot,
+                        &effects.csound,
+                        &self.config.score_import_access,
+                    ),
+                    None => self
+                        .csound
+                        .stage(&effects.csound, &self.config.score_import_access),
+                };
+                // The evaluation put this score in the active slot. A refused
+                // orchestra puts the score in play there again, so each query
+                // of the active slot reads the score in play. The visuals of
+                // this score go too.
+                let csound = match csound {
+                    Ok(csound) => csound,
+                    Err(error) => {
+                        #[cfg(feature = "hydra")]
+                        {
+                            self.staged_hydra = None;
+                        }
+                        self.js
+                            .restore_last_good_active()
+                            .map_err(|error| RuntimeError::Js(error.to_string()))?;
+                        return Err(error);
+                    }
+                };
                 match self.js.active_pattern() {
                     Some(pattern) => Ok(EvaluatedScore::JavaScript {
                         pattern,
-                        effects,
+                        effects: Box::new(effects),
                         settings,
+                        csound,
                     }),
                     None if no_pattern == NoPatternPolicy::Reject => Err(RuntimeError::NoPattern),
                     None if allow_mini_fallback => {
@@ -879,16 +971,17 @@ impl Session {
         // the commit reads the clock, so its time takes nothing from the
         // takeover margin.
         #[cfg(all(feature = "vst", feature = "device-audio"))]
-        if !self.plugin_seam(
+        let Some(plan_lines) = self.plugin_seam(
             &evaluated,
             source,
             hold,
             realtime_cps,
             probe_elapsed,
             &mut clock,
-        )? {
+        )?
+        else {
             return Ok(());
-        }
+        };
         let sampled_now = clock();
         let now = match earliest_now {
             Some(earliest_now) if !sampled_now.is_finite() || sampled_now < earliest_now => {
@@ -906,7 +999,13 @@ impl Session {
             restart_transport,
             candidate_settings,
             Self::live_replacement_takeover_headroom(realtime_cps, probe_elapsed),
-        )
+        )?;
+        // The commit forgot the plugin lines said before. The lines of the
+        // plan go out now, so a note of the score with the same line gives
+        // no second one.
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        self.report_plugin_lines(plan_lines);
+        Ok(())
     }
 
     pub(super) fn evaluated_realtime_cps(
@@ -1106,6 +1205,7 @@ impl Session {
                 pattern,
                 mut effects,
                 settings,
+                csound,
             } => {
                 // The bounded host publishes the active graph only after
                 // construction succeeds. The scheduler generation follows
@@ -1124,6 +1224,7 @@ impl Session {
                     .commit_midi_input_effects(&mut effects, expected_generation)
                     .map_err(RuntimeError::Js)?;
                 self.js.adopt_runtime_settings(&settings);
+                self.csound.commit(csound);
                 // Named rather than elided: a field added to `ScoreEffects`
                 // and forgotten here compiles clean and simply never happens,
                 // which is the quietest bug this seam can produce.
@@ -1132,18 +1233,20 @@ impl Session {
                     cps,
                     samples,
                     preload,
+                    plugins: _kept_at_the_evaluation,
                     gamepad,
                     hydra: _taken_before_the_no_pattern_arms,
                     ..
-                } = effects;
+                } = *effects;
                 #[cfg(not(feature = "hydra"))]
                 let ScoreEffects {
                     cps,
                     samples,
                     preload,
+                    plugins: _kept_at_the_evaluation,
                     gamepad,
                     ..
-                } = effects;
+                } = *effects;
                 let cps = cps.filter(|cps| {
                     debug_assert!(
                         cps.is_finite() && *cps > 0.0,
@@ -1217,6 +1320,7 @@ impl Session {
                 None
             }
         };
+        self.csound.score_changed();
         // The replacement is installed: only now does it own the takeover
         // and its cut. If they were set before the fallible install above,
         // a failed commit would leave a rewind's AtFlip/AtTakeover for the
@@ -1290,14 +1394,25 @@ impl Session {
             }
         }
         self.last_source = Some(Arc::from(source));
+        #[cfg(feature = "device-audio")]
+        {
+            self.installed_cycle = self.evaluated_cycle;
+        }
         self.recovered_source = None;
         self.js.snapshot_active_as_last_good();
         // The lanes of this text are now the lanes of the score in play, and
-        // the chains of this session get the text.
+        // the chains of this session get them: a chain of a lane that left
+        // ends after its time, at once with no live output. A lane that left
+        // keeps its number while a chain has it. The looks at the plugin
+        // copies of the cycles ahead start again with the new score.
         #[cfg(feature = "vst")]
         {
             self.lanes.install(source);
-            crate::vst::score_changed(&self.chains, Some(source));
+            let live = self.plugins_live();
+            crate::vst::score_changed(&self.chains, &self.lanes, Some(source), live);
+            crate::vst::forget_lanes_away(&self.chains, &mut self.lanes);
+            #[cfg(feature = "device-audio")]
+            self.plugin_ahead.restart();
         }
         Ok(())
     }
@@ -1539,6 +1654,7 @@ impl Session {
         let bundled = rustel_voice::BundledOnly;
         let lookup: &dyn rustel_voice::SampleLookup =
             self.samples.as_deref().map_or(&bundled, |library| library);
+        let lookup = crate::csound::ValidationLookup(lookup);
         // The window that plays reports its own notices; the probe's are dropped.
         let (invalid, _notices) = rustel_voice::with_diagnostic_policy(false, || {
             haps.iter().filter(|hap| hap.has_onset()).find_map(|hap| {
@@ -1625,7 +1741,7 @@ impl Session {
                     &onset,
                     self.config.sample_rate,
                     cps,
-                    lookup,
+                    &lookup,
                 );
                 match event {
                     Err(rustel_voice::VoiceError::InvalidControl(message)) => Some(message),
@@ -1667,8 +1783,10 @@ impl Session {
             source,
             mini: self.last_path == EvaluateSource::MiniRust,
             settings: self.js.snapshot_published_runtime_settings(),
+            csound: self.csound_snapshot(),
             cps: self.scheduler.cps(),
             cycle_zero_time: self.scheduler.time_at_cycle(Fraction::ZERO),
+            evaluated_cycle: self.installed_cycle,
         }))
     }
 
@@ -1736,7 +1854,11 @@ impl Session {
             Duration::from_millis(1),
             cancellation,
             clock,
-            Some(&previous.settings),
+            Some((
+                &previous.settings,
+                &previous.csound,
+                previous.evaluated_cycle,
+            )),
         )?;
         // A deferred attempt did not run score code, so retain the target for
         // the next recovery attempt.
@@ -1799,7 +1921,7 @@ impl Session {
         continuation_reserve: Duration,
         cancellation: &AtomicBool,
         mut clock: F,
-        seed: Option<&RuntimeSettings>,
+        seed: Option<ScoreSeed<'_>>,
     ) -> Result<LiveScoreAttempt, RuntimeError>
     where
         F: FnMut() -> f64,
@@ -1827,7 +1949,7 @@ impl Session {
         continuation_reserve: Duration,
         cancellation: &AtomicBool,
         mut clock: F,
-        seed: Option<&RuntimeSettings>,
+        seed: Option<ScoreSeed<'_>>,
     ) -> Result<LiveScoreAttempt, RuntimeError>
     where
         F: FnMut() -> f64,
@@ -1837,7 +1959,7 @@ impl Session {
                 return Err(RuntimeError::Cancelled);
             }
             let settings = match seed {
-                Some(seed) => Some(self.js.seeded_candidate_runtime_settings(seed)),
+                Some((settings, _, _)) => Some(self.js.seeded_candidate_runtime_settings(settings)),
                 None if !self.core_settings_owned => {
                     Some(self.js.snapshot_ambient_runtime_settings())
                 }
@@ -1855,6 +1977,14 @@ impl Session {
             if cancellation.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(RuntimeError::Cancelled);
             }
+            let csound = match seed {
+                Some((_, snapshot, _)) => self.csound.stage_from_snapshot(
+                    snapshot,
+                    &[],
+                    &self.config.score_import_access,
+                )?,
+                None => None,
+            };
             self.install_evaluated_score_with_clock(
                 EvaluatedScore::MiniFallback(pattern),
                 source,
@@ -1865,6 +1995,7 @@ impl Session {
                 false,
                 clock,
             )?;
+            self.csound.commit(csound);
             return Ok(LiveScoreAttempt::Applied(self.generation()));
         }
 
@@ -1884,6 +2015,12 @@ impl Session {
         );
         self.record_producer_phase(ProducerPhase::Evaluation, evaluation_started.elapsed());
         let evaluated = evaluated?;
+        let csound = match (&evaluated, seed) {
+            (EvaluatedScore::MiniFallback(_), Some((_, snapshot, _))) => self
+                .csound
+                .stage_from_snapshot(snapshot, &[], &self.config.score_import_access)?,
+            _ => None,
+        };
         self.install_evaluated_score_with_clock(
             evaluated,
             source,
@@ -1899,6 +2036,7 @@ impl Session {
         if self.holds_edit(source) {
             return Ok(LiveScoreAttempt::Waiting);
         }
+        self.csound.commit(csound);
         Ok(LiveScoreAttempt::Applied(self.generation()))
     }
 
@@ -1923,6 +2061,7 @@ impl Session {
         // restart is the reset boundary.
         self.js.midi_input_bus().clear_keys();
         self.scheduler.rebase_start_anchor(now);
+        self.newest_window = None;
         // Nothing has sounded on the new timeline, so recovery and rollback
         // must not return to the previous performance's score. The device
         // also holds no latency-compensated event of that score.
@@ -1939,6 +2078,7 @@ impl Session {
     /// boundary; an outside-clock `retime` deliberately releases that boundary.
     pub fn finish_transport_start_at(&mut self, now: f64) {
         self.scheduler.rebase_anchor(now, 0.0);
+        self.newest_window = None;
         #[cfg(feature = "device-audio")]
         {
             self.compensated_onsets.clear();
@@ -1948,7 +2088,17 @@ impl Session {
 
     /// Reload the score, then restart its timeline at cycle zero at `now`.
     pub fn restart_at(&mut self, source: &str, mini: bool, now: f64) -> Result<u64, RuntimeError> {
-        let generation = self.reload_at(source, mini, now)?;
+        // The score starts the new timeline, so `getTime()` reads its cycle 0
+        // while it evaluates. A candidate that fails leaves the running
+        // timeline playing, and its window comes back until one restarts.
+        let prior_window = self.newest_window.take();
+        let generation = match self.reload_at(source, mini, now) {
+            Ok(generation) => generation,
+            Err(error) => {
+                self.newest_window = prior_window;
+                return Err(error);
+            }
+        };
         self.restart_transport_at(now);
         Ok(generation)
     }
@@ -2542,6 +2692,16 @@ mod tests {
             assert!(matches!(&error, RuntimeError::ResourceLimit(_)), "{error}");
             assert!(error.to_string().contains("8 haps"), "{error}");
             assert_eq!(session.generation(), 0);
+
+            // The lanes that do not play keep the cap.
+            #[cfg(feature = "vst")]
+            {
+                let muted = "$: s(\"bd\")\n_$: s(\"hh*16\").vst(\"fx\")";
+                session.reload_at(muted, false, 0.0).expect("one hap plays");
+                let deadline = Instant::now() + Duration::from_secs(1);
+                let shadow = session.shadow_haps(Fraction::ZERO, Fraction::ONE, deadline);
+                assert!(shadow.is_none());
+            }
         }
     }
 
@@ -2817,6 +2977,33 @@ mod tests {
     }
 
     #[test]
+    fn a_prebake_helper_may_wrap_a_tempo_setter_for_scores_to_call() {
+        // The community prebake shape: a `bpm` helper that wraps the tempo
+        // setter is setup defining a function, not calling one. The call
+        // runs when a score calls the helper, where a tempo change is
+        // allowed.
+        let mut session = Session::new().expect("session");
+        session
+            .evaluate_prebake("window.bpm = b => setcpm(b / 4)")
+            .expect("a helper that only wraps a tempo setter is setup");
+        session
+            .evaluate("bpm(128); note('c4')")
+            .expect("the score calls the helper, where tempo may change");
+        assert_eq!(session.config().cps, 128.0 / 4.0 / 60.0);
+        assert_eq!(session.scheduler.cps(), 128.0 / 4.0 / 60.0);
+
+        // A wrapper the setup itself calls runs in setup, and the engine
+        // still refuses it there, in its own words.
+        let refused = session
+            .evaluate_prebake("window.cpms = c => setcpm(c)\ncpms(60)")
+            .expect_err("a wrapper called in setup runs in setup");
+        assert!(
+            refused.to_string().contains("setCps/setcps"),
+            "the refusal names the tempo rule: {refused}"
+        );
+    }
+
+    #[test]
     fn accepted_host_effects_apply_once_after_graph_and_tempo_commit() {
         let mut session = session_with_sample_origin("http://127.0.0.1:9");
         session.samples = Some(Arc::new(crate::samples::SampleLibrary::empty()));
@@ -2999,6 +3186,51 @@ mod tests {
         }
     }
 
+    /// A score uses a native orchestra only while the host permits one. The
+    /// refusal is typed, so the studio can offer its switch, and a permit
+    /// the host takes back refuses the next score again. A refused score
+    /// leaves the score in play in the active slot.
+    #[test]
+    fn an_orchestra_loads_only_while_it_is_permitted() {
+        let load = "loadCSound`instr voice
+endin`";
+        let mut session = Session::new().expect("session");
+        let refused = session.evaluate_prebake(load).expect_err("no permission");
+        assert_eq!(refused.kind(), "csound-permission");
+        assert!(
+            refused.to_string().starts_with("Csound is not permitted"),
+            "{refused}"
+        );
+
+        let mut access = ScoreImportAccess::denied();
+        access.permit_csound();
+        session.set_score_import_access(access);
+        // The gate passed. Without the native library the next refusal is
+        // the library's own, never the permission's.
+        if let Err(error) = session.evaluate_prebake(load) {
+            assert!(
+                std::env::var_os("RUSTEL_CSOUND_LIBRARY").is_none()
+                    && error.to_string().contains("Csound 6 is not available"),
+                "{error}"
+            );
+        }
+
+        session.set_score_import_access(ScoreImportAccess::denied());
+        let refused = session
+            .evaluate_prebake(load)
+            .expect_err("permission taken back");
+        assert_eq!(refused.kind(), "csound-permission");
+
+        // The score runs, then the host refuses its orchestra.
+        session.evaluate("note(60)").expect("score in play");
+        let playing = active_values(&session);
+        let refused = session
+            .evaluate(&format!("{load}\nnote(62)"))
+            .expect_err("no permission");
+        assert_eq!(refused.kind(), "csound-permission");
+        assert_eq!(active_values(&session), playing);
+    }
+
     /// Two scripts give `sc` two meanings. A score gets the meaning of the
     /// import in its own text, whatever score ran before.
     #[test]
@@ -3055,6 +3287,38 @@ mod tests {
         let shared = play(&mut session, "$: note(0).sc().zz()").expect("shared");
         assert_eq!(shared, high);
         assert_eq!(play(&mut session, &with("low")).expect("low"), low);
+    }
+
+    /// A score takes a built-in name with `register`, the log says so once,
+    /// and the engine's version answers again once the call is gone.
+    #[test]
+    fn register_takes_a_builtin_and_gives_it_back() {
+        fn play(session: &mut Session, source: &str) -> Result<Vec<String>, RuntimeError> {
+            session.evaluate(source).map(|()| active_values(session))
+        }
+        let mut session = Session::new().expect("session");
+        let engine = play(&mut session, "$: note(0).oneshot(4)").expect("built-in oneshot");
+        let over = "register('oneshot', (grid, pat) => pat.add(note(24)))\n$: note(0).oneshot(4)";
+        let taken = play(&mut session, over).expect("register takes the built-in");
+        assert_ne!(taken, engine);
+        assert_eq!(
+            play(&mut session, over).expect("second update"),
+            taken,
+            "the taken name stays the score's across updates"
+        );
+        let noticed = session.js.take_logs();
+        assert_eq!(
+            noticed
+                .iter()
+                .filter(|line| line.contains("replaces the built-in 'oneshot' (switch angel)"))
+                .count(),
+            1,
+            "said once across updates: {noticed:?}"
+        );
+        assert_eq!(
+            play(&mut session, "$: note(0).oneshot(4)").expect("engine oneshot again"),
+            engine
+        );
     }
 
     #[test]
@@ -4050,5 +4314,120 @@ mod tests {
         assert_eq!(haps.len(), 2);
         assert_eq!(haps[0].value.show(), "bd");
         assert_eq!(haps[1].value.show(), "sd");
+    }
+
+    #[cfg(feature = "extensions")]
+    const ONESHOT: &str = "setcps(1); $: s('riser').oneshot(4)";
+
+    /// The cycles where the score's events start, in its first 200 cycles.
+    #[cfg(feature = "extensions")]
+    fn onsets(session: &Session) -> Vec<f64> {
+        session
+            .query(Fraction::ZERO, Fraction::new(200, 1))
+            .expect("query")
+            .into_iter()
+            .filter_map(|hap| hap.whole.map(|whole| whole.begin.to_f64()))
+            .collect()
+    }
+
+    #[cfg(feature = "extensions")]
+    fn run_clock(session: &mut Session, from: f64, to: f64) {
+        let mut now = from;
+        while now < to {
+            session.schedule_at(now).expect("window");
+            now += 0.05;
+        }
+    }
+
+    #[cfg(feature = "extensions")]
+    #[test]
+    fn oneshot_plays_on_the_next_grid_line_of_the_timeline_its_score_plays_on() {
+        let mut session = Session::new().expect("session");
+        session.evaluate(ONESHOT).expect("start");
+        assert_eq!(onsets(&session), [0.0], "a start");
+
+        run_clock(&mut session, 0.0, 37.3);
+        session.reload_at(ONESHOT, false, 37.3).expect("edit");
+        assert_eq!(onsets(&session), [40.0], "an edit");
+
+        #[cfg(feature = "device-audio")]
+        {
+            session.start_next_from_zero();
+            session
+                .reload_with_clock_cancellable(ONESHOT, false, &AtomicBool::new(false), || 37.3)
+                .expect("rewind");
+            assert_eq!(onsets(&session), [0.0], "a rewind");
+        }
+
+        session.restart_at(ONESHOT, false, 37.3).expect("restart");
+        assert_eq!(onsets(&session), [0.0], "a restart");
+
+        run_clock(&mut session, 37.3, 50.0);
+        session.transport().stop();
+        session.evaluate(ONESHOT).expect("play");
+        assert_eq!(onsets(&session), [0.0], "play after a stop");
+    }
+
+    /// With no grid the next cycle plays: an edit at 37.3 fires at 38, the
+    /// cycle a player waits for when nothing larger was asked for.
+    #[cfg(feature = "extensions")]
+    #[test]
+    fn a_bare_oneshot_plays_on_the_next_cycle() {
+        let mut session = Session::new().expect("session");
+        session
+            .evaluate("setcps(1); $: s('riser').oneshot()")
+            .expect("start");
+        assert_eq!(onsets(&session), [0.0], "a start");
+
+        run_clock(&mut session, 0.0, 37.3);
+        session
+            .reload_at("setcps(1); $: s('riser').oneshot()", false, 37.3)
+            .expect("edit");
+        assert_eq!(onsets(&session), [38.0], "an edit");
+    }
+
+    /// A restart whose candidate fails leaves the timeline running, and
+    /// the next edit still reads the cycle it joins, not cycle 0.
+    #[cfg(feature = "extensions")]
+    #[test]
+    fn a_failed_restart_keeps_the_running_timeline_for_get_time() {
+        let mut session = Session::new().expect("session");
+        session.evaluate(ONESHOT).expect("start");
+        run_clock(&mut session, 0.0, 37.3);
+        session
+            .restart_at("throw new Error('reject candidate')", false, 37.3)
+            .expect_err("candidate must reject");
+        session
+            .reload_at("setcps(1); $: s('riser').oneshot()", false, 37.3)
+            .expect("edit");
+        assert_eq!(
+            onsets(&session),
+            [38.0],
+            "the edit joins the running timeline"
+        );
+    }
+
+    #[cfg(all(feature = "extensions", feature = "device-audio"))]
+    #[test]
+    fn a_rollback_keeps_the_line_its_oneshot_had() {
+        let mut session = Session::new().expect("session");
+        session.evaluate(ONESHOT).expect("start");
+        run_clock(&mut session, 0.0, 37.3);
+        session.reload_at(ONESHOT, false, 37.3).expect("edit");
+        session
+            .mark_audible_generation(session.generation())
+            .expect("rollback target");
+        run_clock(&mut session, 37.3, 41.5);
+        session
+            .reload_at("setcps(1); $: s('hh')", false, 41.5)
+            .expect("next edit");
+
+        let rollback = session.rollback_to_previous_source(41.5).expect("rollback");
+        assert_eq!(rollback, RollbackAttempt::Applied);
+        assert_eq!(
+            onsets(&session),
+            [40.0],
+            "the line passed, so it does not play again"
+        );
     }
 }

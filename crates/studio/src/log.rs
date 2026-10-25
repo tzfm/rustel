@@ -1190,7 +1190,7 @@ impl Widget for LogPanelView<'_> {
         };
         let copy = self
             .keybinds
-            .binding(super::keybinds::BindAction::Copy)
+            .hint_binding(super::keybinds::BindAction::Copy)
             .map(|binding| format!(" · {} copies", binding.hint()))
             .unwrap_or_default();
         // Docked, the band has keys of its own - `e` for the other edge,

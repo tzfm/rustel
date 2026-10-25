@@ -55,9 +55,6 @@ enum Check {
     },
     /// The focused scene moved to this index - previous/next wraps included.
     SceneAt(usize),
-    /// The scene strip took the keyboard: what is typed next reaches the
-    /// strip, not the score, and Esc gives it back.
-    Strip,
     /// The app answered on its status line - the receipt of a chord whose
     /// honest hermetic outcome is a message: there is no MIDI controller to
     /// learn from, no pad to forget, but the chord was recognised and
@@ -277,12 +274,6 @@ const DOCUMENTED: &[Documented] = &[
         check: Check::Effect(|s| s.scene_names().len() == 2),
     },
     Documented {
-        chord: "ctrl+r",
-        enhanced_only: false,
-        setup: None,
-        check: Check::Strip,
-    },
-    Documented {
         chord: "ctrl+shift+r",
         enhanced_only: true,
         setup: None,
@@ -418,7 +409,10 @@ fn every_documented_chord_is_honoured() {
                     studio.press(KeyCode::Left, KeyModifiers::NONE);
                 }
             }
-            studio.chord(chord);
+            // The engine's two-deep command queue can be full at the
+            // press; the studio then asks for the press again, which only
+            // the record chords ever do.
+            studio.press_until_taken(|studio| studio.chord(chord));
             match check {
                 Check::Menu => assert!(
                     studio.menu_open(),
@@ -526,29 +520,6 @@ fn every_documented_chord_is_honoured() {
                     "the documented chord `{chord}` ({capabilities:?}) moved the scene to the \
                      wrong place"
                 ),
-                Check::Strip => {
-                    // A rename owns the keyboard: the letters it is given
-                    // name the scene, they never reach the score, and Esc
-                    // gives the keyboard back with nothing renamed.
-                    studio.type_text("zz");
-                    assert!(
-                        !studio.source().contains("zz"),
-                        "the documented chord `{chord}` ({capabilities:?}) let typing reach the \
-                         score while the strip held the keyboard:\n{}",
-                        studio.source()
-                    );
-                    assert_eq!(
-                        studio.scene_names(),
-                        vec!["first"],
-                        "the documented chord `{chord}` ({capabilities:?}) renamed before Enter"
-                    );
-                    studio.press(KeyCode::Esc, KeyModifiers::NONE);
-                    assert_eq!(
-                        studio.scene_names(),
-                        vec!["first"],
-                        "the documented chord `{chord}` ({capabilities:?}) did not let Esc cancel"
-                    );
-                }
                 Check::Says(receipt) => assert!(
                     studio.status().contains(receipt),
                     "the documented chord `{chord}` ({capabilities:?}) answered \

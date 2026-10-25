@@ -9,10 +9,13 @@
 use rustel_runtime::{ScoreSampleAccess, Session, SessionConfig};
 use rustel_studio::reference::Reference;
 
-fn session() -> Session {
+fn session(csound: bool) -> Session {
     let mut access = ScoreSampleAccess::denied();
     access.permit_public_cors_origins();
-    let config = SessionConfig::default().with_score_sample_access(access);
+    let mut config = SessionConfig::default().with_score_sample_access(access);
+    if csound {
+        config.score_import_access.permit_csound();
+    }
     let mut session = Session::with_config(config).expect("session");
     session.set_direct_diagnostic_logging(false);
     let _ = session.enable_default_samples();
@@ -36,6 +39,10 @@ fn every_reference_example_evaluates() {
     let mut checked = 0usize;
     for index in 0..reference.len() {
         let entry = reference.entry(index).expect("entry");
+        let csound = matches!(
+            entry.name.as_str(),
+            "csound" | "csoundm" | "loadCSound" | "loadOrc"
+        );
         for example in &entry.examples {
             if excused(example) {
                 continue;
@@ -45,11 +52,15 @@ fn every_reference_example_evaluates() {
             // broken example cannot poison or abort the rest of the sweep.
             let example = example.clone();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut session = session();
+                let mut session = session(csound);
                 session.evaluate(&example)
             }));
             match result {
                 Ok(Ok(())) => {}
+                Ok(Err(error))
+                    if csound
+                        && std::env::var_os("RUSTEL_CSOUND_LIBRARY").is_none()
+                        && error.to_string().contains("Csound 6 is not available") => {}
                 Ok(Err(e)) => failures.push(format!("`{}` {e}", entry.name)),
                 Err(_) => failures.push(format!("`{}` panicked", entry.name)),
             }

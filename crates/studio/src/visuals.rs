@@ -25,7 +25,7 @@ use rustel_runtime::ui_events::{
 };
 
 use super::engine::StudioSnapshot;
-use super::theme::{Theme, VisualOptions, hsv, luminance, mix, parse_color, true_rgb};
+use super::theme::{Theme, VisualOptions, hsv, luminance, mix, parse_color, true_rgb, wash};
 
 const MAX_TIMELINE_EVENTS: usize = 2_048;
 const HISTORY_SECONDS: f64 = 8.0;
@@ -291,7 +291,14 @@ impl VisualState {
     /// scrolls on, the marks in the code go out since nothing is sounding,
     /// and the audio sequence starts over for the next set. The previews
     /// stay on the picture; [`Self::start`] is what clears them.
+    ///
+    /// A canvas that is already stopped does not stop again: the second
+    /// word of the engine would reset the audio sequence of the held
+    /// picture, and the held frame would take new audio for a moment.
     pub fn stop(&mut self) {
+        if !self.running {
+            return;
+        }
         self.running = false;
         // Repeated Stop acknowledgements must retain the first stop time.
         self.frozen_at.get_or_insert_with(Instant::now);
@@ -1400,7 +1407,7 @@ impl<'a, 'b> PianoRoll<'a, 'b> {
         if alpha >= 0.999 {
             colour
         } else {
-            mix(self.background, colour, alpha)
+            wash(self.background, colour, alpha)
         }
     }
 }
@@ -1881,7 +1888,7 @@ impl Widget for Spiral<'_, '_> {
             let color = if opacity >= 0.999 {
                 color
             } else {
-                mix(self.request.background, color, opacity)
+                wash(self.request.background, color, opacity)
             };
             // The arc runs to where the note stops sounding, not to the
             // end of its whole span.
@@ -2114,7 +2121,7 @@ impl Widget for PitchWheel<'_, '_> {
         }
         // The hour marks, one per division of the octave - faint for the
         // divisions the event's scale leaves out, as on strudel.cc.
-        let faint = mix(self.request.background, theme.grid, 0.15);
+        let faint = wash(self.request.background, theme.grid, 0.15);
         for division in 0..edo {
             let (x, y) = point_at(angle_of(division as f64 / edo as f64), radius);
             if x >= 0 && y >= 0 {
@@ -2148,7 +2155,7 @@ impl Widget for PitchWheel<'_, '_> {
             let color = if alpha >= 0.999 {
                 own
             } else {
-                mix(self.request.background, own, alpha)
+                wash(self.request.background, own, alpha)
             };
             // The scale's name for the note's degree, beside its name.
             let interval = scale.and_then(|scale| {
@@ -2695,6 +2702,19 @@ impl SpectrogramRamp {
                 theme.meter.peak,
             ],
         };
+        // The quiet end of the picture is painted, not left blank: on a
+        // pixel raster an untouched point is a hole, so the ground fills
+        // it. A ground the terminal owns has no pixel value - the raster
+        // would paint it black and a glyph cell would draw the default
+        // foreground - so the palette's muted colour stands in. The ramp
+        // then starts at a grey the terminal can show.
+        let ground = if true_rgb(ground).is_some() {
+            ground
+        } else if matches!(theme.muted, Color::Reset) {
+            stops[0]
+        } else {
+            theme.muted
+        };
         Self { ground, stops }
     }
 
@@ -2790,7 +2810,7 @@ impl<'a, 'b> Spectrum<'a, 'b> {
         let bars = usize::from(bars_area.width);
         for bar in 0..bars {
             let color = color_override.unwrap_or_else(|| spectrum_color(theme, bar, bars));
-            let peak_color = mix(self.request.background, color, 0.6);
+            let peak_color = wash(self.request.background, color, 0.6);
             let crest = brighten(color);
             let level = self.level(spectrum_level(&bands.levels, bar, bars));
             let peak = self.level(spectrum_level(&bands.peaks, bar, bars));
@@ -2922,7 +2942,7 @@ fn note_to_midi(name: &str) -> Option<f64> {
 }
 
 fn dim(color: Color, theme: &Theme) -> Color {
-    mix(color, theme.background, 0.55)
+    wash(theme.background, color, 0.45)
 }
 
 fn brighten(color: Color) -> Color {
@@ -2965,6 +2985,28 @@ pub(super) struct PainterTerminal {
     pub entry: &'static str,
     /// `(option, note)` pairs for the options that behave differently here.
     pub options: &'static [(&'static str, &'static str)],
+    /// The options the terminal reads as numbers where the documentation
+    /// gives another default or no bounds.
+    pub numbers: &'static [TerminalNumber],
+}
+
+/// A number option as the terminal reads it: the value it takes when the
+/// score leaves the option out, and the bounds it holds the value to. A
+/// switch is 0 or 1.
+pub(super) struct TerminalNumber {
+    pub option: &'static str,
+    pub default: f64,
+    pub min: f64,
+    pub max: f64,
+}
+
+const fn number(option: &'static str, default: f64, min: f64, max: f64) -> TerminalNumber {
+    TerminalNumber {
+        option,
+        default,
+        min,
+        max,
+    }
 }
 
 /// Terminal behaviour of every painter that differs from the documentation.
@@ -3007,16 +3049,24 @@ pub(super) const PAINTER_TERMINAL: &[PainterTerminal] = &[
                 "ignored: the terminal's font is the terminal's",
             ),
         ],
+        // Folded unless told not to: eight rows cannot spread 10..90. And
+        // the range follows the notes until it is pinned.
+        numbers: &[
+            number("fold", 1.0, 0.0, 1.0),
+            number("autorange", 1.0, 0.0, 1.0),
+        ],
     },
     PainterTerminal {
         painter: "punchcard",
         entry: "The same painter as pianoroll here, fed by the highlighter: a plain punchcard() shows every event the highlighter sees, the whole stack, while _punchcard() is tagged to its own pattern. Every pianoroll option applies, with the same exceptions.",
         options: &[],
+        numbers: &[],
     },
     PainterTerminal {
         painter: "wordfall",
         entry: "A punchcard on its side with labels on: time falls from the top, one lane per value across. Every pianoroll option applies, with the same exceptions.",
         options: &[],
+        numbers: &[],
     },
     PainterTerminal {
         painter: "spiral",
@@ -3038,6 +3088,12 @@ pub(super) const PAINTER_TERMINAL: &[PainterTerminal] = &[
             ("playheadThickness", "ignored: see playheadLength"),
             ("logSpiral", "ignored, as on strudel.cc"),
         ],
+        numbers: &[
+            number("stretch", 1.0, 0.1, 4.0),
+            number("inset", 3.0, 0.5, 12.0),
+            number("steady", 1.0, -4.0, 4.0),
+            number("padding", 0.0, 0.0, 1.0),
+        ],
     },
     PainterTerminal {
         painter: "pitchwheel",
@@ -3055,6 +3111,7 @@ pub(super) const PAINTER_TERMINAL: &[PainterTerminal] = &[
             ),
             ("margin", "ignored: the wheel is fitted to its rows"),
         ],
+        numbers: &[],
     },
     PainterTerminal {
         painter: "scope",
@@ -3067,6 +3124,13 @@ pub(super) const PAINTER_TERMINAL: &[PainterTerminal] = &[
                 "the level the trace starts at, not a switch - align is the switch",
             ),
         ],
+        // A scope that names no scale is fitted to its pane at a scale of
+        // 1. Naming one, even 1, ends the fit.
+        numbers: &[
+            number("scale", 1.0, 0.01, 8.0),
+            number("pos", 0.5, 0.0, 1.0),
+            number("trigger", 0.0, -1.0, 1.0),
+        ],
     },
     PainterTerminal {
         painter: "spectrum",
@@ -3077,11 +3141,16 @@ pub(super) const PAINTER_TERMINAL: &[PainterTerminal] = &[
             ("scroll", "only here"),
             ("color", "only here"),
         ],
+        numbers: &[
+            number("min", -80.0, -120.0, 0.0),
+            number("max", 0.0, -120.0, 0.0),
+        ],
     },
     PainterTerminal {
         painter: "markcss",
         entry: "Accepted and never drawn: the studio highlights sounding events in its own theme's colours, which a CSS rule cannot describe.",
         options: &[],
+        numbers: &[],
     },
 ];
 
@@ -3111,6 +3180,21 @@ pub(super) fn painter_terminal_option(painter: &str, option: &str) -> &'static s
                 .map(|(_, note)| *note)
         })
         .unwrap_or("")
+}
+
+/// How the terminal reads one of a painter's options as a number, when it
+/// differs from the documentation.
+pub(super) fn painter_terminal_number(
+    painter: &str,
+    option: &str,
+) -> Option<&'static TerminalNumber> {
+    let painter = painter.strip_prefix('_').unwrap_or(painter);
+    PAINTER_TERMINAL
+        .iter()
+        .find(|painter_terminal| painter_terminal.painter == painter)?
+        .numbers
+        .iter()
+        .find(|number| number.option.eq_ignore_ascii_case(option))
 }
 
 /// The painters' entries, in the order the renderer dispatches them.
@@ -3319,7 +3403,7 @@ pub(super) const REFERENCE_ENTRIES: &[ReferenceEntry] = &[
             },
             ReferenceParam {
                 name: "inset",
-                r#type: "string",
+                r#type: "number",
                 description: "number of rotations before spiral starts (default 3)",
             },
             ReferenceParam {
@@ -3947,7 +4031,7 @@ mod tests {
         let area = Rect::new(0, 0, 60, 12);
         // Options that would draw a five-division wheel rooted on A.
         let picture = draw("pitchwheel", "{edo: 5, root: 440}", &state, area);
-        let faint = mix(theme.background, theme.grid, 0.15);
+        let faint = wash(theme.background, theme.grid, 0.15);
         assert!(
             cells_in(&picture, faint).len() >= 3,
             "the five divisions outside C major are faint:\n{}",
@@ -5201,6 +5285,114 @@ mod tests {
         }
     }
 
+    /// A dim keeps 45% of its colour on a coloured ground, the share the
+    /// painters mixed toward the background before the terminal themes.
+    #[test]
+    fn a_dim_keeps_45_percent_of_its_colour_on_a_coloured_ground() {
+        let mut theme = theme();
+        theme.background = Color::Rgb(20, 20, 20);
+        // 20 + (128 - 20) * 0.45 = 68.6, rounded to 69.
+        assert_eq!(
+            dim(Color::Rgb(128, 128, 128), &theme),
+            Color::Rgb(69, 69, 69)
+        );
+    }
+
+    #[test]
+    fn fades_keep_their_colour_on_a_ground_the_terminal_owns() {
+        let terminal = Theme::built_in("terminal").unwrap();
+        assert_eq!(terminal.background, Color::Reset);
+        // A dim toward a ground that is not a colour would snap to the
+        // ground and paint black on the pixel raster: the colour stands.
+        assert_eq!(
+            dim(terminal.event_inactive, &terminal),
+            terminal.event_inactive
+        );
+        assert_eq!(
+            wash(Color::Reset, Color::Rgb(255, 0, 0), 0.5),
+            Color::Rgb(255, 0, 0)
+        );
+        assert_eq!(
+            wash(Color::Reset, Color::Rgb(255, 0, 0), 0.25),
+            Color::Rgb(255, 0, 0)
+        );
+        // A ground that is a colour still takes its share, in the same
+        // order. The quarter is asymmetric on purpose: a swapped call
+        // lands on 191, not 64.
+        assert_eq!(
+            wash(Color::Rgb(0, 0, 0), Color::Rgb(255, 0, 0), 0.25),
+            Color::Rgb(64, 0, 0)
+        );
+    }
+
+    /// The spectrogram paints its quiet level, so its lowest colour must
+    /// be one the terminal can show. A reset ground would paint black or
+    /// the default foreground, and the picture would open on a slab.
+    #[test]
+    fn a_spectrum_ramp_on_a_terminal_ground_starts_visible() {
+        let theme = Theme::built_in("terminal").expect("terminal ships");
+        let ramp = SpectrogramRamp::new(&theme, theme.background, theme.accent);
+        for step in 0..=100 {
+            let level = step as f32 / 100.0;
+            let colour = ramp.at(level);
+            assert_ne!(colour, Color::Reset, "level {level} has no colour");
+            assert_ne!(colour, Color::Black, "level {level} paints black");
+        }
+    }
+
+    /// A silent note is the case the reports showed as black bars. The
+    /// whole painter path runs under the terminal theme: no cell that
+    /// carries a glyph may come back `Reset`, which the pixel raster
+    /// paints as plain black, and the bars wear the palette's own slots.
+    #[test]
+    fn a_roll_under_the_terminal_theme_paints_no_black_bars() {
+        let state = playing(
+            "$: s(\"bd sd\")._pianoroll()",
+            vec![event(1, "0/1", "1/2", 10.0), event(2, "1/2", "1/1", 10.5)],
+            0.75,
+        );
+        let theme = Theme::built_in("terminal").expect("terminal ships");
+        let parsed = VisualOptions::parse("");
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buffer = Buffer::empty(area);
+        render(
+            VisualRequest {
+                kind: "pianoroll",
+                slot: None,
+                options: &parsed,
+                state: &state,
+                theme: &theme,
+                background: theme.background,
+                inline: true,
+            },
+            area,
+            &mut buffer,
+        );
+        let painted = buffer
+            .content
+            .iter()
+            .filter(|cell| cell.symbol() != " ")
+            .collect::<Vec<_>>();
+        assert!(!painted.is_empty(), "the roll drew nothing");
+        for cell in painted {
+            assert_ne!(
+                cell.fg,
+                Color::Reset,
+                "a painted cell fell back to the terminal's ground"
+            );
+            // Silent notes wear slot 8, sounding ones slot 14, and the
+            // playhead crossing a bar recolours that cell with slot 3.
+            assert!(
+                matches!(
+                    cell.fg,
+                    Color::Indexed(3) | Color::Indexed(8) | Color::Indexed(14)
+                ),
+                "a bar wore {} instead of the palette's slots",
+                cell.fg
+            );
+        }
+    }
+
     #[test]
     fn spectrum_colors_follow_frequency_and_theme() {
         let _gate = cells_tier();
@@ -5900,6 +6092,7 @@ mod tests {
             audible_generation: Some(7),
             confirmed_audio_generation: Some(7),
             source_revision: Some(first_revision),
+            csound: Default::default(),
             cps: 0.5,
             device_time: 10.0,
             cycle: 4.0,
@@ -5949,6 +6142,7 @@ mod tests {
             audible_generation: Some(8),
             confirmed_audio_generation: Some(7),
             source_revision: Some(silent_revision),
+            csound: Default::default(),
             cps: 2.0,
             device_time: 20.0,
             cycle: 40.0,
@@ -5981,5 +6175,76 @@ mod tests {
             visual.clock_at(cutover_wall + std::time::Duration::from_secs(3)),
             Some((23.0, 46.0, 2.0))
         );
+    }
+
+    /// The terminal's own defaults are the values its painters take: an
+    /// option written at its terminal default draws what no option draws,
+    /// so a knob that comes on at it changes nothing on the screen. A scope
+    /// that names its scale is no longer fitted to its pane, which is the
+    /// one difference the picture shows.
+    #[test]
+    fn a_terminal_default_draws_what_no_option_draws() {
+        let area = Rect::new(0, 0, 32, 10);
+        let notes = || {
+            vec![
+                pitched(1, "0/1", "1/2", 261.6, 10.0),
+                pitched(2, "1/2", "1/1", 523.2, 20.0),
+            ]
+        };
+        let mut checked = 0;
+        for painter in PAINTER_TERMINAL {
+            for number in painter.numbers {
+                if (painter.painter, number.option) == ("scope", "scale") {
+                    continue;
+                }
+                let source = format!("$: note(\"c4 c5\")._{}()", painter.painter);
+                let mut state = playing(&source, notes(), 0.2);
+                let mut scope = [0.0f32; UI_SCOPE_SAMPLES];
+                for (index, sample) in scope.iter_mut().enumerate() {
+                    *sample = (std::f32::consts::TAU * 3.0 * index as f32
+                        / UI_SCOPE_SAMPLES as f32)
+                        .sin();
+                }
+                let mut spectrum = [0.0f32; UI_SPECTRUM_BINS];
+                for (index, bin) in spectrum.iter_mut().enumerate() {
+                    *bin = -110.0 + 100.0 * index as f32 / UI_SPECTRUM_BINS as f32;
+                }
+                assert!(state.install_audio(
+                    UiAudioMetadata {
+                        sequence: 1,
+                        generation: 1,
+                        device_time: 0.5,
+                        stream_id: 1,
+                        epoch: 1,
+                        end_frame: 24_000,
+                        sample_rate: 48_000,
+                    },
+                    UiAudioAnalysisSet {
+                        master: UiAudioAnalysisFrame { scope, spectrum },
+                        visuals: Vec::new(),
+                        sides: Vec::new(),
+                    },
+                ));
+                // A stopped clock holds the picture still between the
+                // two draws.
+                state.stop();
+                let written = format!("{{{}: {}}}", number.option, number.default);
+                let plain = draw(painter.painter, "", &state, area);
+                assert!(painted(&plain) > 0, "{} draws", painter.painter);
+                assert_eq!(
+                    rows(&plain),
+                    rows(&draw(painter.painter, &written, &state, area)),
+                    "{} {written}",
+                    painter.painter
+                );
+                assert!(
+                    (number.min..=number.max).contains(&number.default),
+                    "{} {written} is inside its bounds",
+                    painter.painter
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 8, "every terminal number is drawn");
     }
 }

@@ -47,6 +47,18 @@ MIRIFLAGS="$MIRIFLAGS -Zmiri-many-seeds=0..16" \
     baton_crosses_threads snapshots_share_published_slots_safely_with_the_producer \
     retirement_excludes_publication
 
+# Csound command and sample transfers between the callback and its worker.
+MIRIFLAGS="$MIRIFLAGS -Zmiri-many-seeds=0..16" \
+  miri -p rustel-csound --lib -- worker::tests
+
+# Plugin jobs between the callback and its workers: the post, the claim,
+# the park and the join, under 16 thread schedules. The park test leaves
+# each job to a worker, so a worker that misses a post fails it.
+MIRIFLAGS="$MIRIFLAGS -Zmiri-many-seeds=0..16" \
+  miri -p rustel-audio --lib -- \
+    pool::tests::each_posted_job_runs_once_when_the_callback_and_the_workers_race \
+    pool::tests::a_worker_that_parks_never_misses_a_post
+
 # AVX2 kernels. Miri reports only the CPU features of the build, so this build
 # turns AVX2 on.
 RUSTFLAGS="-C target-feature=+avx2" miri -p rustel-audio --lib -- _kernel::

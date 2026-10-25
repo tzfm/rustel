@@ -384,6 +384,7 @@ impl Session {
         let mut report = self.play(duration_secs)?;
         let device = rustel_audio::ScalarDevice::open_default()
             .map_err(|error| RuntimeError::Audio(error.to_string()))?;
+        let csound = self.csound.for_render();
         let (events, notices) =
             rustel_voice::with_diagnostic_policy(self.direct_diagnostic_logging, || {
                 if let Some(library) = &self.samples {
@@ -400,12 +401,17 @@ impl Session {
                     }
                     library.wait_until_idle(std::time::Duration::from_secs(120));
                 }
-                crate::render::scalar_events(
+                let lookup = crate::csound::Lookup {
+                    samples: self.sample_lookup(),
+                    state: &csound,
+                };
+                let events = crate::render::scalar_events(
                     &report.onsets,
                     device.sample_rate(),
                     self.config.cps,
-                    self.sample_lookup(),
-                )
+                    &lookup,
+                )?;
+                Ok::<_, String>(events)
             });
         self.report_voice_notices(notices);
         let events =
@@ -418,13 +424,14 @@ impl Session {
                 .collect(),
             None => Vec::new(),
         };
-        match device.play_with_samples_dispatch_and_polyphony(
+        match device.play_with_samples_dispatch_polyphony_and_inserts(
             &events,
             duration_secs,
             self.transport.stopped_flag(),
             installs,
             self.config.dsp_dispatch,
             self.max_polyphony(),
+            Some(csound.provider(true)),
         ) {
             Ok(()) => {}
             Err(rustel_audio::DevicePlaybackError::Cancelled) => {
@@ -434,6 +441,16 @@ impl Session {
                 return Err(RuntimeError::ResourceLimit(message));
             }
             Err(error) => return Err(RuntimeError::Audio(error.to_string())),
+        }
+        for message in csound.take_errors() {
+            // A starved worker left a gap of silence and played on. Its line
+            // is a plugin line, as in a live set. Each other message fails
+            // the run.
+            if message != rustel_csound::STARVATION_LINE {
+                return Err(RuntimeError::Audio(message));
+            }
+            let record = serde_json::json!({ "csound_failed": { "message": &message } });
+            self.report_plugin_line(message, record);
         }
         report.audio_backend = "scalar-rust/cpal".into();
         report.device_audio = "played".into();
@@ -512,6 +529,7 @@ impl Session {
             crate::render::ensure_mp3_available()?;
         }
         let mut onsets: Vec<OnsetEventJson> = Vec::new();
+        let mut csound_saves = Vec::new();
         // The first window whose pattern threw: its span bounced silent, and
         // the report must say so exactly as a single-score render does - a
         // tape is handed to someone else, and "wrote the file" is not the
@@ -592,6 +610,16 @@ impl Session {
             // that fails, or one that never plays, leaves them.
             if *at < end_secs && self.generation() != generation_before {
                 held.retain(|onset| onset.target_time < *at);
+                let snapshot = self.csound.snapshot();
+                if csound_saves.last().is_some_and(|(last, _)| last == at) {
+                    csound_saves.pop();
+                }
+                if csound_saves
+                    .last()
+                    .is_none_or(|(_, previous)| previous != &snapshot)
+                {
+                    csound_saves.push((*at, snapshot));
+                }
             }
             let next = saves
                 .get(index + 1)
@@ -618,6 +646,7 @@ impl Session {
                 .then_with(|| a.onset_id.cmp(&b.onset_id))
         });
         onsets.dedup_by_key(|onset| onset.onset_id);
+        let csound = self.csound.with_render_timeline(csound_saves);
 
         // The mp3 door is the same render; only the container differs, so a
         // tape bounced either way is the same audio.
@@ -632,6 +661,7 @@ impl Session {
                     session.samples.as_deref(),
                     session.config.dsp_dispatch,
                     session.max_polyphony(),
+                    Some(&csound),
                 )
             } else {
                 crate::render::write_scalar_wav_controlled_with_dispatch(
@@ -652,6 +682,7 @@ impl Session {
                     rustel_audio::WavSampleFormat::Pcm16,
                     session.config.dsp_dispatch,
                     session.max_polyphony(),
+                    Some(&csound),
                 )
             }
             .map_err(render_error)
@@ -748,6 +779,7 @@ impl Session {
                 session.samples.as_deref(),
                 session.config.dsp_dispatch,
                 session.max_polyphony(),
+                Some(&session.csound),
             )
             .map_err(RuntimeError::Io)
         })
@@ -840,6 +872,7 @@ impl Session {
                     session.samples.as_deref(),
                     session.config.dsp_dispatch,
                     session.max_polyphony(),
+                    Some(&session.csound),
                 )
                 .map_err(|error| match error.kind() {
                     std::io::ErrorKind::InvalidInput => {
@@ -873,6 +906,7 @@ impl Session {
                     rustel_audio::WavSampleFormat::Pcm16,
                     session.config.dsp_dispatch,
                     session.max_polyphony(),
+                    Some(&session.csound),
                 )
                 .map_err(render_error);
                 let encoded = rendered.and_then(|(bytes, refused)| {
@@ -910,6 +944,7 @@ impl Session {
                     },
                     session.config.dsp_dispatch,
                     session.max_polyphony(),
+                    Some(&session.csound),
                 )
                 .map(|(bytes, refused)| (Some(bytes), refused))
                 .map_err(render_error)
@@ -1054,13 +1089,20 @@ impl Session {
         self.collect_pending_osc(&onsets, now, cps);
 
         let mut input_warnings: Vec<String> = Vec::new();
-        let (events, notices) =
+        // The note of each event, for its plugin chain.
+        #[cfg(feature = "vst")]
+        let mut values = Vec::new();
+        // Only a plugin chain changes an event.
+        #[cfg_attr(not(feature = "vst"), allow(unused_mut))]
+        let (mut events, notices) =
             rustel_voice::with_diagnostic_policy(self.direct_diagnostic_logging, || {
                 onsets
                     .iter()
                     .filter_map(|onset| {
                         match self.live_audio_event(onset, sample_rate, cps, lookup) {
                             Ok(event) => {
+                                #[cfg(feature = "vst")]
+                                values.push(&onset.value);
                                 if let Some(warning) = self.input_channel_warning(&event)
                                     && !input_warnings.contains(&warning)
                                 {
@@ -1077,8 +1119,11 @@ impl Session {
                             }
                         }
                     })
-                    .collect()
+                    .collect::<Vec<_>>()
             });
+        #[cfg(feature = "vst")]
+        self.chain_live_events(&mut events, &values);
+        self.record_csound_chains(&events);
         self.report_voice_notices(notices);
         // Said once per score text, like a plugin line: the set plays on,
         // and a refusal that stays true is not news each window.

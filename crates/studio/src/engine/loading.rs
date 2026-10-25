@@ -181,6 +181,13 @@ fn waits_for_words(sounds: bool, plugins: bool) -> &'static str {
     }
 }
 
+/// The message a launch logs when it lets its line pass for its sounds,
+/// its plugin copies or both.
+pub(super) fn launch_wait_message(sounds: bool, plugins: bool) -> String {
+    let waits_for = waits_for_words(sounds, plugins);
+    format!("{waits_for} still loading - the launch takes the first line after them")
+}
+
 impl StudioEngine {
     /// Whether starts and edits wait for their sounds, as the master bus
     /// says this turn. Leaving wait lets a held start and a held edit land
@@ -460,14 +467,13 @@ impl StudioEngine {
         if !sounds && !plugins {
             return false;
         }
-        self.launch_takes_next_line(now, waits_for_words(sounds, plugins));
+        self.launch_takes_next_line(now, &launch_wait_message(sounds, plugins));
         true
     }
 
     /// The pending launch lets the line within its head-room pass and aims
-    /// at the next one. The first line it lets pass is logged, with what the
-    /// launch waits for.
-    pub(super) fn launch_takes_next_line(&mut self, now: f64, waits_for: &str) {
+    /// at the next one. The launch logs `said` at the first line it lets pass.
+    pub(super) fn launch_takes_next_line(&mut self, now: f64, said: &str) {
         let cps = self.session.cps().max(1e-6);
         let cycle_now = self.session.cycle_at_time(now);
         let headroom_cycles = self.launch_headroom() * cps;
@@ -477,9 +483,7 @@ impl StudioEngine {
         pending.boundary_cycle = next_boundary(cycle_now, pending.unit_cycles, headroom_cycles);
         pending.boundary_time = now + (pending.boundary_cycle - cycle_now) / cps;
         if !std::mem::replace(&mut pending.waited, true) {
-            self.log_launch(&format!(
-                "{waits_for} still loading - the launch takes the first line after them"
-            ));
+            self.log_launch(said);
         }
     }
 
@@ -636,9 +640,9 @@ impl StudioEngine {
             cue.plugins += self.load.start_plugins;
         }
         // A held edit or a launch counts the copies the session holds its
-        // text for.
+        // text for. The async mode waits for no copy, and counts none.
         #[cfg(feature = "vst")]
-        {
+        if self.waits_for_sounds() {
             let held = self.load.held_edit.iter().map(|held| &held.source);
             let launch = self.pending_launch.iter().map(|pending| &pending.source);
             for source in held.chain(launch) {
@@ -812,7 +816,7 @@ impl StudioEngine {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::engine::tests::*;
     use crate::engine::{Arc, Duration, EnginePressureMonitor, LiveDeviceReport};
@@ -918,7 +922,7 @@ mod tests {
         }
     }
     #[cfg(test)]
-    mod load_mode_tests {
+    pub(crate) mod load_mode_tests {
         //! Tests for the load mode: a start or an edit meeting sounds that are
         //! still loading, the loading cue that follows them, and the one line a
         //! load's late sounds are said in.
@@ -928,7 +932,7 @@ mod tests {
         use rustel_runtime::samples::{SampleFailure, SampleLibrary};
 
         /// A stopped studio in `mode` whose sounds come from `library`.
-        fn studio(mode: LoadMode, library: &Arc<SampleLibrary>) -> StudioEngine {
+        pub(crate) fn studio(mode: LoadMode, library: &Arc<SampleLibrary>) -> StudioEngine {
             studio_with(mode, library, SessionConfig::default())
         }
 
@@ -1346,7 +1350,7 @@ mod tests {
         /// folder that is the only plugin folder of the process. One test at a
         /// time has the folder.
         #[cfg(feature = "vst")]
-        fn fixture_plugins() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
+        pub(crate) fn fixture_plugins() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
             static FOLDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
             let one = FOLDER.lock().unwrap_or_else(|poison| poison.into_inner());
             let folder = tempfile::tempdir().expect("plugins");
@@ -1375,13 +1379,29 @@ mod tests {
 
         /// [`start`] with the plugins of the process on the output, as a play
         /// opens it. Turns until the copies of the first window are ready, and
-        /// the plugin thread has no work.
+        /// the plugin thread has no work. Gives the slot of each copy the output
+        /// takes, from its first note on.
         #[cfg(feature = "vst")]
-        fn start_with_plugins(engine: &mut StudioEngine, source: &str) {
+        pub(crate) fn start_with_plugins(
+            engine: &mut StudioEngine,
+            source: &str,
+        ) -> Arc<std::sync::Mutex<Vec<rustel_audio::InsertSlot>>> {
             engine.session.transport().start();
             let device =
                 LiveScalarDevice::start_silent(48_000, engine.generation()).expect("silent output");
-            engine.session.attach_plugins(&device);
+            engine.session.attach_instruments(&device);
+            let slots = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = rustel_runtime::vst::host().provider(false);
+            device.set_insert_provider(Arc::new({
+                let slots = Arc::clone(&slots);
+                move |key, sample_rate, slot| {
+                    let insert = provider(key, sample_rate, slot);
+                    if insert.is_some() {
+                        slots.lock().unwrap().push(slot);
+                    }
+                    insert
+                }
+            }));
             engine
                 .session
                 .bind_audio_confirmations(device.confirmations())
@@ -1393,6 +1413,7 @@ mod tests {
                 !engine.start_is_held()
             });
             rustel_runtime::vst::host().wait_idle();
+            slots
         }
 
         /// Changing controls must not wait again for the plugin copies of the
@@ -1427,8 +1448,10 @@ $: s("supersaw").seg(16).vst("rustel fixture", {gain: 0.1})"#;
         /// An edit with a new plugin copy goes in play with the copy ready: the
         /// session builds each new copy before the commit. A copy of the fixture
         /// builds in some ms, inside the short wait of the commit, so the edit
-        /// lands at once. An edit with no new chain builds no copy, and the
-        /// async mode holds no edit.
+        /// lands at once. A muted lane gets its copy too, and nothing waits for
+        /// it. An edit with no new chain builds no copy, and the async mode holds
+        /// no edit. In the async mode a launch builds its copy during its
+        /// countdown, and the countdown counts from the clock after the prepare.
         #[cfg(feature = "vst")]
         #[test]
         fn new_plugin_copies_are_still_followed_after_an_edit() {
@@ -1436,7 +1459,8 @@ $: s("supersaw").seg(16).vst("rustel fixture", {gain: 0.1})"#;
             let library = loading_kick();
             let playing = r#"$: s("sine").vst("rustel fixture", {gain: 0.1})"#;
             for (edit, new) in [
-                // A new preset, one more effect, a second lane, an instrument.
+                // A new preset, one more effect, a second lane, an instrument,
+                // a muted lane above.
                 (
                     r#"$: s("sine").vst("rustel fixture", {gain: 0.1, preset: "Soft"})"#.to_owned(),
                     1,
@@ -1447,13 +1471,13 @@ $: s("supersaw").seg(16).vst("rustel fixture", {gain: 0.1})"#;
                     1,
                 ),
                 (r#"$: note("c3").vsti("rustel fixture tone")"#.to_owned(), 1),
-                // No new chain: a lane name, a lane above, a muted lane above.
-                (playing.replace("$:", "lead:"), 0),
-                (format!("$: s(\"sine\")\n{playing}"), 0),
                 (
                     format!("_$: s(\"sine\").vst(\"rustel fixture\")\n{playing}"),
-                    0,
+                    1,
                 ),
+                // No new chain: a lane name, a lane above.
+                (playing.replace("$:", "lead:"), 0),
+                (format!("$: s(\"sine\")\n{playing}"), 0),
             ] {
                 let mut engine = studio(LoadMode::Wait, &library);
                 start_with_plugins(&mut engine, playing);
@@ -1461,25 +1485,56 @@ $: s("supersaw").seg(16).vst("rustel fixture", {gain: 0.1})"#;
                 let install = engine.evaluate(&edit, false).expect("an edit");
                 assert!(!install.held, "{edit}");
                 assert_eq!(engine.active_source(), Some(edit.as_str()));
+                rustel_runtime::vst::host().wait_idle();
                 assert_eq!(copies() - built, new, "{edit}");
             }
             let mut engine = studio(LoadMode::Async, &library);
             start_with_plugins(&mut engine, playing);
             let edit = playing.replace("gain: 0.1", "preset: \"Soft\"");
             assert!(!engine.evaluate(&edit, false).expect("an edit").held);
+            // A launch builds its copy during the countdown, and nothing waits
+            // for it. The countdown reads the text one time: the console line of
+            // the text comes out one time. Past cycle 0, the line of the launch
+            // is 3 cycles ahead or more, and it does not fire in the test.
+            turn_until(&mut engine, "the edit in play past cycle 0", |engine| {
+                engine.live.as_ref().unwrap().device.generation() == engine.generation()
+                    && engine.session.cycle_at_time(device_now(engine)) >= 0.0
+            });
+            rustel_runtime::vst::host().wait_idle();
+            let built = copies();
+            let launch = format!(
+                "const until = Date.now() + 300; while (Date.now() < until) {{}}\nconsole.log('read')\n{edit}\n$: s(\"sine\").vst(\"rustel fixture\")"
+            );
+            let armed = engine.arm_launch(&launch, false, 4.0, false);
+            let armed = armed.expect("arm").expect("a countdown");
+            // The prepare takes 300 ms. The countdown counts from after it.
+            let shown = engine.snapshot().launch.expect("a countdown");
+            assert!(
+                armed.seconds_left - shown.seconds_left < 0.1,
+                "{armed:?} {shown:?}"
+            );
+            assert!(!engine.session.waits_for_plugins(&launch));
+            let sent = turns_for(&mut engine, Duration::from_millis(100));
+            let reads = diagnostics(&sent)
+                .into_iter()
+                .filter(|line| line.kind == "log" && line.message.contains("read"));
+            assert_eq!(reads.count(), 1);
+            rustel_runtime::vst::host().wait_idle();
+            assert_eq!(copies() - built, 1);
             drop(engine);
             rustel_runtime::vst::pin_standard_folders(Vec::new());
         }
 
         /// Preparing a replacement does not take the slot away from the plugin
         /// the current score is still playing. An edit of an orbit keeps each
-        /// copy in play, and an edit with a new preset builds its copy for a
-        /// slot of its own while the copies in play keep their slots.
+        /// copy in play. An edit with a new preset builds its copy for the
+        /// stage of the copy before, while the copies in play keep their
+        /// slots. The copies in play leave at the first note of the edit,
+        /// after their fade.
         #[cfg(feature = "vst")]
         #[test]
         fn preparing_a_plugin_edit_preserves_the_playing_insert() {
             use rustel_runtime::vst;
-            use std::sync::Mutex;
 
             let _plugins = fixture_plugins();
             let host = vst::host();
@@ -1494,24 +1549,7 @@ $: s("supersaw").seg(16).vst("rustel fixture", {gain: 0.1})"#;
 $: note("g#3*4").s("sine").vst("Rustel Fixture")
     .vst("Rustel Fixture", {gain:0.6}).orbit(1)
 $: s("supersaw").seg(16)"#;
-            start_with_plugins(&mut engine, source);
-            let slots = Arc::new(Mutex::new(Vec::new()));
-            engine
-                .live
-                .as_ref()
-                .expect("playing")
-                .device
-                .set_insert_provider(Arc::new({
-                    let slots = Arc::clone(&slots);
-                    let provider = host.provider(false);
-                    move |key, sample_rate, slot| {
-                        let insert = provider(key, sample_rate, slot);
-                        if insert.is_some() {
-                            slots.lock().unwrap().push(slot);
-                        }
-                        insert
-                    }
-                }));
+            let slots = start_with_plugins(&mut engine, source);
             // The copies in play still hold their slots.
             let in_play = |engine: &StudioEngine, slots: &[rustel_audio::InsertSlot]| {
                 let device = &engine.live.as_ref().unwrap().device;
@@ -1544,7 +1582,13 @@ $: s("supersaw").seg(16)"#;
 
             // The edit with a new preset waits for its sound, and the session
             // builds its copy in the wait. The copies in play keep their slots
-            // until the copy of the edit takes a slot of its own.
+            // until the first note of the edit. The copy of the edit takes the
+            // first stage of the chain, and the copies in play leave after
+            // their fade. The score in play plays its first note first, so its
+            // copies are in play.
+            turn_until(&mut engine, "the first note in play", |engine| {
+                engine.session.cycle_at_time(device_now(engine)) > 0.0
+            });
             let played = slots.lock().unwrap().clone();
             let incoming = r#"s("kick*16").vst("Rustel Fixture", {preset: "Soft"})"#;
             assert!(engine.hold_update(incoming, false, false));
@@ -1558,8 +1602,22 @@ $: s("supersaw").seg(16)"#;
             turn_until(&mut engine, "the copy of the edit in play", |engine| {
                 engine.active_source() == Some(incoming) && slots.lock().unwrap().len() == 3
             });
-            assert!(in_play(&engine, &played));
-            assert!(!played.contains(&slots.lock().unwrap()[2]));
+            let soft = slots.lock().unwrap()[2];
+            assert!(played.contains(&soft) && soft.stage == 0);
+            // The fade ends the copies in play at the first note of the edit,
+            // in 2 s of play at most. A release would give them back only 5 s
+            // of play after the edit. The play here counts as the clock of
+            // the chains counts it: 1 s at most for each turn. So a turn that
+            // a busy machine stalls counts 1 s.
+            let play = std::cell::Cell::new(0.0);
+            let last = std::cell::Cell::new(device_now(&engine));
+            turn_until(&mut engine, "the copies in play leaving", |engine| {
+                let now = device_now(engine);
+                play.set(play.get() + (now - last.replace(now)).clamp(0.0, 1.0));
+                assert!(play.get() < 2.0, "the copies in play outlived their fade");
+                played.iter().all(|slot| !in_play(engine, &[*slot]))
+            });
+            assert_eq!(slots.lock().unwrap().len(), 3);
             drop(engine);
             vst::pin_standard_folders(Vec::new());
         }
@@ -2061,16 +2119,23 @@ $: s("supersaw").seg(16)"#;
         }
 
         /// A launch armed while a new score waits for its first window prepares
-        /// nothing, so the new score keeps its takeover. The worker fires a due
-        /// launch and arms the next one in one command, with no turn between.
+        /// nothing at its arm, so the new score keeps its takeover. The worker
+        /// fires a due launch and arms the next one in one command, with no turn
+        /// between. The launch prepares at a later turn of its countdown. Its
+        /// chain comes from a setup helper, so its text has no `vst`: a session
+        /// that ran a plugin call prepares it too.
         #[cfg(feature = "vst")]
         #[test]
-        fn a_launch_armed_while_a_new_score_waits_prepares_nothing() {
+        fn a_launch_armed_while_a_new_score_waits_prepares_at_a_later_turn() {
             let _plugins = fixture_plugins();
             let library = loading_kick();
             let mut engine = studio(LoadMode::Wait, &library);
-            let playing = r#"$: s("sine")"#;
+            let playing = r#"$: s("sine").vst("rustel fixture")"#;
             start_with_plugins(&mut engine, playing);
+            let setup = "globalThis.soft = p => p.vst('rustel fixture', {preset: 'Soft'})";
+            engine
+                .evaluate_prebake_guarded(setup, &std::sync::atomic::AtomicBool::new(false))
+                .expect("a setup");
             let fired = format!("{playing}.gain(0.5)");
             let armed = engine.arm_launch(&fired, false, 0.25, false);
             assert!(armed.expect("arm").is_some());
@@ -2085,11 +2150,11 @@ $: s("supersaw").seg(16)"#;
                 assert!(Instant::now() < deadline, "the launch never fired");
                 std::thread::sleep(Duration::from_millis(2));
             };
-            let next =
-                format!("{fired}\n$: s(\"sine\").vst(\"rustel fixture\", {{preset: \"Soft\"}})");
-            let armed = engine.arm_launch(&next, false, 0.25, false);
+            let next = r#"$: s("sine").gain(0.5)
+$: soft(s("sine"))"#;
+            let armed = engine.arm_launch(next, false, 0.25, false);
             assert!(armed.expect("arm").is_some());
-            assert!(engine.session.plugins_waited_for(&next).is_none());
+            assert!(engine.session.plugins_waited_for(next).is_none());
             let published =
                 |engine: &StudioEngine| engine.live.as_ref().unwrap().device.generation();
             assert!(published(&engine) < install.generation);
@@ -2099,6 +2164,10 @@ $: s("supersaw").seg(16)"#;
                 "the first window of the fired launch",
                 |engine| published(engine) == install.generation,
             );
+            turn_until(&mut engine, "the prepare of the next launch", |engine| {
+                assert!(engine.pending_launch.is_some(), "it fired with no prepare");
+                engine.session.plugins_waited_for(next).is_some()
+            });
             drop(engine);
             rustel_runtime::vst::pin_standard_folders(Vec::new());
         }

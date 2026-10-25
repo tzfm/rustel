@@ -14,12 +14,12 @@ later version.
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, ArrayExpression, ArrayExpressionElement, AssignmentExpression, AwaitExpression,
-    BindingPattern, CallExpression, ExportAllDeclaration, ExportDeclaration,
-    ExportDefaultDeclaration, ExportFromDeclaration, ExportNamedDeclaration, Expression,
-    ForOfStatement, IfStatement, ImportDeclaration, ImportExpression, ImportMeta,
-    JSXAttributeValue, JSXText, NewExpression, ObjectExpression, ObjectPropertyKind, Program,
-    PropertyKey, RegExpLiteral, Statement, TemplateLiteral, VariableDeclarationKind,
+    Argument, ArrayExpression, ArrayExpressionElement, ArrowFunctionExpression,
+    AssignmentExpression, AwaitExpression, BindingPattern, CallExpression, ExportAllDeclaration,
+    ExportDeclaration, ExportDefaultDeclaration, ExportFromDeclaration, ExportNamedDeclaration,
+    Expression, ForOfStatement, Function, IfStatement, ImportDeclaration, ImportExpression,
+    ImportMeta, JSXAttributeValue, JSXText, NewExpression, ObjectExpression, ObjectPropertyKind,
+    Program, PropertyKey, RegExpLiteral, Statement, TemplateLiteral, VariableDeclarationKind,
     VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, VisitMut, walk, walk_mut};
@@ -27,7 +27,7 @@ use oxc_codegen::{Codegen, CodegenOptions};
 use oxc_parser::Parser;
 use oxc_semantic::{Scoping, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType};
-use oxc_syntax::{symbol::SymbolId, xml_entities::XML_ENTITIES};
+use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId, xml_entities::XML_ENTITIES};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -38,6 +38,7 @@ pub use callback_ir::{
     MAX_CALLBACK_IR_SOURCE_BYTES, PatternTransformCandidate, PatternTransformFallbackReason,
     lower_pattern_transform_callback,
 };
+pub use frequency_sliders::is_frequency_control;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseDiagnostic {
@@ -371,7 +372,7 @@ impl OrdinaryStringLiteralRanges {
 /// `.midi("Pilote IAC Bus 1")` reaches the call as four words: `Pilote`,
 /// `IAC`, `Bus`, `1`. The transpiler leaves the string unchanged, so a
 /// name means the same in single and double quotes.
-const PORT_NAMED_CALLS: [(&str, usize); 10] = [
+const PORT_NAMED_CALLS: [(&str, usize); 14] = [
     ("midi", 0),
     ("midin", 0),
     ("midikeys", 0),
@@ -383,6 +384,10 @@ const PORT_NAMED_CALLS: [(&str, usize); 10] = [
     ("samples", 0),
     ("samples", 1),
     ("loadSoundfont", 0),
+    ("loadOrc", 0),
+    ("loadCSound", 0),
+    ("loadCsound", 0),
+    ("loadcsound", 0),
     // A plugin, by the name of its bundle.
     ("vst", 0),
     ("vsti", 0),
@@ -986,7 +991,8 @@ pub struct TranspileOptions {
     /// reads the labeled statements with [`lane_statements`]. The label
     /// rewrite writes each number as the second argument of `.p()`. It does
     /// not use a list with a different count. See
-    /// [`TranspileOutput::lanes_by_place`].
+    /// [`TranspileOutput::lanes_by_place`]. A label with no code is no
+    /// lane, here and in the rewrite.
     pub lane_numbers: Vec<u64>,
 }
 
@@ -1456,6 +1462,110 @@ pub fn unresolved_reads(source: &str) -> Vec<(String, std::ops::Range<usize>)> {
     .unwrap_or_default()
 }
 
+/// Calls of the given names that run while the file itself runs, with the
+/// callee's byte range.
+///
+/// A call inside a function body the file only defines does not run here:
+/// it runs when something calls that function, which is exactly how a
+/// prebake hands later scores a helper that wraps a call the prebake itself
+/// may not make. The calls that do run - at the top level, in a block or
+/// expression the file evaluates, or inside a function invoked where it is
+/// written, as `(() => …)()` - are reported in source order. A call of a
+/// name the file binds itself is a call of the file's own function, not the
+/// host's global of that name.
+///
+/// This reads the syntax alone. Whether some binding a deferred call hides
+/// behind later reaches a helper at setup time is left to the host that
+/// runs the file.
+pub fn running_calls(source: &str, names: &[&str]) -> Vec<(String, std::ops::Range<usize>)> {
+    if check_nesting(source).is_err() {
+        return Vec::new();
+    }
+    on_parse_stack(|| {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
+        if parsed.panicked || !parsed.diagnostics.is_empty() {
+            return Vec::new();
+        }
+        let built = SemanticBuilder::new().build(&parsed.program);
+        let mut calls = RunningCalls {
+            scoping: built.semantic.scoping(),
+            watched: names.iter().copied().collect(),
+            deferred: 0,
+            immediate: HashSet::new(),
+            found: Vec::new(),
+        };
+        calls.visit_program(&parsed.program);
+        calls.found.sort_by_key(|(_, span)| span.start);
+        calls.found
+    })
+    .unwrap_or_default()
+}
+
+/// Collects watched calls and the number of function bodies the file only
+/// defines between them and the code the file runs.
+struct RunningCalls<'s, 'n> {
+    scoping: &'s Scoping,
+    watched: HashSet<&'n str>,
+    deferred: usize,
+    /// First bytes of function bodies invoked where they are written, so
+    /// `(() => …)()` runs its body with the code around it.
+    immediate: HashSet<u32>,
+    found: Vec<(String, std::ops::Range<usize>)>,
+}
+
+impl<'a, 's, 'n> Visit<'a> for RunningCalls<'s, 'n> {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if let Expression::Identifier(identifier) = &call.callee
+            && self.watched.contains(identifier.name.as_str())
+            && self.deferred == 0
+            // A callee the file itself bound is the file's own function,
+            // not the host's global of that name.
+            && identifier
+                .reference_id
+                .get()
+                .is_none_or(|reference| self.scoping.get_reference(reference).symbol_id().is_none())
+        {
+            self.found.push((
+                identifier.name.as_str().to_owned(),
+                identifier.span.start as usize..identifier.span.end as usize,
+            ));
+        }
+        // A function called the moment it is written runs its body with the
+        // code around it, so mark the body before the walk reaches it.
+        match call.callee.get_inner_expression() {
+            Expression::FunctionExpression(function) => {
+                self.immediate.insert(function.span.start);
+            }
+            Expression::ArrowFunctionExpression(function) => {
+                self.immediate.insert(function.span.start);
+            }
+            _ => {}
+        }
+        walk::walk_call_expression(self, call);
+    }
+
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if self.immediate.contains(&function.span.start) {
+            walk::walk_function(self, function, flags);
+            return;
+        }
+        self.deferred += 1;
+        walk::walk_function(self, function, flags);
+        self.deferred -= 1;
+    }
+
+    fn visit_arrow_function_expression(&mut self, function: &ArrowFunctionExpression<'a>) {
+        if self.immediate.contains(&function.span.start) {
+            walk::walk_arrow_function_expression(self, function);
+            return;
+        }
+        self.deferred += 1;
+        walk::walk_arrow_function_expression(self, function);
+        self.deferred -= 1;
+    }
+}
+
 /// A top-level declaration in a setup file.
 ///
 /// Setup runs in its own function scope, so this name is gone the moment the
@@ -1657,6 +1767,91 @@ impl<'a> Visit<'a> for SetupCollector {
         }
         // Always walk on: a setup may define its globals inside a
         // `queueMicrotask` or an `await`ed helper, and those count.
+        walk::walk_call_expression(self, call);
+    }
+}
+
+/// Names a file writes onto the surface every score shares, with the
+/// name's byte range.
+///
+/// These are `window.NAME = …` and `globalThis.NAME = …`, the keys of an
+/// `Object.assign(globalThis, { NAME: … })`, the names in an
+/// `Object.defineProperty(globalThis, 'NAME', …)`, and the same on
+/// `Pattern.prototype`. A write whose name cannot be read - computed,
+/// spread or imported - is not reported. A host that knows the names its
+/// engine answers to can tell which writes land on one of them.
+pub fn global_writes(source: &str) -> Vec<(String, std::ops::Range<usize>)> {
+    if check_nesting(source).is_err() {
+        return Vec::new();
+    }
+    on_parse_stack(|| {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
+        if parsed.panicked {
+            return Vec::new();
+        }
+        let mut collector = GlobalWrites { writes: Vec::new() };
+        collector.visit_program(&parsed.program);
+        collector.writes
+    })
+    .unwrap_or_default()
+}
+
+/// Collects the names written onto the shared surface, and where.
+#[derive(Default)]
+struct GlobalWrites {
+    writes: Vec<(String, std::ops::Range<usize>)>,
+}
+
+impl GlobalWrites {
+    fn push(&mut self, name: &str, span: oxc_span::Span) {
+        self.writes
+            .push((name.to_owned(), span.start as usize..span.end as usize));
+    }
+}
+
+impl<'a> Visit<'a> for GlobalWrites {
+    fn visit_assignment_expression(&mut self, assignment: &AssignmentExpression<'a>) {
+        if let Some(member) = assignment.left.as_member_expression() {
+            let object = member.object();
+            if (is_shared_global(object)
+                || object.is_specific_member_access("Pattern", "prototype"))
+                && let Some((span, name)) = member.static_property_info()
+            {
+                self.push(name, span);
+            }
+        }
+        walk::walk_assignment_expression(self, assignment);
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if call.callee.is_specific_member_access("Object", "assign")
+            && call
+                .arguments
+                .first()
+                .and_then(Argument::as_expression)
+                .is_some_and(is_shared_global)
+            && let Some(Argument::ObjectExpression(object)) = call.arguments.get(1)
+        {
+            for property in &object.properties {
+                if let ObjectPropertyKind::ObjectProperty(property) = property
+                    && !property.computed
+                    && let Some(name) = property.key.static_name()
+                {
+                    self.push(&name, property.key.span());
+                }
+            }
+        } else if call
+            .callee
+            .is_specific_member_access("Object", "defineProperty")
+            && let Some(target) = call.arguments.first().and_then(Argument::as_expression)
+            && (is_shared_global(target)
+                || target.is_specific_member_access("Pattern", "prototype"))
+            && let Some(Expression::StringLiteral(literal)) =
+                call.arguments.get(1).and_then(Argument::as_expression)
+        {
+            self.push(literal.value.as_str(), literal.span);
+        }
         walk::walk_call_expression(self, call);
     }
 }
@@ -3839,6 +4034,16 @@ struct Scanned {
     end: usize,
 }
 
+/// Whether a labeled statement has code to play. A label with no code -
+/// a `$:` at the end of the text, still waiting for its chain - is no
+/// lane: its `.p()` would glue onto the chain of the statement above,
+/// which stacks that lane a second time.
+fn label_has_code(source: &str, statement: &Scanned, regexes_are_present: bool) -> bool {
+    let body = &source[statement.body_start..statement.end];
+    let (chain, _) = split_trailing_trivia(body, regexes_are_present);
+    !chain.trim().is_empty()
+}
+
 /// The top-level statements of `source`, in source order.
 ///
 /// The label rewrite and [`lane_statements`] share this scan, so they find
@@ -3967,6 +4172,10 @@ fn scan_statements(source: &str, regexes_are_present: bool) -> Vec<Scanned> {
 /// Every labeled statement is rewritten even when non-label statements appear
 /// before it, as in `setcpm(140/4)` followed by `$: s("bd*4")`.
 ///
+/// A label with no code is dropped rather than rewritten: its `.p()`, glued
+/// onto the chain of the statement above, would stack that lane a second
+/// time. A `$:` at the end of the text changes no sound.
+///
 /// The second argument of `.p()` is the lane number of the statement.
 /// `lane_numbers` has one number for each labeled statement, in source order.
 /// With no numbers, or with a different count, the second argument is the
@@ -3975,11 +4184,14 @@ fn scan_statements(source: &str, regexes_are_present: bool) -> Vec<Scanned> {
 fn rewrite_labels(source: &str, regexes_are_present: bool, lane_numbers: &[u64]) -> (String, bool) {
     let bytes = source.as_bytes();
     let statements = scan_statements(source, regexes_are_present);
+    let is_lane = |statement: &Scanned| {
+        statement.colon.is_some() && label_has_code(source, statement, regexes_are_present)
+    };
     let labeled = statements
         .iter()
-        .filter(|statement| statement.colon.is_some())
+        .filter(|statement| is_lane(statement))
         .count();
-    if labeled == 0 {
+    if statements.iter().all(|statement| statement.colon.is_none()) {
         return (source.to_string(), false);
     }
     let by_place = lane_numbers.len() != labeled;
@@ -3988,14 +4200,15 @@ fn rewrite_labels(source: &str, regexes_are_present: bool, lane_numbers: &[u64])
     let mut place = 0usize;
 
     for statement in statements {
+        let statement_is_lane = is_lane(&statement);
         let Scanned {
             start: statement_start,
             name_end,
-            colon: Some(colon_at),
+            colon,
             body_start,
             mut end,
-        } = statement
-        else {
+        } = statement;
+        let Some(colon_at) = colon else {
             continue;
         };
         output.push_str(&source[cursor..statement_start]);
@@ -4011,17 +4224,19 @@ fn rewrite_labels(source: &str, regexes_are_present: bool, lane_numbers: &[u64])
         // A trailing line comment is part of the scanned span; `.p()`
         // appended after it would be commented out and the lane lost.
         let (chain, trivia) = split_trailing_trivia(body, regexes_are_present);
-        output.push_str(chain.trim_end());
-        output.push_str(".p(");
-        output.push_str(&quote_single(name));
-        output.push_str(", ");
-        if by_place {
-            output.push_str(&place.to_string());
-        } else {
-            output.push_str(&lane_numbers[place].to_string());
+        if statement_is_lane {
+            output.push_str(chain.trim_end());
+            output.push_str(".p(");
+            output.push_str(&quote_single(name));
+            output.push_str(", ");
+            if by_place {
+                output.push_str(&place.to_string());
+            } else {
+                output.push_str(&lane_numbers[place].to_string());
+            }
+            output.push(')');
+            place += 1;
         }
-        output.push(')');
-        place += 1;
         if !trivia.is_empty() {
             output.push(' ');
             output.push_str(trivia);
@@ -4040,9 +4255,11 @@ fn rewrite_labels(source: &str, regexes_are_present: bool, lane_numbers: &[u64])
 
 /// The lanes in the text of a score, in source order.
 ///
-/// Each labeled statement (`kick: s("bd")`, `$: s("bd*4")`) is one lane. A
-/// score with no label is one lane with the empty label. Its body is the last
-/// statement with code, or empty when the score has no code.
+/// Each labeled statement (`kick: s("bd")`, `$: s("bd*4")`) is one lane,
+/// except a label with no code, which is no lane: a `$:` at the end of the
+/// text, still waiting for its chain. A score with no label is one lane
+/// with the empty label. Its body is the last statement with code, or
+/// empty when the score has no code.
 ///
 /// This reads the score as written, with the scan of the label rewrite. The
 /// rewritten text holds source offsets, which move with each edit above a
@@ -4067,6 +4284,31 @@ pub fn lane_statements(source: &str) -> Option<Vec<LaneStatement>> {
     Some(lanes)
 }
 
+/// Whether two scores hold the same instructions: the sound of one is the
+/// sound of the other. The comparison is the transpiled text with its
+/// error locations off, so a restyling that changes no note - a label with
+/// no code, a new line - reads as the same score. A comment, any code at
+/// all, and a string with another quote style (a plain argument here, not
+/// mini notation) read as changes.
+///
+/// A host asks this before an automatic apply, to leave a set playing when
+/// the edit so far adds nothing. The comparison is of whole programs, so
+/// two scores that read the same here cannot sound different.
+pub fn same_instructions(playing: &str, typed: &str) -> bool {
+    let options = TranspileOptions {
+        emit_mini_locations: false,
+        ..TranspileOptions::default()
+    };
+    let program = |source: &str| transpile(source, &options).output.trim().to_owned();
+    // A text the transpile refuses prints nothing. Two refusals would
+    // compare equal, so a failure on either side answers false: the
+    // question is only answerable for two whole programs.
+    match (program(playing), program(typed)) {
+        (playing, typed) if playing.is_empty() || typed.is_empty() => false,
+        (playing, typed) => playing == typed,
+    }
+}
+
 /// The body of `lane_statements`, always called on a parse stack. Empty when
 /// the score has no code.
 fn lane_statements_here(source: &str) -> Vec<LaneStatement> {
@@ -4080,10 +4322,13 @@ fn lane_statements_here(source: &str) -> Vec<LaneStatement> {
         let (code, _) = split_trailing_trivia(&source[start..statement.end], regexes_are_present);
         (start, code)
     };
-    // The label, the offset of its line, and the code of each lane.
+    // The label, the offset of its line, and the code of each lane. A label
+    // with no code is no lane, as the rewrite also finds.
     let mut lanes: Vec<(&str, usize, &str)> = statements
         .iter()
-        .filter(|statement| statement.colon.is_some())
+        .filter(|statement| {
+            statement.colon.is_some() && label_has_code(source, statement, regexes_are_present)
+        })
         .map(|statement| {
             let label = &source[statement.start..statement.name_end];
             (label, statement.start, code(statement).1)
@@ -4363,6 +4608,98 @@ mod tests {
         assert_eq!(setup_definitions(""), SetupDefinitions::default());
     }
 
+    #[test]
+    fn running_calls_report_the_ones_the_file_makes() {
+        let source = "setcpm(120);\n\
+                      const later = b => setcpm(b / 4);\n\
+                      window.bpm = b => setcpm(b / 4);\n\
+                      function named(b) { return setcpm(b / 4); }\n\
+                      const held = { run: () => setcpm(1) };\n\
+                      clock.setCps(1);\n\
+                      (function () { setcps(2); })();\n\
+                      (() => midin('IAC'))();\n\
+                      if (true) { setCpm(60); }\n";
+        let names = ["setcpm", "setCps", "setcps", "setCpm", "midin"];
+        let calls = running_calls(source, &names);
+        let found = calls
+            .iter()
+            .map(|(name, span)| (name.as_str(), &source[span.start..span.end]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            found,
+            [
+                ("setcpm", "setcpm"),
+                ("setcps", "setcps"),
+                ("midin", "midin"),
+                ("setCpm", "setCpm"),
+            ],
+            "a helper only defined, a method of something else, and a name \
+             in a string are not calls the file makes"
+        );
+    }
+
+    #[test]
+    fn a_file_that_binds_a_watched_name_calls_its_own() {
+        let own = "function setcps(x) { return x }\n\
+                   setcps(1)\n\
+                   const midin = f => f\n\
+                   midin('IAC')\n";
+        assert!(running_calls(own, &["setcps", "midin"]).is_empty());
+
+        let global = "setcps(1)\n";
+        let calls = running_calls(global, &["setcps"]);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(&global[calls[0].1.clone()], "setcps");
+    }
+
+    #[test]
+    fn running_calls_survive_text_that_does_not_parse() {
+        assert!(running_calls("setcps(1", &["setcps"]).is_empty());
+        assert!(running_calls("", &["setcps"]).is_empty());
+    }
+
+    #[test]
+    fn global_writes_name_what_they_replace_and_where() {
+        let source = "window.note = 1\n\
+                      globalThis['stack'] = 2\n\
+                      Pattern.prototype.slow = (p) => p\n\
+                      Object.assign(globalThis, { hush: 1 })\n\
+                      Object.defineProperty(window, 's', { value: 1 })\n";
+        let writes = global_writes(source);
+        let found = writes
+            .iter()
+            .map(|(name, span)| (name.as_str(), &source[span.start..span.end]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            found,
+            [
+                ("note", "note"),
+                ("stack", "'stack'"),
+                ("slow", "slow"),
+                ("hush", "hush"),
+                ("s", "'s'"),
+            ],
+            "every shared surface, and the span of the name on it"
+        );
+    }
+
+    #[test]
+    fn global_writes_skip_the_ones_they_cannot_name() {
+        for source in [
+            "window[key] = 1",
+            "Object.assign(globalThis, helpers)",
+            "Object.assign(window, { [key]: 1 })",
+            "Object.defineProperty(window, key, {})",
+            "local.note = 1",
+            "Object.assign(plugin, { note: 1 })",
+            "read('window.note = 1')",
+        ] {
+            assert!(global_writes(source).is_empty(), "{source}");
+        }
+        assert!(global_writes("globalThis.a = (").is_empty());
+        assert!(global_writes("").is_empty());
+    }
+
     /// Device names remain literal strings in either quote style. Treating a
     /// double-quoted port name as mini-notation splits names that contain spaces.
     #[test]
@@ -4374,6 +4711,10 @@ mod tests {
             r#"$: s("bd").midimap("my map")"#,
             r#"await samples("github:tidalcycles/dirt-samples")"#,
             r#"await samples({ bd: ["bd.wav"] }, "https://example.test/audio/")"#,
+            r#"await loadOrc("local:custom voices.orc")"#,
+            r#"await loadCSound("instr Bell\nendin")"#,
+            r#"await loadCsound(`instr Bell\nendin`)"#,
+            r#"await loadcsound("instr Bell\nendin")"#,
             r#"$: s("bd").serial(38400, 0, 0, "/dev/tty.usbmodem 1")"#,
             r#"$: s("bd").vst("Valhalla Supermassive", { preset: "Warm Pad" })"#,
             r#"$: note("c3").vsti("Serum 2", { preset: "Bass One" })"#,
@@ -4397,6 +4738,8 @@ mod tests {
                         .output
                         .contains("m('github:tidalcycles/dirt-samples'")
                     && !output.output.contains("m('https://example.test/audio/'")
+                    && !output.output.contains("m('local:custom voices.orc'")
+                    && !output.output.contains("m('instr Bell")
                     && !output.output.contains("m('/dev/tty.usbmodem 1'")
                     && !output.output.contains("m('Valhalla Supermassive'")
                     && !output.output.contains("m('Warm Pad'")
@@ -5452,6 +5795,52 @@ mod tests {
             ..TranspileOptions::default()
         };
         assert_eq!(transpile("mondo`a b`", &none).output, "mondo`a b`;");
+    }
+
+    /// A label with no code is no lane: it writes no `.p()`. Before, the
+    /// call glued onto the chain of the statement above and stacked that
+    /// lane a second time, so a `$:` typed at the end of a playing score
+    /// made the set louder.
+    #[test]
+    fn a_label_with_no_code_is_no_lane() {
+        let options = TranspileOptions::default();
+        let base = "$: note(60)\nlead: s(\"hh\")\n";
+        let plain = transpile(base, &options).output;
+        assert_eq!(transpile(&format!("{base}$:"), &options).output, plain);
+        assert_eq!(
+            lane_statements(&format!("{base}$:")),
+            lane_statements(base),
+            "a label with no code is no lane for a host either"
+        );
+        // A label whose chain starts on the next line is still one lane.
+        assert_eq!(
+            lane_statements("$:\n  note(60)"),
+            Some(vec![lane("$", "note(60)", 1)])
+        );
+    }
+
+    /// A label half typed and a new line are the score they finish. Any
+    /// code, a comment, and another quote style are changes: a single
+    /// quoted string is a plain argument here, not mini notation.
+    #[test]
+    fn same_instructions_reads_only_silent_edits_as_the_same() {
+        let playing = "$: s(\"bd\")\nlead: note(\"c\")\n";
+        for typed in [
+            format!("{playing}$:"),
+            format!("{playing}mylane:"),
+            format!("{playing}\n"),
+        ] {
+            assert!(same_instructions(playing, &typed), "{typed:?}");
+        }
+        for typed in [
+            "$: s(\"bd\").gain(.2)\nlead: note(\"c\")\n",
+            "setcps(1)\n$: s(\"bd\")\nlead: note(\"c\")\n",
+            "// mix\n$: s(\"bd\")\nlead: note(\"c\")\n",
+            "$: s(\"bd\")\nlead: note(\"c\")\n4",
+            "$: s('bd')\nlead: note(\"c\")\n",
+        ] {
+            assert!(!same_instructions(playing, typed), "{typed:?}");
+        }
     }
 
     #[test]
