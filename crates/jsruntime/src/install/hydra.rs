@@ -708,17 +708,15 @@ pub(crate) fn restore_surface<'js>(
     let globals = ctx.globals();
     let state = state(ctx)?;
     let saved: rquickjs::Object = state.get(SAVED)?;
-    // A rejected write must not spend the name it failed on: the entry
-    // stays saved and the surface stays installed, so the next evaluation
-    // tries again instead of leaving the score's value in place of the
-    // engine's for the rest of the session. A slot a score locked
-    // non-configurable still takes the original as a plain value while it
-    // stays writable, as the registration restore does.
+    // Each entry is tried once and then spent: a slot a score locked
+    // non-configurable can never be unlocked, so retrying the same name
+    // would fail every later evaluation forever. While such a slot stays
+    // writable it still takes the original as a plain value, so the
+    // engine's name answers again even though its configurability cannot
+    // come back.
     let mut first_failure = None;
-    let mut unrestored = false;
     for entry in saved.props::<String, rquickjs::Value>() {
         let Ok((name, original)) = entry else {
-            unrestored = true;
             continue;
         };
         let restored = (|| {
@@ -758,16 +756,12 @@ pub(crate) fn restore_surface<'js>(
                 }
             }
         })();
-        match restored {
-            Ok(()) => {
-                saved.remove(name.as_str())?;
-            }
-            Err(error) => {
-                unrestored = true;
-                first_failure.get_or_insert(error);
-            }
+        if let Err(error) = restored {
+            first_failure.get_or_insert(error);
         }
+        saved.remove(name.as_str())?;
     }
+    state.set(SAVED, bare_object(ctx)?)?;
     state.set(ASSIGNED, bare_object(ctx)?)?;
     let mut chains = chains.borrow_mut();
     for name in std::mem::take(&mut chains.protected) {
@@ -776,14 +770,7 @@ pub(crate) fn restore_surface<'js>(
         }
     }
     chains.chains.clear();
-    if unrestored {
-        // Keep the surface installed: the next evaluation restores the
-        // names that stay saved rather than leaving them spent.
-        chains.installed = true;
-    } else {
-        state.set(SAVED, bare_object(ctx)?)?;
-        chains.installed = false;
-    }
+    chains.installed = false;
     match first_failure {
         Some(error) => Err(error),
         None => Ok(()),

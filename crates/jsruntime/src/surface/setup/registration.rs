@@ -214,10 +214,11 @@ pub(crate) fn restore_surface(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
         let method: rquickjs::Value = before.get(DISPLACED_METHOD)?;
         let raw: rquickjs::Value = before.get(DISPLACED_RAW)?;
         let scoped: rquickjs::Value = before.get(DISPLACED_SCOPED)?;
-        // The record entry is spent only once its writes landed. A restore
-        // that fails after forgetting the displacement leaves the score's
-        // registration installed for good: the next score has nothing left
-        // to put back.
+        // The record entry is spent either way once tried: a slot a score
+        // locked non-configurable can never be unlocked, so retrying the
+        // same displacement would fail every later evaluation forever.
+        // What the name meant before this score is either put back now or
+        // reported once and left to the lock.
         let restored = (|| {
             if method.is_undefined() && raw.is_undefined() && scoped.is_undefined() {
                 return Ok(());
@@ -226,13 +227,9 @@ pub(crate) fn restore_surface(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
             put_back(&proto, &format!("_{name}"), raw)?;
             put_back(&scope, &name, scoped)
         })();
-        match restored {
-            Ok(()) => {
-                record.remove(&name)?;
-            }
-            Err(error) => {
-                first_failure.get_or_insert(error);
-            }
+        record.remove(&name)?;
+        if let Err(error) = restored {
+            first_failure.get_or_insert(error);
         }
     }
     match first_failure {

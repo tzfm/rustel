@@ -1487,19 +1487,23 @@ impl FiniteAdmission {
             .get(self.next)
             .is_some_and(|event| event.onset_frame < horizon)
         {
-            // Sidechains arm here, as the live path arms at ring intake:
-            // the queue drains as ducks fire, and arming at the prepare
-            // pass would spend its whole capacity on far-future onsets.
-            backend.arm_duck_at(
-                self.events[self.next].onset_frame,
-                self.events[self.next].controls.duck,
-            );
             let compact = self.events[self.next]
                 .clone()
                 .map_kabel(crate::CompactKabelControls::from);
             if !backend.try_note_prepared(compact) {
+                // Admission is refused for now and retried on the next
+                // block: arming before this point would queue the same
+                // sidechain once per retry and flood the duck queue.
                 return;
             }
+            // Sidechains arm here, once per admitted event, as the live
+            // path arms at ring intake: the queue drains as ducks fire,
+            // and arming at the prepare pass would spend its whole
+            // capacity on far-future onsets.
+            backend.arm_duck_at(
+                self.events[self.next].onset_frame,
+                self.events[self.next].controls.duck,
+            );
             self.next += 1;
         }
     }

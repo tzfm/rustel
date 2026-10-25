@@ -1683,6 +1683,41 @@ fn split_probe_bytes(bytes: &[u8]) -> (Vec<u8>, Vec<crossterm::event::Event>) {
                 }
                 index = end + 1;
             }
+            // SS3: F1-F4 arrive as ESC O P/Q/R/S.
+            Some(b'O') => match bytes.get(index + 2) {
+                Some(b'P') => {
+                    keys.push(crossterm::event::Event::Key(KeyEvent::new(
+                        KeyCode::F(1),
+                        KeyModifiers::NONE,
+                    )));
+                    index += 3;
+                }
+                Some(b'Q') => {
+                    keys.push(crossterm::event::Event::Key(KeyEvent::new(
+                        KeyCode::F(2),
+                        KeyModifiers::NONE,
+                    )));
+                    index += 3;
+                }
+                Some(b'R') => {
+                    keys.push(crossterm::event::Event::Key(KeyEvent::new(
+                        KeyCode::F(3),
+                        KeyModifiers::NONE,
+                    )));
+                    index += 3;
+                }
+                Some(b'S') => {
+                    keys.push(crossterm::event::Event::Key(KeyEvent::new(
+                        KeyCode::F(4),
+                        KeyModifiers::NONE,
+                    )));
+                    index += 3;
+                }
+                _ => {
+                    replies.extend_from_slice(&bytes[index..(index + 3).min(bytes.len())]);
+                    index = (index + 3).min(bytes.len());
+                }
+            },
             Some(b']' | b'P' | b'_' | b'^' | b'X') => {
                 // OSC and friends run to ST (ESC \) or BEL.
                 let mut end = index + 2;
@@ -3087,6 +3122,13 @@ mod tests {
         // A split reply at the window's end is a reply, not a key.
         let (replies, _) = crate::terminal::split_probe_bytes(b"\x1b[?20");
         assert_eq!(replies, b"\x1b[?20");
+
+        // SS3 function keys come through as themselves.
+        let (_, keys) = crate::terminal::split_probe_bytes(b"\x1bOP");
+        assert_eq!(
+            keys,
+            vec![Event::Key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE))]
+        );
 
         // A control chord names its letter: 0x03 is Ctrl+C, 0x13 Ctrl+S.
         let (_, keys) = crate::terminal::split_probe_bytes(&[0x03, 0x13]);

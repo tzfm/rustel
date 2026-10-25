@@ -1060,6 +1060,17 @@ mod tests {
         let mods = |json: &str| {
             modulator_controls(&object(json), 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
         };
+        // An oscillator name under a bank that lacks it falls back to the
+        // oscillator, and its pitch still rides the frequency.
+        let (banked, _, _) = mods(
+            r#"{"s": "sine", "bank": "no_such_bank", "lfo": {"a": {"control": "note", "rate": 2}}}"#,
+        );
+        let slot = banked[0].expect("the fallback oscillator resolves the pitch target");
+        assert_eq!(
+            slot.param_base, 220.0,
+            "a banked-but-missing oscillator rides its frequency, not detune"
+        );
+
         for control in ["note", "s", "freq", "frequency", "wt", "detune", "warp"] {
             let lfo = format!(r#""lfo": {{"a": {{"control": "{control}", "rate": 2}}}}"#);
             let direct = format!(r#"{{"s": "wt_digital_basique", {lfo}}}"#);
@@ -2021,11 +2032,16 @@ fn source_pitch_rides_detune(object: &serde_json::Map<String, serde_json::Value>
         // No sound named at all is the default oscillator.
         None => false,
         Some(name) => {
-            // The bank prefix goes on first, so a banked table counts as
-            // the `wt_` name it resolves to, exactly as selection does.
+            // A banked table counts as the `wt_` name it resolves to, as
+            // selection does. A native synth name keeps its oscillator
+            // under a bank that lacks it, and an oscillator rides its
+            // frequency: only a sample rides detune.
             let banked = bank_prefixed(object, name).ok().flatten();
-            let name = banked.as_deref().unwrap_or(name);
-            !is_native_synth_sound(name) && !name.starts_with("wt_")
+            let wavetable = name.starts_with("wt_")
+                || banked
+                    .as_deref()
+                    .is_some_and(|banked| banked.starts_with("wt_"));
+            !wavetable && !is_native_synth_sound(name)
         }
     }
 }

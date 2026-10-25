@@ -147,11 +147,17 @@ pub fn cycle_of(timeline: &Timeline, ghost: i64) -> f64 {
     timeline.beat_at(ghost) as f64 / (4.0 * MICRO_BEATS_PER_BEAT as f64)
 }
 
-/// The mean of two clock samples. Halves each sample first, so a pair
-/// near `i64::MAX` averages exactly as `(a + b) / 2` would, which also
-/// rounds toward zero.
+/// The mean of two clock samples, averaged by bits so a pair near
+/// `i64::MAX` or `i64::MIN` averages exactly as `(a + b) / 2` would,
+/// which rounds toward zero.
 pub(super) fn mean(a: i64, b: i64) -> i64 {
-    a / 2 + b / 2 + (a % 2 + b % 2) / 2
+    let floored = (a & b) + ((a ^ b) >> 1);
+    // A negative half rounds up toward zero, as the plain division does.
+    if (a ^ b) & 1 == 1 && floored < 0 {
+        floored + 1
+    } else {
+        floored
+    }
 }
 
 /// The median of the clock samples a measurement gathered. An empty set
@@ -313,5 +319,11 @@ mod tests {
         assert_eq!(median(&mut high), Some(i64::MAX - 1));
         let mut low = [i64::MIN, i64::MIN, i64::MIN + 2, i64::MIN + 2];
         assert_eq!(median(&mut low), Some(i64::MIN + 1));
+        // Mixed-sign pairs truncate toward zero, exactly as (a + b) / 2.
+        assert_eq!(mean(-1, 2), 0);
+        assert_eq!(mean(1, -2), 0);
+        assert_eq!(mean(-3, 0), -1);
+        assert_eq!(mean(-5, -6), -5);
+        assert_eq!(mean(5, 6), 5);
     }
 }
