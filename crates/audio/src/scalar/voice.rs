@@ -1549,6 +1549,7 @@ impl ScalarBackend {
         quantum_skip: u8,
         phases: &mut [f64; crate::backend::MAX_FM_OPERATORS + 1],
         noise: &mut [NoiseGen; crate::backend::MAX_FM_OPERATORS + 1],
+        live_index: Option<f32>,
         mod_adds: &ModAdds,
         tables: &PeriodicWaveTables,
         sample_rate: f64,
@@ -1598,14 +1599,21 @@ impl ScalarBackend {
         }
 
         // The route depth uses the source's static nominal frequency. Live
-        // frequency modulation moves that oscillator but not the gain of the
-        // route carrying it.
+        // frequency modulation moves that oscillator but not the gain of
+        // the route carrying it.
         let mut incoming = [0.0f32; crate::backend::MAX_FM_OPERATORS + 1];
         for route in fm.routes.iter().flatten() {
             let Some(Some(op)) = fm.operators.get(usize::from(route.source) - 1) else {
                 continue;
             };
-            let amount = route.amount
+            // A live slider on the direct route replaces its base amount;
+            // a modulator aimed at the index still adds on top, as on the
+            // other routes.
+            let base_amount = match (route.mod_slot, live_index) {
+                (Some(0), Some(index)) => index,
+                _ => route.amount,
+            };
+            let amount = base_amount
                 + route
                     .mod_slot
                     .and_then(|slot| mod_adds.fm_index.get(usize::from(slot)).copied())

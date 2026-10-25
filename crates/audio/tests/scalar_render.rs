@@ -35,7 +35,7 @@ fn controls(waveform: Waveform, pan: Option<f32>) -> OscillatorControls {
     OscillatorControls {
         kabel: None,
         limit: None,
-        live_controls: [0; 3],
+        live_controls: [0; 4],
         preview_epoch: 0,
         choke_only: false,
         piano: false,
@@ -5268,6 +5268,104 @@ fn bin_share(signal: &[f32], bins: &[usize]) -> f64 {
     let power = |bin: usize| spectrum[bin].norm_sqr();
     let total: f64 = (1..=RATE / 2).map(power).sum();
     bins.iter().map(|&bin| power(bin)).sum::<f64>() / total
+}
+
+/// A live slider on the FM index bends the SOUNDING input voice: no new
+/// hap, no retrigger. The route amount is 2 until the update lands half a
+/// second in, then ramps to zero, and the last second carries the plain
+/// read. Without the update the bend holds through the same window.
+#[test]
+fn a_live_fm_slider_bends_the_sounding_input_voice_without_a_new_hap() {
+    use rustel_audio::input::InputRing;
+    use rustel_audio::live_control::LiveControlUpdate;
+
+    const RATE: usize = 48_000;
+    // 768 whole 128-frame blocks: about two seconds, so the update at half
+    // a second and the last second's window both sit inside one hap.
+    let total = 768 * 128;
+    let lag = 512usize;
+    let signal: Vec<f32> = (0..total + lag)
+        .map(|frame| {
+            (std::f64::consts::TAU * 300.0 * f64::from(frame as u32) / RATE as f64).sin() as f32
+        })
+        .collect();
+    let render = |update: Option<(u64, f32)>| -> Vec<f32> {
+        let rig = LiveRig::new();
+        let ring = std::sync::Arc::new(InputRing::new());
+        ring.set_channels(1);
+        ring.set_sample_rate(48_000);
+        let mut backend = rustel_audio::LiveScalarBackend::new(48_000, 8).expect("live backend");
+        backend.set_input(Some(std::sync::Arc::clone(&ring)));
+        let mut pcm = vec![0.0f32; total * 2];
+        let mut cursor = 0usize;
+        while cursor < total {
+            let count = (total - cursor).min(128);
+            if cursor == 0 {
+                ring.write(&signal[0..lag + 128], 1);
+                let mut c = controls(Waveform::Sine, None);
+                c.fm = Some(fm_chain(&[Some((2.0, 1.0))]));
+                c.live_controls = [0, 0, 0, 44];
+                assert!(rig.ring.push(rustel_audio::AudioEvent {
+                    onset_id: 1,
+                    generation: 1,
+                    ui_visuals: 0,
+                    target_frame: 0,
+                    onset_lead: 0.0,
+                    freq_hz: 440.0,
+                    gain: 0.8,
+                    duration_secs: 2.0,
+                    controls: c,
+                    sample: None,
+                    wavetable: None,
+                    synth: Some(rustel_audio::SynthSource::Input { channel: 0 }),
+                    cut: None,
+                }));
+            } else {
+                ring.write(&signal[cursor + lag..cursor + lag + 128], 1);
+            }
+            // 188 whole blocks in, past the first half second: an aligned
+            // frame, because the loop steps 128 at a time.
+            if cursor == 188 * 128
+                && let Some((binding, value)) = update
+            {
+                backend.set_live_control(LiveControlUpdate {
+                    binding,
+                    value,
+                    smooth: false,
+                });
+            }
+            backend.process_block_with(
+                &mut pcm[cursor * 2..(cursor + count) * 2],
+                count,
+                cursor as u64,
+                &rig.ring,
+                LiveFlipAtomics {
+                    generation: &rig.generation,
+                    takeover_frame: &rig.takeover,
+                    takeover_cut: &rig.cut,
+                    line_arm: &rig.line_arm,
+                },
+                &rig.stopped,
+            );
+            cursor += count;
+        }
+        pcm.chunks(2)
+            .map(|frame| frame[0])
+            .skip(RATE)
+            .take(RATE)
+            .collect()
+    };
+    let bins = [140, 580, 740, 1020, 1180, 1620];
+    let held = render(None);
+    assert!(
+        bin_share(&held, &bins) > 0.3,
+        "the bend holds while the slider does not move"
+    );
+    let released = render(Some((44, 0.0)));
+    assert!(
+        bin_share(&released, &bins) < 0.01,
+        "a slider to zero unbends the sounding voice mid-note"
+    );
 }
 
 /// The FM matrix bends the live input's playback rate. A 300 Hz signal in

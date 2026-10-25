@@ -49,14 +49,14 @@ fn direct_gain_lpf_and_lpq_follow_distinct_native_cells() {
         assert_ne!(cutoff, q);
         assert_eq!(
             query(&runtime)[0].live_controls,
-            [gain, cutoff, q],
+            [gain, cutoff, q, 0],
             "{lane}{plugin}"
         );
         assert!(runtime.set_slider_value("gain", 0.75).unwrap());
         assert_eq!(runtime.slider_binding("gain"), Some(gain));
         assert_eq!(
             query(&runtime)[0].live_controls,
-            [gain, cutoff, q],
+            [gain, cutoff, q, 0],
             "{lane}{plugin}"
         );
     }
@@ -74,6 +74,7 @@ fn graph_sources_and_effects_keep_existing_slider_bindings_through_gc_and_update
         let bindings = [
             runtime.slider_binding("graphGain").unwrap(),
             runtime.slider_binding("graphFilter").unwrap(),
+            0,
             0,
         ];
         runtime.run_gc();
@@ -113,6 +114,7 @@ fn pitch_combinators_after_sliders_keep_their_bound_controls_on_every_voice() {
             runtime.slider_binding("gain").unwrap(),
             runtime.slider_binding("filter").unwrap(),
             0,
+            0,
         ];
         let haps = query(&runtime);
         assert!(!haps.is_empty(), "{expression}");
@@ -142,13 +144,13 @@ fn sharing_slider_with_timing_does_not_bind_the_timing_only_branch() {
     let haps = query(&runtime);
     assert_eq!(
         haps.iter()
-            .filter(|hap| hap.live_controls == [token, 0, 0])
+            .filter(|hap| hap.live_controls == [token, 0, 0, 0])
             .count(),
         2
     );
     assert_eq!(
         haps.iter()
-            .filter(|hap| hap.live_controls == [0; 3])
+            .filter(|hap| hap.live_controls == [0; 4])
             .count(),
         2
     );
@@ -171,7 +173,7 @@ fn transformed_and_overwritten_values_cannot_retarget_sustained_voices() {
         assert!(
             query(&runtime)
                 .iter()
-                .all(|hap| hap.live_controls == [0; 3]),
+                .all(|hap| hap.live_controls == [0; 4]),
             "{expression}"
         );
     }
@@ -196,10 +198,10 @@ fn tokens_survive_failed_candidates_and_refresh_on_successful_evaluation() {
     evaluate(&runtime, score);
     let second = runtime.slider_binding("same").unwrap();
     assert!(second > first + 1, "failed candidate token was reused");
-    assert_eq!(query(&runtime)[0].live_controls, [second, 0, 0]);
+    assert_eq!(query(&runtime)[0].live_controls, [second, 0, 0, 0]);
     runtime.restore_last_good_active().unwrap();
     assert_eq!(runtime.slider_binding("same"), Some(first));
-    assert_eq!(query(&runtime)[0].live_controls, [first, 0, 0]);
+    assert_eq!(query(&runtime)[0].live_controls, [first, 0, 0, 0]);
 }
 
 #[test]

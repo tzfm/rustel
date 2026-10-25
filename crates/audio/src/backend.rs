@@ -118,10 +118,10 @@ impl Default for FilterControls {
 pub struct OscillatorControls<K = KabelControls> {
     /// KabelSalat runs at the beginning of the main effects chain.
     pub kabel: Option<K>,
-    /// Host-only direct slider bindings: gain, lowpass cutoff, then lowpass
-    /// resonance. Zero is unbound. Tokens never cross score evaluations or
-    /// arbitrary value maps.
-    pub live_controls: [u64; 3],
+    /// Host-only direct slider bindings: gain, lowpass cutoff, lowpass
+    /// resonance, then the direct FM route's index. Zero is unbound. Tokens
+    /// never cross score evaluations or arbitrary value maps.
+    pub live_controls: [u64; 4],
     /// Host preview identity. Zero belongs to the score; a newer nonzero
     /// identity replaces older preview voices without touching score voices.
     pub preview_epoch: u64,
@@ -1043,7 +1043,7 @@ impl<K> Default for OscillatorControls<K> {
     fn default() -> Self {
         Self {
             kabel: None,
-            live_controls: [0; 3],
+            live_controls: [0; 4],
             preview_epoch: 0,
             choke_only: false,
             piano: false,

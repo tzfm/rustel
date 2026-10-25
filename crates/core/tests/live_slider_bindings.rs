@@ -30,8 +30,25 @@ fn direct_controls_bind_independently_and_survive_time_and_visual_metadata() {
     .with_ui_visual_slot(3)
     .tag("lead".into());
     let hap = query(pattern);
-    assert_eq!(hap.live_controls, [41, 42, 43]);
+    assert_eq!(hap.live_controls, [41, 42, 43, 0]);
     assert_eq!(hap.ui_visuals_context(), 8);
+}
+
+/// The direct FM route's index is the fourth live binding, under the
+/// control's canonical name: `fm`, `fmi` and `fmi1` all reach it, and the
+/// chain's other operators do not.
+#[test]
+fn the_fm_index_binds_live_under_the_direct_route_names() {
+    let depth = pure(Value::F64(2.0)).with_slider_binding(44);
+    for name in ["fm", "fmi", "fmi1"] {
+        let hap = query(control(&sound(), name, depth.clone()));
+        assert_eq!(hap.live_controls, [0, 0, 0, 44], "{name} binds");
+    }
+    assert_eq!(
+        query(control(&sound(), "fmi2", depth)).live_controls,
+        [0, 0, 0, 0],
+        "operator 2's index stays query-time"
+    );
 }
 
 #[test]
@@ -51,14 +68,14 @@ fn equal_constant_overwrite_clears_only_the_replaced_parameter() {
         pure(Value::F64(4.0)).with_slider_binding(43),
     );
     let overwritten = control(&pattern, "gain", pure(Value::F64(0.5)));
-    assert_eq!(query(overwritten).live_controls, [0, 42, 43]);
+    assert_eq!(query(overwritten).live_controls, [0, 42, 43, 0]);
     assert_eq!(
         query(control(&pattern, "lpf", pure(Value::F64(800.0)))).live_controls,
-        [41, 0, 43]
+        [41, 0, 43, 0]
     );
     assert_eq!(
         query(control(&pattern, "lpq", pure(Value::F64(4.0)))).live_controls,
-        [41, 42, 0]
+        [41, 42, 0, 0]
     );
 }
 
@@ -66,12 +83,12 @@ fn equal_constant_overwrite_clears_only_the_replaced_parameter() {
 fn arbitrary_maps_drop_bindings_even_when_the_result_is_equal() {
     let raw = pure(Value::F64(0.5)).with_slider_binding(41);
     let mapped = control(&sound(), "gain", raw.fmap(Clone::clone));
-    assert_eq!(query(mapped).live_controls, [0; 3]);
+    assert_eq!(query(mapped).live_controls, [0; 4]);
     let bound = control(&sound(), "gain", raw);
-    assert_eq!(query(bound.fmap(Clone::clone)).live_controls, [0; 3]);
+    assert_eq!(query(bound.fmap(Clone::clone)).live_controls, [0; 4]);
     assert_eq!(
         query(bound.map_haps_native(|hap| Some(hap.clone()))).live_controls,
-        [0; 3]
+        [0; 4]
     );
 }
 
@@ -105,12 +122,12 @@ fn trusted_host_maps_preserve_only_unchanged_controls_and_keep_callback_ownershi
     assert!(mapped.purity().impure);
     assert_eq!(mapped.purity().reachable, [7]);
     rustel_core::with_callback_host(&Host, || {
-        assert_eq!(query(mapped).live_controls, [41, 42, 0]);
+        assert_eq!(query(mapped).live_controls, [41, 42, 0, 0]);
         assert_eq!(
             query(bound.fmap_js_preserving_controls(8)).live_controls,
-            [0, 42, 0]
+            [0, 42, 0, 0]
         );
-        assert_eq!(query(bound.fmap_js(7)).live_controls, [0; 3]);
+        assert_eq!(query(bound.fmap_js(7)).live_controls, [0; 4]);
         assert_eq!(
             query(control(
                 &sound(),
@@ -118,7 +135,7 @@ fn trusted_host_maps_preserve_only_unchanged_controls_and_keep_callback_ownershi
                 raw.fmap_js_preserving_controls(7)
             ))
             .live_controls,
-            [41, 0, 0]
+            [41, 0, 0, 0]
         );
         assert_eq!(
             query(control(
@@ -127,7 +144,7 @@ fn trusted_host_maps_preserve_only_unchanged_controls_and_keep_callback_ownershi
                 raw.fmap_js_preserving_controls(8)
             ))
             .live_controls,
-            [0; 3]
+            [0; 4]
         );
     });
 }
@@ -153,7 +170,7 @@ fn native_outer_control_bind_preserves_timing_and_tracks_both_dependencies() {
     let haps = mapped.query_arc(Fraction::ZERO, Fraction::ONE);
     assert_eq!(haps.len(), 2);
     for hap in haps {
-        assert_eq!(hap.live_controls, [41, 0, 0]);
+        assert_eq!(hap.live_controls, [41, 0, 0, 0]);
         assert_eq!(hap.whole.unwrap().end, Fraction::from(2));
         assert_eq!(hap.part.duration(), Fraction::new(1, 2));
     }
@@ -172,11 +189,11 @@ fn note_sample_index_and_timing_values_do_not_become_audio_bindings() {
     for name in ["note", "n", "speed", "pan"] {
         assert_eq!(
             query(control(&sound(), name, raw.clone())).live_controls,
-            [0; 3]
+            [0; 4]
         );
     }
     let pattern = control(&sound().fast(Fraction::from(2)), "gain", raw);
-    assert_eq!(query(pattern).live_controls, [41, 0, 0]);
+    assert_eq!(query(pattern).live_controls, [41, 0, 0, 0]);
 }
 
 fn bound_pitch(value: Value) -> Pattern {
@@ -207,7 +224,7 @@ fn tonal_rewrites_keep_named_audio_bindings_without_binding_transformed_raw_valu
         scale_transpose(&scaled, Value::F64(2.0)),
     ] {
         let hap = query(pattern);
-        assert_eq!(hap.live_controls, [41, 42, 43]);
+        assert_eq!(hap.live_controls, [41, 42, 43, 0]);
         assert_eq!(hap.value.get("gain"), Some(&Value::F64(0.5)));
         assert_eq!(hap.value.get("cutoff"), Some(&Value::F64(800.0)));
         assert_eq!(hap.value.get("resonance"), Some(&Value::F64(4.0)));
@@ -216,7 +233,7 @@ fn tonal_rewrites_keep_named_audio_bindings_without_binding_transformed_raw_valu
     let transformed = transpose(&raw, Value::F64(12.0));
     assert_eq!(
         query(control(&sound(), "gain", transformed)).live_controls,
-        [0; 3]
+        [0; 4]
     );
 }
 
@@ -230,14 +247,18 @@ fn frequency_rewrites_and_voicing_keep_only_controls_their_output_retains() {
         xen::with_base(&tuned, Value::F64(440.0)),
         xen::ftrans(&tuned, Value::F64(1.0)),
     ] {
-        assert_eq!(query(pattern).live_controls, [41, 42, 43]);
+        assert_eq!(query(pattern).live_controls, [41, 42, 43, 0]);
     }
     let chord = bound_pitch(Value::object([("chord".into(), Value::Str("C".into()))]));
     let voices = voicings::voicing(&chord).query_arc(Fraction::ZERO, Fraction::ONE);
     assert!(voices.len() > 1);
-    assert!(voices.iter().all(|hap| hap.live_controls == [41, 42, 43]));
+    assert!(
+        voices
+            .iter()
+            .all(|hap| hap.live_controls == [41, 42, 43, 0])
+    );
     // rootNotes deliberately returns just the note, removing audio controls.
     let root = query(voicings::root_notes(&chord, Value::F64(3.0)));
-    assert_eq!(root.live_controls, [0; 3]);
+    assert_eq!(root.live_controls, [0; 4]);
     assert!(root.value.get("gain").is_none());
 }

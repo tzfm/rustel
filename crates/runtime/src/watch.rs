@@ -696,6 +696,8 @@ mod changed_source_tests {
 
 #[cfg(test)]
 mod snapshot_tests {
+    // Every test here is unix-only; the import would be unused elsewhere.
+    #[cfg(unix)]
     use super::*;
 
     /// A FIFO with no writer must be refused before the open, which on

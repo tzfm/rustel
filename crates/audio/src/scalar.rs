@@ -247,6 +247,9 @@ struct Voice {
     live_gain: crate::live_control::Ramp,
     live_cutoff: crate::live_control::Ramp,
     live_resonance: crate::live_control::Ramp,
+    /// The direct FM route's index; see [`VoiceSource`] for the routes it
+    /// rides. Inert while the voice carries no such route.
+    live_fm_index: crate::live_control::Ramp,
     /// Frame at which the connected graph begins producing output. This is
     /// normally the source onset. SBD is the exception: its graph begins one
     /// scheduler lead earlier because its asymmetric WaveShaper curve produces
@@ -1490,6 +1493,7 @@ impl ScalarBackend {
             voice.live_gain.retarget(update, self.sample_rate);
             voice.live_cutoff.retarget(update, self.sample_rate);
             voice.live_resonance.retarget(update, self.sample_rate);
+            voice.live_fm_index.retarget(update, self.sample_rate);
         }
         for instrument in &mut self.instrument_gains {
             instrument.gain.retarget(update, self.sample_rate);

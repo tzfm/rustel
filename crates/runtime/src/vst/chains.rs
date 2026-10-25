@@ -1975,7 +1975,7 @@ mod tests {
             whole_begin: "0/1".into(),
             duration_secs: 0.25,
             target_time: 0.0,
-            live_controls: [0; 3],
+            live_controls: [0; 4],
             ui_visuals: 0,
             value: crate::ValueJson::Raw(value.clone()),
             value_show: String::new(),
@@ -2130,7 +2130,7 @@ mod tests {
         // instrument, gain 0 and no gain binding.
         let convert = |lane: usize| {
             let bound = crate::OnsetEventJson {
-                live_controls: [7, 0, 0],
+                live_controls: [7, 0, 0, 0],
                 ..onset(&note(lane), 1)
             };
             let event = crate::render::live_audio_event(&bound, 48_000, 0.5, &Plugins, |_| None);

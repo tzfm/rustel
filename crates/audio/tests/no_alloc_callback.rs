@@ -1331,7 +1331,7 @@ fn live_ring_preserves_the_complete_oscillator_control_bundle() {
     let controls = OscillatorControls {
         kabel: None,
         limit: None,
-        live_controls: [0; 3],
+        live_controls: [0; 4],
         preview_epoch: 7,
         choke_only: false,
         piano: true,

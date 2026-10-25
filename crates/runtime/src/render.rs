@@ -215,6 +215,31 @@ pub(crate) fn bind_live_controls(event: &mut rustel_audio::OnsetEvent, onset: &O
     if event.controls.filters.lowpass_envelope.is_some() {
         event.controls.live_controls[1] = 0;
     }
+    // A modulator aimed at the direct route's index adds to the same amount
+    // the live binding would replace; keep the existing graph when one rides
+    // it. Other operators' indices are separate and keep the binding.
+    let fm_target = rustel_audio::ModTarget::FmIndex(0);
+    if event
+        .controls
+        .lfos
+        .iter()
+        .flatten()
+        .any(|control| control.fxi.is_none() && control.target == fm_target)
+        || event
+            .controls
+            .envs
+            .iter()
+            .flatten()
+            .any(|control| control.fxi.is_none() && control.target == fm_target)
+        || event
+            .controls
+            .bus_mods
+            .iter()
+            .flatten()
+            .any(|control| control.fxi.is_none() && control.target == fm_target)
+    {
+        event.controls.live_controls[3] = 0;
+    }
 }
 
 /// Converts the onsets of a finite play. `onsets` are in the order of their
@@ -1548,7 +1573,7 @@ mod tests {
             whole_begin: "0/1".into(),
             duration_secs: 0.25,
             target_time: 0.0,
-            live_controls: [0; 3],
+            live_controls: [0; 4],
             ui_visuals: 0,
             value: crate::ValueJson::Raw(value),
             value_show: String::new(),
@@ -2077,7 +2102,7 @@ mod tests {
         }));
         onset.generation = 9;
         onset.ui_visuals = 0b101;
-        onset.live_controls = [11, 12, 13];
+        onset.live_controls = [11, 12, 13, 0];
         onset.target_time = 480.25 / 48_000.0;
         let scalar = scalar_event(&onset, 48_000, 0.5, &rustel_voice::BundledOnly)
             .expect("offline conversion");
@@ -2096,11 +2121,11 @@ mod tests {
         assert_eq!(
             live.controls,
             rustel_audio::OscillatorControls {
-                live_controls: [11, 12, 13],
+                live_controls: [11, 12, 13, 0],
                 ..scalar.controls
             }
         );
-        assert_eq!(scalar.controls.live_controls, [0; 3]);
+        assert_eq!(scalar.controls.live_controls, [0; 4]);
         assert_eq!(scalar.generation, onset.generation);
         assert_eq!(scalar.ui_visuals, onset.ui_visuals);
         assert_eq!(live.generation, onset.generation);
@@ -2114,7 +2139,7 @@ mod tests {
             "lfo": { "a": { "control": "gain", "rate": 4, "depth": 4 } }
         }));
         let constant = scalar_event(&onset, 48_000, 0.5, &rustel_voice::BundledOnly).unwrap();
-        onset.live_controls = [11, 0, 0];
+        onset.live_controls = [11, 0, 0, 0];
         let mut bound = scalar_event(&onset, 48_000, 0.5, &rustel_voice::BundledOnly).unwrap();
         bind_live_controls(&mut bound, &onset);
         assert!(
@@ -2125,7 +2150,7 @@ mod tests {
                 .flatten()
                 .any(|lfo| lfo.target == rustel_audio::ModTarget::Gain)
         );
-        assert_eq!(bound.controls.live_controls, [0; 3]);
+        assert_eq!(bound.controls.live_controls, [0; 4]);
         assert_eq!(bound, constant);
         let render = |event| {
             rustel_audio::render_pcm(
@@ -2143,11 +2168,11 @@ mod tests {
     fn cutoff_envelope_keeps_its_own_automation_and_reports_hide_binding_tokens() {
         let mut onset =
             onset(serde_json::json!({ "s": "sine", "gain": 0.5, "cutoff": 800, "lpenv": 2 }));
-        onset.live_controls = [11, 12, 13];
+        onset.live_controls = [11, 12, 13, 0];
         let mut event = scalar_event(&onset, 48_000, 0.5, &rustel_voice::BundledOnly).unwrap();
         bind_live_controls(&mut event, &onset);
         assert!(event.controls.filters.lowpass_envelope.is_some());
-        assert_eq!(event.controls.live_controls, [11, 0, 13]);
+        assert_eq!(event.controls.live_controls, [11, 0, 13, 0]);
         assert!(
             serde_json::to_value(onset)
                 .unwrap()
@@ -2163,10 +2188,10 @@ mod tests {
         }));
         let literal = scalar_event(&onset, 48_000, 1.0, &rustel_voice::BundledOnly)
             .expect("literal controls");
-        onset.live_controls = [11, 12, 13];
+        onset.live_controls = [11, 12, 13, 0];
         let slider = scalar_event(&onset, 48_000, 1.0, &rustel_voice::BundledOnly)
             .expect("slider provenance");
-        assert_eq!(slider.controls.live_controls, [0; 3]);
+        assert_eq!(slider.controls.live_controls, [0; 4]);
         assert_eq!(slider, literal);
     }
 
