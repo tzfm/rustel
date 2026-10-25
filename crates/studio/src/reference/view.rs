@@ -981,6 +981,14 @@ impl ReferenceView<'_> {
             }
             Some((read, bundles)) => format!("{count} · reading {read} of {bundles} bundles…"),
         };
+        // The preset folders read on the plugin thread too, most of all
+        // after the player changed them: the count line says it, and no
+        // ask of the host waits for the read.
+        let count = if tab.presets_reading() {
+            format!("{count} · reading the preset folders…")
+        } else {
+            count
+        };
         buffer.set_stringn(
             inner.x,
             inner.y + 2,

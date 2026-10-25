@@ -147,10 +147,12 @@ Any folder of `.vstpreset` files works too, in any structure: Settings ▸
 VST ▸ `add preset folder` adds one. Each file names its plugin in its
 header, so rustel finds the presets of a plugin in every folder you added,
 and the plugin rows of the page say the count. Enter on a plugin row lists
-its presets. The folders are watched while Studio runs: a preset saved or
-copied in while a score plays is there with no rescan, once the read of
-the folders ends, and the count line of the vst tab says where that read
-is.
+its presets. A change of the folders reads them again at once, on the
+plugin thread: the background-jobs sheet lists the read while it runs, and
+no ask waits for it. The folders are watched while Studio runs: a preset
+saved or copied in while a score plays is there with no rescan, once the
+read of the folders ends, and the count line of the vst tab says where
+that read is.
 
 In the vst tab, Enter on a preset writes the call with the preset. With the
 caret in a call of the same plugin, Enter on a preset changes only the

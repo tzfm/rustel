@@ -863,15 +863,21 @@ impl App {
                 self.dirty_frame = true;
             }
         }
-        // The list of background jobs has a row for the scan and a row
-        // for each load. A test of the scan gives the list new names.
-        let (loads, scan) = (vst::loads(), vst::scan_progress());
-        if loads != self.plugin_loads || scan != self.plugin_scan {
+        // The list of background jobs has a row for the scan, a row for
+        // each load, and a row for the read of the preset folders. A test
+        // of the scan gives the list new names.
+        let (loads, scan, reading) = (vst::loads(), vst::scan_progress(), vst::presets_reading());
+        if loads != self.plugin_loads
+            || scan != self.plugin_scan
+            || reading != self.plugin_presets_reading
+        {
             self.plugin_loads = loads;
             self.plugin_scan = scan;
+            self.plugin_presets_reading = reading;
             self.dirty_frame = true;
         }
         let loading = scanning
+            || reading
             || self
                 .reference_panel
                 .as_ref()
@@ -915,6 +921,7 @@ impl App {
         changed |= panel
             .vst
             .set_scan(vst::scan_progress().map(|scan| (scan.read, scan.bundles)));
+        changed |= panel.vst.set_presets_reading(host.presets_reading());
         // The host reads the preset folder on its own thread. The tab asks
         // again on the next read of the list until the names are here.
         if let Some(presets) = panel.vst.presets_due().and_then(|name| host.presets(name)) {

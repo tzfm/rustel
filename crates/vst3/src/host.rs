@@ -1403,6 +1403,13 @@ impl Host {
         self.state().presets_version
     }
 
+    /// True while the plugin thread reads the preset folders, also for the
+    /// change of the folders themselves: a long read says so, and no
+    /// caller waits for it.
+    pub fn presets_reading(&self) -> bool {
+        self.state().presets_reading
+    }
+
     /// Copies a `.vstpreset` file into the preset folder of its plugin: the
     /// plugin with the class the file names. A score then plays the preset
     /// by the name of the file. Gives the plugin name and the preset name.

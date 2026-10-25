@@ -82,6 +82,9 @@ pub struct VstTab {
     /// read, of all of them. The count line says it, as the samples tab
     /// says its imports.
     scan: Option<(usize, usize)>,
+    /// The host reads the preset folders, on its own thread: the count
+    /// line says it while it runs.
+    presets_reading: bool,
     /// The list as drawn. Kept, not derived: a plugin has up to some
     /// thousand parameters, and each frame reads the rows more than one time.
     rows: Vec<PluginRow>,
@@ -369,6 +372,19 @@ impl VstTab {
         let changed = self.scan != scan;
         self.scan = scan;
         changed
+    }
+
+    /// Takes whether the host reads the preset folders now. The answer
+    /// says the count line changed.
+    pub fn set_presets_reading(&mut self, reading: bool) -> bool {
+        let changed = self.presets_reading != reading;
+        self.presets_reading = reading;
+        changed
+    }
+
+    /// True while the host reads the preset folders on its own thread.
+    pub fn presets_reading(&self) -> bool {
+        self.presets_reading
     }
 
     /// Takes a new plugin list from the host. Returns false when the list
@@ -1041,7 +1057,8 @@ mod tests {
     }
 
     /// The count line of the tab says where the read of the plugin folders
-    /// is, while it runs, and says nothing when no read runs.
+    /// is, while it runs, and says nothing when no read runs. The read of
+    /// the preset folders says itself the same way.
     #[test]
     fn the_read_of_the_plugin_folders_says_where_it_is() {
         let mut tab = VstTab::default();
@@ -1052,5 +1069,11 @@ mod tests {
         assert!(tab.set_scan(Some((2, 3))));
         assert!(tab.set_scan(None));
         assert_eq!(tab.scan(), None);
+        assert!(!tab.set_presets_reading(false));
+        assert!(tab.set_presets_reading(true));
+        assert!(tab.presets_reading());
+        assert!(!tab.set_presets_reading(true));
+        assert!(tab.set_presets_reading(false));
+        assert!(!tab.presets_reading());
     }
 }
