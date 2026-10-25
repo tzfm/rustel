@@ -259,7 +259,8 @@ impl App {
         self.poll_export();
         self.poll_reveal();
         self.poll_vim_config(now);
-        if let Err(error) = self.flush_vim_mapping_timeout() {
+        self.poll_external_changes(now);
+        if let Err(error) = super::vim::flush_timeout(self) {
             self.set_error(ErrorOwner::Editor, error.to_string());
         }
         if self
@@ -576,7 +577,12 @@ impl App {
                 crate::remote::RemoteEvent::Key(key) => {
                     let event = Event::Key(key);
                     self.performance.observe_input(&event, Instant::now());
-                    self.handle_terminal_event(event)?;
+                    // A machine sends normal keys. Read them with the
+                    // usual editing, not the score's Vim modes.
+                    self.remote_key_event = true;
+                    let outcome = self.handle_terminal_event(event);
+                    self.remote_key_event = false;
+                    outcome?;
                     self.input_dirty = true;
                     // Disabling the listener also discards its queued keys.
                     if self.remote.is_none() {

@@ -3,11 +3,11 @@
 //!
 //! The engine refuses `await import('https://...')` from an origin that is
 //! not trusted, and an orchestra while native execution is not permitted.
-//! The page reads as a switch: Enter permits a refused row, and Space flips
-//! a row where it stands, so a permission can be taken back without the row
-//! leaving the page. A refused or turned-off origin stays listed until the
-//! studio closes; an origin trust is kept in the settings, while the
-//! orchestra switch lasts one run.
+//! The page reads as a switch: Enter permits a refused row, and Space or
+//! either sideways arrow flips a row where it stands, so a permission can
+//! be taken back without the row leaving the page. A refused or turned-off
+//! origin stays listed until the studio closes; an origin trust is kept in
+//! the settings, while the orchestra switch lasts one run.
 
 use super::super::settings::PermissionRow;
 use super::super::worker::EngineFailure;

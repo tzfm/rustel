@@ -52,6 +52,8 @@ pub enum HelpContext {
     Mixer,
     /// The memory breakdown, docked along the top or the bottom.
     Memory,
+    /// The knobs column beside the score.
+    Knobs,
 }
 
 impl HelpContext {
@@ -83,6 +85,7 @@ impl HelpContext {
             Self::Viz => "visuals panel",
             Self::Mixer => "mixer",
             Self::Memory => "memory breakdown",
+            Self::Knobs => "knobs",
         }
     }
 
@@ -120,7 +123,7 @@ impl HelpContext {
             }
             #[cfg(feature = "vst")]
             Self::SettingsVst => {
-                "The folders with your VST3 plugins, then the standard folders of the system. The plugin host reads all of them. Rescan after you install a plugin."
+                "The folders with your VST3 plugins, then the standard folders of the system. The plugin host reads all of them. Rescan after you install a plugin. A plugin that breaks on another thread stays on the audio thread with its audio thread only switch on. Space on a plugin row turns its switch on or off."
             }
             Self::Log => {
                 "The newest studio messages are at the bottom of the log. v shows the running commentary underneath them."
@@ -150,6 +153,11 @@ impl HelpContext {
                 "Where the header's mem goes: the parts that add up to it, each against \
                  the limit that holds it, docked along the bottom or the top beside the \
                  score. It stays while you work, and the settings sheet stands clear of it."
+            }
+            Self::Knobs => {
+                "The numbers of the call under the caret, as sliders. The arrows write \
+                 the score as they move, and the far left takes an optional entry out. \
+                 Press Enter to type an exact value. A plugin keeps the knobs you add to it."
             }
         }
     }
@@ -222,6 +230,17 @@ impl HelpContext {
                     "top or bottom / taller or shorter / back to the score / hide",
                 ),
             ],
+            Self::Knobs => [
+                ("↑/↓ · ←/→", "choose a knob / move it, Shift for one step"),
+                (
+                    "Enter · a · r · ⌫",
+                    "type a value / add a knob / suggested knobs back / take a knob out",
+                ),
+                (
+                    "Home · End · Esc",
+                    "bottom or off / top / back to the score",
+                ),
+            ],
             Self::Set => [
                 (
                     "Up/Down · Enter",
@@ -278,7 +297,10 @@ impl HelpContext {
                     "arrows · PgUp/PgDn · Tab",
                     "navigate, fold/open, change tab",
                 ),
-                ("Enter · Space · Esc", "use · preview · go back/close"),
+                (
+                    "Alt+A · Enter · Space · Esc",
+                    "auto preview · use · preview · go back/close",
+                ),
             ],
             Self::Settings => [
                 ("Up / Down", "choose a setting"),
@@ -319,7 +341,10 @@ impl HelpContext {
             Self::SettingsVst => [
                 ("a / +", "add a folder with VST3 plugins"),
                 ("Enter · d", "do the selected action · remove the folder"),
-                ("Tab · Esc", "other pages · close"),
+                (
+                    "Space · Tab · Esc",
+                    "turn audio thread only on or off · other pages · close",
+                ),
             ],
             Self::Log => [
                 (
@@ -424,6 +449,17 @@ fn shortcut_with_alias(keybinds: &Keybinds, action: BindAction) -> String {
     join_hints(hints, " / ")
 }
 
+/// The learned chord when the action has one, else the menu path that
+/// reaches it. A shipped-unbound action still reads as reachable.
+fn shortcut_or_menu(keybinds: &Keybinds, action: BindAction, menu: &str) -> String {
+    let shortcut = shortcut_with_alias(keybinds, action);
+    if shortcut.is_empty() {
+        menu.to_owned()
+    } else {
+        shortcut
+    }
+}
+
 fn join_hints(hints: impl IntoIterator<Item = String>, separator: &str) -> String {
     hints
         .into_iter()
@@ -510,8 +546,20 @@ fn shortcut_rows_with_keybinds(
         ),
         HelpRow::new(hint(BindAction::Settings), "open settings"),
         HelpRow::new(
-            "Options > Settings > prebakes",
-            "open the selected global/local prebake",
+            shortcut_or_menu(
+                keybinds,
+                BindAction::OpenGlobalPrebake,
+                "Options > Global prebake",
+            ),
+            "open the global prebake",
+        ),
+        HelpRow::new(
+            shortcut_or_menu(
+                keybinds,
+                BindAction::OpenLocalPrebake,
+                "Options > Local prebake",
+            ),
+            "open the local prebake",
         ),
         HelpRow::new(hint(BindAction::ThemePicker), "open the theme picker"),
         HelpRow::new(hint(BindAction::SetPanel), "show or hide the set panel"),

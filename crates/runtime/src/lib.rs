@@ -166,6 +166,8 @@ pub use session::{
     SessionDiagnostic, VOICE_NOTICE_DIAGNOSTIC, WindowSound,
 };
 
+#[cfg(feature = "device-audio")]
+pub use session::LIVE_REPLACEMENT_MIN_HEADROOM;
 #[cfg(any(test, feature = "test-support"))]
 pub use session::SessionPanicPoint;
 #[cfg(all(feature = "vst", feature = "device-audio"))]

@@ -1039,6 +1039,15 @@ fn fetch_following_redirects(
 }
 
 /// [`fetch_following_redirects`] with the resolver passed in, so a test can
+/// Statuses a briefly overloaded host answers with. The sample hosts are
+/// large static sites, and a 429 or 5xx from one is usually seconds long.
+fn hop_status_is_transient(code: u16) -> bool {
+    matches!(code, 429 | 500 | 502 | 503 | 504)
+}
+
+/// Rest taken before each retry of a transient hop failure.
+const TRANSIENT_HOP_RESTS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(4)];
+
 /// stand a loopback listener in for a public host and drive the real hop loop.
 /// `resolve` receives the grant's loopback naming, never the hop's own.
 fn fetch_following_redirects_via(
@@ -1062,10 +1071,33 @@ fn fetch_following_redirects_via(
         remote_url_allowed(current.as_str())?;
         // Manifest and audio fetches both resolve under the caller's
         // FetchBudget, so a lookup honours the deadline and cancellation.
-        let response =
-            single_hop_get_with_resolver(&current, budget, None, None, |netloc, hop_budget| {
-                resolve(netloc, hop_budget, loopback_named)
-            })?;
+        let mut transient_retries = 0;
+        let response = loop {
+            match single_hop_get_with_resolver(
+                &current,
+                budget,
+                None,
+                None,
+                |netloc, hop_budget| resolve(netloc, hop_budget, loopback_named),
+            ) {
+                Ok(response) => break response,
+                Err(error @ HopError::Status { code, .. })
+                    if hop_status_is_transient(code)
+                        && transient_retries < TRANSIENT_HOP_RESTS.len() =>
+                {
+                    let rest = TRANSIENT_HOP_RESTS[transient_retries];
+                    // Sleep only while the batch budget still holds the next
+                    // try, so a real outage still fails on time.
+                    if budget.remaining().is_ok_and(|left| left > rest) {
+                        transient_retries += 1;
+                        std::thread::sleep(rest);
+                        continue;
+                    }
+                    return Err(error.into());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
         if (300..400).contains(&response.status()) {
             if redirects == 5 {
                 return Err(format!("GET {url}: too many redirects"));
@@ -1304,27 +1336,58 @@ mod tests {
         }
     }
 
+    /// Answer each request with the next response, one per connection,
+    /// handing back the header lines of every request.
+    fn answers_in_order(
+        responses: &[&'static str],
+    ) -> (SocketAddr, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{BufRead, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("listener address");
+        let owned = responses.to_vec();
+        let server = std::thread::spawn(move || {
+            let mut lines = Vec::new();
+            for response in owned {
+                let (stream, _) = listener.accept().expect("request");
+                let mut writer = stream.try_clone().expect("clone");
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 && !line.trim().is_empty() {
+                    lines.push(line.trim_end().to_owned());
+                    line.clear();
+                }
+                writer.write_all(response.as_bytes()).expect("response");
+            }
+            lines
+        });
+        (address, server)
+    }
+
     /// Answer one loopback request with `response`, handing back the request's
     /// header lines.
     #[cfg(feature = "hydra")]
     fn answer_once(response: &'static str) -> (SocketAddr, std::thread::JoinHandle<Vec<String>>) {
-        use std::io::{BufRead, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let address = listener.local_addr().expect("listener address");
-        let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("request");
-            let mut writer = stream.try_clone().expect("clone");
-            let mut reader = std::io::BufReader::new(stream);
-            let mut lines = Vec::new();
-            let mut line = String::new();
-            while reader.read_line(&mut line).unwrap_or(0) > 0 && !line.trim().is_empty() {
-                lines.push(line.trim_end().to_owned());
-                line.clear();
-            }
-            writer.write_all(response.as_bytes()).expect("response");
-            lines
-        });
-        (address, server)
+        answers_in_order(&[response])
+    }
+
+    /// A briefly overloaded host answers 5xx once and then serves the sample.
+    /// The fetch rests and retries the hop instead of failing the batch.
+    #[test]
+    fn a_transient_hop_status_is_retried() {
+        let (address, server) = answers_in_order(&[
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc",
+        ]);
+        let bytes = fetch_following_redirects_via(
+            &format!("http://{address}/0800_Aspirin_sf2_file.js"),
+            &test_budget(Duration::from_secs(10)),
+            1024,
+            "sample",
+            |_, _, _| Ok(vec![address]),
+        )
+        .expect("the sample after the rest");
+        assert_eq!(bytes, b"abc");
+        server.join().expect("server thread");
     }
 
     /// One Hydra image hop to `address`, its query carrying a token no error may

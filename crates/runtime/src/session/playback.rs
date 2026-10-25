@@ -442,8 +442,15 @@ impl Session {
             }
             Err(error) => return Err(RuntimeError::Audio(error.to_string())),
         }
-        if let Some(error) = csound.take_errors().into_iter().next() {
-            return Err(RuntimeError::Audio(error));
+        for message in csound.take_errors() {
+            // A starved worker left a gap of silence and played on. Its line
+            // is a plugin line, as in a live set. Each other message fails
+            // the run.
+            if message != rustel_csound::STARVATION_LINE {
+                return Err(RuntimeError::Audio(message));
+            }
+            let record = serde_json::json!({ "csound_failed": { "message": &message } });
+            self.report_plugin_line(message, record);
         }
         report.audio_backend = "scalar-rust/cpal".into();
         report.device_audio = "played".into();
@@ -1122,13 +1129,20 @@ impl Session {
         self.collect_pending_osc(&onsets, now, cps);
 
         let mut input_warnings: Vec<String> = Vec::new();
-        let (events, notices) =
+        // The note of each event, for its plugin chain.
+        #[cfg(feature = "vst")]
+        let mut values = Vec::new();
+        // Only a plugin chain changes an event.
+        #[cfg_attr(not(feature = "vst"), allow(unused_mut))]
+        let (mut events, notices) =
             rustel_voice::with_diagnostic_policy(self.direct_diagnostic_logging, || {
                 onsets
                     .iter()
                     .filter_map(|onset| {
                         match self.live_audio_event(onset, sample_rate, cps, lookup) {
                             Ok(event) => {
+                                #[cfg(feature = "vst")]
+                                values.push(&onset.value);
                                 if let Some(warning) = self.input_channel_warning(&event)
                                     && !input_warnings.contains(&warning)
                                 {
@@ -1145,8 +1159,11 @@ impl Session {
                             }
                         }
                     })
-                    .collect()
+                    .collect::<Vec<_>>()
             });
+        #[cfg(feature = "vst")]
+        self.chain_live_events(&mut events, &values);
+        self.record_csound_chains(&events);
         self.report_voice_notices(notices);
         // Said once per score text, like a plugin line: the set plays on,
         // and a refusal that stays true is not news each window.

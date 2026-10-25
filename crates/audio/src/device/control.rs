@@ -53,6 +53,7 @@ impl LiveShared {
             ring: Arc::new(Ring::new(LIVE_RING_CAPACITY)),
             immediate: Arc::new(Ring::new(64)),
             live_controls: Arc::new(crate::assets::AssetRing::new()),
+            insert_values: Arc::new(crate::assets::AssetRing::new()),
             max_polyphony: Arc::new(AtomicUsize::new(crate::MAX_POLYPHONY)),
             confirmations: crate::confirmation::ConfirmationChannel::new(),
             analysis: Arc::new(LiveAnalysisTap::with_sides()),
@@ -114,6 +115,10 @@ impl LiveShared {
             callback_xruns: Arc::new(AtomicU64::new(0)),
             callback_scope_misses: Arc::new(AtomicU64::new(0)),
             cutover_race_blocks: Arc::new(AtomicU64::new(0)),
+            plugin_jobs_inline: Arc::new(AtomicU64::new(0)),
+            plugin_join_wait_nanos: Arc::new(AtomicU64::new(0)),
+            plugin_late_jobs: Arc::new(AtomicU64::new(0)),
+            plugin_real_time: Arc::new(AtomicBool::new(false)),
             meter: Arc::new(crate::meter::MasterMeterShared::new()),
             score_sources_active: Arc::new(AtomicBool::new(false)),
             score_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -165,6 +170,10 @@ impl LiveShared {
                 leaked: self.samples.leaked.load(Ordering::Acquire),
             },
             cutover_race_blocks: self.cutover_race_blocks.load(Ordering::Acquire),
+            plugin_workers: 0,
+            plugin_jobs_inline: self.plugin_jobs_inline.load(Ordering::Acquire),
+            plugin_join_wait_nanos: self.plugin_join_wait_nanos.load(Ordering::Acquire),
+            plugin_late_jobs: self.plugin_late_jobs.load(Ordering::Acquire),
         }
     }
 
@@ -256,6 +265,9 @@ impl LiveShared {
         // The old callback has joined: there is no remaining in-flight
         // reservation to carry into the new frame domain.
         self.rendering_until_frame.store(frames, Ordering::Release);
+        for ring in [&self.ring, &self.immediate] {
+            ring.publish_frontier(frames, frames, new_sample_rate);
+        }
         self.playback_origin_nanos
             .store(UNSET_STREAM_INSTANT_NANOS, Ordering::Release);
         self.buffer_playback_nanos.store(0, Ordering::Release);

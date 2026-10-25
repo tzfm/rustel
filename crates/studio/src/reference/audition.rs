@@ -275,6 +275,39 @@ pub fn tab_previews(tab: Tab) -> bool {
     }
 }
 
+/// The label the pulse row draws at the end of its meter: the gain, the
+/// auto preview state in words, and - on the samples tab only, the one
+/// place a reveal hint earns its room - the shortcuts beside it. The
+/// foot of the list names the key that flips the state; this row shows
+/// the state it left behind, lit while it is on. Drawing and
+/// hit-testing both measure through here, so the bar stops where the
+/// label starts and the knob sits where the click did.
+fn pulse_label(tab: Tab, gain: &str, auto_preview: bool) -> String {
+    let arrow = super::super::terminal::symbol("▸");
+    // Words, not a key glyph: the state reads without learning anything.
+    let auto = if auto_preview { "auto on" } else { "auto off" };
+    if tab == Tab::Samples {
+        format!(" {arrow} {gain} {auto} ⌥↑↓ ⌥O file ")
+    } else {
+        format!(" {arrow} {gain} {auto} ")
+    }
+}
+
+/// The widest label the pulse row carries: the gain text at its longest,
+/// which one decimal at an end of the range reaches. Drawing and
+/// hit-testing reserve this width, so the bar's end and the knob stay
+/// where the click lands however the gain is spelt.
+fn reserved_pulse_label_width(tab: Tab, auto_preview: bool) -> u16 {
+    let floor = format!("{:+.1}dB", PREVIEW_FLOOR_DB);
+    let ceiling = format!("{:+.1}dB", PREVIEW_CEIL_DB);
+    let widest = if floor.chars().count() >= ceiling.chars().count() {
+        floor
+    } else {
+        ceiling
+    };
+    pulse_label(tab, &widest, auto_preview).chars().count() as u16
+}
+
 /// The sample shape, when available, above a combined peak meter and
 /// preview gain fader.
 pub(super) fn render_samples_pulse(
@@ -309,14 +342,8 @@ pub(super) fn render_samples_pulse(
     // The meter background shows peak level; the knob and label show
     // preview gain in decibels.
     let gain = format_preview_gain(pulse.preview_gain);
-    let arrow = super::super::terminal::symbol("▸");
-    // Keep the samples tab's volume and reveal shortcuts beside the fader.
-    let label = if tab == Tab::Samples {
-        format!(" {arrow} {gain} ⌥↑↓ ⌥O file ")
-    } else {
-        format!(" {arrow} {gain} ")
-    };
-    let label_width = label.chars().count() as u16;
+    let label = pulse_label(tab, &gain, pulse.auto_preview);
+    let label_width = reserved_pulse_label_width(tab, pulse.auto_preview);
     let bar_width = inner.width.saturating_sub(label_width);
     let floor = -60.0_f32;
     let up = ((pulse.peak_db.max(floor) - floor) / -floor).clamp(0.0, 1.0);
@@ -358,6 +385,29 @@ pub(super) fn render_samples_pulse(
         usize::from(label_width),
         Style::default().fg(theme.muted),
     );
+    // The state leads the label in words and lights up while on: the
+    // switch reads at a glance instead of as one more dim glyph.
+    let switch = if pulse.auto_preview {
+        "auto on"
+    } else {
+        "auto off"
+    };
+    let switch_style = if pulse.auto_preview {
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.foreground)
+    };
+    let arrow = super::super::terminal::symbol("▸");
+    let words_in = format!(" {arrow} {gain} ").chars().count() as u16;
+    buffer.set_stringn(
+        inner.x + bar_width + words_in,
+        meter_y,
+        switch,
+        switch.chars().count(),
+        switch_style,
+    );
 }
 
 /// The one spinner the whole studio turns while something is on its way:
@@ -397,13 +447,14 @@ pub const PREVIEW_CEIL_DB: f32 = 12.0;
 
 /// The preview gain a pointer position on the meter row means. The far
 /// left is true silence, like the master fader's.
-pub fn preview_gain_at(inner: Rect, x: u16) -> f32 {
-    // The label the meter draws: gain, and - on the samples tab only, the
-    // one place a reveal hint earns its room - the shortcut beside it.
-    // Drawing and hit-testing must agree on this width, or the knob sits
-    // where the click did not.
-    let label_width = " ▸ +12.0dB ⌥↑↓ ⌥O file ".chars().count() as u16;
-    let bar_width = inner.width.saturating_sub(label_width).max(1);
+pub fn preview_gain_at(inner: Rect, x: u16, tab: Tab, auto_preview: bool) -> f32 {
+    // The label measured at its widest, as the row reserves it: see
+    // `reserved_pulse_label_width`. Drawing agrees on this width, so the
+    // knob sits where the click did.
+    let bar_width = inner
+        .width
+        .saturating_sub(reserved_pulse_label_width(tab, auto_preview))
+        .max(1);
     let along = f32::from(x.saturating_sub(inner.x).min(bar_width - 1));
     let fraction = along / f32::from(bar_width.saturating_sub(1).max(1));
     if fraction <= 0.0 {
@@ -440,5 +491,47 @@ pub fn format_preview_gain(gain: f32) -> String {
         "0.0dB".to_owned()
     } else {
         format!("{db:+.1}dB")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The knob the pulse row draws sits where a click lands: drawing and
+    /// hit-testing reserve the same widest label, however the gain spells,
+    /// so a click on the knob reads the gain it shows, within the half
+    /// cell the knob is rounded to.
+    #[test]
+    fn the_drawn_preview_knob_reads_as_the_gain_it_shows() {
+        let inner = Rect::new(0, 0, 40, 10);
+        let theme = crate::theme::Theme::built_in_default();
+        for gain in [0.0_f32, 0.25, 1.0, 2.0] {
+            let pulse = SamplesPulse {
+                peak_db: -12.0,
+                preview_gain: gain,
+                auto_preview: false,
+                shape: None,
+            };
+            let mut buffer = Buffer::empty(inner);
+            render_samples_pulse(&pulse, inner, Tab::Chords, &mut buffer, &theme);
+            let meter_y = (0..inner.height)
+                .find(|&y| (0..inner.width).any(|x| buffer[(x, y)].symbol() == "\u{25ae}"))
+                .expect("the fader row");
+            let knob_x = (0..inner.width)
+                .find(|&x| buffer[(x, meter_y)].symbol() == "\u{25ae}")
+                .expect("the knob column");
+            let clicked = preview_gain_at(inner, knob_x, Tab::Chords, false);
+            if gain <= 0.0 {
+                assert_eq!(clicked, 0.0, "the far left is silence");
+                continue;
+            }
+            let drawn = rustel_audio::linear_to_db(gain);
+            let decoded = rustel_audio::linear_to_db(clicked);
+            assert!(
+                (decoded - drawn).abs() <= 2.0,
+                "{gain}: the knob draws {drawn} dB but a click on it reads {decoded} dB"
+            );
+        }
     }
 }

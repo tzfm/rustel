@@ -433,6 +433,10 @@ const BUILT_INS: &[(&str, &str)] = &[
     // No palette of its own: `reset` and the terminal's 16 colours, so the
     // studio wears whatever palette the terminal already carries.
     ("terminal", include_str!("themes/terminal.json")),
+    // The same ground with one role moved: the accent and the selection
+    // take the palette's slot 1, which reads warm in palettes whose
+    // bright slot is gold.
+    ("terminal-warm", include_str!("themes/terminal-warm.json")),
     ("solarized", include_str!("themes/solarized.json")),
     ("ember", include_str!("themes/ember.json")),
     ("hell", include_str!("themes/hell.json")),
@@ -1132,6 +1136,30 @@ impl Theme {
     /// The colour a replay tab wears.
     pub fn replay_colour(&self) -> Color {
         self.replay.unwrap_or(self.warn)
+    }
+
+    /// The colour of a pane: its tab on the strip, and its title. The first
+    /// pane wears the accent. The second wears the accent's hue turned a
+    /// sixth of the way round the colour wheel, with its saturation and
+    /// lightness kept, and nudged until it stands off the background as the
+    /// accent does: a neighbouring hue, so it belongs to the theme, and still
+    /// another colour, so the two read as two wherever the caret is. A
+    /// palette the terminal owns has no hue to turn, and the second pane
+    /// takes its `mini` colour instead. A grey accent has no hue either.
+    pub fn pane_colour(&self, pane: usize) -> Color {
+        if pane == 0 {
+            return self.accent;
+        }
+        true_rgb(self.accent).map_or(self.mini, |rgb| {
+            let (hue, saturation, lightness) = to_hsl(rgb);
+            readable(
+                hue + 60.0,
+                saturation,
+                lightness,
+                self.background,
+                ACCENT_CONTRAST,
+            )
+        })
     }
 
     /// The text that reads on a filled chip: the background, where the
@@ -1966,6 +1994,8 @@ pub struct ThemePicker {
     /// wheel moves it the list keeps no margin, so the clicked row stays
     /// under the pointer.
     pub hold_scroll: bool,
+    /// Vim Command mode until `i` or `a` asks to type in the search.
+    pub(crate) vim_insert: bool,
 }
 
 impl ThemePicker {
@@ -1985,7 +2015,16 @@ impl ThemePicker {
             rolled: false,
             scroll: std::cell::Cell::new(0),
             hold_scroll: false,
+            vim_insert: false,
         }
+    }
+
+    pub(crate) fn vim_insert(&self) -> bool {
+        self.vim_insert
+    }
+
+    pub(crate) fn set_vim_insert(&mut self, insert: bool) {
+        self.vim_insert = insert;
     }
 
     /// Whether the row under the cursor is the one that rolls a new theme.
@@ -2133,6 +2172,8 @@ pub struct ThemePickerView<'a> {
     pub theme: &'a Theme,
     /// Under a camera theme: what the reader needs to know to see it.
     pub camera: Option<CameraNote>,
+    /// Vim text modes own the search and the list keys.
+    pub vim: bool,
 }
 
 impl ratatui::widgets::Widget for ThemePickerView<'_> {
@@ -2175,8 +2216,15 @@ impl ratatui::widgets::Widget for ThemePickerView<'_> {
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         );
+        let command = self.vim && !self.picker.vim_insert();
         let prompt = if self.picker.query.is_empty() {
-            "search: type a theme".to_owned()
+            if command {
+                "search: i or a types".to_owned()
+            } else {
+                "search: type a theme".to_owned()
+            }
+        } else if command {
+            format!("search: {}", self.picker.query)
         } else {
             format!("search: {}_", self.picker.query)
         };
@@ -2268,6 +2316,17 @@ impl ratatui::widgets::Widget for ThemePickerView<'_> {
             Some(note @ (CameraNote::Off | CameraNote::Failed)) => (note.lines(), theme.warn),
             Some(note @ CameraNote::Starting) => (note.lines(), theme.accent),
             Some(note @ CameraNote::Live) => (note.lines(), theme.ok),
+            None if self.vim && self.picker.vim_insert() => (
+                ["VIM INSERT · Esc returns to Command", "Enter keep · ^n/e/d"],
+                theme.muted,
+            ),
+            None if self.vim => (
+                [
+                    "VIM NORMAL · j/k browse · i types",
+                    "Enter keep · Esc back · ^n/e/d",
+                ],
+                theme.muted,
+            ),
             None => (
                 ["↑/↓ browse · Enter keep", "Esc back · ^n/e/d"],
                 theme.muted,
@@ -2493,6 +2552,30 @@ pub fn true_rgb(color: Color) -> Option<(u8, u8, u8)> {
 /// different controls.
 pub const FADER_HANDLE_OPACITY: f32 = 0.5;
 
+/// RGB to the hue (degrees), saturation and lightness [`hsl`] takes.
+fn to_hsl((red, green, blue): (u8, u8, u8)) -> (f64, f64, f64) {
+    let (red, green, blue) = (
+        f64::from(red) / 255.0,
+        f64::from(green) / 255.0,
+        f64::from(blue) / 255.0,
+    );
+    let (high, low) = (red.max(green).max(blue), red.min(green).min(blue));
+    let lightness = (high + low) / 2.0;
+    let spread = high - low;
+    if spread == 0.0 {
+        return (0.0, 0.0, lightness);
+    }
+    let saturation = spread / (1.0 - (2.0 * lightness - 1.0).abs());
+    let sector = if high == red {
+        ((green - blue) / spread).rem_euclid(6.0)
+    } else if high == green {
+        (blue - red) / spread + 2.0
+    } else {
+        (red - green) / spread + 4.0
+    };
+    (60.0 * sector, saturation, lightness)
+}
+
 /// Mix `left` towards `right` by `right_amount`, 0 through 1.
 pub fn mix(left: Color, right: Color, right_amount: f32) -> Color {
     let amount = right_amount.clamp(0.0, 1.0);
@@ -2506,6 +2589,22 @@ pub fn mix(left: Color, right: Color, right_amount: f32) -> Color {
     };
     let blend = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * amount).round() as u8;
     Color::Rgb(blend(lr, rr), blend(lg, rg), blend(lb, rb))
+}
+
+/// `colour_amount` of `colour` washed in over `ground`, for a fade that has to
+/// stay visible.
+///
+/// A theme that defers its ground to the terminal has no colour to blend
+/// with, and [`mix`] would snap to the ground itself - which the pixel
+/// raster paints as plain black. The colour stays whole instead, so a
+/// silent note keeps its grey rather than disappearing. A ground that is a
+/// colour takes its share exactly as [`mix`] gives it.
+pub fn wash(ground: Color, colour: Color, colour_amount: f32) -> Color {
+    if true_rgb(ground).is_none() {
+        colour
+    } else {
+        mix(ground, colour, colour_amount)
+    }
 }
 
 impl Theme {
@@ -3054,6 +3153,7 @@ mod tests {
                 picker,
                 theme: &theme,
                 camera: None,
+                vim: false,
             }
             .render(area, &mut buffer);
             (0..area.height)
@@ -3203,6 +3303,7 @@ mod tests {
             rolled: false,
             scroll: std::cell::Cell::new(0),
             hold_scroll: false,
+            vim_insert: false,
         };
         assert!(picker.on_randomize());
         let start = picker.randomize_seed;
@@ -3521,6 +3622,7 @@ mod tests {
                 picker: &picker,
                 theme: &theme,
                 camera,
+                vim: false,
             }
             .render(area, &mut buffer);
             let (panel, list) = picker.geometry(area).expect("room");
@@ -3557,14 +3659,16 @@ mod tests {
             rolled: false,
             scroll: std::cell::Cell::new(0),
             hold_scroll: false,
+            vim_insert: false,
         };
         let area = Rect::new(0, 0, 80, 30);
-        let render = |picker: &ThemePicker| {
+        let render = |picker: &ThemePicker, vim: bool| {
             let mut buffer = Buffer::empty(area);
             ThemePickerView {
                 picker,
                 theme: &theme,
                 camera: None,
+                vim,
             }
             .render(area, &mut buffer);
             buffer
@@ -3574,12 +3678,21 @@ mod tests {
                 .collect::<String>()
         };
 
-        let fourth = render(&picker);
+        let fourth = render(&picker, false);
         assert!(fourth.contains(" 4/30 "), "{fourth}");
 
         picker.move_by(1);
-        let fifth = render(&picker);
+        let fifth = render(&picker, false);
         assert!(fifth.contains(" 5/30 "), "{fifth}");
+
+        let command = render(&picker, true);
+        assert!(command.contains("VIM NORMAL"), "{command}");
+        assert!(command.contains("j/k browse"), "{command}");
+        assert!(command.contains("search: i or a types"), "{command}");
+        picker.set_vim_insert(true);
+        let insert = render(&picker, true);
+        assert!(insert.contains("VIM INSERT"), "{insert}");
+        assert!(insert.contains("returns to Co"), "{insert}");
     }
 
     #[test]
@@ -3600,6 +3713,7 @@ mod tests {
             rolled: false,
             scroll: std::cell::Cell::new(0),
             hold_scroll: false,
+            vim_insert: false,
         };
         for character in "RUSTEL".chars() {
             picker.push_query(character);
@@ -3619,6 +3733,7 @@ mod tests {
             picker: &picker,
             theme: &theme,
             camera: None,
+            vim: false,
         }
         .render(area, &mut buffer);
         let text = buffer
@@ -3730,6 +3845,24 @@ mod tests {
                 assert_eq!(theme.fill_text(), Color::Indexed(0), "{name}");
             }
         }
+    }
+
+    /// The warm sibling is one ground with one role moved: a theme that also
+    /// changed its ground would be a different theme, not a variant of this
+    /// one. Checking the whole document catches a field that drifts.
+    #[test]
+    fn terminal_warm_moves_only_the_accent_and_selection() {
+        let plain = Theme::built_in("terminal").expect("terminal ships");
+        let mut expected: serde_json::Value =
+            serde_json::from_str(&plain.to_json()).expect("plain theme is json");
+        expected["name"] = "terminal-warm".into();
+        expected["accent"] = "ansi1".into();
+        expected["selection"] = "ansi1".into();
+        let warm = Theme::built_in("terminal-warm").expect("warm ships");
+        let actual: serde_json::Value =
+            serde_json::from_str(&warm.to_json()).expect("warm theme is json");
+        assert_eq!(actual, expected);
+        assert_eq!(plain.background, warm.background, "the ground is shared");
     }
 
     #[test]
@@ -3911,6 +4044,52 @@ mod tests {
         assert!(error.to_string().contains("built in"), "{error}");
     }
 
+    /// The first pane is the accent and the second is one other colour, the
+    /// same on every call. It keeps the accent's brightness. A palette the
+    /// terminal owns has no hue to turn, so there it is the `mini` colour.
+    #[test]
+    fn the_second_pane_has_its_own_steady_colour() {
+        let mut theme = Theme::built_in(DEFAULT_THEME).unwrap();
+        theme.accent = Color::Rgb(255, 92, 168);
+        assert_eq!(theme.pane_colour(0), theme.accent);
+        let second = theme.pane_colour(1);
+        assert_ne!(second, theme.accent);
+        assert_eq!(second, theme.pane_colour(1), "the same every time");
+        assert!(
+            contrast_ratio(second, theme.background) >= ACCENT_CONTRAST - 0.05,
+            "{second:?} does not stand off the background"
+        );
+
+        // A blue theme stays blue: the second colour is a neighbouring hue,
+        // not the far side of the wheel.
+        theme.accent = Color::Rgb(37, 201, 255);
+        let Color::Rgb(red, green, blue) = theme.pane_colour(1) else {
+            panic!("a true-colour accent gives a true-colour pane colour");
+        };
+        assert!(
+            blue >= red && blue >= green,
+            "({red}, {green}, {blue}) left the blue family"
+        );
+        assert_ne!(theme.pane_colour(1), theme.accent);
+
+        let terminal = Theme::built_in("terminal").expect("terminal ships");
+        assert_eq!(terminal.pane_colour(0), terminal.accent);
+        assert_eq!(terminal.pane_colour(1), terminal.mini);
+        assert_ne!(terminal.pane_colour(1), terminal.pane_colour(0));
+    }
+
+    #[test]
+    fn to_hsl_reads_back_the_hue_hsl_wrote() {
+        for hue in [0.0, 40.0, 120.0, 195.0, 260.0, 330.0] {
+            let rgb = true_rgb(hsl(hue, 0.8, 0.6)).unwrap();
+            let (read, saturation, lightness) = to_hsl(rgb);
+            assert!((read - hue).abs() < 1.5, "hue {hue} read as {read}");
+            assert!((saturation - 0.8).abs() < 0.02, "saturation {saturation}");
+            assert!((lightness - 0.6).abs() < 0.01, "lightness {lightness}");
+        }
+        assert_eq!(to_hsl((128, 128, 128)).1, 0.0, "a grey has no saturation");
+    }
+
     /// A palette colour cannot be blended, so a mix that touches one snaps
     /// to the side with more weight. It does not invent a mid-grey.
     #[test]
@@ -4026,6 +4205,7 @@ mod confinement_tests {
             rolled: false,
             scroll: std::cell::Cell::new(0),
             hold_scroll: false,
+            vim_insert: false,
         };
         let shown = 12;
         let margin = crate::scroll::margin(shown);

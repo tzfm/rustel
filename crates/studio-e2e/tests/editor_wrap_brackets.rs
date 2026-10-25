@@ -125,6 +125,12 @@ fn changing_the_caret_shape_changes_the_bracket_mark_immediately() {
     studio.set_caret(caret);
     for shape in 0..6 {
         studio.chord("ctrl+o");
+        // The caret's row is on the appearance page. A fresh studio opens
+        // the sheet on its first page and pages once; a reopen returns to
+        // the page it left, which already is the appearance one.
+        if !studio.rows().iter().any(|row| row.contains("caret shape")) {
+            studio.press(KeyCode::Tab, KeyModifiers::NONE);
+        }
         for _ in 0..40 {
             if studio
                 .rows()
@@ -196,7 +202,9 @@ fn the_bracket_switch_is_on_the_sheet() {
 
     studio.chord("ctrl+o");
     // Down until the row is the selected one - the sheet marks it `▸ ` -
-    // not merely visible, which it is from the first frame.
+    // not merely visible, which it is from the first frame. The row is on
+    // the appearance page, the second tab.
+    studio.press(KeyCode::Tab, KeyModifiers::NONE);
     for _ in 0..30 {
         if studio
             .rows()

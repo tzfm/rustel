@@ -314,6 +314,34 @@ mod tests {
                         && row.chord == crate::keybinds::shortcut_label("Alt+T"))
             );
 
+            // iTerm2's Option as Normal sends a dagger, not Alt+T. In a
+            // tape the composed key still focuses the timeline.
+            app.focus = Focus::Editor;
+            app.keybinds.set_reach(crate::keybinds::Reach {
+                enhanced: false,
+                terminal: "iTerm2".into(),
+            });
+            app.handle_terminal_event(Event::KeyWithText {
+                key: KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT),
+                text: "†".into(),
+            })
+            .unwrap();
+            assert_eq!(
+                app.focus,
+                Focus::Timeline,
+                "a composed Option+T focuses the tape"
+            );
+
+            // Without the keyboard protocol the terminal sends only the
+            // dagger, and the profile still knows what it stood for.
+            app.focus = Focus::Editor;
+            app.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('†'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+            assert_eq!(app.focus, Focus::Timeline, "a bare dagger focuses the tape");
+
             // A learnt chord takes the place of Alt+T, here and in the hint.
             let chord = crate::keybinds::KeyCombo::parse("ctrl+shift+f8").unwrap();
             app.learn_keybind(BindAction::FocusTimeline, Some(chord));

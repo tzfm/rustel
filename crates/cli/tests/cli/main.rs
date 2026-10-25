@@ -312,6 +312,18 @@ fn a_render_goes_through_the_plugin_a_score_names() {
         ),
         "{notice}"
     );
+    // A settings file with a fault gives a warning, and the plugin plays.
+    let settings = config.join("rustel.json");
+    std::fs::write(&settings, r#"{"plugin_audio_thread": "OTT"}"#).unwrap();
+    let (faulty, notice) = render(r#".vst("rustel fixture", { gain: 0.25 })"#);
+    assert!(scaled(&faulty, 0.25));
+    assert!(
+        notice.contains(
+            "warning: audio thread only off for each plugin: plugin_audio_thread must be a list of plugin names"
+        ),
+        "{notice}"
+    );
+    std::fs::remove_file(&settings).unwrap();
 
     // The second plugin of the bundle is an instrument. With `.vsti()` the
     // plugin makes the sound of the note: a 440 Hz sine with a peak of

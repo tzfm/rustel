@@ -79,6 +79,15 @@ fn play_until(insert: &mut dyn OrbitInsert, heard: &dyn Fn(&Recording) -> bool) 
     recording
 }
 
+/// The diagnostics of the worker, less the starvation line. A busy machine
+/// can starve the worker while an orchestra compiles: that is a gap of
+/// silence, not an error of the score.
+fn errors(program: &Program) -> Vec<String> {
+    let mut errors = program.take_errors();
+    errors.retain(|line| line != rustel_csound::STARVATION_LINE);
+    errors
+}
+
 #[test]
 fn native_timing_cut_nested_notes_reset_and_callback_allocation() {
     let _serial = serial();
@@ -157,6 +166,8 @@ fn native_timing_cut_nested_notes_reset_and_callback_allocation() {
     let tail = play(insert.as_mut(), 2);
     assert!(tail.0.iter().chain(&tail.1).all(|v| *v == 0.0));
     assert_eq!(program.pending_events(), 0);
+    // No error and no starvation line: the warm-up and the compile after
+    // the cut read dry by design.
     assert!(program.take_errors().is_empty());
     drop(insert);
     assert_eq!(program.active_instances(), 0);
@@ -200,7 +211,7 @@ fn a_cut_keeps_earlier_notes_and_notes_submitted_after_it() {
     assert!(live.0[onset..].iter().all(|v| (v - 0.6).abs() < 1e-6));
     assert_eq!(live.0, live.1);
     assert_eq!(program.pending_events(), 0);
-    assert!(program.take_errors().is_empty());
+    assert!(errors(&program).is_empty());
 }
 
 #[test]
@@ -249,7 +260,7 @@ fn reset_suspends_globals_until_the_next_score() {
     assert!(back.0.iter().any(|v| (v - 0.125).abs() < 1e-6));
     let held = play(insert.as_mut(), 2);
     assert!(held.0[128..].iter().all(|v| (v - 0.125).abs() < 1e-6));
-    assert!(program.take_errors().is_empty());
+    assert!(errors(&program).is_empty());
 }
 
 #[test]
@@ -272,11 +283,14 @@ fn bundled_instruments_and_custom_pfields_render_at_host_rates() {
                 note.p5 = 80.0;
             }
             insert.score(program.prepare(note).unwrap(), 0);
+            // The worker renders the frames before the test reads them: a
+            // slow machine compiles the orchestra after the first reads.
+            insert.prime(16 * BLOCK);
             let (left, right) = play(insert.as_mut(), 16);
             assert!(left.iter().chain(&right).all(|v| v.is_finite()));
             let peak = left.iter().fold(0.0_f32, |peak, v| peak.max(v.abs()));
             assert!(peak > 0.001, "{name} at {rate} Hz was silent");
-            assert!(program.take_errors().is_empty());
+            assert!(errors(&program).is_empty());
         }
     }
     assert!(Program::compile(&["instr broken\nno_such_opcode 1\nendin".into()]).is_err());
@@ -303,13 +317,13 @@ fn runtime_errors_reach_the_host_and_a_corrected_note_recovers() {
         assert!(Violations::capture().since(before).clean());
         let silent = play(insert.as_mut(), 3);
         assert!(silent.0.iter().chain(&silent.1).all(|v| *v == 0.0));
-        assert!(!program.take_errors().is_empty());
+        assert!(!errors(&program).is_empty());
         let id = program.prepare(event("triangle", 0.1)).unwrap();
         insert.score(id, 0);
         let corrected = play_until(insert.as_mut(), &|recording| {
             recording.0.iter().any(|v| v.abs() > 0.001)
         });
         assert!(corrected.0.iter().any(|v| v.abs() > 0.001));
-        assert!(program.take_errors().is_empty());
+        assert!(errors(&program).is_empty());
     }
 }

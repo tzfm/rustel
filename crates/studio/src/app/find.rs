@@ -4,14 +4,20 @@ use super::*;
 use crate::editor::FindDirection;
 
 impl App {
-    /// Open the find bar for the focused score. The chord and Edit > Find
-    /// both arrive here.
+    /// Open the find prompt for the focused score. The chord and Edit > Find
+    /// both arrive here. The editor says whether its profile keeps the bar
+    /// open, so a modal profile closes it on Enter and repeats with `n`.
     pub(super) fn open_find(&mut self) {
         self.focus_editor_for_locator();
-        self.editor_mut().vim_interrupt();
+        self.editor_mut().interrupt_key_mode();
+        let keeps_open = self.editor().find_bar_keeps_open();
         self.editor_mut()
-            .begin_find(FindDirection::Forward, true, 0);
-        self.status = "find - type a regular expression \u{b7} Enter next \u{b7} Esc closes".into();
+            .begin_find(FindDirection::Forward, keeps_open, 0);
+        self.status = if keeps_open {
+            "find - type a regular expression \u{b7} Enter next \u{b7} Esc closes".into()
+        } else {
+            "find - type a regular expression \u{b7} Enter searches \u{b7} Esc cancels".into()
+        };
         self.dirty_frame = true;
     }
 
@@ -153,6 +159,28 @@ mod tests {
         }
 
         #[test]
+        fn vim_edit_find_closes_on_enter_and_n_walks_matches() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "one two one three one\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            let head = |app: &App| app.editor().primary_selection().head.0;
+
+            chord(&mut app);
+            assert!(app.editor().find_open());
+            for character in "one".chars() {
+                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(!app.editor().find_open(), "Enter searches once and closes");
+            let first = head(&app);
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+            assert_ne!(head(&app), first, "n walks forward");
+            press(&mut app, KeyCode::Char('N'), KeyModifiers::NONE);
+            assert_eq!(head(&app), first, "N walks back");
+        }
+
+        #[test]
         fn backspace_keeps_the_non_vim_find_bar_open() {
             let directory = tempfile::tempdir().expect("temp dir");
             let (mut app, _scene) = plain_app(directory.path(), "one\n");
@@ -197,6 +225,19 @@ mod tests {
                 "the pasted pattern is searched at once"
             );
             assert_eq!(app.editor().source(), score);
+        }
+
+        #[test]
+        fn composed_text_types_in_the_find_bar() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "one two one\n");
+            chord(&mut app);
+            app.handle_terminal_event(Event::KeyWithText {
+                key: KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT),
+                text: "t".into(),
+            })
+            .expect("composed text");
+            assert_eq!(app.editor().find_footer_label().as_deref(), Some("FIND t"));
         }
     }
 }

@@ -77,7 +77,7 @@ codegen-units = 16
 incremental = true
 
 [patch.crates-io]
-# iTerm2 alternate codes, Unix F15-F20 offsets and the key that stays unread
-# after a resize; return to crates.io after a release includes
-# crossterm-rs/crossterm PRs #1125, #1127 and #1128.
-crossterm = { git = "https://github.com/tzfm/crossterm", rev = "88dc698277fa9470a5d1a268244c95069af39bb6" }
+# iTerm2 alternate codes, Unix F15-F20 offsets, the key that stays unread
+# after a resize and kitty associated text; return to crates.io after a
+# release includes crossterm-rs/crossterm PRs #1125, #1127 and #1128.
+crossterm = { git = "https://github.com/tzfm/crossterm", rev = "f772fd3f90be8a85d0a94866bc9daeb0e082255d" }

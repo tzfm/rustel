@@ -35,7 +35,9 @@ mod shield_hold;
 mod ui_state;
 pub use loading::LoadingCue;
 pub(crate) use loading::import_alert;
-use loading::{Followed, LoadState};
+#[cfg(all(test, feature = "vst"))]
+pub(super) use loading::tests::load_mode_tests;
+use loading::{Followed, LoadState, launch_wait_message};
 use shield_hold::ShieldHold;
 use ui_state::StudioUiState;
 
@@ -952,8 +954,12 @@ struct PendingLaunch {
     /// What its text needs; in wait mode it lands on the first line after
     /// all of it has loaded.
     followed: Vec<Followed>,
-    /// A line has passed while its sounds were loading.
+    /// A line has passed while the launch waited.
     waited: bool,
+    /// The launch prepared the plugin copies of its text, or needs no
+    /// prepare: see [`StudioEngine::prepare_launch`].
+    #[cfg(feature = "vst")]
+    prepared: bool,
 }
 
 /// A launch that has fired: its evaluation is done, the new generation is
@@ -1054,8 +1060,8 @@ pub struct LaunchInfo {
     pub seconds_left: f64,
 }
 
-/// Head-room a reload needs before its takeover: the schedule lead, the
-/// continuity margin, and a little for the evaluation itself.
+/// The time a launch keeps for its evaluation, on top of the schedule lead
+/// and the floor of its takeover: see `StudioEngine::launch_headroom`.
 const LAUNCH_HEADROOM_SECS: f64 = 0.08;
 /// How often a moving slider re-queries the horizon. Shorter than the
 /// horizon itself, so the ear never waits a whole cover for a change;
@@ -3776,6 +3782,8 @@ pub(super) mod tests {
             preview: false,
             followed: Vec::new(),
             waited: false,
+            #[cfg(feature = "vst")]
+            prepared: true,
         });
     }
 

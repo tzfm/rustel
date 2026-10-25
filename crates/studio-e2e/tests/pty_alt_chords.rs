@@ -456,7 +456,7 @@ fn probe_alt_chords_through_a_real_pty() {
     terminal.write(&[0x0f]); // Ctrl+O: the settings sheet
     std::thread::sleep(Duration::from_millis(600));
     // This fresh Studio opens Settings on its first page. Three Tabs land on Keybinds:
-    // settings → advanced → mapping → keybinds. Do not infer the current page
+    // settings → appearance → mapping → keybinds. Do not infer the current page
     // from a diff-painted phrase: an unchanged cell may not be emitted by
     // ConPTY, which used to make this loop skip straight past Keybinds.
     for _ in 0..3 {
@@ -558,14 +558,15 @@ fn probe_alt_chords_through_a_real_pty() {
     );
 
     // Alt+A as Windows Terminal delivers it: ESC a (sanity: the other Alt
-    // chord, proven in the same encoding).
+    // chord, proven in the same encoding). The status line is the witness:
+    // the footer shows the shortcut whether or not it is on.
     let mark = terminal.buffer.lock().unwrap().len();
     terminal.write(&[0x1b, b'a']);
     std::thread::sleep(Duration::from_millis(800));
     let frame = terminal.text();
     let after = &frame[mark..];
     assert!(
-        after.contains("samples") && contains_plain(&frame, "auto-play"),
+        after.contains("auto-play on"),
         "Alt+A produced no reaction:\n{}",
         terminal.diagnostics()
     );

@@ -365,6 +365,7 @@ fn e_opens_the_source_for_editing_and_esc_keeps_it() {
     let name = folder.file_name().unwrap().to_string_lossy().into_owned();
 
     import_folder(&mut studio, &folder);
+    wait_for_source_scan(&mut studio, &folder);
 
     studio.press(KeyCode::Char('e'), KeyModifiers::NONE);
     studio.settle();

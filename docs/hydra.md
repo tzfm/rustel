@@ -150,7 +150,7 @@ Selections keep a contrast limit for readable text. A
 [theme](studio.md#themes) can draw its own picture while the score is not
 drawing. Visuals opacity also limits theme pictures.
 
-The **hydra smoothing** row is on the Advanced page of Settings, in the
+The **hydra smoothing** row is on the Appearance page of Settings, in the
 Rendering group. It is off by default. The renderer can draw the picture
 larger than the terminal shows it, then reduces it to the display size. When
 smoothing is on, the renderer averages each block of pixels. This reduces

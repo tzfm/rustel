@@ -409,7 +409,10 @@ fn every_documented_chord_is_honoured() {
                     studio.press(KeyCode::Left, KeyModifiers::NONE);
                 }
             }
-            studio.chord(chord);
+            // The engine's two-deep command queue can be full at the
+            // press; the studio then asks for the press again, which only
+            // the record chords ever do.
+            studio.press_until_taken(|studio| studio.chord(chord));
             match check {
                 Check::Menu => assert!(
                     studio.menu_open(),

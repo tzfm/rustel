@@ -83,6 +83,57 @@ download_release() {
   NEW_BIN="$TMP/$BIN"
 }
 
+# The Linux source build needs the ALSA and libudev development files: CPAL
+# locates ALSA with pkg-config, and gilrs locates libudev the same way.
+# Without them the `alsa-sys` build script panics inside cargo, after the
+# checkout, with a message that names a missing package but no package
+# manager. Check first and name the command for the distribution we are on.
+check_linux_build_deps() {
+  local probe="${PKG_CONFIG:-}"
+  if [ -z "$probe" ]; then
+    if command -v pkg-config >/dev/null 2>&1; then
+      probe="pkg-config"
+    elif command -v pkgconf >/dev/null 2>&1; then
+      probe="pkgconf"
+    fi
+  fi
+
+  local missing=""
+  if [ -z "$probe" ]; then
+    missing="pkg-config, the ALSA headers and the libudev headers"
+  else
+    "$probe" --exists alsa 2>/dev/null || missing="the ALSA headers"
+    "$probe" --exists libudev 2>/dev/null \
+      || missing="${missing:+$missing and }the libudev headers"
+  fi
+  if [ -z "$missing" ]; then
+    return 0
+  fi
+
+  local install
+  if command -v apt-get >/dev/null 2>&1; then
+    install="sudo apt-get install -y build-essential pkg-config libasound2-dev libudev-dev"
+  elif command -v dnf >/dev/null 2>&1; then
+    install="sudo dnf install -y gcc gcc-c++ make pkgconf-pkg-config alsa-lib-devel systemd-devel"
+  elif command -v pacman >/dev/null 2>&1; then
+    install="sudo pacman -S --needed base-devel pkgconf alsa-lib systemd-libs"
+  elif command -v zypper >/dev/null 2>&1; then
+    install="sudo zypper install -y gcc gcc-c++ make pkg-config alsa-devel systemd-devel"
+  elif command -v apk >/dev/null 2>&1; then
+    install="sudo apk add build-base pkgconf alsa-lib-dev eudev-dev"
+  else
+    install="install pkg-config and the ALSA and libudev development packages"
+  fi
+
+  say "missing build dependencies: $missing" >&2
+  say "the Linux build needs ALSA headers for audio and libudev headers for gamepads" >&2
+  say "PipeWire provides the running connection, not the headers a build reads" >&2
+  say "install them with:" >&2
+  printf '    %s\n' "$install" >&2
+  say "then run rustelup again; see $BASE_URL/blob/main/docs/building.md" >&2
+  exit 1
+}
+
 # Build $BRANCH or $COMMIT in $SRC_DIR with the release profile. The checkout
 # and its `target` directory stay, so the next build compiles the changes only.
 build_from_source() {
@@ -98,6 +149,10 @@ build_from_source() {
   esac
   [ -z "$COMMIT" ] || [ "${#COMMIT}" -eq 40 ] \
     || err "--commit requires the full 40-character hash"
+
+  if [ "$PLATFORM" = "linux" ]; then
+    check_linux_build_deps
+  fi
 
   say "building rustel $name from source ($PLATFORM $ARCH)"
   [ -d "$SRC_DIR/.git" ] || git init -q "$SRC_DIR"

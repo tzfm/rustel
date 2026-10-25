@@ -6,11 +6,12 @@
 //! engine.
 //!
 //! One thread, the plugin thread, makes every plugin call except the audio
-//! processing. The audio callback owns a running plugin and gives the plugin
-//! back to the plugin thread at the end. On macOS the creation and the
-//! release of a plugin run on the process's main thread instead, which
-//! the plugin thread waits for; see [`install_main_service`] for the
-//! contract.
+//! processing. The audio processing runs in the audio callback or on a
+//! plugin worker of the engine, one thread at a time. The audio engine owns
+//! a running plugin and gives the plugin back to the plugin thread at the
+//! end. On macOS the creation and the release of a plugin run on the
+//! process's main thread instead, which the plugin thread waits for. See
+//! [`install_main_service`] for the contract.
 //!
 //! ```text
 //!   score:   .vst("name", { mix: 0.4 })
@@ -33,10 +34,12 @@ mod main_thread;
 mod module;
 mod preset;
 mod scan;
+mod watch;
 mod worker;
 
 pub use host::{
-    FoundPreset, Host, Plugin, PluginInfo, Prepared, Resolved, ScanProgress, Status, WorkerProgram,
+    FoundPreset, Host, Plugin, PluginInfo, Prepared, Resolved, ScanProgress, Status, WantedCopy,
+    WorkerProgram,
 };
 pub use main_thread::{install_main_service, needs_the_main_thread, pump_main};
 pub use scan::{default_folders, find_bundles};
@@ -65,6 +68,22 @@ pub struct ParamInfo {
     pub steps: u32,
     /// The value at the start as the plugin prints it.
     pub default_text: String,
+    /// What the parameter is to a host, as the plugin marks it.
+    pub role: ParamRole,
+}
+
+/// What a parameter is to a host, as the plugin marks it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ParamRole {
+    /// A parameter of the sound.
+    #[default]
+    Plain,
+    /// The dry/wet mix, as the plugin names it to a host.
+    Mix,
+    /// The plugin's own bypass.
+    Bypass,
+    /// The plugin's program change.
+    Program,
 }
 
 impl ParamInfo {

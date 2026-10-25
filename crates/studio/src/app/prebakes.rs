@@ -120,13 +120,24 @@ impl App {
         self.queue_prebakes(&chain, false);
     }
 
-    /// Show a prebake in the focused pane, from the settings sheet.
+    /// Show a prebake in the focused pane, from the settings sheet, the
+    /// Options menu, or a learnt chord.
     pub(super) fn open_prebake(&mut self, scope: PrebakeScope) {
+        // The theme editor keeps an unsaved draft. Say so instead of
+        // closing it and putting the theme back.
+        if self.theme_editor.is_some() {
+            self.status = "the theme editor is open - s saves, Esc goes back to the themes".into();
+            self.dirty_frame = true;
+            return;
+        }
         // Setup belongs to the set view; a tape gives the studio back first.
         if self.replay_view.is_some() {
             self.close_replay();
         }
-        self.close_settings_sheet();
+        // Sheets and prompts over the old surface would keep the keyboard
+        // while the prebake is drawn under them. The log is reading
+        // furniture and stays.
+        self.dismiss_dialogs_except(&[PanelKind::Log]);
         self.focus = Focus::Editor;
         #[cfg(feature = "hydra")]
         self.sync_settings_webcam_preview();
@@ -467,6 +478,7 @@ mod tests {
 
         use crate::app::tests::support::*;
         use crate::app::*;
+        use crate::menu::MenuAction;
 
         /// Enter on a prebake row opens it as a tab and hands over the keyboard.
         #[test]
@@ -476,11 +488,11 @@ mod tests {
 
             app.toggle_settings_sheet();
             assert_eq!(app.focus, Focus::Panel(PanelKind::Settings));
-            // Up from the top wraps to the last row (full paths), then trim
-            // recordings, then the local prebake.
-            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
-            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
-            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            // Down to the local prebake row, past the set rows and the
+            // global prebake above it.
+            for _ in 0..9 {
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            }
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
             assert!(app.settings_sheet.is_none(), "the sheet handed over");
@@ -491,6 +503,60 @@ mod tests {
             assert_eq!(app.scenes.score_count(), 1);
             assert_eq!(app.scenes.len(), 2);
             assert!(app.status.contains("prebake (local)"), "{}", app.status);
+        }
+
+        /// The shortcut path opens the same tab and closes the sheet.
+        #[test]
+        fn the_prebake_actions_open_their_tabs_and_close_settings() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+
+            app.toggle_settings_sheet();
+            assert!(
+                app.dispatch_bind_action(BindAction::OpenGlobalPrebake, false)
+                    .expect("global prebake action")
+            );
+            assert!(app.settings_sheet.is_none(), "the sheet handed over");
+            assert_eq!(app.current_prebake(), Some(PrebakeScope::Global));
+            assert_eq!(app.focus, Focus::Editor);
+
+            app.toggle_settings_sheet();
+            assert!(
+                app.dispatch_bind_action(BindAction::OpenLocalPrebake, false)
+                    .expect("local prebake action")
+            );
+            assert_eq!(app.current_prebake(), Some(PrebakeScope::Local));
+
+            app.toggle_theme_picker();
+            assert!(app.theme_picker.is_some(), "the picker is open");
+            app.dispatch_menu_action(MenuAction::GlobalPrebake)
+                .expect("global prebake menu row");
+            assert_eq!(app.current_prebake(), Some(PrebakeScope::Global));
+            assert!(
+                app.theme_picker.is_none(),
+                "the prebake dismissed the sheet over it"
+            );
+        }
+
+        /// The shortcut takes the keyboard from a panel and gives it to
+        /// the prebake in the focused pane.
+        #[test]
+        fn the_prebake_shortcut_takes_the_keyboard_from_a_panel() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.toggle_reference_browse();
+            app.focus = Focus::Panel(PanelKind::Reference);
+            assert!(
+                app.dispatch_bind_action(BindAction::OpenLocalPrebake, false)
+                    .expect("local prebake action")
+            );
+            assert_eq!(app.focus, Focus::Editor);
+            assert_eq!(app.current_prebake(), Some(PrebakeScope::Local));
+            assert_eq!(
+                app.panes[app.focused].scene,
+                app.scenes.current().id,
+                "the focused pane shows the prebake"
+            );
         }
 
         /// A prebake tab is never a file: its text goes where its scope keeps

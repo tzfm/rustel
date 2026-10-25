@@ -390,6 +390,7 @@ fn an_imported_drop_survives_a_reopen() {
     let mut studio = reopen_over(studio);
 
     studio.chord("ctrl+o");
+    // The sources page is the fifth tab.
     for _ in 0..4 {
         studio.press(KeyCode::Tab, KeyModifiers::NONE);
     }

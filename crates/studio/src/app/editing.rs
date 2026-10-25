@@ -10,136 +10,47 @@ impl App {
     pub(super) fn sync_editor_keybindings(&mut self) {
         self.keybinds
             .set_editor_keybindings(self.ui_settings.editor_keybindings);
-        let mappings = self.vim_config.mappings();
+        let mappings = super::vim::mappings(self);
         for scene in self.scenes.scenes_mut() {
             scene
                 .editor
                 .set_keybindings(self.ui_settings.editor_keybindings);
-            scene.editor.set_vim_mappings(Arc::clone(&mappings));
+            scene
+                .editor
+                .set_vim_mappings(std::sync::Arc::clone(&mappings));
         }
         self.refresh_editor_shortcut_hints();
     }
 
     pub(super) fn editor_cursor_shape(&self) -> super::super::terminal::CaretShape {
-        if self.editor_accepts_raw_paste() && !self.editor().vim_is_insert() {
-            super::super::terminal::CaretShape::SteadyBlock
+        use super::super::terminal::CaretShape;
+        // Vim shapes follow the mode: a block in Normal and Visual, a bar
+        // in Insert. The setting and its blink do not apply, so typing
+        // cannot restart a blink phase on every key.
+        if self.editor().uses_modal_keys() {
+            return if self.editor().accepts_typed_text() {
+                CaretShape::SteadyBar
+            } else {
+                CaretShape::SteadyBlock
+            };
+        }
+        if self.editor_accepts_raw_paste() && !self.editor().accepts_typed_text() {
+            CaretShape::SteadyBlock
         } else {
             self.theme.caret_shape(self.ui_settings.caret_shape)
         }
     }
 
-    pub(super) fn dispatch_vim_key(&mut self, key: KeyEvent) -> Result<bool, RuntimeError> {
-        let moment = self.moment();
-        if self
-            .scenes
-            .current_mut()
-            .editor
-            .vim_queue_mapped_key(key, moment)
-        {
-            self.drain_vim_mappings(false)?;
-            self.dirty_frame = true;
-            return Ok(true);
-        }
-        self.dispatch_vim_builtin(key)
+    /// Typed text has a place in the editor when the editor accepts it, or
+    /// when a machine sent it. A remote key is literal text in every mode.
+    pub(super) fn editor_takes_typed_text(&self) -> bool {
+        self.remote_key_event || self.editor().accepts_typed_text()
     }
 
-    pub(super) fn flush_vim_mapping_timeout(&mut self) -> Result<(), RuntimeError> {
-        if self.editor().vim_mapping_timed_out(self.moment()) {
-            self.flush_vim_mapping_pending()?;
-        }
-        Ok(())
-    }
-
-    pub(super) fn flush_vim_mapping_pending(&mut self) -> Result<(), RuntimeError> {
-        self.drain_vim_mappings(true)
-    }
-
-    fn drain_vim_mappings(&mut self, force: bool) -> Result<(), RuntimeError> {
-        while let Some((mapped, remaining)) =
-            self.scenes.current_mut().editor.vim_take_mapped_keys(force)
-        {
-            for step in mapped {
-                match step {
-                    crate::vim_config::VimMappedKey::Key(key) => {
-                        if self.editor_accepts_raw_paste() && self.dispatch_vim_builtin(key)? {
-                            if self.editor().vim_motion_blocked() {
-                                break;
-                            }
-                        } else {
-                            self.route_terminal_event(Event::Key(key), false)?;
-                        }
-                    }
-                    crate::vim_config::VimMappedKey::Action(action) => {
-                        // A Studio action is not a Vim motion. A pending
-                        // operator must not wait for the next key.
-                        self.editor_mut().vim_cancel_pending();
-                        self.dispatch_bind_action(action, false)?;
-                    }
-                }
-            }
-            for key in remaining {
-                self.handle_terminal_event(Event::Key(key))?;
-            }
-        }
-        self.refresh_editor_shortcut_hints();
-        Ok(())
-    }
-
-    fn dispatch_vim_builtin(&mut self, key: KeyEvent) -> Result<bool, RuntimeError> {
-        let kind = key.kind;
-        let mut key = crate::vim_config::canonical_key(key);
-        key.kind = kind;
-        let pending = self.editor().vim_has_pending_command();
-        let before = self.editor().revision();
-        let previous_caret = self.editor().primary_selection().head.0;
-        let moment = self.moment();
-        let atomic_delete_range = if !self.editor().vim_is_insert()
-            && matches!(key.code, KeyCode::Char('x') | KeyCode::Delete)
-        {
-            self.slider_delete_range(&Command::DeleteForward)
-        } else {
-            None
-        };
-        let outcome = self
-            .scenes
-            .current_mut()
-            .editor
-            .vim_key(key, moment, atomic_delete_range);
-        let mut handled = match outcome {
-            Ok(handled) => {
-                if handled {
-                    self.clear_error(ErrorOwner::Editor);
-                }
-                handled
-            }
-            Err(error) => {
-                self.set_error(ErrorOwner::Editor, error.to_string());
-                true
-            }
-        };
-        if !handled && pending {
-            self.scenes.current_mut().editor.vim_cancel_pending();
-            handled = true;
-        }
-        if !handled && let Some(command) = self.editor().vim_insert_command(key) {
-            self.dispatch_editor(command)?;
-            return Ok(true);
-        }
-        if handled {
-            if self.editor().revision() != before || self.editor().vim_needs_escape() {
-                self.focus = Focus::Editor;
-            }
-            if self.editor().revision() != before {
-                #[cfg(feature = "hydra")]
-                self.sync_settings_webcam_preview();
-                self.armed_slider = None;
-                self.drop_pane_selection();
-            }
-            self.after_document_change(before, true);
-            self.warp_caret_over_sliders(previous_caret);
-            self.dirty_frame = true;
-        }
-        Ok(handled)
+    /// Leave any pending key mode before an action from outside the
+    /// keyboard. The Vim package owns how a mode is left.
+    pub(super) fn interrupt_key_input(&mut self) -> Result<(), RuntimeError> {
+        super::vim::interrupt(self)
     }
 
     pub(super) fn forward_mouse_to_editor(
@@ -164,10 +75,7 @@ impl App {
                 .mouse_event(mouse, map, moment)
         };
         let outcome = outcome.and_then(|changed| {
-            self.scenes
-                .current_mut()
-                .editor
-                .vim_normalize_after_input()?;
+            self.scenes.current_mut().editor.normalize_after_input()?;
             Ok(changed)
         });
         match outcome {
@@ -202,10 +110,7 @@ impl App {
                 .editor
                 .dispatch(command, moment, &mut *self.clipboard);
         let outcome = outcome.and_then(|effects| {
-            self.scenes
-                .current_mut()
-                .editor
-                .vim_normalize_after_input()?;
+            self.scenes.current_mut().editor.normalize_after_input()?;
             Ok(effects)
         });
         match outcome {
@@ -223,7 +128,7 @@ impl App {
         Ok(())
     }
 
-    fn after_document_change(&mut self, before: Revision, may_restore_savepoint: bool) {
+    pub(super) fn after_document_change(&mut self, before: Revision, may_restore_savepoint: bool) {
         let scene = self.scenes.current().id;
         self.after_edit(scene, before, may_restore_savepoint);
     }
@@ -233,7 +138,7 @@ impl App {
     /// Right from before the widget lands after it, Left the reverse, and a
     /// click takes the nearer edge. What cannot rest inside cannot silently
     /// un-render or edit the call's hidden text.
-    fn warp_caret_over_sliders(&mut self, previous: usize) {
+    pub(super) fn warp_caret_over_sliders(&mut self, previous: usize) {
         let scene_id = self.scenes.current().id;
         let selection = self.editor().primary_selection();
         if !selection.is_empty() {
@@ -428,8 +333,6 @@ impl App {
                 {
                     self.generator_preview_pending = false;
                 }
-                self.log
-                    .push(LogLevel::Debug, "transport", "stop - the set goes quiet");
                 self.pending_evaluation = None;
                 self.stop_replays();
                 // A stop is a stop: the engine cancels the armed launch, and
@@ -437,41 +340,83 @@ impl App {
                 self.forget_arming();
                 self.landing_name = None;
                 self.next_launch = Launch::Now;
-                // The snapshot can trail the key by a frame. The local flag
-                // makes even two rapid presses distinct: first drain, second
-                // cut every remaining voice and effect tail now.
-                let cutting = self.stop_requested || self.is_stopping();
-                // The worker stops on an atomic now; the snapshot that says so
-                // arrives up to 100ms later. Forgetting here means a Stop
-                // followed immediately by Update restarts, instead of the
-                // update being read as redundant against a score that is
-                // already on its way out.
-                self.installed_revision = None;
-                self.stop_requested = true;
-                // Scheduling stops on the first press even while existing
-                // voices and effects drain. Freeze the transport picture at
-                // that instant so the cycle counter and beat light do not
-                // imply that the score is still advancing through its tail.
-                self.visual.stop();
-                // Is what is stopping the set at all? A stop of a tape
-                // being heard again, or of a preview sounding under the
-                // score, is not an event of the set the recorder is
-                // writing, so it must not grow that tape.
-                let stopping_the_set = self.replay_view.is_none();
+                // A stop for a transport already stopped has nothing to
+                // stop: the engine word would only come back as a second
+                // settle, which resets the advisories and discards the
+                // visual update the held frame is showing - a flicker on a
+                // picture at rest.
+                let mut said: Option<String> = None;
+                if self.is_playing() || self.is_stopping() || self.stop_requested {
+                    self.log
+                        .push(LogLevel::Debug, "transport", "stop - the set goes quiet");
+                    // The snapshot can trail the key by a frame. The local flag
+                    // makes even two rapid presses distinct: first drain, second
+                    // cut every remaining voice and effect tail now.
+                    let cutting = self.stop_requested || self.is_stopping();
+                    // The worker stops on an atomic now; the snapshot that says so
+                    // arrives up to 100ms later. Forgetting here means a Stop
+                    // followed immediately by Update restarts, instead of the
+                    // update being read as redundant against a score that is
+                    // already on its way out.
+                    self.installed_revision = None;
+                    self.stop_requested = true;
+                    // Scheduling stops on the first press even while existing
+                    // voices and effects drain. Freeze the transport picture at
+                    // that instant so the cycle counter and beat light do not
+                    // imply that the score is still advancing through its tail.
+                    self.visual.stop();
+                    // Is what is stopping the set at all? A stop of a tape
+                    // being heard again, or of a preview sounding under the
+                    // score, is not an event of the set the recorder is
+                    // writing, so it must not grow that tape.
+                    let stopping_the_set = self.replay_view.is_none();
+                    #[cfg(feature = "hydra")]
+                    let stopping_the_set = stopping_the_set && self.snippet_preview.is_none();
+                    if cutting {
+                        self.worker.force_stop();
+                    } else {
+                        self.worker.request_stop();
+                    }
+                    // What a stop installs is silence; the tape says so where
+                    // it happened, so a replay goes quiet there too.
+                    if !cutting && stopping_the_set && self.recorder.is_some() {
+                        let at = self.recorder_started.elapsed().as_secs_f64();
+                        if let Some(recorder) = self.recorder.as_mut() {
+                            recorder.record_save_via(
+                                at,
+                                SaveStatus::Installed,
+                                rustel_runtime::session_log::STOP_SOURCE,
+                                None,
+                                Some("stop"),
+                            );
+                        }
+                    }
+                    said = Some(if cutting {
+                        "stopping now".to_owned()
+                    } else {
+                        format!(
+                            "stopping - letting the tail ring out ({} again cuts it)",
+                            self.keybinds.hint(BindAction::Stop)
+                        )
+                    });
+                } else if self.preview_armed.is_some() {
+                    // The browser's audition sounds under its own voice, not
+                    // the transport: its stop still says the word, though the
+                    // engine's transport has nothing to stop. The silence
+                    // below is the whole of the work, and a second press
+                    // finds nothing left to cut.
+                    said = Some(format!(
+                        "stopping - letting the tail ring out ({} again cuts it)",
+                        self.keybinds.hint(BindAction::Stop)
+                    ));
+                }
                 // The same window: a preview was playing under a score
                 // that is on its way out, so there is nothing to put back
                 // and nothing to hang the next one on.
                 #[cfg(feature = "hydra")]
-                let stopping_the_set = stopping_the_set && self.snippet_preview.is_none();
-                #[cfg(feature = "hydra")]
                 {
                     self.snippet_preview = None;
                     self.snippet_heard = false;
-                }
-                if cutting {
-                    self.worker.force_stop();
-                } else {
-                    self.worker.request_stop();
                 }
                 // A stop is a stop, and that includes the sample sounding
                 // under the browser. The audition has no transport of its
@@ -480,28 +425,9 @@ impl App {
                 // that clock would otherwise keep counting through the
                 // silence.
                 self.silence_preview();
-                // What a stop installs is silence; the tape says so where
-                // it happened, so a replay goes quiet there too.
-                if !cutting && stopping_the_set && self.recorder.is_some() {
-                    let at = self.recorder_started.elapsed().as_secs_f64();
-                    if let Some(recorder) = self.recorder.as_mut() {
-                        recorder.record_save_via(
-                            at,
-                            SaveStatus::Installed,
-                            rustel_runtime::session_log::STOP_SOURCE,
-                            None,
-                            Some("stop"),
-                        );
-                    }
+                if let Some(said) = said {
+                    self.status = said;
                 }
-                self.status = if cutting {
-                    "stopping now".into()
-                } else {
-                    format!(
-                        "stopping - letting the tail ring out ({} again cuts it)",
-                        self.keybinds.hint(BindAction::Stop)
-                    )
-                };
             }
         }
         Ok(())

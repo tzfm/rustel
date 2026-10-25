@@ -189,6 +189,24 @@ pub(crate) struct ReturnedInsert(pub *mut dyn crate::insert::OrbitInsert);
 unsafe impl Send for InsertInstall {}
 unsafe impl Send for ReturnedInsert {}
 
+/// A copy the producer asks the callback to give back, by its slot and its
+/// key. A release holds no box.
+#[derive(Clone, Copy)]
+pub(crate) struct InsertRelease {
+    pub slot: crate::insert::InsertSlot,
+    pub key: crate::insert::InsertKey,
+}
+
+/// The plugin workers of an output on their way to the callback: one count
+/// of their `Arc`, from `Arc::into_raw`. The device keeps its own count, so
+/// the callback never drops the last one.
+#[derive(Clone, Copy)]
+pub(crate) struct PoolInstall(pub *const crate::pool::PoolShared);
+
+// SAFETY: the count crosses the SPSC ring once, and one side owns it at a
+// time. The pool is `Send` and `Sync`.
+unsafe impl Send for PoolInstall {}
+
 const KABEL_RETIRING: usize = 1 << (usize::BITS - 1);
 
 /// Keeps prepared graph programs alive until a scheduling window has been
@@ -278,6 +296,9 @@ pub(crate) struct SampleChannel {
     pub fx_reverb_returns: AssetRing<ReturnedFxReverb>,
     pub insert_installs: AssetRing<InsertInstall>,
     pub insert_returns: AssetRing<ReturnedInsert>,
+    pub insert_releases: AssetRing<InsertRelease>,
+    /// One place: the device ships its plugin workers to each backend once.
+    pub pool_installs: AssetRing<PoolInstall>,
     /// Stage reverbs refused by the install queue or callback byte budget.
     pub fx_reverb_refusals: AtomicU64,
     pub insert_refusals: AtomicU64,
@@ -321,6 +342,8 @@ impl SampleChannel {
             // A place for each slot: one turn ships each insert of a start.
             insert_installs: AssetRing::with_capacity(crate::insert::INSERT_SLOTS),
             insert_returns: AssetRing::with_capacity(crate::insert::INSERT_SLOTS),
+            insert_releases: AssetRing::with_capacity(crate::insert::INSERT_SLOTS),
+            pool_installs: AssetRing::with_capacity(1),
             fx_reverb_refusals: AtomicU64::new(0),
             insert_refusals: AtomicU64::new(0),
             kabel_installs: AssetRing::new(),
@@ -440,6 +463,11 @@ impl Drop for SampleChannel {
         while let Some(install) = self.insert_installs.pop() {
             // SAFETY: never reached the consumer. Unique ownership here.
             drop(unsafe { Box::from_raw(install.insert) });
+        }
+        while let Some(install) = self.pool_installs.pop() {
+            // SAFETY: the count never reached the consumer, and this side
+            // owns it.
+            drop(unsafe { std::sync::Arc::from_raw(install.0) });
         }
     }
 }
@@ -751,6 +779,10 @@ mod tests {
         channel.fx_reverb_returns.push(stage).ok().expect("push");
         let insert = ReturnedInsert(boxed_insert());
         channel.insert_returns.push(insert).ok().expect("push");
+        // The plugin workers of the output wait in their one place.
+        let pool = std::sync::Arc::new(crate::pool::PoolShared::new(1, true).expect("a pool"));
+        let install = PoolInstall(std::sync::Arc::into_raw(std::sync::Arc::clone(&pool)));
+        channel.pool_installs.push(install).ok().expect("push");
         channel
             .kabel_installs
             .push(KabelInstall {
@@ -776,5 +808,6 @@ mod tests {
             .ok()
             .expect("push");
         drop(channel); // must not leak (miri/asan would flag)
+        assert_eq!(std::sync::Arc::strong_count(&pool), 1);
     }
 }

@@ -26,8 +26,14 @@ struct SetupState<'js> {
     /// prototype method, the raw `_name` method, and the scope entry.
     /// Emptied once the surface has been given back.
     displaced: rquickjs::Object<'js>,
+    /// The names the engine shipped, so their replacement can be said in
+    /// the log once.
     #[qjs(skip_trace)]
     sealed: Rc<RefCell<HashSet<String>>>,
+    /// The built-in names whose replacement this realm has reported, so an
+    /// update loop that re-registers says each one only once.
+    #[qjs(skip_trace)]
+    notified: RefCell<HashSet<String>>,
 }
 
 /// Where the score realm keeps what a `register()` displaced, so the next
@@ -73,6 +79,52 @@ fn remember_displaced<'js>(
     before.set(DISPLACED_SCOPED, scope.get::<_, rquickjs::Value>(name)?)?;
     displaced.set(name, before)?;
     Ok(())
+}
+
+/// A score may take any name the engine shipped; the surface the next score
+/// gets back returns the built-in. Say each replacement once per name, so a
+/// pasted prebake that does not know rustel ships the same recipe learns it
+/// without the log filling on every update.
+fn notice_builtin_replacement<'js>(
+    ctx: &Ctx<'js>,
+    state: &rquickjs::Class<'js, SetupState<'js>>,
+    name: &str,
+) {
+    let first = {
+        let state = state.borrow();
+        if !state.sealed.borrow().contains(name) {
+            return;
+        }
+        state.notified.borrow_mut().insert(name.to_owned())
+    };
+    if !first {
+        return;
+    }
+    let origin = reference_origin(name);
+    let note = if origin.is_empty() {
+        format!(
+            "register('{name}') replaces the built-in '{name}'. remove the call to get it back."
+        )
+    } else {
+        format!(
+            "register('{name}') replaces the built-in '{name}' ({origin}). remove the call to get it back."
+        )
+    };
+    if let Ok(logger) = ctx.globals().get::<_, rquickjs::Function<'js>>("logger") {
+        let _ = logger.call::<_, rquickjs::Value>((note, "warn"));
+    }
+}
+
+/// The reference label of the collection a built-in name comes from, when it
+/// has one.
+fn reference_origin(name: &str) -> &'static str {
+    #[cfg(feature = "extensions")]
+    let mut entries = crate::install::reference_entries().chain(rustel_ext::reference_entries());
+    #[cfg(not(feature = "extensions"))]
+    let mut entries = crate::install::reference_entries();
+    entries
+        .find(|entry| entry.name == name || entry.synonyms.contains(&name))
+        .map_or("", |entry| entry.origin)
 }
 
 fn displaced_state<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Option<rquickjs::Array<'js>>> {
@@ -898,15 +950,8 @@ fn register_one<'js>(
     let publish = mode == RegistrationMode::Public;
     let install_method = mode != RegistrationMode::RawOnly;
     let publish_raw = publish || mode != RegistrationMode::Public;
-    if publish && state.borrow().sealed.borrow().contains(&name) {
-        return Err(rquickjs::Exception::throw_message(
-            ctx,
-            &format!(
-                "register('{name}') would replace the existing built-in '{name}'. Pick a different name."
-            ),
-        ));
-    }
     if publish {
+        notice_builtin_replacement(ctx, state, &name);
         remember_displaced(ctx, state, &name)?;
     }
     let length: rquickjs::Value = options.function.get("length")?;
@@ -1126,6 +1171,7 @@ pub(super) fn install<'js>(
             string_parser: common::undefined(ctx),
             displaced,
             sealed: sealed.clone(),
+            notified: RefCell::new(HashSet::new()),
         },
     )
     .map_err(|error| error.to_string())?;

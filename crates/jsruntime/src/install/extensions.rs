@@ -41,6 +41,7 @@ fn read_pattern_state<'js>(
 fn call_pattern_callable<'js>(
     ctx: Ctx<'js>,
     declaration: rustel_ext::PatternCallable,
+    cycle_time: &Cell<f64>,
     args: &[rquickjs::Value<'js>],
     receiver: Option<(rustel_core::Pattern, Sidecar<'js>)>,
 ) -> rquickjs::Result<rquickjs::Class<'js, NativePatternWrapper<'js>>> {
@@ -77,6 +78,9 @@ fn call_pattern_callable<'js>(
                 .set(extension_state_property(key), wrapper)?;
             rustel_core::silence()
         }
+        rustel_ext::PatternCallableBehavior::ReadCycle(call) => {
+            call(cycle_time.get(), &patterns, receiver_pattern)
+        }
     };
     derive_wrapper(ctx, pattern, &sidecars)
 }
@@ -85,15 +89,17 @@ fn install_pattern_callable<'js>(
     ctx: &Ctx<'js>,
     proto: &rquickjs::Object<'js>,
     globals: &rquickjs::Object<'js>,
+    cycle_time: &Rc<Cell<f64>>,
     declaration: rustel_ext::PatternCallable,
 ) -> Result<(), String> {
     for name in declaration.names {
         if declaration.surface.global {
             let call = declaration;
+            let cycle_time = cycle_time.clone();
             let function = Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'js>, args: Rest<rquickjs::Value<'js>>| {
-                    call_pattern_callable(ctx, call, &args.0, None)
+                    call_pattern_callable(ctx, call, &cycle_time, &args.0, None)
                 },
             )
             .map_err(|error| error.to_string())?;
@@ -106,6 +112,7 @@ fn install_pattern_callable<'js>(
 
         if declaration.surface.method {
             let call = declaration;
+            let cycle_time = cycle_time.clone();
             let function = Function::new(
                 ctx.clone(),
                 hr_this_rest(move |ctx, this, args| {
@@ -113,7 +120,7 @@ fn install_pattern_callable<'js>(
                         let borrowed = this.0.borrow();
                         (borrowed.pattern.clone(), Sidecar::of(&borrowed))
                     };
-                    call_pattern_callable(ctx, call, &args.0, Some(receiver))
+                    call_pattern_callable(ctx, call, &cycle_time, &args.0, Some(receiver))
                 }),
             )
             .map_err(|error| error.to_string())?;
@@ -159,13 +166,14 @@ fn install_value_callable<'js>(
 }
 
 pub(super) fn install<'js>(
+    runtime: &JsRuntime,
     ctx: &Ctx<'js>,
     proto: &rquickjs::Object<'js>,
     globals: &rquickjs::Object<'js>,
 ) -> Result<(), String> {
     initialize_pattern_states(ctx)?;
     for declaration in rustel_ext::pattern_callables() {
-        install_pattern_callable(ctx, proto, globals, *declaration)?;
+        install_pattern_callable(ctx, proto, globals, &runtime.cycle_time, *declaration)?;
     }
     for declaration in rustel_ext::value_callables() {
         install_value_callable(ctx, globals, *declaration)?;

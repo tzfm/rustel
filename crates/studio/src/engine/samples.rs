@@ -847,7 +847,10 @@ impl StudioEngine {
     /// a tab, the score in play, an armed launch or a held edit. A plugin
     /// call keeps its plugin by a part of the name too. Another string
     /// keeps a plugin by its whole name only: see
-    /// [`rustel_runtime::vst::whole_names`].
+    /// [`rustel_runtime::vst::whole_names`]. Each chain of the score keeps
+    /// its plugins too, also after a Stop: see
+    /// [`rustel_runtime::Session::plugin_names`]. So a plugin from a setup
+    /// text, an import or a name the score computes stays loaded.
     /// The host keeps each plugin with a running copy, so an unload waits
     /// for the output of its score to close. A stop parks the output with
     /// the copies of its score. The sweep closes a parked output that holds
@@ -878,6 +881,7 @@ impl StudioEngine {
         }
         // Another string keeps a plugin by its whole name only.
         keep.extend(rustel_runtime::vst::whole_names(&strings));
+        keep.extend(self.session.plugin_names());
         // The close sends the copies to the plugin thread before the unload.
         // Piano mode, a key that rings out or a score tail keeps the output
         // open. Its copies keep their plugins loaded.
@@ -1892,6 +1896,8 @@ mod tests {
             preview: false,
             followed: Vec::new(),
             waited: false,
+            #[cfg(feature = "vst")]
+            prepared: true,
         });
         assert!(
             protected_afresh(&mut engine).contains(&SampleId(74)),

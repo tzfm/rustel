@@ -39,6 +39,12 @@ pub(super) enum Pointer {
     /// the press keeps the pointer, so a drag that wanders keeps driving
     /// it, the way the master's does.
     MixerPanelFader,
+    /// A press on the knobs column. On a rail, the rail it landed on - its
+    /// row and its cells - follows the pointer anywhere on the screen, the
+    /// way the desk's faders do. On a name it drags nothing.
+    Knobs {
+        rail: Option<(usize, Rect)>,
+    },
     /// Dragging the samples tab's preview-volume row.
     PreviewVolume,
     #[cfg(feature = "hydra")]
@@ -345,10 +351,12 @@ impl App {
             return Ok(true);
         }
         // Below every sheet: the set panel, docked or as a sheet,
-        // the mixer's desk and the visuals panel.
+        // the mixer's desk, the breakdown, the knobs column and the
+        // visuals panel.
         if self.click_set_panel(x, y)
             || self.click_mixer_panel(x, y)
             || self.click_memory_dock(x, y)
+            || self.press_knobs(self.regions.knobs, x, y)
             || self.click_viz_panel(x, y)
         {
             return Ok(true);
@@ -383,7 +391,7 @@ impl App {
         }
         if within(self.regions.scenes, x, y) {
             if let Some(index) = self.scene_chip_at(x, y) {
-                self.click_scene_chip(index);
+                self.select_scene(index);
             }
             return Ok(true);
         }
@@ -470,6 +478,12 @@ impl App {
             }
             Some(Pointer::MixerPanelFader) => {
                 self.drag_mixer_panel_fader(y);
+                true
+            }
+            Some(Pointer::Knobs { rail }) => {
+                if let Some((at, rail)) = rail {
+                    self.drag_knob(at, rail, x);
+                }
                 true
             }
             Some(Pointer::MixerFader {
@@ -566,6 +580,14 @@ impl App {
             self.follow_pointer_shape(x, y);
             return true;
         }
+        if let Some(Pointer::Knobs {
+            rail: Some((at, rail)),
+        }) = released
+        {
+            self.drag_knob(at, rail, x);
+            self.follow_pointer_shape(x, y);
+            return true;
+        }
         self.follow_pointer_shape(x, y);
         #[cfg(feature = "hydra")]
         if matches!(released, Some(Pointer::GeneratorControl { .. })) {
@@ -591,10 +613,11 @@ impl App {
             return true;
         }
         // Letting go of the master volume, the minimap, the pane's
-        // scrollbar, a panel, the preview volume, a desk fader, a prompt's
-        // field or a reference or desk selection needs nothing more. Only
-        // the score's own gesture goes on to the score's editor: it never
-        // saw these presses, so their release is not its to finish.
+        // scrollbar, a panel, the preview volume, a desk fader, a knob's
+        // rail, a prompt's field or a reference or desk selection needs
+        // nothing more. Only the score's own gesture goes on to the
+        // score's editor: it never saw these presses, so their release
+        // is not its to finish.
         matches!(
             released,
             Some(
@@ -604,6 +627,7 @@ impl App {
                     | Pointer::Panel
                     | Pointer::PreviewVolume
                     | Pointer::MixerPanelFader
+                    | Pointer::Knobs { .. }
                     | Pointer::PromptField
                     | Pointer::ReferenceText { .. }
                     | Pointer::MixerText { .. }
@@ -651,6 +675,7 @@ impl App {
             || self.scroll_set_panel(x, y, direction)
             || self.memory_dock_at(x, y)
             || self.scroll_viz_panel(x, y, direction)
+            || self.wheel_knobs_over(x, y, direction)
         {
             return true;
         }
@@ -1750,6 +1775,60 @@ mod tests {
             press(&mut app, chip.x + 1, chip.y);
             assert!(app.log_panel.is_some());
             assert_eq!(app.focus, Focus::Panel(PanelKind::Log));
+        }
+
+        /// A mouse drag still selects in Vim Normal. The mode does not
+        /// change under the hand, and the next operator uses the band.
+        #[test]
+        fn a_mouse_selection_enters_visual_and_d_uses_it() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            type_text(&mut app, "hello world");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.focus = Focus::Editor;
+            app.editor_mut().set_wrap(false);
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+                .expect("test terminal");
+            let mut draw = |app: &mut App| {
+                terminal
+                    .draw(|frame| app.paint_into(frame, Instant::now()).expect("frame paints"))
+                    .expect("draw");
+            };
+            draw(&mut app);
+            let score = app.focused_map().expect("the score is drawn").area();
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                score.x + 2,
+                score.y,
+            );
+            mouse(
+                &mut app,
+                MouseEventKind::Drag(MouseButton::Left),
+                score.x + 6,
+                score.y,
+            );
+            mouse(
+                &mut app,
+                MouseEventKind::Up(MouseButton::Left),
+                score.x + 6,
+                score.y,
+            );
+            assert!(
+                !app.editor().primary_selection().is_empty(),
+                "the mouse still selects"
+            );
+            assert!(
+                app.editor().vim_is_visual(),
+                "the released selection enters Visual"
+            );
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+            assert_ne!(
+                app.editor().source().trim_end(),
+                "hello world",
+                "d used the mouse selection"
+            );
         }
 
         /// A drag in a prompt's field is the field's alone, down to the release: a

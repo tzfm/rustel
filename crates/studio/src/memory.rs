@@ -179,8 +179,8 @@ impl VisualsMemory {
 /// One plugin of the plugin host, as a row of the breakdown.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PluginMemory {
-    /// The name, then the kind, the state, the running copies and the time
-    /// of the load, as far as the host knows them.
+    /// The name, then the kind, the state, the running copies, the time of
+    /// the load and the latency, as far as the host knows them.
     pub label: String,
     /// The host loaded the plugin. The plugin is in the Studio process, and
     /// its memory is part of the figure.

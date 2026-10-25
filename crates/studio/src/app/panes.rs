@@ -981,7 +981,7 @@ mod tests {
         }
 
         #[test]
-        fn a_click_on_the_other_panes_tab_keeps_the_caret_and_both_panes() {
+        fn a_click_on_the_other_panes_tab_moves_the_caret_there_and_keeps_both_panes() {
             let directory = tempfile::tempdir().unwrap();
             let mut app = navigation_app(directory.path(), 5, true);
             app.regions.scenes = Rect::new(0, 1, 140, 1);
@@ -1003,13 +1003,20 @@ mod tests {
             click(&mut app, 4);
             click(&mut app, 3);
 
+            // The caret is in the right pane. The third scene is in the left.
             click(&mut app, 2);
-            assert_eq!(app.focused, 1);
+            assert_eq!(app.focused, 0, "the caret went to the pane that has it");
+            assert_eq!(app.scenes.current().id, ids[2]);
             assert_eq!(
                 app.panes.iter().map(|pane| pane.scene).collect::<Vec<_>>(),
-                [ids[2], ids[3]]
+                [ids[2], ids[3]],
+                "and neither pane changed its scene"
             );
-            assert!(app.status.contains("left pane"), "{}", app.status);
+
+            // And back, by the tab of the right pane.
+            click(&mut app, 3);
+            assert_eq!(app.focused, 1);
+            assert_eq!(app.scenes.current().id, ids[3]);
         }
 
         #[test]

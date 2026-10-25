@@ -108,11 +108,17 @@ impl LiveScalarDevice {
             kabel_cache: std::sync::Mutex::new(Vec::with_capacity(crate::MAX_KABEL_GRAPHS)),
             program_cache: std::sync::Mutex::new(Vec::new()),
             insert_cache: std::sync::Mutex::new(Vec::with_capacity(
-                crate::insert::INSERT_SLOTS * 2,
+                crate::insert::INSERT_SLOTS * 3,
             )),
             insert_waiting: std::sync::Mutex::new(Vec::with_capacity(crate::insert::INSERT_SLOTS)),
+            insert_released: std::sync::Mutex::new(Vec::with_capacity(
+                crate::insert::INSERT_SLOTS * 3,
+            )),
             insert_provider: std::sync::Mutex::new(None),
             insert_names: std::sync::Mutex::new(None),
+            insert_values: std::sync::Mutex::new(None),
+            plugin_pool: std::sync::Mutex::new(None),
+            plugin_pool_shipped: AtomicBool::new(false),
             shared,
             sample_rate: facts.sample_rate_hz(),
             channels: facts.channels(),
@@ -283,6 +289,14 @@ impl Drop for LiveScalarDevice {
         // Finish the output owner before publishing retirement to any
         // producer endpoint retained beyond this device's lifetime.
         self.stream = None;
+        // No callback runs now, so no job is out. The plugin workers end
+        // here, on the producer.
+        drop(
+            self.plugin_pool
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
         self.shared.confirmations.retire_after_join();
     }
 }
@@ -764,6 +778,16 @@ impl LiveScalarDevice {
             // SAFETY: the old callback joined. This unconsumed box has one owner.
             drop(unsafe { Box::from_raw(install.insert) });
         }
+        // A release names a copy of the old backend. It holds no box.
+        while self.shared.samples.insert_releases.pop().is_some() {}
+        // The plugin workers stay. The next turn ships them to the new
+        // backend.
+        for install in self.shared.samples.pool_installs.drain_available() {
+            // SAFETY: the old callback joined. This count of the `Arc` has
+            // one owner.
+            drop(unsafe { Arc::from_raw(install.0) });
+        }
+        *self.plugin_pool_shipped.get_mut() = false;
         self.reclaim_assets();
         self.clear_reverb_caches();
         // No output remains if replacement preparation or startup fails.
@@ -1406,10 +1430,10 @@ fn prepare_finite_inserts(
                 .iter()
                 .map(|controls| (crate::instrument_slot(chain), controls))
                 .chain(event.controls.effects.iter().enumerate().filter_map(
-                    |(stage, controls)| {
-                        controls
-                            .as_ref()
-                            .map(|controls| (crate::effect_slot(chain, stage), controls))
+                    |(place, controls)| {
+                        controls.as_ref().map(|controls| {
+                            (crate::effect_slot(chain, controls.stage(place)), controls)
+                        })
                     },
                 ));
         for (slot, controls) in slots {
@@ -1950,12 +1974,23 @@ where
     // the closure drops with the stream.
     #[cfg(windows)]
     let mut pro_audio = CallbackProAudio(None);
+    // On Linux the callback takes the class of the plugin workers at its
+    // first call after a worker got it, and gives it back when the closure
+    // drops with the stream.
+    #[cfg(target_os = "linux")]
+    let mut real_time = CallbackRealTime::new(buffer_frames, sample_rate);
+    // cpal reports no underruns for a WASAPI output, so the callback counts
+    // them from the playback clock.
+    #[cfg(windows)]
+    let mut underruns = PlaybackUnderruns::new(buffer_frames, sample_rate);
     device
         .build_output_stream(
             config,
             move |output: &mut [T], info| {
                 #[cfg(windows)]
                 pro_audio.attach_once();
+                #[cfg(target_os = "linux")]
+                real_time.promote_once(&shared.plugin_real_time);
                 gate.render_or_silence(output, |output| {
                     let playback = info.timestamp().playback;
                     let origin = *playback_origin.get_or_insert(playback);
@@ -1974,6 +2009,13 @@ where
                     shared
                         .buffer_playback_nanos
                         .store(elapsed_nanos, Ordering::Release);
+                    #[cfg(windows)]
+                    underruns.observe(
+                        elapsed_nanos,
+                        latency_nanos,
+                        output.len() / channels,
+                        &shared,
+                    );
                     shared
                         .playback_latency_nanos
                         .store(latency_nanos, Ordering::Release);
@@ -2136,7 +2178,10 @@ mod tests {
         };
         let mut event = OnsetEvent::new(0, 440.0, 1.0, 0.1);
         event.controls.instrument = Some(crate::InsertControls::new(key).with_score(7));
-        event.controls.effects[0] = Some(crate::InsertControls::new(key));
+        // The first effect goes to the slot of its stage, 2.
+        let mut effect = crate::InsertControls::new(key);
+        effect.set_stage(2);
+        event.controls.effects[0] = Some(effect);
         let mut backend = ScalarBackend::new();
         backend.init(48_000).unwrap();
         assert!(matches!(
@@ -2156,7 +2201,7 @@ mod tests {
             Some(key)
         );
         assert_eq!(
-            backend.orbit_insert_key(crate::effect_slot(event.controls.insert_chain(), 0)),
+            backend.orbit_insert_key(crate::effect_slot(event.controls.insert_chain(), 2)),
             Some(key)
         );
         event.controls.instrument = Some(crate::InsertControls::new(crate::InsertKey {
@@ -2764,7 +2809,8 @@ mod tests {
 
         /// A resumed output keeps the inserts of its chains. Each chain is
         /// silent until its next note. When an insert keeps a tail through
-        /// its reset, the next note moves the level up from 0.
+        /// its reset, the next note moves the level up from 0. The chains
+        /// run on plugin workers.
         #[cfg(feature = "test-support")]
         #[test]
         fn a_resumed_output_silences_a_kept_tail_until_the_next_note() {
@@ -2786,8 +2832,12 @@ mod tests {
                         (*left, *right) = (self.1, self.1);
                     }
                 }
+                fn any_thread(&self) -> bool {
+                    true
+                }
             }
             let _tripwire_guard = tripwire_assertion_guard();
+            crate::set_plugin_pool_for_test(Some(2));
             let key = crate::insert::InsertKey {
                 plugin: 1,
                 preset: 0,
@@ -2891,8 +2941,286 @@ mod tests {
                             .holds_insert(crate::insert::instrument_slot(1), instrument_key)
                     );
                 }
-                assert_eq!(manual.device().report().callback_scope_misses, 0);
+                let report = manual.device().report();
+                assert_eq!(report.callback_scope_misses, 0);
+                assert_eq!(report.plugin_workers, 2);
             }
+            crate::set_plugin_pool_for_test(None);
+        }
+
+        /// Passes its input on after the work `spin` asks for its next
+        /// block, the work `steady` asks for each block and the time off the
+        /// CPU `pause` asks for, in microseconds. It runs on any thread, and
+        /// counts its blocks on a plugin worker in `away`.
+        #[cfg(feature = "test-support")]
+        struct Spinning {
+            key: crate::insert::InsertKey,
+            spin: Arc<AtomicU64>,
+            steady: Arc<AtomicU64>,
+            pause: Arc<AtomicU64>,
+            away: Arc<AtomicU64>,
+        }
+
+        #[cfg(feature = "test-support")]
+        impl crate::insert::OrbitInsert for Spinning {
+            fn key(&self) -> crate::insert::InsertKey {
+                self.key
+            }
+            fn set_param(&mut self, _: crate::insert::InsertParam, _: u32) {}
+            fn process(&mut self, _: &mut [f32], _: &mut [f32]) {
+                let spin = self.spin.swap(0, Ordering::SeqCst) + self.steady.load(Ordering::SeqCst);
+                let spin = Duration::from_micros(spin);
+                let start = Instant::now();
+                while start.elapsed() < spin {
+                    std::hint::spin_loop();
+                }
+                let pause = Duration::from_micros(self.pause.swap(0, Ordering::SeqCst));
+                if !pause.is_zero() {
+                    std::thread::sleep(pause);
+                }
+                if crate::pool::on_plugin_worker() {
+                    self.away.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            fn any_thread(&self) -> bool {
+                true
+            }
+        }
+
+        /// Builds a [`Spinning`] copy for each key, with `spin`, `steady`,
+        /// `pause` and `away`.
+        #[cfg(feature = "test-support")]
+        fn spinning(
+            spin: &Arc<AtomicU64>,
+            steady: &Arc<AtomicU64>,
+            pause: &Arc<AtomicU64>,
+            away: &Arc<AtomicU64>,
+        ) -> Arc<crate::insert::InsertProvider> {
+            let (spin, steady) = (Arc::clone(spin), Arc::clone(steady));
+            let (pause, away) = (Arc::clone(pause), Arc::clone(away));
+            Arc::new(move |key, _, _| {
+                Some(Box::new(Spinning {
+                    key,
+                    spin: Arc::clone(&spin),
+                    steady: Arc::clone(&steady),
+                    pause: Arc::clone(&pause),
+                    away: Arc::clone(&away),
+                }))
+            })
+        }
+
+        /// The plugin workers run above half load. A light set posts no
+        /// job, also one that spends 13% of each sub-block. After a
+        /// sub-block, a buffer past 80% of its time so far opens the gate for
+        /// its next sub-block. A buffer past 80% keeps the gate open for the
+        /// next buffer. The buffer that takes the workers opens it only at
+        /// its end. The average opens the gate past half load. The gate
+        /// closes when the average falls below 35%, and a stop leaves it as
+        /// it was.
+        #[cfg(feature = "test-support")]
+        #[test]
+        fn a_light_set_posts_no_job_and_a_heavy_buffer_turns_the_pool_on() {
+            let _tripwire_guard = tripwire_assertion_guard();
+            // At 8 kHz a sub-block of 128 frames lasts 16 ms, so a light set
+            // stays far below each threshold, also after its first sub-block.
+            let mut manual = ManualLiveOutput::new(8_000, 7).expect("manual output");
+            // Workers with the real gate. Only a worker runs the job of the
+            // chain.
+            let pool = crate::pool::PluginPool::start_test_pool(2, false).expect("a pool");
+            let shared = Arc::clone(pool.shared());
+            for bus in 0..crate::insert::MAX_INSERT_BUSES {
+                shared.claim_before_join(crate::pool::JobKind::Effect, bus);
+            }
+            *manual.device().plugin_pool.lock().unwrap() = Some(pool);
+            let (spin, away) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+            let steady = Arc::new(AtomicU64::new(0));
+            manual
+                .device()
+                .set_insert_provider(spinning(&spin, &steady, &Arc::default(), &away));
+            let mut tone = resume_tone(0);
+            tone.controls.effects[0] = Some(crate::insert::InsertControls::new(Default::default()));
+            LiveReverbBatch::install_inserts(manual.device(), std::slice::from_ref(&tone));
+            assert!(manual.device().push(tone));
+            // A buffer of 2048 frames has 16 sub-blocks and a period of
+            // 256 ms. A render gives the jobs a worker ran in it.
+            let mut output = vec![0.0f32; 2048 * 2];
+            let mut render = |manual: &mut ManualLiveOutput| {
+                manual.render(&mut output);
+                away.swap(0, Ordering::SeqCst)
+            };
+            // The buffer that takes the workers posts no job, also at 90%:
+            // the callback has its class from the next buffer on. Its end
+            // opens the gate for the next buffer.
+            spin.store(230_400, Ordering::SeqCst);
+            assert_eq!(render(&mut manual), 0);
+            assert!(shared.gate_is_open());
+            assert_eq!(render(&mut manual), 16, "each sub-block posts its job");
+            assert!(!shared.gate_is_open());
+            for _ in 0..8 {
+                assert_eq!(render(&mut manual), 0, "a light set posted a job");
+            }
+            // A steady set spends 2 ms of each sub-block of 16 ms. It stays
+            // near 13% of its time so far and posts no job. Against the time
+            // of one sub-block, it passes 80% by its seventh sub-block.
+            steady.store(2_000, Ordering::SeqCst);
+            assert_eq!(render(&mut manual), 0, "a steady set at 13% posted a job");
+            assert!(!shared.gate_is_open());
+            steady.store(0, Ordering::SeqCst);
+            // A start of 14 ms passes 80% of its first sub-block of 16 ms.
+            // It is about 5% of the buffer. It pools from its second
+            // sub-block, and the gate closes at the end of the buffer.
+            spin.store(14_000, Ordering::SeqCst);
+            assert_eq!(render(&mut manual), 15);
+            assert!(!shared.gate_is_open());
+            assert_eq!(render(&mut manual), 0);
+            // A heavy start pools from its second sub-block, and the buffer
+            // at 90% keeps the gate open for the next buffer.
+            spin.store(230_400, Ordering::SeqCst);
+            assert_eq!(render(&mut manual), 15);
+            assert!(shared.gate_is_open());
+            assert_eq!(render(&mut manual), 16);
+            assert!(!shared.gate_is_open());
+            assert_eq!(render(&mut manual), 0);
+            // The stop ramp and the stopped buffers leave the gate as it was:
+            // closed, also after a heavy ramp, or open.
+            for open in [false, true] {
+                spin.store(230_400, Ordering::SeqCst);
+                if open {
+                    assert_eq!(render(&mut manual), 15);
+                }
+                manual.device().stop();
+                for _ in 0..4 {
+                    render(&mut manual);
+                }
+                assert_eq!(spin.load(Ordering::SeqCst), 0, "no heavy block ran");
+                assert!(manual.device().report().stop_acknowledged);
+                assert_eq!(shared.gate_is_open(), open);
+                manual.device().resume();
+            }
+            assert!(render(&mut manual) > 0, "the resume posted no job");
+            assert!(!shared.gate_is_open());
+            // The load meter gives the time of the jobs.
+            let load = manual.device().report().realtime_load;
+            assert!(load.worker_busy_nanos > 0 && load.join_wait_nanos > 0);
+
+            // The average opens the gate past half load, with no buffer past
+            // 80%, and closes it below 35%.
+            let period = 2048 * 1_000_000_000 / 8_000;
+            let mut end_buffer = |percent: u64| {
+                manual.backend.end_pool_buffer(2048, period * percent / 100);
+                shared.gate_is_open()
+            };
+            for _ in 0..64 {
+                assert!(!end_buffer(0));
+            }
+            // At 70% the average is 1750, 3062, 4046, 4784, then 5338.
+            for _ in 0..4 {
+                assert!(!end_buffer(70));
+            }
+            assert!(end_buffer(70));
+            for _ in 0..16 {
+                assert!(end_buffer(40));
+            }
+            assert!(!end_buffer(0));
+            for _ in 0..16 {
+                assert!(!end_buffer(40));
+            }
+            // One buffer past 80% opens the gate, with an average of 2125.
+            for _ in 0..64 {
+                assert!(!end_buffer(0));
+            }
+            assert!(end_buffer(85));
+            assert!(!end_buffer(0));
+        }
+
+        /// A stopped output posts no job, and its plugin workers park. A
+        /// resumed output posts jobs again. The report counts the jobs the
+        /// callback ran and the late ones.
+        #[cfg(feature = "test-support")]
+        #[test]
+        fn a_stopped_output_parks_its_plugin_workers() {
+            let _tripwire_guard = tripwire_assertion_guard();
+            crate::set_plugin_pool_for_test(Some(2));
+            let mut manual = ManualLiveOutput::new(48_000, 7).expect("manual output");
+            let (spin, away) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+            let pause = Arc::new(AtomicU64::new(0));
+            manual
+                .device()
+                .set_insert_provider(spinning(&spin, &Arc::default(), &pause, &away));
+            let mut tone = resume_tone(0);
+            tone.controls.effects[0] = Some(crate::insert::InsertControls::new(Default::default()));
+            LiveReverbBatch::install_inserts(manual.device(), std::slice::from_ref(&tone));
+            let shared = Arc::clone(
+                manual
+                    .device()
+                    .plugin_pool
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .expect("plugin workers")
+                    .shared(),
+            );
+            assert!(manual.device().push(tone));
+            let mut output = [0.0f32; 256 * 2];
+            // With no claim by a worker, the callback runs the job of each
+            // sub-block.
+            shared.hold_claims(true);
+            manual.render(&mut output);
+            assert_eq!(manual.device().report().plugin_jobs_inline, 2);
+            shared.hold_claims(false);
+            // From here only a worker runs the job of the chain.
+            for bus in 0..crate::insert::MAX_INSERT_BUSES {
+                shared.claim_before_join(crate::pool::JobKind::Effect, bus);
+            }
+            for _ in 0..4 {
+                manual.render(&mut output);
+            }
+            assert!(
+                away.load(Ordering::SeqCst) > 0,
+                "the chain ran on no worker"
+            );
+            manual.device().stop();
+            for _ in 0..3 {
+                manual.render(&mut output);
+            }
+            assert!(manual.device().report().stop_acknowledged);
+            let stopped = away.load(Ordering::SeqCst);
+            for _ in 0..20 {
+                manual.render(&mut output);
+            }
+            assert_eq!(
+                away.load(Ordering::SeqCst),
+                stopped,
+                "a stopped block posted a job"
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while shared.parked_workers() < 2 {
+                assert!(
+                    Instant::now() < deadline,
+                    "a worker of a stopped output did not park"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            manual.device().resume();
+            manual.render(&mut output);
+            assert!(
+                away.load(Ordering::SeqCst) > stopped,
+                "the resume posted no job"
+            );
+            // A job of 2 ms of work the callback waits for is not late: the
+            // plugin needs that time.
+            spin.store(2_000, Ordering::SeqCst);
+            manual.render(&mut output);
+            assert_eq!(manual.device().report().plugin_late_jobs, 0);
+            // A job of 3 ms off the CPU the callback waits for is late.
+            pause.store(3_000, Ordering::SeqCst);
+            manual.render(&mut output);
+            let report = manual.device().report();
+            assert_eq!(report.plugin_late_jobs, 1);
+            assert_eq!(report.plugin_workers, 2);
+            assert_eq!(report.plugin_jobs_inline, 2);
+            assert!(report.plugin_join_wait_nanos >= 2_000_000);
+            crate::set_plugin_pool_for_test(None);
         }
 
         /// A stop fades an orbit routed to another output pair with the main
@@ -4550,6 +4878,17 @@ mod tests {
         fn live_environment_controls_use_the_product_namespace() {
             assert_eq!(MAX_LIVE_LATENCY_ENV, "RUSTEL_MAX_LIVE_LATENCY_MS");
             assert_eq!(LIVE_BUFFER_FRAMES_ENV, "RUSTEL_LIVE_BUFFER_FRAMES");
+            assert_eq!(PLUGIN_THREADS_ENV, "RUSTEL_PLUGIN_THREADS");
+            // The options set the plugin workers before the environment,
+            // and the cores of the process set them last.
+            let plugin_threads = super::super::inserts::plugin_threads;
+            let cores = crate::pool::plugin_workers();
+            assert_eq!(plugin_threads(Some(3), Some("5")), 3);
+            assert_eq!(plugin_threads(Some(0), None), 0);
+            assert_eq!(plugin_threads(None, Some("5")), 5);
+            assert_eq!(plugin_threads(None, Some("0")), 0);
+            assert_eq!(plugin_threads(None, Some("five")), cores);
+            assert_eq!(plugin_threads(None, None), cores);
         }
 
         #[test]

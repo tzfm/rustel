@@ -511,6 +511,11 @@ impl Studio {
         &self.app.status
     }
 
+    /// Clear the status bar so a test can wait for the next notice.
+    pub fn clear_status(&mut self) {
+        self.app.status.clear();
+    }
+
     /// The focused pane's source, exactly as stored.
     pub fn source(&self) -> String {
         self.app.editor().source()
@@ -689,6 +694,13 @@ impl Studio {
     /// moves.
     pub fn master_gain_db(&self) -> f32 {
         self.app.master.gain_db()
+    }
+
+    /// The loudest master sample since the last read, the meter's own
+    /// reading. A test pumps in a wall-clock loop and takes the worst of
+    /// these, the way the meter does across turns.
+    pub fn master_peak(&mut self) -> f32 {
+        self.app.worker.master().take_levels().peak
     }
 
     /// Replace the focused scene's whole score - the way a paste of a

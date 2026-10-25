@@ -2,8 +2,9 @@
 //!
 //! Score evaluation and replacement live in `session/evaluation.rs`; finite
 //! playback and offline rendering live in `session/playback.rs`. The wait of
-//! a live edit for its plugin copies lives in `session/plugin_wait.rs`. This
-//! module owns the shared state and live scheduling.
+//! a live edit for its plugin copies, and the look at the plugin copies of
+//! the cycles ahead, live in `session/plugin_wait.rs`. This module owns the
+//! shared state. Live scheduling lives in `session/scheduling.rs`.
 
 mod assets;
 mod diagnostics;
@@ -117,9 +118,11 @@ const LIVE_REPLACEMENT_QUERY_COMPUTE_SHARE: f64 = 0.75;
 /// Immediate replacements keep the old generation audible for at least this
 /// long while the accepted candidate fills its first scheduling runway. A
 /// measured-heavy candidate grows from this floor with its bounded one-cycle
-/// query budget; see [`Session::live_replacement_takeover_headroom`].
+/// query budget; see [`Session::live_replacement_takeover_headroom`]. A
+/// quantised launch keeps this floor past its clock read too, so a host
+/// that fires a launch before its line counts it in its head-room.
 #[cfg(any(feature = "device-audio", test))]
-const LIVE_REPLACEMENT_MIN_HEADROOM: Duration = Duration::from_millis(80);
+pub const LIVE_REPLACEMENT_MIN_HEADROOM: Duration = Duration::from_millis(80);
 /// Smallest elapsed-time slice offered to a live impure scheduler query.
 /// Smaller tokens are dominated by ordinary scheduling jitter, so a steady
 /// producer that cannot afford this much fails closed before entering JS.
@@ -298,7 +301,9 @@ pub(crate) struct LiveAudioBatch {
     /// prefill. An empty transfer from an unchanged full horizon cannot.
     pub(crate) prefill_progress: bool,
     /// Starts immediately after Scheduler accepted the tick, before draining,
-    /// JSON/audio conversion, generation handoff, or ring transfer.
+    /// JSON/audio conversion, generation handoff, or ring transfer. A look
+    /// at the plugin copies ahead in the turn moves it later by the time of
+    /// the look.
     pub(crate) tail_started: Instant,
 }
 
@@ -426,6 +431,8 @@ struct AudibleSource {
     csound: crate::CsoundSnapshot,
     cps: f64,
     cycle_zero_time: f64,
+    /// The cycle that `getTime()` returned while this source evaluated.
+    evaluated_cycle: f64,
 }
 
 /// Settings a Session is built with; [`Session::with_config`] validates them.
@@ -784,10 +791,23 @@ pub struct Session {
     /// session asks for a copy at this rate.
     #[cfg(feature = "vst")]
     plugin_rate: std::sync::atomic::AtomicU32,
+    /// An evaluation of this session ran a plugin call: see
+    /// [`Self::ran_plugin_calls`].
+    #[cfg(feature = "vst")]
+    ran_plugin_calls: bool,
+    /// The plugin names of the plugin calls of the last evaluation that ran
+    /// one, until a look at the plugin copies starts their load: see
+    /// [`Self::load_ran_plugins`].
+    #[cfg(feature = "vst")]
+    plugins_to_load: Vec<String>,
     /// The plugin chains of the scores of this session. The names source
-    /// of the live output reads the same chains.
+    /// and the values source of the live output read the same chains.
     #[cfg(feature = "vst")]
     chains: Arc<std::sync::Mutex<crate::vst::Chains>>,
+    /// The flag of [`Self::chains`] that is true while a slider of the score
+    /// in play links a parameter value: see [`Self::set_slider_value`].
+    #[cfg(feature = "vst")]
+    slider_links: Arc<AtomicBool>,
     /// The lanes of the scores of this session, each with the number its
     /// plugin notes carry.
     #[cfg(feature = "vst")]
@@ -795,9 +815,14 @@ pub struct Session {
     /// The last look of [`Self::plugins_pending`]: its time, the generation
     /// of the score, and the count.
     #[cfg(feature = "vst")]
-    plugin_look: std::cell::Cell<Option<(Instant, u64, usize)>>,
+    plugin_look: Option<(Instant, u64, usize)>,
+    /// The looks at the cycles ahead of the score in play, for the plugin
+    /// copies of their notes: see `Session::look_ahead_for_plugins`.
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    plugin_ahead: plugin_wait::PluginAhead,
     /// The edit that waits for its plugin copies, while the score in play
-    /// plays on: see [`Self::reload_live`].
+    /// plays on: see [`Self::reload_live`]. Or the launch whose arm
+    /// prepared its copies: see [`Self::prepare_reload`].
     #[cfg(all(feature = "vst", feature = "device-audio"))]
     plugin_hold: Option<plugin_wait::PluginHold>,
     /// An edit waits for its plugin copies: see [`Self::set_plugin_wait`].
@@ -908,6 +933,17 @@ pub struct Session {
     /// The next live reload plays its score from the score's own cycle
     /// zero, instead of joining the cycle already running.
     next_from_zero: bool,
+    /// The cycle of the newest scheduling window, with the transport's stop
+    /// count when it ran. A stop or a restart ends that timeline, so a later
+    /// evaluation does not read its cycle.
+    newest_window: Option<(f64, u64)>,
+    /// The cycle that `getTime()` returned while the newest score evaluated.
+    #[cfg(feature = "device-audio")]
+    evaluated_cycle: f64,
+    /// The cycle that `getTime()` returned while the installed score
+    /// evaluated. A rollback evaluates that score again with it.
+    #[cfg(feature = "device-audio")]
+    installed_cycle: f64,
     last_path: EvaluateSource,
     /// The default sample banks. `None` until enabled;
     /// resolution then falls back to the bundled `bd` alone.
@@ -1060,6 +1096,10 @@ impl Session {
         let transport = Arc::new(Transport::default());
         let scheduler = Scheduler::new(transport.clone(), config.cps, config.horizon);
         let csound = crate::csound::State::new(config.score_import_access.csound_allowed());
+        #[cfg(feature = "vst")]
+        let chains = Arc::new(std::sync::Mutex::new(crate::vst::Chains::new()));
+        #[cfg(feature = "vst")]
+        let slider_links = crate::vst::slider_links(&chains);
         Ok(Self {
             js,
             panic_guard_active: false,
@@ -1098,11 +1138,19 @@ impl Session {
             #[cfg(feature = "vst")]
             plugin_rate: std::sync::atomic::AtomicU32::new(0),
             #[cfg(feature = "vst")]
-            chains: Arc::new(std::sync::Mutex::new(crate::vst::Chains::new())),
+            ran_plugin_calls: false,
+            #[cfg(feature = "vst")]
+            plugins_to_load: Vec::new(),
+            #[cfg(feature = "vst")]
+            chains,
+            #[cfg(feature = "vst")]
+            slider_links,
             #[cfg(feature = "vst")]
             lanes: crate::vst::LaneTable::default(),
             #[cfg(feature = "vst")]
-            plugin_look: std::cell::Cell::new(None),
+            plugin_look: None,
+            #[cfg(all(feature = "vst", feature = "device-audio"))]
+            plugin_ahead: plugin_wait::PluginAhead::default(),
             #[cfg(all(feature = "vst", feature = "device-audio"))]
             plugin_hold: None,
             #[cfg(all(feature = "vst", feature = "device-audio"))]
@@ -1139,6 +1187,11 @@ impl Session {
             requeried_generation: None,
             takeover_override: None,
             next_from_zero: false,
+            newest_window: None,
+            #[cfg(feature = "device-audio")]
+            evaluated_cycle: 0.0,
+            #[cfg(feature = "device-audio")]
+            installed_cycle: 0.0,
             last_path: EvaluateSource::Pattern,
             last_play_iterations: 0,
             samples: None,
@@ -1247,20 +1300,34 @@ impl Session {
                 .store(device.sample_rate(), std::sync::atomic::Ordering::Relaxed);
             self.plugins_live
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            crate::vst::attach(device, &self.chains);
         }
         device.set_insert_provider(self.csound.provider(false));
         let csound = self.csound.clone();
         #[cfg(feature = "vst")]
-        let chains = self.chains.clone();
-        device.set_insert_names(Arc::new(move || {
-            let mut named = csound.named_chains();
+        let plugins = self.chains.clone();
+        device.set_insert_names(Arc::new(move |turn: rustel_audio::InsertTurn| {
+            // Only a plugin copy goes back by a release. A Csound copy is
+            // busy while its worker runs.
             #[cfg(feature = "vst")]
-            named.extend(crate::vst::named_chains(&chains));
-            named.sort_unstable();
-            named.dedup();
-            named
+            let mut chains = crate::vst::named_chains(&plugins, turn);
+            #[cfg(not(feature = "vst"))]
+            let mut chains = {
+                let _ = turn;
+                rustel_audio::InsertChains::default()
+            };
+            chains.named.extend(csound.named_chains());
+            chains.named.sort_unstable();
+            chains.named.dedup();
+            chains
         }));
+        // The output gives each copy the values the sliders of the score
+        // move: see `Self::set_slider_value`.
+        #[cfg(feature = "vst")]
+        {
+            let chains = self.chains.clone();
+            let values = move |room| crate::vst::take_slider_values(&chains, room);
+            device.set_insert_values(Arc::new(values));
+        }
     }
 
     /// Gives the plugins the sample rate of the live output after a reopen
@@ -1278,9 +1345,63 @@ impl Session {
         self.plugins_live.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Converts a note of this session for a live output: see
-    /// [`crate::render::live_audio_event`]. The note takes the number of
-    /// its plugin chain from the chains of this session.
+    /// True when an evaluation of this session ran a plugin call. A plugin
+    /// name in a comment, or in a branch that does not run, is not a call.
+    #[cfg(feature = "vst")]
+    pub fn ran_plugin_calls(&self) -> bool {
+        self.ran_plugin_calls
+    }
+
+    /// The plugin names of the chains of the score in play and of the text
+    /// the session plans, as the notes write them, each one time. A chain in
+    /// its grace does not count: its lane left the text, or the lane lost
+    /// the instrument or each plugin of the chain. A Stop ends no chain, so
+    /// the names stay while the transport is stopped. A caller that unloads
+    /// the plugins no score uses keeps these plugins: also a plugin from a
+    /// setup text, an import or a name the score computes. Empty for a
+    /// session with no live output: see [`Self::attach_plugins`].
+    #[cfg(feature = "vst")]
+    pub fn plugin_names(&self) -> Vec<String> {
+        if !self.plugins_live() {
+            return Vec::new();
+        }
+        crate::vst::plugin_names(&self.chains)
+    }
+
+    /// Keeps the plugin name of each plugin call an evaluation ran. `names`
+    /// are the plugin names of those calls. The next look at the plugin
+    /// copies loads these plugins: see [`Self::load_ran_plugins`]. A plugin
+    /// call of the evaluation stays known, also in a session with no live
+    /// output: see [`Self::ran_plugin_calls`].
+    #[cfg(feature = "vst")]
+    fn keep_ran_plugins(&mut self, names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        self.ran_plugin_calls = true;
+        names.clone_into(&mut self.plugins_to_load);
+    }
+
+    /// Starts the load of the plugins the last evaluation ran, with no wait.
+    /// A look at the plugin copies calls it after it asks the host for its
+    /// copies. The plugin thread does one job at a time, so these loads come
+    /// after the copies of the lanes that play. The load still starts before
+    /// the first note of the plugin asks, also for a lane that does not play
+    /// now. A name the host does not know while it reads the plugin folders
+    /// waits for the next look: see [`crate::vst::load`]. Only a session
+    /// with plugins on a live output loads a plugin: see
+    /// [`Self::attach_plugins`].
+    #[cfg(feature = "vst")]
+    fn load_ran_plugins(&mut self) {
+        if self.plugins_live() && !self.plugins_to_load.is_empty() {
+            crate::vst::load(&mut self.plugins_to_load);
+        }
+    }
+
+    /// Converts a note of this session for a live output, with no plugin
+    /// chain: see [`crate::render::live_audio_event`]. A live window gives
+    /// the notes the voice took their chains after the conversion: see
+    /// [`Self::chain_live_events`].
     fn live_audio_event(
         &self,
         onset: &OnsetEventJson,
@@ -1292,24 +1413,47 @@ impl Session {
             samples,
             state: &self.csound,
         };
-        let event = crate::render::live_audio_event(onset, sample_rate, cps, &lookup, |value| {
-            #[cfg(feature = "vst")]
-            if let ValueJson::Raw(value) = value {
-                return crate::vst::live_chain(&self.chains, value);
-            }
-            #[cfg(not(feature = "vst"))]
-            let _ = value;
-            None
-        })?;
-        self.csound.record_chain(&event.controls);
-        Ok(event)
+        crate::render::live_audio_event(onset, sample_rate, cps, &lookup, |_| None)
     }
 
-    /// Plugin calls named in a candidate source. Evaluated haps supply the
-    /// chain identity used to prepare each plugin copy.
+    /// Gives each event of a live window the plugin chain of its note, in
+    /// one assignment for the window: see [`crate::vst::assign`]. `values`
+    /// are the notes of `events`, in the same order. A note with no room
+    /// for its chain plays with no plugin. With plugins on a live output,
+    /// a slider that is the value of a plugin key of a note links to the
+    /// parameter of its copy: see [`crate::vst::link_sliders`].
     #[cfg(feature = "vst")]
-    pub fn plugin_calls_for_source(&self, source: &str) -> Vec<crate::lint::NamedPlugin> {
-        crate::lint::live_plugins(source)
+    pub(crate) fn chain_live_events(
+        &self,
+        events: &mut [rustel_audio::AudioEvent],
+        values: &[&ValueJson],
+    ) {
+        let live = self.plugins_live();
+        let notes = values.iter().copied();
+        let chains = crate::vst::assign(&self.chains, &self.lanes, &self.csound, notes, live);
+        for ((event, chain), value) in events.iter_mut().zip(chains).zip(values) {
+            chain.apply(&mut event.controls, &mut event.gain);
+            if live && let ValueJson::Raw(value) = value {
+                let param_of =
+                    |name: &str, key: &str| crate::vst::started()?.loaded(name)?.param(key);
+                crate::vst::link_sliders(&self.chains, value, &event.controls, param_of);
+            }
+        }
+    }
+
+    /// The plugin chains of this session, for the tests of the chains.
+    #[cfg(all(test, feature = "vst"))]
+    pub(crate) fn chains_for_test(&self) -> &std::sync::Mutex<crate::vst::Chains> {
+        &self.chains
+    }
+
+    /// The Csound chains of this session take the chain of each Csound note
+    /// of a live window, after the plugin chains: see
+    /// [`Self::chain_live_events`].
+    fn record_csound_chains(&self, events: &[rustel_audio::AudioEvent]) {
+        for event in events {
+            self.csound.record_chain(&event.controls);
+        }
     }
 
     pub fn generation(&self) -> u64 {
@@ -1387,9 +1531,23 @@ mod tests {
         let note = values.find(|value| value.get("vst").or(value.get("vsti")).is_some());
         note.expect("plugin note")
     }
+    /// The chain of the first plugin note of the first cycle, as a window of
+    /// the live output gives it.
     #[cfg(feature = "vst")]
     pub(super) fn plugin_chain(session: &Session) -> u64 {
-        crate::vst::live_chain(&session.chains, &plugin_note(session)).expect("plugin chain")
+        let note = ValueJson::Raw(plugin_note(session));
+        let live = session.plugins_live();
+        let chains = crate::vst::assign(
+            &session.chains,
+            &session.lanes,
+            &session.csound,
+            [&note],
+            live,
+        );
+        match chains[..] {
+            [crate::vst::NoteChain::Seat(seat)] => seat.chain,
+            _ => panic!("plugin chain"),
+        }
     }
     /// The fixture plugin in a new folder, as the only plugin folder of the
     /// process: no test reads the plugins or the presets of the machine. A

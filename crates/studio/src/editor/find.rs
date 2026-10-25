@@ -96,7 +96,7 @@ impl Editor {
     /// The non-Vim footer label. Vim reports the prompt through
     /// `vim_label`, beside the mode, and keeps its `/` or `?`.
     pub(crate) fn find_footer_label(&self) -> Option<String> {
-        if self.vim_enabled() || !self.find.open {
+        if self.uses_modal_keys() || !self.find.open {
             return None;
         }
         let mut label = if self.find.pattern.is_empty() {
@@ -222,7 +222,7 @@ impl Editor {
         let pattern = if self.find.pattern.is_empty() {
             // Only Vim's empty `/` repeats the last search. The find bar
             // does not drag an earlier Vim pattern into a fresh search.
-            if self.vim_enabled() {
+            if self.uses_modal_keys() {
                 self.find.last_pattern.clone().unwrap_or_default()
             } else {
                 String::new()
@@ -317,7 +317,7 @@ impl Editor {
         if end <= start {
             return Err(FindError::NoMatch);
         }
-        let selection = if self.vim_enabled() {
+        let selection = if self.uses_modal_keys() {
             Selection::caret(start)
         } else {
             Selection::range(end, start)

@@ -446,6 +446,7 @@ impl App {
             }
             if row < super::super::settings::KEYBIND_ACTION_START
                 || row == super::super::settings::VIM_MAPPINGS_PATH_ROW
+                || row == super::super::settings::LIST_NAVIGATION_ROW
             {
                 self.keybind_learn = None;
                 self.handle_settings_key(KeyCode::Enter, false, false);
@@ -698,6 +699,8 @@ impl App {
                 let syntax_check_changed = settings.syntax_check != self.ui_settings.syntax_check;
                 let auto_evaluate_changed =
                     settings.auto_evaluate != self.ui_settings.auto_evaluate;
+                let external_changes_changed =
+                    settings.external_changes != self.ui_settings.external_changes;
                 // A set with a limiter of its own keeps it, so the row can
                 // change the default and this set go on sounding the same.
                 // That is the design, but it is not obvious from the sheet,
@@ -821,6 +824,19 @@ impl App {
                         "auto evaluate on - a paused edit applies itself while the set plays"
                     } else {
                         "auto evaluate off - update applies the score"
+                    }
+                    .into();
+                } else if external_changes_changed {
+                    self.status = match self.ui_settings.external_changes {
+                        ExternalChanges::Off => {
+                            "external watch off - the file is read when the score opens"
+                        }
+                        ExternalChanges::Sync => {
+                            "external watch sync - a save elsewhere replaces the text"
+                        }
+                        ExternalChanges::SyncAndEvaluate => {
+                            "external watch sync & eval - a save elsewhere replaces the text and plays"
+                        }
                     }
                     .into();
                 } else if webcam_confirmed {
@@ -1037,6 +1053,14 @@ impl App {
                 return true;
             }
             #[cfg(feature = "vst")]
+            SettingsAction::AddPresetFolder => {
+                self.settings_sheet = Some(sheet);
+                self.open_set_prompt(SetPrompt::AddPresetFolder);
+                #[cfg(feature = "hydra")]
+                self.sync_settings_webcam_preview();
+                return true;
+            }
+            #[cfg(feature = "vst")]
             SettingsAction::RemoveVstFolder(at) => {
                 self.remove_vst_folder(at);
                 // The list is one row shorter, and the cursor stays on a row.
@@ -1047,9 +1071,37 @@ impl App {
                 sheet.selected = sheet.selected.min(rows - 1);
             }
             #[cfg(feature = "vst")]
+            SettingsAction::RemovePresetFolder(at) => {
+                self.remove_preset_folder(at);
+                self.count_vst_folders(&mut sheet);
+                let rows = super::super::settings::VST_CONTROL_COUNT
+                    + sheet.vst_folder_count
+                    + sheet.vst_standard_count
+                    + sheet.vst_preset_folder_count;
+                sheet.selected = sheet.selected.min(rows - 1);
+            }
+            #[cfg(feature = "vst")]
             SettingsAction::ScanVst => self.scan_vst(),
             #[cfg(feature = "vst")]
             SettingsAction::RescanVst => self.rescan_vst(),
+            #[cfg(feature = "vst")]
+            SettingsAction::ToggleAudioThread(at) => {
+                // The row the cursor holds is its place among the plugins
+                // the filter kept; the switch belongs to the plugin.
+                if let Some(at) = self.vst_plugin_at(at) {
+                    self.toggle_audio_thread(at);
+                }
+            }
+            #[cfg(feature = "vst")]
+            SettingsAction::ToggleVstPresets(at) => self.toggle_vst_presets(&mut sheet, at),
+            #[cfg(feature = "vst")]
+            SettingsAction::JumpVst(letter) => self.jump_vst_plugin(&mut sheet, letter),
+            #[cfg(feature = "vst")]
+            SettingsAction::FilterVst(code) => {
+                let filter = std::mem::take(&mut self.vst_filter);
+                self.vst_filter = filter.typed(code);
+                self.mirror_vst_rows(&mut sheet);
+            }
         }
         // The keybind learn belongs to the Keybinds page: Tabbed away
         // from it - or closed by any door the sheet has - the learn goes
@@ -1388,6 +1440,19 @@ impl App {
                 },
             ),
         )
+        .chain(
+            (self.ui_settings.editor_keybindings == crate::editor::EditorKeybindings::Vim).then(
+                || super::super::settings::KeybindRow {
+                    action: "Vim list keys",
+                    chord: if self.ui_settings.vim_list_navigation {
+                        "On".into()
+                    } else {
+                        "Off".into()
+                    },
+                    ..Default::default()
+                },
+            ),
+        )
         .collect()
     }
 }
@@ -1657,11 +1722,13 @@ mod tests {
             let webcam_row = (0..64)
                 .find(|selected| {
                     let mut sheet = SettingsSheet::default();
+                    sheet.show_page(crate::settings::SettingsPage::Appearance);
                     sheet.selected = *selected;
                     sheet.webcam_row_selected()
                 })
                 .expect("webcam row");
             let mut sheet = SettingsSheet::default();
+            sheet.show_page(crate::settings::SettingsPage::Appearance);
             sheet.selected = webcam_row;
             app.settings_sheet = Some(sheet);
             app.focus = Focus::Panel(PanelKind::Settings);
@@ -1699,16 +1766,16 @@ mod tests {
                 crate::settings::SettingsSheetView::geometry(app.frame).expect("settings geometry");
             app.handle_mouse(MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: panel.x + 14,
+                column: panel.x + 25,
                 row: panel.y,
                 modifiers: KeyModifiers::NONE,
             })
-            .expect("advanced tab click");
+            .expect("sliders tab click");
             assert!(!policy.webcam_status().requested);
 
             // Esc/shortcut close cannot leave a hidden preview worker requested.
             if let Some(sheet) = app.settings_sheet.as_mut() {
-                sheet.show_page(crate::settings::SettingsPage::Settings);
+                sheet.show_page(crate::settings::SettingsPage::Appearance);
                 sheet.select(webcam_row);
                 sheet.webcam_preview = true;
             }
@@ -1720,6 +1787,7 @@ mod tests {
             // Resizing below the sheet's minimum width revokes immediately;
             // the logical panel may remain open, but it is no longer visible.
             let mut sheet = SettingsSheet::default();
+            sheet.show_page(crate::settings::SettingsPage::Appearance);
             sheet.select(webcam_row);
             sheet.webcam_preview = true;
             app.settings_sheet = Some(sheet);
@@ -1753,11 +1821,13 @@ mod tests {
             let webcam_row = (0..64)
                 .find(|selected| {
                     let mut sheet = SettingsSheet::default();
+                    sheet.show_page(crate::settings::SettingsPage::Appearance);
                     sheet.selected = *selected;
                     sheet.webcam_row_selected()
                 })
                 .expect("webcam row");
             let mut sheet = SettingsSheet::default();
+            sheet.show_page(crate::settings::SettingsPage::Appearance);
             sheet.selected = webcam_row;
             app.settings_sheet = Some(sheet);
             app.focus = Focus::Panel(PanelKind::Settings);
@@ -1822,11 +1892,13 @@ mod tests {
             let webcam_row = (0..64)
                 .find(|selected| {
                     let mut sheet = SettingsSheet::default();
+                    sheet.show_page(crate::settings::SettingsPage::Appearance);
                     sheet.selected = *selected;
                     sheet.webcam_row_selected()
                 })
                 .expect("webcam row");
             let mut sheet = SettingsSheet::default();
+            sheet.show_page(crate::settings::SettingsPage::Appearance);
             sheet.selected = webcam_row;
             app.settings_sheet = Some(sheet);
             app.focus = Focus::Panel(PanelKind::Settings);
@@ -1893,11 +1965,13 @@ mod tests {
             let webcam_row = (0..64)
                 .find(|selected| {
                     let mut sheet = SettingsSheet::default();
+                    sheet.show_page(crate::settings::SettingsPage::Appearance);
                     sheet.selected = *selected;
                     sheet.webcam_row_selected()
                 })
                 .expect("webcam row");
             let mut sheet = SettingsSheet::default();
+            sheet.show_page(crate::settings::SettingsPage::Appearance);
             sheet.selected = webcam_row + 2;
             app.settings_sheet = Some(sheet);
             app.focus = Focus::Panel(PanelKind::Settings);
@@ -1983,18 +2057,20 @@ mod tests {
         }
 
         #[test]
-        fn advanced_polyphony_changes_the_live_bus_and_persists_without_restarting() {
+        fn polyphony_changes_the_live_bus_and_persists_without_restarting() {
             let directory = tempfile::tempdir().unwrap();
             let mut app = app_over(directory.path());
             app.frame = Rect::new(0, 0, 120, 40);
             assert_eq!(app.worker.master().max_polyphony(), 128);
-            let mut sheet = SettingsSheet::default();
-            sheet.show_page(crate::settings::SettingsPage::Advanced);
+            let sheet = SettingsSheet::default();
             app.settings_sheet = Some(sheet);
             app.focus = Focus::Panel(PanelKind::Settings);
-            // Past the load mode and the output buffer.
-            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
-            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            // Down to the machine rows at the page's end, onto max
+            // polyphony: past the set rows, the load mode and the output
+            // buffer.
+            for _ in 0..14 {
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            }
             press(&mut app, KeyCode::Right, KeyModifiers::NONE);
             assert_eq!(app.ui_settings.max_polyphony, 192);
             assert_eq!(app.worker.master().max_polyphony(), 192);
@@ -2011,10 +2087,13 @@ mod tests {
             let mut app = app_over(directory.path());
             app.frame = Rect::new(0, 0, 120, 40);
             assert_eq!(app.worker.master().load_mode(), LoadMode::Wait);
-            let mut sheet = SettingsSheet::default();
-            sheet.show_page(crate::settings::SettingsPage::Advanced);
+            let sheet = SettingsSheet::default();
             app.settings_sheet = Some(sheet);
             app.focus = Focus::Panel(PanelKind::Settings);
+            // Down onto the load mode, the first machine row at the end.
+            for _ in 0..12 {
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            }
             press(&mut app, KeyCode::Right, KeyModifiers::NONE);
             assert_eq!(app.ui_settings.load_mode, LoadMode::Async);
             assert_eq!(app.worker.master().load_mode(), LoadMode::Async);

@@ -113,12 +113,37 @@ impl Session {
         end: Fraction,
         budget: Duration,
     ) -> Result<Vec<Hap>, RuntimeError> {
+        // A panic in this query is a query panic of the score in play.
+        self.panic_is_query.set(true);
+        let haps = self.query_bounded(|cancellation| {
+            self.js.query_cancellable_with_hap_budget(
+                Slot::Active,
+                0,
+                begin,
+                end,
+                budget,
+                self.scheduler.query_hap_budget(),
+                cancellation,
+            )
+        });
+        self.panic_is_query.set(false);
+        haps
+    }
+
+    /// Runs `run`, one query of the active score, under the stop flag of the
+    /// transport and in the panic boundary of a query. The call does not
+    /// mark a panic in `run` as a query panic of the score in play, so a
+    /// panic in a read of a candidate never parks the score in play: see
+    /// [`Self::with_panic_recovery`].
+    pub(super) fn query_bounded(
+        &self,
+        run: impl FnOnce(&AtomicBool) -> Result<Vec<Hap>, rustel_jsruntime::QueryError>,
+    ) -> Result<Vec<Hap>, RuntimeError> {
         if self.panic_poisoned {
             return Err(RuntimeError::Panic(
                 "native score work panicked; Session recovery is unavailable".into(),
             ));
         }
-        self.panic_is_query.set(true);
         // Cancellable: a dense query is long enough for a user to change their
         // mind about, and a JavaScript callback can otherwise prevent the
         // recursive Rust checks from ever regaining control. One caller-owned
@@ -129,24 +154,14 @@ impl Session {
             #[cfg(any(test, feature = "test-support"))]
             self.panic_if_injected(SessionPanicPoint::Query);
             let result = rustel_core::with_cancellation(cancellation, || {
-                self.js
-                    .query_cancellable_with_hap_budget(
-                        Slot::Active,
-                        0,
-                        begin,
-                        end,
-                        budget,
-                        self.scheduler.query_hap_budget(),
-                        cancellation,
-                    )
-                    .map_err(RuntimeError::from)
+                run(cancellation).map_err(RuntimeError::from)
             });
             self.js.raise_caught_native_panic();
             result
         };
         // Inside a recovery boundary a panic rebuilds the Session; a query
         // made outside one, such as `rustel query`, reports it as an error.
-        let result = if recovery::panic_is_contained() {
+        if recovery::panic_is_contained() {
             query()
         } else {
             recovery::catch_score_panic(query).unwrap_or_else(|message| {
@@ -154,9 +169,7 @@ impl Session {
                     "native score work panicked ({message})"
                 )))
             })
-        };
-        self.panic_is_query.set(false);
-        result
+        }
     }
 
     pub fn query_report(

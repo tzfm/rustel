@@ -73,6 +73,10 @@ struct InputDiagnostic {
     failed: bool,
 }
 
+/// How every message about a refused camera ends. The studio recognises a
+/// blocked camera by it, and clears the warning once the request is gone.
+pub const WEBCAM_BLOCKED_HINT: &str = "enable Hydra webcam in Settings";
+
 /// The camera state shown by the Settings sheet.
 ///
 /// This deliberately contains no backend error text, device name or path.
@@ -890,7 +894,7 @@ impl HydraInputs {
         if camera_mask != 0 && !self.policy.webcam_allowed() {
             let _ = self.diagnostics_tx.send(InputDiagnostic {
                 slot: camera_mask.trailing_zeros() as u8,
-                message: "webcam source blocked; enable Hydra webcam in Settings".into(),
+                message: format!("webcam source blocked; {WEBCAM_BLOCKED_HINT}"),
                 failed: true,
             });
         }
@@ -918,7 +922,7 @@ impl HydraInputs {
         if requested && !self.policy.webcam_allowed() {
             let _ = self.diagnostics_tx.send(InputDiagnostic {
                 slot: 0,
-                message: "webcam theme blocked; enable Hydra webcam in Settings".into(),
+                message: format!("webcam theme blocked; {WEBCAM_BLOCKED_HINT}"),
                 failed: true,
             });
         }

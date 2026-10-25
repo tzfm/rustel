@@ -12,7 +12,7 @@ impl App {
         let editor_focused = self.editor_accepts_raw_paste();
         let editor = &self.scenes.current().editor;
         self.keybinds
-            .filter_editor_hints(|key| editor_focused && editor.vim_claims_key(key));
+            .filter_editor_hints(|key| editor_focused && editor.claims_key(key));
     }
 
     /// What this press means to the chord table, as an editor command, for
@@ -144,6 +144,14 @@ impl App {
                 self.toggle_settings_sheet();
                 Ok(true)
             }
+            Do::OpenGlobalPrebake => {
+                self.open_prebake(PrebakeScope::Global);
+                Ok(true)
+            }
+            Do::OpenLocalPrebake => {
+                self.open_prebake(PrebakeScope::Local);
+                Ok(true)
+            }
             Do::Devices => {
                 self.toggle_device_panel();
                 Ok(true)
@@ -198,6 +206,10 @@ impl App {
             }
             Do::Memory => {
                 self.open_log_from_memory();
+                Ok(true)
+            }
+            Do::Knobs => {
+                self.toggle_knobs_panel();
                 Ok(true)
             }
             Do::Export => {
@@ -331,7 +343,7 @@ impl App {
     }
 
     /// The panel action an Alt letter means where the keyboard is now.
-    fn panel_action_at(&self, letter: char) -> Option<BindAction> {
+    pub(super) fn panel_action_at(&self, letter: char) -> Option<BindAction> {
         use PanelKind::{Reference, Set, Settings};
         let score = matches!(self.focus, Focus::Editor | Focus::Timeline);
         let tape = score && self.current_replay().is_some();

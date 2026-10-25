@@ -87,7 +87,11 @@ impl App {
         self.dismiss_dialogs(Some(PanelKind::Theme));
         self.theme_picker = Some(ThemePicker::open(&self.theme));
         self.focus_panel(PanelKind::Theme);
-        self.status = "theme - type to search · ←/→/↑/↓ preview · Enter keep · Esc back".into();
+        self.status = if super::vim::enabled(self) {
+            "theme - j/k browse · i types · Enter keep · Esc back".into()
+        } else {
+            "theme - type to search · ←/→/↑/↓ preview · Enter keep · Esc back".into()
+        };
         self.dirty_frame = true;
     }
 
@@ -1468,9 +1472,8 @@ mod tests {
             app.preview_theme();
             assert_eq!(app.theme.name, before, "Up previews the previous theme");
 
-            // ←/→ do not: they belong to the randomize row, where the list is
-            // infinite in both directions and the arrows are drawn on the row
-            // itself to say so.
+            // ←/→ do not walk the list: they belong to the randomize row
+            // and to the terminal family, where they step between variants.
             press(&mut app, KeyCode::Right, KeyModifiers::NONE);
             assert_eq!(
                 app.theme.name, before,
@@ -1693,6 +1696,7 @@ mod tests {
                 rolled: false,
                 scroll: std::cell::Cell::new(0),
                 hold_scroll: false,
+                vim_insert: false,
             });
             app.focus = Focus::Panel(PanelKind::Theme);
             press(&mut app, KeyCode::Down, KeyModifiers::NONE);
@@ -1743,6 +1747,7 @@ mod tests {
                 rolled: false,
                 scroll: std::cell::Cell::new(0),
                 hold_scroll: false,
+                vim_insert: false,
             });
             let (_, list) = mouse_app
                 .theme_picker
@@ -1790,6 +1795,7 @@ mod tests {
                 rolled: false,
                 scroll: std::cell::Cell::new(0),
                 hold_scroll: false,
+                vim_insert: false,
             });
             app.focus = Focus::Panel(PanelKind::Theme);
             press(&mut app, KeyCode::Down, KeyModifiers::NONE);

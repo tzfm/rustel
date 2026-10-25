@@ -2,16 +2,18 @@
 //!
 //! A plugin calls these through the VST3 interfaces. The parameter queue
 //! and the event list have a fixed size, because the plugin reads them in
-//! the audio callback.
+//! the audio callback or on a plugin worker of the engine.
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::{Class, ComWrapper, Interface};
+
+use crate::instance::CopyState;
 
 /// The parameter values one audio block carries to a plugin.
 pub(crate) const MAX_CHANGES: usize = 32;
@@ -105,8 +107,17 @@ impl IHostApplicationTrait for HostApp {
 }
 
 /// The controller reports edits and restart requests here. There is no
-/// plugin window, so the host has nothing to do with an edit.
-pub(crate) struct Handler;
+/// plugin window, so the host has nothing to do with an edit. A restart
+/// request for a new latency sets the flag in the cell of the copy.
+pub(crate) struct Handler {
+    state: Arc<CopyState>,
+}
+
+impl Handler {
+    pub(crate) fn new(state: Arc<CopyState>) -> ComWrapper<Self> {
+        ComWrapper::new(Self { state })
+    }
+}
 
 impl Class for Handler {
     type Interfaces = (IComponentHandler,);
@@ -125,7 +136,14 @@ impl IComponentHandlerTrait for Handler {
         kResultOk
     }
 
-    unsafe fn restartComponent(&self, _flags: int32) -> tresult {
+    unsafe fn restartComponent(&self, flags: int32) -> tresult {
+        // A plugin calls this from any thread, also from a plugin worker
+        // inside a block. The call takes no lock and makes no allocation.
+        // With the release store, the thread that reads the flag sees each
+        // write the plugin made before the call.
+        if flags & RestartFlags_::kLatencyChanged != 0 {
+            self.state.latency_changed.store(true, Ordering::Release);
+        }
         kResultOk
     }
 }
@@ -402,8 +420,8 @@ pub(crate) struct Queue {
 /// The values one parameter takes in one audio block.
 const MAX_POINTS: usize = 8;
 
-// SAFETY: one thread, the audio thread, writes a queue and then calls the
-// plugin, and the plugin reads the queue only in that call.
+// SAFETY: one thread, the thread that runs the block, writes a queue and
+// then calls the plugin, and the plugin reads the queue only in that call.
 unsafe impl Send for Queue {}
 unsafe impl Sync for Queue {}
 
@@ -420,7 +438,8 @@ impl Queue {
     /// as an earlier one takes its place. A full queue changes its last
     /// value.
     fn push(&self, offset: i32, value: f64) {
-        // SAFETY: only the audio thread writes, and no read runs now.
+        // SAFETY: only the thread that runs the block writes, and no read
+        // runs now.
         let points = unsafe { &mut *self.points.get() };
         let used = self.used.load(Ordering::Relaxed);
         let at = points[..used]
@@ -456,7 +475,8 @@ impl IParamValueQueueTrait for Queue {
         let used = self.used.load(Ordering::Relaxed);
         match usize::try_from(index) {
             Ok(index) if index < used && !offset.is_null() && !value.is_null() => {
-                // SAFETY: the audio thread does not write in a plugin call.
+                // SAFETY: the thread that runs the block does not write in a
+                // plugin call.
                 let point = unsafe { (&*self.points.get())[index] };
                 unsafe {
                     *offset = point.0;
@@ -545,15 +565,15 @@ impl IParameterChangesTrait for Changes {
 pub(crate) const MAX_EVENTS: usize = 256;
 
 /// The note events of one audio block. The list has a fixed size, so a new
-/// event costs no allocation. The audio thread fills the list before the
-/// plugin call and the plugin reads the list in that call.
+/// event costs no allocation. The thread that runs the block fills the list
+/// before the plugin call and the plugin reads the list in that call.
 pub(crate) struct Events {
     events: std::cell::UnsafeCell<[Event; MAX_EVENTS]>,
     used: AtomicUsize,
 }
 
-// SAFETY: one thread, the audio thread, writes the list and then calls the
-// plugin, and the plugin reads the list only in that call.
+// SAFETY: one thread, the thread that runs the block, writes the list and
+// then calls the plugin, and the plugin reads the list only in that call.
 unsafe impl Send for Events {}
 unsafe impl Sync for Events {}
 
@@ -572,7 +592,8 @@ impl Events {
         if used == MAX_EVENTS {
             return false;
         }
-        // SAFETY: only the audio thread writes, and no read runs now.
+        // SAFETY: only the thread that runs the block writes, and no read
+        // runs now.
         unsafe { (&mut *self.events.get())[used] = event };
         self.used.store(used + 1, Ordering::Relaxed);
         true
@@ -587,7 +608,8 @@ impl Events {
     /// and a plugin ends a note by its key.
     pub(crate) fn sort(&self) {
         let used = self.used.load(Ordering::Relaxed);
-        // SAFETY: only the audio thread writes, and no read runs now.
+        // SAFETY: only the thread that runs the block writes, and no read
+        // runs now.
         let events = unsafe { &mut (&mut *self.events.get())[..used] };
         let place = |event: &Event| {
             let start = event.r#type == Event_::EventTypes_::kNoteOnEvent as u16;
@@ -618,7 +640,8 @@ impl IEventListTrait for Events {
         let used = self.used.load(Ordering::Relaxed);
         match usize::try_from(index) {
             Ok(index) if index < used && !event.is_null() => {
-                // SAFETY: the audio thread does not write in a plugin call.
+                // SAFETY: the thread that runs the block does not write in a
+                // plugin call.
                 unsafe { *event = (&*self.events.get())[index] };
                 kResultOk
             }
@@ -628,5 +651,32 @@ impl IEventListTrait for Events {
 
     unsafe fn addEvent(&self, _event: *mut Event) -> tresult {
         kResultFalse
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A restart request for a new latency sets the flag in the cell of the
+    /// copy, also with other requests in the same call. Each other request
+    /// leaves the flag as it is.
+    #[test]
+    fn a_restart_for_a_new_latency_sets_the_flag_of_the_copy() {
+        let state = Arc::new(CopyState::default());
+        let handler: vst3::ComPtr<IComponentHandler> = Handler::new(Arc::clone(&state))
+            .to_com_ptr()
+            .expect("the handler interface");
+        // SAFETY: the pointer holds the handler for the whole test, and the
+        // call reads no pointer.
+        let restart = |flags| unsafe { handler.restartComponent(flags) };
+        let changed = || state.latency_changed.load(Ordering::Acquire);
+        assert_eq!(restart(!RestartFlags_::kLatencyChanged), kResultOk);
+        assert!(!changed());
+        let flags = RestartFlags_::kParamValuesChanged | RestartFlags_::kLatencyChanged;
+        assert_eq!(restart(flags), kResultOk);
+        assert!(changed());
+        assert_eq!(restart(!RestartFlags_::kLatencyChanged), kResultOk);
+        assert!(changed());
     }
 }

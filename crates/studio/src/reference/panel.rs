@@ -172,6 +172,7 @@ impl ReferencePanel {
             selection: None,
             tab: Tab::Reference,
             mode: ReferenceMode::Browse,
+            vim_insert: false,
             query: String::new(),
             results: Vec::new(),
             snippets_last: false,
@@ -304,6 +305,7 @@ impl ReferencePanel {
         if self.tab != tab {
             self.snippet_code_scroll.set(0);
         }
+        self.vim_insert = false;
         self.tab = tab;
     }
 
@@ -314,6 +316,41 @@ impl ReferencePanel {
             .position(|(tab, _)| *tab == self.tab)
             .unwrap_or(0);
         self.select_tab(all[(at + 1) % all.len()].0);
+    }
+
+    /// The word for the half of the open plugin the vst tab lists.
+    #[cfg(feature = "vst")]
+    fn section_said(&self) -> &'static str {
+        match self.vst.section() {
+            VstSection::Params => "the parameters of the plugin",
+            VstSection::Presets => "the presets of the plugin",
+        }
+    }
+
+    /// Tab in the vst tab with a plugin open flips the half of the plugin
+    /// under its row - the parameters or the presets - and says the half it
+    /// shows. With no plugin open, and on every other tab, Tab goes to the
+    /// next tab of the panel as anywhere.
+    #[cfg(feature = "vst")]
+    pub fn tab_key(&mut self) -> Option<&'static str> {
+        if self.tab == Tab::Vst && self.vst.toggle_section() {
+            Some(self.section_said())
+        } else {
+            self.toggle_tab();
+            None
+        }
+    }
+
+    /// BackTab: the halves of a plugin are two, so the flip is the same one,
+    /// and every other tab goes to the tab before.
+    #[cfg(feature = "vst")]
+    pub fn back_tab_key(&mut self) -> Option<&'static str> {
+        if self.tab == Tab::Vst && self.vst.toggle_section() {
+            Some(self.section_said())
+        } else {
+            self.previous_tab();
+            None
+        }
     }
 
     pub(crate) fn refresh(&mut self, reference: &Reference) {
@@ -444,6 +481,8 @@ impl ReferencePanel {
         } else {
             match self.tab {
                 Tab::Samples => &self.sound_query,
+                Tab::Chords => &self.chord_query,
+                Tab::Scales => &self.scale_query,
                 #[cfg(feature = "vst")]
                 Tab::Vst => self.vst.query(),
                 _ => &self.query,
@@ -454,6 +493,16 @@ impl ReferencePanel {
             inner.x + (column as u16).min(inner.width.saturating_sub(1)),
             inner.y + 1,
         ))
+    }
+
+    /// Whether the search box is in Vim Insert mode.
+    pub(crate) fn vim_insert(&self) -> bool {
+        self.vim_insert
+    }
+
+    /// Enter or leave Vim Insert mode for the search box.
+    pub(crate) fn set_vim_insert(&mut self, insert: bool) {
+        self.vim_insert = insert;
     }
 
     /// Whether this view has a search box, and so a use for letters.

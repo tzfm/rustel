@@ -13,6 +13,7 @@ travel with any binary built from this tree.
 Every package here is compatible with AGPL-3.0-or-later, but each carries
 a condition a release must satisfy:
 
+- **audio_thread_priority 0.38.0** - MPL-2.0 - https://github.com/mozilla/audio_thread_priority
 - **mp3lame-encoder 0.2.4** - LGPL-3.0 - https://github.com/DoumanAsh/mp3lame-encoder
 - **mp3lame-sys 0.1.11** - LGPL-3.0 - https://github.com/DoumanAsh/mp3lame-sys
 - **opuscule 0.2.1** - MPL-2.0 - https://codeberg.org/jojo-laplace/opuscule
@@ -33,9 +34,10 @@ a condition a release must satisfy:
 - **MPL-2.0**: §3.3 permits distributing a Larger Work under a Secondary
   License, and §1.12 names AGPL-3.0 as one - provided the covered files do
   not carry the Exhibit B "Incompatible With Secondary Licenses" notice.
-  Verified 2026-08-20 for `opuscule` and the `symphonia` crates and
-  2026-08-26 for `serialport`: no source file carries it (the only matches
-  are the boilerplate licence text itself). Their own file-level MPL terms continue to apply to those files.
+  Verified 2026-08-20 for `opuscule` and the `symphonia` crates,
+  2026-08-26 for `serialport` and 2026-10-19 for `audio_thread_priority`:
+  no source file carries it (the only matches are the boilerplate licence
+  text itself). Their own file-level MPL terms continue to apply to those files.
 
 ## Scope of this file
 
@@ -198,7 +200,7 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | 18 | Unicode-3.0 |
 | 17 | Zlib OR Apache-2.0 OR MIT |
 | 10 | Apache-2.0/MIT |
-| 9 | MPL-2.0 |
+| 10 | MPL-2.0 |
 | 6 | ISC |
 | 6 | Unlicense OR MIT |
 | 5 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
@@ -255,6 +257,7 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | `ash` | 0.38.0+1.3.281 | MIT OR Apache-2.0 |
 | `async-trait` | 0.1.92 | MIT OR Apache-2.0 |
 | `atomic` | 0.6.1 | Apache-2.0/MIT |
+| `audio_thread_priority` | 0.38.0 | MPL-2.0 |
 | `autocfg` | 1.5.1 | Apache-2.0 OR MIT |
 | `autotools` | 0.2.7 | MIT |
 | `base64` | 0.22.1 | MIT OR Apache-2.0 |

@@ -2049,6 +2049,8 @@ mod tests {
                     theme: &theme,
                     keybinds: &keybinds,
                     focused: true,
+                    vim: false,
+                    anchored: false,
                     pulse: None,
                     sounding_note: None,
                     picture: false,
@@ -2716,6 +2718,80 @@ mod tests {
             assert!(app.preview_gain > start, "the plus key still raises it");
         }
 
+        /// Alt+A says whether walking the browser's lists of things to hear
+        /// plays each row the cursor lands on, and the answer is kept for
+        /// the next session.
+        #[test]
+        fn alt_a_previews_each_row_you_walk_and_is_remembered() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.reference_panel = Some(crate::reference::ReferencePanel::browse(&app.reference));
+            app.reference_panel
+                .as_mut()
+                .expect("the browse list")
+                .select_tab(crate::reference::Tab::Chords);
+            app.focus = Focus::Panel(PanelKind::Reference);
+
+            // Off to start: the cursor walks quietly.
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            assert!(app.preview_armed.is_none(), "nothing was previewed");
+            // Alt+A turns it on, and the choice is kept.
+            press(&mut app, KeyCode::Char('a'), KeyModifiers::ALT);
+            assert!(app.ui_settings.auto_preview);
+            assert_eq!(app.prefs.auto_preview, Some(true));
+            assert!(app.status.contains("auto-play on"), "{}", app.status);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            assert!(app.status.contains("C7"), "{}", app.status);
+            // Alt+A again: the choice turns off, and is kept turned off.
+            press(&mut app, KeyCode::Char('a'), KeyModifiers::ALT);
+            assert!(!app.ui_settings.auto_preview);
+            assert_eq!(app.prefs.auto_preview, Some(false));
+        }
+
+        /// A terminal that composes Option chords into text sends å for
+        /// Option+A. The recovery answers on every tab that auditions, and
+        /// leaves the character to the search box everywhere else.
+        #[test]
+        fn an_option_composed_alt_a_answers_on_every_tab_that_auditions() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.keybinds.set_reach(crate::keybinds::Reach {
+                enhanced: false,
+                terminal: "iTerm2".into(),
+            });
+            app.reference_panel = Some(crate::reference::ReferencePanel::browse(&app.reference));
+            app.reference_panel
+                .as_mut()
+                .expect("the browse list")
+                .select_tab(crate::reference::Tab::Chords);
+            app.focus = Focus::Panel(PanelKind::Reference);
+
+            press(&mut app, KeyCode::Char('å'), KeyModifiers::NONE);
+            assert!(app.ui_settings.auto_preview, "{}", app.status);
+            assert!(
+                app.reference_panel
+                    .as_ref()
+                    .expect("the browse list")
+                    .chord_query
+                    .is_empty(),
+                "the character did not type into the search"
+            );
+
+            app.reference_panel
+                .as_mut()
+                .expect("the browse list")
+                .select_tab(crate::reference::Tab::Reference);
+            press(&mut app, KeyCode::Char('å'), KeyModifiers::NONE);
+            assert!(
+                app.ui_settings.auto_preview,
+                "a tab with nothing to preview kept the character for its text"
+            );
+            assert_eq!(
+                app.reference_panel.as_ref().expect("the browse list").query,
+                "å"
+            );
+        }
+
         /// A scale is a thing to hear: → and Space play it, one note after
         /// another.
         #[test]
@@ -2819,11 +2895,19 @@ mod tests {
             );
             assert!(app.status.contains("again cuts it"));
 
-            // Do not wait for a worker snapshot: two rapid real shortcut presses
-            // still mean graceful, then immediate.
+            // With the transport at rest the audition was the only voice,
+            // and the first press stopped it: a second press has nothing
+            // left to cut, so the word that already said the stop stands.
+            // The graceful-then-immediate pair belongs to the transport,
+            // whose tail a second press really does cut.
             app.handle_editor_effect(EditorEffect::Stop)
                 .expect("second stop");
-            assert_eq!(app.status, "stopping now");
+            assert!(
+                app.status
+                    .starts_with("stopping - letting the tail ring out"),
+                "nothing sounds, so the standing word stays: {}",
+                app.status
+            );
             // Those two are the whole of what the browser draws the bar from -
             // the shape and the clock that started it - so with neither there
             // is no progress left to draw however long the clock runs.

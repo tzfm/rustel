@@ -5,7 +5,7 @@
 
 use ratatui::layout::Rect;
 
-use super::super::{set_panel, viz_panel};
+use super::super::{knobs_panel, set_panel, viz_panel};
 
 /// Narrowest source pane that still gets a minimap.
 const MINIMAP_MIN_EDITOR_WIDTH: u16 = 64;
@@ -109,6 +109,10 @@ pub struct StudioRegions {
     /// True when the reference sits over the rightmost pane rather than
     /// beside it, because the terminal is too narrow for both.
     pub reference_overlays: bool,
+    /// The knobs column, a rail for each numeric parameter of the call at
+    /// the caret, when it is open and the panes keep their least. Empty in
+    /// zen, where the column refuses to open.
+    pub knobs: Rect,
     /// The notice rows, the status line and, while the footer setting is
     /// on, the meter, orbits and device chips. Empty in zen.
     pub footer: Rect,
@@ -122,15 +126,18 @@ impl StudioRegions {
 }
 
 /// Which of the ordinary chrome rows the layout should carve: the menu bar,
-/// the header, the footer's meter and chip row. Zen hides all of them
-/// regardless of the other three, which are the player's lasting display
-/// preferences - leaving zen restores exactly these, not the factory
-/// defaults.
+/// the header, the beat line under it, the footer's meter and chip row.
+/// Zen hides all of them regardless of the other four, which are the
+/// player's lasting display preferences - leaving zen restores exactly
+/// these, not the factory defaults.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChromeLayout {
     pub zen: bool,
     pub menu: bool,
     pub header: bool,
+    /// The beat line's own row under the header, which the header's
+    /// setting gates: no header, nothing for the line to sit under.
+    pub beat_line: bool,
     pub footer: bool,
 }
 
@@ -141,6 +148,7 @@ impl ChromeLayout {
             zen,
             menu: true,
             header: true,
+            beat_line: false,
             footer: true,
         }
     }
@@ -150,6 +158,7 @@ impl ChromeLayout {
             zen: settings.zen,
             menu: settings.show_menu,
             header: settings.show_header,
+            beat_line: settings.beat_line != super::super::settings::BeatLineStyle::Off,
             footer: settings.show_footer,
         }
     }
@@ -310,6 +319,7 @@ pub fn regions_with(
         mixer,
         log,
         None,
+        false,
         0,
         false,
     )
@@ -337,6 +347,7 @@ pub fn regions_with_footer(
     mixer: Option<viz_panel::Dock>,
     log: Option<viz_panel::Dock>,
     memory: Option<viz_panel::Dock>,
+    knobs: bool,
     notice_rows: u16,
     has_piano_notes: bool,
 ) -> StudioRegions {
@@ -354,6 +365,7 @@ pub fn regions_with_footer(
             mixer,
             log,
             memory,
+            knobs,
             notice_rows,
             has_piano_notes,
         )
@@ -394,6 +406,7 @@ fn layout_regions(
     mixer: Option<viz_panel::Dock>,
     log: Option<viz_panel::Dock>,
     memory: Option<viz_panel::Dock>,
+    knobs: bool,
     notice_rows: u16,
     has_piano_notes: bool,
 ) -> StudioRegions {
@@ -469,7 +482,11 @@ fn layout_regions(
     }
     let menu = menu_row(area, chrome);
     let menu_height = menu.height;
-    let header_height = u16::from(chrome.header && area.height >= 3);
+    // The beat line is the header's second row: it keeps its room whether
+    // the transport runs or rests, so the panes never shift under a beat,
+    // and it yields its row back on a terminal too short to spare one.
+    let header_height = u16::from(chrome.header && area.height >= 3)
+        + u16::from(chrome.header && chrome.beat_line && area.height >= 8);
     let chips_height = u16::from(area.height >= SCENES_MIN_HEIGHT);
     // The footer setting takes only the meter and chip row: the notices,
     // retained piano notes and the status line keep theirs.
@@ -685,6 +702,28 @@ fn layout_regions(
         }
     }
 
+    // The knobs column hugs the score, inside every other column: the
+    // rails are for the call under the caret, and everything between
+    // them and the score is one more thing the eye crosses. It is the
+    // first thing to go when the room runs short - a rail can wait for a
+    // wider terminal, the panes cannot - and a reference sitting over
+    // the score hides this edge, so it waits too.
+    let mut knobs_area = Rect::default();
+    if knobs
+        && !reference_overlays
+        && body.width >= knobs_panel::KNOBS_WIDTH + least
+        && body.height >= knobs_panel::KNOBS_HEIGHT
+    {
+        let width = knobs_panel::KNOBS_WIDTH;
+        knobs_area = Rect::new(
+            body.right().saturating_sub(width),
+            body.y,
+            width,
+            body.height,
+        );
+        body.width = body.width.saturating_sub(width);
+    }
+
     let mut panes = [PaneRegion::default(); 2];
     let title_height = u16::from(pane_count == 2 && body.height >= 4);
     let left_width = if pane_count == 2 {
@@ -749,6 +788,7 @@ fn layout_regions(
         memory: memory_area,
         reference,
         reference_overlays,
+        knobs: knobs_area,
         footer,
     }
 }
