@@ -556,6 +556,42 @@ fn opacity_rows_clamp_and_are_claimed_across_a_reopen() {
     );
 }
 
+/// A beat-line-only change is the reader's claim on its own: it survives
+/// a reopen without an opacity having to change beside it.
+#[test]
+fn a_beat_line_only_change_survives_a_reopen() {
+    let mut studio = hermetic();
+    open_appearance(&mut studio);
+    select_row(&mut studio, "▸ beat line");
+    let before = row_with(&mut studio, "beat line");
+    for _ in 0..10 {
+        studio.press(KeyCode::Right, KeyModifiers::NONE);
+        studio.settle();
+        if row_with(&mut studio, "beat line") != before {
+            break;
+        }
+    }
+    let changed = row_with(&mut studio, "beat line");
+    assert_ne!(changed, before, "setup: the beat line moved from {before}");
+
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.settle();
+    // Prefs are written on a debounce: the wait is what makes the quit
+    // honest.
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    studio.pump();
+    studio.quit();
+    let mut studio = reopen_over(studio);
+
+    open_appearance(&mut studio);
+    select_row(&mut studio, "▸ beat line");
+    assert_eq!(
+        row_with(&mut studio, "beat line"),
+        changed,
+        "the beat-line-only change survived the reopen"
+    );
+}
+
 /// `full paths` is a privacy switch with a visible job: messages about
 /// files say the folder, not just the name - here the drop of an
 /// already-open score, which names its path in the refusal.

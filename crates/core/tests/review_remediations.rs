@@ -312,3 +312,31 @@ fn bite_with_an_index_past_the_fraction_range_refuses() {
         Some(QueryLimit::NativeFraction { operation: "bite" }),
     );
 }
+
+/// A `revv` over a span at the far edge of the native fraction range
+/// refuses as `NativeFraction { operation: "revv" }` instead of unwinding.
+#[test]
+fn revv_over_a_span_at_the_native_edge_refuses() {
+    let pattern = pure(Value::F64(1.0)).revv();
+    let edge = Fraction::int(i128::MIN);
+    let state = State::new(TimeSpan::new(edge, Fraction::int(i128::MIN + 2)));
+    match pattern.try_query_state_with_budget(&state, 1_000) {
+        Err(QueryLimit::NativeFraction { operation: "revv" }) => {}
+        other => panic!("expected a revv refusal at the native edge, got {other:?}"),
+    }
+}
+
+/// `repeatCycles(-1)` at the same boundary refuses as
+/// `NativeFraction { operation: "repeatCycles" }` instead of unwinding.
+#[test]
+fn repeat_cycles_at_the_native_edge_refuses() {
+    let pattern = pure(Value::F64(1.0)).repeat_cycles(Fraction::int(-1));
+    let edge = Fraction::int(i128::MIN);
+    let state = State::new(TimeSpan::new(edge, Fraction::int(i128::MIN + 2)));
+    match pattern.try_query_state_with_budget(&state, 1_000) {
+        Err(QueryLimit::NativeFraction {
+            operation: "repeatCycles",
+        }) => {}
+        other => panic!("expected a repeatCycles refusal at the native edge, got {other:?}"),
+    }
+}

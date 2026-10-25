@@ -2821,3 +2821,98 @@ fn restoring_a_registered_name_runs_no_inherited_setter() {
         started.elapsed()
     );
 }
+
+/// A score that locks a displaced name's prototype slot must not keep its
+/// registration installed for good. The next score's restore writes the
+/// built-in value back into the locked slot, and the built-in behavior
+/// answers again.
+/// A slot locked against both delete and write cannot be restored, and
+/// that failure is reported once: later evaluations proceed instead of
+/// failing on the same permanent lock forever.
+#[test]
+fn a_fully_locked_registration_slot_fails_once_not_forever() {
+    use std::sync::atomic::AtomicBool;
+
+    let rt = JsRuntime::new().unwrap();
+    rt.install_semantic_bindings().unwrap();
+    let options = TranspileOptions::default();
+    let cancellation = AtomicBool::new(false);
+    rt.evaluate_score_with_effects_cancellable(
+        "register('rev', p => p); \
+         const proto = Object.getPrototypeOf(note('c')); \
+         Object.defineProperty(proto, 'rev', { configurable: false, writable: false }); \
+         pure('a')",
+        &options,
+        Duration::from_secs(10),
+        &cancellation,
+    )
+    .expect("the displacement and the lock install");
+
+    assert!(
+        rt.evaluate_score_with_effects_cancellable(
+            "pure('b')",
+            &options,
+            Duration::from_secs(10),
+            &cancellation,
+        )
+        .is_err(),
+        "the restore over the permanent lock reports its failure"
+    );
+    // The lock is permanent; the one failure is spent. A later score
+    // evaluates, and the stuck slot keeps the score's function.
+    rt.evaluate_score_with_effects_cancellable(
+        r#"note("c3 e3 g3")"#,
+        &options,
+        Duration::from_secs(10),
+        &cancellation,
+    )
+    .expect("a later score proceeds after the one failure");
+    let haps = rt
+        .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
+        .expect("query");
+    assert_eq!(haps.len(), 3);
+}
+
+#[test]
+fn a_locked_registration_slot_still_gets_the_builtin_back() {
+    use std::sync::atomic::AtomicBool;
+
+    let rt = JsRuntime::new().unwrap();
+    rt.install_semantic_bindings().unwrap();
+    let options = TranspileOptions::default();
+    let cancellation = AtomicBool::new(false);
+    rt.evaluate_score_with_effects_cancellable(
+        "register('rev', p => p); \
+         Object.defineProperty(Object.getPrototypeOf(note('c')), 'rev', { configurable: false }); \
+         pure('a')",
+        &options,
+        Duration::from_secs(10),
+        &cancellation,
+    )
+    .expect("the displacement and the lock install");
+
+    rt.evaluate_score_with_effects_cancellable(
+        r#"note("c3 e3 g3").rev()"#,
+        &options,
+        Duration::from_secs(10),
+        &cancellation,
+    )
+    .expect("the next score restores the built-in");
+    let haps = rt
+        .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
+        .expect("query");
+    let notes: Vec<String> = haps
+        .iter()
+        .map(|hap| {
+            hap.value
+                .get("note")
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| format!("{:?}", hap.value))
+        })
+        .collect();
+    assert_eq!(
+        notes,
+        ["g3", "e3", "c3"],
+        "the built-in rev reverses; the registration is not still answering"
+    );
+}

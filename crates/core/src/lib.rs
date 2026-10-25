@@ -2185,6 +2185,9 @@ fn map_js_haps(
         // Every iteration can enter QuickJS, and a wide query holds tens of
         // thousands of haps. Check inside the loop so callback and GC work
         // cannot keep the producer occupied after cancellation or a deadline.
+        // A pending query error is deliberately NOT a stop: the turn
+        // boundary turns a throwing callback into silence after every hap
+        // had its turn, which the `and`/`or` lazy-truthy contracts pin.
         if budget_exhausted() || cancellation_requested() || query_deadline_expired() {
             return Vec::new();
         }
@@ -2600,8 +2603,8 @@ pub(crate) fn push_budgeted(out: &mut Vec<Hap>, hap: Hap) -> bool {
 ///
 /// Returns `None` once the budget is spent, so callers propagate rather than
 /// truncate.
-pub(crate) fn extend_budgeted(branches: impl IntoIterator<Item = Vec<Hap>>) -> Option<Vec<Hap>> {
-    let mut out: Vec<Hap> = Vec::new();
+pub(crate) fn extend_budgeted<T>(branches: impl IntoIterator<Item = Vec<T>>) -> Option<Vec<T>> {
+    let mut out: Vec<T> = Vec::new();
     for branch in branches {
         if !charge_haps(out.len() + branch.len()) {
             return None;
@@ -2648,6 +2651,13 @@ pub fn refuse_js_pending_jobs() {
 /// Refuse an oversized Euclidean mask through the typed resource channel.
 pub fn refuse_euclid_steps(steps: u64, limit: u64) {
     refuse(QueryLimit::EuclidSteps { steps, limit });
+}
+
+/// Refuse a native-fraction overflow through the typed resource channel.
+/// Extension nodes use this where their span shifts leave the range an
+/// `i128` numerator can hold.
+pub fn refuse_native_fraction(operation: &'static str) {
+    refuse(QueryLimit::NativeFraction { operation });
 }
 
 /// Charge a growing collection outside this crate, by its current length.
@@ -4122,7 +4132,7 @@ enum Node {
     /// of throwing at the host boundary: an expression the language can
     /// build must build here too, and it must empty the query rather than
     /// abort the evaluation.
-    QueryError(&'static str),
+    QueryError(Arc<str>),
     /// A resource refusal whose construction is valid but whose query cannot
     /// be answered within the native runtime's bound. The refusal is emitted
     /// here, inside the top-level query boundary; setting the thread-local at
@@ -4617,7 +4627,7 @@ impl Pattern {
             Node::Silence => Vec::new(),
 
             Node::QueryError(message) => {
-                signal_query_error(|| (*message).into());
+                signal_query_error(|| message.to_string());
                 Vec::new()
             }
 
@@ -4810,7 +4820,17 @@ impl Pattern {
                 .collect(),
 
             Node::ExpandHapsNative(pat, f) => {
-                pat.query(state).into_iter().flat_map(|h| f(&h)).collect()
+                // One hap expands into N, so the output can outgrow the
+                // input's own charge; each push is charged as it lands.
+                let mut out = Vec::new();
+                for h in pat.query(state) {
+                    for expanded in f(&h) {
+                        if !push_budgeted(&mut out, expanded) {
+                            return Vec::new();
+                        }
+                    }
+                }
+                out
             }
 
             Node::Collect(pat) => collect_congruent(pat.query(state))
@@ -5108,15 +5128,44 @@ impl Pattern {
             }
 
             Node::RepeatCycles(pattern, count) => {
+                // Every shift is checked: a span at the far edge of the
+                // native range refuses rather than unwinds, as `fastGap`
+                // does.
+                let refuse_shift = || {
+                    refuse(QueryLimit::NativeFraction {
+                        operation: "repeatCycles",
+                    });
+                };
                 let cycle = state.span.begin.sam();
-                let source_cycle = cycle.div(*count).sam();
-                let delta = cycle.sub(source_cycle);
-                let shifted = state.with_span(|span| span.with_time(|time| time.sub(delta)));
+                let Some(delta) = cycle
+                    .checked_div(*count)
+                    .and_then(|source| cycle.checked_sub(source.sam()))
+                else {
+                    refuse_shift();
+                    return Vec::new();
+                };
+                let shifted = state.with_span(|span| {
+                    match (span.begin.checked_sub(delta), span.end.checked_sub(delta)) {
+                        (Some(begin), Some(end)) => TimeSpan::new(begin, end),
+                        _ => {
+                            refuse_shift();
+                            *span
+                        }
+                    }
+                });
                 pattern
                     .query(&shifted)
                     .into_iter()
                     .map(|mut hap| {
-                        hap.update_span(|span| span.with_time(|time| time.add(delta)));
+                        hap.update_span(|span| {
+                            span.with_time(|time| match time.checked_add(delta) {
+                                Some(shifted) => shifted,
+                                None => {
+                                    refuse_shift();
+                                    time
+                                }
+                            })
+                        });
                         hap
                     })
                     .collect()
@@ -5954,20 +6003,32 @@ impl Pattern {
                 Some(resolved)
             }
             // `pure(pattern)`: one hap per cycle, each carrying the same known
-            // inner pattern. Mirrors `Node::Pure`'s query exactly.
-            Node::PurePattern(inner) => Some(
-                state
-                    .span
-                    .span_cycles()
-                    .into_iter()
-                    .map(|subspan| {
-                        ResolvedHap::of(
-                            Hap::new(Some(whole_cycle(subspan.begin)), subspan, Value::Undefined),
-                            inner.clone(),
-                        )
-                    })
-                    .collect(),
-            ),
+            // inner pattern. Mirrors `Node::Pure`'s query exactly, including
+            // its pre-charge: if every inner pattern is silent, the join's
+            // output stays empty and no later vector exists for the generic
+            // check to catch, so the charge belongs here.
+            Node::PurePattern(inner) => {
+                let spans = state.span.span_cycles();
+                if !charge_haps(spans.len()) {
+                    return Some(Vec::new());
+                }
+                note_materialised(spans.len());
+                Some(
+                    spans
+                        .into_iter()
+                        .map(|subspan| {
+                            ResolvedHap::of(
+                                Hap::new(
+                                    Some(whole_cycle(subspan.begin)),
+                                    subspan,
+                                    Value::Undefined,
+                                ),
+                                inner.clone(),
+                            )
+                        })
+                        .collect(),
+                )
+            }
 
             // `fmap(func)` with a user callback. `fmap` is representation-
             // agnostic: whatever the outer hap carries is what `func`
@@ -6065,10 +6126,14 @@ impl Pattern {
             // pattern-of-patterns) otherwise fell through to the plain-query
             // fallback and hit the pattern-valued refusal with no haps at all.
             Node::Stack(children) => Some(
-                children
-                    .iter()
-                    .flat_map(|child| query_stack_child(|| child.resolve_for_join(state)))
-                    .collect(),
+                extend_budgeted(
+                    children
+                        .iter()
+                        .map(|child| query_stack_child(|| child.resolve_for_join(state))),
+                )
+                // A refused concatenation resolves to silence; the refusal
+                // itself travels on the query-wide channel.
+                .unwrap_or_default(),
             ),
             // `fastGap` on a pattern-of-patterns: the join must consume the
             // same compressed outer windows the query path produces, or
@@ -6131,7 +6196,14 @@ impl Pattern {
                         });
                         return Some(Vec::new());
                     };
+                    // The per-cycle results concatenate, so each extend is
+                    // charged: the branches are individually legal while the
+                    // running total is not.
+                    if !charge_haps(resolved_haps.len() + haps.len()) {
+                        return Some(Vec::new());
+                    }
                     resolved_haps.extend(haps);
+                    note_accumulated(resolved_haps.len());
                 }
                 Some(resolved_haps)
             }
@@ -6809,7 +6881,16 @@ impl Pattern {
     /// query span and the hap spans.
     pub fn revv(&self) -> Self {
         fn negate(span: &TimeSpan) -> TimeSpan {
-            TimeSpan::new(span.end.neg(), span.begin.neg())
+            // A span at the far edge of the native range cannot be negated;
+            // the query refuses rather than unwinds. The returned span is
+            // never read once the refusal flag is set.
+            match (span.end.checked_neg(), span.begin.checked_neg()) {
+                (Some(end), Some(begin)) => TimeSpan::new(end, begin),
+                (None, _) | (_, None) => {
+                    refuse(QueryLimit::NativeFraction { operation: "revv" });
+                    *span
+                }
+            }
         }
         self.with_query_span(negate).with_hap_span(negate)
     }
@@ -7966,8 +8047,8 @@ pub const UNREADABLE_MIDI_PORT: &str = "(unreadable port name)";
 /// complaint and calls the non-function later, so the host must build
 /// something rather than throw. See
 /// `crates/jsruntime/tests/bind_ownership.rs`.
-pub fn query_error_pattern(message: &'static str) -> Pattern {
-    Pattern::of(Node::QueryError(message))
+pub fn query_error_pattern(message: impl Into<Arc<str>>) -> Pattern {
+    Pattern::of(Node::QueryError(message.into()))
 }
 
 /// A pure pattern that refuses through the typed resource channel when it is

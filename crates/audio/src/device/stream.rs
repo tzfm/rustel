@@ -1463,18 +1463,73 @@ fn prepare_finite_inserts(
     Ok(())
 }
 
-fn queue_finite_events(
+/// The events a finite playback still has to admit, in onset order. The
+/// callback admits them as the output reaches them, the way the live ring
+/// does, so native score queues stay bounded however long the list is.
+pub(super) struct FiniteAdmission {
+    events: Vec<OnsetEvent>,
+    next: usize,
+    sample_rate: u32,
+}
+
+impl FiniteAdmission {
+    /// One scheduler lookahead: an onset is admitted before the block that
+    /// reaches it, never after.
+    pub(super) fn horizon(&self, frame: u64) -> u64 {
+        frame.saturating_add((self.sample_rate as u64 / 10).max(1) + 256)
+    }
+
+    /// Admit every event due before `horizon`. An event the backend cannot
+    /// take yet stays for the next block, exactly as a full live ring does.
+    pub(super) fn admit_until(&mut self, backend: &mut ScalarBackend, horizon: u64) {
+        while self
+            .events
+            .get(self.next)
+            .is_some_and(|event| event.onset_frame < horizon)
+        {
+            let compact = self.events[self.next]
+                .clone()
+                .map_kabel(crate::CompactKabelControls::from);
+            if !backend.try_note_prepared(compact) {
+                // Admission is refused for now and retried on the next
+                // block: arming before this point would queue the same
+                // sidechain once per retry and flood the duck queue.
+                return;
+            }
+            // Sidechains arm here, once per admitted event, as the live
+            // path arms at ring intake: the queue drains as ducks fire,
+            // and arming at the prepare pass would spend its whole
+            // capacity on far-future onsets.
+            backend.arm_duck_at(
+                self.events[self.next].onset_frame,
+                self.events[self.next].controls.duck,
+            );
+            self.next += 1;
+        }
+    }
+}
+
+pub(super) fn queue_finite_events(
     backend: &mut ScalarBackend,
     events: &[OnsetEvent],
-) -> Result<(), DevicePlaybackError> {
-    for event in events {
-        backend
-            .prepare_kabel_event(event)
-            .map_err(DevicePlaybackError::ResourceLimit)?;
-        backend.note(event.clone());
-    }
+    sample_rate: u32,
+) -> Result<FiniteAdmission, DevicePlaybackError> {
+    let mut queued = events.to_vec();
+    queued.sort_by_key(|event| event.onset_frame);
+    backend
+        .prepare_finite_playback(&queued)
+        .map_err(DevicePlaybackError::ResourceLimit)?;
+    // Admit the first scheduler window before priming: ahead-rendering
+    // inserts are primed over the notes near frame zero, so those notes
+    // must already be pending, exactly as a full pre-queue left them.
+    let mut admission = FiniteAdmission {
+        events: queued,
+        next: 0,
+        sample_rate,
+    };
+    admission.admit_until(backend, admission.horizon(0));
     backend.prime_finite_inserts();
-    Ok(())
+    Ok(admission)
 }
 
 impl ScalarDevice {
@@ -1707,7 +1762,7 @@ impl ScalarDevice {
             }
         }
         backend.forbid_inline_reverb();
-        queue_finite_events(&mut backend, events)?;
+        let admission = queue_finite_events(&mut backend, events, self.sample_rate())?;
 
         let written = Arc::new(AtomicU64::new(0));
         let failed = Arc::new(AtomicBool::new(false));
@@ -1718,6 +1773,7 @@ impl ScalarDevice {
             total_frames,
             written.clone(),
             failed.clone(),
+            admission,
         )?;
         stream.play().map_err(|error| {
             DevicePlaybackError::Unavailable(format!(
@@ -1844,6 +1900,7 @@ fn build_stream(
     total_frames: u64,
     written: Arc<AtomicU64>,
     failed: Arc<AtomicBool>,
+    admission: FiniteAdmission,
 ) -> Result<cpal::Stream, DevicePlaybackError> {
     macro_rules! build {
         ($sample:ty) => {
@@ -1854,6 +1911,7 @@ fn build_stream(
                 total_frames,
                 written,
                 failed,
+                admission,
             )
         };
     }
@@ -1883,6 +1941,7 @@ fn build_typed_stream<T>(
     total_frames: u64,
     written: Arc<AtomicU64>,
     failed: Arc<AtomicBool>,
+    mut admission: FiniteAdmission,
 ) -> Result<cpal::Stream, DevicePlaybackError>
 where
     T: SizedSample + FromSample<f32>,
@@ -1892,7 +1951,14 @@ where
         .build_output_stream(
             config,
             move |output: &mut [T], _| {
-                write_output(&mut backend, output, channels, total_frames, &written);
+                write_output(
+                    &mut backend,
+                    output,
+                    channels,
+                    total_frames,
+                    &written,
+                    &mut admission,
+                );
             },
             flag_stream_failure(failed),
             Some(Duration::from_secs(3)),
@@ -2131,12 +2197,19 @@ mod tests {
                     )
                     .is_none()
             );
-            queue_finite_events(&mut backend, &events).unwrap();
+            let mut admission = queue_finite_events(&mut backend, &events, 48_000).unwrap();
             let written = AtomicU64::new(0);
             let mut output = vec![0.0f32; total as usize * 2];
             let before = crate::tripwire::Violations::capture();
             crate::tripwire::audio_scope(|| {
-                super::super::callback::write_output(&mut backend, &mut output, 2, total, &written);
+                super::super::callback::write_output(
+                    &mut backend,
+                    &mut output,
+                    2,
+                    total,
+                    &written,
+                    &mut admission,
+                );
             });
             assert!(crate::tripwire::Violations::capture().since(before).clean());
             assert_eq!(written.load(Ordering::Acquire), total);
@@ -2152,6 +2225,140 @@ mod tests {
                     .any(|v| v.abs() > 0.01)
             );
         }
+    }
+
+    /// A finite playback longer than the pending-event ceiling still sounds
+    /// every event: the callback admits from the timeline as the output
+    /// reaches it, so the short events drain and the final tone is
+    /// retained. The backend is built the way production builds it, from
+    /// `with_dispatch`, whose pools start empty: the producer reserves what
+    /// the in-callback admission needs.
+    #[test]
+    fn finite_playback_admits_events_past_the_pending_ceiling() {
+        let _guard = tripwire_assertion_guard();
+        let spacing = 64u64;
+        let mut events: Vec<_> = (0..crate::scalar::MAX_PENDING_EVENTS as u64)
+            .map(|index| OnsetEvent::new(index * spacing, 440.0, 0.05, 0.001))
+            .collect();
+        let tone_at = crate::scalar::MAX_PENDING_EVENTS as u64 * spacing + 128;
+        events.push(OnsetEvent::new(tone_at, 220.0, 0.8, 0.25));
+        let total = tone_at + 24_000;
+
+        let mut backend = ScalarBackend::with_dispatch(DspDispatch::portable());
+        backend.init(48_000).unwrap();
+        let mut admission = queue_finite_events(&mut backend, &events, 48_000).unwrap();
+        let written = AtomicU64::new(0);
+        let mut output = Vec::new();
+        while written.load(Ordering::Acquire) < total {
+            let mut block = [0.0f32; 128 * 2];
+            let before = crate::tripwire::Violations::capture();
+            crate::tripwire::audio_scope(|| {
+                super::super::callback::write_output(
+                    &mut backend,
+                    &mut block,
+                    2,
+                    total,
+                    &written,
+                    &mut admission,
+                );
+            });
+            assert!(
+                crate::tripwire::Violations::capture().since(before).clean(),
+                "in-callback admission allocated"
+            );
+            output.extend_from_slice(&block);
+        }
+        let tone = &output[tone_at as usize * 2..];
+        assert!(
+            tone.iter().any(|sample| sample.abs() > 0.01),
+            "the tone after a full pending queue of short events must still sound"
+        );
+    }
+
+    /// Sidechains arm at admission, as the live path arms at ring intake:
+    /// with a list longer than the duck queue's capacity, a trigger past
+    /// the old full-queue drop still dips its target orbit.
+    #[test]
+    fn finite_playback_arms_ducks_past_the_queue_capacity() {
+        let _guard = tripwire_assertion_guard();
+        let duck = crate::DuckControls {
+            targets: [
+                Some(crate::DuckTarget {
+                    orbit: 2,
+                    onset_secs: 0.0,
+                    attack_secs: 0.05,
+                    depth: 1.0,
+                }),
+                None,
+                None,
+                None,
+            ],
+        };
+        let controls = |orbit: u8, duck: Option<crate::DuckControls>| crate::OscillatorControls {
+            orbit,
+            duck,
+            envelope: crate::Envelope {
+                attack_secs: 0.001,
+                decay_secs: 0.0,
+                sustain: 1.0,
+                release_secs: 0.01,
+            },
+            ..Default::default()
+        };
+        // A sustained tone on orbit 2, and more silent duck triggers than
+        // the 4096-entry sidechain queue holds, spaced far enough apart
+        // that the gain recovers to unity between dips.
+        let tone_duration = (4500u64 * 4800 + 12_000) as f32 / 48_000.0;
+        let tone = OnsetEvent::new(0, 220.0, 1.0, tone_duration).with_controls(controls(2, None));
+        let count = 4500u64;
+        let spacing = 4800u64;
+        let last_onset = count * spacing;
+        let triggers = (0..count).map(|index| {
+            OnsetEvent::new(index * spacing + 2400, 220.0, 0.0, 0.01)
+                .with_controls(controls(1, Some(duck)))
+        });
+        let mut events = vec![tone];
+        events.extend(triggers);
+        let total = last_onset + 12_000;
+
+        let mut backend = ScalarBackend::with_dispatch(DspDispatch::portable());
+        backend.init(48_000).unwrap();
+        let mut admission = queue_finite_events(&mut backend, &events, 48_000).unwrap();
+        let written = AtomicU64::new(0);
+        let mut output = vec![0.0f32; 0];
+        while written.load(Ordering::Acquire) < total {
+            let mut block = [0.0f32; 128 * 2];
+            crate::tripwire::audio_scope(|| {
+                super::super::callback::write_output(
+                    &mut backend,
+                    &mut block,
+                    2,
+                    total,
+                    &written,
+                    &mut admission,
+                );
+            });
+            output.extend_from_slice(&block);
+        }
+        let rms = |from: usize, to: usize| {
+            let slice = &output[from * 2..to * 2];
+            (slice
+                .iter()
+                .map(|s| f64::from(*s) * f64::from(*s))
+                .sum::<f64>()
+                / slice.len() as f64)
+                .sqrt()
+        };
+        let last_trigger = (count - 1) * spacing + 2400;
+        let before = rms(
+            (last_trigger - 2_000) as usize,
+            (last_trigger - 100) as usize,
+        );
+        let dipped = rms((last_trigger + 50) as usize, (last_trigger + 600) as usize);
+        assert!(
+            dipped < before * 0.5,
+            "the trigger past the queue capacity must still dip the orbit:              before {before:.5}, at the last trigger {dipped:.5}"
+        );
     }
 
     #[test]

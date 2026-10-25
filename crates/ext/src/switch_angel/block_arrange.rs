@@ -116,7 +116,13 @@ impl ExtensionPatternNode for BlockLaneNode {
                 }
                 selected.push(source);
             }
-            output.extend(query_inner(&outer, &rustel_core::stack(selected), state));
+            let branch = query_inner(&outer, &rustel_core::stack(selected), state);
+            // Branches concatenate across selector haps; charge the running
+            // total before it grows past the query's hap budget.
+            if !rustel_core::charge_hap_at(output.len() + branch.len()) {
+                return Vec::new();
+            }
+            output.extend(branch);
         }
         output
     }

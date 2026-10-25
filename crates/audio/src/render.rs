@@ -8,30 +8,19 @@ use crate::backend::{AudioBackend, OnsetEvent};
 
 /// Render `frames` of stereo interleaved `f32` PCM at `sample_rate` using
 /// `backend` and the supplied onset list.
+///
+/// The list is admitted as the output reaches it, in onset order, so a
+/// render longer than the backend's pending-event ceiling still sounds
+/// every event instead of silently dropping the ones past it.
 pub fn render_pcm(
     backend: &mut dyn AudioBackend,
     sample_rate: u32,
     frames: usize,
     events: &[OnsetEvent],
 ) -> Result<Vec<f32>, String> {
-    backend.init(sample_rate)?;
-    backend.reset();
-    for e in events {
-        backend.prepare_note(e)?;
-        backend.note(e.clone());
-    }
-    let mut pcm = vec![0.0f32; frames * 2];
-    // Process in 128-frame blocks (Dough's native block size) for realism.
-    const BLOCK: usize = 128;
-    let mut offset = 0;
-    while offset < frames {
-        let n = (frames - offset).min(BLOCK);
-        let start = offset * 2;
-        let end = start + n * 2;
-        backend.process_block(&mut pcm[start..end], n);
-        offset += n;
-    }
-    Ok(pcm)
+    let mut queued = events.to_vec();
+    queued.sort_by_key(|event| event.onset_frame);
+    render_pcm_events(backend, sample_rate, frames, queued)
 }
 
 /// Render events in onset order as the output reaches them. The iterator may
@@ -327,7 +316,12 @@ pub fn write_wav_events_controlled(
         .checked_mul(u64::from(CHANNELS))
         .and_then(|value| value.checked_mul(u64::from(bytes_per_sample)))
         .ok_or_else(|| "PCM byte count overflowed".to_string())?;
-    if data_bytes + 36 > u64::from(u32::MAX) {
+    // Checked: the addition itself can leave the u64 range before the RIFF
+    // bound comparison runs, and the guard must refuse, not unwind.
+    if data_bytes
+        .checked_add(36)
+        .is_none_or(|with_header| with_header > u64::from(u32::MAX))
+    {
         return Err(format!(
             "{frames} frames need {data_bytes} PCM bytes, which a RIFF file cannot address"
         ));
@@ -537,6 +531,59 @@ fn finalise_partial_wav(
     file.set_len(u64::from(data_bytes) + 44)
         .map_err(|error| error.to_string())?;
     file.flush().map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod riff_limit_tests {
+    use super::*;
+
+    /// A frame count whose PCM byte count leaves the u64 range only when
+    /// the RIFF header is added must meet the size refusal, before any file
+    /// is created or the backend is asked to render.
+    #[test]
+    fn a_riff_size_that_overflows_only_with_its_header_is_refused() {
+        let path = std::env::temp_dir().join("rustel-riff-never-created.wav");
+        let _ = std::fs::remove_file(&path);
+        struct Never;
+        impl AudioBackend for Never {
+            fn name(&self) -> &'static str {
+                "never"
+            }
+            fn init(&mut self, _: u32) -> Result<(), String> {
+                panic!("the size refusal must come before the backend runs")
+            }
+            fn reset(&mut self) {}
+            fn note(&mut self, _: crate::OnsetEvent) {}
+            fn prepare_note(&mut self, _: &crate::OnsetEvent) -> Result<(), String> {
+                Ok(())
+            }
+            fn process_block(&mut self, _: &mut [f32], _: usize) {
+                panic!("the size refusal must come before any processing")
+            }
+        }
+        // PCM16: 2 bytes a sample, 2 channels - 4 bytes a frame. 2^62 - 1
+        // frames need 2^64 - 4 bytes, which only overflows once the 36
+        // header bytes are added.
+        let error = write_wav_controlled(
+            &path,
+            &mut Never,
+            48_000,
+            (1_u64 << 62) as usize - 1,
+            &[],
+            RenderControl::default(),
+            WavSampleFormat::Pcm16,
+        )
+        .expect_err("the overflowed RIFF size must be refused");
+        assert!(
+            error.contains("cannot address"),
+            "the refusal names the size: {error}"
+        );
+        assert!(
+            !path.exists(),
+            "the refusal comes before any file is created"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 #[cfg(test)]

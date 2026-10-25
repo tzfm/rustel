@@ -708,34 +708,73 @@ pub(crate) fn restore_surface<'js>(
     let globals = ctx.globals();
     let state = state(ctx)?;
     let saved: rquickjs::Object = state.get(SAVED)?;
+    // Each entry is tried once and then spent: a slot a score locked
+    // non-configurable can never be unlocked, so retrying the same name
+    // would fail every later evaluation forever. While such a slot stays
+    // writable it still takes the original as a plain value, so the
+    // engine's name answers again even though its configurability cannot
+    // come back.
+    let mut first_failure = None;
     for entry in saved.props::<String, rquickjs::Value>() {
-        let (name, original) = entry?;
-        // Delete first, always. While the surface is installed `speed` is an
-        // accessor, and assigning to an accessor calls its SETTER - which
-        // would record a drawing instruction for a window that is closing.
-        globals.remove(name.as_str())?;
-        // Defined, not assigned: an assignment runs any setter on the
-        // prototype chain, and a score turn restores before its deadline
-        // starts. The attributes are the ones the engine's `set` gave it.
-        if !original.is_undefined() {
-            globals.prop(
-                name.as_str(),
-                rquickjs::object::Property::from(original)
-                    .writable()
-                    .enumerable()
-                    .configurable(),
-            )?;
+        let Ok((name, original)) = entry else {
+            continue;
+        };
+        let restored = (|| {
+            // Delete first, always. While the surface is installed `speed`
+            // is an accessor, and assigning to an accessor calls its SETTER
+            // - which would record a drawing instruction for a window that
+            // is closing.
+            match globals.remove(name.as_str()) {
+                Ok(()) => {
+                    if original.is_undefined() {
+                        return Ok(());
+                    }
+                    // Defined, not assigned: an assignment runs any setter on
+                    // the prototype chain, and a score turn restores before
+                    // its deadline starts. The attributes are the ones the
+                    // engine's `set` gave it.
+                    globals.prop(
+                        name.as_str(),
+                        rquickjs::object::Property::from(original)
+                            .writable()
+                            .enumerable()
+                            .configurable(),
+                    )
+                }
+                Err(error) => {
+                    if original.is_undefined() {
+                        return Err(error);
+                    }
+                    // The slot stayed: a score locked it non-configurable.
+                    // It still takes a new value while it stays writable, so
+                    // the engine's name answers again even though its
+                    // configurability cannot come back.
+                    globals.prop(
+                        name.as_str(),
+                        rquickjs::object::Property::from(original).writable(),
+                    )
+                }
+            }
+        })();
+        if let Err(error) = restored {
+            first_failure.get_or_insert(error);
         }
+        saved.remove(name.as_str())?;
     }
     state.set(SAVED, bare_object(ctx)?)?;
     state.set(ASSIGNED, bare_object(ctx)?)?;
     let mut chains = chains.borrow_mut();
     for name in std::mem::take(&mut chains.protected) {
-        release_host_global(ctx, name)?;
+        if let Err(error) = release_host_global(ctx, name) {
+            first_failure.get_or_insert(error);
+        }
     }
     chains.chains.clear();
     chains.installed = false;
-    Ok(())
+    match first_failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// Build the recorder for one chain.

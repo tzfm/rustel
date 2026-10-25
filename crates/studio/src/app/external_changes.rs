@@ -19,7 +19,7 @@ use crate::scenes::SCENE_EXTENSION;
 
 /// How often a watched file is stat-ed. Ten checks a second costs
 /// microseconds of work, and a read happens only when the stamp moves.
-const POLL: Duration = Duration::from_millis(100);
+pub(super) const POLL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FileStamp {
@@ -45,6 +45,17 @@ pub(super) struct ExternalWatch {
     /// The first poll after the mode turns on only records what is there.
     /// Otherwise every score in the set would open and play at once.
     started: bool,
+}
+
+/// Why one open scene's file did or did not reload.
+enum ReloadOutcome {
+    /// The file's text was adopted into the editor.
+    Adopted,
+    /// The file holds what the editor already saved, or could not be read.
+    Refused,
+    /// A save of the studio's own is still in flight; try again once it
+    /// lands.
+    SavePending,
 }
 
 impl App {
@@ -164,9 +175,27 @@ impl App {
             // Read and adopt before selecting, so a save of our own never
             // steals a tab back from the one the reader is on.
             Some(id) => {
-                if !self.reload_open_scene(id, path) {
-                    self.dirty_frame = true;
-                    return;
+                match self.reload_open_scene(id, path) {
+                    ReloadOutcome::Adopted => {}
+                    ReloadOutcome::SavePending => {
+                        // The stamp was already advanced, so nothing would
+                        // trigger a re-read once the save lands. Keep the
+                        // file settling: the next polls retry, and an
+                        // external edit that landed under the pending save
+                        // is still adopted instead of being overwritten by
+                        // the next studio save.
+                        if let Some(watch) = self.external_watch.as_mut()
+                            && let Some(file) = watch.files.get_mut(path)
+                        {
+                            file.settling = true;
+                        }
+                        self.dirty_frame = true;
+                        return;
+                    }
+                    ReloadOutcome::Refused => {
+                        self.dirty_frame = true;
+                        return;
+                    }
                 }
                 if mode == ExternalChanges::SyncAndEvaluate
                     && let Some(index) = self.scenes.index_of(id)
@@ -205,22 +234,25 @@ impl App {
         }
     }
 
-    /// Read one open scene's file into its editor. Answers whether the
-    /// text changed.
-    fn reload_open_scene(&mut self, scene_id: SceneId, path: &Path) -> bool {
+    /// Read one open scene's file into the editor.
+    fn reload_open_scene(&mut self, scene_id: SceneId, path: &Path) -> ReloadOutcome {
         let Ok(source) = bounded_file::read_to_string(path, MAX_DOCUMENT_BYTES) else {
-            return false;
+            return ReloadOutcome::Refused;
         };
         let Some(scene) = self.scenes.get_mut(scene_id) else {
-            return false;
+            return ReloadOutcome::Refused;
         };
         // A save of our own is not an external change. The file may hold
         // text older than the caret, and adopting it would drop what was
         // typed after the save was queued.
-        if scene.latest_save.is_some() || source_revision(&source) == scene.saved_source_revision {
-            return false;
+        if scene.latest_save.is_some() {
+            return ReloadOutcome::SavePending;
         }
-        scene.adopt_source(&source)
+        if source_revision(&source) == scene.saved_source_revision {
+            return ReloadOutcome::Refused;
+        }
+        scene.adopt_source(&source);
+        ReloadOutcome::Adopted
     }
 
     /// What an edit made outside the studio owes the studio.

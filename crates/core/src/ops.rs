@@ -44,7 +44,7 @@ pub trait PatOps: Clone + Sized + Send + Sync + 'static {
     // -- constructors ------------------------------------------------------
     fn pat_pure(value: Value) -> Self;
     fn pat_silence() -> Self;
-    fn pat_query_error(message: &'static str) -> Self;
+    fn pat_query_error(message: std::sync::Arc<str>) -> Self;
     fn pat_query_limit(limit: crate::QueryLimit) -> Self;
     fn pat_stack(pats: Vec<Self>) -> Self;
     fn pat_slowcat(pats: Vec<Self>) -> Self;
@@ -216,7 +216,7 @@ impl PatOps for Pattern {
     fn pat_silence() -> Self {
         crate::silence()
     }
-    fn pat_query_error(message: &'static str) -> Self {
+    fn pat_query_error(message: std::sync::Arc<str>) -> Self {
         crate::query_error_pattern(message)
     }
     fn pat_query_limit(limit: crate::QueryLimit) -> Self {
@@ -486,7 +486,7 @@ impl PatOps for PurePattern {
     fn pat_silence() -> Self {
         PurePattern::assert_pure(crate::silence())
     }
-    fn pat_query_error(message: &'static str) -> Self {
+    fn pat_query_error(message: std::sync::Arc<str>) -> Self {
         PurePattern::assert_pure(crate::query_error_pattern(message))
     }
     fn pat_query_limit(limit: crate::QueryLimit) -> Self {

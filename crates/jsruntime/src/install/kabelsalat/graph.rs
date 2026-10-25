@@ -134,7 +134,7 @@ fn array<'js>(ctx: &Ctx<'js>, values: Vec<Value<'js>>) -> Result<Array<'js>> {
     Ok(array)
 }
 fn array_values<'js>(ctx: &Ctx<'js>, value: &Array<'js>) -> Result<Vec<Value<'js>>> {
-    let len = value.len();
+    let len = js_array_len(value)?;
     check_inputs(ctx, len)?;
     (0..len).map(|index| value.get(index)).collect()
 }
@@ -806,8 +806,9 @@ pub(super) fn call<'js>(ctx: &Ctx<'js>, name: &str, args: Vec<Value<'js>>) -> Re
                 } else {
                     Array::from_js(ctx, existing)?
                 };
-                check_inputs(ctx, values.len() + 1)?;
-                values.set(values.len(), metadata)?;
+                let len = js_array_len(&values)?;
+                check_inputs(ctx, len + 1)?;
+                values.set(len, metadata)?;
                 object.set("inputOf", values)?;
             } else {
                 object.set("outputOf", metadata)?;
@@ -880,8 +881,9 @@ fn dfs<'js>(
 ) -> Result<Value<'js>> {
     let _depth = enter(ctx)?;
     let current = invoke(ctx, &callback, vec![current, visited.clone().into_value()])?;
-    check_inputs(ctx, visited.len() + 1)?;
-    visited.set(visited.len(), current.clone())?;
+    let len = js_array_len(visited)?;
+    check_inputs(ctx, len + 1)?;
+    visited.set(len, current.clone())?;
     let mut mapped = Vec::new();
     for input in inputs(ctx, &current)? {
         if array_values(ctx, visited)?.contains(&input) {

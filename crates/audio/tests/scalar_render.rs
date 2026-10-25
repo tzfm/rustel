@@ -377,6 +377,157 @@ fn zero_speed_sample_is_an_audio_no_op() {
     );
 }
 
+/// An active delay at a sample rate whose delay line is shorter than the
+/// 128-frame quantum, and a delay configured at a 1 Hz rate, both stay
+/// bounded instead of panicking on an inverted clamp.
+#[test]
+fn an_active_delay_stays_bounded_at_low_sample_rates() {
+    let event = || {
+        let controls = OscillatorControls {
+            delay: Some(rustel_audio::DelayControls {
+                wet: 0.5,
+                time_secs: 0.25,
+                feedback: 0.3,
+            }),
+            ..OscillatorControls::default()
+        };
+        OnsetEvent::new(0, 440.0, 0.5, 0.2).with_controls(controls)
+    };
+    for rate in [64_u32, 128, 1] {
+        let pcm = render_pcm(&mut ScalarBackend::new(), rate, 512, &[event()])
+            .unwrap_or_else(|error| panic!("render at {rate} Hz: {error}"));
+        assert!(
+            pcm.iter().all(|sample| sample.is_finite()),
+            "delay at {rate} Hz left non-finite samples"
+        );
+    }
+}
+
+/// A rate above the sample clock advances an LFO by more than a whole
+/// cycle a sample, and a negative rate walks below zero. Both must stay
+/// wrapped in `[0, 1)`: at 72 kHz over a 48 kHz clock the phase walks
+/// 0, 0.5, 0, 0.5 and a full-depth tremolo alternates sample to sample
+/// instead of walking out of its range and sticking.
+#[test]
+fn lfo_phases_wrap_for_rates_above_and_below_the_sample_clock() {
+    let render_with = |rate: f32| {
+        let controls = OscillatorControls {
+            tremolo: Some(rustel_audio::TremoloControls {
+                frequency_hz: rate,
+                depth: 1.0,
+                skew: 1.0,
+                shape: 0,
+                phase_offset: 0.0,
+                time_secs: 0.0,
+            }),
+            ..OscillatorControls::default()
+        };
+        let event = OnsetEvent::new(0, 440.0, 0.5, 0.5)
+            .with_optional_synth(Some(rustel_audio::SynthSource::One))
+            .with_controls(controls);
+        render_pcm(&mut ScalarBackend::new(), 48_000, 2_000, &[event])
+            .unwrap_or_else(|error| panic!("render: {error}"))
+    };
+
+    // The aliased 24 kHz alternation still runs well past the first wrap.
+    let aliased = render_with(72_000.0);
+    for frame in (1_000..1_900).step_by(2) {
+        assert!(
+            aliased[frame * 2] < 0.005,
+            "the wrapped phase must keep visiting 0, not drift past the cycle"
+        );
+        assert!(
+            aliased[(frame + 1) * 2] > 0.03,
+            "the wrapped phase must keep visiting 0.5"
+        );
+    }
+
+    // A negative rate stays in the cycle too: wrapped in the positive
+    // direction, its gain keeps moving instead of sticking at a clamp.
+    let negative = render_with(-100.0);
+    let drift = (900..1_500)
+        .map(|frame| negative[frame * 2])
+        .fold(None::<(f32, f32)>, |spread, value| match spread {
+            None => Some((value, value)),
+            Some((low, high)) => Some((low.min(value), high.max(value))),
+        })
+        .expect("samples");
+    assert!(
+        drift.1 - drift.0 > 0.1,
+        "a negative rate must keep moving through its cycle, spread {drift:?}"
+    );
+}
+
+/// A render longer than the backend's pending-event ceiling still sounds
+/// every event: admission follows the output, so the short events drain as
+/// the render advances and the final tone is retained.
+#[test]
+fn a_render_past_the_pending_ceiling_keeps_its_final_event() {
+    let spacing = 64u64;
+    let mut events: Vec<_> = (0..rustel_audio::MAX_PENDING_EVENTS as u64)
+        .map(|index| OnsetEvent::new(index * spacing, 440.0, 0.05, 0.001))
+        .collect();
+    let tone_at = rustel_audio::MAX_PENDING_EVENTS as u64 * spacing + 128;
+    events.push(OnsetEvent::new(tone_at, 220.0, 0.8, 0.25));
+    let frames = tone_at as usize + 48_000;
+    let pcm = render_pcm(&mut ScalarBackend::new(), 48_000, frames, &events)
+        .unwrap_or_else(|error| panic!("render: {error}"));
+    let tone = &pcm[tone_at as usize * 2..];
+    assert!(
+        tone.iter().any(|sample| sample.abs() > 0.01),
+        "the tone after a full pending queue of short events must still sound"
+    );
+}
+
+/// Events that create no voice - a sample not installed at onset, a muted
+/// event - must not spend the active-voice ceiling: the valid tone after a
+/// full segment of them still sounds.
+#[test]
+fn events_without_a_voice_do_not_spend_the_voice_ceiling() {
+    let missing = || {
+        OnsetEvent::new(0, 0.0, 1.0, 0.1).with_sample(SampleControls {
+            sample: rustel_audio::SampleId(9_999),
+            playback_rate: 1.0,
+            begin: 0.0,
+            end: 1.0,
+            hold: SampleHold::Slice,
+            muted: false,
+            loop_secs: None,
+            envelope_peak: 1.0,
+            reversed: false,
+            nudge_secs: 0.0,
+            cut: None,
+        })
+    };
+    let muted = || {
+        OnsetEvent::new(0, 0.0, 1.0, 0.1).with_sample(SampleControls {
+            sample: BUNDLED_BD_SAMPLE_ID,
+            playback_rate: 1.0,
+            begin: 0.0,
+            end: 1.0,
+            hold: SampleHold::Slice,
+            muted: true,
+            loop_secs: None,
+            envelope_peak: 1.0,
+            reversed: false,
+            nudge_secs: 0.0,
+            cut: None,
+        })
+    };
+    for voiceless in [missing, muted] {
+        let mut events: Vec<_> = (0..rustel_audio::MAX_ACTIVE_VOICES)
+            .map(|_| voiceless())
+            .collect();
+        events.push(OnsetEvent::new(0, 440.0, 0.8, 0.2));
+        let pcm = render_pcm(&mut ScalarBackend::new(), 48_000, 4_800, &events)
+            .unwrap_or_else(|error| panic!("render: {error}"));
+        assert!(
+            pcm.iter().any(|sample| sample.abs() > 0.001),
+            "the valid tone after a segment of voice-less events must still sound"
+        );
+    }
+}
+
 /// A looped sample is silent for the whole hap while its step is longer than
 /// its loop, and sounds to the end of the hap at a step that fits.
 #[test]

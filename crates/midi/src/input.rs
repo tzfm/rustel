@@ -67,6 +67,10 @@ pub enum MidiEvent {
     Continue,
     Stop,
     ActiveSensing,
+    /// A packet the decoder does not model: a system-exclusive message or
+    /// an undefined status byte, delivered to a listener that shows raw
+    /// bytes.
+    Raw,
 }
 
 impl MidiEvent {
@@ -99,6 +103,7 @@ impl MidiEvent {
             Self::Continue => "continue",
             Self::Stop => "stop",
             Self::ActiveSensing => "active-sensing",
+            Self::Raw => "raw",
         }
     }
 }
@@ -168,6 +173,17 @@ pub fn decode(bytes: &[u8]) -> Option<MidiEvent> {
     })
 }
 
+/// The one dispatch both listeners share: a modeled packet carries its
+/// event, and an unmodeled one reaches only a listener that shows raw
+/// bytes, as the packet itself.
+fn dispatch(bytes: &[u8], pass_raw: bool) -> Option<MidiEvent> {
+    match decode(bytes) {
+        Some(event) => Some(event),
+        None if pass_raw => Some(MidiEvent::Raw),
+        None => None,
+    }
+}
+
 /// A MIDI note number as a name, for a display a musician can read.
 ///
 /// Octave numbering matches `note_to_midi`'s: middle C (60) is c4 there, so
@@ -210,7 +226,7 @@ impl MidiListener {
     where
         F: FnMut(u64, MidiEvent, &[u8]) + Send + 'static,
     {
-        Self::open_filtered(selector, midir::Ignore::None, on_message)
+        Self::open_with_raw(selector, midir::Ignore::None, true, on_message)
     }
 
     /// Open an input, letting the caller choose what the driver filters out.
@@ -223,6 +239,23 @@ impl MidiListener {
     pub fn open_filtered<F>(
         selector: Option<&str>,
         ignore: midir::Ignore,
+        on_message: F,
+    ) -> Result<Self, String>
+    where
+        F: FnMut(u64, MidiEvent, &[u8]) + Send + 'static,
+    {
+        Self::open_with_raw(selector, ignore, false, on_message)
+    }
+
+    /// Open an input, deciding whether a packet the decoder does not model
+    /// still reaches the listener. The monitor says yes: showing a musician
+    /// everything their device sends is its whole job, and the packet
+    /// arrives as [`MidiEvent::Raw`] with its original bytes. A
+    /// score-facing listener keeps the filtering it always had.
+    fn open_with_raw<F>(
+        selector: Option<&str>,
+        ignore: midir::Ignore,
+        pass_raw: bool,
         mut on_message: F,
     ) -> Result<Self, String>
     where
@@ -248,7 +281,7 @@ impl MidiListener {
                 port,
                 "rustel-in",
                 move |micros, bytes, _| {
-                    if let Some(event) = decode(bytes) {
+                    if let Some(event) = dispatch(bytes, pass_raw) {
                         on_message(micros, event, bytes);
                     }
                 },
@@ -461,5 +494,32 @@ mod tests {
         assert_eq!((controller, low, high, count), (74, 3, 127, 4));
         assert_eq!(summary.channels, vec![1]);
         assert_eq!(summary.total, 5);
+    }
+
+    /// A packet the decoder does not model reaches a listener that shows
+    /// raw bytes, as the packet itself; a score-facing listener never sees
+    /// one.
+    #[test]
+    fn unmodeled_packets_reach_only_a_raw_listener() {
+        use super::*;
+
+        // System-exclusive and an undefined status byte.
+        for packet in [&[0xf0_u8, 0x01, 0xf7][..], &[0xf1_u8][..]] {
+            assert_eq!(decode(packet), None, "{packet:?} is not modeled");
+            assert_eq!(
+                dispatch(packet, true),
+                Some(MidiEvent::Raw),
+                "{packet:?} reaches a raw listener"
+            );
+            assert_eq!(
+                dispatch(packet, false),
+                None,
+                "{packet:?} is filtered for a typed listener"
+            );
+        }
+        // A modeled packet is unaffected by the choice.
+        assert_eq!(dispatch(&[0x90, 60, 100], false), decode(&[0x90, 60, 100]));
+        assert_eq!(MidiEvent::Raw.kind(), "raw");
+        assert_eq!(MidiEvent::Raw.channel(), None);
     }
 }

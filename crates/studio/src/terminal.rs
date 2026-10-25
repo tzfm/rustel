@@ -274,7 +274,9 @@ impl TerminalFeatures {
             symbols,
         };
         if let Some(answers) = ask_terminal() {
-            features.apply_answers(parse_answers(&answers));
+            let (replies, keys) = split_probe_bytes(&answers);
+            features.apply_answers(parse_answers(&replies));
+            HELD_KEYS.with(|held| held.borrow_mut().extend(keys));
         }
         features
     }
@@ -942,6 +944,7 @@ pub mod profiles {
 
     #[cfg(test)]
     mod tests {
+
         use super::super::super::keybinds::KeyCombo;
 
         /// The shipped table parses, and every row is a chord the preferences
@@ -1588,6 +1591,163 @@ fn parse_answers(bytes: &[u8]) -> Answers {
     answers
 }
 
+#[cfg(unix)]
+thread_local! {
+    /// Keys typed while the startup probe owned stdin, handed back to the
+    /// reader one by one so they reach the editor exactly once.
+    static HELD_KEYS: std::cell::RefCell<std::collections::VecDeque<crossterm::event::Event>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+/// Split the probe window's bytes into the terminal's replies and the keys
+/// typed while it ran. A key is a bare byte, or a CSI sequence a terminal
+/// never answers a capability query with: an arrow, home, end, or a `~`
+/// form. Everything else stays a reply, as the whole window was before.
+#[cfg(unix)]
+fn split_probe_bytes(bytes: &[u8]) -> (Vec<u8>, Vec<crossterm::event::Event>) {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let plain_key = |byte: u8| {
+        let (code, modifiers) = match byte {
+            b'\r' | b'\n' => (KeyCode::Enter, KeyModifiers::NONE),
+            b'\t' => (KeyCode::Tab, KeyModifiers::NONE),
+            0x7f => (KeyCode::Backspace, KeyModifiers::NONE),
+            0x20..=0x7e => {
+                let code = KeyCode::Char(byte as char);
+                let modifiers = if byte.is_ascii_uppercase() {
+                    KeyModifiers::SHIFT
+                } else {
+                    KeyModifiers::NONE
+                };
+                (code, modifiers)
+            }
+            0x01..=0x1a => (
+                // Ctrl plus a letter arrives as the letter's control value:
+                // 0x03 is Ctrl+C, and it must reach the editor as 'c'.
+                KeyCode::Char((byte + b'a' - 1) as char),
+                KeyModifiers::CONTROL,
+            ),
+            _ => return None,
+        };
+        Some(KeyEvent::new(code, modifiers))
+    };
+    let csi_key = |params: &[u8], final_byte: u8| {
+        let code = match final_byte {
+            b'A' if params.is_empty() => KeyCode::Up,
+            b'B' if params.is_empty() => KeyCode::Down,
+            b'C' if params.is_empty() => KeyCode::Right,
+            b'D' if params.is_empty() => KeyCode::Left,
+            b'H' if params.is_empty() => KeyCode::Home,
+            b'F' if params.is_empty() => KeyCode::End,
+            b'~' => match params {
+                b"1" | b"7" => KeyCode::Home,
+                b"2" => KeyCode::Insert,
+                b"3" => KeyCode::Delete,
+                b"4" | b"8" => KeyCode::End,
+                b"5" => KeyCode::PageUp,
+                b"6" => KeyCode::PageDown,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some(KeyEvent::new(code, KeyModifiers::NONE))
+    };
+
+    let mut replies = Vec::new();
+    let mut keys = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != 0x1b {
+            match plain_key(bytes[index]) {
+                Some(event) => keys.push(crossterm::event::Event::Key(event)),
+                None => replies.push(bytes[index]),
+            }
+            index += 1;
+            continue;
+        }
+        match bytes.get(index + 1) {
+            Some(b'[') => {
+                // Scan to the CSI final byte in 0x40..=0x7e.
+                let mut end = index + 2;
+                while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
+                    end += 1;
+                }
+                if end >= bytes.len() {
+                    replies.extend_from_slice(&bytes[index..]);
+                    break;
+                }
+                if let Some(event) = csi_key(&bytes[index + 2..end], bytes[end]) {
+                    keys.push(crossterm::event::Event::Key(event));
+                } else {
+                    replies.extend_from_slice(&bytes[index..=end]);
+                }
+                index = end + 1;
+            }
+            // SS3: F1-F4 arrive as ESC O P/Q/R/S.
+            Some(b'O') => match bytes.get(index + 2) {
+                Some(b'P') => {
+                    keys.push(crossterm::event::Event::Key(KeyEvent::new(
+                        KeyCode::F(1),
+                        KeyModifiers::NONE,
+                    )));
+                    index += 3;
+                }
+                Some(b'Q') => {
+                    keys.push(crossterm::event::Event::Key(KeyEvent::new(
+                        KeyCode::F(2),
+                        KeyModifiers::NONE,
+                    )));
+                    index += 3;
+                }
+                Some(b'R') => {
+                    keys.push(crossterm::event::Event::Key(KeyEvent::new(
+                        KeyCode::F(3),
+                        KeyModifiers::NONE,
+                    )));
+                    index += 3;
+                }
+                Some(b'S') => {
+                    keys.push(crossterm::event::Event::Key(KeyEvent::new(
+                        KeyCode::F(4),
+                        KeyModifiers::NONE,
+                    )));
+                    index += 3;
+                }
+                _ => {
+                    replies.extend_from_slice(&bytes[index..(index + 3).min(bytes.len())]);
+                    index = (index + 3).min(bytes.len());
+                }
+            },
+            Some(b']' | b'P' | b'_' | b'^' | b'X') => {
+                // OSC and friends run to ST (ESC \) or BEL.
+                let mut end = index + 2;
+                while end < bytes.len() {
+                    if bytes[end] == 0x07 {
+                        end += 1;
+                        break;
+                    }
+                    if bytes[end] == 0x1b && bytes.get(end + 1) == Some(&b'\\') {
+                        end += 2;
+                        break;
+                    }
+                    end += 1;
+                }
+                replies.extend_from_slice(&bytes[index..end.min(bytes.len())]);
+                index = end.min(bytes.len());
+            }
+            Some(_) => {
+                replies.extend_from_slice(&bytes[index..index + 2]);
+                index += 2;
+            }
+            None => {
+                replies.push(0x1b);
+                break;
+            }
+        }
+    }
+    (replies, keys)
+}
+
 #[cfg(any(unix, windows))]
 const TERMINAL_CAPABILITY_QUERY: &[u8] =
     b"\x1b[?2026$p\x1b[?1016$p\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[c";
@@ -2023,6 +2183,9 @@ impl TerminalSession {
         }
         #[cfg(unix)]
         {
+            if HELD_KEYS.with(|held| !held.borrow().is_empty()) {
+                return Ok(true);
+            }
             if self.note_hangup() {
                 return Ok(false);
             }
@@ -2061,6 +2224,10 @@ impl TerminalSession {
     }
 
     pub fn read_event(&self) -> io::Result<crossterm::event::Event> {
+        #[cfg(unix)]
+        if let Some(event) = HELD_KEYS.with(|held| held.borrow_mut().pop_front()) {
+            return Ok(event);
+        }
         #[cfg(windows)]
         if let Some(input) = self.windows_input.borrow_mut().as_mut() {
             let event = input.read()?;
@@ -2924,6 +3091,53 @@ mod tests {
         assert_eq!(
             parse_answers(b"\x1b_Gi=32;OK\x1b\\\x1b[?2026;20$y\x1b[6;20;10;99t"),
             Answers::default()
+        );
+    }
+    /// Keys typed while the startup probe owned stdin must survive: the
+    /// probe window splits into the terminal's replies and the keys, and
+    /// the keys come back as events exactly once.
+    #[cfg(unix)]
+    #[test]
+    fn probe_bytes_split_into_replies_and_typed_keys() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        // A DECRQM reply, a typed x, an arrow, another reply fragment, a
+        // typed Enter, and the DA1 close.
+        let stream = b"\x1b[?2026;2$yx\x1b[D\x1b[?1016;2$y\r\x1b[?62;4c";
+        let (replies, keys) = crate::terminal::split_probe_bytes(stream);
+        assert_eq!(
+            replies, b"\x1b[?2026;2$y\x1b[?1016;2$y\x1b[?62;4c",
+            "the capability replies stay whole for the parser"
+        );
+        assert_eq!(
+            keys,
+            vec![
+                Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ],
+            "the typed keys come back in order"
+        );
+
+        // A split reply at the window's end is a reply, not a key.
+        let (replies, _) = crate::terminal::split_probe_bytes(b"\x1b[?20");
+        assert_eq!(replies, b"\x1b[?20");
+
+        // SS3 function keys come through as themselves.
+        let (_, keys) = crate::terminal::split_probe_bytes(b"\x1bOP");
+        assert_eq!(
+            keys,
+            vec![Event::Key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE))]
+        );
+
+        // A control chord names its letter: 0x03 is Ctrl+C, 0x13 Ctrl+S.
+        let (_, keys) = crate::terminal::split_probe_bytes(&[0x03, 0x13]);
+        assert_eq!(
+            keys,
+            vec![
+                Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            ]
         );
     }
 }

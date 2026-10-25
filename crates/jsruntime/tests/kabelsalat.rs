@@ -266,3 +266,68 @@ fn graph_helpers_outside_k_report_the_required_context() {
         assert!(error.contains("inside K()"), "{error}");
     }
 }
+
+/// A `length` past `i32::MAX` is a claim a score controls, not storage.
+/// Every host read of it must return the graph's bounded-input error rather
+/// than rquickjs' own length read, which panics on such an array. Each
+/// refusal arrives as query silence, with the paired small claim sounding.
+#[test]
+fn oversized_array_claims_are_refused_without_panicking() {
+    let runtime = runtime();
+    // Graph source runs while the query compiles it: `map` reads a poly
+    // node's `ins`, `asModuleInput` reads the array an earlier call
+    // installed, and `dfs` reads the visited array the score passed in.
+    let graph_pairs = [
+        (
+            "worklet('const p = sine([2, 3]); p.map(x => x).out()')",
+            "worklet('const p = sine([2, 3]); p.ins.length = 2 ** 31; p.map(x => x).out()')",
+        ),
+        (
+            "worklet('n(2).asModuleInput(1, 0).sine().mul(.1).out()')",
+            "worklet('const m = n(2).asModuleInput(1, 0); m.inputOf.length = 2 ** 31;\
+             m.asModuleInput(1, 0).sine().mul(.1).out()')",
+        ),
+        (
+            "worklet('n(2).dfs(x => x).sine().mul(.1).out()')",
+            "worklet('const visited = []; visited.length = 2 ** 31;\
+             n(2).dfs(x => x, visited).sine().mul(.1).out()')",
+        ),
+    ];
+    for (small, oversized) in graph_pairs {
+        for (source, expected) in [(small, 1), (oversized, 0)] {
+            runtime
+                .evaluate_score(source, &TranspileOptions::default())
+                .unwrap_or_else(|error| panic!("{source}: {error}"));
+            let haps = runtime
+                .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
+                .unwrap_or_else(|error| panic!("{source}: {error}"));
+            assert_eq!(haps.len(), expected, "{source}");
+        }
+    }
+
+    // Worklet inputs and FX chains are read during the same query-side
+    // compile, so the refusal arrives as query silence rather than an unwind.
+    let event_pairs = [
+        (
+            "pure(0).fmap(() => ({freq: 110, workletSrc: 'n(sFreq + pat[0]).out()', workletInputs: [2]}))",
+            "pure(0).fmap(() => { const a = [2]; a.length = 2 ** 31;\
+             return {freq: 110, workletSrc: 'n(sFreq + pat[0]).out()', workletInputs: a}; })",
+        ),
+        (
+            "pure(0).fmap(() => ({freq: 110, workletSrc: 'n(sFreq).out()', FX: []}))",
+            "pure(0).fmap(() => { const fx = []; fx.length = 2 ** 31;\
+             return {freq: 110, workletSrc: 'n(sFreq).out()', FX: fx}; })",
+        ),
+    ];
+    for (small, oversized) in event_pairs {
+        for (source, expected) in [(small, 1), (oversized, 0)] {
+            runtime
+                .evaluate_score(source, &TranspileOptions::default())
+                .unwrap_or_else(|error| panic!("{source}: {error}"));
+            let haps = runtime
+                .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
+                .unwrap_or_else(|error| panic!("{source}: {error}"));
+            assert_eq!(haps.len(), expected, "{source}");
+        }
+    }
+}

@@ -36,7 +36,15 @@ impl OrbitDelay {
     #[inline]
     pub(super) fn read(line: &[f32], write: usize, delay_frames: f32) -> f32 {
         let len = line.len();
-        let delay_frames = delay_frames.clamp(128.0, (len - 1) as f32);
+        if len == 0 {
+            return 0.0;
+        }
+        // A sample rate under 16 kHz gives a line shorter than the
+        // 128-frame quantum; the floor yields to the line's own end so the
+        // clamp stays a range.
+        let ceiling = (len - 1) as f32;
+        let floor = 128.0_f32.min(ceiling);
+        let delay_frames = delay_frames.clamp(floor, ceiling);
         let whole = delay_frames.floor() as usize;
         let fraction = delay_frames - whole as f32;
         let newer = (write + len - whole) % len;
@@ -274,8 +282,8 @@ pub(super) fn apply_fx_stage(
                 .tremolo_phase
                 .get_or_insert_with(|| lfo_phase0(tr.time_secs, tr.frequency_hz, tr.phase_offset));
             let raw = lfo_waveshape(tr.shape, phase, tr.skew) * tr.depth;
-            let next = phase + f64::from(tr.frequency_hz) / f64::from(sample_rate);
-            state.tremolo_phase = Some(if next > 1.0 { next - 1.0 } else { next });
+            let next = wrap_phase(phase + f64::from(tr.frequency_hz) / f64::from(sample_rate));
+            state.tremolo_phase = Some(next);
             let gain = base + raw.powf(1.5).clamp(0.0, 1.0);
             // A NaN sum gives the gain its default.
             if gain.is_nan() { 1.0 } else { gain }
@@ -324,8 +332,8 @@ pub(super) fn apply_fx_stage(
                 .phaser_phase
                 .get_or_insert_with(|| lfo_phase0(ph.time_secs, ph.rate_hz, 0.0));
             let raw = (lfo_waveshape(0, phase, 0.5) - 0.5) * lfo_depth;
-            let next = phase + f64::from(ph.rate_hz) / f64::from(sample_rate);
-            state.phaser_phase = Some(if next > 1.0 { next - 1.0 } else { next });
+            let next = wrap_phase(phase + f64::from(ph.rate_hz) / f64::from(sample_rate));
+            state.phaser_phase = Some(next);
             js_clamp(raw, -sweep, sweep)
         } else {
             0.0

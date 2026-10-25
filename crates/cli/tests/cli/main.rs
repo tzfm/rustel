@@ -9314,3 +9314,81 @@ fn misspelled_commands_with_arguments_offer_a_hint() {
 }
 
 mod diagnostics;
+
+/// A later cue whose atomic write fails is reported as a failed save. The
+/// protocol must not announce that cue as active while the watched file
+/// still holds the older save.
+#[test]
+fn a_replay_save_that_never_reached_the_score_is_reported_not_announced() {
+    let quiet = r#"note("c4").gain(0.2)"#;
+    let tape = installed_tape(
+        "replay-io-fail.rustel-session",
+        &[(0.0, quiet), (1.0, quiet)],
+    );
+    let out = scratch("replay-io-fail.strudel");
+    // The later cue's atomic-write staging path, occupied by a directory so
+    // the write cannot land.
+    let staging = out.with_extension("rustel.replay-tmp");
+    let _ = std::fs::remove_file(&staging);
+    std::fs::create_dir_all(&staging).expect("stage the failure");
+
+    let mut child = rustel()
+        .args([
+            "replay",
+            tape.to_str().expect("UTF-8 tape"),
+            "--out",
+            out.to_str().expect("UTF-8 target"),
+            "--json",
+        ])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn replay");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (lines, done) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if lines.send(line).is_err() {
+                return;
+            }
+        }
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut saw_failure = false;
+    let mut saw_any_active = false;
+    while std::time::Instant::now() < deadline {
+        match done.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(line) => {
+                if line.contains("replay_save_failed") {
+                    saw_failure = true;
+                }
+                if line.contains("\"score_active\"") {
+                    saw_any_active = true;
+                }
+                if saw_failure {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        saw_failure,
+        "the failed delivery must be reported on stderr"
+    );
+    assert!(
+        !saw_any_active,
+        "a cue whose save never reached the score must not be announced active"
+    );
+    let _ = std::fs::remove_dir_all(&staging);
+    for path in [tape, out] {
+        let _ = std::fs::remove_file(path);
+    }
+}

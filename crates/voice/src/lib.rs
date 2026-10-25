@@ -140,6 +140,29 @@ mod classification_tests {
             &Lookup::Unknown,
         )
         .expect("a banked oscillator name falls back to the oscillator");
+
+        // A dedicated synth name under a bank follows the sample path both
+        // ways: the bank's asset plays when it has one, and the normal
+        // unknown-sound refusal names the bank when it does not.
+        let event = detailed(
+            &json!({ "s": "supersaw", "bank": "my_bank" }),
+            &Lookup::Found,
+        )
+        .expect("the banked asset resolves");
+        assert!(event.sample.is_some(), "the found asset is the sound");
+        assert!(
+            event.synth.is_none(),
+            "the synth the plain name names does not take over"
+        );
+        assert_eq!(
+            refusal(
+                &json!({ "s": "supersaw", "bank": "my_bank" }),
+                &Lookup::Unknown
+            ),
+            VoiceError::UnknownSound(
+                "my_bank_supersaw is not loaded - that layer stays silent, the rest plays".into(),
+            )
+        );
     }
 
     #[test]
@@ -1030,6 +1053,46 @@ mod tests {
         }
     }
 
+    // A banked wavetable and its direct spelling must classify the same:
+    // the gates test the bank-prefixed name, as selection does.
+    #[test]
+    fn a_banked_wavetable_gates_like_its_direct_spelling() {
+        let mods = |json: &str| {
+            modulator_controls(&object(json), 1.0, 0.1, 0.0, 0.5, 220.0).expect("no refusal")
+        };
+        // An oscillator name under a bank that lacks it falls back to the
+        // oscillator, and its pitch still rides the frequency.
+        let (banked, _, _) = mods(
+            r#"{"s": "sine", "bank": "no_such_bank", "lfo": {"a": {"control": "note", "rate": 2}}}"#,
+        );
+        let slot = banked[0].expect("the fallback oscillator resolves the pitch target");
+        assert_eq!(
+            slot.param_base, 220.0,
+            "a banked-but-missing oscillator rides its frequency, not detune"
+        );
+
+        for control in ["note", "s", "freq", "frequency", "wt", "detune", "warp"] {
+            let lfo = format!(r#""lfo": {{"a": {{"control": "{control}", "rate": 2}}}}"#);
+            let direct = format!(r#"{{"s": "wt_digital_basique", {lfo}}}"#);
+            let banked = format!(r#"{{"s": "basique", "bank": "wt_digital", {lfo}}}"#);
+            let (direct, _, _) = mods(&direct);
+            let (banked, _, _) = mods(&banked);
+            let direct = &direct[0];
+            let banked = &banked[0];
+            match (direct, banked) {
+                (Some(direct), Some(banked)) => {
+                    assert_eq!(
+                        (direct.param_base, direct.min, direct.max),
+                        (banked.param_base, banked.min, banked.max),
+                        "{control} modulates both spellings the same way"
+                    );
+                }
+                (None, None) => {}
+                pair => panic!("{control}: the gate differs between spellings: {pair:?}"),
+            }
+        }
+    }
+
     // Synth pitch modulation uses frequency; samples use detune in cents with base 0.
     #[test]
     fn a_pitch_modulator_rides_detune_on_a_sample_and_frequency_on_a_synth() {
@@ -1909,6 +1972,35 @@ pub fn native_synth_yields_to_sample(name: &str) -> bool {
     name == "one"
 }
 
+/// The sound names [`synth_source`] claims as a source of its own, distinct
+/// from the basic oscillator names. Keep the two lists in step.
+const DEDICATED_SYNTH_SOUNDS: &[&str] = &[
+    "one",
+    "white",
+    "pink",
+    "brown",
+    "crackle",
+    "zzfx",
+    "z_sine",
+    "z_sawtooth",
+    "z_triangle",
+    "z_square",
+    "z_tan",
+    "z_noise",
+    "bytebeat",
+    "in",
+    "bus",
+    "supersaw",
+    "pulse",
+    "sbd",
+];
+
+/// True when a sound name names a dedicated synth source, so an explicit
+/// bank that lacks it refuses rather than falling back to an oscillator.
+fn is_dedicated_synth_sound(name: &str) -> bool {
+    DEDICATED_SYNTH_SOUNDS.contains(&name)
+}
+
 /// True when a sound name is generated entirely by the native voice engine.
 ///
 /// These names need no preload when no sample bank claims them. Oscillator
@@ -1939,7 +2031,18 @@ fn source_pitch_rides_detune(object: &serde_json::Map<String, serde_json::Value>
     match object.get("s").and_then(serde_json::Value::as_str) {
         // No sound named at all is the default oscillator.
         None => false,
-        Some(name) => !is_native_synth_sound(name) && !name.starts_with("wt_"),
+        Some(name) => {
+            // A banked table counts as the `wt_` name it resolves to, as
+            // selection does. A native synth name keeps its oscillator
+            // under a bank that lacks it, and an oscillator rides its
+            // frequency: only a sample rides detune.
+            let banked = bank_prefixed(object, name).ok().flatten();
+            let wavetable = name.starts_with("wt_")
+                || banked
+                    .as_deref()
+                    .is_some_and(|banked| banked.starts_with("wt_"));
+            !wavetable && !is_native_synth_sound(name)
+        }
     }
 }
 
@@ -2440,9 +2543,11 @@ fn resolve_voice_at(
             let synth = if plays_plugin {
                 None
             } else {
-                // A sample named `one` is the sound, not the constant signal.
-                synth_source(object, duration_secs, target_time)?
-                    .filter(|synth| !(sample.is_some() && *synth == rustel_audio::SynthSource::One))
+                // A resolved sample is the sound, not a starting point for
+                // the synth its unbanked name names: `s("supersaw").bank("my_bank")`
+                // plays the bank's supersaw when the bank has one. A sample
+                // named `one` already followed this rule.
+                synth_source(object, duration_secs, target_time)?.filter(|_| sample.is_none())
             };
             // One cycle is one bar of 4 quarter notes.
             let clocked = |plugin: rustel_audio::InsertControls| {
@@ -3209,6 +3314,19 @@ pub fn bank_prefixed(
     }
 }
 
+/// The name a wavetable gate tests: the raw `s` with the bank prefix
+/// applied, so `s("basique").bank("wt_digital")` counts as the `wt_` name it
+/// resolves to. Mirrors [`wavetable_controls`]'s own prefixing.
+fn banked_source_name(object: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let name = object.get("s").and_then(serde_json::Value::as_str)?;
+    Some(
+        bank_prefixed(object, name)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| name.to_owned()),
+    )
+}
+
 /// `wt_`-named sounds route to the wavetable oscillator.
 fn wavetable_controls(
     object: &serde_json::Map<String, serde_json::Value>,
@@ -3591,7 +3709,19 @@ fn sample_controls(
             }
             // Not a sample: the oscillator path decides whether the name
             // means anything (and refuses loudly when it does not).
-            SampleResolution::Unknown => return Ok(None),
+            SampleResolution::Unknown => {
+                // An explicitly banked name a dedicated synth would claim
+                // has no oscillator fallback: the score asked the bank for
+                // that sound, and the bank does not have it. A basic
+                // oscillator name keeps its oscillator, as
+                // `s('sine').bank(...)` always had.
+                if banked_name && is_dedicated_synth_sound(plain) {
+                    return Err(VoiceError::UnknownSound(format!(
+                        "{name} is not loaded - that layer stays silent, the rest plays"
+                    )));
+                }
+                return Ok(None);
+            }
         };
     // A soundfont zone plays at its note's pitch, from its start: `speed`,
     // `begin`/`end`, `unit`, `cut` and `nudge` do not reach it.
@@ -4310,8 +4440,8 @@ fn modulator_controls(
             // Only the wavetable and supersaw oscillators have `detune` and
             // `spread` params. No other source has such a param to ride.
             "detune" | "spread" => {
-                let source = object.get("s").and_then(serde_json::Value::as_str)?;
-                if !source.starts_with("wt_") && source != "supersaw" {
+                let source = banked_source_name(object)?;
+                if !source.starts_with("wt_") && source.as_str() != "supersaw" {
                     return None;
                 }
                 if control == "detune" {
@@ -4329,7 +4459,11 @@ fn modulator_controls(
                         object
                             .get("spread")
                             .and_then(serde_json::Value::as_f64)
-                            .unwrap_or(if source == "supersaw" { 0.6 } else { 0.7 }),
+                            .unwrap_or(if source.as_str() == "supersaw" {
+                                0.6
+                            } else {
+                                0.7
+                            }),
                         false,
                     ))
                 }
@@ -4338,7 +4472,7 @@ fn modulator_controls(
             // same rules as the position pair below - `warpdc` is absent for
             // the same reason `wtdc` is.
             "warp" | "warprate" | "warpsync" | "warpdepth" | "warpskew" => {
-                let source = object.get("s").and_then(serde_json::Value::as_str)?;
+                let source = banked_source_name(object)?;
                 if !source.starts_with("wt_") {
                     return None;
                 }
@@ -4383,7 +4517,7 @@ fn modulator_controls(
             // (a `dc`/`dcoffset` param-name mismatch throws), so neither can
             // a score here.
             "wt" | "wtrate" | "wtsync" | "wtdepth" | "wtskew" => {
-                let source = object.get("s").and_then(serde_json::Value::as_str)?;
+                let source = banked_source_name(object)?;
                 if !source.starts_with("wt_") {
                     return None;
                 }

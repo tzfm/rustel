@@ -914,7 +914,9 @@ impl SceneSet {
         if self.name() == name {
             return Ok(target);
         }
-        if target.exists() {
+        // A path that only differs in case can still be this set's own
+        // folder on a filesystem that folds case; that rename goes through.
+        if target.exists() && !same_file_system_path(&target, &self.directory) {
             return Err(SceneError::NameTaken(name.to_owned()));
         }
         std::fs::rename(&self.directory, &target)?;
@@ -1412,7 +1414,9 @@ impl SceneSet {
         let target = scene
             .path
             .with_file_name(format!("{name}.{SCENE_EXTENSION}"));
-        if target.exists() {
+        // A case-only change of this scene's own file goes through on a
+        // filesystem that folds case.
+        if target.exists() && !same_file_system_path(&target, &scene.path) {
             return Err(SceneError::NameTaken(name.to_owned()));
         }
         if scene.path.exists() {
@@ -1815,6 +1819,20 @@ pub fn replay_name(path: &Path) -> String {
         .unwrap_or(stem)
 }
 
+/// Whether two paths name the same file: on a filesystem that folds letter
+/// case, a path with different capitalization still resolves to it, so a
+/// case-only rename changes the name it shows rather than replacing
+/// another file.
+pub(crate) fn same_file_system_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 40
@@ -1926,6 +1944,22 @@ mod size_limit_tests {
 }
 #[cfg(test)]
 mod tests {
+    /// A rename that only changes capitalization is this set's own folder
+    /// or file under another spelling: it goes through on a filesystem that
+    /// folds case, instead of being read as another set's name.
+    #[test]
+    fn a_case_only_rename_of_the_same_set_and_scene_goes_through() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut set =
+            SceneSet::create_in(root.path(), "october", "$: s(\"bd\")").expect("create set");
+        set.rename_set("October")
+            .expect("a case-only set rename goes through");
+        assert_eq!(set.name(), "October");
+        set.rename_current("Scene 1")
+            .expect("a case-only scene rename goes through");
+        assert_eq!(set.scenes[set.current].name(), "Scene 1");
+    }
+
     use super::*;
 
     fn write(directory: &Path, name: &str, text: &str) {

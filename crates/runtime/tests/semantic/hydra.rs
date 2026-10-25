@@ -783,3 +783,52 @@ fn a_solid_of_smoothed_arrays_inside_an_image_chain_composes() {
         .unwrap_or_else(|error| panic!("the o0 chain composes: {error}"));
     assert!(shader.contains("solid("), "{shader}");
 }
+
+#[test]
+fn a_failed_restoration_does_not_wedge_later_scores() {
+    // A score that locks one borrowed name can fail the restoration that
+    // gives the names back. The next score may see that failure, but the one
+    // after it must recover: the restoration clears its state even when one
+    // name refuses.
+    let mut session = Session::new().expect("session");
+    session
+        .evaluate(
+            "await initHydra()\n\
+             Object.defineProperty(globalThis, 'osc', { configurable: false });\n\
+             $: s(\"bd\")",
+        )
+        .expect("the visuals install and the score plays");
+    // This evaluation restores first and may fail on the locked `osc`.
+    let _ = session.evaluate("$: s(\"bd\")");
+    let recovered = session.evaluate("$: s(\"bd sd\")");
+    recovered.expect("a later score must recover from the failed restoration");
+    let haps = session
+        .query(
+            rustel_fraction::Fraction::ZERO,
+            rustel_fraction::Fraction::ONE,
+        )
+        .expect("query");
+    assert_eq!(haps.len(), 2);
+
+    // A slot the score locked non-configurable but writable still gets the
+    // engine value written back, so the name answers again at once.
+    let mut session = Session::new().expect("session");
+    session
+        .evaluate(
+            "await initHydra()\n\
+             Object.defineProperty(globalThis, 'speed', {\n\
+               value: 0, writable: true, configurable: false });\n\
+             $: s(\"bd\")",
+        )
+        .expect("the visuals install over the locked slot");
+    session
+        .evaluate("$: note(\"c e g\")")
+        .expect("the restore writes the engine value into the locked slot");
+    let haps = session
+        .query(
+            rustel_fraction::Fraction::ZERO,
+            rustel_fraction::Fraction::ONE,
+        )
+        .expect("query");
+    assert_eq!(haps.len(), 3);
+}

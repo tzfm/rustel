@@ -1,6 +1,16 @@
 # Changelog
 
 ## Unreleased
+- A beat line chosen on its own survives a restart. Before, it went back to off unless an opacity changed too.
+- An edit another program saved while the studio was still finishing its own save is loaded, not left on disk for the next studio save to overwrite.
+- A sound under an explicit bank plays the bank's asset when the bank has one, and names the missing sound when it does not. A banked wavetable keeps its pitch and position controls, the same as its direct spelling.
+- An orbit sent to an output pair a mono device does not have still sounds, through the main pair.
+- A render or playback longer than the queue of pending events keeps every note. Before, notes past 8192 queued events disappeared before their time came.
+- LFO rates above the sample clock, and negative rates, keep moving through their cycle instead of sticking at a clamp.
+- Keys typed while the terminal answers the studio's startup questions reach the editor. Before, they vanished into the answers.
+- A rename that only changes capitalization works where the filesystem folds case, for a set, a scene and a tape.
+- midi-monitor shows packets it does not model, as raw bytes, in both text and --json output.
+- Hydra's fps option sets the frame rate of the score's visuals. Before, every value played at 30 frames a second.
 - The plugin list of the Settings vst page takes a filter: `/` starts it, the letters keep the plugins their names reach - a part of a name is enough, as the preset search reads it - Enter keeps it standing and Esc drops it. While it types, the keys the page binds are letters of it, so `a` adds no folder.
 - The header's tempo line reads cycle 0.00 while the studio is stopped, as before the first play. The stop freezes the clock for the canvas the player keeps, and the header kept saying the cycle the score stopped on. A canvas that is already stopped no longer takes a second stop word, and a stop pressed while the playback is already stopped no longer asks the engine to stop again: the word came back as a second settle, which reset the advisories and discarded the visual update the held frame was showing.
 - FM modulators now run from the start of the render, as in the browser reference. Before, each note restarted its modulator phase, so FM notes past the first cycle sounded different from strudel, and dense FM scores came out louder.

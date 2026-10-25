@@ -716,7 +716,8 @@ impl App {
                 let opacity_changed = settings.backdrop_opacity
                     != self.ui_settings.backdrop_opacity
                     || settings.interface_opacity != self.ui_settings.interface_opacity
-                    || settings.editor_opacity != self.ui_settings.editor_opacity;
+                    || settings.editor_opacity != self.ui_settings.editor_opacity
+                    || settings.beat_line != self.ui_settings.beat_line;
                 // The second Enter on an open preview, turning the switch on
                 // now that the picture has already answered what it looks
                 // like. Worth its own line: the generic "settings kept"

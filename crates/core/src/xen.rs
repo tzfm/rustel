@@ -465,10 +465,11 @@ fn materialized_arg(arg: Value) -> Value {
     }
 }
 fn query_error_pattern<P: PatOps>(message: impl FnOnce() -> String + Send + Sync + 'static) -> P {
-    // Abort at query time: a bad argument fails the whole query, not one hap.
-    let captured = message();
-    let leaked: &'static str = Box::leak(captured.into_boxed_str());
-    P::pat_query_error(leaked)
+    // Abort at query time: a bad argument fails the whole query, not one
+    // hap. The message lives in the pattern: dropping the pattern returns
+    // it, so a score edited through many bad scale names does not retain
+    // one allocation per attempt.
+    P::pat_query_error(message().into())
 }
 
 /// `withBase(base, pat)`: rescale `freq` from the 220 Hz default base, or

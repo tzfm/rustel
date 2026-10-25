@@ -569,9 +569,14 @@ impl HydraFrames {
             ),
             Stream::Score => return false,
         };
+        // Drawn is read before current: a replacement that lands between
+        // the two loads moves the current epoch, so the comparison fails
+        // instead of certifying a sketch the replacement already ended.
+        // Reading current first could pair this epoch with a drawn value
+        // the replacement is one instruction away from clearing.
         epoch != 0
-            && current.load(Ordering::Acquire) == epoch
             && drawn.load(Ordering::Acquire) == epoch
+            && current.load(Ordering::Acquire) == epoch
             && installed.load(Ordering::Acquire)
     }
 
@@ -779,9 +784,12 @@ impl HydraHost {
     /// and selected-output read. A stale renderer can never acknowledge a
     /// later theme because epochs are compared exactly.
     pub fn theme_drawn(&self, epoch: u64) -> bool {
+        // Drawn before current, as `sketch_drawn` reads it: a replacement
+        // that lands between the loads moves the current epoch and the
+        // comparison fails instead of certifying the old theme.
         epoch != 0
-            && self.shared.theme_epoch.load(Ordering::Acquire) == epoch
             && self.shared.theme_drawn_epoch.load(Ordering::Acquire) == epoch
+            && self.shared.theme_epoch.load(Ordering::Acquire) == epoch
             && self.shared.theme_installed.load(Ordering::Acquire)
     }
 
@@ -1121,6 +1129,16 @@ const PREVIEW_EDGE: u32 = 320;
 const FRAME_INTERVAL: Duration =
     Duration::from_nanos(1_000_000_000 / crate::HYDRA_FRAMES_PER_SECOND as u64);
 
+/// The pace this frame runs at: the score program's own fps when one is
+/// installed, and the default interval when none is, so a preview or a
+/// theme alone keeps the usual cadence.
+fn frame_interval(score_fps: Option<u32>) -> Duration {
+    match score_fps {
+        Some(fps) if fps > 0 => Duration::from_nanos(1_000_000_000 / u64::from(fps)),
+        _ => FRAME_INTERVAL,
+    }
+}
+
 /// Sends each distinct failure message once. The sent messages are forgotten
 /// after a frame in which nothing failed, and on `rearm`.
 struct SaidOnce<'a> {
@@ -1371,7 +1389,7 @@ fn worker(
             frames = 0;
             counted = Instant::now();
         }
-        std::thread::sleep(FRAME_INTERVAL);
+        std::thread::sleep(frame_interval(score.as_ref().map(|p| p.options.fps)));
     }
 }
 
@@ -2667,5 +2685,18 @@ mod tests {
                 "only the frames that reduce are delivered"
             );
         }
+    }
+
+    /// The pace follows the score program's own fps: 60 halves the default
+    /// wait, 15 doubles it, and no score program keeps the default.
+    #[test]
+    fn the_worker_pace_follows_the_score_program_fps() {
+        assert_eq!(super::frame_interval(None), super::FRAME_INTERVAL);
+        assert_eq!(
+            super::frame_interval(Some(crate::HYDRA_FRAMES_PER_SECOND)),
+            super::FRAME_INTERVAL
+        );
+        assert_eq!(super::frame_interval(Some(60)), super::FRAME_INTERVAL / 2);
+        assert_eq!(super::frame_interval(Some(15)), super::FRAME_INTERVAL * 2);
     }
 }
