@@ -627,7 +627,7 @@ impl ScalarBackend {
                     return false;
                 }
                 let mut event = *e;
-                if event.controls.live_controls != [0; 3] {
+                if event.controls.live_controls != [0; 4] {
                     for target in live_control_targets {
                         if event.controls.live_controls[0] == target.binding {
                             event.gain = target.value;
@@ -638,6 +638,15 @@ impl ScalarBackend {
                             }
                             if event.controls.live_controls[2] == target.binding {
                                 filter.q = target.value;
+                            }
+                        }
+                        if let Some(fm) = event.controls.fm.as_mut() {
+                            for route in fm.routes.iter_mut().flatten() {
+                                if route.mod_slot == Some(0)
+                                    && event.controls.live_controls[3] == target.binding
+                                {
+                                    route.amount = target.value;
+                                }
                             }
                         }
                     }
@@ -651,6 +660,23 @@ impl ScalarBackend {
                 let live_resonance = crate::live_control::Ramp::new(
                     event.controls.live_controls[2],
                     event.controls.filters.lowpass.map_or(0.0, |filter| filter.q),
+                );
+                // The binding rides the direct route (`fm`, `fmi`): operator 1
+                // into the carrier. A value of zero carries no route, and the
+                // ramp stays inert until a retrigger brings one.
+                let live_fm_index = crate::live_control::Ramp::new(
+                    event.controls.live_controls[3],
+                    event
+                        .controls
+                        .fm
+                        .and_then(|fm| {
+                            fm.routes
+                                .iter()
+                                .flatten()
+                                .find(|route| route.mod_slot == Some(0))
+                                .map(|route| route.amount)
+                        })
+                        .unwrap_or(0.0),
                 );
                 // Keep the source's unit-gain amplitude even when the slider
                 // begins at zero, so a sustained silent note can fade in.
@@ -1437,6 +1463,7 @@ impl ScalarBackend {
                     live_gain,
                     live_cutoff,
                     live_resonance,
+                    live_fm_index,
                     graph_start_frame,
                     start_frame: e.onset_frame,
                     generation: e.generation,
@@ -2088,6 +2115,10 @@ impl ScalarBackend {
                             .map_or_else(FxParamHold::default, ModAdds::fx_hold);
                     }
                     let mod_adds = mod_adds.as_ref().unwrap_or(&zero_mod_adds);
+                    // A slider at zero carries the binding but no route, so
+                    // the ramp only runs while the matrix exists.
+                    let live_fm_index = (v.live_fm_index.binding != 0 && v.controls.fm.is_some())
+                        .then(|| v.live_fm_index.next());
                     let fm_matrix_hz = match &v.controls.fm {
                         None => 0.0f32,
                         Some(fm) => {
@@ -2101,6 +2132,7 @@ impl ScalarBackend {
                                 state.quantum_skip,
                                 &mut state.phases,
                                 &mut state.noise,
+                                live_fm_index,
                                 mod_adds,
                                 tables,
                                 sr,

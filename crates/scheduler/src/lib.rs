@@ -52,7 +52,7 @@ pub struct Event {
     pub target_time: f64,
     pub value: Value,
     /// Direct gain, cutoff and resonance slider tokens. Zero means unbound.
-    pub live_controls: [u64; 3],
+    pub live_controls: [u64; 4],
     pub ui_visuals: u64,
     /// `.log()`'s already-formatted text, printed when this onset fires.
     ///
@@ -2472,7 +2472,7 @@ mod tests {
                 duration: Fraction::ONE,
                 target_time: 0.50,
                 value: Value::Str("late".into()),
-                live_controls: [0; 3],
+                live_controls: [0; 4],
                 ui_visuals: 0,
                 log_line: None,
             },
@@ -2484,7 +2484,7 @@ mod tests {
                 duration: Fraction::ONE,
                 target_time: 0.25,
                 value: Value::Str("early".into()),
-                live_controls: [0; 3],
+                live_controls: [0; 4],
                 ui_visuals: 0,
                 log_line: None,
             },
@@ -2506,7 +2506,7 @@ mod tests {
             duration: Fraction::ONE,
             target_time: f64::NAN,
             value: Value::Str("nan".into()),
-            live_controls: [0; 3],
+            live_controls: [0; 4],
             ui_visuals: 0,
             log_line: None,
         });
@@ -2534,7 +2534,11 @@ mod tests {
         assert_eq!(scheduler.tick(&clock), TickStatus::Filled);
         let events = scheduler.drain_through(&clock, 1.0);
         assert!(!events.is_empty());
-        assert!(events.iter().all(|event| event.live_controls == [73, 0, 0]));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.live_controls == [73, 0, 0, 0])
+        );
     }
 
     #[test]
@@ -2556,7 +2560,7 @@ mod tests {
                 ("s".into(), Value::Str(name.into())),
                 ("gain".into(), Value::F64(0.5)),
             ]),
-            live_controls: [0; 3],
+            live_controls: [0; 4],
             ui_visuals: 0,
             log_line: None,
         };

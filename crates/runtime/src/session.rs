@@ -1678,7 +1678,7 @@ mod tests {
             whole_begin: "0".into(),
             duration_secs: 0.25,
             target_time: 0.0,
-            live_controls: [0; 3],
+            live_controls: [0; 4],
             ui_visuals: 0,
             value: ValueJson::Raw(value),
             value_show: String::new(),

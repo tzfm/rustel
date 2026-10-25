@@ -252,10 +252,10 @@ pub struct Hap {
     /// Source spans, concatenated on every bind. Drives editor highlighting,
     /// so it must survive every combinator that carries context.
     pub context: Vec<(usize, usize)>,
-    /// Direct live slider bindings: gain, low-pass cutoff, then low-pass
-    /// resonance. Zero is unbound.
+    /// Direct live slider bindings: gain, low-pass cutoff, low-pass
+    /// resonance, then the direct FM route's index. Zero is unbound.
     /// These are host tokens, never score values or source-location guesses.
-    pub live_controls: [u64; 3],
+    pub live_controls: [u64; 4],
     slider_binding: u64,
     ui_visuals: u64,
     /// Exact JavaScript lookup shape (holes, length, enumerable keys) when the
@@ -308,7 +308,7 @@ impl Hap {
             part,
             value,
             context: Vec::new(),
-            live_controls: [0; 3],
+            live_controls: [0; 4],
             slider_binding: 0,
             ui_visuals: 0,
             pick_lookup: None,
@@ -551,7 +551,7 @@ impl Hap {
                 .cloned(),
             value,
             context: self.context.clone(),
-            live_controls: [0; 3],
+            live_controls: [0; 4],
             slider_binding: 0,
             ui_visuals: self.ui_visuals,
             scale: self.scale.clone(),
@@ -573,7 +573,7 @@ impl Hap {
             pick_lookup: if keep_lookup { self.pick_lookup } else { None },
             value,
             context: self.context,
-            live_controls: [0; 3],
+            live_controls: [0; 4],
             slider_binding: 0,
             ui_visuals: self.ui_visuals,
             scale: self.scale,
@@ -605,7 +605,7 @@ impl Hap {
     }
 
     fn without_live_controls(mut self) -> Self {
-        self.live_controls = [0; 3];
+        self.live_controls = [0; 4];
         self.slider_binding = 0;
         self
     }
@@ -613,9 +613,12 @@ impl Hap {
     /// Trusted pitch rewrites can carry named audio controls unchanged.
     /// A raw slider value still loses its identity when its pitch changes.
     fn with_pitch_live_controls(mut self, input: &Hap) -> Self {
-        self.live_controls = [0; 3];
+        self.live_controls = [0; 4];
         self.slider_binding = 0;
-        for (index, key) in ["gain", "cutoff", "resonance"].into_iter().enumerate() {
+        for (index, key) in ["gain", "cutoff", "resonance", "fmi"]
+            .into_iter()
+            .enumerate()
+        {
             if input.live_controls[index] != 0
                 && let Some(before) = input.value.get(key).and_then(Value::as_f64)
                 && self.value.get(key).and_then(Value::as_f64) == Some(before)
@@ -3103,7 +3106,7 @@ fn query_weight_sequence(cumulative: &[Pattern], state: &State) -> Vec<Hap> {
                         value: Value::List(values),
                         context,
                         ui_visuals: inner.ui_visuals | outer.ui_visuals,
-                        live_controls: [0; 3],
+                        live_controls: [0; 4],
                         slider_binding: 0,
                         pick_lookup: None,
                         scale: inner.scale.clone().or_else(|| outer.scale.clone()),
@@ -3619,7 +3622,7 @@ fn applied_pick_lookup(
 }
 
 /// Provenance follows semantic ownership, never equality of sampled numbers.
-fn applied_live_controls(flow: LookupFlow, left: &Hap, right: &Hap) -> ([u64; 3], u64) {
+fn applied_live_controls(flow: LookupFlow, left: &Hap, right: &Hap) -> ([u64; 4], u64) {
     match flow {
         LookupFlow::Left => (left.live_controls, left.slider_binding),
         LookupFlow::LeftControls => (left.live_controls, 0),
@@ -3628,7 +3631,7 @@ fn applied_live_controls(flow: LookupFlow, left: &Hap, right: &Hap) -> ([u64; 3]
             // Opaque objects can run score code when materialized. Refuse the
             // optional binding rather than inspecting them a second time.
             if matches!(left.value, Value::JsValue(_)) || matches!(right.value, Value::JsValue(_)) {
-                return ([0; 3], 0);
+                return ([0; 4], 0);
             }
             if !matches!(
                 (&left.value, &right.value),
@@ -3638,7 +3641,7 @@ fn applied_live_controls(flow: LookupFlow, left: &Hap, right: &Hap) -> ([u64; 3]
             }
             let mut bindings = left.live_controls;
             if let Value::Object(values) = &right.value {
-                for (slot, key) in ["gain", "cutoff", "resonance"].iter().enumerate() {
+                for (slot, key) in ["gain", "cutoff", "resonance", "fmi"].iter().enumerate() {
                     if values.contains_key(key) {
                         bindings[slot] = right.live_controls[slot];
                     }
@@ -3646,7 +3649,7 @@ fn applied_live_controls(flow: LookupFlow, left: &Hap, right: &Hap) -> ([u64; 3]
             }
             (bindings, 0)
         }
-        LookupFlow::Infer | LookupFlow::Add => ([0; 3], 0),
+        LookupFlow::Infer | LookupFlow::Add => ([0; 4], 0),
     }
 }
 
@@ -5824,7 +5827,7 @@ impl Pattern {
                                 value,
                                 context: locations,
                                 ui_visuals: inner.ui_visuals,
-                                live_controls: [0; 3],
+                                live_controls: [0; 4],
                                 slider_binding: 0,
                                 pick_lookup: None,
                                 // `combineContext(h.value)`: a scale key on
@@ -6722,7 +6725,7 @@ impl Pattern {
                     let materialized = hap.value.contains_js_value();
                     if materialized {
                         hap.value = materialize_js_value(&hap.value);
-                        hap.live_controls = [0; 3];
+                        hap.live_controls = [0; 4];
                         hap.slider_binding = 0;
                     }
                     if let Some(settings) = &metadata_owner
@@ -6966,6 +6969,7 @@ impl Pattern {
                     "gain" => mapped.live_controls[0] = slider_binding,
                     "cutoff" => mapped.live_controls[1] = slider_binding,
                     "resonance" => mapped.live_controls[2] = slider_binding,
+                    "fmi" => mapped.live_controls[3] = slider_binding,
                     _ => {}
                 }
             }
