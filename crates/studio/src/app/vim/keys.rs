@@ -363,6 +363,7 @@ mod tests {
     use super::*;
     use crate::app::tests::support::*;
     use crate::editor::{ByteOffset, Selection};
+    use crate::reference::{PluginRow, VstSection};
 
     fn vim_app() -> (tempfile::TempDir, App) {
         let directory = tempfile::tempdir().expect("temp dir");
@@ -465,6 +466,65 @@ mod tests {
             "",
             "paging does not type"
         );
+    }
+
+    /// l and h walk the vst tab the way → and ← do: a plugin opens onto
+    /// the rows of its halves, a half opens as the view of the tab, and h
+    /// goes back to the plugin list. The plugins are the test fixture, in
+    /// the one host of the process.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn hl_opens_a_plugin_and_its_halves_of_the_vst_tab() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+        app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+        app.ui_settings.vim_list_navigation = true;
+        app.sync_editor_keybindings();
+        let plugins = tempfile::tempdir().expect("plugin folder");
+        rustel_vst3_fixture::install(plugins.path());
+        rustel_runtime::vst::pin_standard_folders(vec![plugins.path().to_path_buf()]);
+        let host = rustel_runtime::vst::host();
+        host.wait_idle();
+        host.resolve(rustel_vst3_fixture::NAME, true);
+        host.wait_idle();
+        let mut panel = ReferencePanel::browse(&app.reference);
+        panel.select_tab(Tab::Vst);
+        app.set_reference_panel(Some(panel));
+        app.focus_panel(PanelKind::Reference);
+        app.sync_plugins();
+        let vst = |app: &App| {
+            let panel = app.reference_panel.as_ref().expect("panel");
+            (
+                panel.vst.inside(),
+                panel.vst.rows().to_vec(),
+                panel.vst.selected,
+            )
+        };
+
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+        let (inside, rows, selected) = vst(&app);
+        assert_eq!(inside, None, "l opened the plugin, not a half");
+        assert_eq!(rows[selected], PluginRow::Plugin(0));
+        assert_eq!(
+            &rows[1..3],
+            &[
+                PluginRow::Section(VstSection::Presets),
+                PluginRow::Section(VstSection::Params)
+            ][..]
+        );
+
+        // j j reaches the row of the parameters, l opens them as the view,
+        // and h goes back to the row of the half.
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+        let (inside, rows, selected) = vst(&app);
+        assert_eq!(inside, Some(VstSection::Params));
+        assert_eq!(rows[selected], PluginRow::Param(0));
+        press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+        let (inside, rows, selected) = vst(&app);
+        assert_eq!(inside, None);
+        assert_eq!(rows[selected], PluginRow::Section(VstSection::Params));
     }
 
     #[test]

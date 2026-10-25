@@ -318,19 +318,18 @@ impl ReferencePanel {
         self.select_tab(all[(at + 1) % all.len()].0);
     }
 
-    /// The word for the half of the open plugin the vst tab lists.
+    /// The word for the half of the open plugin the vst tab shows.
     #[cfg(feature = "vst")]
     fn section_said(&self) -> &'static str {
-        match self.vst.section() {
-            VstSection::Params => "the parameters of the plugin",
-            VstSection::Presets => "the presets of the plugin",
+        match self.vst.inside() {
+            Some(VstSection::Params) => "the parameters of the plugin",
+            _ => "the presets of the plugin",
         }
     }
 
-    /// Tab in the vst tab with a plugin open flips the half of the plugin
-    /// under its row - the parameters or the presets - and says the half it
-    /// shows. With no plugin open, and on every other tab, Tab goes to the
-    /// next tab of the panel as anywhere.
+    /// Tab in the vst tab, in a half of an open plugin, flips to the other
+    /// half of it and says the half it shows. In the plugin list, and on
+    /// every other tab, Tab goes to the next tab of the panel as anywhere.
     #[cfg(feature = "vst")]
     pub fn tab_key(&mut self) -> Option<&'static str> {
         if self.tab == Tab::Vst && self.vst.toggle_section() {
@@ -1284,11 +1283,15 @@ impl ReferencePanel {
         #[cfg(feature = "vst")]
         if self.tab == Tab::Vst {
             // Enter writes the row into the score: the plugin call, a
-            // parameter, or a preset. A row with no text opens: a group, or
-            // a plugin before its load, which has no kind yet.
+            // parameter, or a preset. A row with no text opens: a group, a
+            // half of the open plugin, or a plugin before its load, which
+            // has no kind yet.
             let text = self.vst.score_text();
             match self.vst.row(self.vst.selected) {
                 Some(PluginRow::Group(index)) => self.vst.toggle_group(index),
+                Some(PluginRow::Section(section)) => {
+                    self.vst.show_section(section);
+                }
                 Some(PluginRow::Plugin(_)) if text.is_none() => {
                     self.vst.expand();
                 }
@@ -1407,9 +1410,13 @@ impl ReferencePanel {
         if self.tab == Tab::Samples && !self.bank_list() {
             return PanelAction::Close;
         }
-        // The same on the vst tab: ← folds a plugin, Esc leaves.
+        // The same on the vst tab: Esc in a half of an open plugin goes
+        // back to the plugin list, and Esc in the list leaves.
         #[cfg(feature = "vst")]
         if self.tab == Tab::Vst {
+            if self.vst.leave() {
+                return PanelAction::Nothing;
+            }
             return PanelAction::Close;
         }
         match self.mode {
@@ -1489,13 +1496,20 @@ impl ReferencePanel {
         #[cfg(feature = "vst")]
         if self.tab == Tab::Vst {
             // A click selects the row. On a plugin or a group the click is
-            // the fold also, as on the sample banks.
+            // the fold also, as on the sample banks, and on a row naming a
+            // half of the open plugin the click opens the half.
             let Some(clicked) = self.vst.row(index) else {
                 return PanelAction::Nothing;
             };
             self.vst.selected = index;
-            if matches!(clicked, PluginRow::Plugin(_) | PluginRow::Group(_)) && !self.vst.expand() {
-                self.vst.collapse();
+            match clicked {
+                PluginRow::Section(_) => {
+                    self.vst.expand();
+                }
+                PluginRow::Plugin(_) | PluginRow::Group(_) if !self.vst.expand() => {
+                    self.vst.collapse();
+                }
+                _ => {}
             }
             return PanelAction::Nothing;
         }

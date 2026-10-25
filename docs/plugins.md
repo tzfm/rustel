@@ -33,8 +33,10 @@ rustel vst --rescan
 one plugin. A second word keeps the parameters with the word in their group,
 name or key. In Studio, the vst tab of the reference panel lists the plugins,
 and Ctrl-F in a `vst()` or `vsti()` call completes plugin names, parameters
-and presets. Under an open plugin, Tab moves between its parameters and its
-presets, and a search lists the half the cursor is in.
+and presets. → on a plugin opens the two rows under it, its presets and its
+parameters, and → on one of the two makes that half the view of the tab, with
+its own search and a trail on the search line. ← and Esc go back, Tab flips
+the halves, and a search of the plugin list reads plugin names only.
 
 Rustel reads the standard VST3 folders:
 
@@ -150,9 +152,9 @@ is.
 
 In the vst tab, Enter on a preset writes the call with the preset. With the
 caret in a call of the same plugin, Enter on a preset changes only the
-preset, and Enter on the row of that plugin goes to its rows. The pick of a
-plugin name with Ctrl-F leaves the panel open on the presets of the plugin,
-so the next Enter picks one.
+preset, and Enter on the row of that plugin goes to the rows under it. The
+pick of a plugin name with Ctrl-F leaves the panel open in the presets of
+the plugin, so the next Enter picks one.
 
 A plugin call with no `preset` plays `default.vstpreset` when the folder of
 the plugin has one. Save the start sound of a plugin there, and each call

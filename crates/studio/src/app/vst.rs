@@ -189,10 +189,10 @@ impl App {
     }
 
     /// Anywhere else in a named plugin call, open its parameters directly:
-    /// the plugin of the call opens with the cursor under its row, so one
-    /// Enter picks from it. A plugin still loading keeps the cursor on its
-    /// row, and Enter dives under it when the load lands. Name and preset
-    /// strings keep their more specific completion lists.
+    /// the plugin of the call opens with the tab in its parameters, so one
+    /// Enter picks from them. A plugin still loading fills the view when
+    /// the load lands. Name and preset strings keep their more specific
+    /// completion lists.
     pub(super) fn open_plugin_parameters(&mut self) -> bool {
         let Some((name, _)) = self.plugin_call_at_caret() else {
             return false;
@@ -200,7 +200,7 @@ impl App {
         let mut panel = ReferencePanel::browse(&self.reference);
         panel.select_tab(Tab::Vst);
         panel.vst.open_named(name);
-        panel.vst.select_under();
+        panel.vst.show_section(VstSection::Params);
         self.reference_anchor = None;
         self.set_reference_panel(Some(panel));
         self.sync_plugins();
@@ -212,7 +212,7 @@ impl App {
         true
     }
 
-    /// The pick of a plugin name wrote the call: the panel stays open, on
+    /// The pick of a plugin name wrote the call: the panel stays open, in
     /// the presets of the plugin, so the next Enter picks one for the call.
     pub(super) fn open_plugin_presets(&mut self, name: String) {
         let mut panel = ReferencePanel::browse(&self.reference);
@@ -672,9 +672,9 @@ impl App {
     /// The text of a row of the vst tab, as the text goes in at the caret.
     /// The text is no spelling of the word the column opened on, so the
     /// anchor goes. Enter on the row of the plugin the call at the caret
-    /// names writes nothing: the name stays as written, and the cursor goes
-    /// under the row, to the half of the plugin the tab holds, where the
-    /// next Enter picks.
+    /// names writes nothing: the name stays as written, and the cursor
+    /// goes under the row, to the rows of the halves of the plugin, where
+    /// the next Enter opens one of them.
     pub(super) fn plugin_text_at_caret(&mut self, text: String) -> Option<String> {
         self.reference_anchor = None;
         let keys = self.reference_panel.as_ref().is_some_and(|panel| {
@@ -1151,10 +1151,14 @@ mod tests {
             Some(PluginRow::Plugin(0))
         );
         // Enter on the row of the plugin the call names: nothing goes in,
-        // the panel stays, and the cursor goes under the row.
+        // the panel stays, and the cursor goes under the row, to the rows
+        // of the halves of the plugin.
         assert_eq!(app.plugin_text_at_caret(".vsti(\"Serum 2\")".into()), None);
         let panel = app.reference_panel.as_ref().expect("the panel stays");
-        assert_eq!(panel.vst.row(panel.vst.selected), Some(PluginRow::Param(0)));
+        assert_eq!(
+            panel.vst.row(panel.vst.selected),
+            Some(PluginRow::Section(VstSection::Presets))
+        );
         assert_eq!(app.editor().source(), before);
     }
 
@@ -1166,10 +1170,10 @@ mod tests {
         let before = app.editor().source().to_owned();
         let panel = app.reference_panel.as_mut().expect("the vst tab");
         panel.vst.show_section(VstSection::Presets);
-        // The rows under the plugin are its two presets; the cursor goes to
-        // `Lead`.
-        panel.vst.selected = 2;
-        assert_eq!(panel.vst.row(2), Some(PluginRow::Preset(1)));
+        // The view of the presets holds the two presets of the plugin; the
+        // cursor goes to `Lead`.
+        panel.vst.selected = 1;
+        assert_eq!(panel.vst.row(1), Some(PluginRow::Preset(1)));
         let said = app.plugin_text_at_caret("preset: \"Lead\"".into());
         assert_eq!(said.as_deref(), Some("preset: \"Lead\""));
         // The pair the call holds is the anchor the pick replaces.
@@ -1185,7 +1189,7 @@ mod tests {
         {
             let panel = app.reference_panel.as_mut().expect("the vst tab");
             panel.vst.show_section(VstSection::Presets);
-            panel.vst.selected = 2;
+            panel.vst.selected = 1;
         }
         assert_eq!(
             app.plugin_text_at_caret("preset: \"Lead\"".into())
@@ -1197,7 +1201,7 @@ mod tests {
             .as_mut()
             .expect("the vst tab")
             .vst
-            .selected = 1;
+            .selected = 0;
         assert_eq!(
             app.plugin_text_at_caret("preset: \"Default\"".into())
                 .as_deref(),

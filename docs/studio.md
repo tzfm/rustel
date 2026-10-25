@@ -448,10 +448,13 @@ copies the code. A copy does not change the score. Paste the code into the
 score, then update the score.
 
 The vst tab lists the VST3 plugins in the plugin folders. Right arrow loads a
-plugin and opens its row: the parameters at the top level, then one row for
-each parameter group with its parameter count, then the presets. Right arrow
-on a group shows its parameters. Left arrow closes the group or the plugin.
-A parameter row shows the name a score writes, the title and the default.
+plugin and opens its row onto two rows under it: its presets and its
+parameters. Right arrow on one of the two makes that half the view of the
+tab, with a trail on the search line - `Serum > presets` - and its own
+search. Left arrow and Esc go back to the plugin list. In the parameters
+view, right arrow on a group shows its parameters, and left arrow closes the
+group first. A parameter row shows the name a score writes, the title and
+the default.
 
 In a `.vst()` or `.vsti()` call, Ctrl+F completes from the plugin host. The
 first string lists the plugin names: a part of a name finds the plugin, and a
@@ -459,8 +462,9 @@ plugin of a known kind shows only for its own call. The object lists the
 parameter keys of the plugin, each with its title and default, when the plugin
 has loaded.
 The string of `preset` lists the preset files of the plugin.
-Type to search the plugins by name. With a plugin open, the search finds its
-parameters too, by name, title or group. Enter on a plugin writes
+Type to search the plugins by name. In the view of a half, the search finds
+its rows: parameters by name, title or group, presets by name. Enter on a
+plugin writes
 `.vst("name")` for an effect and `.vsti("name")` for an instrument at the
 caret. Enter on a parameter writes the parameter with its default, and Enter
 on a preset writes `preset: "name"`.
