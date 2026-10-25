@@ -25,6 +25,7 @@ pub(super) fn run_replay(
 
     let ReplayRun {
         out,
+        output: output_selector,
         speed,
         from,
         export,
@@ -356,6 +357,7 @@ pub(super) fn run_replay(
             // A replay carries no device override; the tape sounds the same
             // at any buffer size.
             buffer_frames: None,
+            output: output_selector,
             watch: true,
             duration: None,
             cps: script.baseline_cps.unwrap_or(0.5),

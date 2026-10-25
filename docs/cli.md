@@ -105,9 +105,12 @@ rustel play song.strudel --watch --save-session debug
 rustel play song.strudel --watch --no-save-session
 rustel replay take.rustel-session
 rustel replay take.rustel-session --export set.wav
+rustel replay take.rustel-session --output silent
 ```
 
 See [Sessions](sessions.md) for recording and replay limits.
+`--output silent` plays the tape with no audio device, the way a server or
+an ssh session does; the clock and the event protocol still run.
 To show the active code in the terminal that plays the score, use `--follow`.
 To render it in a separate process, pipe the score events to `watch-code`:
 

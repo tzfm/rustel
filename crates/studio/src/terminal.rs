@@ -274,9 +274,16 @@ impl TerminalFeatures {
             symbols,
         };
         if let Some(answers) = ask_terminal() {
-            let (replies, keys) = split_probe_bytes(&answers);
-            features.apply_answers(parse_answers(&replies));
-            HELD_KEYS.with(|held| held.borrow_mut().extend(keys));
+            // The byte split and the held-key queue are Unix-only; the
+            // Windows probe path above never reads stdin itself.
+            #[cfg(unix)]
+            {
+                let (replies, keys) = split_probe_bytes(&answers);
+                features.apply_answers(parse_answers(&replies));
+                HELD_KEYS.with(|held| held.borrow_mut().extend(keys));
+            }
+            #[cfg(not(unix))]
+            features.apply_answers(parse_answers(&answers));
         }
         features
     }
