@@ -569,7 +569,7 @@ impl HydraFrames {
             ),
             Stream::Score => return false,
         };
-        // Drawn is read BEFORE current: a replacement that lands between
+        // Drawn is read before current: a replacement that lands between
         // the two loads moves the current epoch, so the comparison fails
         // instead of certifying a sketch the replacement already ended.
         // Reading current first could pair this epoch with a drawn value

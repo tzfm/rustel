@@ -1681,7 +1681,7 @@ fn split_probe_bytes(bytes: &[u8]) -> (Vec<u8>, Vec<crossterm::event::Event>) {
                 }
                 index = end + 1;
             }
-            Some(other @ (b']' | b'P' | b'_' | b'^' | b'X')) => {
+            Some(b']' | b'P' | b'_' | b'^' | b'X') => {
                 // OSC and friends run to ST (ESC \) or BEL.
                 let mut end = index + 2;
                 while end < bytes.len() {
@@ -1697,7 +1697,6 @@ fn split_probe_bytes(bytes: &[u8]) -> (Vec<u8>, Vec<crossterm::event::Event>) {
                 }
                 replies.extend_from_slice(&bytes[index..end.min(bytes.len())]);
                 index = end.min(bytes.len());
-                let _ = other;
             }
             Some(_) => {
                 replies.extend_from_slice(&bytes[index..index + 2]);

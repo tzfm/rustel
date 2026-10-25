@@ -54,7 +54,10 @@ impl Session {
                 .saturating_add(MICRO_BEATS_PER_BEAT),
         );
         let time_origin = self.timeline.time_at(beat_now).saturating_add(
-            (beat_origin - beat_now).saturating_mul(micros_per_beat) / MICRO_BEATS_PER_BEAT,
+            beat_origin
+                .saturating_sub(beat_now)
+                .saturating_mul(micros_per_beat)
+                / MICRO_BEATS_PER_BEAT,
         );
         self.timeline = Timeline {
             micros_per_beat,

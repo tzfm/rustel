@@ -369,15 +369,19 @@ fn zero_speed_sample_is_an_audio_no_op() {
 /// bounded instead of panicking on an inverted clamp.
 #[test]
 fn an_active_delay_stays_bounded_at_low_sample_rates() {
-    let mut controls = OscillatorControls::default();
-    controls.delay = Some(rustel_audio::DelayControls {
-        wet: 0.5,
-        time_secs: 0.25,
-        feedback: 0.3,
-    });
-    let event = OnsetEvent::new(0, 440.0, 0.5, 0.2).with_controls(controls);
+    let event = || {
+        let controls = OscillatorControls {
+            delay: Some(rustel_audio::DelayControls {
+                wet: 0.5,
+                time_secs: 0.25,
+                feedback: 0.3,
+            }),
+            ..OscillatorControls::default()
+        };
+        OnsetEvent::new(0, 440.0, 0.5, 0.2).with_controls(controls)
+    };
     for rate in [64_u32, 128, 1] {
-        let pcm = render_pcm(&mut ScalarBackend::new(), rate, 512, &[event.clone()])
+        let pcm = render_pcm(&mut ScalarBackend::new(), rate, 512, &[event()])
             .unwrap_or_else(|error| panic!("render at {rate} Hz: {error}"));
         assert!(
             pcm.iter().all(|sample| sample.is_finite()),
@@ -394,15 +398,17 @@ fn an_active_delay_stays_bounded_at_low_sample_rates() {
 #[test]
 fn lfo_phases_wrap_for_rates_above_and_below_the_sample_clock() {
     let render_with = |rate: f32| {
-        let mut controls = OscillatorControls::default();
-        controls.tremolo = Some(rustel_audio::TremoloControls {
-            frequency_hz: rate,
-            depth: 1.0,
-            skew: 1.0,
-            shape: 0,
-            phase_offset: 0.0,
-            time_secs: 0.0,
-        });
+        let controls = OscillatorControls {
+            tremolo: Some(rustel_audio::TremoloControls {
+                frequency_hz: rate,
+                depth: 1.0,
+                skew: 1.0,
+                shape: 0,
+                phase_offset: 0.0,
+                time_secs: 0.0,
+            }),
+            ..OscillatorControls::default()
+        };
         let event = OnsetEvent::new(0, 440.0, 0.5, 0.5)
             .with_optional_synth(Some(rustel_audio::SynthSource::One))
             .with_controls(controls);

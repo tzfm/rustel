@@ -109,7 +109,15 @@ fn long_sequential_scores_reuse_processor_storage() {
     let pcm = render_pcm(&mut backend, RATE, 200 * 1024, &events).unwrap();
     let mut one = ScalarBackend::new();
     render_pcm(&mut one, RATE, 1024, &events[..1]).unwrap();
-    assert_eq!(backend.kabel_resident_bytes(), one.kabel_resident_bytes());
+    // Admission runs one scheduler lookahead ahead, so a graph is prepared
+    // while the previous voice still sounds: the storage tracks the peak
+    // overlap inside that window - here two graphs - never one per event.
+    assert!(
+        backend.kabel_resident_bytes() <= 2 * one.kabel_resident_bytes(),
+        "200 sequential graphs retained {} bytes against one graph's {}",
+        backend.kabel_resident_bytes(),
+        one.kabel_resident_bytes()
+    );
     assert_eq!(backend.missing_kabel_events(), 0);
     assert!(pcm.iter().any(|sample| *sample > 0.0));
 }

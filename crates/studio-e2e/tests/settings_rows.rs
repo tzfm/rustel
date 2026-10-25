@@ -572,10 +572,7 @@ fn a_beat_line_only_change_survives_a_reopen() {
         }
     }
     let changed = row_with(&mut studio, "beat line");
-    assert_ne!(
-        changed, before,
-        "setup: the beat line moved from {before}"
-    );
+    assert_ne!(changed, before, "setup: the beat line moved from {before}");
 
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     studio.settle();

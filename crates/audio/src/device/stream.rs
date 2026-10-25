@@ -2218,7 +2218,10 @@ mod tests {
 
     /// A finite playback longer than the pending-event ceiling still sounds
     /// every event: the callback admits from the timeline as the output
-    /// reaches it, so the short events drain and the final tone is retained.
+    /// reaches it, so the short events drain and the final tone is
+    /// retained. The backend is built the way production builds it, from
+    /// `with_dispatch`, whose pools start empty: the producer reserves what
+    /// the in-callback admission needs.
     #[test]
     fn finite_playback_admits_events_past_the_pending_ceiling() {
         let _guard = tripwire_assertion_guard();
@@ -2230,7 +2233,8 @@ mod tests {
         events.push(OnsetEvent::new(tone_at, 220.0, 0.8, 0.25));
         let total = tone_at + 24_000;
 
-        let mut backend = ScalarBackend::prepared(48_000, 8).unwrap();
+        let mut backend = ScalarBackend::with_dispatch(DspDispatch::portable());
+        backend.init(48_000).unwrap();
         let mut admission = queue_finite_events(&mut backend, &events, 48_000).unwrap();
         let written = AtomicU64::new(0);
         let mut output = Vec::new();

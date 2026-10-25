@@ -11,7 +11,7 @@ static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let pointer = System.alloc(layout);
+        let pointer = unsafe { System.alloc(layout) };
         if !pointer.is_null() {
             LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
         }
@@ -20,11 +20,11 @@ unsafe impl GlobalAlloc for Counting {
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-        System.dealloc(pointer, layout)
+        unsafe { System.dealloc(pointer, layout) }
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let moved = System.realloc(pointer, layout, new_size);
+        let moved = unsafe { System.realloc(pointer, layout, new_size) };
         if !moved.is_null() {
             LIVE_BYTES.fetch_add(new_size.saturating_sub(layout.size()), Ordering::Relaxed);
         }

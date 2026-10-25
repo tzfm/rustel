@@ -608,6 +608,13 @@ pub(super) fn seeded_phase(onset_id: u64, voice: usize) -> f32 {
 }
 
 impl PendingEvents {
+    /// Reserve room for `additional` more events. A producer-side
+    /// operation: the callback refuses rather than allocating.
+    pub(super) fn reserve(&mut self, additional: usize) {
+        self.slots.reserve(additional);
+        self.order.reserve(additional);
+    }
+
     pub(super) fn with_capacity(capacity: usize) -> Self {
         Self {
             slots: Vec::with_capacity(capacity),
@@ -987,6 +994,18 @@ impl ScalarBackend {
     /// admit the events themselves as the output reaches them and a list
     /// longer than the pending ceiling still plays in full.
     pub fn prepare_finite_playback(&mut self, events: &[OnsetEvent]) -> Result<(), String> {
+        // `note` grew the pending queue and the voice vector on the
+        // producer as it queued the whole list, and the callback must
+        // refuse rather than allocate: reserve the same need here, held by
+        // the ceilings the engine already enforces. Without this a backend
+        // from `with_dispatch`, whose init reserves every pool but these,
+        // refuses every in-callback admission.
+        let pending_need = events.len().min(crate::scalar::MAX_PENDING_EVENTS);
+        self.pending.reserve(pending_need);
+        let voices_need = events.len().min(crate::scalar::MAX_ACTIVE_VOICES);
+        if self.voices.capacity() < voices_need {
+            self.voices.reserve(voices_need - self.voices.len());
+        }
         // Pools sized for everything the backend can sound, so the
         // in-callback admission never allocates.
         let capacity = self.voices.capacity();

@@ -1452,6 +1452,37 @@ fn isobite_plays_the_next_cycle_on_each_structure_event() {
     assert!(report.query_threw.is_some());
 }
 
+/// A throwing `appLeft` closure stops the application at the first throw,
+/// exactly as `fmap` does: later pairs must not reach user code.
+#[test]
+fn a_throwing_apply_closure_invokes_no_later_pairs() {
+    let mut session = Session::new().expect("session");
+    session
+        .evaluate(
+            r#"globalThis.applyCalls = 0;
+            pure(x => {
+              globalThis.applyCalls += 1;
+              if (globalThis.applyCalls === 1) throw new Error("first pair");
+              return x;
+            }).appLeft(note("c e g"))"#,
+        )
+        .expect("evaluate");
+    let haps = session.query(Fraction::ZERO, Fraction::ONE).expect("query");
+    assert!(haps.is_empty(), "a throwing closure yields no haps");
+
+    session
+        .evaluate("pure(globalThis.applyCalls)")
+        .expect("evaluate the counter");
+    let haps = session
+        .query(Fraction::ZERO, Fraction::ONE)
+        .expect("query the counter");
+    assert_eq!(
+        haps[0].value.as_f64(),
+        Some(1.0),
+        "only the first pair reaches the closure; the count is later"
+    );
+}
+
 /// A throwing `fmap` callback stops the mapping at the first throw. The
 /// haps after it must not reach user code, exactly as an unwinding
 /// exception would not have run them.

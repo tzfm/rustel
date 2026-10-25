@@ -2524,9 +2524,8 @@ impl ScalarBackend {
                                         });
                                         let raw = (lfo_waveshape(0, phase, 0.5) - 0.5) * depth;
                                         let add = js_clamp(raw, -0.5 * lfo.depth, 0.5 * lfo.depth);
-                                        let next = phase + f64::from(rate) / sr;
                                         *width_lfo_phase =
-                                            Some(if next > 1.0 { next - 1.0 } else { next });
+                                            Some(wrap_phase(phase + f64::from(rate) / sr));
                                         add
                                     }
                                 };

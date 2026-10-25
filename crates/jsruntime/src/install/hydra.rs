@@ -727,16 +727,16 @@ pub(crate) fn restore_surface<'js>(
         // Defined, not assigned: an assignment runs any setter on the
         // prototype chain, and a score turn restores before its deadline
         // starts. The attributes are the ones the engine's `set` gave it.
-        if !original.is_undefined() {
-            if let Err(error) = globals.prop(
+        if !original.is_undefined()
+            && let Err(error) = globals.prop(
                 name.as_str(),
                 rquickjs::object::Property::from(original)
                     .writable()
                     .enumerable()
                     .configurable(),
-            ) {
-                first_failure.get_or_insert(error);
-            }
+            )
+        {
+            first_failure.get_or_insert(error);
         }
     }
     state.set(SAVED, bare_object(ctx)?)?;

@@ -249,7 +249,7 @@ pub(super) fn atomic_write(path: &Path, source: &str) -> io::Result<bool> {
     // file cannot hold these bytes, and reading it whole only to learn that
     // would cost the save an unbounded read.
     let same_length = std::fs::metadata(path)
-        .map(|metadata| metadata.len() == source.as_bytes().len() as u64)
+        .map(|metadata| metadata.len() == source.len() as u64)
         .unwrap_or(false);
     if same_length && std::fs::read(path).is_ok_and(|kept| kept == source.as_bytes()) {
         return Ok(false);

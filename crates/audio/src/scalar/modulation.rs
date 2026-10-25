@@ -375,16 +375,16 @@ pub(super) fn nan_param_default(target: crate::backend::ModTarget, source: &Voic
 /// measured as a 4.6x spike two samples wide, once per LFO cycle.
 ///
 /// The wavetable phases are f64 for the same reason.
+pub(super) fn lfo_phase0(time_secs: f32, frequency_hz: f32, phase_offset: f32) -> f64 {
+    (f64::from(time_secs) * f64::from(frequency_hz) + f64::from(phase_offset)).rem_euclid(1.0)
+}
+
 /// Wrap an LFO or oscillator phase into `[0, 1)`. A rate above the sample
 /// rate advances by more than a whole cycle a sample, and a negative rate
 /// walks below zero, so the wrap removes every whole turn at once rather
 /// than one.
 pub(super) fn wrap_phase(phase: f64) -> f64 {
     phase - phase.floor()
-}
-
-pub(super) fn lfo_phase0(time_secs: f32, frequency_hz: f32, phase_offset: f32) -> f64 {
-    (f64::from(time_secs) * f64::from(frequency_hz) + f64::from(phase_offset)).rem_euclid(1.0)
 }
 
 /// Unipolar LFO waveshapes on phase in [0, 1]; phase stays f64. The walks
