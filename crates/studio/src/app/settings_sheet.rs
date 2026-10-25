@@ -1085,11 +1085,23 @@ impl App {
             #[cfg(feature = "vst")]
             SettingsAction::RescanVst => self.rescan_vst(),
             #[cfg(feature = "vst")]
-            SettingsAction::ToggleAudioThread(at) => self.toggle_audio_thread(at),
+            SettingsAction::ToggleAudioThread(at) => {
+                // The row the cursor holds is its place among the plugins
+                // the filter kept; the switch belongs to the plugin.
+                if let Some(at) = self.vst_plugin_at(at) {
+                    self.toggle_audio_thread(at);
+                }
+            }
             #[cfg(feature = "vst")]
             SettingsAction::ToggleVstPresets(at) => self.toggle_vst_presets(&mut sheet, at),
             #[cfg(feature = "vst")]
             SettingsAction::JumpVst(letter) => self.jump_vst_plugin(&mut sheet, letter),
+            #[cfg(feature = "vst")]
+            SettingsAction::FilterVst(code) => {
+                let filter = std::mem::take(&mut self.vst_filter);
+                self.vst_filter = filter.typed(code);
+                self.mirror_vst_rows(&mut sheet);
+            }
         }
         // The keybind learn belongs to the Keybinds page: Tabbed away
         // from it - or closed by any door the sheet has - the learn goes

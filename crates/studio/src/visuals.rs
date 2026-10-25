@@ -291,7 +291,14 @@ impl VisualState {
     /// scrolls on, the marks in the code go out since nothing is sounding,
     /// and the audio sequence starts over for the next set. The previews
     /// stay on the picture; [`Self::start`] is what clears them.
+    ///
+    /// A canvas that is already stopped does not stop again: the second
+    /// word of the engine would reset the audio sequence of the held
+    /// picture, and the held frame would take new audio for a moment.
     pub fn stop(&mut self) {
+        if !self.running {
+            return;
+        }
         self.running = false;
         // Repeated Stop acknowledgements must retain the first stop time.
         self.frozen_at.get_or_insert_with(Instant::now);

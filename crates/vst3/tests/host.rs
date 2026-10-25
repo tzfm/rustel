@@ -283,6 +283,65 @@ fn a_plugin_runs_with_the_values_a_score_names() {
     assert_eq!(line, "process threads 2, overlap no\n");
 }
 
+/// The watch of the preset folders reads the disk again when a file comes
+/// in or goes out: a preset the player saves while the studio runs counts
+/// with no rescan and no ask. Each read takes the next number.
+#[test]
+fn the_watch_of_the_preset_folders_reads_the_disk_again() {
+    let rig = Rig::new("watch");
+    // The load gives the plugin its class, so the names have an answer,
+    // and the read of the folders ends with the watch on.
+    rig.plugin();
+    let names = |wanted: &[&str]| {
+        rig.host.presets(NAME).is_some_and(|names| {
+            names
+                == wanted
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect::<Vec<_>>()
+        })
+    };
+    let wait = |wanted: &[&str]| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !names(wanted) {
+            assert!(
+                Instant::now() < deadline,
+                "presets of the watch: {wanted:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait(&[]);
+    let version = rig.host.presets_version();
+    rig.write_preset(
+        "Late Save.vstpreset",
+        &rustel_vst3_fixture::preset(0.5, 0.0),
+    );
+    wait(&["Late Save"]);
+    // A file that goes out leaves the list the same way.
+    std::fs::remove_file(
+        rig.root
+            .join("presets")
+            .join(NAME)
+            .join("Late Save.vstpreset"),
+    )
+    .expect("preset file");
+    wait(&[]);
+    assert!(rig.host.presets_version() > version);
+    // The quiet stays quiet: no read of the watch with no change behind
+    // it, or the watch would read the disk for good. Windows can say one
+    // event of the removal late, behind the quiet of the rest, so the
+    // reads settle first: a read that follows the last change drains, and
+    // the quiet after it reads nothing.
+    let mut settled = rig.host.presets_version();
+    let drain = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < drain {
+        std::thread::sleep(Duration::from_millis(100));
+        settled = rig.host.presets_version();
+    }
+    assert_eq!(rig.host.presets_version(), settled);
+}
+
 #[test]
 fn a_preset_file_sets_the_state_of_the_plugin() {
     let rig = Rig::new("preset");
