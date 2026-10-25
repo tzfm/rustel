@@ -261,6 +261,8 @@ impl TerminalFeatures {
         // `TerminalFeatures` of its own to ask - the mixer and device
         // panels keep only a `Theme` - reads it back through `symbol`.
         symbol_state::set(symbols);
+        // Only the unix probe below writes answers back into the features.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut features = Self {
             name,
             truecolor,
@@ -273,6 +275,9 @@ impl TerminalFeatures {
             pixel_mouse: false,
             symbols,
         };
+        // The probe owns stdin on unix; the Windows build does not ask, and
+        // the probe's helpers stay unix-only beside this block.
+        #[cfg(unix)]
         if let Some(answers) = ask_terminal() {
             let (replies, keys) = split_probe_bytes(&answers);
             features.apply_answers(parse_answers(&replies));
@@ -1810,11 +1815,6 @@ fn ask_terminal() -> Option<Vec<u8>> {
         }
     }
     Some(answers)
-}
-
-#[cfg(not(unix))]
-fn ask_terminal() -> Option<Vec<u8>> {
-    None
 }
 
 #[cfg(windows)]
