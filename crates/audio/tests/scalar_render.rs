@@ -5102,6 +5102,164 @@ fn input_postgain_scales_the_monitored_signal_once() {
     );
 }
 
+/// The share of a one-second signal's power in the given whole-Hz bins, DC
+/// aside.
+fn bin_share(signal: &[f32], bins: &[usize]) -> f64 {
+    const RATE: usize = 48_000;
+    assert_eq!(signal.len(), RATE, "the bins assume one second at 48 kHz");
+    let mut spectrum: Vec<rustfft::num_complex::Complex<f64>> = signal
+        .iter()
+        .map(|&sample| rustfft::num_complex::Complex::new(f64::from(sample), 0.0))
+        .collect();
+    rustfft::FftPlanner::new()
+        .plan_fft_forward(spectrum.len())
+        .process(&mut spectrum);
+    let power = |bin: usize| spectrum[bin].norm_sqr();
+    let total: f64 = (1..=RATE / 2).map(power).sum();
+    bins.iter().map(|&bin| power(bin)).sum::<f64>() / total
+}
+
+/// The FM matrix bends the live input's playback rate. A 300 Hz signal in
+/// the ring, whose period is a whole 160 frames, stays in its bin on the
+/// plain read; under a 440 Hz modulator with route amount 2 the read rate
+/// swings 1±2, and the signal's energy spreads onto the sideband bins
+/// 300±k·440, folded at zero into 140 and 580. The bent read never crosses
+/// the writer: a crossing would read unpublished frames as exact silence,
+/// and a 300 Hz read at full level is never that close to zero.
+#[test]
+fn the_fm_matrix_bends_the_live_inputs_playback_rate() {
+    use rustel_audio::input::InputRing;
+
+    const RATE: usize = 48_000;
+    // 564 whole 128-frame blocks. The input callback hands over its frames
+    // block by block, one read-lag ahead, so the reader is placed behind the
+    // writer with room for the bend throughout. The lag is the ring's fixed
+    // 512-frame one; the fixture must write at least that much ahead.
+    let total = 564 * 128;
+    let lag = 512usize;
+    let signal: Vec<f32> = (0..total + lag)
+        .map(|frame| {
+            (std::f64::consts::TAU * 300.0 * f64::from(frame as u32) / RATE as f64).sin() as f32
+        })
+        .collect();
+    let render = |fm: Option<rustel_audio::FmControls>| -> Vec<f32> {
+        let ring = std::sync::Arc::new(InputRing::new());
+        ring.set_channels(1);
+        ring.set_sample_rate(48_000);
+        let pcm = render_live_with(
+            total,
+            |backend| backend.set_input(Some(std::sync::Arc::clone(&ring))),
+            |cursor, rig| {
+                if cursor == 0 {
+                    ring.write(&signal[0..lag + 128], 1);
+                    let mut c = controls(Waveform::Sine, None);
+                    c.fm = fm;
+                    assert!(rig.ring.push(rustel_audio::AudioEvent {
+                        onset_id: 1,
+                        generation: 1,
+                        ui_visuals: 0,
+                        target_frame: 0,
+                        onset_lead: 0.0,
+                        freq_hz: 440.0,
+                        gain: 0.8,
+                        duration_secs: 2.0,
+                        controls: c,
+                        sample: None,
+                        wavetable: None,
+                        synth: Some(rustel_audio::SynthSource::Input { channel: 0 }),
+                        cut: None,
+                    }));
+                } else {
+                    ring.write(&signal[cursor + lag..cursor + lag + 128], 1);
+                }
+            },
+            |_, _| {},
+        );
+        pcm.chunks(2)
+            .map(|frame| frame[0])
+            .skip(RATE / 4)
+            .take(RATE)
+            .collect()
+    };
+    let plain = render(None);
+    let carrier = bin_share(&plain, &[300]);
+    assert!(
+        carrier > 0.99,
+        "the plain read must carry the 300 Hz signal: {carrier}"
+    );
+    let noise = bin_share(&plain, &[140, 580]);
+    assert!(noise < 0.01, "the plain read has no sidebands: {noise}");
+
+    let bent = render(Some(fm_chain(&[Some((2.0, 1.0))])));
+    let sidebands = bin_share(&bent, &[140, 580, 740, 1020, 1180, 1620]);
+    assert!(
+        sidebands > 0.3,
+        "the bent read must move energy to the modulator's sidebands: {sidebands}"
+    );
+    let mut dropout = 0usize;
+    let mut longest = 0usize;
+    for &sample in &bent {
+        if sample.abs() < 1e-6 {
+            dropout += 1;
+            longest = longest.max(dropout);
+        } else {
+            dropout = 0;
+        }
+    }
+    assert!(
+        longest <= 2,
+        "the bent read crossed the writer and read silence: {longest} dead frames"
+    );
+}
+
+/// The FM matrix output scales with the voice's nominal frequency, so a
+/// synthetic zero-frequency event modulates nothing: the whole render is the
+/// plain one, sample for sample. A division by the zero nominal would leave
+/// a NaN position, which reads as silence and moves the samples.
+#[test]
+fn input_fm_with_a_zero_nominal_frequency_is_the_plain_read() {
+    use rustel_audio::input::InputRing;
+
+    let render = |fm: Option<rustel_audio::FmControls>| -> Vec<f32> {
+        let ring = std::sync::Arc::new(InputRing::new());
+        ring.set_channels(1);
+        ring.set_sample_rate(48_000);
+        ring.write(&[0.5f32; 96_000], 1);
+        render_live_with(
+            9_600,
+            |backend| backend.set_input(Some(std::sync::Arc::clone(&ring))),
+            |cursor, rig| {
+                if cursor == 0 {
+                    let mut c = controls(Waveform::Sine, None);
+                    c.fm = fm;
+                    assert!(rig.ring.push(rustel_audio::AudioEvent {
+                        onset_id: 1,
+                        generation: 1,
+                        ui_visuals: 0,
+                        target_frame: 0,
+                        onset_lead: 0.0,
+                        freq_hz: 0.0,
+                        gain: 0.8,
+                        duration_secs: 2.0,
+                        controls: c,
+                        sample: None,
+                        wavetable: None,
+                        synth: Some(rustel_audio::SynthSource::Input { channel: 0 }),
+                        cut: None,
+                    }));
+                }
+            },
+            |_, _| {},
+        )
+    };
+    let plain = render(None);
+    let modulated = render(Some(fm_chain(&[Some((2.0, 1.0))])));
+    assert_eq!(
+        modulated, plain,
+        "a zero nominal frequency must modulate nothing, not one sample"
+    );
+}
+
 /// A gain as an orbit insert. Parameter 1 is the gain.
 struct GainInsert {
     key: rustel_audio::InsertKey,

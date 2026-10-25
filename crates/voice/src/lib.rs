@@ -6599,6 +6599,7 @@ pub static SOUND_REFERENCE: &[ReferenceEntry] = &[
         description: concat!(
             "Choose an input in the device picker's audio in section; the `none` row at the top of that list turns the input off again. `s(\"in\")` plays channel 0; `s(\"in:1\")` plays channel 1. `n` selects an input channel, not a pitch. With no input open, the source is silent.\n\n",
             "Effects: gain, pan, filters, distortion, delay and reverb process the incoming audio.\n\n",
+            "Modulation: the FM controls bend the playback rate of the incoming signal. The route amounts set the bend; `note` does not retune it. A deep or slow bend can skip or repeat parts of the stream.\n\n",
             "Rhythm: `seg` / `segment` divides the pattern into listening windows. Adjacent windows can sound continuous; add `clip(.5)` to leave gaps. Envelopes shape each window.\n\n",
             "Requires recorded audio: `speed`, sample `begin` / `end`, and reverse playback with `speed(-1)` need a recorded sample. `note` does not retune the live input. `chop` can change event timing, but its sample slices do not select different parts of the stream; `rev` reverses event order, not the incoming waveform."
         ),
@@ -6606,6 +6607,7 @@ pub static SOUND_REFERENCE: &[ReferenceEntry] = &[
         examples: &[
             "$: s(\"in\").lpf(2000).room(.5).delay(.3)",
             "$: s(\"in\").seg(8).clip(.5).attack(.005).release(.01).lpf(1200)",
+            "$: s(\"in\").fm(\"<0 2 8>\").fmh(2)",
             "$: stack(s(\"in\").pan(0), s(\"in:1\").pan(1))",
         ],
         tags: &["sound", "external_io"],

@@ -322,7 +322,16 @@ impl AudioBackend for ScalarBackend {
             } else {
                 f64::from(ring_rate) / f64::from(self.sample_rate)
             };
-            let wanted = (frames as f64 * ratio).ceil() as u64;
+            // An input voice under the FM matrix reads ahead of the shared
+            // cursor by the integrated bend, and a rate-locked cursor keeps
+            // only the callback's own frames of room - the keep rule never
+            // widens it to the fixed lag. Reserve the bend's room with the
+            // callback's, so the read never crosses the writer.
+            let input_fm = self.voices.iter().any(|voice| {
+                voice.controls.fm.is_some() && matches!(voice.source, VoiceSource::Input { .. })
+            });
+            let wanted =
+                (frames as f64 * ratio).ceil() as u64 + u64::from(input_fm) * INPUT_FM_HEADROOM;
             let placed = ring.reader_frame(
                 self.input_cursor.map(|cursor| cursor.floor() as u64),
                 wanted,
@@ -792,7 +801,10 @@ impl ScalarBackend {
                                 None,
                             ),
                             crate::backend::SynthSource::Input { channel } => (
-                                VoiceSource::Input { channel },
+                                VoiceSource::Input {
+                                    channel,
+                                    fm_phase: 0.0,
+                                },
                                 e.duration_secs,
                                 // A live signal at its own level, under the
                                 // ordinary envelope. postgain is NOT folded
@@ -2074,7 +2086,7 @@ impl ScalarBackend {
                             .map_or_else(FxParamHold::default, ModAdds::fx_hold);
                     }
                     let mod_adds = mod_adds.as_ref().unwrap_or(&zero_mod_adds);
-                    let fm_offset_hz = match &v.controls.fm {
+                    let fm_matrix_hz = match &v.controls.fm {
                         None => 0.0f32,
                         Some(fm) => {
                             let state =
@@ -2093,7 +2105,7 @@ impl ScalarBackend {
                             )
                         }
                     };
-                    let fm_offset_hz = fm_offset_hz + mod_adds.frequency_hz;
+                    let fm_offset_hz = fm_matrix_hz + mod_adds.frequency_hz;
                     if v.live_cutoff.binding != 0 {
                         let cutoff = v.live_cutoff.next();
                         v.filters.set_lowpass_frequency(cutoff);
@@ -2602,12 +2614,44 @@ impl ScalarBackend {
                                 .unwrap_or(0.0);
                             (sample, sample)
                         }
-                        VoiceSource::Input { channel } => {
+                        VoiceSource::Input { channel, fm_phase } => {
                             let sample = match (&input, input_base) {
-                                (Some(ring), Some((base, ratio))) => ring.sample_at(
-                                    base + (sub_start + i) as f64 * ratio,
-                                    usize::from(*channel),
-                                ),
+                                (Some(ring), Some((base, ratio))) => {
+                                    // The FM matrix bends the read rate, as
+                                    // it bends an oscillator's frequency: the
+                                    // deviation in Hz against the voice's
+                                    // nominal frequency is the rate multiplier
+                                    // the reader runs at, integrated into
+                                    // `fm_phase`. The multiplier deviation is
+                                    // the route amount times the operator
+                                    // signal, independent of the note. A read
+                                    // that runs past the writer lands in
+                                    // silence and one far behind in the
+                                    // ring's oldest frames.
+                                    let position =
+                                        base + (sub_start + i) as f64 * ratio + *fm_phase;
+                                    if v.controls.fm.is_some() {
+                                        // The matrix output is exactly zero
+                                        // when the nominal frequency is zero,
+                                        // which keeps the division finite.
+                                        if fm_matrix_hz != 0.0 {
+                                            *fm_phase += f64::from(fm_matrix_hz)
+                                                / f64::from(v.freq_hz)
+                                                * ratio;
+                                        }
+                                        // The integral of a modulator that
+                                        // starts at phase zero carries its DC
+                                        // as a one-sided LEAD into the
+                                        // writer, which a reader one block
+                                        // behind has no room for. The leak
+                                        // re-centers the swing into the
+                                        // ring's history and bounds a
+                                        // drifting operator; above a hertz it
+                                        // is too slow to hear.
+                                        *fm_phase -= *fm_phase * INPUT_FM_LEAK;
+                                    }
+                                    ring.sample_at(position, usize::from(*channel))
+                                }
                                 _ => 0.0,
                             };
                             (sample, sample)

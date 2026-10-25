@@ -828,6 +828,16 @@ struct OrbitDuck {
     previous: DuckSegments,
 }
 
+/// Per-frame DC removal of an input voice's FM phase, one ring window per
+/// e-fold: slow enough to leave musical rates alone, fast enough to keep the
+/// integrated bend from walking the read into the writer or out of the ring.
+const INPUT_FM_LEAK: f64 = 1.0 / crate::input::INPUT_RING_FRAMES as f64;
+
+/// Input-ring frames reserved beside the callback's own while any input
+/// voice runs the FM matrix: room for the integrated bend to read ahead of
+/// the shared cursor without crossing the writer.
+const INPUT_FM_HEADROOM: u64 = 512;
+
 #[derive(Clone, Debug)]
 // The wavetable variant carries 32 f64 phases, which makes it much larger
 // than the rest. Boxing it would put a pointer chase in the per-sample voice
@@ -836,7 +846,15 @@ struct OrbitDuck {
 enum VoiceSource {
     /// `s("in")` - one channel of the audio input, read from the ring the
     /// input callback fills.
-    Input { channel: u8 },
+    Input {
+        channel: u8,
+        /// The FM matrix's integrated read-rate deviation, in input frames:
+        /// how far this voice reads from the shared cursor. Each sample adds
+        /// the FM sum against the voice's nominal frequency, so the voice
+        /// plays the ring back at a bent rate while `note` still does not
+        /// retune the input.
+        fm_phase: f64,
+    },
     /// `s("bus")` - the voice's source is bus N's mix rather than a generator.
     /// Receivers are evaluated after the senders, so the
     /// sum for this sample is already complete when it is read.
