@@ -9359,17 +9359,17 @@ fn a_replay_save_that_never_reached_the_score_is_reported_not_announced() {
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut saw_failure = false;
-    let mut saw_second_active = false;
+    let mut saw_any_active = false;
     while std::time::Instant::now() < deadline {
         match done.recv_timeout(std::time::Duration::from_millis(200)) {
             Ok(line) => {
                 if line.contains("replay_save_failed") {
                     saw_failure = true;
                 }
-                if line.contains("\"score_active\"") && line.contains("\"save\": 2") {
-                    saw_second_active = true;
+                if line.contains("\"score_active\"") {
+                    saw_any_active = true;
                 }
-                if saw_failure || saw_second_active {
+                if saw_failure {
                     break;
                 }
             }
@@ -9384,7 +9384,7 @@ fn a_replay_save_that_never_reached_the_score_is_reported_not_announced() {
         "the failed delivery must be reported on stderr"
     );
     assert!(
-        !saw_second_active,
+        !saw_any_active,
         "a cue whose save never reached the score must not be announced active"
     );
     let _ = std::fs::remove_dir_all(&staging);

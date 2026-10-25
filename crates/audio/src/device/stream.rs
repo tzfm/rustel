@@ -1487,6 +1487,13 @@ impl FiniteAdmission {
             .get(self.next)
             .is_some_and(|event| event.onset_frame < horizon)
         {
+            // Sidechains arm here, as the live path arms at ring intake:
+            // the queue drains as ducks fire, and arming at the prepare
+            // pass would spend its whole capacity on far-future onsets.
+            backend.arm_duck_at(
+                self.events[self.next].onset_frame,
+                self.events[self.next].controls.duck,
+            );
             let compact = self.events[self.next]
                 .clone()
                 .map_kabel(crate::CompactKabelControls::from);
@@ -2261,6 +2268,92 @@ mod tests {
         assert!(
             tone.iter().any(|sample| sample.abs() > 0.01),
             "the tone after a full pending queue of short events must still sound"
+        );
+    }
+
+    /// Sidechains arm at admission, as the live path arms at ring intake:
+    /// with a list longer than the duck queue's capacity, a trigger past
+    /// the old full-queue drop still dips its target orbit.
+    #[test]
+    fn finite_playback_arms_ducks_past_the_queue_capacity() {
+        let _guard = tripwire_assertion_guard();
+        let duck = crate::DuckControls {
+            targets: [
+                Some(crate::DuckTarget {
+                    orbit: 2,
+                    onset_secs: 0.0,
+                    attack_secs: 0.05,
+                    depth: 1.0,
+                }),
+                None,
+                None,
+                None,
+            ],
+        };
+        let controls = |orbit: u8, duck: Option<crate::DuckControls>| crate::OscillatorControls {
+            orbit,
+            duck,
+            envelope: crate::Envelope {
+                attack_secs: 0.001,
+                decay_secs: 0.0,
+                sustain: 1.0,
+                release_secs: 0.01,
+            },
+            ..Default::default()
+        };
+        // A sustained tone on orbit 2, and more silent duck triggers than
+        // the 4096-entry sidechain queue holds, spaced far enough apart
+        // that the gain recovers to unity between dips.
+        let tone_duration = (4500u64 * 4800 + 12_000) as f32 / 48_000.0;
+        let tone = OnsetEvent::new(0, 220.0, 1.0, tone_duration).with_controls(controls(2, None));
+        let count = 4500u64;
+        let spacing = 4800u64;
+        let last_onset = count * spacing;
+        let triggers = (0..count).map(|index| {
+            OnsetEvent::new(index * spacing + 2400, 220.0, 0.0, 0.01)
+                .with_controls(controls(1, Some(duck)))
+        });
+        let mut events = vec![tone];
+        events.extend(triggers);
+        let total = last_onset + 12_000;
+
+        let mut backend = ScalarBackend::with_dispatch(DspDispatch::portable());
+        backend.init(48_000).unwrap();
+        let mut admission = queue_finite_events(&mut backend, &events, 48_000).unwrap();
+        let written = AtomicU64::new(0);
+        let mut output = vec![0.0f32; 0];
+        while written.load(Ordering::Acquire) < total {
+            let mut block = [0.0f32; 128 * 2];
+            crate::tripwire::audio_scope(|| {
+                super::super::callback::write_output(
+                    &mut backend,
+                    &mut block,
+                    2,
+                    total,
+                    &written,
+                    &mut admission,
+                );
+            });
+            output.extend_from_slice(&block);
+        }
+        let rms = |from: usize, to: usize| {
+            let slice = &output[from * 2..to * 2];
+            (slice
+                .iter()
+                .map(|s| f64::from(*s) * f64::from(*s))
+                .sum::<f64>()
+                / slice.len() as f64)
+                .sqrt()
+        };
+        let last_trigger = (count - 1) * spacing + 2400;
+        let before = rms(
+            (last_trigger - 2_000) as usize,
+            (last_trigger - 100) as usize,
+        );
+        let dipped = rms((last_trigger + 50) as usize, (last_trigger + 600) as usize);
+        assert!(
+            dipped < before * 0.5,
+            "the trigger past the queue capacity must still dip the orbit:              before {before:.5}, at the last trigger {dipped:.5}"
         );
     }
 

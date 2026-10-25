@@ -384,7 +384,18 @@ pub(super) fn lfo_phase0(time_secs: f32, frequency_hz: f32, phase_offset: f32) -
 /// walks below zero, so the wrap removes every whole turn at once rather
 /// than one.
 pub(super) fn wrap_phase(phase: f64) -> f64 {
-    phase - phase.floor()
+    if (0.0..=1.0).contains(&phase) {
+        // An exact cycle end stays stored: the waveshapes read phase 1.0
+        // as the end of the cycle, and dyadic rates land on it exactly.
+        return phase;
+    }
+    if phase > 1.0 {
+        // Whole turns come off, but an exact boundary maps to 1.0, as the
+        // one-turn subtract the walks always did.
+        phase - (phase.ceil() - 1.0)
+    } else {
+        phase - phase.floor()
+    }
 }
 
 /// Unipolar LFO waveshapes on phase in [0, 1]; phase stays f64. The walks
@@ -545,6 +556,7 @@ pub(super) fn lfo_shape(shape: u8, phase: f32, skew: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use super::wrap_phase;
     use super::*;
     mod lfo_waveshape_tests {
         /// `tremolo` defaults to skew 1, and `tri` divides by `1 - skew` on its
@@ -754,5 +766,20 @@ mod tests {
             assert!((env_mod_value(&e, 0.5) - 0.5).abs() < 1e-3);
             assert!(env_mod_value(&e, 0.9999) < 1e-3);
         }
+    }
+
+    /// The wrap matches the one-turn subtract the walks always did, and
+    /// holds for rates past the sample clock and negative rates.
+    #[test]
+    fn wrap_phase_keeps_a_stored_cycle_end() {
+        assert_eq!(wrap_phase(0.0), 0.0);
+        assert_eq!(wrap_phase(0.5), 0.5);
+        assert_eq!(wrap_phase(1.0), 1.0, "an exact cycle end stays stored");
+        assert_eq!(wrap_phase(1.5), 0.5);
+        assert_eq!(wrap_phase(2.0), 1.0, "a whole extra turn lands on 1.0");
+        assert_eq!(wrap_phase(250.75), 0.75);
+        assert_eq!(wrap_phase(250.0), 1.0);
+        assert_eq!(wrap_phase(-0.25), 0.75);
+        assert_eq!(wrap_phase(-250.5), 0.5);
     }
 }

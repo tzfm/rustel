@@ -809,4 +809,26 @@ fn a_failed_restoration_does_not_wedge_later_scores() {
         )
         .expect("query");
     assert_eq!(haps.len(), 2);
+
+    // A slot the score locked non-configurable but writable still gets the
+    // engine value written back, so the name answers again at once.
+    let mut session = Session::new().expect("session");
+    session
+        .evaluate(
+            "await initHydra()\n\
+             Object.defineProperty(globalThis, 'speed', {\n\
+               value: 0, writable: true, configurable: false });\n\
+             $: s(\"bd\")",
+        )
+        .expect("the visuals install over the locked slot");
+    session
+        .evaluate("$: note(\"c e g\")")
+        .expect("the restore writes the engine value into the locked slot");
+    let haps = session
+        .query(
+            rustel_fraction::Fraction::ZERO,
+            rustel_fraction::Fraction::ONE,
+        )
+        .expect("query");
+    assert_eq!(haps.len(), 3);
 }

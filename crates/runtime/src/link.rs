@@ -468,13 +468,16 @@ impl Actor {
                 // Every operand but host_now is peer-supplied, so each
                 // step saturates: an absurd answer is a sample like any
                 // other, not an unwind.
+                // Both means are exact: a saturated add of two extremes
+                // halves to the wrong value, and the offset and the beat
+                // grid follow it.
                 measure
                     .samples
-                    .push(ghost_time.saturating_sub(host_now.saturating_add(host_time) / 2));
+                    .push(ghost_time.saturating_sub(core::mean(host_now, host_time)));
                 if let Some(prev_ghost) = message.prev_ghost_time.filter(|time| *time != 0) {
-                    measure.samples.push(
-                        (ghost_time.saturating_add(prev_ghost) / 2).saturating_sub(host_time),
-                    );
+                    measure
+                        .samples
+                        .push(core::mean(ghost_time, prev_ghost).saturating_sub(host_time));
                 }
                 measure.samples.truncate(MEASURE_SAMPLES * 2);
             }

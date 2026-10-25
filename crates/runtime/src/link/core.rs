@@ -134,8 +134,12 @@ pub fn should_join(
         return false;
     }
     let ghost_diff = other_offset.saturating_sub(current_offset);
+    // A difference past the range of i64 is not a tie: saturating_abs
+    // sends it to i64::MAX, far over the epsilon, where neither side
+    // joins. Plain abs would panic in a checked build and wrap negative
+    // in a wrapping one, where the epsilon test would then read true.
     ghost_diff > SESSION_EPSILON_MICROS
-        || (ghost_diff.abs() < SESSION_EPSILON_MICROS && other_id < current_id)
+        || (ghost_diff.saturating_abs() < SESSION_EPSILON_MICROS && other_id < current_id)
 }
 
 /// Where a grid is, in cycles of four beats, at a ghost time.
@@ -146,7 +150,7 @@ pub fn cycle_of(timeline: &Timeline, ghost: i64) -> f64 {
 /// The mean of two clock samples. Halves each sample first, so a pair
 /// near `i64::MAX` averages exactly as `(a + b) / 2` would, which also
 /// rounds toward zero.
-fn mean(a: i64, b: i64) -> i64 {
+pub(super) fn mean(a: i64, b: i64) -> i64 {
     a / 2 + b / 2 + (a % 2 + b % 2) / 2
 }
 
@@ -275,6 +279,9 @@ mod tests {
         assert!(!should_join(higher, 0, lower, SESSION_EPSILON_MICROS));
         // A session is never joined with itself.
         assert!(!should_join(higher, 0, higher, 9_000_000));
+        // A difference past the range of i64 is no tie, whatever the ids.
+        assert!(!should_join(higher, 0, lower, i64::MIN));
+        assert!(!should_join(lower, 0, higher, i64::MIN));
     }
 
     #[test]

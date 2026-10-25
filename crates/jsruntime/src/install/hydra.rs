@@ -708,38 +708,66 @@ pub(crate) fn restore_surface<'js>(
     let globals = ctx.globals();
     let state = state(ctx)?;
     let saved: rquickjs::Object = state.get(SAVED)?;
-    // One rejected write must not wedge the surface: the next evaluation
-    // restores from this same state, so a failure that leaves the state in
-    // place repeats forever. Every name is attempted, the state is cleared
-    // regardless, and the first failure is reported at the end.
+    // A rejected write must not spend the name it failed on: the entry
+    // stays saved and the surface stays installed, so the next evaluation
+    // tries again instead of leaving the score's value in place of the
+    // engine's for the rest of the session. A slot a score locked
+    // non-configurable still takes the original as a plain value while it
+    // stays writable, as the registration restore does.
     let mut first_failure = None;
+    let mut unrestored = false;
     for entry in saved.props::<String, rquickjs::Value>() {
         let Ok((name, original)) = entry else {
+            unrestored = true;
             continue;
         };
-        // Delete first, always. While the surface is installed `speed` is an
-        // accessor, and assigning to an accessor calls its SETTER - which
-        // would record a drawing instruction for a window that is closing.
-        if let Err(error) = globals.remove(name.as_str()) {
-            first_failure.get_or_insert(error);
-            continue;
-        }
-        // Defined, not assigned: an assignment runs any setter on the
-        // prototype chain, and a score turn restores before its deadline
-        // starts. The attributes are the ones the engine's `set` gave it.
-        if !original.is_undefined()
-            && let Err(error) = globals.prop(
-                name.as_str(),
-                rquickjs::object::Property::from(original)
-                    .writable()
-                    .enumerable()
-                    .configurable(),
-            )
-        {
-            first_failure.get_or_insert(error);
+        let restored = (|| {
+            // Delete first, always. While the surface is installed `speed`
+            // is an accessor, and assigning to an accessor calls its SETTER
+            // - which would record a drawing instruction for a window that
+            // is closing.
+            match globals.remove(name.as_str()) {
+                Ok(()) => {
+                    if original.is_undefined() {
+                        return Ok(());
+                    }
+                    // Defined, not assigned: an assignment runs any setter on
+                    // the prototype chain, and a score turn restores before
+                    // its deadline starts. The attributes are the ones the
+                    // engine's `set` gave it.
+                    globals.prop(
+                        name.as_str(),
+                        rquickjs::object::Property::from(original)
+                            .writable()
+                            .enumerable()
+                            .configurable(),
+                    )
+                }
+                Err(error) => {
+                    if original.is_undefined() {
+                        return Err(error);
+                    }
+                    // The slot stayed: a score locked it non-configurable.
+                    // It still takes a new value while it stays writable, so
+                    // the engine's name answers again even though its
+                    // configurability cannot come back.
+                    globals.prop(
+                        name.as_str(),
+                        rquickjs::object::Property::from(original).writable(),
+                    )
+                }
+            }
+        })();
+        match restored {
+            Ok(()) => {
+                saved.remove(name.as_str())?;
+            }
+            Err(error) => {
+                unrestored = true;
+                first_failure.get_or_insert(error);
+            }
         }
     }
-    state.set(SAVED, bare_object(ctx)?)?;
     state.set(ASSIGNED, bare_object(ctx)?)?;
     let mut chains = chains.borrow_mut();
     for name in std::mem::take(&mut chains.protected) {
@@ -748,7 +776,14 @@ pub(crate) fn restore_surface<'js>(
         }
     }
     chains.chains.clear();
-    chains.installed = false;
+    if unrestored {
+        // Keep the surface installed: the next evaluation restores the
+        // names that stay saved rather than leaving them spent.
+        chains.installed = true;
+    } else {
+        state.set(SAVED, bare_object(ctx)?)?;
+        chains.installed = false;
+    }
     match first_failure {
         Some(error) => Err(error),
         None => Ok(()),

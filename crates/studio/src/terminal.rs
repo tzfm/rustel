@@ -1622,7 +1622,9 @@ fn split_probe_bytes(bytes: &[u8]) -> (Vec<u8>, Vec<crossterm::event::Event>) {
                 (code, modifiers)
             }
             0x01..=0x1a => (
-                KeyCode::Char((byte + b'@' - 1) as char),
+                // Ctrl plus a letter arrives as the letter's control value:
+                // 0x03 is Ctrl+C, and it must reach the editor as 'c'.
+                KeyCode::Char((byte + b'a' - 1) as char),
                 KeyModifiers::CONTROL,
             ),
             _ => return None,
@@ -3085,5 +3087,15 @@ mod tests {
         // A split reply at the window's end is a reply, not a key.
         let (replies, _) = crate::terminal::split_probe_bytes(b"\x1b[?20");
         assert_eq!(replies, b"\x1b[?20");
+
+        // A control chord names its letter: 0x03 is Ctrl+C, 0x13 Ctrl+S.
+        let (_, keys) = crate::terminal::split_probe_bytes(&[0x03, 0x13]);
+        assert_eq!(
+            keys,
+            vec![
+                Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            ]
+        );
     }
 }

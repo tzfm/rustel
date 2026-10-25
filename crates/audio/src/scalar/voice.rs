@@ -992,7 +992,10 @@ impl ScalarBackend {
     /// The producer-side half of a finite playback's event list: every
     /// effect `note` applies before the pending push, so the callback can
     /// admit the events themselves as the output reaches them and a list
-    /// longer than the pending ceiling still plays in full.
+    /// longer than the pending ceiling still plays in full. Sidechains arm
+    /// at admission, as the live path arms at ring intake: the duck queue
+    /// is bounded, and arming the whole list up front would spend it on
+    /// far-future onsets before a single block sounds.
     pub fn prepare_finite_playback(&mut self, events: &[OnsetEvent]) -> Result<(), String> {
         // `note` grew the pending queue and the voice vector on the
         // producer as it queued the whole list, and the callback must
@@ -1017,7 +1020,6 @@ impl ScalarBackend {
                 continue;
             }
             self.prepare_kabel_event(event)?;
-            self.arm_duck(event);
             self.leasing_waves |= event.controls.partials.is_some();
         }
         Ok(())
