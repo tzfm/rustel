@@ -168,17 +168,7 @@ pub fn decode(bytes: &[u8]) -> Option<MidiEvent> {
     })
 }
 
-/// A MIDI note number as a name, for a display a musician can read.
-///
-/// Octave numbering matches `note_to_midi`'s: middle C (60) is c4 there, so
-/// note 0 is c-1.
-pub fn note_name(note: u8) -> String {
-    const NAMES: [&str; 12] = [
-        "c", "c#", "d", "d#", "e", "f", "f#", "g", "g#", "a", "a#", "b",
-    ];
-    let octave = i32::from(note) / 12 - 1;
-    format!("{}{}", NAMES[usize::from(note % 12)], octave)
-}
+pub use rustel_core::util::note_name;
 
 /// An open input port.
 ///
@@ -428,15 +418,6 @@ mod tests {
         ] {
             assert_eq!(decode(bytes), None, "accepted status as data {bytes:02x?}");
         }
-    }
-
-    #[test]
-    fn note_names_line_up_with_note_to_midi() {
-        // 60 is middle C, which `note_to_midi("c4", _)` also gives.
-        assert_eq!(note_name(60), "c4");
-        assert_eq!(note_name(48), "c3");
-        assert_eq!(note_name(69), "a4");
-        assert_eq!(note_name(0), "c-1");
     }
 
     /// The summary is the mapping aid: turning one knob must show up as one

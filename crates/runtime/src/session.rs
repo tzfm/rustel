@@ -840,6 +840,8 @@ pub struct Session {
     stop_when_silent: Option<rustel_audio::SilenceStop>,
     /// Optional master limiter for WAV/MP3 file exports.
     export_limiter: Option<rustel_audio::RenderLimiter>,
+    /// Tick resolution and meter for a MIDI file render.
+    midi_export_options: rustel_smf::SmfOptions,
     /// The input-channel warnings already said for this score and this
     /// input: a silent voice on `in:1` is news once, not once a window.
     input_warnings_reported: std::collections::BTreeSet<String>,
@@ -1157,6 +1159,7 @@ impl Session {
             prebake_selects_variants: false,
             stop_when_silent: None,
             export_limiter: None,
+            midi_export_options: rustel_smf::SmfOptions::default(),
             input_warnings_reported: std::collections::BTreeSet::new(),
             refusals_reported: std::collections::BTreeSet::new(),
             plugin_lines_reported: std::collections::BTreeSet::new(),

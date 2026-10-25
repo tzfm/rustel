@@ -33,6 +33,13 @@
 - `getTime()` reads 0 when a score starts from its first cycle: Play after a stop, a restart or a rewind. Before, it kept the old cycle, so a pattern placed with it played late. A failed update that falls back to the last score gives that score its first value again.
 - New `oneshot(grid)` from Switch Angel plays a pattern once, on the next grid line after the update.
 - In Windows Terminal, a syntax error no longer leaves stray coloured cells across the screen. The studio now sends underline colours in the colon form that Windows Terminal reads.
+- Add MIDI file export. `rustel export --format midi` writes a Type 1 file. Studio adds a MIDI format to the export sheet.
+- Add MIDI file import. `rustel import-midi` writes a score. A dropped `.mid` file opens as a new Studio scene.
+- Pattern queries allocate less. Time and value changes reuse a hap, and a shared object map stays shared until a write. A 4-cycle query with five controls drops from 3,297 to 2,353 allocations.
+- The Studio Chords tab sorts the chord symbols it has no name for. Their order changed on each run before.
+- The new `terminal` theme follows the terminal's own palette: `reset` and the 16 `ansiN` colours, so a custom scheme such as a Kitty or Noctalia one shows through the studio.
+- The theme picker's delete key refuses a theme the studio ships on the first press. Before, the second press went looking for a file a built-in theme does not have and answered with an error that listed every theme name.
+- The Studio Chords tab no longer leaks memory while it is open. Each draw leaked 336 small strings with the default dictionary.
 
 ### Sound changes
 

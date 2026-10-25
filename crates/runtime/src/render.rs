@@ -46,6 +46,8 @@ pub enum RenderFormat {
     /// Returns an unsupported-format error unless the `mp3-export` feature is
     /// enabled.
     ScalarMp3,
+    /// A Type 1 Standard MIDI File of the scheduled onsets.
+    Midi,
 }
 
 /// Whether this build encodes [`RenderFormat::ScalarMp3`].

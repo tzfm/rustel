@@ -69,6 +69,7 @@ fn open_sources(studio: &mut Hermetic) {
 
 /// How long a local import may take to walk its folder.
 const IMPORT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+const SOURCE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A local import lands as `fetching its list of sounds` and settles, on
 /// a later frame, to the receipt - bounded like every asynchronous wait
@@ -79,13 +80,37 @@ fn wait_for_import(studio: &mut Hermetic) {
     });
 }
 
+/// Wait for the source row, the durable result of an import. The receipt is
+/// a transient status that the source's scan line can replace.
+fn wait_for_source(studio: &mut Hermetic, folder: &Path) {
+    let name = folder.file_name().unwrap().to_string_lossy().into_owned();
+    studio.pump_until(SOURCE_BUDGET, "the source reached the list", |studio| {
+        studio
+            .rows()
+            .iter()
+            .any(|row| row.contains(&name) && row.contains("(local)"))
+    });
+}
+
+/// Wait for the source's scan to settle. The row's sound count is durable,
+/// unlike the transient import receipt.
+fn wait_for_source_scan(studio: &mut Hermetic, folder: &Path) {
+    let name = folder.file_name().unwrap().to_string_lossy().into_owned();
+    studio.pump_until(SOURCE_BUDGET, "the source scan settled", |studio| {
+        studio
+            .rows()
+            .iter()
+            .any(|row| row.contains(&name) && row.contains("(local)") && row.contains("sound(s)"))
+    });
+}
+
 /// Import a folder by dropping it on the studio - the sheet lands on
 /// Sources with the row already listed - and leave the selection on the
 /// imported row.
 fn import_folder(studio: &mut Hermetic, folder: &Path) {
     studio.paste(&folder.display().to_string());
     studio.settle();
-    wait_for_import(studio);
+    wait_for_source(studio, folder);
     let name = folder.file_name().unwrap().to_string_lossy().into_owned();
     assert_eq!(
         studio.focus(),
@@ -113,7 +138,7 @@ fn a_source_added_from_the_sheet_lists_and_can_be_removed() {
     studio.paste(&folder.display().to_string());
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();
-    wait_for_import(&mut studio);
+    wait_for_source(&mut studio, &folder);
     let rows = studio.rows();
     let name = folder.file_name().unwrap().to_string_lossy();
     assert!(
@@ -252,6 +277,7 @@ fn r_aliases_the_bank_a_source_imported() {
     let folder = audio_folder("alias");
 
     import_folder(&mut studio, &folder);
+    wait_for_source_scan(&mut studio, &folder);
 
     studio.press(KeyCode::Char('r'), KeyModifiers::NONE);
     studio.settle();
@@ -288,6 +314,7 @@ fn alt_r_in_the_samples_browser_aliases_an_imported_bank() {
     let mut studio = hermetic();
     let folder = audio_folder_with_bank("browser-alias", BANK);
     import_folder(&mut studio, &folder);
+    wait_for_source_scan(&mut studio, &folder);
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     studio.settle();
     assert_eq!(studio.focus(), None, "setup: the sheet is closed");
@@ -338,6 +365,7 @@ fn e_opens_the_source_for_editing_and_esc_keeps_it() {
     let name = folder.file_name().unwrap().to_string_lossy().into_owned();
 
     import_folder(&mut studio, &folder);
+    wait_for_source_scan(&mut studio, &folder);
 
     studio.press(KeyCode::Char('e'), KeyModifiers::NONE);
     studio.settle();

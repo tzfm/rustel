@@ -6,6 +6,7 @@
 
 /// Replacing a file's contents in one rename.
 mod atomic_file;
+pub use atomic_file::replace_file_bytes;
 mod capabilities;
 mod capability_report;
 mod csound;
@@ -46,8 +47,10 @@ pub mod midi_bridge;
 /// the studio, because both drive the same scheduler.
 #[cfg(feature = "midi")]
 pub mod midi_clock;
+mod midi_export;
 #[cfg(feature = "midi")]
 pub mod midi_input;
+mod midi_onset;
 #[cfg(feature = "osc")]
 pub mod osc_bridge;
 mod process_stats;
@@ -111,8 +114,8 @@ pub use engine_pressure::{
     EnginePressureStatusV1, EnginePressureVoicesV1,
 };
 pub use hap_json::{
-    BenchMetrics, HapJson, OnsetEventJson, PlayReport, QueryReport, RenderReport, SpanJson,
-    ValueJson, haps_to_json,
+    BenchMetrics, HapJson, MidiExportReport, OnsetEventJson, PlayReport, QueryReport, RenderReport,
+    SpanJson, ValueJson, haps_to_json,
 };
 
 /// The stack every thread gets if it will build a JavaScript runtime and query

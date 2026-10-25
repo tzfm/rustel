@@ -459,6 +459,7 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | `metal` | 0.32.0 | MIT OR Apache-2.0 |
 | `micromath` | 2.1.0 | Apache-2.0 OR MIT |
 | `midir` | 0.11.0 | MIT |
+| `midly` | 0.5.3 | Unlicense |
 | `minimal-lexical` | 0.2.1 | MIT/Apache-2.0 |
 | `miniz_oxide` | 0.8.9 | MIT OR Zlib OR Apache-2.0 |
 | `mio` | 1.2.2 | MIT |

@@ -42,6 +42,7 @@ rustel-fraction = { path = "../fraction" }
 rustel-scheduler = { path = "../scheduler" }
 rustel-voice = { path = "../voice" }
 rustel-midi = { path = "../midi", optional = true }
+rustel-smf = { path = "../smf" }
 rustel-hydra = { path = "../hydra", optional = true }
 rustel-osc = { path = "../osc", optional = true }
 rustel-serial = { path = "../serial", optional = true }

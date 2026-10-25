@@ -24,6 +24,7 @@ later version.
 //! full queue are each reported and dropped. Silence from one MIDI device is
 //! less harmful than a stopped process.
 
+#[cfg(feature = "device")]
 pub mod input;
 
 use std::cmp::Reverse;
@@ -32,15 +33,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "device")]
 use midir::{MidiOutput, MidiOutputConnection};
 
 /// What to say when there is no sequencer to ask.
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "device", target_os = "linux"))]
 pub(crate) const NO_SEQUENCER: &str =
     "no ALSA sequencer: /dev/snd/seq is absent, so this machine has no MIDI ports";
 
 /// What to say when the sequencer is there but refuses this user.
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "device", target_os = "linux"))]
 pub(crate) const SEQUENCER_REFUSED: &str = "no ALSA sequencer access: this user may not open \
      /dev/snd/seq; join the audio group (sudo usermod -aG audio $USER), then log in again";
 
@@ -53,7 +55,7 @@ pub(crate) const SEQUENCER_REFUSED: &str = "no ALSA sequencer access: this user 
 /// be initialized, and libasound writes its own account to stderr on every
 /// attempt. Asking the filesystem first names the cause once, in words,
 /// without calling into ALSA.
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "device", target_os = "linux"))]
 pub(crate) fn sequencer_ready() -> Result<(), &'static str> {
     const SEQUENCER: &std::ffi::CStr = c"/dev/snd/seq";
     // SAFETY: `SEQUENCER` is a static NUL-terminated string, and `access`
@@ -68,7 +70,7 @@ pub(crate) fn sequencer_ready() -> Result<(), &'static str> {
 
 /// Every other platform reaches MIDI through its own API, which has no such
 /// device.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(feature = "device", not(target_os = "linux")))]
 pub(crate) fn sequencer_ready() -> Result<(), &'static str> {
     Ok(())
 }
@@ -76,7 +78,7 @@ pub(crate) fn sequencer_ready() -> Result<(), &'static str> {
 /// [`sequencer_ready`]'s answer, given what `access(2)` said about opening
 /// `/dev/snd/seq` for reading and writing. Any failure other than absence or
 /// refusal is left for ALSA's own open to report.
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "device", target_os = "linux"))]
 fn sequencer_verdict(access: std::io::Result<()>) -> Result<(), &'static str> {
     match access.map_err(|error| error.kind()) {
         Err(std::io::ErrorKind::NotFound) => Err(NO_SEQUENCER),
@@ -86,12 +88,14 @@ fn sequencer_verdict(access: std::io::Result<()>) -> Result<(), &'static str> {
 }
 
 /// A `midir` output client, or why there is not one.
+#[cfg(feature = "device")]
 pub(crate) fn open_output(name: &str) -> Result<MidiOutput, String> {
     sequencer_ready()?;
     MidiOutput::new(name).map_err(|error| error.to_string())
 }
 
 /// A `midir` input client, or why there is not one.
+#[cfg(feature = "device")]
 pub(crate) fn open_input(name: &str) -> Result<midir::MidiInput, String> {
     sequencer_ready()?;
     midir::MidiInput::new(name).map_err(|error| error.to_string())
@@ -525,6 +529,7 @@ pub trait MidiPort: Send {
     }
 }
 
+#[cfg(feature = "device")]
 impl MidiPort for MidiOutputConnection {
     fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
         MidiOutputConnection::send(self, bytes).map_err(|error| error.to_string())
@@ -652,6 +657,7 @@ pub fn port_for_selector(selector: &str, names: &[String]) -> Option<usize> {
 ///
 /// `None` selects the first port. `kind` identifies the direction in error
 /// messages ("MIDI port" or "MIDI input").
+#[cfg(feature = "device")]
 pub(crate) fn resolve_port(
     selector: Option<&str>,
     names: &[String],
@@ -732,6 +738,7 @@ impl Drop for MidiWorkerExit {
 
 impl MidiSender {
     /// List the output ports, in the order a numeric `midiport` indexes them.
+    #[cfg(feature = "device")]
     pub fn ports() -> Result<Vec<String>, String> {
         let output = open_output("rustel")?;
         Ok(output
@@ -748,6 +755,7 @@ impl MidiSender {
     /// synth is an output, and the same device can appear in both with
     /// different indices. Listing only outputs left a musician guessing at what
     /// their controller is called.
+    #[cfg(feature = "device")]
     pub fn input_ports() -> Result<Vec<String>, String> {
         let input = open_input("rustel")?;
         Ok(input
@@ -764,6 +772,7 @@ impl MidiSender {
     /// name match is case-insensitive and by substring, because the full names
     /// carry platform noise a musician should not have to type
     /// ("Midi Through:Midi Through Port-0 14:0").
+    #[cfg(feature = "device")]
     pub fn open(selector: Option<&str>) -> Result<Self, String> {
         let output = open_output("rustel")?;
         let ports = output.ports();
@@ -795,7 +804,7 @@ impl MidiSender {
     /// Windows has no equivalent - WinMM cannot create ports - so there the
     /// caller must install a loopback driver (loopMIDI) and [`Self::open`] it
     /// by name.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(all(feature = "device", any(target_os = "linux", target_os = "macos")))]
     pub fn create_virtual(name: &str) -> Result<Self, String> {
         use midir::os::unix::VirtualOutput as _;
         let output = open_output("rustel")?;
@@ -1358,7 +1367,7 @@ impl Drop for MidiSender {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "device"))]
 mod sequencer_tests {
     use super::*;
 
@@ -1539,6 +1548,7 @@ mod tests {
     /// `.midi(...)` and `midin(...)` open, tested without a device: no
     /// selector is the first port, an explicit empty one is refused like a
     /// name that matches nothing, and an index past the ports is refused.
+    #[cfg(feature = "device")]
     #[test]
     fn the_openers_resolve_a_selector_to_a_port_or_a_named_refusal() {
         let names = vec!["Controller Keys".to_string(), "Controller Pads".to_string()];

@@ -175,6 +175,7 @@ mod loading_line;
 mod log_panel;
 mod memory_panel;
 mod menu_bar;
+mod midi_import;
 mod mixer;
 mod mouse;
 mod panes;

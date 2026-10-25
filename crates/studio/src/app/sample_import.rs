@@ -116,6 +116,15 @@ fn is_score_path(path: &std::path::Path) -> bool {
         })
 }
 
+/// Whether a dropped file is a Standard MIDI File.
+fn is_midi_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("mid") || extension.eq_ignore_ascii_case("midi")
+        })
+}
+
 fn normalized_sample_source(spec: &str) -> String {
     let spec = spec.trim();
     let path = std::path::Path::new(spec);
@@ -328,6 +337,7 @@ impl App {
             },
         );
         let mut opened = 0usize;
+        let mut midi = 0usize;
         let mut presets = 0usize;
         let mut refused: Vec<String> = Vec::new();
         // Collected rather than adopted one at a time: adopting re-walks
@@ -356,6 +366,10 @@ impl App {
             } else if is_score_path(path) {
                 self.open_dropped_score(path);
                 opened += 1;
+            } else if is_midi_path(path) {
+                if self.import_dropped_midi(path) {
+                    midi += 1;
+                }
             } else if self.take_dropped_preset(path) {
                 presets += 1;
             } else {
@@ -375,20 +389,23 @@ impl App {
             }
             many => self.add_sample_sources(many),
         };
-        if imported == 0 && opened == 0 && presets == 0 && !refused.is_empty() {
+        if imported == 0 && opened == 0 && midi == 0 && presets == 0 && !refused.is_empty() {
             self.status = format!(
-                "nothing to import from {} - audio, a folder of audio, or a score",
+                "nothing to import from {} - audio, a folder of audio, a score, or a MIDI file",
                 refused.join(", ")
             );
         } else if !refused.is_empty() {
-            self.status = format!("{} skipped: not audio or a score", refused.join(", "));
+            self.status = format!(
+                "{} skipped: not audio, a score, or a MIDI file",
+                refused.join(", ")
+            );
         }
         if !refused.is_empty() {
             self.log.push(
                 LogLevel::Warn,
                 "drop",
                 format!(
-                    "not audio, a folder of audio, or a score: {}",
+                    "not audio, a folder of audio, a score, or a MIDI file: {}",
                     refused.join(", ")
                 ),
             );
@@ -397,8 +414,8 @@ impl App {
             LogLevel::Debug,
             "drop",
             format!(
-                "{imported} source(s) imported · {opened} score(s) opened · {presets} preset(s) \
-                 added · {} refused",
+                "{imported} source(s) imported · {opened} score(s) opened · {midi} MIDI file(s) \
+                 imported · {presets} preset(s) added · {} refused",
                 refused.len()
             ),
         );
@@ -1450,6 +1467,91 @@ mod tests {
             assert!(app.status.contains("not imported"), "{}", app.status);
             assert_eq!(refusals(&app), 4);
             assert_eq!(app.log.unseen(), warnings, "a refusal is not a warning");
+        }
+
+        fn midi_fixture(directory: &std::path::Path, end: u64) -> std::path::PathBuf {
+            let path = directory.join("song.mid");
+            let bytes = rustel_smf::Timeline {
+                ppq: 480,
+                tempo_micros_per_quarter: 500_000,
+                meter: rustel_smf::Meter::FOUR_FOUR,
+                tracks: vec![rustel_smf::Track {
+                    name: "lead".into(),
+                    channel: 1,
+                    messages: vec![
+                        rustel_smf::Message {
+                            tick: 0,
+                            kind: rustel_smf::MessageKind::NoteOn {
+                                note: 60,
+                                velocity: 100,
+                            },
+                        },
+                        rustel_smf::Message {
+                            tick: end,
+                            kind: rustel_smf::MessageKind::NoteOff { note: 60 },
+                        },
+                    ],
+                }],
+            }
+            .to_bytes()
+            .expect("MIDI bytes");
+            std::fs::write(&path, bytes).expect("fixture");
+            path
+        }
+
+        #[test]
+        fn dropping_a_midi_file_creates_a_scene_and_leaves_the_file_alone() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let midi = midi_fixture(directory.path(), 3_840);
+            let bytes = std::fs::read(&midi).expect("fixture");
+            let before = app.scenes.scores().count();
+
+            app.accept_drop(std::slice::from_ref(&midi));
+
+            assert_eq!(app.scenes.scores().count(), before + 1);
+            assert!(app.status.contains("imported song.mid"), "{}", app.status);
+            assert_eq!(std::fs::read(&midi).expect("fixture"), bytes);
+            let scene = app.scenes.current();
+            assert_ne!(scene.path, midi);
+            assert!(scene.path.exists());
+            assert!(scene.editor.source().contains("note("));
+            assert!(scene.editor.source().contains(".slow(2)"));
+            assert!(scene.rewind, "a two-bar import starts at its own zero");
+        }
+
+        #[test]
+        fn a_malformed_midi_drop_creates_nothing() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let bad = directory.path().join("bad.mid");
+            std::fs::write(&bad, b"nope").expect("fixture");
+            let before = app.scenes.scores().count();
+
+            app.accept_drop(std::slice::from_ref(&bad));
+
+            assert_eq!(app.scenes.scores().count(), before);
+            assert!(app.status.contains("could not import"), "{}", app.status);
+            assert!(
+                app.log
+                    .lines()
+                    .iter()
+                    .any(|line| line.level == LogLevel::Error)
+            );
+        }
+
+        #[test]
+        fn a_midi_drop_in_mini_mode_is_refused() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            app.options.mini = true;
+            let midi = midi_fixture(directory.path(), 480);
+            let before = app.scenes.scores().count();
+
+            app.accept_drop(std::slice::from_ref(&midi));
+
+            assert_eq!(app.scenes.scores().count(), before);
+            assert!(app.status.contains("JavaScript mode"), "{}", app.status);
         }
     }
 }
