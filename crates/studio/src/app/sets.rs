@@ -715,7 +715,9 @@ impl App {
                     | SetPrompt::EditSampleSource(_)
             );
             #[cfg(feature = "vst")]
-            let settings_prompt = settings_prompt || prompt == SetPrompt::AddVstFolder;
+            let settings_prompt = settings_prompt
+                || prompt == SetPrompt::AddVstFolder
+                || prompt == SetPrompt::AddPresetFolder;
             self.set_prompt_return_focus =
                 Some(if settings_prompt && self.settings_sheet.is_some() {
                     Focus::Panel(PanelKind::Settings)
@@ -738,7 +740,9 @@ impl App {
                 | SetPrompt::RenameSample
         );
         #[cfg(feature = "vst")]
-        let over_settings = over_settings || prompt == SetPrompt::AddVstFolder;
+        let over_settings = over_settings
+            || prompt == SetPrompt::AddVstFolder
+            || prompt == SetPrompt::AddPresetFolder;
         if over_settings && self.settings_sheet.is_some() {
             self.dismiss_dialogs_except(&[PanelKind::Set, PanelKind::Settings]);
         } else {
@@ -834,6 +838,11 @@ impl App {
                 FilePicker::new("plugin folder", "reads its plugins", Vec::new(), &root)
                     .choosing_folders()
             }
+            #[cfg(feature = "vst")]
+            SetPrompt::AddPresetFolder => {
+                FilePicker::new("preset folder", "reads its presets", Vec::new(), &root)
+                    .choosing_folders()
+            }
         };
         self.set_prompt = Some((prompt, picker));
         self.focus_panel(PanelKind::Set);
@@ -879,6 +888,10 @@ impl App {
             #[cfg(feature = "vst")]
             SetPrompt::AddVstFolder => {
                 "plugin folder - type a path, or Tab to browse and Enter on . · Esc back".into()
+            }
+            #[cfg(feature = "vst")]
+            SetPrompt::AddPresetFolder => {
+                "preset folder - any structure · Enter on . or a path adds it · Esc back".into()
             }
         };
         self.dirty_frame = true;
@@ -982,6 +995,8 @@ impl App {
                 }
                 #[cfg(feature = "vst")]
                 SetPrompt::AddVstFolder => self.add_vst_folder(&path),
+                #[cfg(feature = "vst")]
+                SetPrompt::AddPresetFolder => self.add_preset_folder(&path),
             },
         }
         self.dirty_frame = true;
@@ -1518,6 +1533,10 @@ pub(super) enum SetPrompt {
     /// A folder with VST3 plugins, for the vst page of the settings sheet.
     #[cfg(feature = "vst")]
     AddVstFolder,
+    /// A folder with `.vstpreset` files in any structure, for the vst page
+    /// of the settings sheet.
+    #[cfg(feature = "vst")]
+    AddPresetFolder,
 }
 
 #[cfg(test)]

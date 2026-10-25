@@ -859,9 +859,26 @@ struct App {
     /// Where the plugin scan was at the last turn, while the scan runs.
     #[cfg(feature = "vst")]
     plugin_scan: Option<rustel_runtime::vst::ScanProgress>,
+    /// The reads of the preset folders at the last turn: the watch reads
+    /// them again when a file changed, and the open plugin takes the
+    /// presets of that read.
+    #[cfg(feature = "vst")]
+    plugin_presets_version: u64,
+    /// The text of the settings vst page's plugin filter. The sheet holds
+    /// only its state, for its rows and its keys.
+    #[cfg(feature = "vst")]
+    vst_filter: settings::VstFilter,
+    /// The plugins the filter kept, by their place in the full scanned
+    /// list. Identity in length while no filter holds.
+    #[cfg(feature = "vst")]
+    vst_shown: Vec<usize>,
     /// The plugin rows of the memory breakdown, as last measured.
     #[cfg(feature = "vst")]
     plugin_memory: Vec<super::memory::PluginMemory>,
+    /// The presets of the settings vst page's open plugin row, as the host
+    /// last read them: see [`SettingsSheet::vst_open`].
+    #[cfg(feature = "vst")]
+    settings_vst_open_presets: Vec<String>,
     linter: Linter,
     /// The newest finding per scene, in the coordinates of the revision
     /// it was checked at.
@@ -1641,7 +1658,15 @@ impl App {
             #[cfg(feature = "vst")]
             plugin_loads: Vec::new(),
             #[cfg(feature = "vst")]
+            settings_vst_open_presets: Vec::new(),
+            #[cfg(feature = "vst")]
             plugin_scan: None,
+            #[cfg(feature = "vst")]
+            plugin_presets_version: 0,
+            #[cfg(feature = "vst")]
+            vst_filter: settings::VstFilter::default(),
+            #[cfg(feature = "vst")]
+            vst_shown: Vec::new(),
             #[cfg(feature = "vst")]
             plugin_memory: Vec::new(),
             linter: Linter::spawn().map_err(RuntimeError::Io)?,
@@ -1950,7 +1975,10 @@ impl App {
         app.adopt_global_sources();
         app.refresh_catalogue();
         #[cfg(feature = "vst")]
-        app.adopt_vst_folders();
+        {
+            app.adopt_vst_folders();
+            app.adopt_preset_folders();
+        }
         // Laid out the way the set was left: the same scores in the same
         // panes, with the caret in the pane that had it.
         app.restore_panes();

@@ -34,6 +34,7 @@ mod main_thread;
 mod module;
 mod preset;
 mod scan;
+mod watch;
 mod worker;
 
 pub use host::{

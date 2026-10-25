@@ -2290,17 +2290,21 @@ const SOURCES_CONTROLS: &[Row] = &[
 /// How many selectable rows precede the imports on Sources.
 pub(super) const SOURCE_CONTROL_COUNT: usize = SOURCES_CONTROLS.len();
 
-/// The two actions at the top of the vst page, before the folders: the
-/// label and the explanation of each.
+/// The actions at the top of the vst page, before the folders: the label
+/// and the explanation of each.
 #[cfg(feature = "vst")]
-const VST_CONTROLS: [(&str, &str); 3] = [
+const VST_CONTROLS: [(&str, &str); 4] = [
     (
         "add folder",
         "opens a prompt for a folder with VST3 plugins",
     ),
     (
+        "add preset folder",
+        "opens a prompt for a folder with .vstpreset files, any structure",
+    ),
+    (
         "scan",
-        "reads every folder and tests new or changed plugins",
+        "reads every folder, tests new or changed plugins, and reads the preset folders",
     ),
     (
         "rescan",
@@ -2312,9 +2316,11 @@ pub(super) const VST_CONTROL_COUNT: usize = VST_CONTROLS.len();
 #[cfg(feature = "vst")]
 const VST_ADD_ROW: usize = 0;
 #[cfg(feature = "vst")]
-const VST_SCAN_ROW: usize = 1;
+const VST_PRESET_ADD_ROW: usize = 1;
 #[cfg(feature = "vst")]
-const VST_RESCAN_ROW: usize = 2;
+const VST_SCAN_ROW: usize = 2;
+#[cfg(feature = "vst")]
+const VST_RESCAN_ROW: usize = 3;
 
 /// The terminal profile belongs with the bindings it determines.
 pub(super) const TERMINAL_PROFILE_ROW: usize = 0;
@@ -2838,6 +2844,34 @@ pub struct SettingsSheet {
     /// removes the rows. Each row has the switch `audio thread only`.
     #[cfg(feature = "vst")]
     pub vst_scanned_count: usize,
+    /// How many preset folders the player added follow the standard folders.
+    #[cfg(feature = "vst")]
+    pub vst_preset_folder_count: usize,
+    /// The scanned row whose presets the page lists under it, by its place
+    /// in the scanned list. `None` while no row is open.
+    #[cfg(feature = "vst")]
+    pub vst_open: Option<usize>,
+    /// How many presets the open row lists under it: the page keeps the
+    /// names.
+    #[cfg(feature = "vst")]
+    pub vst_open_count: usize,
+    /// The App owes the sheet the presets of the open row: the row opened,
+    /// or the host read the preset folders again.
+    #[cfg(feature = "vst")]
+    pub vst_presets_due: bool,
+    /// Where the plugin filter stands. The App owns its text and mirrors
+    /// its state here.
+    #[cfg(feature = "vst")]
+    pub vst_filter: VstFilterState,
+    /// How many plugin rows the page lists: every one the scan found, or
+    /// the ones the standing filter kept. The App keeps the count.
+    #[cfg(feature = "vst")]
+    pub vst_shown: usize,
+    /// The open plugin row's place among the rows the page lists - `None`
+    /// while no row is open, or when the filter dropped the plugin it
+    /// holds. The row itself is [`SettingsSheet::vst_open`].
+    #[cfg(feature = "vst")]
+    pub vst_open_listed: Option<usize>,
     /// The first line of the page drawn, kept from key to key so walking
     /// through the middle of a page leaves it still. The page keeps a margin
     /// of rows around the selection; see [`super::scroll`].
@@ -2912,6 +2946,18 @@ pub enum SettingsAction {
     /// `d` on a folder the player added: take the folder off the list.
     #[cfg(feature = "vst")]
     RemoveVstFolder(usize),
+    /// The vst page: the sheet hands over to a picker for a folder with
+    /// `.vstpreset` files, in any folder structure.
+    #[cfg(feature = "vst")]
+    AddPresetFolder,
+    /// `d` on a preset folder the player added: take the folder off the
+    /// list, and the host reads the preset folders again.
+    #[cfg(feature = "vst")]
+    RemovePresetFolder(usize),
+    /// Enter on a scanned row: list the presets the folders hold for the
+    /// plugin under its row, or close the list.
+    #[cfg(feature = "vst")]
+    ToggleVstPresets(usize),
     /// Enter on the scan row: read every plugin folder again, and test the
     /// plugins with no answer in the scan cache.
     #[cfg(feature = "vst")]
@@ -2925,6 +2971,15 @@ pub enum SettingsAction {
     /// of plugins.
     #[cfg(feature = "vst")]
     ToggleAudioThread(usize),
+    /// A letter on the vst page: jump to the next plugin whose name
+    /// begins with it, from the row the cursor holds and around the list.
+    #[cfg(feature = "vst")]
+    JumpVst(char),
+    /// A key of the vst page's plugin filter: the App owns its text and
+    /// takes the key to it. The key is the whole press, so Enter, Esc and
+    /// Backspace reach the text as letters of their own meaning.
+    #[cfg(feature = "vst")]
+    FilterVst(crossterm::event::KeyCode),
     /// Enter on a keybind row: wait for a chord, and make it this
     /// action's. The chord itself arrives through the app's learn state.
     LearnKeybind(BindAction),
@@ -3181,21 +3236,66 @@ impl SettingsSheet {
         matches!(self.page, SettingsPage::Vst)
     }
 
+    /// How many plugin rows the vst page lists: the ones the standing
+    /// filter kept. The App keeps the count; before it has - a fresh
+    /// sheet, or one the App has not mirrored yet - the scan's own count
+    /// stands in while no filter holds.
+    #[cfg(feature = "vst")]
+    pub fn vst_plugins_shown(&self) -> usize {
+        if self.vst_shown == 0 && self.vst_filter == VstFilterState::Off {
+            self.vst_scanned_count
+        } else {
+            self.vst_shown
+        }
+    }
+
     /// The vst page is a list, as the sources page is: the arrows walk the
-    /// two actions, the folders the player added, the standard folders,
-    /// then the plugins the scan found. Only a folder the player added is
-    /// removed. Space on a plugin turns its switch `audio thread only` on or
-    /// off.
+    /// actions, the folders the player added, the standard folders, the
+    /// preset folders, then the plugins the scan found. Only a folder the
+    /// player added is removed. Space on a plugin turns its switch
+    /// `audio thread only` on or off, and Enter lists its presets.
     #[cfg(feature = "vst")]
     fn vst_key(&mut self, code: crossterm::event::KeyCode) -> SettingsAction {
         use crossterm::event::KeyCode;
         let added = self.vst_folder_count;
         let folders = VST_CONTROL_COUNT + added + self.vst_standard_count;
-        let len = folders + self.vst_scanned_count;
+        let scanned = folders + self.vst_preset_folder_count;
+        // The rows past the folders are the plugins the page lists: every
+        // one the scan found, or the ones the standing filter kept.
+        let len = scanned + self.vst_plugins_shown();
         let at = self.selected.min(len - 1);
         let on_added = at >= VST_CONTROL_COUNT && at < VST_CONTROL_COUNT + added;
+        let on_preset = at >= folders && at < scanned;
         match code {
-            KeyCode::Char(' ') if at >= folders => SettingsAction::ToggleAudioThread(at - folders),
+            // `/` starts a filter of the plugin list, or takes a standing
+            // one back up to type.
+            KeyCode::Char('/') if !self.vst_filter.is_typing() => SettingsAction::FilterVst(code),
+            // While the letters build it, every key the page binds is a
+            // letter of it: `a` adds no folder, `d` and Backspace take
+            // none off, Space switches no plugin, and `/` types a slash.
+            // Enter keeps the filter standing and hands the rows back,
+            // and Esc drops it whole - the first Esc ends it, the next
+            // closes the sheet as ever.
+            KeyCode::Char(_)
+            | KeyCode::Enter
+            | KeyCode::Backspace
+            | KeyCode::Delete
+            | KeyCode::Esc
+                if self.vst_filter.is_typing() =>
+            {
+                SettingsAction::FilterVst(code)
+            }
+            // The arrows end the typing - the filter stands - and move
+            // through the rows the standing text kept.
+            KeyCode::Up if self.vst_filter.is_typing() => {
+                self.selected = (at + len - 1) % len;
+                SettingsAction::FilterVst(code)
+            }
+            KeyCode::Down if self.vst_filter.is_typing() => {
+                self.selected = (at + 1) % len;
+                SettingsAction::FilterVst(code)
+            }
+            KeyCode::Char(' ') if at >= scanned => SettingsAction::ToggleAudioThread(at - scanned),
             KeyCode::Up => {
                 self.selected = (at + len - 1) % len;
                 SettingsAction::Nothing
@@ -3206,15 +3306,26 @@ impl SettingsSheet {
             }
             KeyCode::Char('a' | '+') => SettingsAction::AddVstFolder,
             KeyCode::Enter if at == VST_ADD_ROW => SettingsAction::AddVstFolder,
+            KeyCode::Enter if at == VST_PRESET_ADD_ROW => SettingsAction::AddPresetFolder,
             KeyCode::Enter if at == VST_SCAN_ROW => SettingsAction::ScanVst,
             KeyCode::Enter if at == VST_RESCAN_ROW => SettingsAction::RescanVst,
+            KeyCode::Enter if at >= scanned => SettingsAction::ToggleVstPresets(at - scanned),
             KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace if on_added => {
                 SettingsAction::RemoveVstFolder(at - VST_CONTROL_COUNT)
             }
-            // The page takes the key, so the score does not.
-            KeyCode::Enter | KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
-                SettingsAction::Nothing
+            KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace if on_preset => {
+                SettingsAction::RemovePresetFolder(at - folders)
             }
+            // A letter jumps to the next plugin that begins with it, from
+            // the row the cursor holds and around: `s` reaches Serum and
+            // the rest of the s's. The arms above took `d` on the rows it
+            // removes, and `a` adds a folder everywhere, so `A` reaches
+            // the a's.
+            KeyCode::Char(letter) if letter.is_alphanumeric() && !matches!(letter, 'a' | '+') => {
+                SettingsAction::JumpVst(letter)
+            }
+            // The page takes the key, so the score does not.
+            KeyCode::Enter | KeyCode::Delete | KeyCode::Backspace => SettingsAction::Nothing,
             _ => SettingsAction::Ignored,
         }
     }
@@ -3436,10 +3547,15 @@ impl SettingsSheet {
                 })
                 .collect(),
             #[cfg(feature = "vst")]
+            // The filter's echo line counts as a line wherever it shows;
+            // its text is the page's to draw, not this row map's.
             SettingsPage::Vst => vst_lines(
                 self.vst_folder_count,
                 self.vst_standard_count,
-                self.vst_scanned_count,
+                self.vst_preset_folder_count,
+                self.vst_plugins_shown(),
+                self.vst_open_listed.map(|open| (open, self.vst_open_count)),
+                self.vst_filter != VstFilterState::Off,
             )
             .iter()
             .enumerate()
@@ -3664,7 +3780,10 @@ impl SettingsSheet {
             return self.mapping_key(code);
         }
         #[cfg(feature = "vst")]
-        if self.shows_vst() && !matches!(code, KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab) {
+        if self.shows_vst()
+            && (!matches!(code, KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab)
+                || self.vst_filter.is_typing())
+        {
             return self.vst_key(code);
         }
         // The keybinds page keeps Esc and Tab for the sheet - a page you
@@ -3973,7 +4092,10 @@ impl SettingsSheet {
                 &vst_lines(
                     self.vst_folder_count,
                     self.vst_standard_count,
-                    self.vst_scanned_count,
+                    self.vst_preset_folder_count,
+                    self.vst_plugins_shown(),
+                    self.vst_open_listed.map(|open| (open, self.vst_open_count)),
+                    self.vst_filter != VstFilterState::Off,
                 ),
             ),
             SettingsPage::Mapping => self.mapping_first(rows),
@@ -4040,8 +4162,7 @@ impl SettingsSheet {
                 },
             ));
         }
-        // Two footer rows on the vst page: the plugin count and the preset
-        // folder.
+        // Two footer rows on the vst page: the plugin count and the hint.
         #[cfg(feature = "vst")]
         if self.shows_vst() {
             return Some((
@@ -4141,7 +4262,10 @@ impl SettingsSheet {
         let lines = vst_lines(
             self.vst_folder_count,
             self.vst_standard_count,
-            self.vst_scanned_count,
+            self.vst_preset_folder_count,
+            self.vst_plugins_shown(),
+            self.vst_open_listed.map(|open| (open, self.vst_open_count)),
+            self.vst_filter != VstFilterState::Off,
         );
         self.choice_at(available, x, y, &lines)
     }
@@ -4631,6 +4755,19 @@ enum SourceLine {
     NoImports,
     /// A source row, by its cursor index in the combined list.
     Row(usize),
+    /// A preset name under the open plugin row of the vst page. The view
+    /// reads the names from the page: the sheet keeps only their count
+    /// for its cursor math. Not a row of the cursor.
+    #[cfg(feature = "vst")]
+    Detail,
+    /// No preset folders yet: the empty state of the vst page's preset
+    /// folder group.
+    #[cfg(feature = "vst")]
+    NoPresets,
+    /// The echo of the vst page's plugin filter, above the rows it kept.
+    /// The page holds the text; not a row of the cursor.
+    #[cfg(feature = "vst")]
+    Filter,
 }
 
 /// Which boxed section a sources-page or vst-page header names.
@@ -4645,6 +4782,8 @@ enum SourceSection {
     PluginFolders,
     #[cfg(feature = "vst")]
     StandardFolders,
+    #[cfg(feature = "vst")]
+    PresetFolders,
     #[cfg(feature = "vst")]
     Scanned,
 }
@@ -4661,6 +4800,8 @@ impl SourceSection {
             Self::PluginFolders => "your folders",
             #[cfg(feature = "vst")]
             Self::StandardFolders => "standard folders",
+            #[cfg(feature = "vst")]
+            Self::PresetFolders => "preset folders",
             #[cfg(feature = "vst")]
             Self::Scanned => "scanned plugins",
         }
@@ -4682,29 +4823,75 @@ fn source_lines(imported: usize, shipped: usize) -> Vec<SourceLine> {
     )
 }
 
-/// The lines of the vst page in order: the two actions, the folders the
-/// player added (or the empty-state line), the standard folders, then one
-/// row for every plugin the scan found.
+/// The lines of the vst page in order: the actions, the folders the player
+/// added (or the empty-state line), the standard folders, the preset
+/// folders, then one row for every plugin the scan found, with the presets
+/// of the open row under it.
 #[cfg(feature = "vst")]
-fn vst_lines(added: usize, standard: usize, scanned: usize) -> Vec<SourceLine> {
-    use SourceSection::{PluginFolders, Plugins, Scanned, StandardFolders};
-    let mut lines = section_lines(
-        [Plugins, PluginFolders, StandardFolders],
-        VST_CONTROL_COUNT,
-        added,
-        standard,
-    );
-    if scanned > 0 {
-        let folders = VST_CONTROL_COUNT + added + standard;
-        lines.pop();
+fn vst_lines(
+    added: usize,
+    standard: usize,
+    presets: usize,
+    scanned: usize,
+    open: Option<(usize, usize)>,
+    filter: bool,
+) -> Vec<SourceLine> {
+    use SourceSection::{PluginFolders, Plugins, PresetFolders, Scanned, StandardFolders};
+    let mut lines = Vec::new();
+    lines.push(SourceLine::Header {
+        section: Plugins,
+        first: true,
+    });
+    lines.extend((0..VST_CONTROL_COUNT).map(SourceLine::Control));
+    lines.push(SourceLine::Gap);
+    lines.push(SourceLine::Header {
+        section: PluginFolders,
+        first: false,
+    });
+    if added == 0 {
+        lines.push(SourceLine::NoImports);
+    }
+    let at = VST_CONTROL_COUNT;
+    lines.extend((at..at + added).map(SourceLine::Row));
+    if standard > 0 {
+        lines.push(SourceLine::Gap);
+        lines.push(SourceLine::Header {
+            section: StandardFolders,
+            first: false,
+        });
+        lines.extend((at + added..at + added + standard).map(SourceLine::Row));
+    }
+    lines.push(SourceLine::Gap);
+    lines.push(SourceLine::Header {
+        section: PresetFolders,
+        first: false,
+    });
+    if presets == 0 {
+        lines.push(SourceLine::NoPresets);
+    }
+    let at = at + added + standard;
+    lines.extend((at..at + presets).map(SourceLine::Row));
+    if scanned > 0 || filter {
         lines.push(SourceLine::Gap);
         lines.push(SourceLine::Header {
             section: Scanned,
             first: false,
         });
-        lines.extend((folders..folders + scanned).map(SourceLine::Row));
-        lines.push(SourceLine::Footer);
+        if filter {
+            lines.push(SourceLine::Filter);
+        }
+        let at = at + presets;
+        for index in 0..scanned {
+            lines.push(SourceLine::Row(at + index));
+            if let Some(count) = open
+                .filter(|(open, _)| *open == index)
+                .map(|(_, count)| count)
+            {
+                lines.extend(std::iter::repeat_n(SourceLine::Detail, count));
+            }
+        }
     }
+    lines.push(SourceLine::Footer);
     lines
 }
 
@@ -4744,13 +4931,126 @@ fn section_lines(
     lines
 }
 
-/// The vst page as the page reads: the plugin folders in cursor order, one
-/// row for every plugin the scan found, and the two facts under the list.
+/// The filter of the vst page's plugin list, as the App holds its text.
+/// `/` starts the typing, every letter builds it - even the keys the
+/// page's rows bind - Enter keeps it standing, and Esc drops it whole.
+/// The App owns the text; the sheet holds only its [`VstFilterState`].
+#[cfg(feature = "vst")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum VstFilter {
+    #[default]
+    Off,
+    /// The letters are still building it; the arrows and Enter end them.
+    Typing(String),
+    /// Enter kept it: the list stays filtered until `/` takes it back up.
+    Set(String),
+}
+
+#[cfg(feature = "vst")]
+impl VstFilter {
+    /// While the letters build it, the page's keys are its text.
+    pub fn is_typing(&self) -> bool {
+        matches!(self, VstFilter::Typing(_))
+    }
+
+    /// While no filter holds, the page lists every plugin.
+    pub fn is_off(&self) -> bool {
+        matches!(self, VstFilter::Off)
+    }
+
+    /// The key a filter takes while it types, and the filter it leaves:
+    /// a letter builds it, `/` types a slash, Enter keeps it standing,
+    /// Backspace and Delete take a letter off - and an empty filter goes
+    /// with them - Esc drops the whole filter, and the arrows end the
+    /// typing and keep it standing.
+    pub fn typed(self, code: crossterm::event::KeyCode) -> VstFilter {
+        use crossterm::event::KeyCode;
+        match (self, code) {
+            (_, KeyCode::Esc) => VstFilter::Off,
+            (VstFilter::Typing(text), KeyCode::Backspace | KeyCode::Delete) => {
+                let mut text = text;
+                if text.pop().is_none() {
+                    VstFilter::Off
+                } else {
+                    VstFilter::Typing(text)
+                }
+            }
+            (VstFilter::Typing(mut text), KeyCode::Char(letter)) => {
+                text.push(letter);
+                VstFilter::Typing(text)
+            }
+            (VstFilter::Set(text), KeyCode::Char('/')) => VstFilter::Typing(text),
+            (VstFilter::Off, KeyCode::Char('/')) => VstFilter::Typing(String::new()),
+            (typing, _) => kept(typing),
+        }
+    }
+
+    /// The echo line of the filter, above the rows it kept: the text and
+    /// its caret while it types, and a word when the text keeps no
+    /// plugin.
+    pub fn echo(&self, shown: usize) -> Option<String> {
+        let echo = |text: &str, caret: &str| {
+            if !text.is_empty() && shown == 0 {
+                format!("filter: {text}{caret} · no plugins match")
+            } else {
+                format!("filter: {text}{caret}")
+            }
+        };
+        match self {
+            VstFilter::Off => None,
+            VstFilter::Typing(text) => Some(echo(text, "▏")),
+            VstFilter::Set(text) => Some(echo(text, "")),
+        }
+    }
+}
+
+/// A typing Enter or the arrows ended: the text stands as the filter, or
+/// nothing stands when it is empty.
+#[cfg(feature = "vst")]
+fn kept(filter: VstFilter) -> VstFilter {
+    match filter {
+        VstFilter::Typing(text) if text.is_empty() => VstFilter::Off,
+        VstFilter::Typing(text) => VstFilter::Set(text),
+        standing => standing,
+    }
+}
+
+/// Where the vst page's plugin filter stands, as the sheet holds it for
+/// its key routing and its row math. The App owns the text and mirrors
+/// its state here.
+#[cfg(feature = "vst")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VstFilterState {
+    /// No filter: the page lists every plugin.
+    #[default]
+    Off,
+    /// A filter stands: the page lists the plugins its text kept.
+    Set,
+    /// The letters are building it: the page's keys are its text.
+    Typing,
+}
+
+#[cfg(feature = "vst")]
+impl VstFilterState {
+    /// While the letters build it, the page's keys are its text.
+    pub fn is_typing(self) -> bool {
+        matches!(self, VstFilterState::Typing)
+    }
+}
+
+/// The vst page as the page reads: the plugin folders and the preset
+/// folders in cursor order, one row for every plugin the scan found, and
+/// the plugin count under the list.
 #[cfg(feature = "vst")]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VstPage {
     /// The folders the player added, then the standard folders.
     pub folders: Vec<VstFolder>,
+    /// The folders with `.vstpreset` files the player added.
+    pub preset_folders: Vec<VstFolder>,
+    /// The presets of the plugin row the page lists open, by name. Empty
+    /// while the host reads the folders: see [`SettingsSheet::vst_open`].
+    pub open_presets: Vec<String>,
     /// Every plugin the host found, in the order the page lists them.
     pub scanned: Vec<VstScanned>,
     /// The number of plugins the host found in all folders.
@@ -4759,8 +5059,12 @@ pub struct VstPage {
     /// says it, so the page itself shows the scan the header badge stands
     /// for.
     pub scan: Option<rustel_runtime::vst::ScanProgress>,
-    /// The folder with one folder of `.vstpreset` files for each plugin.
-    pub presets: String,
+    /// The echo of the plugin filter, above the rows it kept: the text
+    /// and its caret while it types. `None` while no filter holds.
+    pub filter: Option<String>,
+    /// The plugins the page lists, by their place in the full scanned
+    /// list. The page reads it only while a filter holds.
+    pub shown: Vec<usize>,
 }
 
 /// One plugin the scan found, as its row reads: the name, where the plugin
@@ -4775,6 +5079,9 @@ pub struct VstScanned {
     /// The switch `audio thread only`: the copies of the plugin stay on the
     /// audio thread.
     pub audio_thread: bool,
+    /// How many preset files the preset folders hold for the plugin. The
+    /// row says the number only when it is not zero.
+    pub presets: usize,
 }
 
 /// One plugin folder, as its row reads.
@@ -4959,6 +5266,207 @@ mod tests {
             SettingsNavigation::default().open(),
             SettingsSheet::default()
         );
+    }
+
+    /// A letter on the vst page jumps to a plugin, and the keys the page
+    /// binds stay bound: `a` adds a folder from any row, and `d` takes a
+    /// folder off only on the rows that hold one.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn a_letter_jumps_and_the_bound_keys_of_the_vst_page_stay() {
+        let mut settings = UiSettings::default();
+        let features = TerminalFeatures::default();
+        let mut sheet = SettingsSheet::default();
+        sheet.show_page(SettingsPage::Vst);
+        sheet.vst_folder_count = 1;
+        sheet.vst_standard_count = 1;
+        sheet.vst_preset_folder_count = 1;
+        sheet.vst_scanned_count = 3;
+        let mut key = |sheet: &mut SettingsSheet, code| sheet.key(code, &mut settings, &features);
+        // The rows before the plugins: the folder the player added, then
+        // the standard folder, then the preset folder.
+        sheet.selected = VST_CONTROL_COUNT;
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char('d')),
+            SettingsAction::RemoveVstFolder(0)
+        );
+        // `a` keeps its add from every row, and a letter no row binds
+        // jumps to the plugins.
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char('a')),
+            SettingsAction::AddVstFolder
+        );
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char('s')),
+            SettingsAction::JumpVst('s')
+        );
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char('S')),
+            SettingsAction::JumpVst('S')
+        );
+        // On a plugin row no folder sits under, `d` is a letter too.
+        sheet.selected = VST_CONTROL_COUNT + 3 + 1;
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char('d')),
+            SettingsAction::JumpVst('d')
+        );
+    }
+
+    /// `/` filters the plugin list by its letters, and while the letters
+    /// build the filter every key the page binds is a letter of it: `a`
+    /// adds no folder, `d` removes none, and Space switches no plugin.
+    /// Enter keeps the filter standing, and Esc - which the sheet owes
+    /// back once the filter is gone - drops it whole.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn a_slash_filters_the_plugins_and_the_bound_keys_type() {
+        let mut settings = UiSettings::default();
+        let features = TerminalFeatures::default();
+        let mut sheet = SettingsSheet::default();
+        sheet.show_page(SettingsPage::Vst);
+        sheet.vst_folder_count = 1;
+        sheet.vst_standard_count = 1;
+        sheet.vst_preset_folder_count = 1;
+        sheet.vst_scanned_count = 3;
+        sheet.vst_shown = 3;
+        // The App owns the text and mirrors its state into the sheet;
+        // this is its half, run beside the sheet's.
+        let mut filter = VstFilter::default();
+        let mut key = |sheet: &mut SettingsSheet, code| {
+            let action = sheet.key(code, &mut settings, &features);
+            filter = std::mem::take(&mut filter).typed(code);
+            sheet.vst_filter = match &filter {
+                VstFilter::Off => VstFilterState::Off,
+                VstFilter::Typing(_) => VstFilterState::Typing,
+                VstFilter::Set(_) => VstFilterState::Set,
+            };
+            action
+        };
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char('/')),
+            SettingsAction::FilterVst(KeyCode::Char('/'))
+        );
+        for letter in ['a', 'd', ' ', 's'] {
+            assert_eq!(
+                key(&mut sheet, KeyCode::Char(letter)),
+                SettingsAction::FilterVst(KeyCode::Char(letter)),
+                "{letter} is a letter of the filter"
+            );
+        }
+        assert_eq!(sheet.vst_filter, VstFilterState::Typing);
+        // Enter keeps the filter standing, and the letters jump again.
+        assert_eq!(
+            key(&mut sheet, KeyCode::Enter),
+            SettingsAction::FilterVst(KeyCode::Enter)
+        );
+        assert_eq!(sheet.vst_filter, VstFilterState::Set);
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char('s')),
+            SettingsAction::JumpVst('s')
+        );
+        // `/` takes the standing filter back up, and Esc drops it whole;
+        // once it is gone, Esc owes the sheet back its close.
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char('/')),
+            SettingsAction::FilterVst(KeyCode::Char('/'))
+        );
+        assert_eq!(sheet.vst_filter, VstFilterState::Typing);
+        assert_eq!(
+            key(&mut sheet, KeyCode::Esc),
+            SettingsAction::FilterVst(KeyCode::Esc)
+        );
+        assert_eq!(sheet.vst_filter, VstFilterState::Off);
+        assert_eq!(key(&mut sheet, KeyCode::Esc), SettingsAction::Close);
+    }
+
+    /// While a filter stands, the cursor walks the plugins it kept and no
+    /// others, and the rows the keys address are places among the kept.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn a_standing_filter_walks_the_plugins_it_kept() {
+        let mut settings = UiSettings::default();
+        let features = TerminalFeatures::default();
+        let mut sheet = SettingsSheet::default();
+        sheet.show_page(SettingsPage::Vst);
+        sheet.vst_folder_count = 1;
+        sheet.vst_standard_count = 1;
+        sheet.vst_preset_folder_count = 1;
+        sheet.vst_scanned_count = 3;
+        // The filter kept one of the three.
+        sheet.vst_filter = VstFilterState::Set;
+        sheet.vst_shown = 1;
+        let mut key = |sheet: &mut SettingsSheet, code| sheet.key(code, &mut settings, &features);
+        // The one row that shows is the last of the page: Down wraps to
+        // the first, and not into the plugins the filter dropped.
+        sheet.selected = VST_CONTROL_COUNT + 3;
+        assert_eq!(
+            key(&mut sheet, KeyCode::Down),
+            SettingsAction::Nothing,
+            "Down stays on the page"
+        );
+        assert_eq!(sheet.selected, 0, "Down wraps within the rows that show");
+        // Enter and Space address the kept row's place, for the App to
+        // find the plugin it holds.
+        sheet.selected = VST_CONTROL_COUNT + 3;
+        assert_eq!(
+            key(&mut sheet, KeyCode::Enter),
+            SettingsAction::ToggleVstPresets(0)
+        );
+        assert_eq!(
+            key(&mut sheet, KeyCode::Char(' ')),
+            SettingsAction::ToggleAudioThread(0)
+        );
+    }
+
+    /// The filter's own key math: a letter builds it, Backspace takes one
+    /// off and an empty one goes, the arrows and Enter end the typing and
+    /// keep the text standing, and the echo says when nothing matches.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn the_filter_takes_its_keys_and_says_what_it_keeps() {
+        use crossterm::event::KeyCode;
+        let filter = VstFilter::default();
+        let filter = filter.typed(KeyCode::Char('/'));
+        assert_eq!(filter, VstFilter::Typing(String::new()));
+        let filter = filter.typed(KeyCode::Char('s')).typed(KeyCode::Char('e'));
+        assert_eq!(filter, VstFilter::Typing("se".into()));
+        // The arrows and Enter end the typing and keep the text standing.
+        assert_eq!(
+            filter.clone().typed(KeyCode::Down),
+            VstFilter::Set("se".into())
+        );
+        let filter = filter.typed(KeyCode::Enter);
+        assert_eq!(filter, VstFilter::Set("se".into()));
+        // `/` takes a standing filter back up with its text.
+        assert_eq!(
+            filter.typed(KeyCode::Char('/')),
+            VstFilter::Typing("se".into())
+        );
+        // Backspace takes a letter off, and an empty filter goes with it.
+        let filter = VstFilter::Typing("se".into());
+        assert_eq!(
+            filter.typed(KeyCode::Backspace),
+            VstFilter::Typing("s".into())
+        );
+        assert_eq!(
+            VstFilter::Typing(String::new()).typed(KeyCode::Backspace),
+            VstFilter::Off
+        );
+        // The echo: the caret while it types, the text when it stands,
+        // and a word when the text keeps no plugin.
+        assert_eq!(
+            VstFilter::Typing("se".into()).echo(1),
+            Some("filter: se▏".to_owned())
+        );
+        assert_eq!(
+            VstFilter::Set("se".into()).echo(1),
+            Some("filter: se".to_owned())
+        );
+        assert_eq!(
+            VstFilter::Set("zz".into()).echo(0),
+            Some("filter: zz · no plugins match".to_owned())
+        );
+        assert_eq!(VstFilter::Off.echo(3), None);
     }
 
     #[test]
@@ -9123,6 +9631,8 @@ mod tests {
         let settings = UiSettings::default();
         let features = TerminalFeatures::default();
         let theme = Theme::default();
+        // The page lists four groups: a taller frame fits the plugins of
+        // the scan under the folders.
         let vst = VstPage {
             folders: vec![
                 VstFolder {
@@ -9139,20 +9649,25 @@ mod tests {
                     name: "Tone".into(),
                     state: "ready".into(),
                     audio_thread: false,
+                    presets: 0,
                 },
                 VstScanned {
                     name: "Kick".into(),
                     state: "found".into(),
                     audio_thread: true,
+                    presets: 2,
                 },
             ],
+            preset_folders: Vec::new(),
+            open_presets: Vec::new(),
             plugins: 2,
             scan: Some(rustel_runtime::vst::ScanProgress {
                 read: 3,
                 bundles: 124,
                 plugin: "Shell › Comp".into(),
             }),
-            presets: "~/Music/presets".into(),
+            filter: None,
+            shown: Vec::new(),
         };
         let mut sheet = SettingsSheet {
             page: SettingsPage::Vst,
@@ -9161,7 +9676,7 @@ mod tests {
             vst_scanned_count: 2,
             ..Default::default()
         };
-        let frame = Rect::new(0, 0, 120, 24);
+        let frame = Rect::new(0, 0, 120, 32);
         let mut buffer = Buffer::empty(frame);
         SettingsSheetView {
             sheet,
@@ -9199,9 +9714,17 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("scanned plugins"), "{text}");
+        assert!(text.contains("preset folders"), "{text}");
+        assert!(
+            text.contains("none yet · Enter on add preset folder adds one"),
+            "{text}"
+        );
         assert!(text.contains("Tone · ready"), "{text}");
         assert!(!text.contains("Tone · ready ·"), "{text}");
-        assert!(text.contains("Kick · found · audio thread only"), "{text}");
+        assert!(
+            text.contains("Kick · found (2) · audio thread only"),
+            "{text}"
+        );
         assert!(
             text.contains("scanning · 3 of 124 bundles · Shell › Comp"),
             "{text}"
@@ -9216,6 +9739,10 @@ mod tests {
         for _ in 0..4 {
             walk(&mut sheet, down);
         }
+        // The folders the player added and the standard folders take no
+        // switch.
+        assert_eq!(walk(&mut sheet, space), SettingsAction::Ignored);
+        walk(&mut sheet, down);
         assert_eq!(walk(&mut sheet, space), SettingsAction::Ignored);
         walk(&mut sheet, down);
         assert_eq!(
@@ -9223,7 +9750,7 @@ mod tests {
             SettingsAction::ToggleAudioThread(0)
         );
         walk(&mut sheet, down);
-        assert_eq!(sheet.selected, 6);
+        assert_eq!(sheet.selected, 7);
         assert_eq!(
             walk(&mut sheet, space),
             SettingsAction::ToggleAudioThread(1)
@@ -9265,7 +9792,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            text.contains("Space turns audio thread only on or off"),
+            text.contains("Enter lists the presets · Space turns audio thread only on or off"),
+            "{text}"
+        );
+        assert!(
+            text.contains("2 plugins found · a letter jumps to its plugins"),
             "{text}"
         );
         assert!(text.contains("▸ Kick"), "{text}");

@@ -176,8 +176,98 @@ fn a_plugin_folder_added_on_the_sheet_reaches_the_host_and_can_be_removed() {
     // The cursor went up to the rescan row with the last folder.
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();
-    assert_eq!(studio.status(), "reading the plugin folders");
+    // No folder is left: the read ends in no time, and the line that says
+    // it runs may already say the count it ended with.
+    assert!(
+        studio.status() == "reading the plugin folders" || studio.status() == "0 plugins found",
+        "{}",
+        studio.status()
+    );
     wait_for_row(&mut studio, "0 plugins found");
+}
+
+/// `/` filters the plugin rows of the vst page by their letters. While
+/// the letters build the filter, the keys the page binds type into it -
+/// `a` opens no folder prompt - and Enter keeps it standing while the
+/// arrows and Enter act on the rows it kept. Backspace takes the letters
+/// off, and an empty filter goes with them.
+#[test]
+fn a_slash_filters_the_plugin_rows_of_the_settings_page() {
+    let mut studio = hermetic();
+    let folder = tempfile::tempdir().expect("plugin folder");
+    rustel_vst3_fixture::install(folder.path());
+    let path = folder.path().display().to_string();
+
+    // The vst page is the sixth tab, with the fixture's two plugins.
+    studio.chord("ctrl+o");
+    for _ in 0..5 {
+        studio.press(KeyCode::Tab, KeyModifiers::NONE);
+    }
+    studio.settle();
+    studio.press(KeyCode::Char('a'), KeyModifiers::NONE);
+    studio.settle();
+    studio.paste(&path);
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.settle();
+    vst::host().resolve(rustel_vst3_fixture::NAME, true);
+    wait_for_row(&mut studio, "2 plugins found");
+    let plugins = |studio: &mut Hermetic| {
+        studio
+            .rows()
+            .into_iter()
+            .filter(|row| row.contains("Rustel Fixture"))
+            .count()
+    };
+
+    // `/` starts the filter. `a` types into it - no folder prompt opens -
+    // and no plugin name holds an `a`, so the filter says so.
+    studio.press(KeyCode::Char('/'), KeyModifiers::NONE);
+    studio.settle();
+    studio.press(KeyCode::Char('a'), KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    row_containing(&rows, "filter: a▏ · no plugins match");
+    assert!(
+        !studio.status().contains("plugin folder"),
+        "`a` typed into the filter, not the page: {}",
+        studio.status()
+    );
+
+    // Backspace takes the `a` off, and `tone` keeps the Tone plugin alone.
+    studio.press(KeyCode::Backspace, KeyModifiers::NONE);
+    for letter in ['t', 'o', 'n', 'e'] {
+        studio.press(KeyCode::Char(letter), KeyModifiers::NONE);
+    }
+    studio.settle();
+    let rows = studio.rows();
+    row_containing(&rows, "filter: tone▏");
+    assert_eq!(
+        plugins(&mut studio),
+        1,
+        "the filter keeps the Tone plugin alone:\n{}",
+        rows.join("\n")
+    );
+
+    // Enter keeps the filter standing, without its caret.
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.settle();
+    row_containing(&studio.rows(), "filter: tone");
+    assert_eq!(plugins(&mut studio), 1, "the standing filter holds");
+
+    // `/` takes the standing filter back up, and Backspace takes its
+    // letters off - an empty filter goes with them: both plugins are
+    // rows again.
+    studio.press(KeyCode::Char('/'), KeyModifiers::NONE);
+    studio.settle();
+    for _ in 0..5 {
+        studio.press(KeyCode::Backspace, KeyModifiers::NONE);
+    }
+    studio.settle();
+    assert_eq!(plugins(&mut studio), 2, "the empty filter keeps all");
+    assert!(
+        !studio.rows().iter().any(|row| row.contains("filter:")),
+        "the echo line went with the filter"
+    );
 }
 
 /// Open the reference column on its vst tab: the fifth tab.
@@ -273,8 +363,10 @@ fn a_completion_in_a_plugin_call_lists_names_keys_and_presets() {
 
     // The bundle is not loaded: its name is in the list for an effect and
     // in the list for an instrument. A part of the name in lower case
-    // finds the row.
-    for call in ["vst", "vsti"] {
+    // finds the row. The pick of the first name opens the presets of the
+    // plugin, which loads the bundle: the instrument list then has the
+    // instrument of the bundle, and the effect list the effect.
+    for (call, plugin) in [("vst", "Rustel Fixture"), ("vsti", "Rustel Fixture Tone")] {
         let text = format!("$: s(\"bd\").{call}(\"fix\")");
         complete_after(&mut studio, &text, "fix");
         assert_eq!(
@@ -283,12 +375,12 @@ fn a_completion_in_a_plugin_call_lists_names_keys_and_presets() {
         );
         wait_for_row(&mut studio, "1 of 1 plugins");
         row_containing(&studio.rows(), "search: fix");
+        if call == "vsti" {
+            wait_for_row(&mut studio, "Rustel Fixture Tone");
+        }
         studio.press(KeyCode::Enter, KeyModifiers::NONE);
         studio.settle();
-        assert_eq!(
-            studio.score(),
-            format!("$: s(\"bd\").{call}(\"Rustel Fixture\")")
-        );
+        assert_eq!(studio.score(), format!("$: s(\"bd\").{call}({plugin:?})"));
     }
 
     // The object of the call: `preset` at once, and the 4 keys of the
@@ -361,6 +453,13 @@ fn a_completion_in_a_plugin_call_lists_names_keys_and_presets() {
         studio.score(),
         "$: s(\"bd\").vst(\"rustel fixture\", { preset: \"Dark Bass\" })"
     );
+
+    // The host is the one of the process: leave its preset root over a
+    // folder with no files, so a later test counts no preset of this one.
+    // On Windows the loaded plugin holds this test's folder, so its preset
+    // files stay after the test ends.
+    let empty = tempfile::tempdir().expect("empty preset root");
+    vst::host().set_preset_folder(empty.path().to_path_buf());
 }
 
 /// Switching from plugin-name completion to the vst tab keeps the plugin
@@ -428,4 +527,48 @@ fn a_plugins_parameters_are_available_throughout_its_call() {
     assert_eq!(studio.reference_tab(), Some("vst"));
     wait_for_row(&mut studio, "▾ Rustel Fixture Tone");
     assert!(studio.rows().iter().all(|row| !row.contains("beatgate")));
+}
+
+/// A preset file that lands in the preset folder while the studio runs
+/// reaches the open plugin with no rescan: the watch of the folders reads
+/// them again. The preset the player saved mid-play is there once the
+/// read ends, and the score keeps playing through it.
+#[test]
+fn a_preset_file_saved_while_the_studio_runs_reaches_the_open_plugin() {
+    let mut studio = hermetic();
+    let folder = tempfile::tempdir().expect("plugin folder");
+    let presets = folder.path().join("presets");
+    let of_fixture = presets.join(rustel_vst3_fixture::NAME);
+    std::fs::create_dir_all(&of_fixture).expect("preset folder");
+    std::fs::write(
+        of_fixture.join("Dark Bass.vstpreset"),
+        rustel_vst3_fixture::preset(0.5, 0.0),
+    )
+    .expect("preset file");
+    let plugins = folder.path().join("plugins");
+    rustel_vst3_fixture::install(&plugins);
+    vst::host().set_preset_folder(presets);
+    vst::pin_standard_folders(vec![plugins]);
+
+    // The presets are the half of the plugin the saved file reaches. →
+    // opens the plugin on its parameters, Tab goes to the presets.
+    studio.press(KeyCode::End, KeyModifiers::NONE);
+    open_vst_tab(&mut studio);
+    wait_for_row(&mut studio, "1 of 1 plugins");
+    studio.press(KeyCode::Right, KeyModifiers::NONE);
+    studio.settle();
+    studio.press(KeyCode::Tab, KeyModifiers::NONE);
+    studio.settle();
+    studio.pump_until(LOAD_BUDGET, "the presets of the read", |studio| {
+        studio.rows().iter().any(|row| row.contains("Dark Bass"))
+    });
+
+    std::fs::write(
+        of_fixture.join("Late Save.vstpreset"),
+        rustel_vst3_fixture::preset(0.5, 0.0),
+    )
+    .expect("preset file");
+    studio.pump_until(LOAD_BUDGET, "the preset of the watch", |studio| {
+        studio.rows().iter().any(|row| row.contains("Late Save"))
+    });
 }

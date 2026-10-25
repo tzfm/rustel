@@ -1,0 +1,7 @@
+/*
+  @by undy
+  @origin regressions
+  @duration 4
+*/
+setcps(0.5)
+note("c3").s("sine").fm(2).fmh(1.5).fast("3")

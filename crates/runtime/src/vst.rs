@@ -39,6 +39,9 @@ pub const PRESETS_DIRECTORY_NAME: &str = "vst";
 static HOST: OnceLock<Host> = OnceLock::new();
 static USER_FOLDERS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 static PINNED_FOLDERS: Mutex<Option<Vec<PathBuf>>> = Mutex::new(None);
+/// The folders with `.vstpreset` files the player added: see
+/// [`set_preset_folders`].
+static PRESET_FOLDERS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 static WORKER: Mutex<Option<rustel_vst3::WorkerProgram>> = Mutex::new(None);
 /// The names of [`set_audio_thread_plugins`]. `None` before the first read
 /// of the switches: see [`audio_thread_plugins`].
@@ -91,6 +94,21 @@ pub fn presets_folder() -> Option<PathBuf> {
     crate::config_dir::canonical().map(|data| data.join(PRESETS_DIRECTORY_NAME))
 }
 
+/// The folders with `.vstpreset` files the player added, in any folder
+/// structure: the header of each file says its plugin.
+pub fn preset_folders() -> Vec<PathBuf> {
+    PRESET_FOLDERS.lock().expect("preset folders").clone()
+}
+
+/// Sets the folders with `.vstpreset` files the player added, and the host
+/// reads the preset folders again. The read runs on the plugin thread.
+pub fn set_preset_folders(folders: Vec<PathBuf>) {
+    *PRESET_FOLDERS.lock().expect("preset folders") = folders.clone();
+    if let Some(host) = started() {
+        host.set_preset_folders(folders);
+    }
+}
+
 /// The host, started on first use.
 pub fn host() -> &'static Host {
     #[cfg(test)]
@@ -100,6 +118,7 @@ pub fn host() -> &'static Host {
         if let Some(presets) = presets_folder() {
             host.set_preset_folder(presets);
         }
+        host.set_preset_folders(PRESET_FOLDERS.lock().expect("preset folders").clone());
         host.set_worker(WORKER.lock().expect("worker program").clone());
         host.set_audio_thread_plugins(&audio_thread_plugins(std::env::var_os(AUDIO_THREAD_ENV)));
         host.scan(&folders());

@@ -347,6 +347,10 @@ pub struct StudioPrefs {
     /// them before the standard folders of the system.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vst_folders: Vec<String>,
+    /// Folders with `.vstpreset` files the player added, in any folder
+    /// structure: the header of each file says its plugin.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preset_folders: Vec<String>,
     /// Whether an imported source is fetched into the cache in the
     /// background rather than on the first note that needs it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
