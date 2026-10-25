@@ -3364,6 +3364,7 @@ pub(super) fn play_live(
     _link: bool,
     _audio_input: Option<String>,
     _buffer_frames: Option<u32>,
+    _output_selector: Option<String>,
     _ui_events: bool,
     _first_install_from_zero: bool,
     // Dropped unsent, so a replay's delivery thread exits.
