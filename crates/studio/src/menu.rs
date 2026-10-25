@@ -107,6 +107,7 @@ pub enum MenuAction {
     Jobs,
     /// The memory breakdown, docked along the bottom or the top.
     Memory,
+    Lanes,
     Zen,
     LineNumbers,
     Wrap,
@@ -1274,6 +1275,8 @@ pub struct MenuContext<'a> {
     pub zen: bool,
     /// The mixer panel is open.
     pub mixer: bool,
+    /// The Lanes panel is open.
+    pub lanes: bool,
     /// The log sheet is open. A toggle like the mixer's, because the row
     /// closes it as readily as it opens it and the menu should say which
     /// of the two the next press will do.
@@ -1748,7 +1751,7 @@ pub fn menus(cx: &MenuContext) -> Vec<Menu> {
                     on: cx.log,
                 },
                 "Log",
-                'l',
+                'g',
                 with_alias(BindAction::Log),
             ),
             MenuItem::new(
@@ -1768,6 +1771,15 @@ pub fn menus(cx: &MenuContext) -> Vec<Menu> {
                 "Mixer",
                 'm',
                 with_alias(BindAction::Mixer),
+            ),
+            MenuItem::new(
+                MenuItemKind::Toggle {
+                    id: MenuAction::Lanes,
+                    on: cx.lanes,
+                },
+                "Lanes",
+                'l',
+                hint(BindAction::Lanes),
             ),
             MenuItem::new(
                 MenuItemKind::Toggle {
@@ -1920,6 +1932,7 @@ mod tests {
             split: false,
             zen: false,
             mixer: false,
+            lanes: false,
             log: false,
             jobs: false,
             memory: false,
@@ -2221,6 +2234,7 @@ mod tests {
             (BindAction::FocusPanels, MenuAction::SwitchPanel),
             (BindAction::Log, MenuAction::Log),
             (BindAction::Mixer, MenuAction::Mixer),
+            (BindAction::Lanes, MenuAction::Lanes),
         ];
         for (action, menu_action) in cases {
             let mut binds = Keybinds::default();

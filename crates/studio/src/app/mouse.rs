@@ -356,6 +356,7 @@ impl App {
         if self.click_set_panel(x, y)
             || self.click_mixer_panel(x, y)
             || self.click_memory_dock(x, y)
+            || self.click_lanes_panel(x, y)
             || self.press_knobs(self.regions.knobs, x, y)
             || self.click_viz_panel(x, y)
         {
@@ -674,6 +675,7 @@ impl App {
             || self.scroll_mixer_fader(x, y, direction)
             || self.scroll_set_panel(x, y, direction)
             || self.memory_dock_at(x, y)
+            || self.lanes_panel_at(x, y)
             || self.scroll_viz_panel(x, y, direction)
             || self.wheel_knobs_over(x, y, direction)
         {

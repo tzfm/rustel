@@ -219,6 +219,7 @@ pub(super) fn install<'js>(
         "_spiral",
         "_pitchwheel",
         "_spectrum",
+        "_lanes",
         "scope",
         "tscope",
         "pianoroll",
@@ -227,6 +228,7 @@ pub(super) fn install<'js>(
         "spiral",
         "pitchwheel",
         "spectrum",
+        "lanes",
     ] {
         let current: rquickjs::Value = proto.get(name).map_err(|error| error.to_string())?;
         if !rquickjs::Coerced::<bool>::from_js(ctx, current)
@@ -277,6 +279,7 @@ pub(super) fn install<'js>(
         "spiral",
         "pitchwheel",
         "spectrum",
+        "lanes",
     ] {
         let current: rquickjs::Value = globals.get(name).map_err(|error| error.to_string())?;
         if current.as_function().is_none() {

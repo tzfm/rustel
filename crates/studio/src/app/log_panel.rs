@@ -170,7 +170,7 @@ impl App {
         let mixer = self.mixer_panel.map(MixerPanel::dock);
         let memory = self.memory_dock_request();
         let laid = |extent| {
-            self.layout_with_fixtures(mixer, Some(band(extent)), memory)
+            self.layout_with_fixtures(mixer, Some(band(extent)), memory, self.lanes_dock)
                 .log
                 .height
         };
@@ -522,6 +522,7 @@ mod tests {
                     app.mixer_panel.map(MixerPanel::dock),
                     app.log_dock_request(),
                     app.memory_dock_request(),
+                    app.lanes_dock,
                 )
                 .log
             };
@@ -551,6 +552,7 @@ mod tests {
                 app.mixer_panel.map(MixerPanel::dock),
                 app.log_dock_request(),
                 app.memory_dock_request(),
+                app.lanes_dock,
             )
             .log
         }

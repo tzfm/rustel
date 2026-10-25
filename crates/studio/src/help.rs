@@ -52,6 +52,8 @@ pub enum HelpContext {
     Mixer,
     /// The memory breakdown, docked along the top or the bottom.
     Memory,
+    /// The Lanes panel, docked along the top or the bottom.
+    Lanes,
     /// The knobs column beside the score.
     Knobs,
 }
@@ -85,6 +87,7 @@ impl HelpContext {
             Self::Viz => "visuals panel",
             Self::Mixer => "mixer",
             Self::Memory => "memory breakdown",
+            Self::Lanes => "lanes",
             Self::Knobs => "knobs",
         }
     }
@@ -154,6 +157,11 @@ impl HelpContext {
                  the limit that holds it, docked along the bottom or the top beside the \
                  score. It stays while you work, and the settings sheet stands clear of it."
             }
+            Self::Lanes => {
+                "A playhead crosses the score's lanes, one row for each sound of each lane, \
+                 named after the lane's label. What has played fades on the left, and the \
+                 lookahead shows what is coming on the right. It stays while you edit."
+            }
             Self::Knobs => {
                 "The numbers of the call under the caret, as sliders. The arrows write \
                  the score as they move, and the far left takes an optional entry out. \
@@ -221,6 +229,11 @@ impl HelpContext {
                 ("e", "the top or the bottom"),
                 ("- / +", "a row shorter / taller"),
                 ("Esc · click ×", "back to the score, docked / hide it"),
+            ],
+            Self::Lanes => [
+                ("e", "the top or the bottom"),
+                ("- / +", "a row shorter / taller"),
+                ("Esc", "back to the score, docked"),
             ],
             Self::Mixer => [
                 ("←/→ · Enter", "choose a strip / the next one"),
@@ -415,6 +428,7 @@ impl HelpContext {
             Self::Set => rows[2].0 = append("Delete · Esc", BindAction::SetPanel),
             Self::Log => rows[2].0 = append("v · Esc", BindAction::Log),
             Self::Memory => rows[2].0 = append("Esc · click ×", BindAction::Memory),
+            Self::Lanes => rows[2].0 = append("Esc", BindAction::Lanes),
             _ => {}
         }
         rows

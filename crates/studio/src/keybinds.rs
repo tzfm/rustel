@@ -76,6 +76,7 @@ pub enum BindAction {
     PianoMode,
     SetPanel,
     Mixer,
+    Lanes,
     VisualsOne,
     VisualsTwo,
     /// The inline visualizers under their calls in the score.
@@ -137,7 +138,7 @@ pub enum BindAction {
 
 impl BindAction {
     /// Every action, in the order the Keybinds page lists them.
-    pub const ALL: [BindAction; 59] = [
+    pub const ALL: [BindAction; 60] = [
         // Transport
         Self::Evaluate,
         Self::Stop,
@@ -155,6 +156,7 @@ impl BindAction {
         Self::PianoMode,
         Self::SetPanel,
         Self::Mixer,
+        Self::Lanes,
         Self::VisualsOne,
         Self::VisualsTwo,
         Self::Visualizers,
@@ -224,6 +226,7 @@ impl BindAction {
             Self::PianoMode => "piano-mode",
             Self::SetPanel => "set-panel",
             Self::Mixer => "mixer",
+            Self::Lanes => "lanes",
             Self::VisualsOne => "visuals-one",
             Self::VisualsTwo => "visuals-two",
             Self::Visualizers => "visualizers",
@@ -296,6 +299,7 @@ impl BindAction {
             Self::PianoMode => "piano mode",
             Self::SetPanel => "set panel",
             Self::Mixer => "mixer desk",
+            Self::Lanes => "lanes",
             Self::VisualsOne => "toggle visuals 1",
             Self::VisualsTwo => "toggle visuals 2",
             Self::Visualizers => "toggle inline visualizers",
@@ -398,6 +402,7 @@ impl BindAction {
             Self::FocusPanels => shift(F(10)),
             Self::Jobs => plain(F(12)), // unused: Jobs ships unbound; open from View ▸ Background jobs
             Self::Memory => plain(F(12)), // unused: Memory ships unbound; open from the header
+            Self::Lanes => plain(F(12)), // unused: Lanes ships unbound, open it from View ▸ Lanes
             Self::Visualizers => plain(F(12)), // unused: ships unbound; learn a key on the Keybinds page
             Self::OpenGlobalPrebake => plain(F(12)), // unused: ships unbound; open from Options or learn a key
             Self::OpenLocalPrebake => plain(F(12)), // unused: ships unbound; open from Options or learn a key
@@ -1164,18 +1169,19 @@ pub enum KeybindCapture {
 /// that have no other door.
 pub const NO_SPARE_KEY: &[BindAction] = &[BindAction::Knobs];
 
-/// The actions the studio ships with no chord, on purpose. Background jobs
-/// and Memory open from their View menu rows, and the memory breakdown from
-/// the header's figures too. The prebakes open from the Options menu. They
-/// are looked at now and then, not played, and every plain function key and
-/// Ctrl letter already means something a set is performed with. A player
-/// who wants one learns it in Settings ▸ Keybinds.
+/// The actions the studio ships with no chord, on purpose. Background jobs,
+/// Memory and Lanes open from their View menu rows, and the memory breakdown
+/// from the header's figures too. The prebakes open from the Options menu.
+/// They are looked at now and then, not played, and every plain function
+/// key and Ctrl letter already means something a set is performed with. A
+/// player who wants one learns it in Settings ▸ Keybinds.
 ///
 /// The panel actions ship with no chord in the table too. Each one answers
 /// to its [`BindAction::panel_letter`] with Alt until a chord is learnt.
 pub const SHIPS_UNBOUND: &[BindAction] = &[
     BindAction::Jobs,
     BindAction::Memory,
+    BindAction::Lanes,
     BindAction::Visualizers,
     BindAction::OpenGlobalPrebake,
     BindAction::OpenLocalPrebake,

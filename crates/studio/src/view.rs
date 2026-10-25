@@ -118,6 +118,8 @@ pub enum PanelKind {
     Mixer,
     /// The memory breakdown, a band along the top or the bottom.
     Memory,
+    /// The Lanes panel, a band along the top or the bottom.
+    Lanes,
     /// The knobs column, a rail for each numeric parameter of the call
     /// at the caret.
     Knobs,
@@ -139,6 +141,7 @@ impl PanelKind {
             Self::Viz => "visuals",
             Self::Mixer => "mixer",
             Self::Memory => "memory",
+            Self::Lanes => "lanes",
             Self::Knobs => "knobs",
         }
     }
@@ -764,6 +767,8 @@ pub struct StudioView<'a> {
     /// What the docked memory breakdown shows and the room it asks the
     /// layout for, while it is open.
     pub memory: Option<(super::memory::MemoryFigures, super::viz_panel::Dock)>,
+    /// The room the Lanes panel asks the layout for, while it is open.
+    pub lanes: Option<super::viz_panel::Dock>,
     /// The export sheet, when it is open.
     pub export: Option<&'a ExportSheet>,
     /// The theme picker, when it is open.
@@ -961,6 +966,7 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
         view.mixer_panel.map(super::mixer_panel::MixerPanel::dock),
         view.log.and_then(|(_, panel)| log_dock(panel, area)),
         view.memory.as_ref().map(|(_, dock)| *dock),
+        view.lanes,
         view.knobs.is_some(),
         u16::from(chrome.error.is_some()) + u16::from(chrome.audio_warning.is_some()),
         chrome.piano_notes.is_some(),
@@ -1248,6 +1254,21 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
                 closes_on_esc: chrome.zen,
             },
             layout.memory,
+        );
+    }
+    // The Lanes panel, a fixture painted with the desk and the breakdown.
+    if let Some(dock) = view.lanes
+        && !layout.lanes.is_empty()
+    {
+        frame.render_widget(
+            super::lanes_panel::LanesPanelView {
+                edge: dock.edge,
+                state: view.visual,
+                theme,
+                focused: view.focused_panel == Some(PanelKind::Lanes),
+                closes_on_esc: chrome.zen,
+            },
+            layout.lanes,
         );
     }
     if let Some(panel) = view.set_panel
@@ -2207,6 +2228,7 @@ mod tests {
                 band(Edge::Bottom, 16),
                 band(Edge::Bottom, 13),
                 memory,
+                None,
                 false,
                 0,
                 false,
@@ -2570,6 +2592,7 @@ mod tests {
                 None,
                 log,
                 None,
+                None,
                 false,
                 0,
                 false,
@@ -2921,6 +2944,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 false,
                 0,
                 false,
@@ -3002,6 +3026,7 @@ mod tests {
                 false,
                 None,
                 [None, None],
+                None,
                 None,
                 None,
                 None,
@@ -3221,6 +3246,7 @@ mod tests {
                         log: None,
                         jobs: None,
                         memory: None,
+                        lanes: None,
                         log_memory: None,
                         export: None,
                         theme_picker: None,
@@ -3346,6 +3372,7 @@ mod tests {
                         log: None,
                         jobs: None,
                         memory: None,
+                        lanes: None,
                         log_memory: None,
                         export: None,
                         theme_picker: None,
@@ -3459,6 +3486,7 @@ mod tests {
                         log: None,
                         jobs: None,
                         memory: None,
+                        lanes: None,
                         log_memory: None,
                         export: None,
                         theme_picker: None,
@@ -3593,6 +3621,7 @@ mod tests {
                         log: None,
                         jobs: None,
                         memory: None,
+                        lanes: None,
                         log_memory: None,
                         export: None,
                         theme_picker: None,

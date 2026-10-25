@@ -613,6 +613,7 @@ impl App {
                     Some(panel.dock()),
                     self.log_dock_request(),
                     self.memory_dock_request(),
+                    self.lanes_dock,
                 )
                 .mixer
                 .is_empty();

@@ -26,6 +26,7 @@ pub mod jobs;
 /// that changes it.
 pub mod keybinds;
 pub mod knobs_panel;
+mod lanes_panel;
 pub mod lint;
 pub mod log;
 pub mod memory;

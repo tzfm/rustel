@@ -661,6 +661,74 @@ Inline visualizers on the Settings > Keybinds page. Visual settings control
 their appearance and opacity. See [Hydra](hydra.md) for shader visuals and
 backgrounds. Visuals stop advancing when playback stops.
 
+### Lanes
+
+View ▸ Lanes opens the Lanes panel along the bottom of the studio. The panel is
+closed until you open it. Each row shows one sound of one lane. The page holds
+still and the playhead moves from left to right across it. When the playhead is
+three quarters of the way across, the page moves on by half its width. The notes
+that played fade on the left. The right side shows the notes that come next.
+
+```text
+             ▼
+kick  ·▮···▮┊··▮···▮···▮···
+hats  ×·×·×·┊×·×·×·×·×·×·×·
+bass  ▃▃▃·▅▅┊▅▅·▂▂▂▂·▃▃▃·▅▅
+       12.4 ◆
+             ▲
+```
+
+A labeled lane, such as `kick:`, gives its name to its row. A labeled lane that
+plays several sounds shows its name on a line of its own, and each sound hangs
+under it on a branch:
+
+```text
+drums
+    └╴ sbd   ··▮·····▮·····▮····
+    └╴ white ×···×···×···×···×··
+```
+
+A `$:` lane, and a pattern that a variable holds, show the sound name. Each lane
+takes its own colour from the theme, and a sound has the same mark in every
+lane. A pitched sound shows each note as a block, and the height of the block
+follows the pitch. The number on the line of the diamond is the current cycle.
+
+When the panel has the keyboard, `e` moves it between the top and the bottom,
+`-` and `+` change its height, and Esc gives the keyboard back to the score.
+The panel stays open, and it opens again at the next launch. The panel has no
+shortcut. To add one, learn a key in Settings ▸ Keybinds.
+
+A score can draw the same view. `_lanes()` draws the rows of its own pattern
+under the call. `all(lanes)` draws every lane in a strip along the bottom,
+behind the score:
+
+```js
+kick: s("sbd*4")
+hats: s("white*8").decay(.04).gain(.4)
+bass: note("<c2 eb2>*4").s("sawtooth").lpf(500)
+all(lanes)
+```
+
+The options are:
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `cycles` | 3 | The cycles across the view. The engine looks 2.5 cycles ahead, so a longer view has an empty right edge. |
+| `scroll` | 0 | 1 moves the page past a fixed playhead. |
+| `playhead` | 0.25 | With `scroll: 1`, the place of the playhead, from 0 at the left to 1 at the right. |
+| `labels` | 1 | 0 removes the row names. |
+
+```js
+s("sbd*4, white*8")._lanes({ cycles: 1 })
+note("c3 eb3 g3 bb3").s("sawtooth")._lanes({ scroll: 1, playhead: 0.5 })
+```
+
+The terminal writes every cell that changes. When the page holds still, only
+the playhead's column changes from one step to the next. With `scroll: 1`, all
+the marks move together, so it costs the terminal more. Both move at most 20
+times a second. `lanes()` and `_lanes()` are Rustel extensions, and a
+score that uses them does not run on strudel.cc.
+
 ## Themes
 
 Press Ctrl+T to choose a theme. Type to search, use arrows to select, and press

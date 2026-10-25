@@ -765,6 +765,7 @@ impl App {
                         self.audible_scene = None;
                     }
                 }
+                self.visual.install_lanes(self.evaluated_source.as_ref());
                 self.rebuild_slider_spans();
                 self.invalidate_maps();
                 self.dirty_frame = true;
@@ -1300,7 +1301,7 @@ pub(super) fn virtual_rows_for(
                 "pianoroll" | "punchcard" => 8,
                 // On its side the roll needs the height it gave to time.
                 "wordfall" => 12,
-                "scope" | "tscope" | "spectrum" => 6,
+                "scope" | "tscope" | "spectrum" | "lanes" => 6,
                 "spiral" => 12,
                 "pitchwheel" => 10,
                 other => return Some(Err(format!("unknown inline visual kind {other:?}"))),

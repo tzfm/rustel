@@ -216,10 +216,11 @@ impl App {
     /// settings sheet says `ui opacity` governs them, and on themes whose
     /// minimap ground equals the editor's, telling them apart by colour is
     /// impossible), the reference column, the set panel's column, the
-    /// visualizer docks, and the mixer desk. A panel left out of this is
-    /// washed at the score's own strength - a tint on the glyph tiers,
-    /// where the picture is only a cell colour, and an unreadable panel on
-    /// the pixel tier, where the picture really is painted over it.
+    /// visualizer docks, the mixer desk and the Lanes panel. A panel left
+    /// out of this is washed at the score's own strength - a tint on the
+    /// glyph tiers, where the picture is only a cell colour, and an
+    /// unreadable panel on the pixel tier, where the picture really is
+    /// painted over it.
     pub(super) fn docked_chrome(&self) -> Vec<Rect> {
         let mut rects: Vec<Rect> = self
             .regions
@@ -235,6 +236,7 @@ impl App {
         rects.extend(self.regions.viz);
         rects.push(self.regions.mixer);
         rects.push(self.regions.memory);
+        rects.push(self.regions.lanes);
         rects.retain(|rect| !rect.is_empty());
         rects
     }
@@ -509,6 +511,7 @@ impl App {
                 .as_ref()
                 .and_then(|panel| view::log_dock(panel, terminal_area)),
             self.memory_dock.map(|dock| dock.dock(terminal_area)),
+            self.lanes_dock,
             self.knobs_panel.is_some(),
             self.footer_notice_rows(),
             self.has_piano_notes(),
@@ -544,6 +547,7 @@ impl App {
         // the room it got, and its key claim rests on it.
         self.mixer_unlaid = false;
         self.memory_unlaid = false;
+        self.lanes_unlaid = false;
         // The knobs column as well, and its rows are read for the room it
         // got: the scroll follows the selection into whatever height the
         // body left the column.
@@ -1249,6 +1253,7 @@ impl App {
             memory: self
                 .memory_dock
                 .map(|dock| (self.memory_figures(inputs.stats), dock.dock(self.frame))),
+            lanes: self.lanes_dock,
             jobs: self
                 .jobs_panel
                 .as_ref()
@@ -2314,6 +2319,7 @@ mod tests {
         #[test]
         fn inline_visuals_survive_degenerate_sizes() {
             let painters = [
+                "lanes",
                 "pianoroll",
                 "pitchwheel",
                 "punchcard",

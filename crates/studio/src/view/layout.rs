@@ -104,6 +104,11 @@ pub struct StudioRegions {
     /// log - inside the desk and the log on a shared edge, and the first
     /// of the three to give up rows. In zen, a band laid over the score.
     pub memory: Rect,
+    /// The Lanes panel's band, while it is open: along the top or the
+    /// bottom, carved at the fixtures' tier after the memory breakdown, so
+    /// on a shared edge it is the one nearest the score. In zen, a band
+    /// laid over the score.
+    pub lanes: Rect,
     /// The reference column, when it is open.
     pub reference: Rect,
     /// True when the reference sits over the rightmost pane rather than
@@ -319,6 +324,7 @@ pub fn regions_with(
         mixer,
         log,
         None,
+        None,
         false,
         0,
         false,
@@ -332,9 +338,9 @@ pub struct SetSidebar {
     pub width: u16,
 }
 
-/// The full studio layout: the docked memory breakdown with the other
-/// fixtures, and separate rows for visible notices and retained piano notes
-/// above the ordinary two-row footer.
+/// The full studio layout: the docked memory breakdown and the Lanes panel
+/// with the other fixtures, and separate rows for visible notices and
+/// retained piano notes above the ordinary two-row footer.
 #[allow(clippy::too_many_arguments)]
 pub fn regions_with_footer(
     area: Rect,
@@ -347,6 +353,7 @@ pub fn regions_with_footer(
     mixer: Option<viz_panel::Dock>,
     log: Option<viz_panel::Dock>,
     memory: Option<viz_panel::Dock>,
+    lanes: Option<viz_panel::Dock>,
     knobs: bool,
     notice_rows: u16,
     has_piano_notes: bool,
@@ -365,6 +372,7 @@ pub fn regions_with_footer(
             mixer,
             log,
             memory,
+            lanes,
             knobs,
             notice_rows,
             has_piano_notes,
@@ -406,6 +414,7 @@ fn layout_regions(
     mixer: Option<viz_panel::Dock>,
     log: Option<viz_panel::Dock>,
     memory: Option<viz_panel::Dock>,
+    lanes: Option<viz_panel::Dock>,
     knobs: bool,
     notice_rows: u16,
     has_piano_notes: bool,
@@ -478,6 +487,18 @@ fn layout_regions(
                 },
             );
         }
+        // The Lanes panel is a popup band too, inside the desk and the
+        // breakdown on an edge it shares with them.
+        if let Some(dock) = lanes {
+            let edge = dock.edge.band();
+            let mut room = area;
+            for (band, asked) in [(regions.mixer, mixer), (regions.memory, memory)] {
+                if !band.is_empty() && asked.is_some_and(|asked| asked.edge.band() == edge) {
+                    carve_band(&mut room, edge, band.height);
+                }
+            }
+            regions.lanes = zen_popup_band(room, viz_panel::Dock { edge, ..dock });
+        }
         return regions;
     }
     let menu = menu_row(area, chrome);
@@ -527,6 +548,7 @@ fn layout_regions(
         lands(mixer)
             || fixture_lands(log)
             || fixture_lands(memory)
+            || fixture_lands(lanes)
             || docks.iter().copied().any(lands)
     };
     let scenes_height = chips_height
@@ -608,6 +630,14 @@ fn layout_regions(
         && let Some(rows) = fixture_rows(body.height, dock.extent)
     {
         memory_area = carve_band(&mut body, dock.edge.band(), rows);
+    }
+    // The Lanes panel after them, nearest the score: it shows the score's
+    // own lanes, and it is the first fixture to shrink.
+    let mut lanes_area = Rect::default();
+    if let Some(dock) = lanes
+        && let Some(rows) = fixture_rows(body.height, dock.extent)
+    {
+        lanes_area = carve_band(&mut body, dock.edge.band(), rows);
     }
     // The reference stands the stage's full height, over a band, so a
     // band across the bottom never cuts it short.
@@ -786,6 +816,7 @@ fn layout_regions(
         mixer: mixer_area,
         log: log_area,
         memory: memory_area,
+        lanes: lanes_area,
         reference,
         reference_overlays,
         knobs: knobs_area,
