@@ -46,6 +46,7 @@
 
 ### Sound changes
 
+- `s("in")` takes the FM controls: `fm`, `fmh`, `fmwave` and the operator envelopes bend the playback rate of the incoming signal, and the route amounts set the bend while `note` still does not retune the input. Waveshaping already reached the input through `dist` and `diode`, and still does.
 - `partials` plays up to 2047 partials, or 4095 from a list of 4096, as Firefox does. Before, only the first 32 played, so a 128-partial sawtooth was too dark. The partials use Firefox's band-limited tables and normalization. Eight voices with 128 partials render 128 s of audio in 4.6 s instead of 62 s on a 4-core x86-64 Linux machine.
 - Sawtooth, square and triangle tables have 4096 samples at every sample rate, as in Firefox. At 44.1 kHz and 48 kHz the sound does not change.
 
