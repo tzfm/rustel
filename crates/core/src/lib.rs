@@ -2185,17 +2185,10 @@ fn map_js_haps(
         // Every iteration can enter QuickJS, and a wide query holds tens of
         // thousands of haps. Check inside the loop so callback and GC work
         // cannot keep the producer occupied after cancellation or a deadline.
-        // A pending query error is the same stop: a callback that threw must
-        // not expose side effects from the haps after it, exactly as an
-        // unwinding exception would not have run them. The deadline is
-        // checked directly first: its own interrupt exception arrives as a
-        // query error, and it must keep its typed refusal instead of
-        // turning into strudel-style silence.
+        // A pending query error is deliberately NOT a stop: the turn
+        // boundary turns a throwing callback into silence after every hap
+        // had its turn, which the `and`/`or` lazy-truthy contracts pin.
         if budget_exhausted() || cancellation_requested() || query_deadline_expired() {
-            return Vec::new();
-        }
-        if query_error_pending() {
-            query_deadline_passed_now();
             return Vec::new();
         }
         let mapped = hap.with_value(|v| {
@@ -2829,28 +2822,6 @@ impl Drop for ExpiryGuard {
     fn drop(&mut self) {
         DEADLINE_EXPIRED.with(|slot| slot.set(self.0));
     }
-}
-
-/// Whether the installed query deadline has passed, checked now rather
-/// than on the sampling interval. A loop that stops on a pending query
-/// error calls this first: the deadline's own interrupt exception arrives
-/// as a query error, and it must keep its typed refusal instead of turning
-/// into strudel-style silence.
-pub(crate) fn query_deadline_passed_now() -> bool {
-    if DEADLINE_EXPIRED.with(|slot| slot.get()) {
-        return true;
-    }
-    let passed = QUERY_DEADLINE.with(|slot| {
-        slot.get()
-            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
-    });
-    if passed {
-        DEADLINE_EXPIRED.with(|expired| expired.set(true));
-        refuse(QueryLimit::QueryDeadline {
-            millis: QUERY_DEADLINE_MILLIS.with(|slot| slot.get()),
-        });
-    }
-    passed
 }
 
 /// Whether the installed native query deadline has passed. Sampled every
@@ -5219,10 +5190,6 @@ impl Pattern {
                             {
                                 return Vec::new();
                             }
-                            if query_error_pending() {
-                                query_deadline_passed_now();
-                                return Vec::new();
-                            }
                             if !push_budgeted(
                                 &mut out,
                                 Hap {
@@ -5269,10 +5236,6 @@ impl Pattern {
                                 || cancellation_requested()
                                 || query_deadline_expired()
                             {
-                                return Vec::new();
-                            }
-                            if query_error_pending() {
-                                query_deadline_passed_now();
                                 return Vec::new();
                             }
                             if !push_budgeted(
@@ -5336,10 +5299,6 @@ impl Pattern {
                             || cancellation_requested()
                             || query_deadline_expired()
                         {
-                            return Vec::new();
-                        }
-                        if query_error_pending() {
-                            query_deadline_passed_now();
                             return Vec::new();
                         }
                         if !push_budgeted(
