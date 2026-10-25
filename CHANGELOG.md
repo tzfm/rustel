@@ -1,6 +1,16 @@
 # Changelog
 
 ## Unreleased
+- A beat line chosen on its own survives a restart. Before, it went back to off unless an opacity changed too.
+- An edit another program saved while the studio was still finishing its own save is loaded, not left on disk for the next studio save to overwrite.
+- A sound under an explicit bank plays the bank's asset when the bank has one, and names the missing sound when it does not. A banked wavetable keeps its pitch and position controls, the same as its direct spelling.
+- An orbit sent to an output pair a mono device does not have still sounds, through the main pair.
+- A render or playback longer than the queue of pending events keeps every note. Before, notes past 8192 queued events disappeared before their time came.
+- LFO rates above the sample clock, and negative rates, keep moving through their cycle instead of sticking at a clamp.
+- Keys typed while the terminal answers the studio's startup questions reach the editor. Before, they vanished into the answers.
+- A rename that only changes capitalization works where the filesystem folds case, for a set, a scene and a tape.
+- midi-monitor shows packets it does not model, as raw bytes, in both text and --json output.
+- Hydra's fps option sets the frame rate of the score's visuals. Before, every value played at 30 frames a second.
 - On a terminal that composes Option+A into text, the Chords and Scales tabs read it as the auto preview toggle. Before, the composed character typed into the search box.
 - A click on the preview fader reads the bar it draws. Before, the click's bar was narrower than the drawn one, so a click on the knob set a gain a few dB higher.
 - Sample and manifest fetches retry a transient 429 or 5xx after a short rest, so a briefly overloaded sample host no longer fails a corpus run.
