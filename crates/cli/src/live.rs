@@ -30,6 +30,7 @@ pub(super) fn run_musician(
         link,
         audio_input,
         buffer_frames,
+        output: output_selector,
         // Read in `run`, which stores the one global switch `json_asked()`
         // reports; the field itself has no second reader here.
         json: _,
@@ -183,6 +184,7 @@ pub(super) fn run_musician(
         link,
         audio_input,
         buffer_frames,
+        output_selector.clone(),
         ui_events,
         first_install_from_zero,
         anchored,
@@ -1361,6 +1363,7 @@ pub(super) fn play_live(
     link: bool,
     audio_input: Option<String>,
     buffer_frames: Option<u32>,
+    output_selector: Option<String>,
     ui_events: bool,
     first_install_from_zero: bool,
     anchored: Option<std::sync::mpsc::Sender<()>>,
@@ -1473,7 +1476,7 @@ pub(super) fn play_live(
         );
     }
     let mut device = rustel_audio::LiveScalarDevice::start_output_with_options(
-        None,
+        output_selector.as_deref(),
         session.generation(),
         live_output_options(session, buffer_frames),
     )
@@ -3361,6 +3364,7 @@ pub(super) fn play_live(
     _link: bool,
     _audio_input: Option<String>,
     _buffer_frames: Option<u32>,
+    _output_selector: Option<String>,
     _ui_events: bool,
     _first_install_from_zero: bool,
     // Dropped unsent, so a replay's delivery thread exits.

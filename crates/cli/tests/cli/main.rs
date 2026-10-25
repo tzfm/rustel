@@ -9338,6 +9338,8 @@ fn a_replay_save_that_never_reached_the_score_is_reported_not_announced() {
             tape.to_str().expect("UTF-8 tape"),
             "--out",
             out.to_str().expect("UTF-8 target"),
+            "--output",
+            "silent",
             "--json",
         ])
         .stderr(std::process::Stdio::piped())

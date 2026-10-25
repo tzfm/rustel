@@ -574,6 +574,10 @@ struct MusicianArgs {
     /// Cycles per second the score starts at; setcps/setcpm in the score win.
     #[arg(long, default_value_t = 0.5, help_heading = "Playing")]
     cps: f64,
+    /// The audio output to open: a device name, or `silent` for none -
+    /// the clock, the meters and takes without audio hardware.
+    #[arg(long, value_name = "NAME")]
+    output: Option<String>,
     /// Output buffer in frames - the latency knob: the callback size on
     /// macOS and Linux; on Windows (WASAPI shared mode) the callback stays
     /// at the 10 ms device period and this is the buffer queued ahead of it.
@@ -1031,6 +1035,10 @@ enum Command {
         /// it at the end.
         #[arg(long, value_name = "FILE")]
         out: Option<PathBuf>,
+        /// The audio output to open: a device name, or `silent` for none -
+        /// a replay without audio hardware keeps its clock and its protocol.
+        #[arg(long, value_name = "NAME")]
+        output: Option<String>,
         /// Bounce the replayed set to WAV or MP3 instead of playing it: the
         /// recording becomes audio with no DAW and no loopback device.
         ///
@@ -2269,6 +2277,7 @@ fn run_command(
             json: _,
             session,
             out,
+            output,
             speed,
             from,
             export,
@@ -2281,6 +2290,7 @@ fn run_command(
             &session,
             ReplayRun {
                 out,
+                output,
                 speed,
                 from,
                 export,
@@ -2552,6 +2562,7 @@ fn run_command(
                     None,
                     None,
                     false,
+                    None,
                     None,
                     None,
                     false,
@@ -2877,6 +2888,7 @@ fn run_doc(name: &str, json: bool) -> Result<(), RuntimeError> {
 /// The `replay` command's options, for [`run_replay`].
 struct ReplayRun {
     out: Option<PathBuf>,
+    output: Option<String>,
     speed: f64,
     from: f64,
     export: Option<PathBuf>,
