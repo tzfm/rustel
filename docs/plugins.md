@@ -121,7 +121,9 @@ s("hh*8").vst("valhalla supermassive", {
   plugin does not have. The note keeps its plugin.
 - Studio refuses an update with a wrong parameter name of a loaded plugin.
   The last score plays on, and Studio marks the name and gives the nearest
-  one.
+  one. A preset name no file of the loaded plugin has is refused and marked
+  the same way, read as the engine reads it, upper case, spaces and
+  punctuation aside.
 
 A plugin name with no plugin, a preset name with no file, or a dropped value
 gives one warning for each evaluation. The warning shows in the Studio log,

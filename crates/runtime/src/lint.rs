@@ -289,6 +289,8 @@ fn lint_with_scan(
     ignored_midi_options(source, &mut diagnostics);
     #[cfg(feature = "vst")]
     plugin_key_problems(source, &mut diagnostics);
+    #[cfg(feature = "vst")]
+    plugin_preset_problems(source, &mut diagnostics);
     let registers_voicings = source.contains("addVoicings(");
     let picks_dictionary = source.contains(".dict(") || source.contains("setDefaultVoicings(");
     // Sound names are judged only by a library that has its banks; an empty
@@ -2196,6 +2198,8 @@ pub struct NamedPlugin {
     pub instrument: bool,
     /// The `preset` of the call, when a quoted string gives the name.
     pub preset: Option<String>,
+    /// The place of the `preset` name in the text, between its quotes.
+    pub preset_at: Option<std::ops::Range<usize>>,
     /// The place of each key of the object of the call, in the text.
     pub keys: Vec<std::ops::Range<usize>>,
 }
@@ -2294,6 +2298,49 @@ fn plugin_key_problems(source: &str, diagnostics: &mut Vec<Diagnostic>) {
     }
 }
 
+/// Reports the `preset` of a plugin call whose name no preset file of the
+/// plugin has, the way the engine refuses the call. The check loads no
+/// plugin and reads no folder: a plugin not yet loaded, and a list the
+/// host is still reading, are not judged. A blank name is a place being
+/// typed, not a wrong name.
+#[cfg(feature = "vst")]
+fn plugin_preset_problems(source: &str, diagnostics: &mut Vec<Diagnostic>) {
+    let Some(host) = crate::vst::started() else {
+        return;
+    };
+    for call in live_plugins(source) {
+        let (Some(preset), Some(at)) = (call.preset.as_deref(), call.preset_at.clone()) else {
+            continue;
+        };
+        if preset.trim().is_empty() {
+            continue;
+        }
+        let Some(plugin) = host.loaded(&call.name) else {
+            continue;
+        };
+        let Some(known) = host.presets(plugin.name()) else {
+            continue;
+        };
+        let wanted = crate::vst::canonical(preset);
+        if known
+            .iter()
+            .any(|name| crate::vst::canonical(name) == wanted)
+        {
+            continue;
+        }
+        let mut message = format!("{} has no preset \"{preset}\"", plugin.name());
+        if let Some(near) = closest(preset, known.iter().map(String::as_str)) {
+            message.push_str(&format!(" - did you mean \"{near}\"?"));
+        }
+        diagnostics.push(Diagnostic {
+            level: Level::Value,
+            message,
+            from: at.start,
+            to: at.end,
+        });
+    }
+}
+
 /// Every plugin call of the live code, in the order written. A comment and
 /// a muted lane ask for nothing here, as in [`live_sound_names`].
 pub fn live_plugins(source: &str) -> Vec<NamedPlugin> {
@@ -2340,6 +2387,7 @@ fn plugin_calls(source: &str) -> Vec<PluginCall> {
             name: name.to_owned(),
             instrument,
             preset: preset.map(|value| source[value.content.clone()].to_owned()),
+            preset_at: preset.map(|value| value.content.clone()),
             keys: object_keys(&code, &literals, open, close),
         };
         plugins.push(PluginCall {
@@ -5016,6 +5064,10 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
             name: name.to_owned(),
             instrument,
             preset: preset.map(str::to_owned),
+            preset_at: preset.map(|word| {
+                let at = score.find(word).expect("the preset in the score");
+                at..at + word.len()
+            }),
             keys: Vec::new(),
         };
         let mut found = live_plugins(score);
@@ -5042,6 +5094,17 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
                 .collect::<Vec<_>>(),
             ["depth", "preset"]
         );
+        // The place of the preset name sits between its quotes.
+        assert_eq!(
+            found_preset_at(score, "ott"),
+            Some("Loud".to_owned()),
+            "the preset name, not its quotes, is the place"
+        );
+        assert_eq!(
+            found_preset_at("s(\"bd\").vst('a')", "a"),
+            None,
+            "no preset, no place"
+        );
         assert_eq!(
             words("s(\"bd\").vst('a', { \"in gain\": 1, mix: f({ x: 1 }), 100: 0.5, tail })"),
             ["in gain", "mix", "100"]
@@ -5049,5 +5112,14 @@ $: keys(".5").filterValues(x => x.log()).s("hh:4")"#;
         assert!(words("s(\"bd\").vst('a').fm({ depth: 1 })").is_empty());
         // The first line of a call in a comment leaves a text with no call.
         assert!(live_plugins("// $: s(\"bd\").vst(\n  \"ott\", { depth: 1 })").is_empty());
+    }
+
+    /// The text the place of the preset of the first call of `plugin` holds.
+    fn found_preset_at(score: &str, plugin: &str) -> Option<String> {
+        live_plugins(score)
+            .into_iter()
+            .find(|call| call.name == plugin)?
+            .preset_at
+            .map(|at| score[at].to_owned())
     }
 }
