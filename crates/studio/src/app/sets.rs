@@ -98,6 +98,17 @@ impl App {
         self.dirty_frame = true;
     }
 
+    /// The row a refresh should keep: the score or tape the reader has
+    /// selected, so an update behind the scenes does not move the panel.
+    pub(super) fn set_panel_selection(&self) -> Option<PathBuf> {
+        self.set_panel.as_ref().and_then(|panel| {
+            panel
+                .selected_file()
+                .map(|file| file.path.clone())
+                .or_else(|| panel.selected_tape().map(|tape| tape.path.clone()))
+        })
+    }
+
     pub(super) fn set_reveal_target(&self) -> RevealTarget {
         if let Some(panel) = &self.set_panel {
             if let Some(file) = panel.selected_file() {
@@ -1851,6 +1862,44 @@ mod tests {
                 app.set_panel.as_ref().unwrap().detail_rows()[0],
                 "first",
                 "vim mode: the block still follows"
+            );
+        }
+
+        /// A save that lands re-reads the rows, so the foot follows the
+        /// file without the score being reopened, and the reader's
+        /// selection does not move while it happens.
+        #[test]
+        fn the_details_follow_a_save_without_reopening_the_score() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            std::fs::write(directory.path().join("second.strudel"), "// plain").unwrap();
+            let mut app = app_over(directory.path());
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            assert_eq!(app.set_panel.as_ref().unwrap().detail_rows()[0], "second");
+            // The header of the open score gains an author: the update
+            // writes it to disk behind the panel's back.
+            app.dispatch_editor(crate::editor::Command::Move {
+                motion: crate::editor::Motion::DocumentStart,
+                extend: false,
+            })
+            .expect("top");
+            app.dispatch_editor(crate::editor::Command::InsertText(
+                "/*\n@by you\n*/\n".into(),
+            ))
+            .expect("edit");
+            app.dispatch_editor(crate::editor::Command::Evaluate)
+                .expect("update");
+            app.wait_for_saves();
+            assert_eq!(
+                app.set_panel.as_ref().unwrap().detail_rows()[0],
+                "second",
+                "the save moved no row"
+            );
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            let rows = app.set_panel.as_ref().unwrap().detail_rows();
+            assert!(
+                rows.contains(&"@by you".to_owned()),
+                "the foot reads the saved header: {rows:?}"
             );
         }
 

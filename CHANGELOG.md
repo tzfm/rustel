@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- The set panel's foot follows a save: a score whose header changed on update renews its row's details without the score being reopened, and the reader's selection does not move. An edit another program saved renews them too.
 - The export sheet takes stems: the row on, a bounce writes a `<name> stems` folder beside the take, holding `main.wav` with the same audio plus one stereo WAV a sounding orbit, named `1.wav` upward, as the CLI's `--stems` does. Stems need the WAV format: turning them on takes the format back to wav, and mp3 turns them off. The status names the folder, because the take lands inside it.
 - The hint rows at the set panel's bottom name the open and filter keys, so Enter and `/` are easy to find.
 - `--stems` on render writes a `<name> stems` folder beside the bounce: the same audio as `main.wav`, plus one stereo WAV per sounding orbit, named `1.wav` upward, in the export
