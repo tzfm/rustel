@@ -1063,9 +1063,12 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
                 },
             ]
         } else if self.panel.selected_file().is_some() {
-            ["Enter open · / filter · n new", reveal_hint.as_str()]
+            ["Enter · 1-9 open · / filter · n new", reveal_hint.as_str()]
         } else {
-            ["←/→ fold · / filter · n new", folder_hint.as_str()]
+            [
+                "←/→ fold · 1-9 open · / filter · n new",
+                folder_hint.as_str(),
+            ]
         };
         for (row, text) in hints.iter().enumerate().take(usize::from(hint.height)) {
             buffer.set_stringn(
@@ -1131,10 +1134,16 @@ mod selection_tests {
         let mut panel = panel_with_a_tape(directory.path());
         panel.selected = 0;
         let score = rendered_rows(&panel, AREA, true).join("\n");
-        assert!(score.contains("Enter open · / filter · n new"), "{score}");
+        assert!(
+            score.contains("Enter · 1-9 open · / filter · n new"),
+            "{score}"
+        );
         panel.selected = panel.files.len();
         let fold = rendered_rows(&panel, AREA, true).join("\n");
-        assert!(fold.contains("←/→ fold · / filter · n new"), "{fold}");
+        assert!(
+            fold.contains("←/→ fold · 1-9 open · / filter · n new"),
+            "{fold}"
+        );
     }
 
     #[test]

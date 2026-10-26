@@ -243,10 +243,13 @@ impl HelpContext {
             ],
             Self::Set => [
                 (
-                    "Up/Down · Enter",
-                    "choose a score or a tape / open it (a double click too)",
+                    "Up/Down · Enter · 1-9",
+                    "choose a score / open it / open the strip's score",
                 ),
-                ("Space · n", "fold sessions / start a new session tape"),
+                (
+                    "Space · n · /",
+                    "fold sessions / start a new tape / filter by name and @fields",
+                ),
                 (
                     "Delete · Esc · ^B",
                     "delete (Enter confirms) / back to the score / hide the panel",

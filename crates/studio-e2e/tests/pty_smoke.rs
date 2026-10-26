@@ -1092,7 +1092,7 @@ fn mouse_click_restores_editor_focus_and_places_the_caret() {
     );
     terminal.write(&[0x02]); // ^B: show and focus the set panel.
     assert!(
-        terminal.wait_for("Enter open · / filter · n new", REPAINT_BUDGET),
+        terminal.wait_for("Enter · 1-9 open · / filter · n new", REPAINT_BUDGET),
         "the set panel was not painted:\n{}",
         terminal.diagnostics()
     );
