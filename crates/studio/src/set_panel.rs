@@ -17,6 +17,7 @@ use ratatui::{
     style::{Modifier, Style},
 };
 
+use super::metadata::ScoreMeta;
 use super::scenes::{SceneId, SceneSet, SetFile};
 use super::theme::Theme;
 use rustel_runtime::product;
@@ -61,6 +62,8 @@ pub struct FileRow {
     pub strip: Option<usize>,
     pub current: bool,
     pub dirty: bool,
+    /// What its leading comments say about it, read off the file.
+    pub meta: ScoreMeta,
 }
 
 #[derive(Clone, Debug)]
@@ -159,7 +162,8 @@ impl SetPanel {
                     current: file.open == Some(current),
                     dirty: scene.is_some_and(|scene| scene.dirty),
                     name: file.name,
-                    path: file.path,
+                    path: file.path.clone(),
+                    meta: ScoreMeta::read(&file.path),
                     open: file.open,
                 }
             })
