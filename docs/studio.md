@@ -174,9 +174,10 @@ it. Press 1 to 9 to open the score that holds that number on the strip. Space
 folds a section. Esc returns to the editor. Use `+` and `-` to change the
 panel size.
 
-Press `i` on a score to see its details: the name, its strip number and open
-state, the `@` fields its leading comments carry, and when it was last saved.
-Esc closes the details. A move to another row closes them too.
+The panel's foot shows the selected row's details: the name, its strip number
+and open state, the `@` fields its leading comments carry, and when it was
+last saved. The block follows the selection with no key of its own. A tape's
+row shows its recording time, and the sessions fold its count.
 
 Press `/` to filter the scores: type, and the panel hides the scores the query
 does not answer. A query matches a name or any `@` field value. Enter leaves

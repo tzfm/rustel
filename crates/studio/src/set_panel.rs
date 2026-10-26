@@ -67,18 +67,9 @@ pub struct FileRow {
     pub meta: ScoreMeta,
 }
 
-/// The details `i` opens over a score's row: what the popup says, one
-/// row each, and the line it says it about. The popup draws only while
-/// that line is still the selected one, so whatever leaves the row
-/// behind - a move, a click, a refresh - takes the popup with it
-/// without a key of its own.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SetDetails {
-    /// The panel line the rows describe.
-    pub line: usize,
-    /// What the popup says, one row each.
-    pub rows: Vec<String>,
-}
+/// How many rows the details block at the panel's foot holds. Longer
+/// detail is cut, with a count of what did not fit.
+const DETAIL_ROWS: usize = 6;
 
 /// The `/` filter: what it holds, and whether the box still has the
 /// keyboard. While it stands, the list hides the scores it does not
@@ -112,8 +103,6 @@ pub struct SetPanel {
     pub unsaved: Option<String>,
     /// What the last verb refused, shown under the list.
     pub error: Option<String>,
-    /// The details popup `i` opened, over the row it was opened on.
-    pub details: Option<SetDetails>,
     /// The `/` filter, while one stands.
     pub search: Option<Search>,
     /// Whether the search box is in Vim's Insert mode, the way every
@@ -149,7 +138,6 @@ impl SetPanel {
             deleting: None,
             unsaved: None,
             error: None,
-            details: None,
             search: None,
             vim_insert: false,
             last_click: None,
@@ -236,9 +224,6 @@ impl SetPanel {
             .min(self.lines.len().saturating_sub(1));
         self.deleting = None;
         self.unsaved = None;
-        // The folder was read again: what the details popup said about a
-        // row may no longer be what the row is.
-        self.details = None;
     }
 
     /// Where the cursor goes after a row is deleted: the row that took
@@ -344,45 +329,72 @@ impl SetPanel {
         }
     }
 
-    /// The selected score's details, as `i` shows them: its name, where
-    /// it stands on the strip, what its leading comments say about it,
-    /// and when the file was last saved. Read once, here, so the popup
-    /// is a view of the row as it was opened rather than a second copy
-    /// of the folder. Returns false on a row that is not a score's,
-    /// where `i` is not the panel's key.
-    pub fn open_details(&mut self) -> bool {
-        let line = self.selected;
-        let Some(SetLine::File(index)) = self.selected_line() else {
-            return false;
-        };
-        let Some(rows) = self.files.get(index).map(|file| {
-            let mut rows = vec![file.name.clone()];
-            let mut state = match file.strip {
-                Some(strip) => format!("open · strip {strip}"),
-                None => "not open".to_owned(),
-            };
-            if file.current {
-                state.push_str(" · on screen");
+    /// The selected line's details, as the panel's foot shows them: one
+    /// row each. A score's name, where it stands on the strip, what its
+    /// leading comments say about it, and when the file was last saved;
+    /// a tape's name and recording time; the sessions fold's count. The
+    /// block follows the selection with no key of its own.
+    pub fn detail_rows(&self) -> Vec<String> {
+        match self.selected_line() {
+            Some(SetLine::File(index)) => {
+                self.files
+                    .get(index)
+                    .map(|file| {
+                        let mut rows = vec![file.name.clone()];
+                        let mut state = match file.strip {
+                            Some(strip) => format!("open · strip {strip}"),
+                            None => "not open".to_owned(),
+                        };
+                        if file.current {
+                            state.push_str(" · on screen");
+                        }
+                        if file.dirty {
+                            state.push_str(" · unsaved");
+                        }
+                        rows.push(state);
+                        rows.extend(
+                            file.meta.fields().iter().map(|(key, value)| {
+                                format!("@{key} {value}").trim_end().to_owned()
+                            }),
+                        );
+                        if let Some(saved) = saved_at(&file.path) {
+                            rows.push(format!("saved {saved}"));
+                        }
+                        rows
+                    })
+                    .unwrap_or_default()
             }
-            if file.dirty {
-                state.push_str(" · unsaved");
-            }
-            rows.push(state);
-            rows.extend(
-                file.meta
-                    .fields()
-                    .iter()
-                    .map(|(key, value)| format!("@{key} {value}").trim_end().to_owned()),
-            );
-            if let Some(saved) = saved_at(&file.path) {
-                rows.push(format!("saved {saved}"));
-            }
-            rows
-        }) else {
-            return false;
-        };
-        self.details = Some(SetDetails { line, rows });
-        true
+            Some(SetLine::Tape(index)) => self
+                .tapes
+                .get(index)
+                .map(|tape| {
+                    let note = if tape.recording {
+                        "recording".to_owned()
+                    } else {
+                        size_label(tape.bytes)
+                    };
+                    vec![
+                        tape_label(&tape.name),
+                        format!("recorded {} · {note}", tape.recorded),
+                    ]
+                })
+                .unwrap_or_default(),
+            Some(SetLine::Sessions) => vec![format!("{} tapes", self.tapes.len())],
+            None => Vec::new(),
+        }
+    }
+
+    /// The details as the foot has room for: the first rows, then a
+    /// count of the rest when the block cannot hold them all.
+    pub fn foot_detail_rows(&self) -> Vec<String> {
+        let rows = self.detail_rows();
+        if rows.len() <= DETAIL_ROWS {
+            return rows;
+        }
+        let more = rows.len() - (DETAIL_ROWS - 1);
+        let mut held = rows[..DETAIL_ROWS - 1].to_vec();
+        held.push(format!("+{more} more"));
+        held
     }
 
     /// Whether the search box holds the keyboard: the box typing, or the
@@ -394,10 +406,8 @@ impl SetPanel {
     }
 
     /// `/` opens the search box, which takes the keyboard and reads the
-    /// query into the list as it grows. Whatever popup stood over a row
-    /// gives way to it.
+    /// query into the list as it grows.
     pub fn open_search(&mut self) {
-        self.details = None;
         self.search = Some(Search {
             query: String::new(),
             typing: true,
@@ -512,8 +522,9 @@ impl SetPanel {
     }
 
     /// The panel's docked place: the sidebar, when the layout gave it one.
-    /// The rows are the title, the list, the error line and two hint rows;
-    /// the column on the editor's side is the rule between the two.
+    /// The rows are the title, the list, the details block, the error
+    /// line and two hint rows; the column on the editor's side is the
+    /// rule between the two.
     pub fn docked_parts(sidebar: Rect, on_right: bool) -> Option<DockedParts> {
         if sidebar.is_empty() || sidebar.height < 5 || sidebar.width < 8 {
             return None;
@@ -526,13 +537,21 @@ impl SetPanel {
         };
         let title = Rect::new(inner_x, sidebar.y, inner_width, 1);
         let hints = 2u16.min(sidebar.height.saturating_sub(3));
-        let list_height = sidebar
+        // Between the list and the error line, the details block takes
+        // what it can: the list keeps one row, the block caps at
+        // DETAIL_ROWS, and a short panel drops the block first.
+        let flex = sidebar
             .height
             .saturating_sub(1)
             .saturating_sub(1)
             .saturating_sub(hints);
+        let details = u16::try_from(DETAIL_ROWS)
+            .expect("the cap is small")
+            .min(flex.saturating_sub(1));
+        let list_height = flex - details;
         let list = Rect::new(inner_x, sidebar.y + 1, inner_width, list_height);
-        let error = Rect::new(inner_x, list.bottom(), inner_width, 1);
+        let details = Rect::new(inner_x, list.bottom(), inner_width, details);
+        let error = Rect::new(inner_x, details.bottom(), inner_width, 1);
         let hint = Rect::new(inner_x, error.bottom(), inner_width, hints);
         let rule_x = if on_right {
             sidebar.x
@@ -543,6 +562,7 @@ impl SetPanel {
         Some(DockedParts {
             title,
             list,
+            details,
             error,
             hint,
             rule,
@@ -550,11 +570,12 @@ impl SetPanel {
     }
 
     /// The sheet form's place: bottom-right like the other sheets, a row
-    /// per line up to a screenful.
+    /// per line up to a screenful, the details block under the list.
     pub fn sheet_geometry(&self, available: Rect) -> Option<(Rect, Rect)> {
         let rows = (self.lines.len() as u16).clamp(1, 16);
-        // Title, the list, an error line, two hint lines, borders.
-        let height = rows + 6;
+        // Title, the list, the details block, an error line, two hint
+        // lines, borders.
+        let height = rows + 6 + u16::try_from(DETAIL_ROWS).expect("the cap is small");
         let width = self
             .width
             .saturating_add(4)
@@ -607,6 +628,7 @@ impl SetPanel {
 pub struct DockedParts {
     pub title: Rect,
     pub list: Rect,
+    pub details: Rect,
     pub error: Rect,
     pub hint: Rect,
     pub rule: Rect,
@@ -786,38 +808,51 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
         let bold = Style::default()
             .fg(theme.accent)
             .add_modifier(Modifier::BOLD);
-        let (title, list, error, hint) = match SetPanel::docked_parts(self.sidebar, self.on_right) {
-            Some(parts) => {
-                // Docked, the panel stands on the theme's own ground, so a
-                // theme's picture runs under it at the interface opacity
-                // as it does under the header; the sheet form is a sheet.
-                super::view::clear_surface(
-                    buffer,
-                    self.sidebar,
-                    Style::default().bg(theme.background).fg(theme.foreground),
-                );
-                let rule = Style::default().fg(theme.rule);
-                for y in parts.rule.y..parts.rule.bottom() {
-                    buffer.set_stringn(parts.rule.x, y, "│", 1, rule);
+        let (title, list, details, error, hint) =
+            match SetPanel::docked_parts(self.sidebar, self.on_right) {
+                Some(parts) => {
+                    // Docked, the panel stands on the theme's own ground, so a
+                    // theme's picture runs under it at the interface opacity
+                    // as it does under the header; the sheet form is a sheet.
+                    super::view::clear_surface(
+                        buffer,
+                        self.sidebar,
+                        Style::default().bg(theme.background).fg(theme.foreground),
+                    );
+                    let rule = Style::default().fg(theme.rule);
+                    for y in parts.rule.y..parts.rule.bottom() {
+                        buffer.set_stringn(parts.rule.x, y, "│", 1, rule);
+                    }
+                    (
+                        parts.title,
+                        parts.list,
+                        parts.details,
+                        parts.error,
+                        parts.hint,
+                    )
                 }
-                (parts.title, parts.list, parts.error, parts.hint)
-            }
-            None => {
-                let Some((sheet, list)) = self.panel.sheet_geometry(area) else {
-                    return;
-                };
-                super::view::clear_surface(
-                    buffer,
-                    sheet,
-                    Style::default().bg(theme.overlay).fg(theme.foreground),
-                );
-                super::devices::draw_border(buffer, sheet, theme);
-                let title = Rect::new(sheet.x + 2, sheet.y, sheet.width.saturating_sub(4), 1);
-                let error = Rect::new(list.x, list.bottom(), list.width, 1);
-                let hint = Rect::new(list.x, list.bottom() + 1, list.width, 2);
-                (title, list, error, hint)
-            }
-        };
+                None => {
+                    let Some((sheet, list)) = self.panel.sheet_geometry(area) else {
+                        return;
+                    };
+                    super::view::clear_surface(
+                        buffer,
+                        sheet,
+                        Style::default().bg(theme.overlay).fg(theme.foreground),
+                    );
+                    super::devices::draw_border(buffer, sheet, theme);
+                    let title = Rect::new(sheet.x + 2, sheet.y, sheet.width.saturating_sub(4), 1);
+                    let details = Rect::new(
+                        list.x,
+                        list.bottom(),
+                        list.width,
+                        u16::try_from(DETAIL_ROWS).expect("the cap is small"),
+                    );
+                    let error = Rect::new(list.x, details.bottom(), list.width, 1);
+                    let hint = Rect::new(list.x, error.bottom(), list.width, 2);
+                    (title, list, details, error, hint)
+                }
+            };
         let name = format!(" {} ", self.panel.set_name);
         buffer.set_stringn(
             title.x,
@@ -916,6 +951,23 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
             let padded = format!("{text:<width$}");
             buffer.set_stringn(list.x, y, &padded, width, style);
         }
+        // The selected line's details, standing at the foot the way a
+        // file manager's pane does: the block follows the selection,
+        // with no key of its own. The first row names the thing; the
+        // rest is what the panel knows about it.
+        for (row, text) in self.panel.foot_detail_rows().iter().enumerate() {
+            buffer.set_stringn(
+                details.x,
+                details.y + row as u16,
+                text,
+                usize::from(details.width),
+                Style::default().fg(if row == 0 {
+                    theme.foreground
+                } else {
+                    theme.muted
+                }),
+            );
+        }
         if let Some(message) = &self.panel.error {
             buffer.set_stringn(
                 error.x,
@@ -1011,7 +1063,7 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
                 },
             ]
         } else if self.panel.selected_file().is_some() {
-            ["Enter open · i details · n new", reveal_hint.as_str()]
+            ["Enter open · n new", reveal_hint.as_str()]
         } else {
             ["←/→ fold · n new", folder_hint.as_str()]
         };
@@ -1034,7 +1086,7 @@ mod selection_tests {
     use super::tests::{rendered_rows, set_in};
     use super::*;
 
-    const AREA: Rect = Rect::new(0, 0, SIDEBAR_WIDTH, 12);
+    const AREA: Rect = Rect::new(0, 0, SIDEBAR_WIDTH, 20);
 
     /// A panel over a set of three scores and one tape.
     fn panel_with_a_tape(directory: &Path) -> SetPanel {
@@ -1079,7 +1131,7 @@ mod selection_tests {
         let mut panel = panel_with_a_tape(directory.path());
         panel.selected = 0;
         let score = rendered_rows(&panel, AREA, true).join("\n");
-        assert!(score.contains("Enter open · i details · n new"), "{score}");
+        assert!(score.contains("Enter open · n new"), "{score}");
         panel.selected = panel.files.len();
         let fold = rendered_rows(&panel, AREA, true).join("\n");
         assert!(fold.contains("←/→ fold · n new"), "{fold}");
@@ -1295,10 +1347,10 @@ mod tests {
         );
     }
 
-    /// `i` opens the selected score's details: its name, where it stands
-    /// on the strip, what its leading comments say about it, and when it
-    /// was last saved. The fold is not a score's row, and the key is not
-    /// its.
+    /// The details block at the foot carries the selected score's name,
+    /// its @fields and its saved time, with no key to open: it follows
+    /// the selection. The fold says its count, a tape its recording
+    /// time, and long detail is cut with a count of what did not fit.
     #[test]
     fn details_carry_the_name_the_comments_and_the_saved_time() {
         let directory = tempfile::tempdir().unwrap();
@@ -1314,11 +1366,9 @@ mod tests {
         std::fs::create_dir_all(&sessions).unwrap();
         let mut panel = SetPanel::open(&set, &sessions, None);
 
-        // The fold is not a score's row: the key is not the panel's
-        // there.
+        // The fold is not a score's row: its detail is its count.
         panel.selected = panel.files.len();
-        assert!(!panel.open_details());
-        assert!(panel.details.is_none(), "nothing stood up");
+        assert_eq!(panel.detail_rows(), ["0 tapes".to_string()]);
 
         let spare = panel
             .lines
@@ -1329,26 +1379,37 @@ mod tests {
             })
             .expect("spare is listed");
         panel.selected = spare;
-        assert!(panel.open_details(), "a score's row opens the details");
-        let details = panel.details.as_ref().expect("the popup is up");
-        assert_eq!(details.line, spare);
+        let rows = panel.detail_rows();
         assert_eq!(
-            details.rows[..4],
+            rows[..4],
             ["spare", "not open", "@title night drive", "@by you"]
         );
         assert!(
-            details.rows[4].starts_with("saved "),
+            rows[4].starts_with("saved "),
             "the saved time is there: {:?}",
-            details.rows[4]
+            rows[4]
         );
 
-        // A refresh reads the folder again: what the popup said about it
-        // is old.
+        // A tape's detail is its name and its recording time.
+        std::fs::write(
+            sessions.join("session-2026-09-24T03-15-30.rustel-session"),
+            "{\"recorded\":\"2026-09-24T03:15:30Z\"}\n",
+        )
+        .unwrap();
         panel.refresh(&set, &sessions, None, None);
-        assert!(panel.details.is_none());
+        panel.toggle_sessions();
+        let tape = panel
+            .lines
+            .iter()
+            .position(|line| matches!(line, SetLine::Tape(_)))
+            .expect("a tape is listed");
+        panel.selected = tape;
+        let rows = panel.detail_rows();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[1], "recorded 2026-09-24T03:15:30Z · 36 B");
     }
 
-    /// An open score's details say which strip it is on, when it is the
+    /// An open score's detail says which strip it is on, when it is the
     /// one on screen, and when it holds edits the file does not have
     /// yet.
     #[test]
@@ -1369,14 +1430,59 @@ mod tests {
             .iter()
             .position(|line| *line == SetLine::File(current))
             .expect("the current score's line");
-        assert!(panel.open_details());
         let file = &panel.files[current];
-        let details = panel.details.as_ref().expect("the popup is up");
-        assert_eq!(details.rows[0], file.name);
+        let rows = panel.detail_rows();
+        assert_eq!(rows[0], file.name);
         assert_eq!(
-            details.rows[1],
+            rows[1],
             format!("open · strip {} · on screen · unsaved", file.strip.unwrap())
         );
+    }
+
+    /// Detail longer than the block is cut, and the last row counts what
+    /// did not fit.
+    #[test]
+    fn long_detail_is_cut_with_a_count_of_the_rest() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut set = set_in(directory.path());
+        std::fs::write(
+            directory.path().join("tagged.strudel"),
+            concat!(
+                "/*\n@title many tags\n",
+                "@tag one\n@tag two\n@tag three\n@tag four\n@tag five\n",
+                "*/\n$: s(\"bd\")\n",
+            ),
+        )
+        .unwrap();
+        set.select(2);
+        set.close_current().unwrap();
+        let sessions = set.sessions_directory();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mut panel = SetPanel::open(&set, &sessions, None);
+        let tagged = panel
+            .lines
+            .iter()
+            .position(|line| match line {
+                SetLine::File(index) => panel.files[*index].name == "tagged",
+                _ => false,
+            })
+            .expect("tagged is listed");
+        panel.selected = tagged;
+        let rows = panel.foot_detail_rows();
+        // name, state, title and two tags shown; the last row counts the
+        // three tags and the saved time that did not fit.
+        assert_eq!(
+            rows[..5],
+            [
+                "tagged",
+                "not open",
+                "@title many tags",
+                "@tag one",
+                "@tag two"
+            ]
+        );
+        assert_eq!(rows.len(), 6, "{rows:?}");
+        assert_eq!(rows.last(), Some(&"+4 more".to_owned()), "{rows:?}");
     }
 
     #[test]
@@ -1543,7 +1649,8 @@ mod tests {
         let sidebar = Rect::new(0, 2, SIDEBAR_WIDTH, 20);
         let parts = SetPanel::docked_parts(sidebar, false).unwrap();
         assert_eq!(parts.title, Rect::new(1, 2, 38, 1));
-        assert_eq!(parts.list, Rect::new(1, 3, 38, 16));
+        assert_eq!(parts.list, Rect::new(1, 3, 38, 10));
+        assert_eq!(parts.details, Rect::new(1, 13, 38, 6));
         assert_eq!(parts.error.y, 19);
         assert_eq!(parts.hint, Rect::new(1, 20, 38, 2));
         assert_eq!(parts.rule, Rect::new(39, 2, 1, 20));
@@ -1551,7 +1658,7 @@ mod tests {
         let right = Rect::new(70, 2, SIDEBAR_WIDTH, 20);
         let parts = SetPanel::docked_parts(right, true).unwrap();
         assert_eq!(parts.rule, Rect::new(70, 2, 1, 20));
-        assert_eq!(parts.list, Rect::new(72, 3, 38, 16));
+        assert_eq!(parts.list, Rect::new(72, 3, 38, 10));
         let frame = Rect::new(0, 0, 100, 30);
         assert_eq!(panel.row_at(sidebar, frame, 5, 4), Some(1));
         assert_eq!(panel.row_at(sidebar, frame, 5, 10), None, "past the lines");

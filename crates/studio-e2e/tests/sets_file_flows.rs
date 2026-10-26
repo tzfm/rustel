@@ -189,13 +189,13 @@ fn the_set_panel_opens_a_score_by_its_strip_number() {
     assert_eq!(studio.focus(), None);
 }
 
-/// `i` on a score's row in the set panel opens its details over the row:
-/// the name, where it stands on the strip, the @fields its leading
-/// comments carry, and when it was last saved. Esc closes the popup
-/// before the panel's own Esc hands the keyboard back. Vim mode changes
-/// none of it, the panel being a list, not a text surface.
+/// The selected score's details stand at the foot of the set panel and
+/// follow the selection: the name, where it stands on the strip, the
+/// @fields its leading comments carry, and when it was last saved. No
+/// key opens or closes them. Vim mode changes none of it, the panel
+/// being a list, not a text surface.
 #[test]
-fn the_set_panel_shows_a_scores_details_over_its_row() {
+fn the_set_panel_shows_the_selected_scores_details_at_its_foot() {
     let mut studio = hermetic();
     std::fs::write(
         studio.set_directory().join("night.strudel"),
@@ -209,38 +209,30 @@ fn the_set_panel_shows_a_scores_details_over_its_row() {
     assert_eq!(studio.focus(), Some(PanelKind::Set));
     // The panel opens on the score on screen; the titled one is below it.
     studio.press(KeyCode::Down, KeyModifiers::NONE);
-    studio.press(KeyCode::Char('i'), KeyModifiers::NONE);
     studio.settle();
     let rows = studio.rows();
-    assert!(
-        rows.iter().any(|row| row.contains("i details")),
-        "the popup is up over the row"
-    );
     for expected in ["night", "not open", "@title night drive", "@by you"] {
         assert!(
             rows.iter().any(|row| row.contains(expected)),
-            "the popup says {expected}:\n{}",
+            "the block says {expected}:\n{}",
             rows.join("\n")
         );
     }
     assert!(
         rows.iter().any(|row| row.contains("saved ")),
-        "the popup says when it was saved:\n{}",
+        "the block says when it was saved:\n{}",
         rows.join("\n")
     );
 
-    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    // The block follows the selection: back on the score on screen, the
+    // titled one's fields leave the foot.
+    studio.press(KeyCode::Up, KeyModifiers::NONE);
     studio.settle();
     let rows = studio.rows();
     assert!(
         rows.iter().all(|row| !row.contains("@title night drive")),
-        "Esc closed the popup:\n{}",
+        "the block followed the move:\n{}",
         rows.join("\n")
-    );
-    assert_eq!(
-        studio.focus(),
-        Some(PanelKind::Set),
-        "Esc answered only the popup"
     );
 }
 

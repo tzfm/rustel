@@ -569,10 +569,6 @@ fn shortcut_rows_with_keybinds(
             "start a new session tape; keep scores and playback",
         ),
         HelpRow::new(
-            "i in set panel",
-            "show the selected score's details: name, @fields, saved time",
-        ),
-        HelpRow::new(
             "/ in set panel",
             "filter the scores by name or @field; Enter keeps, Esc restores",
         ),

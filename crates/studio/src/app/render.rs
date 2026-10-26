@@ -65,7 +65,6 @@ struct VisualReadings {
 /// The quick action's popup as the frame draws it: the cell it hangs from,
 /// its rows, and the caret in its form.
 type SmartPopup = ((u16, u16), Vec<String>, Option<(u16, u16)>);
-type SetDetailsPopup = ((u16, u16), Vec<String>);
 
 /// What sits over the view - the precision slider, the quick action, the
 /// replay edit and help - and the theme editor, lent to the paint half for
@@ -73,7 +72,6 @@ type SetDetailsPopup = ((u16, u16), Vec<String>);
 struct Overlays {
     precision: Option<slider_precision::PrecisionView>,
     smart: Option<SmartPopup>,
-    set_details: Option<SetDetailsPopup>,
     replay_edit: Option<replay_edit::ReplayEdit>,
     help: Option<HelpState>,
     help_context: HelpContext,
@@ -831,7 +829,6 @@ impl App {
             let area = smart_action::geometry(self.frame, anchor, rows.len() as u16);
             (anchor, rows, state.form_caret(area))
         });
-        let set_details = self.set_details_popup();
         let replay_edit = self.replay_edit.clone();
         let help = self.help;
         let help_context = self.help_context();
@@ -841,7 +838,6 @@ impl App {
         Overlays {
             precision,
             smart,
-            set_details,
             replay_edit,
             help,
             help_context,
@@ -849,28 +845,6 @@ impl App {
             theme_editor,
             theme_editor_focused,
         }
-    }
-
-    /// The details popup over the set panel's selected score: anchored at
-    /// the row it details, drawn only while the panel holds the keyboard
-    /// and the row is still the selected one. Whatever leaves the row
-    /// behind - a move, a click, a refresh - has already taken the
-    /// popup's state with it; this only refuses to draw a leftover.
-    fn set_details_popup(&self) -> Option<SetDetailsPopup> {
-        if self.focus != Focus::Panel(PanelKind::Set) {
-            return None;
-        }
-        let panel = self.set_panel.as_ref()?;
-        let details = panel.details.as_ref()?;
-        if panel.selected != details.line {
-            return None;
-        }
-        let list = panel.list_area(self.regions.sidebar, self.frame)?;
-        let row = details
-            .line
-            .saturating_sub(panel.scroll)
-            .min(usize::from(list.height.saturating_sub(1)));
-        Some(((list.x + 1, list.y + row as u16), details.rows.clone()))
     }
 
     /// The header, the footer and the bar as this frame draws them.
@@ -1748,9 +1722,6 @@ impl App {
         if let Some((anchor, rows, caret)) = &overlays.smart {
             smart_action::render(frame, &self.theme, *anchor, rows, *caret);
         }
-        if let Some((anchor, rows)) = &overlays.set_details {
-            paint_set_details(frame, &self.theme, *anchor, rows);
-        }
         // The knobs column's edit form draws its caret the way the quick
         // action's does: over the panel, in place of the score's caret,
         // which the keyboard is not on while the form is up. The form
@@ -2061,46 +2032,6 @@ impl App {
             }
         }
         cells
-    }
-}
-
-/// The set panel's details popup: the quick action's look, anchored at
-/// the row it details and pulled back onto the screen near an edge. The
-/// first row is the score's name, the rest are muted.
-fn paint_set_details(
-    frame: &mut ratatui::Frame<'_>,
-    theme: &Theme,
-    anchor: (u16, u16),
-    rows: &[String],
-) {
-    let area = smart_action::geometry(frame.area(), anchor, rows.len() as u16);
-    super::super::graphics::cover_images(area);
-    frame.render_widget(ratatui::widgets::Clear, area);
-    frame.render_widget(
-        ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .title(" i details ")
-            .style(
-                ratatui::style::Style::default()
-                    .bg(theme.overlay)
-                    .fg(theme.foreground),
-            ),
-        area,
-    );
-    for (at, row) in rows.iter().enumerate() {
-        let y = area.y + 1 + at as u16;
-        if y + 1 >= area.bottom() {
-            break;
-        }
-        let style = if at == 0 {
-            ratatui::style::Style::default().fg(theme.foreground)
-        } else {
-            ratatui::style::Style::default().fg(theme.muted)
-        };
-        frame.render_widget(
-            ratatui::widgets::Paragraph::new(row.clone()).style(style),
-            Rect::new(area.x + 1, y, area.width.saturating_sub(2), 1),
-        );
     }
 }
 
