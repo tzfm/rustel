@@ -3774,9 +3774,9 @@ dependencies = [
 
 [[package]]
 name = "rustel-hydra"
-version = "0.1.5"
+version = "0.1.0"
+source = "git+https://github.com/tzfm/rustel-hydra.git?tag=v0.1.0#9e6dea31e492b0e0d6c939fa87b65b986e6b7219"
 dependencies = [
- "miniz_oxide",
  "pollster",
  "serde",
  "serde_json",
