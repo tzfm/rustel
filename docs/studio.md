@@ -164,8 +164,9 @@ uses the terminal's own selection.
 ### The set panel
 
 Press Ctrl+B. Use the arrows to select a score or session, then Enter to open
-it. Space folds a section. Esc returns to the editor. Use `+` and `-` to change
-the panel size.
+it. Press 1 to 9 to open the score that holds that number on the strip. Space
+folds a section. Esc returns to the editor. Use `+` and `-` to change the
+panel size.
 
 Delete asks for confirmation before it removes a file. Confirming also discards
 its unsaved edits. Studio does not delete the last score or the active session

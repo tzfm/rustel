@@ -11,7 +11,9 @@ static AUDIO_CALLBACK_ALLOCATOR: rustel_audio::tripwire::TripwireAlloc =
     rustel_audio::tripwire::TripwireAlloc;
 
 use crossterm::event::{KeyCode, KeyModifiers};
-use rustel_studio_e2e::{Hermetic, hermetic, hermetic_recording, row_containing, wav_bytes};
+use rustel_studio_e2e::{
+    Hermetic, PanelKind, hermetic, hermetic_recording, row_containing, wav_bytes,
+};
 
 /// How long a local import may take to walk its folder.
 const IMPORT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
@@ -124,6 +126,40 @@ fn set_browser_reveals_open_and_closed_scores_without_opening_or_editing_them() 
         studio.press(KeyCode::Down, KeyModifiers::NONE);
     }
     assert_eq!(std::fs::read_to_string(closed).unwrap(), "$: s(\"hh\")");
+}
+
+#[test]
+fn the_set_panel_opens_a_score_by_its_strip_number() {
+    let mut studio = hermetic();
+    std::fs::write(
+        studio.set_directory().join("second.strudel"),
+        "$: s(\"hh\")",
+    )
+    .unwrap();
+    studio.chord("ctrl+b");
+    studio.press(KeyCode::Down, KeyModifiers::NONE);
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(studio.scene_names(), ["first", "second"]);
+    assert_eq!(studio.score(), "$: s(\"hh\")");
+
+    // A number no score holds names what it missed, and the panel keeps
+    // the keyboard; a number on the strip opens its score, Enter on its
+    // row in one key.
+    studio.chord("ctrl+b");
+    studio.chord("ctrl+b");
+    studio.press(KeyCode::Char('5'), KeyModifiers::NONE);
+    assert_eq!(studio.status(), "no scene 5 on the strip");
+    assert_eq!(studio.focus(), Some(PanelKind::Set));
+    studio.press(KeyCode::Char('1'), KeyModifiers::NONE);
+    assert_eq!(studio.focus(), None, "the opened score takes the keyboard");
+    assert_eq!(studio.score(), "$: s(\"bd\")\n");
+    assert_eq!(studio.scene_names(), ["first", "second"], "no tab added");
+
+    studio.chord("ctrl+b");
+    studio.chord("ctrl+b");
+    studio.press(KeyCode::Char('2'), KeyModifiers::NONE);
+    assert_eq!(studio.score(), "$: s(\"hh\")", "strip 2 selected");
+    assert_eq!(studio.focus(), None);
 }
 
 /// File ▸ New set: a folder named after the day appears under the sets

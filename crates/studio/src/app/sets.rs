@@ -256,6 +256,26 @@ impl App {
                 }
             }
             KeyCode::Enter if !primary => self.open_set_line(),
+            // A strip number opens its score the way Enter on its row does.
+            // The numbers run to nine; a strip past that stays on the arrows.
+            KeyCode::Char(digit @ '1'..='9') if !primary => {
+                let strip = (digit as u8 - b'0') as usize;
+                match panel
+                    .files
+                    .iter()
+                    .position(|file| file.strip == Some(strip))
+                {
+                    Some(row) => {
+                        panel.selected = panel
+                            .lines
+                            .iter()
+                            .position(|line| *line == SetLine::File(row))
+                            .unwrap_or(panel.selected);
+                        self.open_set_line();
+                    }
+                    None => self.status = format!("no scene {} on the strip", strip),
+                }
+            }
             KeyCode::Char(' ') if !primary => panel.toggle_sessions(),
             KeyCode::Char('+' | '=' | '-' | '_') if !primary => {
                 let grow = matches!(code, KeyCode::Char('+' | '='));
@@ -1630,6 +1650,43 @@ mod tests {
                 app.panes[app.focused].scene,
                 app.scenes.current().id,
                 "the pane shows it, as a click on its tab would"
+            );
+            assert_eq!(app.focus, Focus::Editor);
+        }
+
+        /// A digit opens the score holding that strip number, the way Enter
+        /// on its row does. A digit no score holds names what it missed, and
+        /// the panel keeps the keyboard. Vim mode changes none of it: the
+        /// panel is a list, and a digit is not one of its letters.
+        #[test]
+        fn a_digit_opens_the_score_with_that_strip_number() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.new_scene(false);
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            // first holds strip 1, scene 1 holds strip 2.
+            press(&mut app, KeyCode::Char('3'), KeyModifiers::NONE);
+            assert_eq!(app.scenes.current().name(), "scene 1", "nothing opened");
+            assert!(app.status.contains("no scene 3"), "{}", app.status);
+            assert_eq!(
+                app.focus,
+                Focus::Panel(PanelKind::Set),
+                "the panel keeps the keyboard"
+            );
+            press(&mut app, KeyCode::Char('1'), KeyModifiers::NONE);
+            assert_eq!(app.scenes.current().name(), "first", "strip 1 opened");
+            assert_eq!(app.focus, Focus::Editor, "the score takes the keyboard");
+            let panel = app.set_panel.as_ref().expect("the panel stays open");
+            assert_eq!(panel.selected, 0, "the selection followed the scene");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Char('2'), KeyModifiers::NONE);
+            assert_eq!(
+                app.scenes.current().name(),
+                "scene 1",
+                "strip 2 in Vim mode"
             );
             assert_eq!(app.focus, Focus::Editor);
         }
