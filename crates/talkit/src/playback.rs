@@ -45,10 +45,10 @@ pub fn play(samples: &[f32], rate: u32) -> Result<(), String> {
 
     loop {
         if failed.0.load(Ordering::Acquire) {
-            return Err(failed.1.lock().unwrap().clone());
+            return Err(failed.1.lock().expect("the lock is not poisoned").clone());
         }
         let done = {
-            let c = cursor.lock().unwrap();
+            let c = cursor.lock().expect("the lock is not poisoned");
             c.pos >= c.data.len()
         };
         if done {
@@ -81,7 +81,7 @@ where
         .build_output_stream(
             config,
             move |data: &mut [T], _| {
-                let mut c = cursor.lock().unwrap();
+                let mut c = cursor.lock().expect("the lock is not poisoned");
                 for frame in data.chunks_mut(channels) {
                     for (ch, slot) in frame.iter_mut().enumerate() {
                         let audible = ch < 2;
@@ -99,7 +99,7 @@ where
                 }
             },
             move |err| {
-                *failed.1.lock().unwrap() = err.to_string();
+                *failed.1.lock().expect("the lock is not poisoned") = err.to_string();
                 failed.0.store(true, Ordering::Release);
             },
             None,
