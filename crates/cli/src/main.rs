@@ -1315,6 +1315,11 @@ enum Command {
         /// (.mp3 is mp3, .json is onset-json, anything else the normal WAV).
         #[arg(long, value_enum)]
         format: Option<RenderCliFormat>,
+        /// Beside the file, write a `<name> stems` folder: the same bounce
+        /// as main.wav plus one WAV per sounding orbit, tapped before the
+        /// export limiter so they sum back to the unmastered main. WAV only.
+        #[arg(long)]
+        stems: bool,
         /// The sample rate in Hz.
         #[arg(long, default_value_t = 48000, value_name = "HZ")]
         sample_rate: u32,
@@ -2624,6 +2629,7 @@ fn run_command(
             cps,
             output,
             format,
+            stems,
             sample_rate,
             // Folded into the run's one JSON switch at parse time.
             json: _,
@@ -2634,6 +2640,16 @@ fn run_command(
                     .as_deref()
                     .map_or(RenderCliFormat::ScalarWav, format_for_output)
             });
+            if stems
+                && !matches!(
+                    format,
+                    RenderCliFormat::ScalarWav | RenderCliFormat::ScalarF32
+                )
+            {
+                return Err(RuntimeError::Message(
+                    "--stems writes WAV stems beside a WAV export, so it needs a WAV format".into(),
+                ));
+            }
             let output = match output {
                 Some(output) => output,
                 None => default_render_output(input.file.as_deref(), format),
@@ -2679,6 +2695,7 @@ fn run_command(
                 session.stop_export_when_silent(floor, std::time::Duration::from_secs_f64(hold));
                 session.set_render_tail(RENDER_TAIL_CEILING_SECS);
             }
+            session.set_stems_export(stems);
             let report = session.render(duration, &output, format.into())?;
             if json_asked() {
                 outln!(
@@ -2707,6 +2724,18 @@ fn run_command(
                     report.onset_count,
                     if report.onset_count == 1 { "" } else { "s" },
                 );
+                if stems {
+                    outln!(
+                        "{}",
+                        style::dim(
+                            on,
+                            &format!(
+                                "a stem per sounding orbit, in {}",
+                                rustel_audio::stems_folder(&output).display()
+                            )
+                        )
+                    );
+                }
                 if until_silence {
                     outln!(
                         "{}",
@@ -6754,6 +6783,25 @@ mod tests {
             .is_err(),
             "a length is one thing or the other"
         );
+        let cli = Cli::try_parse_from([
+            product::COMMAND_NAME,
+            "render",
+            "song.strudel",
+            "--stems",
+            "--format",
+            "scalar-f32",
+        ])
+        .expect("a stems export");
+        match cli.command {
+            Command::Render { stems, format, .. } => {
+                assert!(stems, "--stems parses on");
+                assert!(
+                    matches!(format, Some(RenderCliFormat::ScalarF32)),
+                    "the float format parses: {format:?}"
+                );
+            }
+            other => panic!("not a render: {other:?}"),
+        }
         let wants = |line: &[&str]| {
             let mut args = vec![product::COMMAND_NAME];
             args.extend_from_slice(line);

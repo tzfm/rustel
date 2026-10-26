@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- `--stems` on render writes a `<name> stems` folder beside the bounce: the same audio as `main.wav`, plus one stereo WAV per sounding orbit, named `1.wav` upward, in the export
+format. Each stem is tapped after its orbit's delay, reverb, filter, duck and fader, before the master, so the stems sum back to an unmastered main and mastering stays in the DAW. Stems need a WAV format, and an existing stems folder is refused.
 - File ▸ Open set takes a Strudel pattern export. A `.json` object of pattern code becomes a new set folder named after the file, with one score per entry, and a score that carries a `@title` field takes it as its file name.
 - Press / in the set panel to filter the scores: the panel hides the ones a query does not answer, matching names and @field values. Enter leaves the filter standing and moves to the first match, Esc restores the full list, and the sessions fold stays unfiltered. In vim mode the box keeps its own modes: i or a types.
 - Press i on a score in the set panel to see its details: the name, its strip number and open state, the @fields its leading comments carry, and when the file was last saved. Esc closes the details, and so does a move to another row.

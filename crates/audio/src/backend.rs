@@ -1233,6 +1233,13 @@ pub trait AudioBackend {
     /// Render the next `frames` stereo frames into `out` (length `frames * 2`).
     fn process_block(&mut self, out: &mut [f32], frames: usize);
 
+    /// This backend's orbit taps, when a stems render asked for them. The
+    /// taps hold the block the last [`process_block`](Self::process_block)
+    /// rendered. Backends without orbits keep none.
+    fn stems(&self) -> Option<&crate::scalar::Stems> {
+        None
+    }
+
     /// Human-readable backend name.
     fn name(&self) -> &'static str;
 }
