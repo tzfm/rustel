@@ -727,7 +727,7 @@ fn a_direct_slider_after_pitch_transforms_updates_sustained_audio_before_the_nex
 /// a new bundle for the host, so each call gives a plugin not yet loaded.
 #[cfg(feature = "vst")]
 fn fixture_plugins() -> tempfile::TempDir {
-    let folder = tempfile::tempdir().unwrap();
+    let folder = tempfile::tempdir().expect("tempdir created");
     rustel_vst3_fixture::install(folder.path());
     rustel_runtime::vst::pin_standard_folders(vec![folder.path().to_path_buf()]);
     folder
@@ -1691,10 +1691,10 @@ fn tick_for(engine: &mut StudioEngine, how_long: Duration, each: &mut dyn FnMut(
 /// A set folder holding, for each `(bank, takes)` of `banks`, a bank of
 /// that many short silent takes.
 fn set_of_banks(banks: &[(&str, usize)]) -> tempfile::TempDir {
-    let set = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    let set = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("tempdir created");
     for &(bank, takes) in banks {
         let folder = set.path().join(bank);
-        std::fs::create_dir(&folder).unwrap();
+        std::fs::create_dir(&folder).expect("the directory is created");
         for take in 0..takes {
             rustel_runtime::write_silent_wav(folder.join(format!("{take}.wav")), 48_000, 1, 0.01)
                 .expect("a take on disk");
@@ -3467,7 +3467,12 @@ fn piano_over_playback_tail_stops(immediate: bool) {
             .as_ref()
             .is_some_and(|pressure| pressure.device.realtime_pressure.active_voices == 1)
     });
-    let stream = sounding.pressure.as_ref().unwrap().device.stream_id;
+    let stream = sounding
+        .pressure
+        .as_ref()
+        .expect("the wait confirmed the pressure")
+        .device
+        .stream_id;
 
     // The real producer has already scheduled a long score. Piano must sound
     // on its callback without waiting for that score's next onset.
@@ -3478,7 +3483,15 @@ fn piano_over_playback_tail_stops(immediate: bool) {
             .as_ref()
             .is_some_and(|pressure| pressure.device.realtime_pressure.active_voices == 2)
     });
-    assert_eq!(chord.pressure.as_ref().unwrap().device.stream_id, stream);
+    assert_eq!(
+        chord
+            .pressure
+            .as_ref()
+            .expect("the wait confirmed the pressure")
+            .device
+            .stream_id,
+        stream
+    );
     assert!(chord.playing);
 
     worker.request_stop();
@@ -3536,7 +3549,11 @@ fn piano_over_playback_tail_stops(immediate: bool) {
     });
     assert!(restarted.playing);
     assert_eq!(
-        restarted.pressure.unwrap().device.stream_id,
+        restarted
+            .pressure
+            .expect("the wait confirmed the pressure")
+            .device
+            .stream_id,
         stream,
         "the restart adopts the parked stream instead of opening one"
     );

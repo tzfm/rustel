@@ -683,7 +683,7 @@ mod live_panic_tests {
         assert!(
             event["live_error"]["message"]
                 .as_str()
-                .unwrap()
+                .expect("the field is a string")
                 .contains("injected CLI query panic")
         );
         assert_eq!(session.active_source(), Some(source));

@@ -98,7 +98,7 @@ fn order_key(path: &Path, spelling: &str, cached: &mut Option<(PathBuf, Order)>)
     if cached.as_ref().is_none_or(|(folder, _)| folder != parent) {
         *cached = Some((parent.to_owned(), read_order(parent).unwrap_or_default()));
     }
-    let order = &cached.as_ref().unwrap().1;
+    let order = &cached.as_ref().expect("the cache line was just filled").1;
     let original = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -369,7 +369,10 @@ impl SampleLibrary {
             .remove(old_name)
             .unwrap_or_else(|| old_name.to_owned());
         order.insert(
-            new.file_name().unwrap().to_string_lossy().into_owned(),
+            new.file_name()
+                .expect("the path has a name")
+                .to_string_lossy()
+                .into_owned(),
             sort_name,
         );
         // Creating the new directory entry without replacing a destination is

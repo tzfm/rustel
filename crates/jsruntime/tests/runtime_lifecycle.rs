@@ -7,6 +7,10 @@
 //!
 //! The test measures **plateaus during a long run**, per resource,
 //! independently - never in aggregate.
+#![allow(
+    clippy::print_stdout,
+    reason = "progress lines trace the runtime lifecycle"
+)]
 
 use rustel_core::{Pattern, Value, fastcat, live_node_count, pure};
 use rustel_fraction::Fraction;
@@ -75,11 +79,11 @@ fn run(cycles: usize) {
 }
 
 fn run_inner(cycles: usize) {
-    let rt = JsRuntime::new().unwrap();
+    let rt = JsRuntime::new().expect("the runtime builds");
 
     // --- case A: a graph the user deliberately holds -----------------------
     let (hb, hp) = cyclic_graph(&rt);
-    let held_idx = rt.hold(&hb, hp).unwrap();
+    let held_idx = rt.hold(&hb, hp).expect("the hold registers");
 
     // --- case B: an OPAQUE graph, also held --------------------------------
     // Its reachable set is incomplete, so `gc_mark` must mark every cell.
@@ -94,15 +98,15 @@ fn run_inner(cycles: usize) {
         opaque_pat.purity().opaque,
         "precondition: graph must be opaque"
     );
-    let opaque_idx = rt.hold(&ob, opaque_pat).unwrap();
+    let opaque_idx = rt.hold(&ob, opaque_pat).expect("the hold registers");
 
     // Warm up, then take the baseline AFTER the held graphs exist.
     for _ in 0..20 {
         let (b, p) = cyclic_graph(&rt);
-        rt.set_active(&b, p).unwrap();
+        rt.set_active(&b, p).expect("the activation registers");
         let _ = rt
             .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
-            .unwrap();
+            .expect("the query succeeds");
     }
     settle(&rt);
     let base = sample(&rt);
@@ -110,10 +114,10 @@ fn run_inner(cycles: usize) {
     // --- churn: replace the active graph `cycles` times --------------------
     for _ in 0..cycles {
         let (b, p) = cyclic_graph(&rt);
-        rt.set_active(&b, p).unwrap(); // replaces -> previous is unreachable
+        rt.set_active(&b, p).expect("the activation registers"); // replaces -> previous is unreachable
         let _ = rt
             .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
-            .unwrap();
+            .expect("the query succeeds");
     }
     settle(&rt);
     let after = sample(&rt);
@@ -164,7 +168,7 @@ fn run_inner(cycles: usize) {
     // --- 3. the active graph is still callable -----------------------------
     let active = rt
         .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
-        .unwrap();
+        .expect("the query succeeds");
     assert_eq!(active.len(), 2);
     assert!(
         active.iter().all(|h| h.value.show().ends_with('!')),
@@ -175,7 +179,7 @@ fn run_inner(cycles: usize) {
     // --- 4. the HELD graph survived every GC -------------------------------
     let held = rt
         .query(Slot::Held, held_idx, Fraction::ZERO, Fraction::ONE)
-        .unwrap();
+        .expect("the query succeeds");
     assert_eq!(held.len(), 2, "held graph was collected");
     assert!(
         held.iter().all(|h| h.value.show().ends_with('!')),
@@ -185,7 +189,7 @@ fn run_inner(cycles: usize) {
     // --- 5. the OPAQUE graph survived -- conservative marking works --------
     let opaque = rt
         .query(Slot::Held, opaque_idx, Fraction::ZERO, Fraction::ONE)
-        .unwrap();
+        .expect("the query succeeds");
     assert!(!opaque.is_empty(), "opaque graph produced nothing");
     assert!(
         opaque.iter().all(|h| h.value.show().ends_with('?')),
@@ -249,13 +253,13 @@ fn held_slot_replacement_plateaus() {
 }
 
 fn held_slot_replacement_inner() {
-    let rt = JsRuntime::new().unwrap();
+    let rt = JsRuntime::new().expect("the runtime builds");
     let (b0, p0) = cyclic_graph(&rt);
-    let idx = rt.hold(&b0, p0).unwrap();
+    let idx = rt.hold(&b0, p0).expect("the hold registers");
 
     for _ in 0..20 {
         let (b, p) = cyclic_graph(&rt);
-        rt.replace_held(idx, &b, p).unwrap();
+        rt.replace_held(idx, &b, p).expect("the replace registers");
     }
     settle(&rt);
     let base = sample(&rt);
@@ -263,10 +267,10 @@ fn held_slot_replacement_inner() {
     const N: usize = if cfg!(debug_assertions) { 500 } else { 10_000 };
     for _ in 0..N {
         let (b, p) = cyclic_graph(&rt);
-        rt.replace_held(idx, &b, p).unwrap();
+        rt.replace_held(idx, &b, p).expect("the replace registers");
         let _ = rt
             .query(Slot::Held, idx, Fraction::ZERO, Fraction::ONE)
-            .unwrap();
+            .expect("the query succeeds");
     }
     settle(&rt);
     let after = sample(&rt);
@@ -297,11 +301,11 @@ fn held_slot_replacement_inner() {
     // Still callable after all that churn.
     let haps = rt
         .query(Slot::Held, idx, Fraction::ZERO, Fraction::ONE)
-        .unwrap();
+        .expect("the query succeeds");
     assert_eq!(haps.len(), 2);
 
     // And releasing frees the last one.
-    rt.release_held(idx).unwrap();
+    rt.release_held(idx).expect("the release registers");
     settle(&rt);
     assert!(
         cells_dropped() > after.cells,

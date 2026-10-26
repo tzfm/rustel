@@ -4,7 +4,7 @@ use rustel_fraction::Fraction;
 fn control(pattern: &Pattern, name: &str, value: Pattern) -> Pattern {
     default_control_registry()
         .get(name)
-        .unwrap()
+        .expect("the control is registered")
         .apply(pattern, Some(value))
 }
 

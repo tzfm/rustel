@@ -34,7 +34,12 @@ pub(crate) fn parse(file: &[u8]) -> Result<Preset<'_>, String> {
     if bytes(list, 4) != Some(b"List") {
         return Err(bad());
     }
-    let count = i32::from_le_bytes(bytes(list + 4, 4).ok_or_else(bad)?.try_into().unwrap());
+    let count = i32::from_le_bytes(
+        bytes(list + 4, 4)
+            .ok_or_else(bad)?
+            .try_into()
+            .expect("the slice has the right length"),
+    );
     let mut component = None;
     let mut controller = None;
     for index in 0..usize::try_from(count).map_err(|_| bad())? {

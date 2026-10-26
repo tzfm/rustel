@@ -98,7 +98,10 @@ impl CallbackHost for ThrowOnSecondValue {
     }
 
     fn log_query_error(&self, message: &str) {
-        self.logged.lock().unwrap().push(message.into());
+        self.logged
+            .lock()
+            .expect("the lock is not poisoned")
+            .push(message.into());
     }
 }
 

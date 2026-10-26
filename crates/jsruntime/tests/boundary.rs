@@ -1970,11 +1970,13 @@ fn runtime_with_a_re_lengthening_array_setter(setup: &str) -> JsRuntime {
 /// [`runtime_with_a_re_lengthening_array_setter`], re-lengthening every array
 /// the setter sees to `length` instead.
 fn runtime_re_lengthening_arrays_to(length: &str, setup: &str) -> JsRuntime {
-    let rt = JsRuntime::new().unwrap();
-    rt.install_semantic_bindings().unwrap();
-    rt.install_voicings_prebake().unwrap();
-    rt.set_memory_limit(MATERIALIZE_CEILING).unwrap();
-    rt.eval(setup).unwrap();
+    let rt = JsRuntime::new().expect("the runtime builds");
+    rt.install_semantic_bindings()
+        .expect("the bindings install");
+    rt.install_voicings_prebake().expect("the prebake installs");
+    rt.set_memory_limit(MATERIALIZE_CEILING)
+        .expect("the limit is accepted");
+    rt.eval(setup).expect("the script evaluates");
     rt.eval(&format!(
         "Object.defineProperty(Array.prototype, 0, {{ configurable: true, \
            set(value) {{ \
@@ -1982,7 +1984,7 @@ fn runtime_re_lengthening_arrays_to(length: &str, setup: &str) -> JsRuntime {
                {{ value, writable: true, enumerable: true, configurable: true }}); \
              this.length = {length}; }} }})"
     ))
-    .unwrap();
+    .expect("the script evaluates");
     rt
 }
 
@@ -2101,7 +2103,7 @@ fn install_counted_arrays(rt: &JsRuntime) {
            Object.defineProperty(array, 0, { get() { globalThis.__reads++; return 1; } }); \
            return array; }",
     )
-    .unwrap();
+    .expect("the script evaluates");
 }
 
 fn reads(rt: &JsRuntime) -> f64 {
@@ -2121,7 +2123,7 @@ fn calls_through_js(rt: &JsRuntime, score: &str) -> f64 {
            apply(target, self, args) { \
              globalThis.__calls++; return Reflect.apply(target, self, args); } })",
     )
-    .unwrap();
+    .expect("the script evaluates");
     rt.evaluate_score(score, &TranspileOptions::default())
         .unwrap_or_else(|error| panic!("{score} must evaluate: {error}"));
     rt.get_number("__calls").expect("the call counter")

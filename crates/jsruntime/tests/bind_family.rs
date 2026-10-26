@@ -24,8 +24,9 @@ use rustel_jsruntime::{JsRuntime, Slot};
 use rustel_transpiler::TranspileOptions;
 
 fn wholes(source: &str) -> Vec<String> {
-    let rt = JsRuntime::new().unwrap();
-    rt.install_semantic_bindings().unwrap();
+    let rt = JsRuntime::new().expect("the runtime builds");
+    rt.install_semantic_bindings()
+        .expect("the bindings install");
     rt.evaluate_score(source, &TranspileOptions::default())
         .unwrap_or_else(|e| panic!("{source}: {e}"));
     rt.query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)

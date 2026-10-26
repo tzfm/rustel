@@ -41,8 +41,10 @@ fn assert_clean(runtime: &JsRuntime, label: &str) {
 }
 
 fn semantic_runtime(source: &str) -> JsRuntime {
-    let runtime = JsRuntime::new().unwrap();
-    runtime.install_semantic_bindings().unwrap();
+    let runtime = JsRuntime::new().expect("the runtime builds");
+    runtime
+        .install_semantic_bindings()
+        .expect("the bindings install");
     runtime
         .evaluate_score(source, &TranspileOptions::default())
         .unwrap_or_else(|error| panic!("could not install `{source}`: {error}"));

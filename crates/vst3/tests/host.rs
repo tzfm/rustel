@@ -1721,7 +1721,10 @@ fn a_bundle_that_does_not_load_gives_the_reason() {
 
 fn walk(folder: &std::path::Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    for entry in std::fs::read_dir(folder).unwrap().flatten() {
+    for entry in std::fs::read_dir(folder)
+        .expect("the folder is listed")
+        .flatten()
+    {
         let path = entry.path();
         if path.is_dir() {
             files.extend(walk(&path));

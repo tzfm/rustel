@@ -2828,7 +2828,10 @@ fn rewrite_mini_literals(
             index = end;
             continue;
         }
-        let ch = source[index..].chars().next().unwrap();
+        let ch = source[index..]
+            .chars()
+            .next()
+            .expect("the iterator yields the element");
         output.push(ch);
         index += ch.len_utf8();
     }

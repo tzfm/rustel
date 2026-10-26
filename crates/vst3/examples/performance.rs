@@ -16,6 +16,11 @@
 //! `--parallel=3` runs 3 copies of the chain at the same time on 3 threads.
 //! With either option, a chain on this thread gets the same input, and each
 //! callback compares the output of the threads with its output.
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "the example prints its measurements"
+)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -252,7 +257,7 @@ impl Poller {
         self.stop.store(true, Ordering::Relaxed);
         self.thread
             .take()
-            .unwrap()
+            .expect("finish runs once")
             .join()
             .map_err(|_| "readiness polling thread panicked".into())
     }
@@ -469,7 +474,7 @@ fn run() -> Result<(), String> {
                     .params()
                     .iter()
                     .find(|param| param.id == id)
-                    .unwrap()
+                    .expect("the parameter list has the id")
                     .default;
                 Ok::<_, String>(InsertParam {
                     id,
