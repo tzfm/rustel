@@ -297,7 +297,9 @@ or cycle holds it for the line the row names, and the header shows the
 `» scene` countdown while it waits.
 
 Auto evaluate works while the set plays. A stopped set stays stopped, so
-Ctrl+S remains how playback starts.
+Ctrl+S remains how playback starts. While one score plays, the pause applies
+an edit of that score alone: an edit of another score of the set stays in
+its file, and the evaluate key is the one that runs it.
 
 ### External changes
 
