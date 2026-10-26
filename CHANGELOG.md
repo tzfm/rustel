@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- The hint rows at the set panel's bottom name the open and filter keys, so Enter and `/` are easy to find.
 - `--stems` on render writes a `<name> stems` folder beside the bounce: the same audio as `main.wav`, plus one stereo WAV per sounding orbit, named `1.wav` upward, in the export
 format. Each stem is tapped after its orbit's delay, reverb, filter, duck and fader, before the master, so the stems sum back to an unmastered main and mastering stays in the DAW. Stems need a WAV format, and an existing stems folder is refused.
 - File ▸ Open set takes a Strudel pattern export. A `.json` object of pattern code becomes a new set folder named after the file, with one score per entry, and a score that carries a `@title` field takes it as its file name.

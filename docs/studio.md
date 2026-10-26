@@ -177,7 +177,8 @@ panel size.
 The panel's foot shows the selected row's details: the name, its strip number
 and open state, the `@` fields its leading comments carry, and when it was
 last saved. The block follows the selection with no key of its own. A tape's
-row shows its recording time, and the sessions fold its count.
+row shows its recording time, and the sessions fold its count. The hint rows
+at the panel's bottom name the open and filter keys.
 
 Press `/` to filter the scores: type, and the panel hides the scores the query
 does not answer. A query matches a name or any `@` field value. Enter leaves
