@@ -2062,6 +2062,10 @@ pub fn direct_diagnostic_logging() -> bool {
 /// Print the notice's `record`, or keep the notice for the enclosing
 /// [`with_diagnostic_policy`] scope. Outside every scope, with direct logging
 /// off, it is dropped.
+#[allow(
+    clippy::print_stderr,
+    reason = "notices print when direct logging is on"
+)]
 fn report_notice(message: impl Into<String>, record: serde_json::Value) {
     if direct_diagnostic_logging() {
         eprintln!("{record}");

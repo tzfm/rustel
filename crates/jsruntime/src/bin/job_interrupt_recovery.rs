@@ -5,6 +5,7 @@
 //! discard the residual queue under the runtime lock, collect, and keep using
 //! the same heap. rquickjs 0.14 fixes the old borrowed-context ownership
 //! bug; this control also guards exception consumption and residual-job cleanup.
+#![allow(clippy::print_stdout, reason = "the marker line is the result")]
 
 use std::time::Duration;
 

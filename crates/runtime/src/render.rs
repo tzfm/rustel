@@ -15,6 +15,7 @@ pub fn set_progress_json(on: bool) {
 /// A line about how far a long job has got, on stderr: the JSON object
 /// when the run was asked for JSON, the sentence otherwise - one or the
 /// other, never both on one run.
+#[allow(clippy::print_stderr, reason = "stderr is the progress channel")]
 pub(crate) fn report_progress(json: serde_json::Value, text: impl FnOnce() -> String) {
     if PROGRESS_JSON.load(std::sync::atomic::Ordering::Relaxed) {
         eprintln!("{json}");
@@ -149,6 +150,7 @@ fn tallied_scalar_event(
 }
 
 /// Print each distinct notice once, with its onset count.
+#[allow(clippy::print_stderr, reason = "notices are warnings for the reader")]
 fn print_notice_tally(tally: Option<NoticeTally>) {
     for (message, onsets) in tally.into_iter().flatten() {
         let unit = if onsets == 1 { "onset" } else { "onsets" };
@@ -535,6 +537,10 @@ fn in_memory_render_frames(sample_rate: u32, duration_secs: f64) -> io::Result<u
 /// diagnostics when direct logging is off, so an offline caller is not left
 /// with a silent buffer and no explanation.
 #[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::print_stderr,
+    reason = "refusal records are the direct diagnostic channel"
+)]
 pub(crate) fn render_scalar_pcm_with_refusals(
     sample_rate: u32,
     duration_secs: f64,
@@ -618,6 +624,10 @@ pub(crate) fn render_scalar_pcm_with_refusals(
     Ok((pcm, refused))
 }
 
+#[allow(
+    clippy::print_stderr,
+    reason = "starvation records are the direct diagnostic channel"
+)]
 fn check_csound_errors(csound: Option<&crate::csound::State>) -> io::Result<()> {
     let mut errors = csound.map_or_else(Vec::new, crate::csound::State::take_errors);
     // A starved worker played a gap of silence and the render stands. Its
@@ -649,6 +659,10 @@ fn check_csound_errors(csound: Option<&crate::csound::State>) -> io::Result<()> 
 /// a warning line for a run a person reads, and a record for each other
 /// run. With direct logging off, the problems stay for the session of the
 /// live output. That session queues each one as a plugin line.
+#[allow(
+    clippy::print_stderr,
+    reason = "plugin problems are the direct diagnostic channel"
+)]
 fn print_plugin_problems() {
     #[cfg(feature = "vst")]
     if rustel_voice::direct_diagnostic_logging() {
@@ -801,6 +815,10 @@ pub fn write_scalar_wav_controlled(
 /// voice budget. Answers the bytes written and the distinct voices the
 /// render refused.
 #[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::print_stderr,
+    reason = "refusal records are the direct diagnostic channel"
+)]
 pub(crate) fn write_scalar_wav_controlled_with_dispatch(
     path: impl AsRef<Path>,
     sample_rate: u32,

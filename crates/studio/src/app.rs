@@ -539,6 +539,10 @@ fn status_file_path(path: &std::path::Path, full: bool) -> String {
 /// Enter the alternate screen and run until the user quits. Playback begins
 /// only after the first evaluate command, mirroring the REPL's explicit Play
 /// gesture while still allowing the score to be edited silently first.
+#[allow(
+    clippy::print_stderr,
+    reason = "the theme fallback is reported before the screen opens"
+)]
 fn run_once(options: StudioOptions) -> Result<Session, RuntimeError> {
     let starter = if options.mini {
         DEFAULT_MINI_SCORE

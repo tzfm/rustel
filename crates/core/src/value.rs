@@ -1131,10 +1131,18 @@ mod tests {
         }
 
         impl crate::CallbackHost for MaterializeHost {
+            #[expect(
+                clippy::panic_in_result_fn,
+                reason = "this test double must panic when called"
+            )]
             fn call_value(&self, id: crate::CallbackId, _: &Value) -> Result<Value, String> {
                 panic!("unexpected value callback {id}")
             }
 
+            #[expect(
+                clippy::panic_in_result_fn,
+                reason = "this test double must panic when called"
+            )]
             fn call_query(
                 &self,
                 id: crate::CallbackId,
@@ -1143,6 +1151,10 @@ mod tests {
                 panic!("unexpected query callback {id}")
             }
 
+            #[expect(
+                clippy::panic_in_result_fn,
+                reason = "the unexpected id is a test failure"
+            )]
             fn call_materialize_value(&self, id: crate::CallbackId) -> Result<Value, String> {
                 self.calls.borrow_mut().push(id);
                 Ok(match id {

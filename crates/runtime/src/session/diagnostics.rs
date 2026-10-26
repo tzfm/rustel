@@ -106,6 +106,10 @@ impl Session {
         }
     }
 
+    #[allow(
+        clippy::print_stderr,
+        reason = "direct diagnostics print here by design"
+    )]
     pub(crate) fn report_diagnostic(
         &mut self,
         kind: impl Into<String>,

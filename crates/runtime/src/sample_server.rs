@@ -53,6 +53,10 @@ pub fn serve_until(
 ///
 /// An empty list uses `https://strudel.cc`. A non-empty list replaces that
 /// default, so every permitted browser origin must be named explicitly.
+#[allow(
+    clippy::print_stderr,
+    reason = "the server prints its status records on stderr"
+)]
 pub fn serve_until_with_origins(
     root: &Path,
     host: &str,
@@ -492,6 +496,10 @@ fn is_timeout(error: &std::io::Error) -> bool {
     )
 }
 
+#[allow(
+    clippy::print_stderr,
+    reason = "the server prints its status records on stderr"
+)]
 fn handle(
     mut stream: TcpStream,
     root: &ServedRoot,

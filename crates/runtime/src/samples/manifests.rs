@@ -299,6 +299,10 @@ impl ManifestContext {
         Ok(())
     }
 
+    #[allow(
+        clippy::print_stderr,
+        reason = "registration records are the direct diagnostic channel"
+    )]
     fn register_score_local_folder(
         &self,
         requested: &str,
@@ -411,6 +415,10 @@ impl ManifestContext {
         Ok(())
     }
 
+    #[allow(
+        clippy::print_stderr,
+        reason = "registration records are the direct diagnostic channel"
+    )]
     fn register_custom_value(
         &self,
         value: &serde_json::Value,
@@ -538,6 +546,10 @@ impl ManifestContext {
         }
     }
 
+    #[allow(
+        clippy::print_stderr,
+        reason = "registration records are the direct diagnostic channel"
+    )]
     fn register_local_folder(
         &self,
         requested: &str,

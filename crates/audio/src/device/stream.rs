@@ -2598,10 +2598,18 @@ mod tests {
                 self.output
             }
 
+            #[expect(
+                clippy::panic_in_result_fn,
+                reason = "the stub host does not implement this"
+            )]
             fn supported_input_configs(&self) -> Result<Self::SupportedInputConfigs, cpal::Error> {
                 panic!("listing must not request input formats from the fake host")
             }
 
+            #[expect(
+                clippy::panic_in_result_fn,
+                reason = "the stub host does not implement this"
+            )]
             fn supported_output_configs(
                 &self,
             ) -> Result<Self::SupportedOutputConfigs, cpal::Error> {
@@ -2616,6 +2624,10 @@ mod tests {
                 self.default_config(false)
             }
 
+            #[expect(
+                clippy::panic_in_result_fn,
+                reason = "the stub host does not implement this"
+            )]
             fn build_input_stream_raw<D, E>(
                 &self,
                 _config: cpal::StreamConfig,
@@ -2631,6 +2643,10 @@ mod tests {
                 panic!("listing must not open an input stream")
             }
 
+            #[expect(
+                clippy::panic_in_result_fn,
+                reason = "the stub host does not implement this"
+            )]
             fn build_output_stream_raw<D, E>(
                 &self,
                 _config: cpal::StreamConfig,

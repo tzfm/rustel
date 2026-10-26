@@ -625,6 +625,7 @@ impl App {
         self.emit_performance_records(snapshot, ProcessStats::default());
     }
 
+    #[allow(clippy::print_stderr, reason = "performance records are opt-in output")]
     pub(super) fn emit_performance_records(
         &self,
         performance: StudioPerformanceSnapshot,

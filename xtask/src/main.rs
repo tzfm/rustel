@@ -1,3 +1,9 @@
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "xtask is a terminal tool"
+)]
+
 use std::collections::BTreeSet;
 use std::env;
 use std::fmt;

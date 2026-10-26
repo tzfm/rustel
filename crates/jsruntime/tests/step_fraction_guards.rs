@@ -14,6 +14,10 @@ const PRIMES_TO_101: [u32; 26] = [
     101,
 ];
 
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "a failed guard is a test failure"
+)]
 fn query_first_cycle(source: &str) -> Result<Vec<Hap>, QueryError> {
     let runtime = JsRuntime::new().expect("runtime");
     runtime.install_semantic_bindings().expect("bindings");
