@@ -1,8 +1,12 @@
 # Changelog
 
 ## Unreleased
+<<<<<<< HEAD
 - The talkit speech synthesizer lives in its own repository, [rustel-talkit](https://github.com/tzfm/rustel-talkit), and the build takes it as a pinned package from release v0.1.0. Scores speak as before, and the talkit command installs from that repository.
 - The Hydra video synth lives in its own repository, [rustel-hydra](https://github.com/tzfm/rustel-hydra), and the build takes it as a pinned package from release v0.1.0. Visuals draw as before, with the same character-checked shaders.
+=======
+- The knobs column shows the presets of a plugin call under its rails, closed until → opens them. Enter on a name, and a click on one, write the preset into the call, and the name the call holds carries the mark. The Vim list keys drive the column now, as they do the other panels.
+>>>>>>> 174bf41 (Offer the presets of a plugin call under the knobs column's rails)
 - A slider() on `fm` moves the sounding voice, as the gain and filter sliders do: `s("in").fm(slider(2, 0, 8))` rides the depth live, with no wait for the next hap. This reaches every source; on `s("in")`, whose hap spans the cycle, it is the difference between now and a cycle late. The chain's other operators stay query-time, and a modulator aimed at `fm` keeps its own graph.
 - A change of the preset folders reads them again at once, on the plugin thread as before: the background-jobs sheet lists the read while it runs, and the count line of the vst tab says it too.
 - A preset name no file of its plugin has is a value error of the Studio check, like an unknown sound: the update is refused, the name is marked in the score, and the nearest preset name is given. `rustel play` keeps its one warning for it.

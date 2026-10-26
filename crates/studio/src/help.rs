@@ -157,7 +157,8 @@ impl HelpContext {
             Self::Knobs => {
                 "The numbers of the call under the caret, as sliders. The arrows write \
                  the score as they move, and the far left takes an optional entry out. \
-                 Press Enter to type an exact value. A plugin keeps the knobs you add to it."
+                 Press Enter to type an exact value. A plugin keeps the knobs you add to \
+                 it, and its presets sit under the rails: → opens them, Enter takes one."
             }
         }
     }

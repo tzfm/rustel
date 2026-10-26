@@ -23,8 +23,8 @@ use super::slider::{SliderTrack, Travel, pointer_value, rail_stepped, snap_value
 use super::smart_action::guess_range;
 use super::*;
 use crate::knobs_panel::{
-    AddList, CallAt, Fader, HeldOff, HeldText, Knob, KnobEdit, KnobPlace, KnobState, KnobsPanel,
-    add_row_at, add_sheet, add_shown, knob_at, knob_row, parts, shown,
+    AddList, CallAt, Fader, HeldOff, HeldText, Knob, KnobEdit, KnobPlace, KnobPresets, KnobState,
+    KnobsPanel, add_row_at, add_sheet, add_shown, knob_at, knob_row, parts, presets_rows, shown,
 };
 use crate::number_form::{Field, SliderForm, format_value, short_number};
 use crate::prefs::KnobRange;
@@ -62,6 +62,9 @@ pub(super) struct CallParse {
     /// The call is an audio control, such as `lpf` or `gain`: it takes a
     /// number, and its name says what the number is.
     control: bool,
+    /// The `preset` the call's object names, when a quoted string gives
+    /// it: the preset the score plays.
+    preset: Option<String>,
     knobs: Vec<Knob>,
     entries: Vec<Range<usize>>,
     /// Every key the options object holds, a rail or not: `attack: "0.1
@@ -93,6 +96,9 @@ pub(super) struct KnobsRows {
     /// The call has a list for `a` to add from: a plugin's parameters,
     /// or the options its reference documents.
     pub listed: bool,
+    /// The `preset` the call's object names, when it names one: the mark
+    /// beside the plugin's presets.
+    pub preset: Option<String>,
     pub knobs: Vec<Knob>,
 }
 
@@ -314,6 +320,7 @@ pub(super) fn parse_call(source: &str, caret: usize) -> Option<CallParse> {
     let mut knobs = Vec::new();
     let mut entries = Vec::new();
     let mut keys = Vec::new();
+    let mut preset = None;
     let mut entries_closed = close.is_some();
     for (at, arg) in args.iter().enumerate() {
         if Some(at) == object {
@@ -341,6 +348,13 @@ pub(super) fn parse_call(source: &str, caret: usize) -> Option<CallParse> {
                     continue;
                 };
                 keys.push(label.clone());
+                // The preset the object names, for the mark beside the
+                // plugin's presets.
+                if label == "preset" {
+                    preset = rustel_runtime::sounds::string_argument(&source[value.clone()])
+                        .filter(|name| !name.trim().is_empty())
+                        .map(|name| name.into_owned());
+                }
                 // An entry that holds neither a number nor a whole fader -
                 // a chord, an expression - is no rail, but it must not take
                 // the call's other numbers with it.
@@ -372,6 +386,7 @@ pub(super) fn parse_call(source: &str, caret: usize) -> Option<CallParse> {
         close,
         plugin,
         control,
+        preset,
         knobs,
         entries,
         keys,
@@ -934,7 +949,45 @@ impl App {
             }
         }
         self.assemble_knobs();
-        let count = self.knobs_rows.as_ref().map_or(0, |rows| rows.knobs.len());
+        // The presets of the plugin call, read for the section under the
+        // rails: a new call asks for its own names, and a new read of the
+        // preset folders brings them again. The names stay empty for a
+        // plugin the host is still finding, so the ask goes on while its
+        // parameters have not arrived.
+        #[cfg(feature = "vst")]
+        {
+            let plugin = self
+                .knobs_parse
+                .as_ref()
+                .and_then(|parse| parse.call.as_ref())
+                .and_then(|call| call.plugin.clone());
+            let loading = self
+                .knobs_parse
+                .as_ref()
+                .is_some_and(|parse| parse.params.is_none());
+            if let Some(plugin) = plugin {
+                let version = self.plugin_presets_version;
+                let stale = self
+                    .knobs_panel
+                    .as_ref()
+                    .and_then(|panel| panel.presets.as_ref())
+                    .is_none_or(|presets| {
+                        presets.version != version || (loading && presets.names.is_empty())
+                    });
+                if stale
+                    && let Some(names) = vst::host().presets(&plugin)
+                    && let Some(panel) = self.knobs_panel.as_mut()
+                {
+                    let open = panel.presets.as_ref().is_some_and(|presets| presets.open);
+                    panel.presets = Some(KnobPresets {
+                        names,
+                        version,
+                        open,
+                    });
+                }
+            }
+        }
+        let count = self.knobs_row_count();
         let Some(panel) = self.knobs_panel.as_mut() else {
             return;
         };
@@ -942,6 +995,19 @@ impl App {
         if let Some(parts) = parts(area) {
             panel.follow(count, shown(parts.body));
         }
+    }
+
+    /// The rows the column holds: the rails, and the presets section under
+    /// them, heading and names, while the call is one of a plugin.
+    fn knobs_row_count(&self) -> usize {
+        let knobs = self.knobs_rows.as_ref().map_or(0, |rows| rows.knobs.len());
+        let presets = self
+            .knobs_panel
+            .as_ref()
+            .and_then(|panel| panel.presets.as_ref())
+            .filter(|presets| !presets.names.is_empty())
+            .map_or(0, presets_rows);
+        knobs + presets
     }
 
     /// Put the rows together: the score's knobs with their bounds
@@ -979,6 +1045,7 @@ impl App {
             panel.ranges.clear();
             panel.order.clear();
             panel.order_by_plugin = false;
+            panel.presets = None;
         }
         panel.off_call = call_at;
         for knob in &mut knobs {
@@ -1188,6 +1255,7 @@ impl App {
         self.knobs_rows = Some(KnobsRows {
             name: callee,
             listed: plugin.is_some() || !options.is_empty(),
+            preset: parse.and_then(|call| call.preset.clone()),
             knobs,
         });
     }
@@ -1288,7 +1356,7 @@ impl App {
             self.dirty_frame = true;
             return true;
         }
-        let count = self.knobs_rows.as_ref().map_or(0, |rows| rows.knobs.len());
+        let count = self.knobs_row_count();
         let selected = self.knobs_panel.as_ref().map_or(0, |panel| panel.selected);
         let takes = |code: KeyCode| {
             matches!(
@@ -1325,6 +1393,12 @@ impl App {
                     _ => {}
                 }
             }
+            // The presets section under the rails: → and ← are its chords,
+            // and Enter takes the preset under the hand into the call.
+            if self.knobs_presets_key(code) {
+                self.dirty_frame = true;
+                return true;
+            }
             match code {
                 KeyCode::Esc => {
                     self.focus = Focus::Editor;
@@ -1344,6 +1418,81 @@ impl App {
             return true;
         }
         false
+    }
+
+    /// The keys of the presets section, when the hand is on one of its
+    /// rows: → and Enter open the heading, ← closes it wherever the hand
+    /// is in the section, and Enter on a name takes the preset into the
+    /// call. False leaves the key to the rails.
+    fn knobs_presets_key(&mut self, code: KeyCode) -> bool {
+        let knobs = self.knobs_rows.as_ref().map_or(0, |rows| rows.knobs.len());
+        let Some(panel) = self.knobs_panel.as_mut() else {
+            return false;
+        };
+        if panel
+            .presets
+            .as_ref()
+            .is_none_or(|presets| presets.names.is_empty())
+        {
+            return false;
+        }
+        let Some(offset) = panel.selected.checked_sub(knobs) else {
+            return false;
+        };
+        let name = match code {
+            KeyCode::Right | KeyCode::Enter if offset == 0 => {
+                panel.presets.as_mut().expect("the section has names").open = true;
+                return true;
+            }
+            KeyCode::Left => {
+                panel.presets.as_mut().expect("the section has names").open = false;
+                panel.selected = knobs;
+                return true;
+            }
+            // Enter on a name: the preset goes into the call, and the
+            // evaluation plays it.
+            KeyCode::Enter => panel
+                .presets
+                .as_ref()
+                .and_then(|presets| presets.names.get(offset - 1))
+                .cloned(),
+            _ => return false,
+        };
+        let Some(name) = name else {
+            return false;
+        };
+        self.knob_preset_write(&name);
+        true
+    }
+
+    /// Write `preset: name` into the call the column reads. A preset the
+    /// call holds already gives way to the chosen one, and the score
+    /// changes, so the evaluation plays the chosen preset.
+    fn knob_preset_write(&mut self, name: &str) {
+        let Some(open) = self
+            .knobs_parse
+            .as_ref()
+            .and_then(|parse| parse.call.as_ref())
+            .map(|call| call.open)
+        else {
+            return;
+        };
+        let text = format!("preset: {name:?}");
+        let source = self.editor().source();
+        let Some((range, kept)) = parameter_edit(&source, open, &text, None) else {
+            self.status = "knobs: the call needs a closed object for a preset".into();
+            self.dirty_frame = true;
+            return;
+        };
+        // The call holds a preset already: the chosen one takes its place.
+        let replacement = if kept == source[range.clone()] {
+            text
+        } else {
+            kept
+        };
+        if self.knobs_write(range, &replacement) {
+            self.status = format!("knobs: preset {name}");
+        }
     }
 
     /// The add list's keys: letters search, Enter adds and remembers,
@@ -2427,6 +2576,35 @@ impl App {
         };
         if let Some(panel) = self.knobs_panel.as_mut() {
             panel.selected = at;
+        }
+        // The presets section under the rails: the heading opens and
+        // closes by the click, and a name writes its preset into the call.
+        let knobs = self.knobs_rows.as_ref().map_or(0, |rows| rows.knobs.len());
+        if at >= knobs {
+            match at - knobs {
+                0 => {
+                    if let Some(presets) = self
+                        .knobs_panel
+                        .as_mut()
+                        .and_then(|panel| panel.presets.as_mut())
+                    {
+                        presets.open = !presets.open;
+                    }
+                }
+                offset => {
+                    let name = self
+                        .knobs_panel
+                        .as_ref()
+                        .and_then(|panel| panel.presets.as_ref())
+                        .and_then(|presets| presets.names.get(offset - 1))
+                        .cloned();
+                    if let Some(name) = name {
+                        self.knob_preset_write(&name);
+                    }
+                }
+            }
+            self.dirty_frame = true;
+            return true;
         }
         let rail = knob_row(parts.body, at - scroll).map(|(_, rail)| rail);
         let Some(rail) = rail.filter(|_| on_rail) else {
@@ -3870,5 +4048,91 @@ mod tests {
                 ("mix".to_owned(), false)
             ]
         );
+    }
+
+    #[test]
+    fn the_parse_names_the_preset_the_call_holds() {
+        let source = "$: s(\"bd\").vst(\"FX\", { preset: \"Dark Bass\", gain: 1 })";
+        let caret = source.find("gain").expect("the entry");
+        let parse = parse_call(source, caret).expect("the caret is in the call");
+        assert_eq!(parse.preset.as_deref(), Some("Dark Bass"));
+        let source = "$: s(\"bd\").vst(\"FX\", { gain: 1 })";
+        let caret = source.find("gain").expect("the entry");
+        let parse = parse_call(source, caret).expect("the caret is in the call");
+        assert_eq!(parse.preset, None);
+    }
+
+    /// The presets of a plugin call sit under the rails as a section of
+    /// their own, closed until the hand opens it: → opens the heading, ↓
+    /// walks the names, Enter takes a name into the call - a preset the
+    /// call holds gives way to it - and ← closes the section.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn the_presets_of_a_plugin_call_write_the_score() {
+        use super::super::tests::support::{app_over, press};
+        use crate::editor::{ByteOffset, Selection};
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut app = app_over(directory.path());
+        let score = "$: s(\"bd\").vst(\"FX\", { gain: 1 })\n";
+        app.scenes.current_mut().editor = Editor::new(score).expect("score");
+        let _ = app
+            .scenes
+            .current_mut()
+            .editor
+            .set_selection(Selection::caret(ByteOffset(score.len() - 3)));
+        app.open_knobs_panel(true);
+        app.refresh_knobs(Rect::default());
+        if let Some(panel) = app.knobs_panel.as_mut() {
+            panel.presets = Some(KnobPresets {
+                names: vec!["Dark Bass".into(), "Lead".into()],
+                version: 0,
+                open: false,
+            });
+        }
+        let knobs = app.knobs_rows.as_ref().expect("rows").knobs.len();
+        assert_eq!(
+            app.knobs_row_count(),
+            knobs + 1,
+            "the heading alone while the section is closed"
+        );
+        if let Some(panel) = app.knobs_panel.as_mut() {
+            panel.selected = knobs;
+        }
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(
+            app.knobs_row_count(),
+            knobs + 3,
+            "the names under the heading"
+        );
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            app.editor().source().contains("preset: \"Dark Bass\""),
+            "the pick wrote the preset:\n{}",
+            app.editor().source()
+        );
+        // The second pick replaces the first: one preset member, with the
+        // name it picked.
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let source = app.editor().source();
+        assert!(
+            source.contains("preset: \"Lead\""),
+            "the second pick replaced the first:\n{source}"
+        );
+        assert!(
+            !source.contains("Dark Bass"),
+            "one preset member, the one picked:\n{source}"
+        );
+        assert_eq!(
+            source.matches("preset:").count(),
+            1,
+            "no second spelling of the preset:\n{source}"
+        );
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        let panel = app.knobs_panel.as_ref().expect("the panel");
+        assert!(!panel.presets.as_ref().expect("the section").open);
+        assert_eq!(panel.selected, knobs, "the hand stands on the heading");
+        assert_eq!(app.knobs_row_count(), knobs + 1);
     }
 }

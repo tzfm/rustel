@@ -160,6 +160,12 @@ preset, and Enter on the row of that plugin goes to the rows under it. The
 pick of a plugin name with Ctrl-F leaves the panel open in the presets of
 the plugin, so the next Enter picks one.
 
+The knobs column shows the presets of the plugin call under its rails, as
+a section closed until → opens it. Enter on a name, and a click on one,
+write the preset into the call, and the name the call holds carries the
+mark. ← closes the section, and the j k h l of Vim list keys work there
+as the arrows do.
+
 A plugin call with no `preset` plays `default.vstpreset` when the folder of
 the plugin has one. Save the start sound of a plugin there, and each call
 starts with it:

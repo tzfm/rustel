@@ -1278,6 +1278,15 @@ impl App {
                     name: rows.name.as_deref(),
                     listed: rows.listed,
                     knobs: &rows.knobs,
+                    presets: panel
+                        .presets
+                        .as_ref()
+                        .filter(|presets| !presets.names.is_empty())
+                        .map(|presets| crate::knobs_panel::PresetsSection {
+                            open: presets.open,
+                            names: &presets.names,
+                            active: rows.preset.as_deref(),
+                        }),
                     panel,
                 }),
             mixer_selection: self.mixer_selection.as_ref(),
