@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- File ▸ Open set takes a Strudel pattern export. A `.json` object of pattern code becomes a new set folder named after the file, with one score per entry, and a score that carries a `@title` field takes it as its file name.
 - Press / in the set panel to filter the scores: the panel hides the ones a query does not answer, matching names and @field values. Enter leaves the filter standing and moves to the first match, Esc restores the full list, and the sessions fold stays unfiltered. In vim mode the box keeps its own modes: i or a types.
 - Press i on a score in the set panel to see its details: the name, its strip number and open state, the @fields its leading comments carry, and when the file was last saved. Esc closes the details, and so does a move to another row.
 - Settings ▸ Set has sync with score metadata, on by default. An update renames the score's file to its @title field. The characters a name may not hold turn into dashes, a name already in use is refused with a ribbon, and a score with no @title is left alone.

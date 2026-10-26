@@ -901,6 +901,33 @@ impl SceneSet {
         Ok(set)
     }
 
+    /// A set imported from a Strudel pattern export: a folder of its own
+    /// under `root`, named after the file the export came from, with one
+    /// score written per entry, the first selected. The names arrive
+    /// ready - already file names - and the folder's own rule keeps two
+    /// that collide apart.
+    pub fn import_in(
+        root: &Path,
+        name: &str,
+        scores: &[(String, String)],
+    ) -> Result<Self, SceneError> {
+        if scores.len() > MAX_SCENES {
+            return Err(SceneError::Full);
+        }
+        std::fs::create_dir_all(root)?;
+        let directory = free_set_folder(root, name);
+        std::fs::create_dir(&directory)?;
+        let mut set = Self::empty(directory);
+        set.has_manifest = true;
+        for (name, code) in scores {
+            let file = set.free_path(name);
+            std::fs::write(&file, code)?;
+            set.push(file, code, true)?;
+        }
+        set.select(0);
+        Ok(set)
+    }
+
     /// Rename the set: its folder moves under the same parent, and every
     /// path the set holds follows it. A tape being written into the
     /// folder is the caller's to refuse over.
@@ -2739,6 +2766,60 @@ mod tests {
             SceneSet::open(&renamed.join(SET_FILE_NAME), "starter"),
             Err(SceneError::NotASet(_))
         ));
+    }
+
+    /// A Strudel pattern export imports as a set of its own: a folder named
+    /// after the file the export came from, one score per entry in the
+    /// export's order with the first selected, and two names that
+    /// collide kept apart by the folder's own rule. A second import of
+    /// the same file lands in a folder of its own.
+    #[test]
+    fn a_strudel_export_imports_as_a_set() {
+        let root = tempfile::tempdir().unwrap();
+        let sets = root.path().join("sets");
+        let set = SceneSet::import_in(
+            &sets,
+            "night drive",
+            &[
+                ("vamp bass".to_owned(), "$: s(\"bd*4\")".to_owned()),
+                ("beat".to_owned(), "$: s(\"cp\")".to_owned()),
+                ("beat".to_owned(), "$: s(\"hh\")".to_owned()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(set.name(), "night drive");
+        assert_eq!(set.score_count(), 3);
+        assert_eq!(
+            set.scores()
+                .map(|scene| scene.name().to_owned())
+                .collect::<Vec<_>>(),
+            ["vamp bass", "beat", "beat 2"],
+            "the export's order, collisions suffixed"
+        );
+        assert_eq!(set.current().name(), "vamp bass", "the first is selected");
+        assert_eq!(
+            std::fs::read_to_string(sets.join("night drive").join("beat 2.strudel")).unwrap(),
+            "$: s(\"hh\")"
+        );
+
+        let again = SceneSet::import_in(
+            &sets,
+            "night drive",
+            &[("beat".to_owned(), "$: s(\"cp\")".to_owned())],
+        )
+        .unwrap();
+        assert_eq!(again.name(), "night drive b");
+
+        // More scores than a set holds is refused before anything is
+        // written.
+        let many: Vec<(String, String)> = (0..=MAX_SCENES)
+            .map(|index| (format!("score {index}"), String::new()))
+            .collect();
+        assert!(matches!(
+            SceneSet::import_in(&sets, "full", &many),
+            Err(SceneError::Full)
+        ));
+        assert!(!sets.join("full").exists(), "nothing was written");
     }
 
     #[test]

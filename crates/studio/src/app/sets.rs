@@ -1085,6 +1085,20 @@ impl App {
 
     /// Open another set: a folder, or a score and its folder.
     fn open_set_at(&mut self, path: &std::path::Path) {
+        // A Strudel pattern export - a .json object of scores - is not a
+        // set on disk but the makings of one. The set's own file is a .json
+        // too, and stays a refusal.
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            && !path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with(crate::scenes::SET_FILE_NAME)
+            })
+        {
+            self.import_strudel_set(path);
+            return;
+        }
         let starter = self.starter_score();
         match SceneSet::open(path, starter) {
             Ok(set) => {
@@ -1096,6 +1110,53 @@ impl App {
                     picker.error = Some(error.to_string());
                 }
             }
+        }
+    }
+
+    /// A Strudel pattern export read as a new set: one score per entry,
+    /// in a folder of its own under the sets folder, named after the file
+    /// the export came from. A name with no usable characters
+    /// becomes `untitled`. The status says what was taken up, and the
+    /// panel lists the scores it made.
+    fn import_strudel_set(&mut self, path: &std::path::Path) {
+        let report = |app: &mut Self, error: String| {
+            if let Some((_, picker)) = app.set_prompt.as_mut() {
+                picker.error = Some(error);
+            }
+        };
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) => return report(self, format!("cannot read {}: {error}", path.display())),
+        };
+        let entries = match strudel_export(&text) {
+            Ok(entries) => entries,
+            Err(error) => return report(self, format!("{}: {error}", path.display())),
+        };
+        let stem = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let name = crate::scenes::sanitize_name(&stem).unwrap_or_else(|| "imported set".to_owned());
+        // Strudel keys its entries by an opaque id and names the song in a
+        // @title field inside the code. The title leads when it is there.
+        let scores: Vec<(String, String)> = entries
+            .into_iter()
+            .map(|(key, code)| {
+                let meta = crate::metadata::ScoreMeta::parse(&code);
+                let title = meta.first("title").unwrap_or(key.as_str());
+                let name = crate::scenes::sanitize_name(title)
+                    .or_else(|| crate::scenes::sanitize_name(&key))
+                    .unwrap_or_else(|| "untitled".to_owned());
+                (name, code)
+            })
+            .collect();
+        let root = self.sets_root();
+        match SceneSet::import_in(&root, &name, &scores) {
+            Ok(set) => {
+                self.close_set_prompt();
+                self.switch_set(set, "imported");
+            }
+            Err(error) => report(self, format!("cannot import {}: {error}", path.display())),
         }
     }
 
@@ -1490,6 +1551,35 @@ pub(super) fn shorten_home(path: &std::path::Path) -> String {
         },
         _ => text,
     }
+}
+
+/// The pattern code of a Strudel pattern export: a JSON object whose
+/// entries hold code. Strudel writes each entry as an object with a `code`
+/// field, keyed by an id, and a plain string of code is taken too. An
+/// entry that holds neither shape is not a score.
+fn strudel_export(text: &str) -> Result<Vec<(String, String)>, String> {
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|error| format!("not a Strudel pattern export: {error}"))?;
+    let Some(object) = value.as_object() else {
+        return Err("not a Strudel pattern export - not a JSON object".to_owned());
+    };
+    let scores: Vec<(String, String)> = object
+        .iter()
+        .filter_map(|(key, value)| {
+            let code = match value {
+                serde_json::Value::String(code) => Some(code.as_str()),
+                serde_json::Value::Object(fields) => {
+                    fields.get("code").and_then(|code| code.as_str())
+                }
+                _ => None,
+            }?;
+            Some((key.clone(), code.to_owned()))
+        })
+        .collect();
+    if scores.is_empty() {
+        return Err("not a Strudel pattern export - no scores in it".to_owned());
+    }
+    Ok(scores)
 }
 
 /// The set folders under `root`, `current` left out: a folder with a set
@@ -2083,6 +2173,116 @@ mod tests {
                     .as_ref()
                     .and_then(|(_, picker)| picker.error.clone())
             );
+        }
+
+        /// A Strudel pattern export gives its scores, or says what it is
+        /// not. Strudel writes each entry as an object with a `code` field,
+        /// and a plain string of code is taken too. Entries that hold
+        /// neither shape are left out.
+        #[test]
+        fn a_strudel_export_gives_its_scores_or_a_refusal() {
+            let strudel = r#"{
+              "V1StGXR8_Z5j": { "code": "$: s(\"bd*4\")", "created_at": 1, "collection": "user" },
+              "second": { "code": "$: s(\"cp\")" },
+              "plain string": "$: s(\"hh\")",
+              "third": { "not": "code" }
+            }"#;
+            assert_eq!(
+                strudel_export(strudel).unwrap(),
+                [
+                    ("V1StGXR8_Z5j".to_owned(), "$: s(\"bd*4\")".to_owned()),
+                    ("second".to_owned(), "$: s(\"cp\")".to_owned()),
+                    ("plain string".to_owned(), "$: s(\"hh\")".to_owned()),
+                ]
+            );
+            assert!(
+                strudel_export(r#"[{ "code": "$: s(\"oh\")" }]"#)
+                    .unwrap_err()
+                    .contains("not a JSON object")
+            );
+            assert!(
+                strudel_export("{ no closing brace")
+                    .unwrap_err()
+                    .contains("not a Strudel pattern export")
+            );
+            assert!(
+                strudel_export(r#"{ "import": {} }"#)
+                    .unwrap_err()
+                    .contains("no scores in it")
+            );
+        }
+
+        /// Opening a Strudel pattern export makes a set of it: a folder
+        /// named after the export file, one score per entry, the title
+        /// naming the score that carries one. A file that is not an export
+        /// is refused and the prompt stays.
+        #[test]
+        fn opening_a_strudel_export_makes_a_set() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let sets = directory.path().join("sets");
+            let home = directory.path().join("home");
+            std::fs::create_dir_all(&home).expect("home");
+            let mut app = app_over(&home);
+            app.prefs.sets_directory = Some(sets.display().to_string());
+
+            let export = directory.path().join("gig.json");
+            std::fs::write(
+                &export,
+                concat!(
+                    "{\n",
+                    "  \"V1StGXR8_Z5j\": { \"code\": \"// @title night drive\\n$: s(\\\"bd*4\\\")\" },\n",
+                    "  \"kZ4_hT9pQw2x\": { \"code\": \"$: s(\\\"cp\\\")\" }\n",
+                    "}\n"
+                ),
+            )
+            .expect("export");
+            app.open_set_prompt(SetPrompt::OpenSet);
+            for character in export.display().to_string().chars() {
+                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+            assert!(app.set_prompt.is_none(), "the prompt closed");
+            assert!(
+                app.status.starts_with("imported gig - 2 scene(s)"),
+                "{}",
+                app.status
+            );
+            assert_eq!(app.scenes.directory(), sets.join("gig"));
+            assert_eq!(app.focus, Focus::Editor);
+            assert_eq!(
+                app.scenes
+                    .scores()
+                    .map(|scene| scene.name().to_owned())
+                    .collect::<Vec<_>>(),
+                ["night drive", "kZ4_hT9pQw2x"],
+                "the title leads when it is there"
+            );
+            assert_eq!(app.scenes.current().name(), "night drive");
+            assert_eq!(
+                std::fs::read_to_string(sets.join("gig").join("night drive.strudel")).unwrap(),
+                "// @title night drive\n$: s(\"bd*4\")"
+            );
+
+            // A json file that is not an export says so and stays refused.
+            let not_an_export = directory.path().join("solo.json");
+            std::fs::write(&not_an_export, "[1, 2, 3]").expect("not an export");
+            app.open_set_prompt(SetPrompt::OpenSet);
+            for character in not_an_export.display().to_string().chars() {
+                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(
+                app.set_prompt
+                    .as_ref()
+                    .and_then(|(_, picker)| picker.error.as_deref())
+                    .is_some_and(|error| error.contains("not a Strudel pattern export")),
+                "{:?}",
+                app.set_prompt
+                    .as_ref()
+                    .and_then(|(_, picker)| picker.error.clone())
+            );
+            assert_eq!(app.scenes.directory(), sets.join("gig"), "still in the set");
         }
 
         /// The set list starts with the set changed last, whatever its name.

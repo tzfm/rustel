@@ -607,3 +607,51 @@ fn rename_set_carries_a_sample_source_inside_it() {
         "the moved source reads its sounds: {row}"
     );
 }
+
+/// File ▸ Open set… with a typed path to a Strudel pattern export: the
+/// export becomes a set of its own under the sets folder, one score per
+/// entry, the first one open and the title naming the score that carries
+/// one.
+#[test]
+fn open_set_imports_a_strudel_pattern_export() {
+    let mut studio = hermetic();
+    let root = sets_root(&studio);
+    std::fs::create_dir_all(&root).expect("sets root made");
+    let export = studio.config_home().join("gig.json");
+    std::fs::write(
+        &export,
+        concat!(
+            "{\n",
+            "  \"V1StGXR8_Z5j\": { \"code\": \"// @title night drive\\n$: s(\\\"bd*4\\\")\" },\n",
+            "  \"kZ4_hT9pQw2x\": { \"code\": \"$: s(\\\"cp\\\")\" }\n",
+            "}\n"
+        ),
+    )
+    .expect("export");
+
+    drop_file_menu(&mut studio);
+    studio.press(KeyCode::Char('o'), KeyModifiers::NONE); // Open set…
+    studio.type_text(export.display().to_string().as_str());
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+
+    let status = studio.status();
+    assert!(
+        status.starts_with("imported gig - 2 scene(s)"),
+        "the status names the set made of the export: {status}"
+    );
+    assert_eq!(
+        studio.set_directory(),
+        root.join("gig"),
+        "the set lives beside the others"
+    );
+    assert_eq!(
+        studio.scene_names().as_slice(),
+        ["night drive", "kZ4_hT9pQw2x"],
+        "the title names the score that carries one"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("gig").join("night drive.strudel")).expect("score"),
+        "// @title night drive\n$: s(\"bd*4\")"
+    );
+    row_containing(&studio.rows(), "$: s(\"bd*4\")");
+}

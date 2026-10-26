@@ -15,6 +15,12 @@ plays it. Any other new path, such as `rustel studio set1`, creates a set folder
 with a starter scene. File > Open set does the same with a path you type. The
 parent folder must exist.
 
+A path given to File > Open set can be a Strudel pattern export: a `.json`
+object that holds one pattern of code per entry. Such a file is not a set on
+disk, so Studio makes a set of it. The new set folder sits beside the others and
+takes its name from the export file. One score is written per entry, and a
+score that carries a `@title` field takes it as its file name.
+
 Type or paste a score, then press **Ctrl+S** or **F5**. Press **Ctrl+G** or **F8**
 to stop. Editing does not change the playing score until you update it. If an
 update fails, the last good score keeps playing. An update that changes nothing
