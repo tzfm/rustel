@@ -3872,5 +3872,44 @@ mod tests {
                 assert!(app.keybinds.prefs().is_empty());
             }
         }
+
+        /// iTerm2 with Option as Normal composes Alt+O into `ø` and sends
+        /// no Alt bit. The composed character still reveals the set panel's
+        /// selected file, because the terminal profile recovers the letter.
+        /// A chord learnt over the action retires the letter again, and the
+        /// character then reaches no panel.
+        #[test]
+        fn an_iterm2_composed_option_o_still_reveals_the_set_panels_selection() {
+            // SAFETY: process-global environment, held only by this test
+            // while the studio suite runs one test at a time. The reveal
+            // must answer headless, or the press opens the runner's desktop.
+            unsafe { std::env::set_var(crate::reveal::HEADLESS_ENV, "1") };
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_for(directory.path(), "iTerm2", false);
+            action(&mut app, BindAction::SetPanel);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Set));
+            assert!(app.set_prompt.is_none(), "{}", app.status);
+            app.status.clear();
+            app.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('ø'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+            assert!(app.reveal_pending.is_some(), "{}", app.status);
+            assert!(app.status.starts_with("opening"), "{}", app.status);
+            // The letter retires with a learnt chord, so `ø` types again.
+            app.reveal_pending = None;
+            app.status.clear();
+            app.keybinds
+                .learn(BindAction::ShowFile, KeyCombo::parse("ctrl+f9"));
+            app.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('ø'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+            assert!(app.reveal_pending.is_none(), "{}", app.status);
+            // SAFETY: give the environment back before other tests run.
+            unsafe { std::env::remove_var(crate::reveal::HEADLESS_ENV) };
+        }
     }
 }
