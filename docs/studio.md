@@ -168,6 +168,10 @@ it. Press 1 to 9 to open the score that holds that number on the strip. Space
 folds a section. Esc returns to the editor. Use `+` and `-` to change the
 panel size.
 
+Press `i` on a score to see its details: the name, its strip number and open
+state, the `@` fields its leading comments carry, and when it was last saved.
+Esc closes the details. A move to another row closes them too.
+
 Delete asks for confirmation before it removes a file. Confirming also discards
 its unsaved edits. Studio does not delete the last score or the active session
 tape. Keep a separate backup of sets you want to preserve.

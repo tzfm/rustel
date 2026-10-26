@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Press i on a score in the set panel to see its details: the name, its strip number and open state, the @fields its leading comments carry, and when the file was last saved. Esc closes the details, and so does a move to another row.
 - Settings ▸ Set has sync with score metadata, on by default. An update renames the score's file to its @title field. The characters a name may not hold turn into dashes, a name already in use is refused with a ribbon, and a score with no @title is left alone.
 - A slider() on `fm` moves the sounding voice, as the gain and filter sliders do: `s("in").fm(slider(2, 0, 8))` rides the depth live, with no wait for the next hap. This reaches every source; on `s("in")`, whose hap spans the cycle, it is the difference between now and a cycle late. The chain's other operators stay query-time, and a modulator aimed at `fm` keeps its own graph.
 - A beat line chosen on its own survives a restart. Before, it went back to off unless an opacity changed too.

@@ -66,6 +66,19 @@ pub struct FileRow {
     pub meta: ScoreMeta,
 }
 
+/// The details `i` opens over a score's row: what the popup says, one
+/// row each, and the line it says it about. The popup draws only while
+/// that line is still the selected one, so whatever leaves the row
+/// behind - a move, a click, a refresh - takes the popup with it
+/// without a key of its own.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetDetails {
+    /// The panel line the rows describe.
+    pub line: usize,
+    /// What the popup says, one row each.
+    pub rows: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct SetPanel {
     /// The set's name: its folder's.
@@ -85,6 +98,8 @@ pub struct SetPanel {
     pub unsaved: Option<String>,
     /// What the last verb refused, shown under the list.
     pub error: Option<String>,
+    /// The details popup `i` opened, over the row it was opened on.
+    pub details: Option<SetDetails>,
     /// The last click, for the second of a double click.
     last_click: Option<(usize, Instant)>,
     /// Lines scrolled past the top, so the selection stays in view with a
@@ -115,6 +130,7 @@ impl SetPanel {
             deleting: None,
             unsaved: None,
             error: None,
+            details: None,
             last_click: None,
             hold_scroll: false,
             scroll: 0,
@@ -199,6 +215,9 @@ impl SetPanel {
             .min(self.lines.len().saturating_sub(1));
         self.deleting = None;
         self.unsaved = None;
+        // The folder was read again: what the details popup said about a
+        // row may no longer be what the row is.
+        self.details = None;
     }
 
     /// Where the cursor goes after a row is deleted: the row that took
@@ -288,6 +307,47 @@ impl SetPanel {
             SetLine::Tape(index) => self.tapes.get(index),
             _ => None,
         }
+    }
+
+    /// The selected score's details, as `i` shows them: its name, where
+    /// it stands on the strip, what its leading comments say about it,
+    /// and when the file was last saved. Read once, here, so the popup
+    /// is a view of the row as it was opened rather than a second copy
+    /// of the folder. Returns false on a row that is not a score's,
+    /// where `i` is not the panel's key.
+    pub fn open_details(&mut self) -> bool {
+        let line = self.selected;
+        let Some(SetLine::File(index)) = self.selected_line() else {
+            return false;
+        };
+        let Some(rows) = self.files.get(index).map(|file| {
+            let mut rows = vec![file.name.clone()];
+            let mut state = match file.strip {
+                Some(strip) => format!("open · strip {strip}"),
+                None => "not open".to_owned(),
+            };
+            if file.current {
+                state.push_str(" · on screen");
+            }
+            if file.dirty {
+                state.push_str(" · unsaved");
+            }
+            rows.push(state);
+            rows.extend(
+                file.meta
+                    .fields()
+                    .iter()
+                    .map(|(key, value)| format!("@{key} {value}").trim_end().to_owned()),
+            );
+            if let Some(saved) = saved_at(&file.path) {
+                rows.push(format!("saved {saved}"));
+            }
+            rows
+        }) else {
+            return false;
+        };
+        self.details = Some(SetDetails { line, rows });
+        true
     }
 
     /// Open or shut the fold the tapes sit under.
@@ -514,18 +574,39 @@ fn tape_label(name: &str) -> String {
     {
         return name.to_owned();
     }
+    match readable_stamp(stamp) {
+        Some(readable) if suffix.is_empty() => readable,
+        Some(readable) => format!("{readable}{suffix}"),
+        None => name.to_owned(),
+    }
+}
+
+/// A dashed timestamp, `2026-09-24T03-15-30`, as it reads beside the
+/// list: `Sep 24 03:15:30`. None when the month is not a month.
+fn readable_stamp(stamp: &str) -> Option<String> {
     let months = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
     let month = stamp[5..7].parse::<usize>().unwrap_or(0);
-    let Some(month) = month.checked_sub(1).and_then(|n| months.get(n)) else {
-        return name.to_owned();
-    };
-    format!(
-        "{month} {} {}{suffix}",
+    let month = month.checked_sub(1).and_then(|number| months.get(number))?;
+    Some(format!(
+        "{month} {} {}",
         &stamp[8..10],
         stamp[11..].replace('-', ":")
-    )
+    ))
+}
+
+/// When the file was last saved, read off its mtime the moment details
+/// are opened: `Sep 24 03:15:30`. None when the file cannot be asked.
+fn saved_at(path: &Path) -> Option<String> {
+    let seconds = std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    readable_stamp(&rustel_runtime::session_log::dashed_timestamp(seconds))
 }
 
 /// Clip by terminal columns so a wide custom name cannot displace its size.
@@ -781,7 +862,7 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
                 },
             ]
         } else if self.panel.selected_file().is_some() {
-            ["Enter open · n new", reveal_hint.as_str()]
+            ["Enter open · i details · n new", reveal_hint.as_str()]
         } else {
             ["←/→ fold · n new", folder_hint.as_str()]
         };
@@ -849,7 +930,7 @@ mod selection_tests {
         let mut panel = panel_with_a_tape(directory.path());
         panel.selected = 0;
         let score = rendered_rows(&panel, AREA, true).join("\n");
-        assert!(score.contains("Enter open · n new"), "{score}");
+        assert!(score.contains("Enter open · i details · n new"), "{score}");
         panel.selected = panel.files.len();
         let fold = rendered_rows(&panel, AREA, true).join("\n");
         assert!(fold.contains("←/→ fold · n new"), "{fold}");
@@ -950,6 +1031,90 @@ mod tests {
         assert_eq!(
             panel.selected, 3,
             "shut, the selection comes up to the fold"
+        );
+    }
+
+    /// `i` opens the selected score's details: its name, where it stands
+    /// on the strip, what its leading comments say about it, and when it
+    /// was last saved. The fold is not a score's row, and the key is not
+    /// its.
+    #[test]
+    fn details_carry_the_name_the_comments_and_the_saved_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut set = set_in(directory.path());
+        std::fs::write(
+            directory.path().join("spare.strudel"),
+            "/*\n@title night drive\n@by you\n*/\n$: s(\"bd\")\n",
+        )
+        .unwrap();
+        set.select(2);
+        set.close_current().unwrap();
+        let sessions = set.sessions_directory();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mut panel = SetPanel::open(&set, &sessions, None);
+
+        // The fold is not a score's row: the key is not the panel's
+        // there.
+        panel.selected = panel.files.len();
+        assert!(!panel.open_details());
+        assert!(panel.details.is_none(), "nothing stood up");
+
+        let spare = panel
+            .lines
+            .iter()
+            .position(|line| match line {
+                SetLine::File(index) => panel.files[*index].name == "spare",
+                _ => false,
+            })
+            .expect("spare is listed");
+        panel.selected = spare;
+        assert!(panel.open_details(), "a score's row opens the details");
+        let details = panel.details.as_ref().expect("the popup is up");
+        assert_eq!(details.line, spare);
+        assert_eq!(
+            details.rows[..4],
+            ["spare", "not open", "@title night drive", "@by you"]
+        );
+        assert!(
+            details.rows[4].starts_with("saved "),
+            "the saved time is there: {:?}",
+            details.rows[4]
+        );
+
+        // A refresh reads the folder again: what the popup said about it
+        // is old.
+        panel.refresh(&set, &sessions, None, None);
+        assert!(panel.details.is_none());
+    }
+
+    /// An open score's details say which strip it is on, when it is the
+    /// one on screen, and when it holds edits the file does not have
+    /// yet.
+    #[test]
+    fn details_name_the_strip_the_screen_and_the_unsaved_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let set = set_in(directory.path());
+        let sessions = set.sessions_directory();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mut panel = SetPanel::open(&set, &sessions, None);
+        let current = panel
+            .files
+            .iter()
+            .position(|file| file.current)
+            .expect("a current score");
+        panel.files[current].dirty = true;
+        panel.selected = panel
+            .lines
+            .iter()
+            .position(|line| *line == SetLine::File(current))
+            .expect("the current score's line");
+        assert!(panel.open_details());
+        let file = &panel.files[current];
+        let details = panel.details.as_ref().expect("the popup is up");
+        assert_eq!(details.rows[0], file.name);
+        assert_eq!(
+            details.rows[1],
+            format!("open · strip {} · on screen · unsaved", file.strip.unwrap())
         );
     }
 

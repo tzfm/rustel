@@ -569,6 +569,10 @@ fn shortcut_rows_with_keybinds(
             "start a new session tape; keep scores and playback",
         ),
         HelpRow::new(
+            "i in set panel",
+            "show the selected score's details: name, @fields, saved time",
+        ),
+        HelpRow::new(
             shortcut_with_alias(keybinds, BindAction::Log),
             "open the studio log",
         ),

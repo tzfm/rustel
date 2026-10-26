@@ -15,6 +15,33 @@ use rustel_studio_e2e::{
     Hermetic, PanelKind, hermetic, hermetic_recording, row_containing, wav_bytes,
 };
 
+/// The settings sheet's editor keybindings page, walked to by the sheet's
+/// own keys. The same walk the vim suite makes.
+fn open_editor_keybindings(studio: &mut Hermetic) {
+    studio.chord("ctrl+o");
+    for _ in 0..9 {
+        studio.press(KeyCode::Home, KeyModifiers::NONE);
+        if studio.rows().iter().any(|row| row.contains("▸ Terminal")) {
+            studio.press(KeyCode::Down, KeyModifiers::NONE);
+            assert!(
+                studio
+                    .rows()
+                    .iter()
+                    .any(|row| row.contains("▸ Editor keybindings"))
+            );
+            return;
+        }
+        studio.press(KeyCode::Tab, KeyModifiers::NONE);
+    }
+    panic!("the editor keybindings row is missing");
+}
+
+fn enable_vim(studio: &mut Hermetic) {
+    open_editor_keybindings(studio);
+    studio.press(KeyCode::Right, KeyModifiers::NONE);
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+}
+
 /// How long a local import may take to walk its folder.
 const IMPORT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -160,6 +187,61 @@ fn the_set_panel_opens_a_score_by_its_strip_number() {
     studio.press(KeyCode::Char('2'), KeyModifiers::NONE);
     assert_eq!(studio.score(), "$: s(\"hh\")", "strip 2 selected");
     assert_eq!(studio.focus(), None);
+}
+
+/// `i` on a score's row in the set panel opens its details over the row:
+/// the name, where it stands on the strip, the @fields its leading
+/// comments carry, and when it was last saved. Esc closes the popup
+/// before the panel's own Esc hands the keyboard back. Vim mode changes
+/// none of it, the panel being a list, not a text surface.
+#[test]
+fn the_set_panel_shows_a_scores_details_over_its_row() {
+    let mut studio = hermetic();
+    std::fs::write(
+        studio.set_directory().join("night.strudel"),
+        "/*\n@title night drive\n@by you\n*/\n$: s(\"bd\")\n",
+    )
+    .unwrap();
+    enable_vim(&mut studio);
+
+    studio.chord("ctrl+b");
+    studio.settle();
+    assert_eq!(studio.focus(), Some(PanelKind::Set));
+    // The panel opens on the score on screen; the titled one is below it.
+    studio.press(KeyCode::Down, KeyModifiers::NONE);
+    studio.press(KeyCode::Char('i'), KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    assert!(
+        rows.iter().any(|row| row.contains("i details")),
+        "the popup is up over the row"
+    );
+    for expected in ["night", "not open", "@title night drive", "@by you"] {
+        assert!(
+            rows.iter().any(|row| row.contains(expected)),
+            "the popup says {expected}:\n{}",
+            rows.join("\n")
+        );
+    }
+    assert!(
+        rows.iter().any(|row| row.contains("saved ")),
+        "the popup says when it was saved:\n{}",
+        rows.join("\n")
+    );
+
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    assert!(
+        rows.iter().all(|row| !row.contains("@title night drive")),
+        "Esc closed the popup:\n{}",
+        rows.join("\n")
+    );
+    assert_eq!(
+        studio.focus(),
+        Some(PanelKind::Set),
+        "Esc answered only the popup"
+    );
 }
 
 /// File ▸ New set: a folder named after the day appears under the sets

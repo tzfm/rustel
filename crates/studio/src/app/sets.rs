@@ -143,6 +143,10 @@ impl App {
             && let Some(panel) = self.set_panel.as_mut()
         {
             panel.hold_scroll = false;
+            // The details popup is a view of one row: a move that leaves
+            // the row behind closes it, rather than standing over the
+            // next row with the last row's word.
+            panel.details = None;
         }
         handled
     }
@@ -203,6 +207,12 @@ impl App {
             }
         }
         match code {
+            // The details popup closes before the panel's own Esc does
+            // its bigger job, the way a prompt's Esc answers only the
+            // prompt.
+            KeyCode::Esc if panel.details.is_some() => {
+                panel.details = None;
+            }
             // Zen has no docked furniture: the panel came up as a popup,
             // not the set's file tree standing beside the score, so Esc
             // closes it outright the way every other zen popup does -
@@ -289,6 +299,16 @@ impl App {
                         "set panel is as {} as it goes",
                         if grow { "wide" } else { "narrow" }
                     );
+                }
+            }
+            // The selected score's own page: its name, where it stands on
+            // the strip, what its leading comments say about it, and when
+            // it was last saved. On the fold or a tape the key is not the
+            // panel's, and is refused the way every letter the panel has
+            // no use for is.
+            KeyCode::Char('i') if !primary => {
+                if !panel.open_details() {
+                    return false;
                 }
             }
             // The key the desk has for it: Delete, or the Mac's delete,
@@ -1689,6 +1709,61 @@ mod tests {
                 "strip 2 in Vim mode"
             );
             assert_eq!(app.focus, Focus::Editor);
+        }
+
+        /// `i` opens the selected score's details over its row, Esc closes
+        /// them before the panel's own Esc hands the keyboard back, and a
+        /// move off the row takes them away: the popup is a view of one
+        /// row, not a companion to the panel. Vim mode changes none of
+        /// it, the panel being a list, not a text surface.
+        #[test]
+        fn the_details_popup_opens_closes_and_leaves_with_the_row() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.new_scene(false);
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Set));
+            press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            assert!(
+                app.set_panel.as_ref().unwrap().details.is_some(),
+                "i opens the details"
+            );
+
+            // A move off the row the details describe closes them. Up,
+            // not Down: the row below is the sessions fold, where `i` is
+            // not the panel's key.
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            assert!(app.set_panel.as_ref().unwrap().details.is_none());
+
+            press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            assert!(
+                app.set_panel.as_ref().unwrap().details.is_some(),
+                "i opens them again"
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(
+                app.set_panel.as_ref().unwrap().details.is_none(),
+                "Esc closes the popup"
+            );
+            assert_eq!(
+                app.focus,
+                Focus::Panel(PanelKind::Set),
+                "Esc answered only the popup"
+            );
+
+            // Vim mode: the same keys do the same job.
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            assert!(
+                app.set_panel.as_ref().unwrap().details.is_some(),
+                "vim mode: i opens the details"
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(
+                app.set_panel.as_ref().unwrap().details.is_none(),
+                "vim mode: Esc closes them"
+            );
         }
 
         /// Delete in the panel asks and Enter answers: an open score off the
