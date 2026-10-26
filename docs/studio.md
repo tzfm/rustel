@@ -320,6 +320,24 @@ itself is ignored.
 A save from another program that changes the text replaces the open editor's
 text, including edits that are not saved yet. Studio does not merge the two.
 
+### Sync with score metadata
+
+A score can name its own file. Sync with score metadata, under Settings ▸ Set,
+is on by default. An update renames the score's file to its @title field:
+
+```javascript
+/*
+  @title night drive
+  @by you
+*/
+$: s("bd sd")
+```
+
+The characters a name may not hold turn into dashes, and both ends are
+trimmed. A name another score or file already holds is not taken. The ribbon
+says so, and the file keeps its name. A score with no @title is left
+alone.
+
 ### Stopping
 
 The first Stop lets envelopes and effect tails finish. The transport shows

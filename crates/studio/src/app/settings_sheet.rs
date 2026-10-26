@@ -2069,7 +2069,7 @@ mod tests {
             // Down to the machine rows at the page's end, onto max
             // polyphony: past the set rows, the load mode and the output
             // buffer.
-            for _ in 0..14 {
+            for _ in 0..15 {
                 press(&mut app, KeyCode::Down, KeyModifiers::NONE);
             }
             press(&mut app, KeyCode::Right, KeyModifiers::NONE);
@@ -2091,8 +2091,8 @@ mod tests {
             let sheet = SettingsSheet::default();
             app.settings_sheet = Some(sheet);
             app.focus = Focus::Panel(PanelKind::Settings);
-            // Down onto the load mode, the first machine row at the end.
-            for _ in 0..12 {
+            // Down onto the load mode, past the set rows.
+            for _ in 0..13 {
                 press(&mut app, KeyCode::Down, KeyModifiers::NONE);
             }
             press(&mut app, KeyCode::Right, KeyModifiers::NONE);

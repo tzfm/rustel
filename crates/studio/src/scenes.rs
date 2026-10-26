@@ -1841,6 +1841,36 @@ fn valid_name(name: &str) -> bool {
             .all(|character| character.is_alphanumeric() || matches!(character, ' ' | '-' | '_'))
 }
 
+/// The name a title becomes: the characters a name may not hold turn into
+/// `-`, a run of them becomes one, both ends are trimmed, and forty
+/// characters is the far end. `None` when nothing is left.
+pub(crate) fn sanitize_name(title: &str) -> Option<String> {
+    let mut name = String::with_capacity(title.len());
+    let mut dash = false;
+    for character in title.trim().chars() {
+        if character.is_alphanumeric() || matches!(character, ' ' | '_') {
+            name.push(character);
+            dash = false;
+        } else if !dash {
+            name.push('-');
+            dash = true;
+        }
+    }
+    let cut = |name: String| {
+        if name.chars().count() > 40 {
+            name.chars().take(40).collect()
+        } else {
+            name
+        }
+    };
+    let trimmed = |name: String| {
+        name.trim_matches(|character: char| character == '-' || character.is_whitespace())
+            .to_owned()
+    };
+    let name = trimmed(cut(name));
+    (!name.is_empty()).then_some(name)
+}
+
 /// The first free folder for a new set on `day`: the day itself, then
 /// `day b`, `day c` and on through the alphabet, then numbers.
 fn free_set_folder(root: &Path, day: &str) -> PathBuf {
@@ -1973,6 +2003,39 @@ mod tests {
             .set_len(super::super::editor::DEFAULT_MAX_DOCUMENT_BYTES as u64 + 1)
             .unwrap();
         path
+    }
+
+    #[test]
+    fn a_title_becomes_a_name_the_folder_can_hold() {
+        assert_eq!(sanitize_name("night drive").as_deref(), Some("night drive"));
+        assert_eq!(
+            sanitize_name("  spaced out  ").as_deref(),
+            Some("spaced out")
+        );
+        // What a name may not hold turns into one dash, and the ends are
+        // trimmed of it.
+        assert_eq!(
+            sanitize_name("what? a remix!").as_deref(),
+            Some("what- a remix")
+        );
+        assert_eq!(sanitize_name("///+").as_deref(), None);
+        assert_eq!(sanitize_name("???").as_deref(), None);
+        // Forty characters is the far end, cut at a character edge.
+        let long = "x".repeat(60);
+        assert_eq!(
+            sanitize_name(&long).as_deref(),
+            Some("x".repeat(40).as_str())
+        );
+        let titled = format!("{}!!!", "y".repeat(45));
+        assert_eq!(
+            sanitize_name(&titled).as_deref(),
+            Some("y".repeat(40).as_str())
+        );
+        // The name it makes is one the set accepts.
+        for title in ["night drive", "what? a remix!", "under_score-dash"] {
+            let name = sanitize_name(title).unwrap();
+            assert!(valid_name(&name), "{name}");
+        }
     }
 
     #[test]
