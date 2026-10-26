@@ -11,11 +11,13 @@ use std::time::Duration;
 const BUDGET: Duration = Duration::from_secs(5);
 
 fn runtime() -> JsRuntime {
-    let runtime = JsRuntime::new().unwrap();
-    runtime.install_semantic_bindings().unwrap();
+    let runtime = JsRuntime::new().expect("the runtime builds");
+    runtime
+        .install_semantic_bindings()
+        .expect("the bindings install");
     runtime
         .evaluate_score("s('bd')", &TranspileOptions::default())
-        .unwrap();
+        .expect("the score evaluates");
     runtime
         .eval(
             r#"
@@ -40,7 +42,7 @@ fn runtime() -> JsRuntime {
             };
             "#,
         )
-        .unwrap();
+        .expect("the script evaluates");
     runtime
 }
 
@@ -63,7 +65,7 @@ fn assert_clean_and_reusable(runtime: &JsRuntime) {
     assert!(
         !runtime
             .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
-            .unwrap()
+            .expect("the query succeeds")
             .is_empty()
     );
 }

@@ -13,6 +13,10 @@ description = "Shared control-to-voice resolver for mapping hap values to DSP on
 serde_json = { version = "1", features = ["preserve_order"] }
 rustel-core = { path = "../core", default-features = false }
 rustel-audio = { path = "../audio" }
+
 # The speech settings a `talkit` hap carries, read by the synthesizer's own
 # parser. Default features stay off: the voice never plays a device.
 rustel-talkit = { path = "../talkit", default-features = false }
+
+[lints]
+workspace = true

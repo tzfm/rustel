@@ -1,4 +1,9 @@
 //! The talkit command line: speak text with key=value parameters.
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "the talkit CLI prints its help and errors"
+)]
 
 use std::io::Write;
 use std::process::ExitCode;

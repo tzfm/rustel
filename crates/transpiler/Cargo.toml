@@ -22,3 +22,6 @@ rustel-mini = { path = "../mini" }
 oxc_ast = { version = "0.144.0", features = ["serialize"] }
 oxc_ast_visit = { version = "0.144.0", features = ["serialize"] }
 serde_json = "1.0"
+
+[lints]
+workspace = true

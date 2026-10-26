@@ -113,3 +113,6 @@ rustel-audio = { path = "../audio", features = ["test-support"] }
 rustel-fraction = { path = "../fraction" }
 rustel-vst3-fixture = { path = "../vst3-fixture" }
 rustel-mini = { path = "../mini" }
+
+[lints]
+workspace = true

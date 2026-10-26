@@ -4,21 +4,23 @@ use rustel_jsruntime::{JsRuntime, Slot};
 use rustel_transpiler::TranspileOptions;
 
 fn runtime() -> JsRuntime {
-    let runtime = JsRuntime::new().unwrap();
-    runtime.install_semantic_bindings().unwrap();
+    let runtime = JsRuntime::new().expect("the runtime builds");
+    runtime
+        .install_semantic_bindings()
+        .expect("the bindings install");
     runtime
 }
 
 fn evaluate(runtime: &JsRuntime, expression: &str) {
     runtime
         .evaluate_score(expression, &TranspileOptions::default())
-        .unwrap();
+        .expect("the score evaluates");
 }
 
 fn query(runtime: &JsRuntime) -> Vec<Hap> {
     runtime
         .query(Slot::Active, 0, Fraction::ZERO, Fraction::ONE)
-        .unwrap()
+        .expect("the query succeeds")
 }
 
 #[test]

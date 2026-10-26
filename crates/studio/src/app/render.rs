@@ -1870,6 +1870,7 @@ impl App {
 
     /// Leave each pane the map it was drawn with, and count the frame's
     /// time into the performance record.
+    #[allow(clippy::print_stderr, reason = "performance records are opt-in output")]
     fn finish_frame(&mut self, maps: Vec<ScreenMap>, started: Instant, stats: ProcessStats) {
         for (pane, map) in self.panes.iter_mut().zip(maps) {
             pane.last_map = Some(map);

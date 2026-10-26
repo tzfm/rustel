@@ -1557,6 +1557,10 @@ mod tests {
     }
 
     /// The job's outcome, polled until it arrives or `within` runs out.
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "the deadline is the test failure"
+    )]
     fn await_outcome(job: &ExportJob, within: std::time::Duration) -> Result<f64, String> {
         let deadline = Instant::now() + within;
         loop {

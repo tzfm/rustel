@@ -1,4 +1,8 @@
 //! Native orchestra loading, replacement, and export through the score host.
+#![allow(
+    clippy::print_stderr,
+    reason = "the skip notice names the missing library"
+)]
 
 use rustel_runtime::{QUERY_WORKER_STACK_BYTES, ScoreImportAccess, Session, SessionConfig};
 use std::sync::atomic::AtomicBool;

@@ -128,7 +128,7 @@ fn tokenize_note(str: &str) -> (String, String, String, String) {
         }
     }
     while matches!(chars.peek(), Some('0'..='9')) {
-        oct.push(chars.next().unwrap());
+        oct.push(chars.next().expect("the iterator yields the element"));
     }
     let rest: String = chars.collect::<String>().trim_start().to_string();
     (letter, acc, oct, rest)

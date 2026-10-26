@@ -51,7 +51,10 @@ impl Terminal {
     }
 
     fn stream(&self) -> Stdio {
-        self.slave.try_clone().unwrap().into()
+        self.slave
+            .try_clone()
+            .expect("the pty descriptor clones")
+            .into()
     }
 
     fn read_until(
@@ -83,22 +86,23 @@ impl Terminal {
 
 #[test]
 fn release_notices_use_stderr_and_respect_opt_outs() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().expect("tempdir created");
     let cache = directory.path().join("cache/update-check.json");
-    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(cache.parent().expect("the cache path has a parent"))
+        .expect("the directory is created");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .expect("the clock is after the epoch")
         .as_secs();
     let cached = serde_json::json!({"checked_at": now, "latest_version": "99.0.0"}).to_string();
-    std::fs::write(&cache, &cached).unwrap();
+    std::fs::write(&cache, &cached).expect("the file operation succeeds");
 
     for mode in ["interactive", "flag", "environment", "setting", "pipe"] {
         std::fs::write(
             directory.path().join("rustel.json"),
             serde_json::json!({"check_updates": mode != "setting"}).to_string(),
         )
-        .unwrap();
+        .expect("the file operation succeeds");
         let mut stdout = Terminal::new();
         let mut stderr = Terminal::new();
         let args = ["validate", "-e", "silence"];
@@ -121,8 +125,13 @@ fn release_notices_use_stderr_and_respect_opt_outs() {
         if mode == "flag" {
             command.arg("--no-update-check");
         }
-        let mut child = command.spawn().unwrap();
-        let errors = stderr.read_until(&mut child, |_, child| child.try_wait().unwrap().is_some());
+        let mut child = command.spawn().expect("the child starts");
+        let errors = stderr.read_until(&mut child, |_, child| {
+            child
+                .try_wait()
+                .expect("the child state is readable")
+                .is_some()
+        });
         let output = stdout.read_until(&mut child, |_, _| true);
         let result = wait_for_output(child, &args);
         assert!(result.status.success(), "{mode}: {errors}");
@@ -136,7 +145,10 @@ fn release_notices_use_stderr_and_respect_opt_outs() {
         }
         assert!(!output.contains("rustelup"));
         assert!(!String::from_utf8_lossy(&result.stdout).contains("rustelup"));
-        assert_eq!(std::fs::read_to_string(&cache).unwrap(), cached);
+        assert_eq!(
+            std::fs::read_to_string(&cache).expect("the file operation succeeds"),
+            cached
+        );
     }
 }
 
@@ -146,8 +158,9 @@ fn terminal_cache_confirmation_accepts_only_yes_and_can_be_interrupted() {
         for response in ["no", "yes", "interrupt"] {
             let base = scratch(&format!("terminal-consent-{}-{response}", command[0]));
             let entry = base.join("score").join("response.wav");
-            std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
-            std::fs::write(&entry, b"cached score sample").unwrap();
+            std::fs::create_dir_all(entry.parent().expect("the entry path has a parent"))
+                .expect("the directory is created");
+            std::fs::write(&entry, b"cached score sample").expect("the file operation succeeds");
             let mut terminal = Terminal::new();
             let mut child = rustel()
                 .args(&command)
@@ -156,12 +169,12 @@ fn terminal_cache_confirmation_accepts_only_yes_and_can_be_interrupted() {
                 .stderr(terminal.stream())
                 .stdout(Stdio::piped())
                 .spawn()
-                .unwrap();
+                .expect("the child starts");
             let prompt = terminal.read_until(&mut child, |screen, _| screen.contains("Type yes"));
-            assert!(prompt.contains(base.to_str().unwrap()));
+            assert!(prompt.contains(base.to_str().expect("utf-8 path")));
             assert!(entry.exists(), "deleted before consent");
             if command[0] == "clear-score-cache" {
-                serde_json::from_str::<serde_json::Value>(prompt.trim()).unwrap();
+                serde_json::from_str::<serde_json::Value>(prompt.trim()).expect("valid JSON");
             }
             if response == "interrupt" {
                 // SAFETY: signal only the child process owned by this test.
@@ -170,7 +183,8 @@ fn terminal_cache_confirmation_accepts_only_yes_and_can_be_interrupted() {
                     0
                 );
             } else {
-                writeln!(terminal.master, "{response}").unwrap();
+                writeln!(terminal.master, "{response}")
+                    .expect("the write succeeds while the child lives");
             }
             let output = wait_for_output(child, &command);
             let expected = match response {
@@ -180,7 +194,7 @@ fn terminal_cache_confirmation_accepts_only_yes_and_can_be_interrupted() {
             };
             assert_eq!(output.status.code(), Some(expected), "{output:?}");
             assert_eq!(entry.exists(), response != "yes");
-            std::fs::remove_dir_all(base).unwrap();
+            std::fs::remove_dir_all(base).expect("the cleanup succeeds");
         }
     }
 }
@@ -211,10 +225,13 @@ fn terminal_help_honours_empty_no_color_and_display_flags() {
             .stdout(terminal.stream())
             .stderr(Stdio::piped())
             .spawn()
-            .unwrap();
+            .expect("the child starts");
         let screen = terminal.read_until(&mut child, |screen, child| {
             screen.contains("https://github.com/tzfm/rustel/issues")
-                && child.try_wait().unwrap().is_some()
+                && child
+                    .try_wait()
+                    .expect("the child state is readable")
+                    .is_some()
         });
         let output = wait_for_output(child, &["--help"]);
         assert!(output.status.success());
@@ -231,7 +248,7 @@ fn terminal_stdin_gets_a_watch_code_pipe_hint() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap();
+        .expect("the child starts");
     let output = wait_for_output(child, &["watch-code"]);
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("expects piped score events"));

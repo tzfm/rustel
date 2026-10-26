@@ -20,8 +20,9 @@ use rustel_jsruntime::{JsRuntime, Slot};
 use rustel_transpiler::TranspileOptions;
 
 pub(crate) fn runtime() -> JsRuntime {
-    let rt = JsRuntime::new().unwrap();
-    rt.install_semantic_bindings().unwrap();
+    let rt = JsRuntime::new().expect("the runtime builds");
+    rt.install_semantic_bindings()
+        .expect("the bindings install");
     rt
 }
 

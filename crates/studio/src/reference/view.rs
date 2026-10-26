@@ -331,7 +331,7 @@ impl ReferenceView<'_> {
                             direction.name()
                         ),
                         Row::Generate(_) | Row::Similar => {
-                            let action = row.action().unwrap();
+                            let action = row.action().expect("these rows carry an action");
                             let back = if panel.generator.can_history(action, false) {
                                 super::super::terminal::symbol("◀")
                             } else {

@@ -11,7 +11,7 @@ fn stereo(signal: &str) -> Program {
     Program::from_json(&format!(
         r#"{{"nodes":[{signal},{{"type":"n","value":0}},{{"type":"n","value":1}},{{"type":"output","inputs":[0,1]}},{{"type":"output","inputs":[0,2]}}]}}"#
     ))
-    .unwrap()
+    .expect("the program is valid")
 }
 
 fn worklet(program: Program, start: u64, gate_end: u64, end: u64) -> KabelControls {

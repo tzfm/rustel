@@ -15,3 +15,6 @@ rustel-mini = { path = "../mini" }
 [dev-dependencies]
 rustel-jsruntime = { path = "../jsruntime", features = ["extensions"] }
 rustel-transpiler = { path = "../transpiler" }
+
+[lints]
+workspace = true

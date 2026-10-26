@@ -223,3 +223,6 @@ rustel-vst3-fixture = { path = "../vst3-fixture" }
 # Temp directories for session-log and cache tests.
 tempfile = "3"
 libc = "0.2"
+
+[lints]
+workspace = true

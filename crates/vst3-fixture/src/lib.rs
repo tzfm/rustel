@@ -209,7 +209,13 @@ impl Values {
         if result != kResultOk || !matches!(count, 16 | 24) {
             return kResultFalse;
         }
-        let value = |at: usize| f64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        let value = |at: usize| {
+            f64::from_le_bytes(
+                bytes[at..at + 8]
+                    .try_into()
+                    .expect("the slice has the right length"),
+            )
+        };
         self.set(PARAM_GAIN, value(0));
         self.set(PARAM_GATE, value(8));
         self.set(PARAM_DELAY, value(16));
@@ -1219,6 +1225,7 @@ fn slow_load(name: &str) {
 
 /// One line through the standard library and one through the C runtime. On
 /// Windows the two have a path of their own to the standard output.
+#[allow(clippy::print_stdout, reason = "the fixture tests both output paths")]
 fn print_line() {
     unsafe extern "C" {
         fn puts(text: *const c_char) -> i32;

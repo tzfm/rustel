@@ -5,6 +5,10 @@
 //! `sample_cache` manages cached samples, and `live` runs live and watched playback.
 //! `replay_plan` selects recorded saves for playback and export; `style` handles
 //! terminal colours.
+#![allow(
+    clippy::print_stderr,
+    reason = "the CLI reports its warnings on stderr"
+)]
 
 #[cfg(feature = "device-audio")]
 use std::io;
@@ -3652,11 +3656,11 @@ mod parse_fraction_tests {
         }
         // The bound itself is a cycle time like any other.
         assert_eq!(
-            parse_fraction("9223372036854775808/1").unwrap(),
+            parse_fraction("9223372036854775808/1").expect("the fraction parses"),
             Fraction::int(1 << 63)
         );
         assert_eq!(
-            parse_fraction("-9223372036854775808/1").unwrap(),
+            parse_fraction("-9223372036854775808/1").expect("the fraction parses"),
             Fraction::int(-(1 << 63))
         );
     }
@@ -3664,19 +3668,29 @@ mod parse_fraction_tests {
     /// The legal shapes around the edge keep their exact values and messages.
     #[test]
     fn representable_rationals_parse_unchanged() {
-        assert_eq!(parse_fraction("1/-6").unwrap(), Fraction::new(1, -6));
-        assert_eq!(parse_fraction("1/3").unwrap(), Fraction::new(1, 3));
-        assert_eq!(parse_fraction("0.25").unwrap(), Fraction::new(1, 4));
         assert_eq!(
-            parse_fraction("1e12").unwrap(),
+            parse_fraction("1/-6").expect("the fraction parses"),
+            Fraction::new(1, -6)
+        );
+        assert_eq!(
+            parse_fraction("1/3").expect("the fraction parses"),
+            Fraction::new(1, 3)
+        );
+        assert_eq!(
+            parse_fraction("0.25").expect("the fraction parses"),
+            Fraction::new(1, 4)
+        );
+        assert_eq!(
+            parse_fraction("1e12").expect("the fraction parses"),
             Fraction::int(1_000_000_000_000)
         );
         assert_eq!(
-            parse_fraction("0/-170141183460469231731687303715884105728").unwrap(),
+            parse_fraction("0/-170141183460469231731687303715884105728")
+                .expect("the fraction parses"),
             Fraction::ZERO
         );
         // The zero-denominator refusal keeps its own message.
-        let zero = parse_fraction("1/0").unwrap_err();
+        let zero = parse_fraction("1/0").expect_err("the fraction parses");
         assert!(
             format!("{zero:?}").contains("zero denominator"),
             "the zero-denominator message moved: {zero:?}"
@@ -4308,7 +4322,8 @@ mod live_output_contract_tests {
 
     #[test]
     fn update_checks_require_an_interactive_human_command() {
-        let human = Cli::try_parse_from(["rustel", "check", "-e", "silence"]).unwrap();
+        let human =
+            Cli::try_parse_from(["rustel", "check", "-e", "silence"]).expect("the arguments parse");
         assert!(human.checks_for_updates(true, false));
         assert!(!human.checks_for_updates(false, false));
         assert!(!human.checks_for_updates(true, true));
@@ -4345,10 +4360,11 @@ mod live_output_contract_tests {
         }
         #[cfg(feature = "studio")]
         {
-            let studio = Cli::try_parse_from(["rustel", "studio"]).unwrap();
+            let studio = Cli::try_parse_from(["rustel", "studio"]).expect("the arguments parse");
             assert!(studio.checks_for_updates(true, false));
             for flag in ["--list-themes", "--probe-terminal", "--performance-events"] {
-                let cli = Cli::try_parse_from(["rustel", "studio", flag]).unwrap();
+                let cli =
+                    Cli::try_parse_from(["rustel", "studio", flag]).expect("the arguments parse");
                 assert!(!cli.checks_for_updates(true, false), "{flag}");
             }
         }
@@ -4980,9 +4996,10 @@ mod live_output_contract_tests {
 
     #[test]
     fn verbose_json_shorthand_is_limited_to_live_commands() {
-        let cli = Cli::try_parse_from(["rustel", "devices", "-vvv"]).unwrap();
+        let cli = Cli::try_parse_from(["rustel", "devices", "-vvv"]).expect("the arguments parse");
         assert!(!cli.wants_json());
-        let cli = Cli::try_parse_from(["rustel", "devices", "-vvv", "--json"]).unwrap();
+        let cli = Cli::try_parse_from(["rustel", "devices", "-vvv", "--json"])
+            .expect("the arguments parse");
         assert!(cli.wants_json());
     }
 
@@ -4991,7 +5008,7 @@ mod live_output_contract_tests {
         let event = serde_json::json!({"replay": {"session": "set\u{1b}]52;c;payload\u{7}\u{202e}", "saves": 1}});
         let human = LiveOutput::new(0, false, false)
             .render(LiveDetail::Essential, &event)
-            .unwrap();
+            .expect("the render output builds");
         assert!(human.contains("set␛]52;c;payload␇�"), "{human}");
         assert!(!human.contains('\u{1b}'));
         assert!(!human.contains('\u{7}'));
@@ -4999,9 +5016,10 @@ mod live_output_contract_tests {
 
         let structured = LiveOutput::new(0, false, true)
             .render(LiveDetail::Essential, &event)
-            .unwrap();
+            .expect("the render output builds");
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&structured).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&structured)
+                .expect("the render output builds"),
             event
         );
     }
@@ -5417,7 +5435,7 @@ mod tests {
             Command::Studio {
                 remote_control: Some(address),
                 ..
-            } if address == "127.0.0.1:9247".parse().unwrap()
+            } if address == "127.0.0.1:9247".parse().expect("the address parses")
         ));
 
         let chosen = Cli::try_parse_from([
@@ -5435,7 +5453,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(file.as_deref(), Some(std::path::Path::new("song.strudel")));
-                assert_eq!(remote_control, Some("127.0.0.1:9000".parse().unwrap()));
+                assert_eq!(
+                    remote_control,
+                    Some("127.0.0.1:9000".parse().expect("the address parses"))
+                );
             }
             other => panic!("expected the studio command, got {other:?}"),
         }
@@ -5458,7 +5479,7 @@ mod tests {
                 Command::Studio {
                     remote_control: Some(bind),
                     ..
-                } if bind == address.parse().unwrap()
+                } if bind == address.parse().expect("the address parses")
             ));
         }
 
@@ -5633,9 +5654,15 @@ mod tests {
         assert_eq!(capture.update(&delivery, 8), None);
 
         let replacement = "note(\"g5\")._spectrum()";
-        assert!(!observe_ui_layout_if_audible(&mut delivery, replacement, 9, 8).unwrap());
+        assert!(
+            !observe_ui_layout_if_audible(&mut delivery, replacement, 9, 8)
+                .expect("the observation succeeds")
+        );
         assert_eq!(capture.update(&delivery, 8), None);
-        assert!(observe_ui_layout_if_audible(&mut delivery, replacement, 9, 9).unwrap());
+        assert!(
+            observe_ui_layout_if_audible(&mut delivery, replacement, 9, 9)
+                .expect("the observation succeeds")
+        );
         assert_eq!(
             capture.update(&delivery, 9),
             Some(UiVisualAudioUpdate::Set(0))
@@ -6570,35 +6597,35 @@ mod tests {
     #[test]
     fn render_lengths_read_seconds_minutes_and_bars() {
         assert_eq!(
-            parse_render_length("60").unwrap(),
+            parse_render_length("60").expect("the length parses"),
             RenderLength::Seconds(60.0)
         );
         assert_eq!(
-            parse_render_length("30s").unwrap(),
+            parse_render_length("30s").expect("the length parses"),
             RenderLength::Seconds(30.0)
         );
         assert_eq!(
-            parse_render_length("2m").unwrap(),
+            parse_render_length("2m").expect("the length parses"),
             RenderLength::Seconds(120.0)
         );
         assert_eq!(
-            parse_render_length("1:30").unwrap(),
+            parse_render_length("1:30").expect("the length parses"),
             RenderLength::Seconds(90.0)
         );
         assert_eq!(
-            parse_render_length("1h").unwrap(),
+            parse_render_length("1h").expect("the length parses"),
             RenderLength::Seconds(3600.0)
         );
         assert_eq!(
-            parse_render_length("16b").unwrap(),
+            parse_render_length("16b").expect("the length parses"),
             RenderLength::Cycles(16.0)
         );
         assert_eq!(
-            parse_render_length(" 4 bars ").unwrap(),
+            parse_render_length(" 4 bars ").expect("the length parses"),
             RenderLength::Cycles(4.0)
         );
         assert_eq!(
-            parse_render_length("0.5m").unwrap(),
+            parse_render_length("0.5m").expect("the length parses"),
             RenderLength::Seconds(30.0)
         );
         for (text, seconds) in [
@@ -6610,19 +6637,21 @@ mod tests {
             ("1e12", 1e12),
         ] {
             assert_eq!(
-                parse_render_length(text).unwrap(),
+                parse_render_length(text).expect("the length parses"),
                 RenderLength::Seconds(seconds),
                 "{text}"
             );
         }
         assert_eq!(
-            parse_render_length("1e-3b").unwrap(),
+            parse_render_length("1e-3b").expect("the length parses"),
             RenderLength::Cycles(0.001)
         );
         for bad in [
             "", "abc", "-3", "1:x", "5 weeks", "1e", "NaN", "inf", "1e309",
         ] {
-            let error = parse_render_length(bad).unwrap_err().to_string();
+            let error = parse_render_length(bad)
+                .expect_err("the length parses")
+                .to_string();
             assert!(error.contains("seconds (60, 30s)"), "{bad}: {error}");
         }
     }
