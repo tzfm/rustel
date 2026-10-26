@@ -313,6 +313,21 @@ impl App {
         if !scene.is_score() {
             return;
         }
+        // While another score plays, the typing pause applies nothing: an
+        // edit of a score the set is not playing stays in its file until
+        // the player asks for it with the evaluate key.
+        if !external
+            && self
+                .audible_scene
+                .is_some_and(|playing| playing != scene.id)
+        {
+            self.status = format!(
+                "another score is playing - {} runs this one",
+                self.keybinds.hint(BindAction::Evaluate)
+            );
+            self.dirty_frame = true;
+            return;
+        }
         let (id, revision) = (scene.id, scene.editor.revision());
         let source: Arc<str> = Arc::from(scene.editor.source());
         // What is playing is already this text, byte for byte. An auto
@@ -1520,6 +1535,54 @@ mod tests {
             assert!(
                 !app.auto_evaluate_due,
                 "the elapsed pause is spent stopped, not saved up"
+            );
+        }
+
+        /// While one score plays, the typing pause applies an edit of that
+        /// score alone: an edit of another score stays in its file, the pause
+        /// says why, and the evaluate key is the one that runs it.
+        #[test]
+        fn the_pause_stays_on_the_playing_score() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene) = playing_app(directory.path(), true);
+            playing_this(&mut app, scene, "$: s(\"bd\")\n");
+
+            // An edit of the playing score still applies by itself.
+            app.dispatch_editor(Command::PasteText("$: s(\"bd\")\n$: s(\"hh\")\n".into()))
+                .expect("edit the playing score");
+            app.auto_evaluate();
+            assert!(
+                !queued_by(&app, scene).is_empty(),
+                "the playing score keeps its auto apply"
+            );
+            clear_queued(&mut app);
+
+            // A second scene: an edit of it sends nothing, and the pause says
+            // why. The playing score is left alone.
+            app.new_scene(false);
+            let other = app.scenes.current().id;
+            app.dispatch_editor(Command::PasteText("$: s(\"cp\")\n".into()))
+                .expect("edit the other score");
+            app.auto_evaluate();
+            assert!(
+                queued_by(&app, other).is_empty(),
+                "the pause sent nothing for the other score"
+            );
+            assert!(
+                queued_by(&app, scene).is_empty(),
+                "the pause sent nothing for the playing score either"
+            );
+            assert!(
+                app.status.contains("another score is playing"),
+                "the pause says why: {}",
+                app.status
+            );
+
+            // The press runs the edited score.
+            app.dispatch_editor(Command::Evaluate).expect("the press");
+            assert!(
+                !queued_by(&app, other).is_empty(),
+                "the evaluate key runs the edited score"
             );
         }
 

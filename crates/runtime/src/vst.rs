@@ -372,6 +372,12 @@ pub fn scan_progress() -> Option<ScanProgress> {
     started().and_then(Host::scan_progress)
 }
 
+/// True while the host reads the preset folders on its own thread: the
+/// read of a change of the folders, or of the watch of them.
+pub fn presets_reading() -> bool {
+    started().is_some_and(Host::presets_reading)
+}
+
 /// The plugins in their load now, one name for each bundle. Empty before
 /// the host starts.
 pub fn loads() -> Vec<String> {

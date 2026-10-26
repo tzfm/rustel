@@ -793,6 +793,45 @@ fn a_live_note_plays_through_its_plugin() {
     );
     assert!(rustel_runtime::lint::rejection(wrong, false, None).is_some());
 
+    // A preset name no file of the plugin has is a value error the same
+    // way: Studio refuses the update and marks the name in the score. The
+    // name reads as the engine reads it, upper case aside.
+    let presets = tempfile::tempdir().unwrap();
+    let of_fixture = presets.path().join(rustel_vst3_fixture::NAME);
+    std::fs::create_dir_all(&of_fixture).unwrap();
+    std::fs::write(
+        of_fixture.join("Dark Bass.vstpreset"),
+        rustel_vst3_fixture::preset(0.5, 0.0),
+    )
+    .unwrap();
+    let host = rustel_runtime::vst::host();
+    host.set_preset_folder(presets.path().to_path_buf());
+    // The first ask arms the read of the folders on the plugin thread; the
+    // next one sees its end.
+    host.presets(rustel_vst3_fixture::NAME);
+    host.wait_idle();
+    assert_eq!(
+        host.presets(rustel_vst3_fixture::NAME),
+        Some(vec!["Dark Bass".to_owned()])
+    );
+    let wrong_preset = "note('c3').s('sine').vst('rustel fixture', { preset: 'Dark Bss' }).fast(8)";
+    let marks = rustel_runtime::lint::lint(wrong_preset, false, None);
+    let messages: Vec<&str> = marks.iter().map(|mark| mark.message.as_str()).collect();
+    assert_eq!(
+        messages,
+        ["Rustel Fixture has no preset \"Dark Bss\" - did you mean \"Dark Bass\"?"]
+    );
+    assert_eq!(
+        &wrong_preset[marks[0].from..marks[0].to],
+        "Dark Bss",
+        "the mark sits on the name, between its quotes"
+    );
+    assert!(rustel_runtime::lint::rejection(wrong_preset, false, None).is_some());
+    let right_preset =
+        "note('c3').s('sine').vst('rustel fixture', { preset: 'dark bass' }).fast(8)";
+    assert!(rustel_runtime::lint::lint(right_preset, false, None).is_empty());
+    assert!(rustel_runtime::lint::rejection(right_preset, false, None).is_none());
+
     // The engine refuses no edit for a plugin problem, and gives each
     // problem as one warning. `reached` ends the wait.
     let warnings = |engine: &mut StudioEngine, what: &str, reached: fn(f32) -> bool| {

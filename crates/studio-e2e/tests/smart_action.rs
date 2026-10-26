@@ -36,7 +36,9 @@ fn a_number_becomes_a_fader_and_the_form_writes_the_call() {
     // value 800, and a range guessed around it.
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     assert!(
-        studio.status().starts_with("Tab between the fields"),
+        studio
+            .status()
+            .starts_with("Tab or the arrows between the fields"),
         "Enter opened the form: {}",
         studio.status()
     );

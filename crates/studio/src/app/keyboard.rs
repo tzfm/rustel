@@ -245,6 +245,12 @@ impl App {
                 .reference_panel
                 .as_ref()
                 .is_some_and(|panel| panel.wants_text()),
+            // The column's own sheets: the add list searches, and the form
+            // types its numbers.
+            PanelKind::Knobs => self
+                .knobs_panel
+                .as_ref()
+                .is_some_and(|panel| panel.adding.is_some() || panel.editing.is_some()),
             _ => false,
         }
     }

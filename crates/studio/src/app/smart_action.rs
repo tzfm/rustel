@@ -818,7 +818,8 @@ impl App {
         };
         form.focus(0);
         state.form = Some(form);
-        self.status = "Tab between the fields \u{b7} Enter applies \u{b7} Esc closes".into();
+        self.status =
+            "Tab or the arrows between the fields \u{b7} Enter applies \u{b7} Esc closes".into();
         self.dirty_frame = true;
     }
 
@@ -989,7 +990,6 @@ impl App {
         let primary = key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER);
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let in_form = self
             .smart_action
             .as_ref()
@@ -1011,16 +1011,12 @@ impl App {
                     return true;
                 }
                 KeyCode::Tab | KeyCode::BackTab | KeyCode::Down | KeyCode::Up => {
-                    let forwards = matches!(key.code, KeyCode::Tab | KeyCode::Down)
-                        && !(shift && key.code == KeyCode::Tab);
                     if let Some(form) = self
                         .smart_action
                         .as_mut()
                         .and_then(|state| state.form.as_mut())
                     {
-                        let len = Field::ALL.len();
-                        let next = (form.field + if forwards { 1 } else { len - 1 }) % len;
-                        form.focus(next);
+                        form.navigate(key);
                     }
                     self.dirty_frame = true;
                     return true;

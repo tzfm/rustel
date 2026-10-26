@@ -214,6 +214,25 @@ pub struct HeldText {
     pub fader: Option<Range<usize>>,
 }
 
+/// The presets of the plugin call the column reads: a section of rows of
+/// its own under a heading, closed until the hand opens it. The names come
+/// from the host's read of the preset folders, and the section empties
+/// with the call.
+#[derive(Clone, Debug)]
+pub struct KnobPresets {
+    pub names: Vec<String>,
+    /// The read of the preset folders the names came from: a new read
+    /// brings the names again.
+    pub version: u64,
+    pub open: bool,
+}
+
+/// The rows the presets section holds: its heading, and a row for each
+/// preset while the heading is open.
+pub fn presets_rows(presets: &KnobPresets) -> usize {
+    1 + usize::from(presets.open) * presets.names.len()
+}
+
 /// The panel's own state. The rails themselves belong to each frame's
 /// reading of the score, which the app computes and hands to the view.
 /// What stays here is what the hand is doing.
@@ -223,6 +242,9 @@ pub struct KnobsPanel {
     pub scroll: usize,
     pub adding: Option<AddList>,
     pub editing: Option<KnobEdit>,
+    /// The presets of the plugin call the column reads, as a section of
+    /// rows under the rails. Closed until the hand opens it.
+    pub presets: Option<KnobPresets>,
     /// The entries the hand took out at the far-left stop, held until the
     /// caret leaves the call: the rail stays, and a move right writes the
     /// entry back at the value it left at.
@@ -387,6 +409,15 @@ pub fn rail_cell(rail: Rect, optional: bool, notch: Option<f64>) -> usize {
     }
 }
 
+/// The presets section as the painter draws it: its heading, the names
+/// under it while it is open, and the name the call's object holds.
+pub struct PresetsSection<'a> {
+    pub open: bool,
+    pub names: &'a [String],
+    /// The name the call's object holds, when it holds one.
+    pub active: Option<&'a str>,
+}
+
 /// What the app hands the painter about the column: each frame's reading
 /// of the call at the caret, and what the hand is doing to it.
 pub struct KnobsData<'a> {
@@ -395,6 +426,8 @@ pub struct KnobsData<'a> {
     /// The call has a list for `a` to add from.
     pub listed: bool,
     pub knobs: &'a [Knob],
+    /// The presets of the plugin call, under the rails.
+    pub presets: Option<PresetsSection<'a>>,
     pub panel: &'a KnobsPanel,
 }
 
@@ -407,6 +440,8 @@ pub struct KnobsView<'a> {
     /// the options its reference documents.
     pub listed: bool,
     pub knobs: &'a [Knob],
+    /// The presets of the plugin call, under the rails.
+    pub presets: Option<PresetsSection<'a>>,
     pub panel: &'a KnobsPanel,
     pub theme: &'a Theme,
     pub focused: bool,
@@ -479,6 +514,22 @@ impl Widget for KnobsView<'_> {
             self.draw_label(buffer, label, knob, chosen);
             self.draw_rail(buffer, rail, knob, chosen);
         }
+        // The presets of the plugin call, as rows of their own under the
+        // rails: a heading, and a name under it while the heading is open.
+        if let Some(section) = &self.presets {
+            let first = self.knobs.len();
+            let names = std::iter::once(None)
+                .chain(section.names.iter().filter(|_| section.open).map(Some));
+            for (offset, name) in names.enumerate() {
+                let at = first + offset;
+                let row = at.saturating_sub(self.panel.scroll);
+                let Some((label, _)) = knob_row(body, row) else {
+                    break;
+                };
+                let chosen = self.focused && at == self.panel.selected;
+                self.draw_preset_row(buffer, label, section, name, chosen);
+            }
+        }
         if self.focused {
             for (row, line) in self.hint().iter().enumerate() {
                 buffer.set_stringn(
@@ -515,13 +566,25 @@ impl KnobsView<'_> {
             return ["type · Enter adds · Esc".to_owned(), forget.to_owned()];
         }
         if self.panel.editing.is_some() {
-            return ["Tab · Enter writes · Esc".to_owned(), String::new()];
+            return [
+                "↑↓/Tab fields · Enter writes · Esc".to_owned(),
+                String::new(),
+            ];
         }
-        let rail = match self.knobs.get(self.panel.selected) {
-            Some(knob) if knob.optional && knob.state.is_none() => "→ on · Enter edit",
-            Some(knob) if knob.optional => "⌫ off · Enter edit",
-            Some(_) => "←/→ move · Enter edit",
-            None => "",
+        let section = self
+            .presets
+            .as_ref()
+            .filter(|section| !section.names.is_empty())
+            .and_then(|_| self.panel.selected.checked_sub(self.knobs.len()));
+        let rail = match section {
+            Some(0) => "→ opens the presets",
+            Some(_) => "Enter takes · ← closes",
+            None => match self.knobs.get(self.panel.selected) {
+                Some(knob) if knob.optional && knob.state.is_none() => "→ on · Enter edit",
+                Some(knob) if knob.optional => "⌫ off · Enter edit",
+                Some(_) => "←/→ move · Enter edit",
+                None => "",
+            },
         };
         let call = if plugin {
             "a add · r reset list"
@@ -531,6 +594,64 @@ impl KnobsView<'_> {
             "Esc back to the score"
         };
         [rail.to_owned(), call.to_owned()]
+    }
+
+    /// One row of the presets section: the heading, with its marker and
+    /// its count, or a preset name under it, with the mark of the preset
+    /// the call's object holds.
+    fn draw_preset_row(
+        &self,
+        buffer: &mut ratatui::buffer::Buffer,
+        area: Rect,
+        section: &PresetsSection<'_>,
+        name: Option<&String>,
+        chosen: bool,
+    ) {
+        let theme = self.theme;
+        let style = |colour: ratatui::style::Color| {
+            let style = Style::default().fg(colour);
+            if chosen {
+                style.add_modifier(Modifier::BOLD)
+            } else {
+                style
+            }
+        };
+        let Some(name) = name else {
+            // The heading carries how much it holds beside its name, as the
+            // vst tab names its rows: `presets (1)`.
+            let marker = super::terminal::symbol(if section.open { "▾" } else { "▸" });
+            let held = section.names.len();
+            buffer.set_stringn(
+                area.x,
+                area.y,
+                format!("{marker} presets ({held})"),
+                usize::from(area.width),
+                style(theme.accent),
+            );
+            return;
+        };
+        // The name the call holds is the preset the score plays: it leads
+        // the names, and carries the mark. A studio built without the
+        // plugin host lists no presets, so no name is the one held.
+        #[cfg(feature = "vst")]
+        let active = section.active.is_some_and(|active| {
+            rustel_runtime::vst::canonical(active) == rustel_runtime::vst::canonical(name)
+        });
+        #[cfg(not(feature = "vst"))]
+        let active = false;
+        let mark = if active { "●" } else { " " };
+        let text = format!("{mark} {name}");
+        buffer.set_stringn(
+            area.x,
+            area.y,
+            &text,
+            usize::from(area.width),
+            style(if active {
+                theme.accent
+            } else {
+                theme.foreground
+            }),
+        );
     }
 
     fn draw_label(
