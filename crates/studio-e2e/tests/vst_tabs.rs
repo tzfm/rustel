@@ -622,4 +622,11 @@ fn a_preset_file_saved_while_the_studio_runs_reaches_the_open_plugin() {
     studio.pump_until(LOAD_BUDGET, "the preset of the watch", |studio| {
         studio.rows().iter().any(|row| row.contains("Late Save"))
     });
+
+    // The host is the one of the process: leave its preset root over a
+    // folder with no files, so a later test counts no preset of this one.
+    // On Windows the loaded plugin holds this test's folder, so its preset
+    // files stay after the test ends.
+    let empty = tempfile::tempdir().expect("empty preset root");
+    vst::host().set_preset_folder(empty.path().to_path_buf());
 }
