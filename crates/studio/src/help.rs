@@ -573,6 +573,10 @@ fn shortcut_rows_with_keybinds(
             "show the selected score's details: name, @fields, saved time",
         ),
         HelpRow::new(
+            "/ in set panel",
+            "filter the scores by name or @field; Enter keeps, Esc restores",
+        ),
+        HelpRow::new(
             shortcut_with_alias(keybinds, BindAction::Log),
             "open the studio log",
         ),

@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use crossterm::event::KeyCode;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -79,6 +80,19 @@ pub struct SetDetails {
     pub rows: Vec<String>,
 }
 
+/// The `/` filter: what it holds, and whether the box still has the
+/// keyboard. While it stands, the list hides the scores it does not
+/// answer. The sessions fold and the tapes under it are not filtered:
+/// the question is about scores.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Search {
+    /// What the player typed.
+    pub query: String,
+    /// The box has the keyboard. Enter, or a move, leaves the filter
+    /// standing and gives the rows back. Esc drops it whole.
+    pub typing: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct SetPanel {
     /// The set's name: its folder's.
@@ -100,6 +114,11 @@ pub struct SetPanel {
     pub error: Option<String>,
     /// The details popup `i` opened, over the row it was opened on.
     pub details: Option<SetDetails>,
+    /// The `/` filter, while one stands.
+    pub search: Option<Search>,
+    /// Whether the search box is in Vim's Insert mode, the way every
+    /// text surface keeps its own word for it.
+    pub vim_insert: bool,
     /// The last click, for the second of a double click.
     last_click: Option<(usize, Instant)>,
     /// Lines scrolled past the top, so the selection stays in view with a
@@ -131,6 +150,8 @@ impl SetPanel {
             unsaved: None,
             error: None,
             details: None,
+            search: None,
+            vim_insert: false,
             last_click: None,
             hold_scroll: false,
             scroll: 0,
@@ -253,9 +274,23 @@ impl SetPanel {
         }
     }
 
-    /// The lines: every score, then the fold and, open, the tapes under it.
+    /// The lines: the scores the filter still shows - all of them when
+    /// no filter stands - then the fold and, open, the tapes under it.
+    /// The fold and the tapes are never filtered: the question is about
+    /// scores.
     fn rebuild(&mut self) {
-        let mut lines: Vec<SetLine> = (0..self.files.len()).map(SetLine::File).collect();
+        let query = self
+            .search
+            .as_ref()
+            .map(|search| search.query.as_str())
+            .filter(|query| !query.is_empty());
+        let mut lines: Vec<SetLine> = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| query.is_none_or(|query| score_answers(file, query)))
+            .map(|(index, _)| SetLine::File(index))
+            .collect();
         lines.push(SetLine::Sessions);
         if self.sessions_open {
             lines.extend((0..self.tapes.len()).map(SetLine::Tape));
@@ -348,6 +383,84 @@ impl SetPanel {
         };
         self.details = Some(SetDetails { line, rows });
         true
+    }
+
+    /// Whether the search box holds the keyboard: the box typing, or the
+    /// panel's Insert mode over it in vim.
+    pub fn search_typing(&self) -> bool {
+        self.search
+            .as_ref()
+            .is_some_and(|search| search.typing || self.vim_insert)
+    }
+
+    /// `/` opens the search box, which takes the keyboard and reads the
+    /// query into the list as it grows. Whatever popup stood over a row
+    /// gives way to it.
+    pub fn open_search(&mut self) {
+        self.details = None;
+        self.search = Some(Search {
+            query: String::new(),
+            typing: true,
+        });
+    }
+
+    /// The list, read against the filter again: the query changed.
+    pub fn refilter(&mut self) {
+        self.rebuild();
+    }
+
+    /// The search box's keys, while it holds the keyboard. Every letter
+    /// builds the query, and the list hides what does not answer as the
+    /// query grows. Enter leaves the filter standing and moves the
+    /// selection to the first score it kept. Up and Down leave it
+    /// standing and move. Esc drops the filter whole, and the list is
+    /// the folder's again. Anything else is the box's silence.
+    pub fn search_key(&mut self, code: KeyCode) {
+        let mut refilter = false;
+        match code {
+            KeyCode::Char(character) if !character.is_control() => {
+                if let Some(search) = self.search.as_mut() {
+                    search.query.push(character);
+                    self.error = None;
+                    refilter = true;
+                }
+            }
+            KeyCode::Backspace | KeyCode::Delete => {
+                if let Some(search) = self.search.as_mut() {
+                    search.query.pop();
+                    self.error = None;
+                    refilter = true;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(search) = self.search.as_mut() {
+                    search.typing = false;
+                }
+                // Enter reads as "go there": the cursor lands on the
+                // first score the filter kept.
+                if let Some(first) = self
+                    .lines
+                    .iter()
+                    .position(|line| matches!(line, SetLine::File(_)))
+                {
+                    self.selected = first;
+                }
+            }
+            KeyCode::Up | KeyCode::Down => {
+                if let Some(search) = self.search.as_mut() {
+                    search.typing = false;
+                }
+                self.move_by(if code == KeyCode::Up { -1 } else { 1 });
+            }
+            KeyCode::Esc => {
+                self.search = None;
+                refilter = true;
+            }
+            _ => {}
+        }
+        if refilter {
+            self.rebuild();
+        }
     }
 
     /// Open or shut the fold the tapes sit under.
@@ -609,6 +722,19 @@ fn saved_at(path: &Path) -> Option<String> {
     readable_stamp(&rustel_runtime::session_log::dashed_timestamp(seconds))
 }
 
+/// Whether a score's row answers the filter: its name, or any value its
+/// leading `@` fields carry.
+fn score_answers(file: &FileRow, query: &str) -> bool {
+    let aliases: Vec<String> = file
+        .meta
+        .fields()
+        .iter()
+        .map(|(_, value)| value.clone())
+        .filter(|value| !value.is_empty())
+        .collect();
+    super::fuzzy::score(query, &file.name, &aliases, "").is_some()
+}
+
 /// Clip by terminal columns so a wide custom name cannot displace its size.
 fn fit_tape_label(name: &str, width: usize) -> String {
     use unicode_segmentation::UnicodeSegmentation;
@@ -825,10 +951,31 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
                     Style::default().fg(theme.error),
                 );
             }
+        } else if let Some(search) = &self.panel.search {
+            // The search row, in the reference panel's look: what the
+            // filter holds, and in vim's command mode over an empty
+            // query, the way in.
+            let row = if search.typing
+                && search.query.is_empty()
+                && !self.panel.vim_insert
+                && self.keybinds.editor_keybindings() == super::editor::EditorKeybindings::Vim
+            {
+                "search: i or a types".to_owned()
+            } else {
+                format!("search: {}", search.query)
+            };
+            buffer.set_stringn(
+                error.x,
+                error.y,
+                &row,
+                usize::from(error.width),
+                Style::default().fg(theme.foreground),
+            );
         }
         if self.panel.error.is_none()
             && self.panel.deleting.is_none()
             && self.panel.unsaved.is_none()
+            && self.panel.search.is_none()
             && let Some(tape) = self.panel.selected_tape()
         {
             let recorded = tape.recorded.replace('T', " ");
@@ -850,7 +997,9 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
         let reveal_hint = format!("{reveal} reveal · Del delete · +/- size");
         let live_tape_hint = format!("{reveal} reveal · n new first");
         let folder_hint = format!("{reveal} reveal · +/- size");
-        let hints = if self.panel.unsaved.is_some() {
+        let hints = if self.panel.search_typing() {
+            ["Enter keep · Esc drop", "type to filter the scores"]
+        } else if self.panel.unsaved.is_some() {
             ["Enter retry · Del leave", "Esc keep the set"]
         } else if let Some(tape) = self.panel.selected_tape() {
             [
@@ -934,6 +1083,118 @@ mod selection_tests {
         panel.selected = panel.files.len();
         let fold = rendered_rows(&panel, AREA, true).join("\n");
         assert!(fold.contains("←/→ fold · n new"), "{fold}");
+    }
+
+    #[test]
+    fn a_filter_hides_the_scores_that_do_not_answer() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("night.strudel"),
+            "/*\n@title night drive\n*/\n$: s(\"bd\")\n",
+        )
+        .unwrap();
+        let mut panel = panel_with_a_tape(directory.path());
+        panel.toggle_sessions();
+        let names = |panel: &SetPanel| {
+            panel
+                .lines
+                .iter()
+                .filter_map(|line| match line {
+                    SetLine::File(index) => panel.files.get(*index).map(|file| file.name.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        panel.open_search();
+        panel.search_key(KeyCode::Char('d'));
+        // The name `drop` answers, and so does the title of `night`.
+        assert_eq!(names(&panel), ["drop", "night"]);
+        assert!(
+            panel.lines.contains(&SetLine::Sessions),
+            "the fold is never filtered"
+        );
+        assert!(
+            panel.lines.contains(&SetLine::Tape(0)),
+            "the tapes under it are never filtered"
+        );
+        panel.search_key(KeyCode::Char('r'));
+        panel.search_key(KeyCode::Char('o'));
+        assert_eq!(names(&panel), ["drop"], "the title stopped answering");
+        panel.search_key(KeyCode::Esc);
+        assert_eq!(
+            names(&panel),
+            ["drop", "intro", "night", "spare"],
+            "Esc restores the folder"
+        );
+        assert!(
+            panel.search.is_none(),
+            "Esc drops the filter whole, not just the typing"
+        );
+    }
+
+    /// The box's keys: Enter leaves the filter standing and lands the
+    /// cursor on the first score it kept, a move leaves it standing and
+    /// walks the rows the filter kept, Esc drops it whole and keeps the
+    /// cursor where the row it names went.
+    #[test]
+    fn the_search_box_keeps_drops_and_hands_the_rows_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut panel = panel_with_a_tape(directory.path());
+        panel.open_search();
+        for character in "in".chars() {
+            panel.search_key(KeyCode::Char(character));
+        }
+        panel.search_key(KeyCode::Enter);
+        assert!(
+            !panel.search.as_ref().expect("the filter stands").typing,
+            "Enter ends the typing"
+        );
+        assert_eq!(
+            panel.selected_file().map(|file| file.name.as_str()),
+            Some("intro"),
+            "the cursor lands on the first score the filter kept"
+        );
+        panel.search_key(KeyCode::Down);
+        assert_eq!(
+            panel.selected_line(),
+            Some(SetLine::Sessions),
+            "a move leaves the filter standing and walks the kept rows"
+        );
+        panel.search_key(KeyCode::Esc);
+        assert_eq!(
+            panel.selected_file().map(|file| file.name.as_str()),
+            Some("intro"),
+            "Esc keeps the cursor where the row it names went"
+        );
+    }
+
+    /// The search row shows the query in the reference panel's look,
+    /// with the box's own hints under it, and gives way to an error when
+    /// one comes.
+    #[test]
+    fn the_search_row_shows_the_query_and_yields_to_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut panel = panel_with_a_tape(directory.path());
+        panel.open_search();
+        for character in "dr".chars() {
+            panel.search_key(KeyCode::Char(character));
+        }
+        let rows = rendered_rows(&panel, AREA, true);
+        assert!(
+            rows.iter().any(|row| row.contains("search: dr")),
+            "the row shows the query:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("Enter keep · Esc drop")),
+            "the box's hints stand in for the row hints:\n{}",
+            rows.join("\n")
+        );
+        panel.search_key(KeyCode::Enter);
+        panel.error = Some("could not open the score".to_owned());
+        let rows = rendered_rows(&panel, AREA, true);
+        assert!(rows.iter().all(|row| !row.contains("search: ")));
+        assert!(rows.iter().any(|row| row.contains("could not open")));
     }
 }
 

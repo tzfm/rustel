@@ -172,6 +172,12 @@ Press `i` on a score to see its details: the name, its strip number and open
 state, the `@` fields its leading comments carry, and when it was last saved.
 Esc closes the details. A move to another row closes them too.
 
+Press `/` to filter the scores: type, and the panel hides the scores the query
+does not answer. A query matches a name or any `@` field value. Enter leaves
+the filter standing and moves to the first match. Esc restores the full list.
+The sessions fold is never filtered. In vim mode the box rests in command
+mode: press `i` or `a` to type.
+
 Delete asks for confirmation before it removes a file. Confirming also discards
 its unsaved edits. Studio does not delete the last score or the active session
 tape. Keep a separate backup of sets you want to preserve.

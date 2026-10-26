@@ -127,6 +127,11 @@ impl App {
         self.handle_session_file_key(code)
     }
 
+    /// Whether the set panel's search box holds the keyboard.
+    pub(super) fn set_search_typing(&self) -> bool {
+        self.set_panel.as_ref().is_some_and(SetPanel::search_typing)
+    }
+
     /// The set panel's keys. Returns true when the panel consumed the key.
     pub(super) fn handle_set_key(&mut self, code: KeyCode, primary: bool, shift: bool) -> bool {
         let where_it_stands = |app: &Self| {
@@ -158,6 +163,14 @@ impl App {
             // that outrank a prompt were already handled before dispatch.
             let handled = self.handle_set_prompt_key(code, primary, shift);
             return handled || self.set_prompt.is_some();
+        }
+        // The search box owns the keyboard the same way: while it types,
+        // every key is the box's.
+        if self.set_search_typing() {
+            if let Some(panel) = self.set_panel.as_mut() {
+                panel.search_key(code);
+            }
+            return true;
         }
         // A set that could not go because a score could not be saved:
         // Enter retries, Del leaves without the score, Esc keeps the set.
@@ -212,6 +225,12 @@ impl App {
             // prompt.
             KeyCode::Esc if panel.details.is_some() => {
                 panel.details = None;
+            }
+            // A filter standing drops the same way, before the panel's
+            // own Esc hands the keyboard back.
+            KeyCode::Esc if panel.search.is_some() => {
+                panel.search = None;
+                panel.refilter();
             }
             // Zen has no docked furniture: the panel came up as a popup,
             // not the set's file tree standing beside the score, so Esc
@@ -299,6 +318,18 @@ impl App {
                         "set panel is as {} as it goes",
                         if grow { "wide" } else { "narrow" }
                     );
+                }
+            }
+            // `/` opens the search box: it takes the keyboard, and the
+            // list hides the scores the query does not answer. On a
+            // filter standing it takes the box back up to type. In vim,
+            // the box's letters belong to its own modes instead.
+            KeyCode::Char('/') if !primary && panel.search.is_none() => {
+                panel.open_search();
+            }
+            KeyCode::Char('/') if !primary => {
+                if let Some(search) = panel.search.as_mut() {
+                    search.typing = true;
                 }
             }
             // The selected score's own page: its name, where it stands on
@@ -745,6 +776,15 @@ impl App {
     /// Open a set or source picker, retaining the initiating focus even
     /// when a bank chooser leads into another naming prompt.
     pub(super) fn open_set_prompt(&mut self, prompt: SetPrompt) {
+        // A prompt is the panel's next question, and it takes the
+        // keyboard: the search box stands down, and its vim modes with
+        // it, so a letter the prompt is waiting for cannot land in the
+        // box instead.
+        if let Some(panel) = self.set_panel.as_mut() {
+            panel.search = None;
+            panel.vim_insert = false;
+            panel.refilter();
+        }
         if self.set_prompt.is_none() {
             let settings_prompt = matches!(
                 prompt,
@@ -1764,6 +1804,104 @@ mod tests {
                 app.set_panel.as_ref().unwrap().details.is_none(),
                 "vim mode: Esc closes them"
             );
+        }
+
+        /// `/` opens a filter that owns the keyboard: letters hide the
+        /// scores the query does not answer - `n` types into the query
+        /// rather than starting anything - Enter leaves the filter
+        /// standing on the first score it kept, Esc drops it whole, and a
+        /// set prompt opening stands the box down. In vim the box keeps
+        /// its own modes: `i` types, Esc returns to command, and the
+        /// second Esc drops the filter.
+        #[test]
+        fn the_search_box_filters_keeps_and_drops() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            std::fs::write(
+                directory.path().join("spare.strudel"),
+                "/*\n@title night drive\n*/\n$: s(\"bd\")\n",
+            )
+            .expect("spare");
+            let mut app = app_over(directory.path());
+            app.new_scene(false);
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            let query = |app: &App| {
+                app.set_panel
+                    .as_ref()
+                    .unwrap()
+                    .search
+                    .as_ref()
+                    .map(|search| search.query.clone())
+            };
+            let names = |app: &App| {
+                let panel = app.set_panel.as_ref().unwrap();
+                panel
+                    .lines
+                    .iter()
+                    .filter_map(|line| match line {
+                        SetLine::File(index) => {
+                            panel.files.get(*index).map(|file| file.name.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+            assert_eq!(query(&app).as_deref(), Some("n"), "n types into the query");
+            press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            assert_eq!(
+                names(&app),
+                ["spare"],
+                "the query answers a title, not a name"
+            );
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            {
+                let panel = app.set_panel.as_ref().unwrap();
+                assert!(!panel.search.as_ref().unwrap().typing, "Enter ends typing");
+                assert_eq!(panel.selected_file().unwrap().name, "spare");
+            }
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert_eq!(
+                names(&app),
+                ["first", "scene 1", "spare"],
+                "Esc restores the folder"
+            );
+
+            // A prompt takes the keyboard, so the box stands down.
+            press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+            assert!(app.set_panel.as_ref().unwrap().search.is_some());
+            app.open_set_prompt(SetPrompt::OpenSet);
+            assert!(
+                app.set_panel.as_ref().unwrap().search.is_none(),
+                "a prompt stands the search box down"
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+            // Vim: the box rests in command, `i` types, and the Esc
+            // ladder leaves insert before it drops the filter.
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+            assert_eq!(
+                query(&app).as_deref(),
+                Some(""),
+                "in command mode a letter is not the box's"
+            );
+            press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            assert_eq!(query(&app).as_deref(), Some("sp"), "insert types");
+            assert_eq!(names(&app), ["spare"]);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(
+                !app.set_panel.as_ref().unwrap().vim_insert,
+                "the first Esc only leaves insert"
+            );
+            assert!(app.set_panel.as_ref().unwrap().search.is_some());
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.set_panel.as_ref().unwrap().search.is_none());
         }
 
         /// Delete in the panel asks and Enter answers: an open score off the

@@ -244,6 +244,99 @@ fn the_set_panel_shows_a_scores_details_over_its_row() {
     );
 }
 
+/// `/` filters the set panel: letters hide the scores the query does not
+/// answer - a name or any @field value - Enter leaves the filter
+/// standing, Esc restores the folder. In vim the box rests in command
+/// mode until `i` types, and the Esc ladder leaves insert before it
+/// drops the filter.
+#[test]
+fn the_set_panel_search_filters_and_restores() {
+    let mut studio = hermetic();
+    for (name, body) in [
+        ("alpha.strudel", "$: s(\"hh\")\n"),
+        (
+            "night.strudel",
+            "/*\n@title night drive\n*/\n$: s(\"bd\")\n",
+        ),
+    ] {
+        std::fs::write(studio.set_directory().join(name), body).unwrap();
+    }
+    studio.chord("ctrl+b");
+    studio.settle();
+    assert_eq!(studio.focus(), Some(PanelKind::Set));
+
+    studio.press(KeyCode::Char('/'), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('n'), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('i'), KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    assert!(
+        rows.iter().any(|row| row.contains("search: ni")),
+        "the panel shows the query:\n{}",
+        rows.join("\n")
+    );
+    row_containing(&rows, "night");
+    assert!(
+        rows.iter().all(|row| !row.contains("alpha")),
+        "a score that does not answer hides:\n{}",
+        rows.join("\n")
+    );
+
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    assert!(
+        rows.iter().any(|row| row.contains("alpha")),
+        "Esc restores the folder:\n{}",
+        rows.join("\n")
+    );
+    assert_eq!(studio.focus(), Some(PanelKind::Set), "Esc kept the panel");
+
+    // Vim: the box rests in command, `i` types, and the second Esc
+    // drops the filter. The panel goes away first, so the vim half
+    // opens it fresh, the way the studio does at startup.
+    studio.chord("ctrl+b");
+    assert_eq!(studio.focus(), None, "the panel is away");
+    enable_vim(&mut studio);
+    studio.chord("ctrl+b");
+    studio.settle();
+    assert_eq!(studio.focus(), Some(PanelKind::Set));
+    studio.press(KeyCode::Char('/'), KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    assert!(
+        rows.iter().any(|row| row.contains("search: i or a types")),
+        "in command mode the box says the way in:\n{}",
+        rows.join("\n")
+    );
+    studio.press(KeyCode::Char('i'), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('n'), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('i'), KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    assert!(
+        rows.iter().any(|row| row.contains("search: ni")),
+        "insert types into the box:\n{}",
+        rows.join("\n")
+    );
+    assert!(rows.iter().all(|row| !row.contains("alpha")));
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    assert!(
+        rows.iter().any(|row| row.contains("alpha")),
+        "the second Esc drops the filter:\n{}",
+        rows.join("\n")
+    );
+    assert_eq!(
+        studio.focus(),
+        Some(PanelKind::Set),
+        "Esc answered the box, not the panel"
+    );
+}
+
 /// File ▸ New set: a folder named after the day appears under the sets
 /// folder with a starter scene and its set file, and it is taken up at
 /// once - the header, the score and the disk all agree.

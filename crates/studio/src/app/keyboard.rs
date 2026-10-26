@@ -227,11 +227,16 @@ impl App {
 
     /// Whether the panel has a text field that owns held typing keys.
     fn panel_is_typing(&self, kind: PanelKind) -> bool {
+        // The set prompt types whether the vim surface below it answers
+        // or not.
+        if kind == PanelKind::Set && self.set_prompt.is_some() {
+            return true;
+        }
         if let Some(typing) = super::vim::surface_typing(self) {
             return typing;
         }
         match kind {
-            PanelKind::Set => self.set_prompt.is_some(),
+            PanelKind::Set => self.set_search_typing(),
             PanelKind::Viz => self.viz_docks[self.viz_focus]
                 .as_ref()
                 .is_some_and(|panel| panel.prompt.is_some()),
@@ -310,7 +315,9 @@ impl App {
                     && !primary
                     && !shift
                     && !alt
-                    && self.set_prompt.is_none() =>
+                    && self.set_prompt.is_none()
+                    // `n` is a letter the search box may be typing.
+                    && !self.set_search_typing() =>
             {
                 self.new_session();
                 true
