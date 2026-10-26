@@ -308,8 +308,8 @@ fn the_reference_tab_loads_a_plugin_and_writes_its_call() {
     });
     let rows = studio.rows();
     assert!(rows[row_containing(&rows, "▾ Rustel Fixture")].contains("effect"));
-    row_containing(&rows, "▸ presets");
-    row_containing(&rows, "▸ parameters");
+    row_containing(&rows, "▸ presets (0)");
+    row_containing(&rows, "▸ parameters (4)");
     assert!(rows[row_containing(&rows, "▸ Rustel Fixture Tone")].contains("instrument"));
 
     // → on the parameters row makes them the view of the tab, with the

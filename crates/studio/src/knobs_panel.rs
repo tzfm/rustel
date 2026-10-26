@@ -617,23 +617,16 @@ impl KnobsView<'_> {
             }
         };
         let Some(name) = name else {
+            // The heading carries how much it holds beside its name, as the
+            // vst tab names its rows: `presets (1)`.
             let marker = super::terminal::symbol(if section.open { "▾" } else { "▸" });
+            let held = section.names.len();
             buffer.set_stringn(
                 area.x,
                 area.y,
-                format!("{marker} presets"),
+                format!("{marker} presets ({held})"),
                 usize::from(area.width),
                 style(theme.accent),
-            );
-            let count = section.names.len().to_string();
-            let width = count.chars().count() as u16;
-            let x = area.right().saturating_sub(width).max(area.x);
-            buffer.set_stringn(
-                x,
-                area.y,
-                &count,
-                usize::from(area.right() - x),
-                style(theme.muted),
             );
             return;
         };

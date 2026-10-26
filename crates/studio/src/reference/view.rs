@@ -1040,16 +1040,16 @@ impl ReferenceView<'_> {
                     (vec![(text, heading)], tag)
                 }
                 PluginRow::Section(section) => {
-                    // The row names one half of the open plugin, and the
-                    // tag says how much the half holds.
+                    // The row names one half of the open plugin, with how
+                    // much the half holds beside the name: `presets (0)`.
                     let held = match (section, open) {
                         (VstSection::Presets, Some(plugin)) => plugin.presets,
                         (VstSection::Params, Some(plugin)) => plugin.params.len(),
                         _ => 0,
                     };
-                    let text = format!("   {} {} ", marker(false), section.said());
+                    let text = format!("   {} {} ({held}) ", marker(false), section.said());
                     let style = foreground.add_modifier(Modifier::BOLD);
-                    (vec![(text, style)], (held.to_string(), muted))
+                    (vec![(text, style)], (String::new(), muted))
                 }
                 PluginRow::Group(index) => {
                     let (name, count) = &tab.groups()[index];

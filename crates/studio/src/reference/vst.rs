@@ -470,10 +470,11 @@ impl VstTab {
 
     /// ← closes what the cursor is in, the innermost first: the group, then
     /// the half of the open plugin, then the plugin. The cursor goes to the
-    /// row of what closed.
+    /// row of what closed. An empty half has no row under the cursor: ←
+    /// leaves it the way Esc does.
     pub fn collapse(&mut self) -> bool {
         let Some(row) = self.rows.get(self.selected).copied() else {
-            return false;
+            return self.leave();
         };
         let group = match row {
             PluginRow::Group(index) => Some(index),
@@ -933,6 +934,27 @@ mod tests {
     /// A search of the plugin list keeps the plugins its text finds and
     /// nothing else. A search of a half of an open plugin lists the rows
     /// of that half, and goes with Tab to the other half.
+    /// An empty half of the open plugin has no row under the cursor, and
+    /// ← still leaves it, the way Esc does.
+    #[test]
+    fn left_leaves_an_empty_half_of_the_open_plugin() {
+        use PluginRow::Section;
+        let mut tab = VstTab::default();
+        tab.set_plugins(vec![synth()]);
+        tab.expand();
+        // The plugin holds no preset file: the half of it is empty.
+        assert!(tab.show_section(VstSection::Presets));
+        assert!(tab.rows().is_empty(), "the half holds no preset");
+        assert!(tab.collapse(), "left leaves the empty half");
+        assert_eq!(tab.inside(), None);
+        assert_eq!(
+            tab.row(tab.selected),
+            Some(Section(VstSection::Presets)),
+            "the cursor stands on the row of the half"
+        );
+        assert_eq!(tab.rows().len(), 3, "the plugin with its two rows");
+    }
+
     #[test]
     fn a_search_of_the_list_reads_names_and_a_search_of_the_half_reads_the_half() {
         use PluginRow::{Param, Plugin, Preset};
