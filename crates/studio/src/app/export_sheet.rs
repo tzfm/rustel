@@ -176,13 +176,13 @@ impl App {
                     "exporting {} ({}) → {} - {} ends it early and keeps the file",
                     job.scene_name,
                     settings.describe_length(),
-                    status_file_path(&job.target, self.ui_settings.show_full_paths),
+                    status_file_path(&job.output(), self.ui_settings.show_full_paths),
                     self.keybinds.hint(BindAction::Export)
                 );
                 self.log.push(
                     LogLevel::Info,
                     "export",
-                    format!("{} → {}", job.scene_name, job.target.display()),
+                    format!("{} → {}", job.scene_name, job.output().display()),
                 );
                 self.export_job = Some(job);
             }
@@ -221,7 +221,7 @@ impl App {
                 self.status = format!(
                     "exported {} - {} ({}{}, {:.1}s to render)",
                     job.scene_name,
-                    status_file_path(&job.target, self.ui_settings.show_full_paths),
+                    status_file_path(&job.output(), self.ui_settings.show_full_paths),
                     format_take_length(seconds),
                     if job.finished_early() {
                         ", ended early"
@@ -235,12 +235,12 @@ impl App {
                     "export",
                     format!(
                         "done {} ({})",
-                        job.target.display(),
+                        job.output().display(),
                         format_take_length(seconds)
                     ),
                 );
                 self.status.push_str(" - click the path to show it");
-                self.remember_status_file(job.target.clone());
+                self.remember_status_file(job.output());
             }
             Err(error) => {
                 self.status = format!("export of {} failed: {error}", job.scene_name);

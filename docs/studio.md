@@ -1103,7 +1103,8 @@ folder, and your bank renames. Live playback continues.
 If the export cannot find or load a sound, or the engine refuses a note, the
 export fails and names the refusal. The file is still written. The check covers
 every note the export schedules, also notes after an early end.
-Use Tab and arrows to choose the length, WAV or MP3 format, and output path.
+Use Tab and arrows to choose the length, WAV or MP3 format, stems, and output
+path.
 
 Choose a fixed number of cycles or **until silence**. Until-silence export stops
 when audio stays below the threshold for the hold time. The defaults are
@@ -1119,6 +1120,14 @@ The export limiter starts with the current mixer setting. Changing it in
 the export dialog affects that export only. CLI exports do not inherit the set
 limiter. Match limiter, duration, sample rate, and voice limit when comparing
 an export with another render.
+
+Turn stems on to write a `<name> stems` folder beside the take instead of the
+one file. It holds `main.wav` with the same bounce, plus one stereo WAV for
+each orbit that sounds, named `1.wav` upward. Each stem is tapped after its
+orbit's delay, reverb, filter, duck and fader, before the master limiter, so
+the stems sum back to an unmastered main and mastering stays in the DAW. Stems
+need the WAV format: turning them on takes the format back to WAV, and MP3
+turns them off. The status names the folder, because the take lands inside it.
 
 Press Ctrl+Shift+X again to end an export early. Studio adds a fade and keeps
 the audio already rendered. Use Transport ▸ Reveal last export or take to

@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- The export sheet takes stems: the row on, a bounce writes a `<name> stems` folder beside the take, holding `main.wav` with the same audio plus one stereo WAV a sounding orbit, named `1.wav` upward, as the CLI's `--stems` does. Stems need the WAV format: turning them on takes the format back to wav, and mp3 turns them off. The status names the folder, because the take lands inside it.
 - The hint rows at the set panel's bottom name the open and filter keys, so Enter and `/` are easy to find.
 - `--stems` on render writes a `<name> stems` folder beside the bounce: the same audio as `main.wav`, plus one stereo WAV per sounding orbit, named `1.wav` upward, in the export
 format. Each stem is tapped after its orbit's delay, reverb, filter, duck and fader, before the master, so the stems sum back to an unmastered main and mastering stays in the DAW. Stems need a WAV format, and an existing stems folder is refused.
