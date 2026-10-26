@@ -522,9 +522,9 @@ impl SetPanel {
     }
 
     /// The panel's docked place: the sidebar, when the layout gave it one.
-    /// The rows are the title, the list, the details block, the error
-    /// line and two hint rows; the column on the editor's side is the
-    /// rule between the two.
+    /// The rows are the title, the list, the details block under its own
+    /// rule, the error line and two hint rows; the column on the editor's
+    /// side is the rule between the two.
     pub fn docked_parts(sidebar: Rect, on_right: bool) -> Option<DockedParts> {
         if sidebar.is_empty() || sidebar.height < 5 || sidebar.width < 8 {
             return None;
@@ -538,8 +538,9 @@ impl SetPanel {
         let title = Rect::new(inner_x, sidebar.y, inner_width, 1);
         let hints = 2u16.min(sidebar.height.saturating_sub(3));
         // Between the list and the error line, the details block takes
-        // what it can: the list keeps one row, the block caps at
-        // DETAIL_ROWS, and a short panel drops the block first.
+        // what it can: the list keeps one row, the block caps at a rule
+        // plus DETAIL_ROWS, and a short panel drops the block first - a
+        // rule over nothing is not a block.
         let flex = sidebar
             .height
             .saturating_sub(1)
@@ -547,7 +548,9 @@ impl SetPanel {
             .saturating_sub(hints);
         let details = u16::try_from(DETAIL_ROWS)
             .expect("the cap is small")
+            .saturating_add(1)
             .min(flex.saturating_sub(1));
+        let details = u16::from(details > 1) * details;
         let list_height = flex - details;
         let list = Rect::new(inner_x, sidebar.y + 1, inner_width, list_height);
         let details = Rect::new(inner_x, list.bottom(), inner_width, details);
@@ -573,9 +576,9 @@ impl SetPanel {
     /// per line up to a screenful, the details block under the list.
     pub fn sheet_geometry(&self, available: Rect) -> Option<(Rect, Rect)> {
         let rows = (self.lines.len() as u16).clamp(1, 16);
-        // Title, the list, the details block, an error line, two hint
-        // lines, borders.
-        let height = rows + 6 + u16::try_from(DETAIL_ROWS).expect("the cap is small");
+        // Title, the list, the details block under its own rule, an error
+        // line, two hint lines, borders.
+        let height = rows + 7 + u16::try_from(DETAIL_ROWS).expect("the cap is small");
         let width = self
             .width
             .saturating_add(4)
@@ -846,7 +849,9 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
                         list.x,
                         list.bottom(),
                         list.width,
-                        u16::try_from(DETAIL_ROWS).expect("the cap is small"),
+                        u16::try_from(DETAIL_ROWS)
+                            .expect("the cap is small")
+                            .saturating_add(1),
                     );
                     let error = Rect::new(list.x, details.bottom(), list.width, 1);
                     let hint = Rect::new(list.x, error.bottom(), list.width, 2);
@@ -953,12 +958,29 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
         }
         // The selected line's details, standing at the foot the way a
         // file manager's pane does: the block follows the selection,
-        // with no key of its own. The first row names the thing; the
-        // rest is what the panel knows about it.
-        for (row, text) in self.panel.foot_detail_rows().iter().enumerate() {
+        // with no key of its own. A rule heads the block, the first
+        // row under it names the thing, the rest is what the panel
+        // knows about it.
+        if !details.is_empty() {
+            let rule = "─".repeat(usize::from(details.width));
             buffer.set_stringn(
                 details.x,
-                details.y + row as u16,
+                details.y,
+                &rule,
+                usize::from(details.width),
+                Style::default().fg(theme.rule),
+            );
+        }
+        for (row, text) in self
+            .panel
+            .foot_detail_rows()
+            .iter()
+            .take(usize::from(details.height).saturating_sub(1))
+            .enumerate()
+        {
+            buffer.set_stringn(
+                details.x,
+                details.y + 1 + row as u16,
                 text,
                 usize::from(details.width),
                 Style::default().fg(if row == 0 {
@@ -1508,7 +1530,7 @@ mod tests {
         panel.selected = 3;
         panel.toggle_sessions();
         panel.move_by(1);
-        let rows = rendered_rows(&panel, Rect::new(0, 0, 30, 15), true);
+        let rows = rendered_rows(&panel, Rect::new(0, 0, 30, 16), true);
         let row = rows
             .iter()
             .find(|r| r.contains("Sep 24 03:15:30"))
@@ -1658,8 +1680,8 @@ mod tests {
         let sidebar = Rect::new(0, 2, SIDEBAR_WIDTH, 20);
         let parts = SetPanel::docked_parts(sidebar, false).unwrap();
         assert_eq!(parts.title, Rect::new(1, 2, 38, 1));
-        assert_eq!(parts.list, Rect::new(1, 3, 38, 10));
-        assert_eq!(parts.details, Rect::new(1, 13, 38, 6));
+        assert_eq!(parts.list, Rect::new(1, 3, 38, 9));
+        assert_eq!(parts.details, Rect::new(1, 12, 38, 7));
         assert_eq!(parts.error.y, 19);
         assert_eq!(parts.hint, Rect::new(1, 20, 38, 2));
         assert_eq!(parts.rule, Rect::new(39, 2, 1, 20));
@@ -1667,7 +1689,7 @@ mod tests {
         let right = Rect::new(70, 2, SIDEBAR_WIDTH, 20);
         let parts = SetPanel::docked_parts(right, true).unwrap();
         assert_eq!(parts.rule, Rect::new(70, 2, 1, 20));
-        assert_eq!(parts.list, Rect::new(72, 3, 38, 10));
+        assert_eq!(parts.list, Rect::new(72, 3, 38, 9));
         let frame = Rect::new(0, 0, 100, 30);
         assert_eq!(panel.row_at(sidebar, frame, 5, 4), Some(1));
         assert_eq!(panel.row_at(sidebar, frame, 5, 10), None, "past the lines");

@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- The set panel's details block stands under a rule of its own, set off from the list the way the foot of a file manager's pane is.
 - The set panel's hints and help rows name the strip keys: 1 to 9 opens the strip's score, beside the open and filter keys the foot already names.
 - The set panel's foot follows a save: a score whose header changed on update renews its row's details without the score being reopened, and the reader's selection does not move. An edit another program saved renews them too.
 - The export sheet takes stems: the row on, a bounce writes a `<name> stems` folder beside the take, holding `main.wav` with the same audio plus one stereo WAV a sounding orbit, named `1.wav` upward, as the CLI's `--stems` does. Stems need the WAV format: turning them on takes the format back to wav, and mp3 turns them off. The status names the folder, because the take lands inside it.
