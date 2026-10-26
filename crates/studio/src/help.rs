@@ -328,7 +328,7 @@ impl HelpContext {
             ],
             Self::SettingsPermissions => [
                 (
-                    "Enter · Space",
+                    "Enter · ←/→ · Space",
                     "permit a refused origin · turn a row on or off",
                 ),
                 (

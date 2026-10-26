@@ -347,7 +347,7 @@ impl OrdinaryStringLiteralRanges {
             .iter()
             .chain(ERROR_MESSAGE_CALLS.iter())
             .map(|(name, _)| *name)
-            .chain(["initImage", "import"])
+            .chain(["initImage", "import", "talkit"])
             .any(|name| source.contains(name))
         {
             return Self::default();
@@ -464,6 +464,22 @@ impl HydraImageStringCollector {
                         let span = literal.span();
                         self.ranges.push((span.start as usize, span.end as usize));
                     }
+                }
+            }
+        }
+        // Speech option keys name settings. A value stays mini-notation: a
+        // plain word such as `"sung"` is one event, so the call still reads
+        // it, and `"<natural sung>"` gives one quality to each event.
+        if name == "talkit"
+            && let Some(Argument::ObjectExpression(options)) = arguments.get(1)
+        {
+            for property in &options.properties {
+                if let ObjectPropertyKind::ObjectProperty(property) = property
+                    && !property.computed
+                    && let PropertyKey::StringLiteral(literal) = &property.key
+                {
+                    let span = literal.span();
+                    self.ranges.push((span.start as usize, span.end as usize));
                 }
             }
         }
@@ -4824,6 +4840,25 @@ mod tests {
         );
         assert!(output.output.contains("m('0.2 0.8'"), "{}", output.output);
         assert!(!output.output.contains("m('A B'"), "{}", output.output);
+        // Speech text in double quotes is mini-notation, one word per
+        // event, and so is a speech option, one setting per event.
+        let output = transpile(
+            r#"$: talkit("my name is", { q: "sung monotone" })"#,
+            &TranspileOptions {
+                add_return: false,
+                ..TranspileOptions::default()
+            },
+        );
+        assert!(
+            output.output.contains("m('sung monotone'"),
+            "{}",
+            output.output
+        );
+        assert!(
+            output.output.contains("m('my name is'"),
+            "{}",
+            output.output
+        );
     }
 
     #[test]
