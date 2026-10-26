@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use rustel_audio::{
     BUNDLED_BD_SAMPLE_ID, BUNDLED_BD_SAMPLE_IDENTITY, DecodedSample, SAMPLE_BANK_CAPACITY, SampleId,
 };
-use rustel_voice::{SampleLookup, SampleResolution};
+use rustel_voice::{SampleLookup, SampleResolution, SpeechRequest};
 use sha2::{Digest, Sha256};
 use url::Url;
 
@@ -58,6 +58,7 @@ mod font_queue;
 mod local_names;
 mod manifest_queue;
 mod soundfonts;
+mod speech;
 #[cfg(test)]
 use codecs::decode_ogg;
 use codecs::{codec_for, decode_guarded};
@@ -806,6 +807,10 @@ impl SourceTables {
 
 struct Shared {
     by_url: RwLock<HashMap<Arc<str>, UrlState>>,
+    /// Words the `talkit` control rendered, by request. Each renders once and
+    /// stays until [`SampleLibrary::forget_decoded`] lets it go; see
+    /// `samples::speech`.
+    speech: Mutex<HashMap<speech::SpeechKey, UrlState>>,
     /// URLs introduced by score text and the exact host grant attached to
     /// each one. Loader threads consult this again at I/O time so a later
     /// refactor cannot validate registration and then fetch with broader
@@ -2016,6 +2021,10 @@ impl SampleLookup for SampleLibrary {
         request: &rustel_voice::PluginRequest<'_>,
     ) -> Result<Option<rustel_audio::InsertControls>, String> {
         crate::vst::controls(request)
+    }
+
+    fn insert_speech(&self, request: &SpeechRequest<'_>) -> Result<SampleResolution, String> {
+        speech::speak(&self.shared, request)
     }
 }
 

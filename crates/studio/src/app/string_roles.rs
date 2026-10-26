@@ -212,6 +212,12 @@ impl App {
                     || matches!(
                         (entry.name.as_str(), field.name.as_str(), key.as_str()),
                         ("lfo", "config.shape", "sh")
+                            | ("talkit", "config.personality", "v")
+                            | ("talkit", "config.personality", "voice")
+                            | ("talkit", "config.quality", "q")
+                            | ("talkit", "config.effort", "e")
+                            | ("talkit", "config.language", "l")
+                            | ("talkit", "config.language", "lang")
                     ))
         })
     }
@@ -284,6 +290,36 @@ impl App {
 mod tests {
     use super::*;
     use crate::editor::{Editor, Selection};
+
+    #[test]
+    fn talkit_option_values_have_choices() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut app = crate::app::tests::support::app_over(directory.path());
+        for (marked, expected) in [
+            ("talkit(\"hi\", { personality: \"ro|\" })", true),
+            ("talkit(\"hi\", { v: \"ro|\" })", true),
+            ("talkit(\"hi\", { voice: \"ro|\" })", true),
+            ("talkit(\"hi\", { quality: \"mo|\" })", true),
+            ("talkit(\"hi\", { q: \"mo|\" })", true),
+            ("talkit(\"hi\", { effort: \"wh|\" })", true),
+            ("talkit(\"hi\", { language: \"sp|\" })", true),
+            ("talkit(\"hi\", { l: \"sp|\" })", true),
+            ("talkit(\"hi\", { pitch: \"1|\" })", false),
+            ("talkit(\"hi|\", { v: \"ro\" })", false),
+        ] {
+            let at = marked.find('|').expect("caret marker");
+            app.scenes.current_mut().editor =
+                Editor::new(&marked.replace('|', "")).expect("editor");
+            app.editor_mut()
+                .set_selection(Selection::caret(ByteOffset(at)))
+                .expect("caret");
+            assert_eq!(
+                app.string_choice_set("talkit").is_some(),
+                expected,
+                "{marked}"
+            );
+        }
+    }
 
     #[test]
     fn graph_calls_do_not_borrow_pattern_string_choices() {

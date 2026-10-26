@@ -109,6 +109,9 @@ rustel-scheduler = { path = "../scheduler" }
 rustel-audio = { path = "../audio" }
 rustel-csound = { path = "../csound" }
 rustel-voice = { path = "../voice" }
+# The talkit speech synthesizer. Default features stay off: the runtime
+# renders, it never plays through an output device of its own.
+rustel-talkit = { path = "../talkit", default-features = false }
 rustel-serial = { path = "../serial", optional = true }
 rustel-midi = { path = "../midi", optional = true }
 # Only for `midir::Ignore` on the input path; the MIDI stack itself is behind

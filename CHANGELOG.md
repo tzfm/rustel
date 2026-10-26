@@ -44,6 +44,9 @@
 - `getTime()` reads 0 when a score starts from its first cycle: Play after a stop, a restart or a rewind. Before, it kept the old cycle, so a pattern placed with it played late. A failed update that falls back to the last score gives that score its first value again.
 - New `oneshot(grid)` from Switch Angel plays a pattern once, on the next grid line after the update.
 - In Windows Terminal, a syntax error no longer leaves stray coloured cells across the screen. The studio now sends underline colours in the colon form that Windows Terminal reads.
+- `talkit('hello there')` speaks text in a score, the way `s("...")` plays a sample. Single quotes speak one phrase, and double quotes are mini-notation, so `talkit("my name is")` speaks one word per event. A note sets the pitch the voice starts on, so `note("c3 e3 g3").talkit('la')` sings three notes. An options object sets the 20 voices, pitch, speed, quality, effort and language, each as a pattern, as in `talkit('hola mundo', { v: "little-robot", l: "es" })`, and Studio completes their values. Talkit is experimental. See [Talkit](https://github.com/tzfm/rustel/blob/main/docs/talkit.md).
+- The `talkit` command speaks text through the default output device or writes a WAV file. It carries the parameter model of the old Talk It! program, with the 20 voices, pitch, speed, natural, monotone and sung quality, normal, breathy and whispered effort, English and Spanish rules, and numbers read as words. Its sounds, timing, intonation and English readings are measured from the original engine, and it speaks as that engine does, in 8-bit steps at 11.025 kHz. See [Talkit](https://github.com/tzfm/rustel/blob/main/docs/talkit.md).
+- The left and right arrows turn a trust row on or off, as Space does, so the Trust page changes values the way the settings rows do.
 
 ### Sound changes
 

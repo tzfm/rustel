@@ -556,6 +556,7 @@ impl SampleLibrary {
         let publication = Arc::new(PublicationGate::new());
         let shared = Arc::new(Shared {
             by_url: RwLock::new(HashMap::new()),
+            speech: Mutex::new(HashMap::new()),
             score_sources: RwLock::new(HashMap::new()),
             ready: Mutex::new(ReadySamples::default()),
             shapes: Mutex::new(SampleShapes::default()),
@@ -937,7 +938,8 @@ impl SampleLibrary {
         asked
     }
 
-    /// Forget the decode of `ids` so a later ask fetches and decodes again.
+    /// Forget the decode of `ids` so a later ask fetches and decodes again,
+    /// or, for a `talkit` phrase, renders it again.
     ///
     /// Nothing here holds PCM: the loader publishes each decode once,
     /// through [`Self::take_ready`], and afterwards these tables keep only
@@ -973,19 +975,28 @@ impl SampleLibrary {
                 false
             });
         }
-        {
-            let mut by_url = self.shared.by_url.write().expect("sample url table");
-            by_url.retain(|_, state| {
-                let UrlState::Ready { id, .. } = state else {
-                    return true;
-                };
-                if !ids.contains(id) {
-                    return true;
-                }
-                forgotten.insert(*id);
-                false
-            });
-        }
+        // Spoken words are forgotten the same way: the next ask renders them
+        // again.
+        let forget_ready = |state: &mut UrlState, forgotten: &mut HashSet<SampleId>| {
+            let UrlState::Ready { id, .. } = state else {
+                return true;
+            };
+            if !ids.contains(id) {
+                return true;
+            }
+            forgotten.insert(*id);
+            false
+        };
+        self.shared
+            .by_url
+            .write()
+            .expect("sample url table")
+            .retain(|_, state| forget_ready(state, &mut forgotten));
+        self.shared
+            .speech
+            .lock()
+            .expect("speech table")
+            .retain(|_, state| forget_ready(state, &mut forgotten));
         {
             let mut ready = self.shared.ready.lock().expect("ready samples");
             for id in &forgotten {
@@ -2205,6 +2216,7 @@ pub(super) mod tests {
         pub(in crate::samples) fn sample_test_shared(next_id: u32) -> Shared {
             Shared {
                 by_url: RwLock::new(HashMap::new()),
+                speech: Mutex::new(HashMap::new()),
                 score_sources: RwLock::new(HashMap::new()),
                 ready: Mutex::new(ReadySamples::default()),
                 shapes: Mutex::new(SampleShapes::default()),
