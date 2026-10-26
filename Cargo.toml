@@ -17,13 +17,11 @@ members = [
     "crates/serial",
     "crates/midi",
     "crates/osc",
-    "crates/hydra",
     "crates/vst3",
     "crates/csound",
     "crates/vst3-fixture",
     "crates/kabel",
     "crates/studio-e2e",
-    "crates/talkit",
     "xtask",
 ]
 

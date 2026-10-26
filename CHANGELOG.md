@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- The talkit speech synthesizer lives in its own repository, [rustel-talkit](https://github.com/tzfm/rustel-talkit), and the build takes it as a pinned package from release v0.1.0. Scores speak as before, and the talkit command installs from that repository.
+- The Hydra video synth lives in its own repository, [rustel-hydra](https://github.com/tzfm/rustel-hydra), and the build takes it as a pinned package from release v0.1.0. Visuals draw as before, with the same character-checked shaders.
 - A slider() on `fm` moves the sounding voice, as the gain and filter sliders do: `s("in").fm(slider(2, 0, 8))` rides the depth live, with no wait for the next hap. This reaches every source; on `s("in")`, whose hap spans the cycle, it is the difference between now and a cycle late. The chain's other operators stay query-time, and a modulator aimed at `fm` keeps its own graph.
 - A beat line chosen on its own survives a restart. Before, it went back to off unless an opacity changed too.
 - An edit another program saved while the studio was still finishing its own save is loaded, not left on disk for the next studio save to overwrite.

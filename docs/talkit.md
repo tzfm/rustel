@@ -2,7 +2,8 @@
 
 Speak text. `talkit` is a speech synthesizer built on the parameter model of
 the old Talk It! program, with a formant engine written in Rust. It has no GUI
-and no external libraries, just text in and sound out.
+and no external libraries, just text in and sound out. The engine lives in
+its own repository, [rustel-talkit](https://github.com/tzfm/rustel-talkit).
 
 Talkit is experimental.
 
