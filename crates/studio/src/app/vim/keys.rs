@@ -366,6 +366,7 @@ mod tests {
     use super::*;
     use crate::app::tests::support::*;
     use crate::editor::{ByteOffset, Selection};
+    #[cfg(feature = "vst")]
     use crate::reference::{PluginRow, VstSection};
 
     fn vim_app() -> (tempfile::TempDir, App) {
