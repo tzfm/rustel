@@ -70,3 +70,6 @@ rustel-runtime = { path = "../runtime", default-features = false, features = [
 rustel-vst3-fixture = { path = "../vst3-fixture" }
 tempfile = "3"
 libc = "0.2"
+
+[lints]
+workspace = true

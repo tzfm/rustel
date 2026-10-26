@@ -59,3 +59,6 @@ audio_thread_priority = { version = "0.38", default-features = false }
 # The worker probe reads the core under each thread.
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Kernel"] }
+
+[lints]
+workspace = true

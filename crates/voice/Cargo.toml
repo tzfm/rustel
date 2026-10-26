@@ -13,3 +13,6 @@ description = "Shared control-to-voice resolver for mapping hap values to DSP on
 serde_json = { version = "1", features = ["preserve_order"] }
 rustel-core = { path = "../core", default-features = false }
 rustel-audio = { path = "../audio" }
+
+[lints]
+workspace = true
