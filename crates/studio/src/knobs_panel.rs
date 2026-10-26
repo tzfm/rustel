@@ -566,7 +566,10 @@ impl KnobsView<'_> {
             return ["type · Enter adds · Esc".to_owned(), forget.to_owned()];
         }
         if self.panel.editing.is_some() {
-            return ["Tab · Enter writes · Esc".to_owned(), String::new()];
+            return [
+                "↑↓/Tab fields · Enter writes · Esc".to_owned(),
+                String::new(),
+            ];
         }
         let section = self
             .presets

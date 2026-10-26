@@ -1859,7 +1859,8 @@ impl App {
                 form,
             });
         }
-        self.status = "knobs: Tab between the fields · Enter applies · Esc back".into();
+        self.status =
+            "knobs: Tab or the arrows between the fields · Enter applies · Esc back".into();
         self.dirty_frame = true;
     }
 
@@ -1890,10 +1891,10 @@ impl App {
                 self.status = "the knob keeps its value".into();
                 false
             }
-            KeyCode::Tab => {
-                editing
-                    .form
-                    .focus((editing.form.field + 1) % Field::ALL.len());
+            // The fields of the form walk with the same keys as the smart
+            // action's form: Tab, Shift+Tab and the vertical arrows.
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Down | KeyCode::Up => {
+                editing.form.navigate(&key);
                 true
             }
             KeyCode::Enter if !primary => !self.apply_knobs_form(editing),
@@ -4134,5 +4135,50 @@ mod tests {
         assert!(!panel.presets.as_ref().expect("the section").open);
         assert_eq!(panel.selected, knobs, "the hand stands on the heading");
         assert_eq!(app.knobs_row_count(), knobs + 1);
+    }
+
+    /// The value form of a rail walks its fields with the same keys as the
+    /// smart action's form: ↓ and Tab forward, ↑ and Shift+Tab back, and
+    /// ← and → stay with the field's own caret.
+    #[test]
+    fn the_knobs_form_walks_its_fields_with_the_arrows() {
+        use super::super::tests::support::{app_over, press};
+        use crate::editor::{ByteOffset, Selection};
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut app = app_over(directory.path());
+        let score = "$: note(\"c3\").lpf(800)";
+        app.scenes.current_mut().editor = Editor::new(score).expect("score");
+        let _ = app
+            .scenes
+            .current_mut()
+            .editor
+            .set_selection(Selection::caret(ByteOffset(score.len() - 1)));
+        app.open_knobs_panel(true);
+        app.refresh_knobs(Rect::default());
+        press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+        let field = |app: &App| {
+            app.knobs_panel
+                .as_ref()
+                .and_then(|panel| panel.editing.as_ref())
+                .map(|editing| editing.form.field)
+        };
+        assert_eq!(field(&app), Some(0), "the form opens on the value");
+
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(field(&app), Some(1), "↓ walks to the next field");
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(field(&app), Some(0), "↑ walks back");
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(field(&app), Some(1), "Tab walks forward");
+        press(&mut app, KeyCode::BackTab, KeyModifiers::NONE);
+        assert_eq!(field(&app), Some(0), "Shift+Tab walks back");
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(field(&app), Some(3), "↑ wraps around to the last field");
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(
+            field(&app),
+            Some(3),
+            "→ is the field's own caret, not a field walk"
+        );
     }
 }
