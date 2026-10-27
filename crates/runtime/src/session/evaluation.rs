@@ -1454,8 +1454,12 @@ impl Session {
     ///
     /// Cheap probes keep the established 80 ms response. Heavy probes derive
     /// runway from the *bounded* budget rather than an uncapped cycle: at a
-    /// very low tempo the probe itself is capped at 250 ms, so an edit never
-    /// acquires multi-second artificial latency.
+    /// very low tempo the probe itself is capped, so an edit never acquires
+    /// multi-second artificial latency. A probe that overran even that
+    /// bounded budget - a slow machine's honest measurement - sets the
+    /// runway from what it actually took, still inside the 2 s evaluation
+    /// ceiling: capping below the measured probe guarantees the first
+    /// window publishes after its takeover and the edit rolls back.
     #[cfg(any(feature = "device-audio", test))]
     pub(super) fn live_replacement_takeover_headroom(
         realtime_cps: Option<f64>,
@@ -1471,11 +1475,20 @@ impl Session {
             return LIVE_REPLACEMENT_MIN_HEADROOM;
         }
         let query_budget = Self::live_replacement_probe_budget(realtime_cps);
-        Duration::from_secs_f64(
-            (query_budget.as_secs_f64() / LIVE_REPLACEMENT_QUERY_COMPUTE_SHARE)
-                .min(DEFAULT_HORIZON),
-        )
-        .max(LIVE_REPLACEMENT_MIN_HEADROOM)
+        let bounded = (query_budget.as_secs_f64() / LIVE_REPLACEMENT_QUERY_COMPUTE_SHARE)
+            .min(DEFAULT_HORIZON);
+        // The first window's query costs about what the probe cost. A probe
+        // inside the bounded span keeps the established latency; one that
+        // overran it is the slow machine's own measurement, and covering
+        // less than that would refuse the edit for the machine being slow.
+        let measured = probe_elapsed.as_secs_f64() / LIVE_REPLACEMENT_QUERY_COMPUTE_SHARE;
+        let runway = if measured > DEFAULT_HORIZON {
+            measured
+        } else {
+            bounded
+        };
+        Duration::from_secs_f64(runway.min(QUERY_JS_CPU_BUDGET.as_secs_f64()))
+            .max(LIVE_REPLACEMENT_MIN_HEADROOM)
     }
 
     /// Query the first cycle of a candidate. A throw in any lane, contained
@@ -3598,6 +3611,22 @@ endin`";
         assert!(
             (capped_low_tempo.as_secs_f64() - 1.0 / 3.0).abs() < 1e-9,
             "the bounded 250 ms probe must not create a multi-second takeover: {capped_low_tempo:?}"
+        );
+
+        // A probe that overran the bounded budget is the slow machine's own
+        // measurement: the runway must cover an equivalent first query, or
+        // the edit is refused for the machine being slow.
+        let slow_probe =
+            Session::live_replacement_takeover_headroom(Some(0.5), Duration::from_millis(900));
+        assert_eq!(
+            slow_probe,
+            Duration::from_secs_f64(0.9 / LIVE_REPLACEMENT_QUERY_COMPUTE_SHARE),
+            "a measured-heavy probe sets the runway from its own cost"
+        );
+        assert_eq!(
+            Session::live_replacement_takeover_headroom(Some(0.5), Duration::from_secs(9)),
+            QUERY_JS_CPU_BUDGET,
+            "and never past the evaluation ceiling"
         );
     }
 
