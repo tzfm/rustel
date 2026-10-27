@@ -269,6 +269,14 @@ pub(crate) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
         ) {
             TextAction::Ignored
         } else {
+            // The set panel shows this only over an open search box,
+            // where `/` retypes the standing query. The other surfaces
+            // take `/` as one more way into Insert, which the standing
+            // hint already covers.
+            let typing_hint = match surface.panel_kind() {
+                PanelKind::Set => "press i or a to type, or / to retype",
+                _ => "press i or a to type",
+            };
             match key.code {
                 KeyCode::Char('i' | 'a') => TextAction::EnterInsert,
                 // `/` retypes: the key that opened the box takes it
@@ -281,13 +289,13 @@ pub(crate) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
                 // none, it is text and Command keeps it out.
                 KeyCode::Char(' ') if surface.space_command() => TextAction::Ignored,
                 KeyCode::Char(' ') | KeyCode::Backspace | KeyCode::Delete => {
-                    TextAction::Message("press i or a to type")
+                    TextAction::Message(typing_hint)
                 }
                 KeyCode::Char(character) if !character.is_control() => {
                     if let Some(alias) = alias {
                         TextAction::Arrow(surface.panel_kind(), alias.code)
                     } else {
-                        TextAction::Message("press i or a to type")
+                        TextAction::Message(typing_hint)
                     }
                 }
                 _ => TextAction::Ignored,

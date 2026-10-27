@@ -1075,7 +1075,11 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
         let live_tape_hint = format!("{reveal} reveal · n new first");
         let folder_hint = format!("{reveal} reveal · +/- size");
         let hints = if self.panel.search_typing() {
-            ["Enter keep · Esc drop", "type to filter the scores"]
+            if self.panel.vim_insert {
+                ["Enter keeps the filter", "Esc leaves insert"]
+            } else {
+                ["Enter keeps the filter", "Esc clears the filter"]
+            }
         } else if self.panel.unsaved.is_some() {
             ["Enter retry · Del leave", "Esc keep the set"]
         } else if let Some(tape) = self.panel.selected_tape() {
@@ -1272,8 +1276,23 @@ mod selection_tests {
             rows.join("\n")
         );
         assert!(
-            rows.iter().any(|row| row.contains("Enter keep · Esc drop")),
+            rows.iter()
+                .any(|row| row.contains("Enter keeps the filter")),
             "the box's hints stand in for the row hints:\n{}",
+            rows.join("\n")
+        );
+        panel.vim_insert = true;
+        let rows = rendered_rows(&panel, AREA, true);
+        assert!(
+            rows.iter().any(|row| row.contains("Esc leaves insert")),
+            "in Insert the hints say what the first Esc does:\n{}",
+            rows.join("\n")
+        );
+        panel.vim_insert = false;
+        let rows = rendered_rows(&panel, AREA, true);
+        assert!(
+            rows.iter().any(|row| row.contains("Esc clears the filter")),
+            "out of Insert the hints say what the second Esc does:\n{}",
             rows.join("\n")
         );
         panel.search_key(KeyCode::Enter);
