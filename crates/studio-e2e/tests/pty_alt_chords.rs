@@ -834,3 +834,82 @@ fn iterm2s_composed_digit_selects_the_strip_score() {
         terminal.diagnostics()
     );
 }
+
+/// The composition a protocol terminal reports beside the Alt digit must
+/// not swallow the chord. Ghostty and kitty push the digit with the Alt
+/// bit and the composed character as text; the exotic composition gives
+/// up the chord, the way the US Option+1 spelling ¡ does.
+#[test]
+#[cfg(unix)]
+fn a_negotiated_exotic_composition_selects_the_strip_score() {
+    let Some(binary) = rustel_binary() else {
+        panic!("build the binary first");
+    };
+    let home = tempfile::tempdir().expect("temporary home");
+    std::fs::write(
+        home.path().join("live.strudel"),
+        "$: note(\"c4\").s(\"sine\")\n",
+    )
+    .expect("starter score");
+    let mut terminal = Terminal::open_negotiating(&binary, 24, 80, home.path(), "ghostty");
+    assert!(
+        terminal.wait_for(" ready", Duration::from_secs(30)),
+        "the studio never finished loading:\n{}",
+        terminal.diagnostics()
+    );
+    terminal.write(&[0x0e, 0x0e]);
+    assert!(
+        terminal.wait_for_screen("scene 3 - ", Duration::from_secs(10)),
+        "Ctrl+N twice never put a third score on the strip:\n{}",
+        terminal.diagnostics()
+    );
+    // The stream a real Ghostty sends under the studio's five flags:
+    // the Option press, then the digit with the Alt bit and the composed
+    // text as the last sub-param, then the releases.
+    terminal.write(b"\x1b[57443;3:1u\x1b[49;3:1;161u\x1b[49;3:3;161u\x1b[57443;3:3u");
+    assert!(
+        terminal.wait_for_screen("scene 1 - live", Duration::from_secs(10)),
+        "the composed Option+1 never selected the first score:\n{}",
+        terminal.diagnostics()
+    );
+}
+
+/// A plain ASCII composition is real typing on some layouts - Option+2 is
+/// the one way to type @ in Swedish - so under the same flags it types
+/// into the score and moves nothing on the strip.
+#[test]
+#[cfg(unix)]
+fn a_negotiated_plain_composition_types_instead_of_selecting() {
+    let Some(binary) = rustel_binary() else {
+        panic!("build the binary first");
+    };
+    let home = tempfile::tempdir().expect("temporary home");
+    std::fs::write(
+        home.path().join("live.strudel"),
+        "$: note(\"c4\").s(\"sine\")\n",
+    )
+    .expect("starter score");
+    let mut terminal = Terminal::open_negotiating(&binary, 24, 80, home.path(), "ghostty");
+    assert!(
+        terminal.wait_for(" ready", Duration::from_secs(30)),
+        "the studio never finished loading:\n{}",
+        terminal.diagnostics()
+    );
+    terminal.write(&[0x0e, 0x0e]);
+    assert!(
+        terminal.wait_for_screen("scene 3 - ", Duration::from_secs(10)),
+        "Ctrl+N twice never put a third score on the strip:\n{}",
+        terminal.diagnostics()
+    );
+    terminal.write(b"\x1b[57443;3:1u\x1b[50;3:1;64u\x1b[50;3:3;64u\x1b[57443;3:3u");
+    assert!(
+        terminal.wait_for_screen("@", Duration::from_secs(10)),
+        "the composed Option+2 never typed its text:\n{}",
+        terminal.diagnostics()
+    );
+    assert!(
+        !terminal.text().contains("scene 2 - "),
+        "the plain composition selected a strip score:\n{}",
+        terminal.text()
+    );
+}

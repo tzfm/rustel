@@ -435,17 +435,36 @@ impl App {
         result
     }
 
+    /// Whether the text a terminal composed for an Option key spells the
+    /// Alt chord over typing. Only an exotic one-character composition
+    /// does: the US Option+2, ™, is no character anyone types. A plain
+    /// ASCII one steps aside, because on a Swedish layout Option+2 is the
+    /// one way to type @, and a longer composition pastes.
+    fn composition_spells_the_chord(text: &str) -> bool {
+        let mut characters = text.chars();
+        characters
+            .next()
+            .is_some_and(|character| !character.is_ascii())
+            && characters.next().is_none()
+    }
+
     /// Recover an Option panel chord from the composed character a terminal
     /// sends. Only where the focused surface answers to that Option letter,
     /// so the same character types normally everywhere else.
+    ///
+    /// A terminal that carries the keyboard protocol reports Alt itself, in
+    /// the key the composition rides, so no terminal table is needed for
+    /// that spelling: the protocol is the fact. A legacy terminal sends the
+    /// composed character alone, and the table below reads it.
     fn option_panel_spelling(&self, event: Event) -> Event {
         match &event {
-            Event::KeyWithText { key, .. }
+            Event::KeyWithText { key, text }
                 if key.modifiers == KeyModifiers::ALT
                     && let KeyCode::Char(letter) = key.code =>
             {
                 let letter = letter.to_ascii_lowercase();
-                if self.alt_panel_action_applies(letter) && self.keybinds.composes_option(letter) {
+                if self.alt_panel_action_applies(letter) && Self::composition_spells_the_chord(text)
+                {
                     return Event::Key(KeyEvent::new_with_kind_and_state(
                         KeyCode::Char(letter),
                         KeyModifiers::ALT,
@@ -2968,6 +2987,42 @@ mod tests {
             );
             assert_eq!(app.scenes.current().name(), "first");
         }
+
+        /// A terminal that carries the keyboard protocol reports the Alt
+        /// key itself, with the composition riding beside it. The exotic
+        /// composition gives up the chord, with no terminal table at all.
+        /// A plain ASCII one keeps typing, because on a Swedish layout
+        /// Option+2 is the one way to type @.
+        #[test]
+        fn a_protocols_composed_digit_recovers_the_chord() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_with_two_scores(directory.path());
+            app.handle_terminal_event(Event::KeyWithText {
+                key: KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT),
+                text: "¡".into(),
+            })
+            .expect("composed digit");
+            assert_eq!(
+                app.scenes.current().name(),
+                "first",
+                "the protocol's Alt+1 reached the strip"
+            );
+            app.handle_terminal_event(Event::KeyWithText {
+                key: KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
+                text: "@".into(),
+            })
+            .expect("composed digit");
+            assert_eq!(
+                app.scenes.current().name(),
+                "first",
+                "the plain composition did not reach the strip"
+            );
+            assert!(
+                app.editor().source().contains('@'),
+                "the plain composition typed: {:?}",
+                app.editor().source()
+            );
+        }
     }
 
     mod paging {
@@ -4057,6 +4112,32 @@ mod tests {
             )))
             .unwrap();
             assert!(app.reveal_pending.is_none(), "{}", app.status);
+            // SAFETY: give the environment back before other tests run.
+            unsafe { std::env::remove_var(crate::reveal::HEADLESS_ENV) };
+        }
+
+        /// A terminal that carries the keyboard protocol composes Alt+O
+        /// into `ø` as well, but reports the Alt bit beside it. The chord
+        /// still reveals the set panel's selected file, with no terminal
+        /// table behind it.
+        #[test]
+        fn a_protocols_composed_option_o_still_reveals_the_set_panels_selection() {
+            // SAFETY: process-global environment, held only by this test
+            // while the studio suite runs one test at a time.
+            unsafe { std::env::set_var(crate::reveal::HEADLESS_ENV, "1") };
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_for(directory.path(), "Ghostty", true);
+            action(&mut app, BindAction::SetPanel);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Set));
+            assert!(app.set_prompt.is_none(), "{}", app.status);
+            app.status.clear();
+            app.handle_terminal_event(Event::KeyWithText {
+                key: KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT),
+                text: "ø".into(),
+            })
+            .unwrap();
+            assert!(app.reveal_pending.is_some(), "{}", app.status);
+            assert!(app.status.starts_with("opening"), "{}", app.status);
             // SAFETY: give the environment back before other tests run.
             unsafe { std::env::remove_var(crate::reveal::HEADLESS_ENV) };
         }
