@@ -1012,7 +1012,8 @@ impl Session {
             now,
             restart_transport,
             candidate_settings,
-            Self::live_replacement_takeover_headroom(realtime_cps, probe_elapsed),
+            Self::live_replacement_takeover_headroom(realtime_cps, probe_elapsed)
+                .max(self.replacement_headroom_floor),
         )?;
         // The commit forgot the plugin lines said before. The lines of the
         // plan go out now, so a note of the score with the same line gives

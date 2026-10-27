@@ -53,9 +53,27 @@ use rustel_runtime::ui_events::{
     source_revision,
 };
 use rustel_runtime::{
-    EnginePressureMonitor, EnginePressureSnapshot, LiveFileProducer, LiveProducerStep,
-    RuntimeError, Session, SessionConfig,
+    DEFAULT_HORIZON, EnginePressureMonitor, EnginePressureSnapshot, LIVE_REPLACEMENT_MIN_HEADROOM,
+    LiveFileProducer, LiveProducerStep, RuntimeError, Session, SessionConfig,
 };
+
+/// The most the studio lets the scheduling horizon grow. An evaluation
+/// slower than this still drains the ring, and the replacement it arms
+/// rolls back rather than taking over into a gap.
+const MAX_LIVE_HORIZON: f64 = 2.0;
+
+/// The horizon that keeps a replacement's takeover inside scheduled audio
+/// after an evaluation of the playing score took `evaluation`.
+///
+/// The engine thread is also the live producer, so while it compiles nothing
+/// refills the ring, and a replacement armed after a compile longer than the
+/// ring holds takes over past its last scheduled onset: the refusal that
+/// follows keeps the old score and drops the edit. Twice the compile plus a
+/// tenth keeps a full ring through the next one; a fast machine's compile
+/// never reaches the default horizon, so it schedules as before.
+pub(super) fn horizon_for_evaluation(evaluation: Duration) -> f64 {
+    (evaluation.as_secs_f64() * 2.0 + 0.1).clamp(DEFAULT_HORIZON, MAX_LIVE_HORIZON)
+}
 
 /// Scheduling cadence used by the native studio worker.
 pub const DEFAULT_STUDIO_POLL_INTERVAL: Duration = Duration::from_millis(2);
@@ -1123,6 +1141,10 @@ const BATON_SETTLE_CALLBACKS: u64 = 2;
 pub struct StudioEngine {
     config: StudioConfig,
     session: Session,
+    /// The horizon the session keeps filled, raised when an evaluation of the
+    /// playing score runs longer than the audio scheduled ahead of the clock
+    /// (see [`Self::widen_horizon_for_evaluation`]).
+    live_horizon: f64,
     recovery_epoch: u64,
     launch_pads: Vec<(u8, u8)>,
     live: Option<StudioPlayback>,
@@ -1703,6 +1725,7 @@ impl StudioEngine {
         Ok(Self {
             config,
             session,
+            live_horizon: DEFAULT_HORIZON,
             recovery_epoch: 0,
             launch_pads: Vec::new(),
             live: None,
