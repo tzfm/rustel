@@ -1577,8 +1577,9 @@ mod tests {
         assert_eq!(sheet.target, PathBuf::from("/tmp/bounces/take one.wav"));
         // …and a flip of the format follows it, but never rewrites a
         // deliberate extension.
-        sheet.key(KeyCode::Tab, true);
-        sheet.key(KeyCode::Tab, true);
+        while sheet.field != Field::Format {
+            sheet.key(KeyCode::Tab, true);
+        }
         sheet.key(KeyCode::Right, false);
         let extension = if MP3_EXPORT { "mp3" } else { "wav" };
         assert_eq!(
@@ -1588,11 +1589,10 @@ mod tests {
         sheet.target = PathBuf::from("/tmp/bounces/take.final");
         sheet.key(KeyCode::Left, false);
         assert_eq!(sheet.target, PathBuf::from("/tmp/bounces/take.final"));
-        // Tab wraps back to the top through the limiter and to lines.
-        sheet.key(KeyCode::Tab, false);
-        sheet.key(KeyCode::Tab, false);
-        sheet.key(KeyCode::Tab, false);
-        assert_eq!(sheet.field, Field::Length);
+        // Tab wraps back to the top through the limiter, stems and to lines.
+        while sheet.field != Field::Length {
+            sheet.key(KeyCode::Tab, false);
+        }
     }
 
     #[test]
