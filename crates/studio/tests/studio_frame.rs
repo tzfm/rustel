@@ -536,7 +536,10 @@ fn a_sheet_paints_over_a_visuals_dock() {
                     jobs: None,
                     memory: None,
                     log_memory: None,
-                    export: Some(&sheet),
+                    export: Some(view::ExportView {
+                        sheet: &sheet,
+                        glance: None,
+                    }),
                     theme_picker: None,
                     set_panel: None,
                     set_prompt: None,

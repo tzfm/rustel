@@ -269,15 +269,7 @@ impl Widget for Header<'_, '_> {
                 Some(percent) => format!("{percent}%"),
                 None => format!("{}:{:02}", total / 60, total % 60),
             };
-            let scope = glance
-                .peaks
-                .iter()
-                .map(|peak| {
-                    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-                    let level = peak.clamp(0.0, 1.0).sqrt();
-                    BARS[((level * 7.0).round() as usize).min(7)]
-                })
-                .collect::<String>();
+            let scope = crate::export::scope_line(&glance.peaks);
             let text = format!("⇣ {} {how_far} {scope}", glance.scene_name);
             buffer.set_stringn(
                 after_go,

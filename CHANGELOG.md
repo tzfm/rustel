@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- The export sheet stays open over its bounce, as a DAW's render window does. A percent and a bar say how far under a chosen ceiling, a scope moves with what it hears, and an open end keeps a clock. Esc runs the bounce on in the header, and the export chord ends it early and keeps the file.
 - Ctrl with Shift and a digit selects the strip's score too. Option types real characters on some layouts, and those digits keep typing, so the Ctrl spelling is the one that holds on every layout: Ctrl composes nothing anywhere. A chord learnt over the key retires it, and the help names both spellings.
 - Alt with a digit reaches the strip on every terminal that carries the keyboard protocol, Ghostty and kitty among them. Those terminals report the digit with the Alt bit and its composed text beside it, and the studio took the text, typing `@` into the score where a Swedish layout composes it. A composition of one exotic character now gives its Alt chord back, so the US Option+2 `™` and the Swedish Option+3 `£` select where they typed, while a plain typeable character keeps typing, so the one way to type `@`, `$`, `|`, `[` or `]` on a Swedish layout stays open.
 - The set panel reads each score's saved time once, with the folder. The details block asked the file system on every redraw, which costs nothing on local disk and seconds on a synced or network folder, where it landed on every search keypress.

@@ -346,6 +346,14 @@ pub enum SceneStripMode {
     Learning,
 }
 
+/// The export sheet the chrome draws: its settings face, or the same
+/// sheet over a running bounce, with the render's glance.
+pub struct ExportView<'a> {
+    pub sheet: &'a ExportSheet,
+    /// The running bounce, when one is under the sheet.
+    pub glance: Option<&'a ExportGlance>,
+}
+
 pub struct StudioChrome<'a> {
     pub caret_visible: bool,
     pub keybinds: &'a super::keybinds::Keybinds,
@@ -764,8 +772,9 @@ pub struct StudioView<'a> {
     /// What the docked memory breakdown shows and the room it asks the
     /// layout for, while it is open.
     pub memory: Option<(super::memory::MemoryFigures, super::viz_panel::Dock)>,
-    /// The export sheet, when it is open.
-    pub export: Option<&'a ExportSheet>,
+    /// The export sheet, when it is open: its settings face, or over a
+    /// running bounce the render's progress.
+    pub export: Option<ExportView<'a>>,
     /// The theme picker, when it is open.
     pub theme_picker: Option<&'a ThemePicker>,
     /// The set panel, when it is open.
@@ -1345,12 +1354,17 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
             area,
         );
     }
-    if let Some(sheet) = view.export {
+    if let Some(export) = view.export {
+        // The render face names the chord that ends a bounce early, in the
+        // spelling the keybind table holds.
+        let export_hint = chrome.keybinds.hint(super::keybinds::BindAction::Export);
         frame.render_widget(
             ExportSheetView {
-                sheet,
+                sheet: export.sheet,
                 theme,
                 vim: chrome.vim_text_modes,
+                exporting: export.glance,
+                export_hint: &export_hint,
             },
             area,
         );

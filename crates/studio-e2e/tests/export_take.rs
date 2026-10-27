@@ -148,6 +148,49 @@ fn enter_renders_the_scene_into_the_exports_folder() {
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
 }
 
+/// The sheet stays open over the bounce it starts, as a DAW's render
+/// window: the row says how far with a percent, and the hint names the
+/// way out. Esc closes the window, and the bounce runs on in the header
+/// until it lands.
+#[test]
+fn the_sheet_shows_the_render_over_its_bounce() {
+    let mut studio = hermetic();
+
+    studio.set_score("$: s(\"bd\")");
+    studio.chord("ctrl+shift+x");
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    // The first frame can predate the worker's first write, so the percent
+    // arrives with the render's own first progress.
+    studio.pump_until(
+        EXPORT_BUDGET,
+        "the render row showed its percent",
+        |studio| {
+            let rows = studio.rows();
+            rows.iter()
+                .any(|row| row.contains("rendering first") && row.contains('%'))
+        },
+    );
+    let rows = studio.rows();
+    row_containing(&rows, "ends it early and keeps the file");
+
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(
+        studio.status().contains("runs on"),
+        "the status says where the bounce went: {}",
+        studio.status()
+    );
+    row_containing(&studio.rows(), "⇣ first");
+
+    studio.pump_until(EXPORT_BUDGET, "the export landed", |studio| {
+        studio.status().starts_with("exported")
+    });
+    assert!(
+        studio.status().starts_with("exported first - "),
+        "{}",
+        studio.status()
+    );
+}
+
 /// Stems from the sheet: beside the take a `<name> stems` folder holds the
 /// same bounce as `main.wav` plus one wav a sounding orbit, and the status
 /// names the folder, because the take itself is inside it.
