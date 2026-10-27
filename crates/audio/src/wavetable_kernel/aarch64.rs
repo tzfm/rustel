@@ -95,14 +95,19 @@ unsafe fn gather(
     pcm: &[f32],
     offsets: std::arch::aarch64::int32x4_t,
 ) -> std::arch::aarch64::float32x4_t {
-    let mut lanes = [0.0f32; LANES_PER_VECTOR];
-    for (slot, lane) in lanes.iter_mut().enumerate() {
-        // SAFETY: the caller validated the complete frames these offsets
-        // address, and this kernel stays inside `count` lanes.
-        let offset = vgetq_lane_s32(offsets, lane);
-        *slot = *pcm.get_unchecked(offset as usize);
+    // The lane index of `vgetq_lane_s32` is a compile-time constant, so the
+    // four reads are spelled out.
+    // SAFETY: the caller validated the complete frames these offsets
+    // address, and this kernel stays inside `count` lanes.
+    unsafe {
+        let lanes = [
+            *pcm.get_unchecked(vgetq_lane_s32(offsets, 0) as usize),
+            *pcm.get_unchecked(vgetq_lane_s32(offsets, 1) as usize),
+            *pcm.get_unchecked(vgetq_lane_s32(offsets, 2) as usize),
+            *pcm.get_unchecked(vgetq_lane_s32(offsets, 3) as usize),
+        ];
+        vld1q_f32(lanes.as_ptr())
     }
-    std::arch::aarch64::vld1q_f32(lanes.as_ptr())
 }
 
 fn scalar_interpolate(

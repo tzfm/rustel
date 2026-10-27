@@ -129,9 +129,8 @@ impl WavetableKernel {
         true
     }
 
-    /// Non-x86 targets retain the scalar path until a target-specific kernel
-    /// has independently passed the same fidelity and performance gates.
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    /// Targets without a compiled kernel retain the scalar path.
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_interpolate(
         self,
@@ -148,7 +147,7 @@ impl WavetableKernel {
     }
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
 fn complete_frame(pcm_len: usize, frame_len: usize, frame: usize) -> bool {
     frame
         .checked_mul(frame_len)
@@ -194,7 +193,16 @@ mod tests {
                 WavetableKernelKind::Portable
             }
         );
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(
+            selected_wavetable_kernel_kind(),
+            if std::arch::is_aarch64_feature_detected!("neon") {
+                WavetableKernelKind::Neon
+            } else {
+                WavetableKernelKind::Portable
+            }
+        );
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
         assert_eq!(
             selected_wavetable_kernel_kind(),
             WavetableKernelKind::Portable
@@ -204,6 +212,10 @@ mod tests {
         assert_eq!(
             WavetableKernelKind::Avx2.compiled(),
             cfg!(any(target_arch = "x86", target_arch = "x86_64"))
+        );
+        assert_eq!(
+            WavetableKernelKind::Neon.compiled(),
+            cfg!(target_arch = "aarch64")
         );
     }
 
