@@ -1270,6 +1270,7 @@ pub fn render(frame: &mut Frame<'_>, view: StudioView<'_>, chrome: StudioChrome<
                 on_right: layout.sidebar_side == Side::Right,
                 focused: view.focused_panel == Some(PanelKind::Set),
                 keybinds: chrome.keybinds,
+                caret_lit: chrome.caret_visible,
             },
             area,
         );

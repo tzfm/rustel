@@ -194,8 +194,11 @@ filter keys.
 Press `/` to filter the scores: type, and the panel hides the scores the query
 does not answer. A query matches a name or any `@` field value. Enter leaves
 the filter standing and moves to the first match. Esc restores the full list.
-The sessions fold is never filtered. In vim mode the box rests in command
-mode: press `i` or `a` to type.
+The sessions fold is never filtered. The box shows its caret while it types.
+When the query matches nothing, the row says no match and blinks, so an empty
+list cannot read as an empty folder. While a filter stands, Backspace takes the
+box back up and deletes from the query. It never starts a delete of a file. In
+vim mode the box rests in command mode: press `i` or `a` to type.
 
 Delete asks for confirmation before it removes a file. Confirming also discards
 its unsaved edits. Studio does not delete the last score or the active session

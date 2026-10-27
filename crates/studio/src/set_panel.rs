@@ -826,6 +826,11 @@ pub struct SetPanelView<'a> {
     pub on_right: bool,
     pub focused: bool,
     pub keybinds: &'a super::keybinds::Keybinds,
+    /// Whether the studio's caret is lit this frame: the search box's
+    /// caret blinks in step with it, and a query with no match blinks
+    /// with it too, so the panel moves the way the rest of the studio
+    /// does.
+    pub caret_lit: bool,
 }
 
 impl ratatui::widgets::Widget for SetPanelView<'_> {
@@ -1050,16 +1055,45 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
             }
         } else if let Some(search) = &self.panel.search {
             // The search row, in the reference panel's look: what the
-            // filter holds. Vim's `/` lands in Insert, so a query it
-            // opens starts typing at once.
-            let row = format!("search: {}", search.query);
+            // filter holds, with a caret while it types the way the
+            // picker's field does. A query with no match says so in the
+            // find bar's words, and blinks with the studio's caret, so a
+            // forgotten filter is not mistaken for an empty folder.
+            use unicode_width::UnicodeWidthStr;
+            let answers = self
+                .panel
+                .lines
+                .iter()
+                .any(|line| matches!(line, SetLine::File(_)));
+            let row = if answers {
+                format!("search: {}", search.query)
+            } else {
+                format!("search: {} · no match", search.query)
+            };
+            let caret = "search: ".len() + search.query.width();
+            let room = usize::from(error.width);
             buffer.set_stringn(
                 error.x,
                 error.y,
                 &row,
-                usize::from(error.width),
-                Style::default().fg(theme.foreground),
+                room,
+                Style::default().fg(if answers {
+                    theme.foreground
+                } else if self.caret_lit {
+                    theme.error
+                } else {
+                    theme.muted
+                }),
             );
+            if self.panel.search_typing() && caret < room {
+                // The caret as a reversed cell, over the character it
+                // stands before - or the space after the text, as the
+                // picker's field draws it.
+                buffer.set_style(
+                    Rect::new(error.x + caret as u16, error.y, 1, 1),
+                    Style::default().add_modifier(Modifier::REVERSED),
+                );
+            }
         }
         if self.panel.error.is_none()
             && self.panel.deleting.is_none()
@@ -1313,6 +1347,99 @@ mod selection_tests {
         assert!(rows.iter().all(|row| !row.contains("search: ")));
         assert!(rows.iter().any(|row| row.contains("could not open")));
     }
+
+    /// The search row says when a query matches nothing, in the find
+    /// bar's words, and moves with the studio: the row blinks between
+    /// the error and muted colours with the caret's phase, so a
+    /// forgotten filter cannot read as an empty folder, and while the
+    /// box types a reversed cell stands where the next character lands,
+    /// the way the picker's field draws it.
+    #[test]
+    fn the_search_row_blinks_with_no_match_and_shows_a_caret() {
+        use ratatui::widgets::Widget;
+        let directory = tempfile::tempdir().unwrap();
+        let mut panel = panel_with_a_tape(directory.path());
+        panel.open_search();
+        for character in "zz".chars() {
+            panel.search_key(KeyCode::Char(character));
+        }
+        assert!(
+            !panel
+                .lines
+                .iter()
+                .any(|line| matches!(line, SetLine::File(_))),
+            "the query answers nothing the folder holds"
+        );
+
+        let theme = Theme::built_in_default();
+        let draw = |panel: &SetPanel, caret_lit: bool| {
+            let mut buffer = Buffer::empty(AREA);
+            SetPanelView {
+                panel,
+                theme: &theme,
+                sidebar: AREA,
+                on_right: true,
+                focused: true,
+                keybinds: &crate::keybinds::Keybinds::default(),
+                caret_lit,
+            }
+            .render(AREA, &mut buffer);
+            let texts: Vec<String> = (0..AREA.height)
+                .map(|y| (0..AREA.width).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect();
+            let row = texts
+                .iter()
+                .position(|row| row.contains("search: zz"))
+                .expect("the search row");
+            // `find` hands back a byte offset, and the rule's "│" is three
+            // bytes wide, so count characters for the cell column.
+            let byte = texts[row]
+                .find("search")
+                .expect("where the row's text starts");
+            let start = texts[row][..byte].chars().count();
+            let cells: Vec<_> = (0..AREA.width)
+                .map(|x| buffer[(x, row as u16)].clone())
+                .collect();
+            (texts[row].clone(), start, cells)
+        };
+
+        // The box typing: the row says no match, blinks between
+        // the colours, and the caret cell is reversed at the caret's
+        // place - just past the query.
+        let (row, start, cells) = draw(&panel, true);
+        assert!(row.contains("no match"), "{row}");
+        assert!(
+            cells[start].style().fg == Some(theme.error),
+            "the lit phase shows the row in the error colour"
+        );
+        let (_, _, cells) = draw(&panel, false);
+        assert!(
+            cells[start].style().fg == Some(theme.muted),
+            "the dark phase rests the row in the muted colour"
+        );
+        let (_, _, cells) = draw(&panel, true);
+        let caret = start + "search: ".len() + "zz".len();
+        assert!(
+            cells[caret]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED),
+            "the caret stands just past the query: row {row}"
+        );
+
+        // The filter standing: the row keeps blinking, the caret rests.
+        panel.search_key(KeyCode::Enter);
+        let (row, start, cells) = draw(&panel, true);
+        assert!(row.contains("no match"), "{row}");
+        assert!(cells[start].style().fg == Some(theme.error));
+        assert!(
+            cells.iter().all(|cell| !cell
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED)),
+            "nothing is reversed while the box does not type"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1338,6 +1465,7 @@ mod tests {
             on_right: true,
             focused,
             keybinds: &crate::keybinds::Keybinds::default(),
+            caret_lit: true,
         }
         .render(area, &mut buffer);
         (0..area.height)
@@ -1608,6 +1736,7 @@ mod tests {
                 on_right: false,
                 focused: true,
                 keybinds: &crate::keybinds::Keybinds::default(),
+                caret_lit: true,
             }
             .render(area, &mut buffer);
             (0..area.height)
