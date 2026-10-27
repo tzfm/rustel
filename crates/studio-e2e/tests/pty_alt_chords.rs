@@ -51,12 +51,17 @@ fn rustel_binary() -> Option<std::path::PathBuf> {
 
 struct Terminal {
     buffer: Arc<Mutex<Vec<u8>>>,
-    writer: Box<dyn Write + Send>,
+    // One writer, shared with the handshake responder a negotiated open
+    // spawns: portable-pty hands out a single writer per master.
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Box<dyn Child + Send + Sync>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     // The master must outlive the child: on Windows dropping it closes the
     // ConPTY and takes the child with it.
     _master: Box<dyn MasterPty + Send>,
+    // The responder stops itself once it has answered, so the join handle
+    // only keeps the thread from outliving the terminal.
+    _responder: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Terminal {
@@ -73,6 +78,45 @@ impl Terminal {
         cols: u16,
         cwd: &std::path::Path,
         term_program: Option<&str>,
+    ) -> Self {
+        Self::open_with(binary, rows, cols, cwd, term_program, None)
+    }
+
+    /// The same studio, under a terminal that also answers the kitty
+    /// keyboard protocol handshake, so the studio negotiates the protocol
+    /// and pushes its flags, the way kitty and Ghostty do. The reply names
+    /// the flags the "terminal" supports, then the primary device
+    /// attributes, which is what the terminals send and what the studio's
+    /// probe waits for.
+    ///
+    /// Windows ConPTY does not carry the protocol, so the negotiated
+    /// proofs that use this open run on Unix alone, and the open exists
+    /// there with them.
+    #[cfg(unix)]
+    fn open_negotiating(
+        binary: &std::path::Path,
+        rows: u16,
+        cols: u16,
+        cwd: &std::path::Path,
+        term_program: &str,
+    ) -> Self {
+        Self::open_with(
+            binary,
+            rows,
+            cols,
+            cwd,
+            Some(term_program),
+            Some(b"\x1b[?31u\x1b[?62;1;2;6;9;15;18;21;22c".to_vec()),
+        )
+    }
+
+    fn open_with(
+        binary: &std::path::Path,
+        rows: u16,
+        cols: u16,
+        cwd: &std::path::Path,
+        term_program: Option<&str>,
+        handshake: Option<Vec<u8>>,
     ) -> Self {
         let pty = native_pty_system();
         let pair = pty
@@ -129,9 +173,37 @@ impl Terminal {
             .expect("the studio spawns on the pty");
         let killer = child.clone_killer();
         let reader = pair.master.try_clone_reader().expect("pty reader");
-        let writer = pair.master.take_writer().expect("pty writer");
+        let writer = Arc::new(Mutex::new(pair.master.take_writer().expect("pty writer")));
         let buffer = Arc::new(Mutex::new(Vec::new()));
         let gathered = Arc::clone(&buffer);
+        // A negotiated open answers the studio's handshake query, which is
+        // the first thing the studio writes. The responder waits for the
+        // gathered output to open with the query, so nothing later in the
+        // stream can take its answer, and answers it once.
+        let responder = handshake.map(|reply| {
+            let tail = Arc::clone(&buffer);
+            let replier = Arc::clone(&writer);
+            std::thread::Builder::new()
+                .name("handshake-responder".into())
+                .spawn(move || {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                    while std::time::Instant::now() < deadline {
+                        let asked = {
+                            let Ok(gathered) = tail.lock() else { return };
+                            gathered.starts_with(b"\x1b[?u")
+                        };
+                        if asked {
+                            if let Ok(mut writer) = replier.lock() {
+                                let _ = writer.write_all(&reply);
+                                let _ = writer.flush();
+                            }
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                })
+                .expect("the responder spawns")
+        });
         std::thread::Builder::new()
             .name("pty-drain".into())
             .spawn(move || {
@@ -155,6 +227,7 @@ impl Terminal {
             child,
             killer,
             _master: pair.master,
+            _responder: responder,
         }
     }
 
@@ -223,8 +296,9 @@ impl Terminal {
     }
 
     fn write(&mut self, bytes: &[u8]) {
-        self.writer.write_all(bytes).expect("the pty takes input");
-        self.writer.flush().expect("the pty flushes");
+        let mut writer = self.writer.lock().expect("the writer");
+        writer.write_all(bytes).expect("the pty takes input");
+        writer.flush().expect("the pty flushes");
     }
 }
 
@@ -660,6 +734,59 @@ fn alt_digits_select_strip_scores_in_both_wire_spellings() {
     assert!(
         terminal.wait_for_screen("no scene 9 on the strip", Duration::from_secs(10)),
         "the ESC-prefixed Alt+9 never reached the strip:\n{}",
+        terminal.diagnostics()
+    );
+}
+
+/// A negotiated keyboard delivers the Alt digit the way kitty and Ghostty
+/// do once the studio asks for the protocol: the Option press and release
+/// bracket the digit, which arrives as CSI u with the base key's codepoint
+/// and the Alt bit, whatever the layout composes Option into. A plain PTY
+/// cannot answer the handshake, so the harness answers it as the terminals
+/// do, and the studio negotiates and pushes its flags for real.
+#[cfg(unix)]
+#[test]
+fn negotiated_keyboards_option_digit_selects_the_strip_score() {
+    let Some(binary) = rustel_binary() else {
+        panic!("build the binary first");
+    };
+    let home = tempfile::tempdir().expect("temporary home");
+    std::fs::write(
+        home.path().join("live.strudel"),
+        "$: note(\"c4\").s(\"sine\")\n",
+    )
+    .expect("starter score");
+    let mut terminal = Terminal::open_negotiating(&binary, 24, 80, home.path(), "ghostty");
+    assert!(
+        terminal.wait_for(" ready", Duration::from_secs(30)),
+        "the studio never finished loading:\n{}",
+        terminal.diagnostics()
+    );
+    // A second score, now the selected one, so the digit has a selection
+    // to make.
+    terminal.write(&[0x0e]); // Ctrl+N: a new scene, written beside the set
+    assert!(
+        terminal.wait_for_screen("scene 2 - ", Duration::from_secs(10)),
+        "Ctrl+N never put a second score on the strip:\n{}",
+        terminal.diagnostics()
+    );
+    // The full negotiated stream for Option+1: the Option press (report
+    // all keys sends modifier presses too), then the digit with the Alt
+    // bit, then the release. The release carries an event type the
+    // studio never asked for, so its presence also proves a stray
+    // release cannot swallow the digit that follows.
+    terminal.write(b"\x1b[57443;1u\x1b[49;3u\x1b[57443;1:3u");
+    assert!(
+        terminal.wait_for_screen("scene 1 - live", Duration::from_secs(10)),
+        "the negotiated Option+1 never selected the first score:\n{}",
+        terminal.diagnostics()
+    );
+    // The same stream for Option+2, back the other way: the chord works
+    // while the flags stand, not only on the first press.
+    terminal.write(b"\x1b[57443;1u\x1b[50;3u\x1b[57443;1:3u");
+    assert!(
+        terminal.wait_for_screen("scene 2 - ", Duration::from_secs(10)),
+        "the negotiated Option+2 never selected the second score:\n{}",
         terminal.diagnostics()
     );
 }
