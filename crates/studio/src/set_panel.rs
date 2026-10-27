@@ -65,6 +65,11 @@ pub struct FileRow {
     pub dirty: bool,
     /// What its leading comments say about it, read off the file.
     pub meta: ScoreMeta,
+    /// When it was last saved, as the details block shows it. Read with
+    /// the folder, not on each redraw: a stat per redraw is invisible on
+    /// local disk and slow on a synced or network folder, where it lands
+    /// on every search keypress.
+    pub saved: Option<String>,
 }
 
 /// How many rows the details block at the panel's foot holds. Longer
@@ -189,6 +194,8 @@ impl SetPanel {
                     name: file.name,
                     path: file.path.clone(),
                     meta: ScoreMeta::read(&file.path),
+
+                    saved: saved_at(&file.path),
                     open: file.open,
                 }
             })
@@ -357,7 +364,7 @@ impl SetPanel {
                                 format!("@{key} {value}").trim_end().to_owned()
                             }),
                         );
-                        if let Some(saved) = saved_at(&file.path) {
+                        if let Some(saved) = &file.saved {
                             rows.push(format!("saved {saved}"));
                         }
                         rows
@@ -734,8 +741,8 @@ fn readable_stamp(stamp: &str) -> Option<String> {
     ))
 }
 
-/// When the file was last saved, read off its mtime the moment details
-/// are opened: `Sep 24 03:15:30`. None when the file cannot be asked.
+/// When the file was last saved, read off its mtime when the panel
+/// reads the folder: `Sep 24 03:15:30`. None when the file cannot be asked.
 fn saved_at(path: &Path) -> Option<String> {
     let seconds = std::fs::metadata(path)
         .ok()?
