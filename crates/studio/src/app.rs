@@ -89,6 +89,7 @@ use super::editor::{
     EditorEffect, EditorInput, HistoryMoment, KeyboardCapabilities, MemoryClipboard,
     PlatformClipboard, Revision, TerminalEventBatch, Transaction, VirtualRowSpec,
     composed_text_event, event_to_input_with_binds, is_plain_text_key_event, key_to_command,
+    sole_composed_character,
 };
 use super::engine::{DiagnosticAlert, Launch, LiveMaterial, StudioDiagnostic};
 use super::engine::{StudioConfig, StudioDeviceInfo, StudioDiagnosticLevel, StudioSnapshot};

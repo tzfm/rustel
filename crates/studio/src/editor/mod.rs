@@ -32,7 +32,9 @@ pub use input::{
     EditorInput, KeyboardCapabilities, PRIMARY_MODIFIER, click_extends, event_to_input,
     event_to_input_with_binds, is_stray_control, key_to_command,
 };
-pub(crate) use input::{TerminalEventBatch, composed_text_event, is_plain_text_key_event};
+pub(crate) use input::{
+    TerminalEventBatch, composed_text_event, is_plain_text_key_event, sole_composed_character,
+};
 pub use layout::{
     Affinity, CellPoint, CellSpan, GridRect, Hit, InlineVirtualRow, InlineWidth, RowStart,
     ScreenMap, ScreenRow, TextRow, Viewport, VirtualRowError, VirtualRowSpec, WRAP_MAX_LINE_BYTES,

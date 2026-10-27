@@ -441,11 +441,7 @@ impl App {
     /// ASCII one steps aside, because on a Swedish layout Option+2 is the
     /// one way to type @, and a longer composition pastes.
     fn composition_spells_the_chord(text: &str) -> bool {
-        let mut characters = text.chars();
-        characters
-            .next()
-            .is_some_and(|character| !character.is_ascii())
-            && characters.next().is_none()
+        sole_composed_character(text).is_some_and(|character| !character.is_ascii())
     }
 
     /// Recover an Option panel chord from the composed character a terminal
