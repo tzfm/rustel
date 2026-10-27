@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Alt with 1 to 9 selects that strip's score from the editor, as a digit on its row in the set panel does. The chord runs to nine, and a number the strip does not hold says so. On iTerm2 and Apple Terminal, where Option composes text, the composed digit is recovered into the chord.
 - The set panel's details block stands under a rule of its own, set off from the list the way the foot of a file manager's pane is.
 - The set panel's hints and help rows name the strip keys: 1 to 9 opens the strip's score, beside the open and filter keys the foot already names.
 - The set panel's foot follows a save: a score whose header changed on update renews its row's details without the score being reopened, and the reader's selection does not move. An edit another program saved renews them too.

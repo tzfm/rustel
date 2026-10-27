@@ -594,6 +594,7 @@ fn shortcut_rows_with_keybinds(
             scene_switch(true),
             "split: cycle the focused pane, skipping the other pane's scene",
         ),
+        HelpRow::new("Alt+1-9", "open the strip's numbered score"),
         HelpRow::new(hint(BindAction::NewScene), "new scene"),
         HelpRow::new(
             shortcut_with_alias(keybinds, BindAction::DuplicateScene),

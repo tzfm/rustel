@@ -425,6 +425,24 @@ impl App {
         self.dirty_frame = true;
     }
 
+    /// An Alt digit selects that strip's score, from one, the way the
+    /// digit on its row does: only a score already on the strip answers,
+    /// and the editor takes the keyboard back.
+    pub(super) fn select_strip_by_number(&mut self, strip: usize) {
+        let Some(id) = self.scenes.scores().nth(strip - 1).map(|scene| scene.id) else {
+            self.status = format!("no scene {strip} on the strip");
+            self.dirty_frame = true;
+            return;
+        };
+        if let Some(index) = self.scenes.index_of(id)
+            && self.select_scene(index)
+        {
+            self.refresh_set_panel(self.scenes.get(id).map(|scene| scene.path.clone()));
+            self.focus = Focus::Editor;
+            self.dirty_frame = true;
+        }
+    }
+
     /// What the chosen line names, and its path; whether it is the tape
     /// being written. None on the sessions fold.
     fn set_line_target(&self) -> Option<(String, PathBuf, bool)> {

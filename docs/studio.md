@@ -133,6 +133,11 @@ Selecting a scene changes the editor; it does not start playback. Update the
 selected scene to play it. The scene strip marks the playing scene with `▶`
 and unsaved edits with `●`.
 
+Alt with 1 to 9 selects the score that holds that number on the strip. It
+works while the editor has the keyboard, so you can switch scores without the
+set panel. The panel's rows show the numbers, and a number the strip does not
+hold says so in the footer.
+
 Use Ctrl+N for a new scene or F3 to duplicate the current scene. These actions
 create files. Scene > Rename scene renames the scene and its file. Rename has
 no default shortcut. You can assign one in Settings > Keybinds. Ctrl+W closes
