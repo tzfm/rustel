@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Backspace over a standing filter edits the query, never the file. The key a hand reaches for to fix a filter had fallen to the panel's delete arm, so a second press could confirm the delete of the score under it. Backspace takes the search box back up and deletes from its term; Delete keeps the ask-first arm it always had.
 - File ▸ Import Strudel patterns reads an export into the set already open: one named score file an entry lands in the set's folder, listed by the set panel with no tab taken up. A name the set already holds is skipped and counted, never overwritten, so the same file twice says there is nothing new in it.
 - File ▸ Open set says what it opens: a set or a Strudel pattern export. The prompt's title and hint name both, and the exports lying at the sets root are offered beside the sets with their pattern counts, so an export opens with Enter the way a set does instead of needing a typed path or a folder walk.
 - The export sheet stays open over its bounce, as a DAW's render window does. A percent and a bar say how far under a chosen ceiling, a scope moves with what it hears, and an open end keeps a clock. Esc runs the bounce on in the header, and the export chord ends it early and keeps the file.

@@ -421,6 +421,18 @@ impl SetPanel {
         });
     }
 
+    /// Backspace over a filter standing: the box takes the keyboard back
+    /// and the key deletes from the query, as it does while typing - the
+    /// one key that must never reach the files under the panel.
+    pub fn resume_search(&mut self) {
+        if let Some(search) = self.search.as_mut() {
+            search.typing = true;
+            search.query.pop();
+        }
+        self.error = None;
+        self.refilter();
+    }
+
     /// The list, read against the filter again: the query changed.
     pub fn refilter(&mut self) {
         self.rebuild();

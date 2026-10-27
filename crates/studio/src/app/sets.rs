@@ -341,6 +341,11 @@ impl App {
                     search.typing = true;
                 }
             }
+            // While a filter stands, Backspace takes the box back up and
+            // deletes from the query. The key a hand reaches for to fix a
+            // query must never arm a delete of the file under it - a
+            // second press would confirm it. Delete keeps that arm.
+            KeyCode::Backspace if panel.search.is_some() => panel.resume_search(),
             // The key the desk has for it: Delete, or the Mac's delete,
             // which a terminal sends as Backspace.
             KeyCode::Delete | KeyCode::Backspace => self.ask_delete_set_line(),
@@ -2216,6 +2221,62 @@ mod tests {
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
             assert!(app.set_panel.as_ref().unwrap().search.is_none());
+        }
+
+        /// Backspace over a filter standing edits the query, never the
+        /// file: the hand's way back into the box can press it any
+        /// number of times without arming a delete, where Delete still
+        /// asks.
+        #[test]
+        fn backspace_edits_a_standing_filter_never_the_file() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            std::fs::write(directory.path().join("spare.strudel"), "// spare\n").expect("spare");
+            let mut app = app_over(directory.path());
+            app.new_scene(false);
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            let panel = app.set_panel.as_ref().unwrap();
+            assert!(
+                !panel.search.as_ref().unwrap().typing,
+                "Enter left the filter standing"
+            );
+
+            // Backspace takes the box back up and deletes from the query;
+            // pressed on and on, onto an empty query, it never arms a
+            // delete of the file under the panel.
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            {
+                let panel = app.set_panel.as_ref().unwrap();
+                assert!(panel.search.as_ref().unwrap().typing, "the box types again");
+                assert_eq!(panel.search.as_ref().unwrap().query, "s");
+                assert!(panel.deleting.is_none(), "no delete was armed");
+            }
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            {
+                let panel = app.set_panel.as_ref().unwrap();
+                assert_eq!(
+                    panel.search.as_ref().unwrap().query,
+                    "",
+                    "the query is gone"
+                );
+                assert!(panel.deleting.is_none(), "still no delete was armed");
+            }
+            assert!(
+                directory.path().join("spare.strudel").is_file(),
+                "every file stayed on disk"
+            );
+
+            // Delete keeps its own arm, as the hints say.
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Delete, KeyModifiers::NONE);
+            assert!(
+                app.set_panel.as_ref().unwrap().deleting.is_some(),
+                "Delete asks, as it always did"
+            );
         }
 
         /// Delete in the panel asks and Enter answers: an open score off the

@@ -285,6 +285,34 @@ fn the_set_panel_search_filters_and_restores() {
     );
     assert_eq!(studio.focus(), Some(PanelKind::Set), "Esc kept the panel");
 
+    // Backspace over a standing filter edits the query, never the file
+    // under it: pressed twice over an empty query, nothing is asked
+    // about deleting and every score stays.
+    studio.press(KeyCode::Char('/'), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('n'), KeyModifiers::NONE);
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    for _ in 0..2 {
+        studio.press(KeyCode::Backspace, KeyModifiers::NONE);
+    }
+    studio.settle();
+    let rows = studio.rows();
+    assert!(
+        rows.iter().all(|row| !row.contains("Enter deletes")),
+        "no delete was armed:\n{}",
+        rows.join("\n")
+    );
+    assert_eq!(
+        studio.scene_names().as_slice(),
+        ["first"],
+        "every score is still on the strip"
+    );
+    assert!(
+        studio.set_directory().join("alpha.strudel").is_file()
+            && studio.set_directory().join("night.strudel").is_file(),
+        "every file is still on disk"
+    );
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+
     // Vim: `/` types at once, and the Esc ladder leaves insert before
     // it drops the filter. The panel goes away first, so the vim half
     // opens it fresh, the way the studio does at startup.
