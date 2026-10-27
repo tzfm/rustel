@@ -942,15 +942,17 @@ fn a_negotiated_plain_composition_types_instead_of_selecting() {
         "Ctrl+N twice never put a third score on the strip:\n{}",
         terminal.diagnostics()
     );
+    let mark = terminal.buffer.lock().unwrap().len();
     terminal.write(b"\x1b[57443;3:1u\x1b[50;3:1;64u\x1b[50;3:3;64u\x1b[57443;3:3u");
     assert!(
         terminal.wait_for_screen("@", Duration::from_secs(10)),
         "the composed Option+2 never typed its text:\n{}",
         terminal.diagnostics()
     );
+    let after = terminal.text()[mark..].to_owned();
     assert!(
-        !terminal.text().contains("scene 2 - "),
+        !after.contains("scene 2 - "),
         "the plain composition selected a strip score:\n{}",
-        terminal.text()
+        terminal.diagnostics()
     );
 }
