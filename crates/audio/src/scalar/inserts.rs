@@ -1186,6 +1186,113 @@ mod tests {
                 assert_eq!(*samples, [level; 2], "frame {frame}");
             }
 
+            /// Renders ahead as `Ahead` does, and plays each score for its
+            /// length in frames, as a Csound note plays for its p3. It keeps
+            /// its last 2 notes.
+            struct Notes {
+                ahead: Ahead,
+                frame: u64,
+                notes: [(u64, u64); 2],
+            }
+            impl OrbitInsert for Notes {
+                fn key(&self) -> InsertKey {
+                    self.ahead.key()
+                }
+                fn set_param(&mut self, _: InsertParam, _: u32) {}
+                fn score(&mut self, length: u64, frames: u32) {
+                    let start = self.frame + u64::from(frames);
+                    self.notes = [self.notes[1], (start, start + length)];
+                }
+                fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+                    self.collect(left, right);
+                }
+                fn submit(&mut self, _: &mut [f32], _: &mut [f32]) {}
+                fn collect(&mut self, left: &mut [f32], right: &mut [f32]) {
+                    self.ahead.collect(left, right);
+                    for (left, right) in left.iter_mut().zip(right) {
+                        let frame = self.frame;
+                        let sounds = self
+                            .notes
+                            .iter()
+                            .any(|&(start, end)| (start..end).contains(&frame));
+                        if !sounds {
+                            (*left, *right) = (0.0, 0.0);
+                        }
+                        self.frame += 1;
+                    }
+                }
+                fn flush(&mut self, frames: usize) {
+                    self.ahead.flush(frames);
+                }
+                fn renders_ahead(&self) -> bool {
+                    true
+                }
+            }
+            // The swaps of a recorded set with Csound, at 8 kHz. The second
+            // note of plugin 1 ends on the frame of the swap to plugin 2, or
+            // sounds 64 frames past it. Both swaps are heard, and the
+            // instrument that leaves fades out in 5 ms (40 frames).
+            for length in [2000, 2064] {
+                let mut backend = ScalarBackend::prepared(8_000, 8).unwrap();
+                backend.render_offline();
+                backend.set_insert_provider(Arc::new(|key, _, _| {
+                    let notes = Notes {
+                        ahead: Ahead(key, 0),
+                        frame: 0,
+                        notes: [(0, 0); 2],
+                    };
+                    Some(Box::new(notes) as Box<dyn OrbitInsert>)
+                }));
+                for (frame, plugin, frames) in [
+                    (0, 1, 2000),
+                    (2000, 1, length),
+                    (4000, 2, 2000),
+                    (4064, 3, 2000),
+                ] {
+                    let mut event = OnsetEvent::new(frame, 440.0, 1.0, 0.02);
+                    event.controls.orbit = 0;
+                    let controls = InsertControls::new(InsertKey { plugin, preset: 0 });
+                    event.controls.instrument = Some(controls.with_score(frames));
+                    backend.note(event);
+                }
+                let fade = || {
+                    let mut fade = Ramp::new(0, 0.0);
+                    fade.declick_from(Ramp::new(0, 1.0), 8_000);
+                    fade
+                };
+                let (mut first, mut second) = (fade(), fade());
+                // Plugin 1 plays in its fade only while its note lasts.
+                let before = if length > 2000 { 0.125 } else { 0.0 };
+                // Checks the output of a render that starts on frame `start`.
+                let mut check = |output: &[f32], start: usize| {
+                    for (frame, samples) in output.as_chunks::<2>().0.iter().enumerate() {
+                        let frame = start + frame;
+                        let level = if frame < 4000 {
+                            0.125
+                        } else if frame < 4064 {
+                            0.25 + before * first.next()
+                        } else {
+                            0.375 + 0.25 * second.next()
+                        };
+                        assert_eq!(*samples, [level; 2], "frame {frame}, length {length}");
+                    }
+                };
+                let mut output = vec![0.0; 2 * 4032];
+                backend.process_block(&mut output, 4032);
+                check(&output, 0);
+                // The swap at 4000 is heard, so plugin 1 fades out in the
+                // leaving place, also when its note ended.
+                let slot = crate::insert::instrument_slot(0).physical(0);
+                let leaving = backend.leaving_inserts[slot].as_ref();
+                let plugin = leaving.map(|insert| insert.key().plugin);
+                let mix = backend.insert_mixes[slot];
+                assert_eq!(plugin, Some(1), "length {length}");
+                assert!(mix.leaving.is_moving(), "length {length}");
+                let mut output = vec![0.0; 2 * 192];
+                backend.process_block(&mut output, 192);
+                check(&output, 4032);
+            }
+
             let ring = Arc::new(crate::input::InputRing::new());
             ring.set_sample_rate(24_000);
             ring.set_channels(1);

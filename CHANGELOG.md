@@ -1,10 +1,10 @@
 # Changelog
 
 ## Unreleased
+
 - The talkit speech synthesizer lives in its own repository, [rustel-talkit](https://github.com/tzfm/rustel-talkit), and the build takes it as a pinned package from release v0.1.0. Scores speak as before, and the talkit command installs from that repository.
 - The Hydra video synth lives in its own repository, [rustel-hydra](https://github.com/tzfm/rustel-hydra), and the build takes it as a pinned package from release v0.1.0. Visuals draw as before, with the same character-checked shaders.
 - While one score plays, auto evaluate applies an edit of that score alone. An edit of another score of the set stays in its file until the evaluate key runs it, and the typing pause says so.
-- The knobs column shows the presets of a plugin call under its rails, closed until → opens them. Enter on a name, and a click on one, write the preset into the call, and the name the call holds carries the mark. The Vim list keys drive the column now, as they do the other panels, and its value form walks its fields with ↑↓ and Tab, as the smart action's form does.
 - The knobs column shows the presets of a plugin call under its rails, closed until → opens them. Enter on a name, and a click on one, write the preset into the call, and the name the call holds carries the mark. The Vim list keys drive the column now, as they do the other panels, and its value form walks its fields with ↑↓ and Tab, as the smart action's form does.
 - A slider() on `fm` moves the sounding voice, as the gain and filter sliders do: `s("in").fm(slider(2, 0, 8))` rides the depth live, with no wait for the next hap. This reaches every source; on `s("in")`, whose hap spans the cycle, it is the difference between now and a cycle late. The chain's other operators stay query-time, and a modulator aimed at `fm` keeps its own graph.
 - A change of the preset folders reads them again at once, on the plugin thread as before: the background-jobs sheet lists the read while it runs, and the count line of the vst tab says it too.
@@ -27,7 +27,6 @@
 - On a terminal that composes Option+A into text, the Chords and Scales tabs read it as the auto preview toggle. Before, the composed character typed into the search box.
 - A click on the preview fader reads the bar it draws. Before, the click's bar was narrower than the drawn one, so a click on the knob set a gain a few dB higher.
 - Sample and manifest fetches retry a transient 429 or 5xx after a short rest, so a briefly overloaded sample host no longer fails a corpus run.
-
 - Settings has an Appearance page: the visual rows of the first page in one place. The Advanced page is gone, its rows sit at the end of General, and the first tab is renamed General. A beat line under the header keeps the tempo visible in pulse, travel and wave looks, and the evaluation animation row shapes the flash a run of code makes, with fades of three speeds, swipe, zap, steps, glitch and wave.
 - Auto evaluate no longer reinstalls a score when the edit adds no instruction. Typing a `$:`, a lane name, or a new line under a playing set leaves the sound alone, so an `oneshot` lane does not fire for it. A press, or a watched file, still applies.
 - `oneshot()` with no grid plays on the next cycle, the same as `oneshot(1)`. Before, it was silent.

@@ -312,7 +312,7 @@ the edit plays. If no copy becomes ready in 20 seconds, the wait ends. The
 edit then plays, and a note with no copy plays with no plugin until its copy
 is ready.
 
-Studio has two load modes under Settings ▸ Advanced ▸ Playback. In each mode,
+Studio has two load modes under Settings ▸ General ▸ Playback. In each mode,
 Studio evaluates the text of a launch on a cycle line during the countdown,
 reads its notes, and loads its plugin copies. If this work still runs a short
 time before the line, the launch takes the first line after the work. Until a
