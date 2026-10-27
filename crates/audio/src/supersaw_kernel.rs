@@ -6,6 +6,8 @@
 
 use std::sync::OnceLock;
 
+#[cfg(target_arch = "aarch64")]
+mod aarch64;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod x86;
 
@@ -19,6 +21,8 @@ pub enum SupersawKernelKind {
     Portable,
     /// Eight-lane supersaw evaluation using x86 AVX2 instructions.
     Avx2,
+    /// Four-lane supersaw evaluation using aarch64 NEON instructions.
+    Neon,
 }
 
 impl SupersawKernelKind {
@@ -27,6 +31,7 @@ impl SupersawKernelKind {
         match self {
             Self::Portable => true,
             Self::Avx2 => cfg!(any(target_arch = "x86", target_arch = "x86_64")),
+            Self::Neon => cfg!(target_arch = "aarch64"),
         }
     }
 }
@@ -39,6 +44,7 @@ pub fn selected_supersaw_kernel_kind() -> SupersawKernelKind {
 /// A target-feature implementation selected before the sample loop.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StaticSupersawKernel {
+    pub(crate) kind: SupersawKernelKind,
     render: RenderStaticLanes,
     minimum_lanes: usize,
 }
@@ -53,6 +59,10 @@ impl StaticSupersawKernel {
             SupersawKernelKind::Avx2 => Some(x86::AVX2),
             #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
             SupersawKernelKind::Avx2 => unreachable!("AVX2 is not selectable on this target"),
+            #[cfg(target_arch = "aarch64")]
+            SupersawKernelKind::Neon => Some(aarch64::NEON),
+            #[cfg(not(target_arch = "aarch64"))]
+            SupersawKernelKind::Neon => unreachable!("NEON is not selectable on this target"),
         }
     }
 
@@ -104,6 +114,11 @@ fn detect_best_kernel() -> SupersawKernelKind {
         return SupersawKernelKind::Avx2;
     }
 
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        return SupersawKernelKind::Neon;
+    }
+
     SupersawKernelKind::Portable
 }
 
@@ -126,22 +141,36 @@ mod tests {
                 SupersawKernelKind::Portable
             }
         );
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(
+            selected_supersaw_kernel_kind(),
+            if std::arch::is_aarch64_feature_detected!("neon") {
+                SupersawKernelKind::Neon
+            } else {
+                SupersawKernelKind::Portable
+            }
+        );
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
         assert_eq!(
             selected_supersaw_kernel_kind(),
             SupersawKernelKind::Portable
         );
 
         if let Some(kernel) = first {
-            assert!(!kernel.supports(7));
-            assert!(kernel.supports(8));
+            assert!(!kernel.supports(kernel.minimum_lanes - 1));
+            assert!(kernel.supports(kernel.minimum_lanes));
             assert!(kernel.supports(32));
+            assert_eq!(kernel.kind, selected_supersaw_kernel_kind());
         }
 
         assert!(SupersawKernelKind::Portable.compiled());
         assert_eq!(
             SupersawKernelKind::Avx2.compiled(),
             cfg!(any(target_arch = "x86", target_arch = "x86_64"))
+        );
+        assert_eq!(
+            SupersawKernelKind::Neon.compiled(),
+            cfg!(target_arch = "aarch64")
         );
     }
 }

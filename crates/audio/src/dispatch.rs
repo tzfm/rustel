@@ -51,10 +51,9 @@ impl DspDispatch {
     }
 
     pub const fn supersaw_kernel_kind(self) -> SupersawKernelKind {
-        if self.supersaw.is_some() {
-            SupersawKernelKind::Avx2
-        } else {
-            SupersawKernelKind::Portable
+        match self.supersaw {
+            Some(kernel) => kernel.kind,
+            None => SupersawKernelKind::Portable,
         }
     }
 
