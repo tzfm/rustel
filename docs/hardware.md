@@ -351,6 +351,54 @@ period cannot reduce latency. Larger requests add buffer space.
 `RUSTEL_LIVE_BUFFER_FRAMES` overrides automatic.
 `RUSTEL_MAX_LIVE_LATENCY_MS` sets the accepted latency ceiling, from 50-5000 ms.
 
+## Finding what makes a machine slow
+
+A machine that plays badly is usually short on one of four things. Check them
+in this order: each has a symptom that names it, and a command that confirms
+it.
+
+```text
+power  -> priority -> time  -> speed
+starved   no realtime  small    slow
+supply    for the      buffer   CPU
+          audio graph
+```
+
+Power first. A small board such as a Raspberry Pi lowers its clock when its
+power supply sags, and half clock turns a comfortable score into a struggling
+one. A cool chip that runs slow is the tell: the temperature is fine and the
+machine is still starved. On a Raspberry Pi, run:
+
+```sh
+vcgencmd get_throttled
+vcgencmd measure_clock arm
+```
+
+`0x0` is healthy. Anything else names the problem: bit 0 set is under-voltage
+now, bit 1 an ARM frequency cap now, bit 2 throttling now, and bits 16 to 18
+say one of those happened earlier in this boot. A clock far under the board's
+rated speed while the machine works confirms it. The fix is a supply that
+meets the board's rating and a short, thick cable, not a setting. A laptop in
+a power-saving mode behaves the same way; see the hint above.
+
+Priority second. Through PulseAudio or PipeWire, another program's busy CPU
+can click the output even when the score is light, because the server drives
+the device on a thread that busy work can delay. See the realtime grant and
+buffer cushion under "Output latency" above. `pw-top` shows the stream's
+quantum and an error count that climbs while the graph misses.
+
+Time third. A small buffer leaves little room for a slow turn. Raise the audio
+out latency one rung and listen: cleaner at 2048 than at 256 says the machine
+needs the room, and the sections above say why.
+
+Speed last, and only now blame the score. `rustel doctor --json` reports the
+DSP kernels the machine selected and the deadline misses of the last stream.
+The studio log names its own trouble: "the producer fell behind the audio
+clock" says scheduling could not keep the ring fed, and "replacement prefill
+finished after its takeover" says an edit outran its window. A score that
+needs more than the machine has slows at the same place every time, rather
+than at random.
+
 ## Trust boundary
 
 The default build and the release binaries include the `midi` and `serial`
