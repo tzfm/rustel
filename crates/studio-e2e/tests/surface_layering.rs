@@ -296,7 +296,7 @@ fn a_set_prompt_replaces_the_sheets_and_keeps_the_panel() {
     );
     assert_eq!(
         studio.status(),
-        "open a set - Enter opens the chosen set · Tab browses · type a path · Esc back"
+        "open a set or a Strudel export - Enter opens the chosen one · Tab browses · type a path · Esc back"
     );
 
     // The prompt's Esc is not the score's: it closes only the prompt.
@@ -325,7 +325,7 @@ fn the_set_panel_survives_its_own_prompt() {
     assert_eq!(studio.focus(), Some(PanelKind::Set));
     assert_eq!(
         studio.status(),
-        "open a set - Enter opens the chosen set · Tab browses · type a path · Esc back"
+        "open a set or a Strudel export - Enter opens the chosen one · Tab browses · type a path · Esc back"
     );
 
     studio.press(KeyCode::Esc, KeyModifiers::NONE);

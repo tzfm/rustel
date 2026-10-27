@@ -417,7 +417,7 @@ fn open_set_lists_the_others_and_opens_one() {
     studio.press(KeyCode::Char('o'), KeyModifiers::NONE); // Open set…
     assert_eq!(
         studio.status(),
-        "open a set - Enter opens the chosen set · Tab browses · type a path · Esc back"
+        "open a set or a Strudel export - Enter opens the chosen one · Tab browses · type a path · Esc back"
     );
     // The other set is offered by name, with what is in it.
     let rows = studio.rows();

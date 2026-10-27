@@ -848,9 +848,12 @@ impl App {
         let root = self.sets_root();
         let picker = match prompt {
             SetPrompt::OpenSet => FilePicker::new(
-                "open a set",
+                "open a set or a Strudel export",
                 "opens it",
-                set_candidates(&root, self.scenes.directory()),
+                set_candidates(&root, self.scenes.directory())
+                    .into_iter()
+                    .chain(export_candidates(&root))
+                    .collect(),
                 &root,
             )
             .choosing_folders(),
@@ -945,7 +948,7 @@ impl App {
         self.focus_panel(PanelKind::Set);
         self.status = match prompt {
             SetPrompt::OpenSet => {
-                "open a set - Enter opens the chosen set · Tab browses · type a path · Esc back"
+                "open a set or a Strudel export - Enter opens the chosen one · Tab browses · type a path · Esc back"
                     .into()
             }
             SetPrompt::OpenRecent => {
@@ -1663,6 +1666,58 @@ fn set_candidates(root: &std::path::Path, current: &std::path::Path) -> Vec<Cand
         .collect()
 }
 
+/// The Strudel pattern exports at the sets root, newest first: a `.json`
+/// file the open-set prompt can open is offered beside the sets, so an
+/// export does not need a typed path or a folder walk to be found.
+fn export_candidates(root: &std::path::Path) -> Vec<Candidate> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<(std::time::SystemTime, Candidate)> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+        })
+        .filter_map(|path| {
+            // Reading the file tells it apart from any other json: only a
+            // pattern export with scores in it is offered.
+            let text = std::fs::read_to_string(&path).ok()?;
+            let count = strudel_export(&text).ok()?.len();
+            let changed = std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .ok()?;
+            let label = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            Some((
+                changed,
+                Candidate {
+                    label,
+                    detail: format!(
+                        "Strudel export - {count} pattern{}",
+                        if count == 1 { "" } else { "s" }
+                    ),
+                    path,
+                },
+            ))
+        })
+        .collect();
+    candidates.sort_by(|(a_time, a), (b_time, b)| {
+        b_time
+            .cmp(a_time)
+            .then_with(|| a.label.to_lowercase().cmp(&b.label.to_lowercase()))
+    });
+    candidates
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect()
+}
+
 /// When a set last changed: the newest of its folder and the files in it.
 fn set_changed(path: &std::path::Path) -> std::time::SystemTime {
     let changed = |path: &std::path::Path| {
@@ -2265,6 +2320,59 @@ mod tests {
                     .as_ref()
                     .and_then(|(_, picker)| picker.error.clone())
             );
+        }
+
+        /// File > Open set… offers the sets root's Strudel pattern
+        /// exports beside its sets, so an export opens with Enter the way
+        /// a set does. A json that is not an export is not offered.
+        #[test]
+        fn open_set_offers_the_strudel_exports_beside_the_sets() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let sets = directory.path().join("sets");
+            std::fs::create_dir_all(sets.join("guest")).expect("guest");
+            std::fs::write(sets.join("guest").join("a.strudel"), "$: s(\"oh\")\n")
+                .expect("a score");
+            std::fs::write(
+                sets.join("gig.json"),
+                concat!(
+                    "{\n",
+                    "  \"V1StGXR8_Z5j\": { \"code\": \"$: s(\\\"bd*4\\\")\" }\n",
+                    "}\n"
+                ),
+            )
+            .expect("export");
+            std::fs::write(sets.join("not one.json"), "[1, 2, 3]").expect("not an export");
+            let home = directory.path().join("home");
+            std::fs::create_dir_all(&home).expect("home");
+            let mut app = app_over(&home);
+            app.prefs.sets_directory = Some(sets.display().to_string());
+
+            app.open_set_prompt(SetPrompt::OpenSet);
+            let (_, picker) = app.set_prompt.as_ref().expect("the prompt is up");
+            assert_eq!(picker.title, "open a set or a Strudel export");
+            assert_eq!(
+                picker
+                    .candidates
+                    .iter()
+                    .map(|candidate| (candidate.label.as_str(), candidate.detail.as_str()))
+                    .collect::<Vec<_>>(),
+                [
+                    ("guest", "1 score"),
+                    ("gig.json", "Strudel export - 1 pattern"),
+                ],
+                "sets first, then the exports; a json that is not one stays out"
+            );
+
+            // Enter opens the export as a set, as the typed path always did.
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.set_prompt.is_none(), "the prompt closed");
+            assert!(
+                app.status.starts_with("imported gig - 1 scene(s)"),
+                "{}",
+                app.status
+            );
+            assert_eq!(app.scenes.directory(), sets.join("gig"));
         }
 
         /// A Strudel pattern export gives its patterns, or says what it is
