@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use rustel_audio::{InsertControls, InsertKey, InsertProvider};
 use rustel_csound::{Event, Instrument, Program};
 use rustel_jsruntime::CsoundSource;
-use rustel_voice::{CsoundRequest, SampleLookup, SampleResolution};
+use rustel_voice::{CsoundRequest, SampleLookup, SampleResolution, SpeechRequest};
 use serde_json::{Map, Value};
 
 use crate::score_import::{ImportRefusal, ScoreImportAccess};
@@ -503,6 +503,10 @@ impl SampleLookup for Lookup<'_> {
         self.samples.insert(request)
     }
 
+    fn insert_speech(&self, request: &SpeechRequest<'_>) -> Result<SampleResolution, String> {
+        self.samples.insert_speech(request)
+    }
+
     fn csound(&self, request: &CsoundRequest<'_>) -> Result<InsertControls, String> {
         let program = self.state.program_at(request.target_time)?;
         let event = score_event(request)?;
@@ -537,6 +541,10 @@ impl SampleLookup for ValidationLookup<'_> {
         request: &rustel_voice::PluginRequest<'_>,
     ) -> Result<Option<InsertControls>, String> {
         self.0.insert(request)
+    }
+
+    fn insert_speech(&self, request: &SpeechRequest<'_>) -> Result<SampleResolution, String> {
+        self.0.insert_speech(request)
     }
 
     fn csound(&self, request: &CsoundRequest<'_>) -> Result<InsertControls, String> {
@@ -828,5 +836,50 @@ mod tests {
         assert!((event.p5 - 50.8).abs() < 0.0001);
         assert!(event.p6.contains("frequency/440.4"));
         assert!(!event.p6.contains("csoundm/"));
+    }
+
+    /// A lookup that only answers speech, to prove the wrappers hand a
+    /// speech request to the bank they wrap instead of answering it
+    /// themselves with the no-speech default.
+    struct SpeechSpy {
+        seen: std::cell::Cell<bool>,
+    }
+
+    impl SampleLookup for SpeechSpy {
+        fn resolve(&self, _s: &str, _n: f64, _midi: f64) -> SampleResolution {
+            SampleResolution::Unknown
+        }
+
+        fn insert_speech(&self, _request: &SpeechRequest<'_>) -> Result<SampleResolution, String> {
+            self.seen.set(true);
+            Ok(SampleResolution::Loading)
+        }
+    }
+
+    #[test]
+    fn wrapped_lookups_forward_speech_to_the_bank_they_wrap() {
+        let request = SpeechRequest {
+            text: "hello",
+            params: rustel_talkit::params::Params::default(),
+        };
+        let spy = SpeechSpy {
+            seen: std::cell::Cell::new(false),
+        };
+        assert!(matches!(
+            ValidationLookup(&spy).insert_speech(&request),
+            Ok(SampleResolution::Loading)
+        ));
+        assert!(spy.seen.get());
+        spy.seen.set(false);
+        let state = State::new(false);
+        let lookup = Lookup {
+            samples: &spy,
+            state: &state,
+        };
+        assert!(matches!(
+            lookup.insert_speech(&request),
+            Ok(SampleResolution::Loading)
+        ));
+        assert!(spy.seen.get());
     }
 }
