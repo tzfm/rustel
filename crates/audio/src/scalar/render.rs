@@ -1870,6 +1870,7 @@ impl ScalarBackend {
                 if let Some(jobs) = jobs.as_mut().filter(|_| any_thread) {
                     let job = jobs.job(JobKind::Instrument, bus);
                     job.frames = sub_len;
+                    job.drain = false;
                     job.boxes[0] = slot.take();
                     job.leaving[0] = leaving.take_if(|_| swapping);
                     jobs.post(JobKind::Instrument, bus);
@@ -3353,6 +3354,7 @@ impl ScalarBackend {
                 let (first, fed) = wakes(bus, 0, effects, mixes, block, idle_frames)?;
                 let job = jobs.job(JobKind::Effect, bus);
                 job.frames = sub_len;
+                job.drain = false;
                 for (input, output) in block.iter().zip(&mut job.block) {
                     output[..sub_len].copy_from_slice(&input[..sub_len]);
                 }

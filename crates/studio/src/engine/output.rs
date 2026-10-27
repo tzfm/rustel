@@ -199,6 +199,7 @@ impl StudioEngine {
         // The frame domain the ports' timelines lived in went with the old
         // stream: silence them before the session's generation moves on.
         self.external_outputs().forget();
+        let waits = self.waits_for_sounds();
         let live = self.live.as_mut().expect("recycled playback");
         live.device.set_master_gain(self.master.gain());
         live.device.set_limiter(self.master.limiter());
@@ -219,6 +220,7 @@ impl StudioEngine {
             &mut live.producer,
             live.device.clock_seconds(),
             live.device.sample_rate(),
+            waits,
         )?;
         // Say what opened, as the first open does: a buffer or device
         // change is exactly when the player wants to read what the host
@@ -272,6 +274,7 @@ impl StudioEngine {
         }
         self.external_outputs().forget();
         self.piano = [None; PIANO_KEYS];
+        let waits = self.waits_for_sounds();
         let live = self.live.as_mut().expect("checked playback");
         live.last_recycle_at = Some(observed_at);
         live.progress_at = observed_at;
@@ -285,6 +288,7 @@ impl StudioEngine {
             &mut live.producer,
             live.device.clock_seconds(),
             live.device.sample_rate(),
+            waits,
         )?;
         queue_diagnostic(
             &mut self.pending_diagnostics,
@@ -332,6 +336,7 @@ impl StudioEngine {
             return Err(RuntimeError::Cancelled);
         }
         self.external_outputs().forget();
+        let waits = self.waits_for_sounds();
         let live = self.live.as_mut().expect("checked playback");
         live.last_recycle_at = Some(observed_at);
         live.progress_at = observed_at;
@@ -345,6 +350,7 @@ impl StudioEngine {
             &mut live.producer,
             live.device.clock_seconds(),
             live.device.sample_rate(),
+            waits,
         )?;
         queue_diagnostic(
             &mut self.pending_diagnostics,
@@ -720,7 +726,7 @@ mod tests {
                 .expect("bind real receipts");
             let mut producer =
                 LiveFileProducer::unwatched(Duration::from_millis(2)).expect("producer");
-            arm_output_recovery_after_recycle(session, &mut producer, 0.0, RATE)
+            arm_output_recovery_after_recycle(session, &mut producer, 0.0, RATE, true)
                 .expect("recovery requery");
             assert_eq!(output.device().report().asset_queues.sample_installs, 0);
 
@@ -1384,7 +1390,7 @@ mod tests {
         // Rebinding the same rate must also leave already decoded PCM alone.
         for rate in [48_000, 96_000, 96_000, 44_100] {
             let generation = session.generation();
-            arm_output_recovery_after_recycle(&mut session, &mut producer, 0.25, rate)
+            arm_output_recovery_after_recycle(&mut session, &mut producer, 0.25, rate, true)
                 .expect("arm recovery");
             assert_eq!(library.render_rate_for_test(), rate);
             assert_eq!(session.config().sample_rate, 44_100);
@@ -1394,7 +1400,7 @@ mod tests {
         // rate: the replacement stream has already opened successfully.
         let generation = session.generation();
         assert!(
-            arm_output_recovery_after_recycle(&mut session, &mut producer, f64::NAN, 88_200)
+            arm_output_recovery_after_recycle(&mut session, &mut producer, f64::NAN, 88_200, true)
                 .is_err()
         );
         assert_eq!(library.render_rate_for_test(), 88_200);
@@ -1422,7 +1428,7 @@ mod tests {
 
         let before = session.generation();
         let recovery_now = 0.25;
-        arm_output_recovery_after_recycle(&mut session, &mut producer, recovery_now, 44_100)
+        arm_output_recovery_after_recycle(&mut session, &mut producer, recovery_now, 44_100, true)
             .expect("arm recovery");
         let after = session.generation();
         assert_eq!(after, before + 1);

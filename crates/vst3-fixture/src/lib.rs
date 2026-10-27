@@ -276,13 +276,66 @@ impl Delay {
     }
 }
 
+/// The echo of the effect: see [`ECHO_ENV`].
+struct Echo {
+    /// The time of the echo in milliseconds, read one time, with the
+    /// plugin.
+    millis: u32,
+    /// The place in the ring of the next frame.
+    at: usize,
+    /// The frames of the time of the echo. The ring takes its size at
+    /// `setupProcessing`, so the audio call allocates nothing.
+    ring: Vec<[f32; 2]>,
+}
+
+impl Echo {
+    fn new() -> Self {
+        let millis = std::env::var(ECHO_ENV)
+            .ok()
+            .and_then(|text| text.parse().ok());
+        Self {
+            millis: millis.unwrap_or(0),
+            at: 0,
+            ring: Vec::new(),
+        }
+    }
+
+    /// Gives the ring the frames of the echo at `sample_rate`.
+    fn setup(&mut self, sample_rate: f64) {
+        let frames = f64::from(self.millis) * sample_rate / 1000.0;
+        self.ring = vec![[0.0; 2]; frames.round() as usize];
+        self.at = 0;
+    }
+
+    /// Starts the echo with silence in the ring.
+    fn start(&mut self) {
+        self.ring.fill([0.0; 2]);
+        self.at = 0;
+    }
+
+    /// Takes one frame in, and gives the frame that came in the time of the
+    /// echo before it, or silence with no echo.
+    fn pass(&mut self, frame: [f32; 2]) -> [f32; 2] {
+        let Some(place) = self.ring.get_mut(self.at) else {
+            return [0.0; 2];
+        };
+        let out = std::mem::replace(place, frame);
+        self.at = (self.at + 1) % self.ring.len();
+        out
+    }
+}
+
 struct Processor {
     values: Values,
     delay: RefCell<Delay>,
+    /// See [`ECHO_ENV`].
+    echo: RefCell<Echo>,
     /// Read one time, with the plugin: the audio call reads no variable.
     prints: bool,
     /// The spin of each process call: see [`COST_ENV`].
     cost: Duration,
+    /// The sleep of each setActive call: see [`SLOW_ACTIVATE_ENV`].
+    activate: Duration,
     /// See [`PROCESS_MARK_ENV`].
     mark: Option<ProcessMark>,
 }
@@ -371,9 +424,11 @@ impl IComponentTrait for Processor {
     }
 
     unsafe fn setActive(&self, state: TBool) -> tresult {
+        sleep(self.activate);
         if state != 0 {
             let frames = self.values.get(PARAM_DELAY) * MAX_DELAY as f64;
             self.delay.borrow_mut().start(frames.round() as usize);
+            self.echo.borrow_mut().start();
         }
         kResultOk
     }
@@ -426,7 +481,10 @@ impl IAudioProcessorTrait for Processor {
         self.delay.borrow().frames as u32
     }
 
-    unsafe fn setupProcessing(&self, _setup: *mut ProcessSetup) -> tresult {
+    unsafe fn setupProcessing(&self, setup: *mut ProcessSetup) -> tresult {
+        // SAFETY: the host gives a setup that lives for the call.
+        let sample_rate = unsafe { (*setup).sampleRate };
+        self.echo.borrow_mut().setup(sample_rate);
         kResultOk
     }
 
@@ -495,6 +553,7 @@ impl IAudioProcessorTrait for Processor {
             *buses.__field0.channelBuffers32.add(channel)
         };
         let mut delay = self.delay.borrow_mut();
+        let mut echo = self.echo.borrow_mut();
         let mut next_point = 0;
         for frame in 0..frames {
             while next_point < gain_count && gain_points[next_point].0 <= frame {
@@ -507,16 +566,17 @@ impl IAudioProcessorTrait for Processor {
             // SAFETY: each channel holds the samples of the block, and the
             // checks above found 2 channels on each bus.
             let samples = [0, 1].map(|side| unsafe { *channel(input, side).add(frame) } * level);
+            let echoed = echo.pass(samples);
             for (side, sample) in delay.pass(samples).into_iter().enumerate() {
                 // SAFETY: as above.
-                unsafe { *channel(output, side).add(frame) = sample };
+                unsafe { *channel(output, side).add(frame) = sample + echoed[side] };
             }
         }
         kResultOk
     }
 
     unsafe fn getTailSamples(&self) -> u32 {
-        0
+        self.echo.borrow().ring.len() as u32
     }
 }
 
@@ -656,6 +716,8 @@ struct Tone {
     calls: Cell<u32>,
     /// The spin of each process call: see [`COST_ENV`].
     cost: Duration,
+    /// The sleep of each setActive call: see [`SLOW_ACTIVATE_ENV`].
+    activate: Duration,
     /// See [`PROCESS_MARK_ENV`].
     mark: Option<ProcessMark>,
 }
@@ -675,6 +737,7 @@ impl Tone {
             voices: RefCell::new(Vec::with_capacity(128)),
             calls: Cell::new(0),
             cost: process_cost(),
+            activate: activate_time(),
             mark: ProcessMark::new(),
         }
     }
@@ -776,6 +839,7 @@ impl IComponentTrait for Tone {
     }
 
     unsafe fn setActive(&self, _state: TBool) -> tresult {
+        sleep(self.activate);
         kResultOk
     }
 
@@ -961,8 +1025,10 @@ impl IPluginFactoryTrait for Factory {
                 ComWrapper::new(Processor {
                     values: Values::new(),
                     delay: RefCell::new(Delay::new()),
+                    echo: RefCell::new(Echo::new()),
                     prints: std::env::var_os(PRINT_ENV).is_some(),
                     cost: process_cost(),
+                    activate: activate_time(),
                     mark: ProcessMark::new(),
                 })
                 .to_com_ptr::<FUnknown>()
@@ -1028,6 +1094,17 @@ pub const ABORT_ENV: &str = "RUSTEL_VST3_FIXTURE_ABORT";
 /// With this variable set to a number, the load of the plugin takes that
 /// many milliseconds more, as the load of a large plugin does.
 pub const SLOW_ENV: &str = "RUSTEL_VST3_FIXTURE_SLOW";
+
+/// With this variable set to a number, each new copy of the effect and the
+/// instrument takes that many milliseconds more in each setActive call, as
+/// a large plugin does when it turns on or off. The copy reads the variable
+/// at its creation.
+pub const SLOW_ACTIVATE_ENV: &str = "RUSTEL_VST3_FIXTURE_SLOW_ACTIVATE";
+
+/// With this variable set to a number, each new copy of the effect adds
+/// its input of that many milliseconds before to its output, after the
+/// gain, one time, as an echo. The copy gives that time as its tail.
+pub const ECHO_ENV: &str = "RUSTEL_VST3_FIXTURE_ECHO";
 
 /// With this variable set to a number, the start of each audio class of
 /// the plugin takes that many milliseconds more, as each class of a large
@@ -1097,6 +1174,23 @@ fn process_cost() -> Duration {
         .ok()
         .and_then(|text| text.parse().ok());
     Duration::from_micros(micros.unwrap_or(0))
+}
+
+/// The sleep of each setActive call of a new copy: see
+/// [`SLOW_ACTIVATE_ENV`].
+fn activate_time() -> Duration {
+    let millis = std::env::var(SLOW_ACTIVATE_ENV)
+        .ok()
+        .and_then(|text| text.parse().ok());
+    Duration::from_millis(millis.unwrap_or(0))
+}
+
+/// Sleeps for `time`, as a plugin that turns on or off slowly. No time
+/// sleeps nothing.
+fn sleep(time: Duration) {
+    if !time.is_zero() {
+        std::thread::sleep(time);
+    }
 }
 
 /// Spins for `cost`, as a plugin with that much work in each call.
@@ -1317,5 +1411,33 @@ mod tests {
         let delta = Violations::capture().since(before);
         assert!(delta.clean(), "the delay allocated or freed: {delta:?}");
         assert_eq!(last, [1023.0, -1023.0]);
+    }
+
+    /// Each setActive call of a slow copy sleeps its time, on and off, in
+    /// the effect and in the instrument: see [`SLOW_ACTIVATE_ENV`].
+    #[test]
+    fn each_set_active_call_of_a_slow_copy_sleeps() {
+        let time = Duration::from_millis(20);
+        let effect = Processor {
+            values: Values::new(),
+            delay: RefCell::new(Delay::new()),
+            echo: RefCell::new(Echo::new()),
+            prints: false,
+            cost: Duration::ZERO,
+            activate: time,
+            mark: None,
+        };
+        let mut tone = Tone::new();
+        tone.activate = time;
+        for state in [1, 0] {
+            let start = Instant::now();
+            // SAFETY: the calls take no pointer.
+            unsafe { effect.setActive(state) };
+            assert!(start.elapsed() >= time, "the effect: {state}");
+            let start = Instant::now();
+            // SAFETY: as above.
+            unsafe { tone.setActive(state) };
+            assert!(start.elapsed() >= time, "the instrument: {state}");
+        }
     }
 }

@@ -29,7 +29,7 @@ mod handover;
 #[cfg(all(feature = "vst", feature = "device-audio"))]
 mod plugin_wait;
 #[cfg(all(feature = "vst", feature = "device-audio"))]
-pub use plugin_wait::PLUGIN_WAIT;
+pub use plugin_wait::{PLUGIN_WAIT, SEAM_WAIT};
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -1516,7 +1516,7 @@ mod test_support {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     /// The first plugin note of the first cycle.
     #[cfg(feature = "vst")]
     pub(super) fn plugin_note(session: &Session) -> serde_json::Value {
@@ -1551,7 +1551,7 @@ mod tests {
     /// new folder is a new plugin for the plugin host, so its first copy is
     /// not ready at once. One test at a time has the folder.
     #[cfg(all(feature = "vst", feature = "device-audio"))]
-    pub(super) fn fixture_plugins() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
+    pub(crate) fn fixture_plugins() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
         pub(super) static FOLDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let one = FOLDER.lock().unwrap_or_else(|poison| poison.into_inner());
         let folder = tempfile::tempdir().expect("plugin folder");

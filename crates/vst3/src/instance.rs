@@ -6,10 +6,12 @@ use std::cell::Cell;
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 
-use rustel_audio::{InsertKey, InsertNote, InsertParam, MAX_INSERT_PARAMS, OrbitInsert};
+use rustel_audio::{
+    INSERT_DRAIN_QUIET_SECONDS, InsertKey, InsertNote, InsertParam, MAX_INSERT_PARAMS, OrbitInsert,
+};
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::{ComPtr, ComWrapper};
@@ -43,6 +45,15 @@ const MAX_CHANGED_PARAMS: usize = 32;
 // One block carries the values of a note and the restore of the values of
 // the note before.
 const _: () = assert!(MAX_CHANGES >= 2 * MAX_INSERT_PARAMS);
+/// A block with a peak at this level or below is silent: see [`Played`].
+const QUIET_PEAK: f32 = 1e-6;
+/// The longest tail of a copy, in seconds. A plugin with a longer tail, or
+/// with a tail with no end, counts as this. The long flush plays out this
+/// much at most: see [`play_out`].
+const LONGEST_TAIL: f64 = 3.0;
+/// The silent blocks after the latency in the quiet check of a flush: see
+/// [`play_out`].
+const CHECK_BLOCKS: usize = 4;
 
 /// A parameter value, or a restore of earlier values, at one frame of the
 /// instance. A restore has no parameter number.
@@ -98,19 +109,76 @@ impl HeldNote {
     }
 }
 
+/// Where a plugin copy is, as its cell says: see [`CopyState::place`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum Place {
+    /// The host keeps the copy for its slot, or the copy ended.
+    Home,
+    /// An engine holds the copy: see [`Instance::hold`].
+    Engine,
+    /// The engine gave the copy back, and the plugin thread takes it home.
+    Returning,
+}
+
 /// The cell of one plugin copy. The host creates the cell when it creates
 /// the plugin. The copy keeps the same cell to its end. Each field is an
 /// atomic. Any thread reads and writes the cell with no lock.
 #[derive(Default)]
 pub(crate) struct CopyState {
-    /// True while an engine holds the copy: see [`Instance::hold`].
-    pub held: AtomicBool,
+    /// Where the copy is: a [`Place`].
+    place: AtomicU8,
     /// The latency of the plugin in frames. The plugin thread reads it
     /// from the plugin after the first blocks of the copy.
     pub latency: AtomicU32,
+    /// The tail of the plugin in frames, 3 s at most: the time its sound
+    /// goes on after its input goes silent. The plugin thread reads it with
+    /// the latency.
+    pub tail: AtomicU32,
     /// The plugin asked for a restart because its latency changed. Only
     /// the plugin thread acts on the flag.
     pub latency_changed: AtomicBool,
+    /// The stamp of the preset file at the build of the copy: see
+    /// [`crate::cache::Stamp::number`]. A copy of preset 0 reads no file and
+    /// has no stamp.
+    pub preset: AtomicU64,
+    /// A read of the preset folders found the preset file of the copy
+    /// changed or gone while the copy was in an engine, on its way home or
+    /// in its retune. Only the plugin thread acts on the mark: the copy ends
+    /// at its park, and its retune builds a new copy from the file.
+    pub preset_changed: AtomicBool,
+}
+
+impl CopyState {
+    /// Where the copy is.
+    pub(crate) fn place(&self) -> Place {
+        match self.place.load(Ordering::Relaxed) {
+            place if place == Place::Engine as u8 => Place::Engine,
+            place if place == Place::Returning as u8 => Place::Returning,
+            _ => Place::Home,
+        }
+    }
+
+    pub(crate) fn set_place(&self, place: Place) {
+        self.place.store(place as u8, Ordering::Relaxed);
+    }
+}
+
+/// The processing setup of a copy at one sample rate: 32-bit audio in
+/// blocks of [`MAX_BLOCK`] frames at most, in real time.
+fn processing(sample_rate: u32) -> ProcessSetup {
+    ProcessSetup {
+        processMode: ProcessModes_::kRealtime as i32,
+        symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
+        maxSamplesPerBlock: MAX_BLOCK as i32,
+        sampleRate: f64::from(sample_rate),
+    }
+}
+
+/// The frames of the silent blocks a copy runs after it turns on: 0.1 s.
+/// See [`Loaded::activate`].
+fn warm_frames(sample_rate: u32) -> u64 {
+    u64::from(sample_rate) / 10
 }
 
 /// A plugin with its two halves connected. The plugin thread owns a
@@ -464,12 +532,7 @@ impl Loaded {
         let output_channels = self.bus_channels(OUTPUT);
         // The order is the order of the VST3 call sequence: the bus
         // layout, the processing setup, the buses on, the plugin on.
-        let mut setup = ProcessSetup {
-            processMode: ProcessModes_::kRealtime as i32,
-            symbolicSampleSize: sample32,
-            maxSamplesPerBlock: MAX_BLOCK as i32,
-            sampleRate: f64::from(sample_rate),
-        };
+        let mut setup = processing(sample_rate);
         if unsafe { self.processor.setupProcessing(&mut setup) } != kResultOk {
             return Err(format!("the plugin refused {sample_rate} Hz"));
         }
@@ -564,6 +627,7 @@ impl Loaded {
             beats: 0.0,
             tempo: DEFAULT_TEMPO,
             order: 0,
+            played: Played::default(),
             state,
             retire,
         };
@@ -576,7 +640,7 @@ impl Loaded {
         // where such work costs no audio deadline.
         let warm_up = |instance: &mut Instance| {
             let (mut left, mut right) = ([0.0f32; MAX_BLOCK], [0.0f32; MAX_BLOCK]);
-            for _ in 0..(sample_rate as usize / 10).div_ceil(MAX_BLOCK) {
+            for _ in 0..warm_frames(sample_rate).div_ceil(MAX_BLOCK as u64) {
                 left.fill(0.0);
                 right.fill(0.0);
                 instance.process(&mut left, &mut right);
@@ -590,7 +654,7 @@ impl Loaded {
         if let Some(plugin) = &instance.plugin
             && plugin.state.latency_changed.swap(false, Ordering::Acquire)
         {
-            if let Err(error) = plugin.restart() {
+            if let Err(error) = plugin.restart(None) {
                 // The copy ends here, in its build, so the count of running
                 // copies drops before the host stores the failure.
                 drop(instance.plugin.take());
@@ -598,21 +662,19 @@ impl Loaded {
             }
             warm_up(&mut instance);
         }
-        // The one latency read of the build, after the first blocks.
-        if let Some(plugin) = &instance.plugin {
-            // SAFETY: the call takes no pointer, and the plugin thread makes
-            // it while no block runs.
-            let latency = unsafe { plugin.processor.getLatencySamples() };
-            plugin.state.latency.store(latency, Ordering::Relaxed);
-        }
-        instance.frames = 0;
-        instance.beats = 0.0;
+        // The build reads the latency and the tail one time, after the
+        // first blocks. The clock and the counts of the flush start from
+        // here, so the first blocks count no frame.
+        instance.read_latency_and_tail();
+        instance.rebase();
         Ok(instance)
     }
 
     /// Turns the plugin off and on, as a plugin asks for when its latency
-    /// changes. Runs on the plugin thread while no block runs.
-    fn restart(&self) -> Result<(), String> {
+    /// changes. With a sample rate, the plugin takes the rate while it is
+    /// off, with the setup of its build. Runs on the plugin thread while no
+    /// block runs.
+    fn restart(&self, sample_rate: Option<u32>) -> Result<(), String> {
         // SAFETY: the calls take no pointer, and the plugin thread makes
         // them while no block runs.
         unsafe {
@@ -620,7 +682,15 @@ impl Loaded {
             self.component.setActive(0);
         }
         self.active.set(false);
-        // SAFETY: as above.
+        if let Some(sample_rate) = sample_rate {
+            let mut setup = processing(sample_rate);
+            // SAFETY: the setup lives for the call, and the plugin is off.
+            if unsafe { self.processor.setupProcessing(&mut setup) } != kResultOk {
+                return Err(format!("the plugin refused {sample_rate} Hz"));
+            }
+        }
+        // SAFETY: the call takes no pointer, and the plugin thread makes
+        // it while no block runs.
         if unsafe { self.component.setActive(1) } != kResultOk {
             return Err("the plugin did not turn on".into());
         }
@@ -713,6 +783,8 @@ pub(crate) struct Instance {
     tempo: f64,
     /// The place of this instance in the order the host built them.
     order: u64,
+    /// The counts of the flush of the copy: see [`Self::flush_tail`].
+    played: Played,
     /// The cell of the copy: see [`CopyState`].
     state: Arc<CopyState>,
     retire: Sender<Job>,
@@ -721,6 +793,10 @@ pub(crate) struct Instance {
 // SAFETY: one thread owns an instance at a time and makes each call on it:
 // the plugin thread at the build, then the audio engine, which runs the
 // blocks in the callback or on a plugin worker, one thread at a time. The
+// drop of a `Lent` sends a live copy back to the plugin thread in a job of
+// the line. The plugin thread plays out its tail or sets it up at a new
+// rate while no engine holds it. The copy then waits for its slot under
+// the lock of the host, and the next engine takes it under that lock. The
 // pointers go to memory the instance owns, and the plugin objects go back
 // to the plugin thread at the end.
 unsafe impl Send for Instance {}
@@ -750,17 +826,119 @@ impl Instance {
         self.order
     }
 
-    /// Marks the instance as held by an engine until the instance ends.
-    /// The host reads the mark in the cell it gets.
+    /// Marks the instance as held by an engine, until the engine gives it
+    /// back or it ends. The host reads the mark in the cell it gets.
     pub(crate) fn hold(&self) -> Arc<CopyState> {
-        self.state.held.store(true, Ordering::Relaxed);
+        self.state.set_place(Place::Engine);
         Arc::clone(&self.state)
+    }
+
+    /// The cell of the copy.
+    pub(crate) fn cell(&self) -> &CopyState {
+        &self.state
     }
 
     /// The latency of the plugin in frames, as the plugin thread last read
     /// it.
     pub(crate) fn latency(&self) -> u32 {
         self.state.latency.load(Ordering::Relaxed)
+    }
+
+    /// Reads the latency and the tail of the plugin into the cell. Runs on
+    /// the plugin thread while no block runs.
+    fn read_latency_and_tail(&self) {
+        let Some(plugin) = &self.plugin else {
+            return;
+        };
+        // SAFETY: the calls take no pointer, and the plugin thread makes
+        // them while no block runs.
+        let (latency, tail) = unsafe {
+            (
+                plugin.processor.getLatencySamples(),
+                plugin.processor.getTailSamples(),
+            )
+        };
+        plugin.state.latency.store(latency, Ordering::Relaxed);
+        // A tail with no end, kInfiniteTail, counts as the longest tail.
+        let longest = (self.sample_rate * LONGEST_TAIL) as u32;
+        plugin
+            .state
+            .tail
+            .store(tail.min(longest), Ordering::Relaxed);
+    }
+
+    /// The quiet time of the copy in frames: its tail, 0.25 s at least and
+    /// 3 s at most. A copy quiet this long has no sound left to give.
+    fn quiet_time(&self) -> u64 {
+        let least = (self.sample_rate * f64::from(INSERT_DRAIN_QUIET_SECONDS)) as u64;
+        u64::from(self.tail_frames()).max(least)
+    }
+
+    /// True when the copy has no tail to play out: it ran no frame since its
+    /// last flush, or it is quiet for its quiet time and holds no note and
+    /// no value. Makes no plugin call.
+    pub(crate) fn skips_flush(&self) -> bool {
+        self.played.skips(self.quiet_time(), self.busy())
+    }
+
+    /// Plays out the tail of a copy an engine gave back, on the plugin
+    /// thread, so the next note of the copy has no sound of its life before.
+    /// Each note ends first. A copy that skips ([`Self::skips_flush`]) runs
+    /// no block, and restarts only when the plugin asked for a restart. Each
+    /// other copy restarts and runs silent blocks: see [`play_out`]. The
+    /// blocks stop when `closed` turns true. Then the plugin thread reads
+    /// the latency and the tail, and the clock of the copy starts again:
+    /// see [`Self::rebase`]. `Err` has the reason the plugin did not turn
+    /// on again.
+    pub(crate) fn flush_tail(&mut self, closed: &AtomicBool) -> Result<(), String> {
+        self.reset();
+        let flushed = if !self.skips_flush() {
+            let quiet_time = self.quiet_time();
+            let latency = u64::from(self.latency());
+            let rate = self.sample_rate as u32;
+            let closed = || closed.load(Ordering::Relaxed);
+            play_out(self, quiet_time, latency, rate, &closed)
+        } else if self.state.latency_changed.load(Ordering::Acquire) {
+            Flushed::restart(self)
+        } else {
+            Ok(())
+        };
+        self.read_latency_and_tail();
+        self.rebase();
+        flushed
+    }
+
+    /// Sets the copy up again at `sample_rate`, on the plugin thread, with
+    /// no new build and no preset read. Each note ends first, and the plugin
+    /// takes the rate while it is off. Then silent blocks run as at the
+    /// build, the plugin thread reads the latency and the tail again, and
+    /// the clock of the copy starts again: see [`Self::rebase`]. `Err` has
+    /// the reason the plugin did not take the rate.
+    pub(crate) fn retune(&mut self, sample_rate: u32) -> Result<(), String> {
+        self.reset();
+        if let Some(plugin) = &self.plugin {
+            plugin.restart(Some(sample_rate))?;
+        }
+        self.sample_rate = f64::from(sample_rate);
+        for _ in 0..warm_frames(sample_rate).div_ceil(MAX_BLOCK as u64) {
+            self.silent_block();
+        }
+        self.read_latency_and_tail();
+        self.rebase();
+        Ok(())
+    }
+
+    /// Starts the clock of the copy again from frame 0, after its build, a
+    /// flush or a retune, and the counts of the flush with it. Each value a
+    /// note gave the copy before then is a value of the life before: the
+    /// next note of the copy restores it. Makes no plugin call.
+    pub(crate) fn rebase(&mut self) {
+        self.frames = 0;
+        self.beats = 0.0;
+        for (_, set_at) in &mut self.changed[..self.changed_count] {
+            *set_at = -1;
+        }
+        self.played = Played::default();
     }
 
     pub(crate) fn set_order(&mut self, order: u64) {
@@ -1004,6 +1182,27 @@ impl OrbitInsert for Instance {
     }
 
     fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        self.run(left, right, true);
+    }
+
+    fn tail_frames(&self) -> u32 {
+        self.state.tail.load(Ordering::Relaxed)
+    }
+
+    /// One block of the copy while the score does not play: the plugin gets
+    /// the block with its playing flag off, and the musical position stands.
+    /// The block counts for the flush as a block of
+    /// [`OrbitInsert::process`] does.
+    fn drain(&mut self, left: &mut [f32], right: &mut [f32]) {
+        self.run(left, right, false);
+    }
+}
+
+impl Instance {
+    /// One block of the copy: with `playing`, a block of the score, and
+    /// with no `playing`, a block of [`OrbitInsert::drain`]. Each block
+    /// counts for the flush, with no allocation: see [`Played`].
+    fn run(&mut self, left: &mut [f32], right: &mut [f32], playing: bool) {
         let frames = left.len().min(right.len()).min(MAX_BLOCK);
         let Some(plugin) = &self.plugin else {
             return;
@@ -1054,12 +1253,14 @@ impl OrbitInsert for Instance {
         }
         self.queue_note_events(frames);
         self.queue_param_changes(frames);
-        let state = ProcessContext_::StatesAndFlags_::kPlaying
-            | ProcessContext_::StatesAndFlags_::kTempoValid
+        let mut state = ProcessContext_::StatesAndFlags_::kTempoValid
             | ProcessContext_::StatesAndFlags_::kProjectTimeMusicValid
             | ProcessContext_::StatesAndFlags_::kBarPositionValid
             | ProcessContext_::StatesAndFlags_::kTimeSigValid
             | ProcessContext_::StatesAndFlags_::kContTimeValid;
+        if playing {
+            state |= ProcessContext_::StatesAndFlags_::kPlaying;
+        }
         let mut context: ProcessContext = unsafe { std::mem::zeroed() };
         context.state = state as u32;
         context.sampleRate = self.sample_rate;
@@ -1088,8 +1289,10 @@ impl OrbitInsert for Instance {
         // memory this instance owns for the full call.
         unsafe { ((*(*processor).vtbl).process)(processor, &mut data) };
         self.changes.clear();
-        self.frames += frames as i64;
-        self.beats += frames as f64 * self.tempo / 60.0 / self.sample_rate;
+        if playing {
+            self.frames += frames as i64;
+            self.beats += frames as f64 * self.tempo / 60.0 / self.sample_rate;
+        }
         // A plugin marks a channel with no sound, and has no duty to write
         // such a channel.
         let (first, count) = self.main_output;
@@ -1112,6 +1315,10 @@ impl OrbitInsert for Instance {
                 right[..frames].copy_from_slice(self.channel(first + 1, frames));
             }
         }
+        let output = left[..frames].iter().chain(&right[..frames]);
+        let peak = output.fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+        let busy = self.busy();
+        self.played.add(frames, peak, busy);
     }
 }
 
@@ -1119,7 +1326,7 @@ impl Drop for Instance {
     fn drop(&mut self) {
         // No engine holds the copy from here on. The mark clears first: a
         // copy that ended on the plugin thread has no plugin left.
-        self.state.held.store(false, Ordering::Relaxed);
+        self.state.set_place(Place::Home);
         let Some(plugin) = self.plugin.take() else {
             return;
         };
@@ -1128,5 +1335,212 @@ impl Drop for Instance {
         if let Err(returned) = self.retire.send(Box::new(move || drop(plugin))) {
             (returned.0)();
         }
+    }
+}
+
+/// The counts of a copy for its flush: the frames it played since its last
+/// flush, and its quiet frames in a row. A block is quiet when its peak is
+/// at [`QUIET_PEAK`] or below and the copy holds no note and no value at
+/// its end: see [`OrbitInsert::busy`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Played {
+    frames: u64,
+    quiet: u64,
+}
+
+impl Played {
+    /// Counts one block of `frames` frames with the peak `peak`.
+    fn add(&mut self, frames: usize, peak: f32, busy: bool) {
+        let frames = frames as u64;
+        self.frames += frames;
+        self.quiet = if peak <= QUIET_PEAK && !busy {
+            self.quiet + frames
+        } else {
+            0
+        };
+    }
+
+    /// True when a flush has no tail to play out: the copy ran no frame,
+    /// or it was quiet for `quiet_time` frames and is not `busy`.
+    fn skips(self, quiet_time: u64, busy: bool) -> bool {
+        self.frames == 0 || (self.quiet >= quiet_time && !busy)
+    }
+}
+
+/// A copy a flush plays out with silence: an [`Instance`], or a copy of a
+/// test with a peak for each block.
+trait Flushed {
+    /// Runs one silent block of [`MAX_BLOCK`] frames with no clock, and
+    /// gives the counts after it.
+    fn silent_block(&mut self) -> Played;
+
+    /// Turns the plugin off and on. `Err` has the reason the plugin did not
+    /// turn on.
+    fn restart(&mut self) -> Result<(), String>;
+}
+
+impl Flushed for Instance {
+    fn silent_block(&mut self) -> Played {
+        let (mut left, mut right) = ([0.0f32; MAX_BLOCK], [0.0f32; MAX_BLOCK]);
+        self.drain(&mut left, &mut right);
+        self.played
+    }
+
+    fn restart(&mut self) -> Result<(), String> {
+        self.plugin
+            .as_ref()
+            .map_or(Ok(()), |plugin| plugin.restart(None))
+    }
+}
+
+/// The flush of a copy with a tail: see [`Instance::flush_tail`]. The copy
+/// restarts, then runs the quiet check: silence for `latency` frames, 3 s at
+/// most, and [`CHECK_BLOCKS`] blocks more. A copy quiet at the end of the
+/// check is done. A copy still loud runs the long flush: silence until it is
+/// quiet for `quiet_time` frames, 3 s at most, then a restart and 0.1 s of
+/// silence, as at its build. The flush stops between 2 blocks when `closed`
+/// says so.
+fn play_out(
+    copy: &mut impl Flushed,
+    quiet_time: u64,
+    latency: u64,
+    rate: u32,
+    closed: &dyn Fn() -> bool,
+) -> Result<(), String> {
+    let mut played = Played::default();
+    let longest = (f64::from(rate) * LONGEST_TAIL) as u64;
+    // A latency longer than the longest tail counts as the longest tail. So
+    // the check of a plugin that reports a false latency runs 3 s at most.
+    let check = latency.min(longest) + (CHECK_BLOCKS * MAX_BLOCK) as u64;
+    copy.restart()?;
+    if !silence(copy, &mut played, closed, |ran, _| ran < check) || played.quiet > 0 {
+        return Ok(());
+    }
+    let loud = |ran, played: Played| played.quiet < quiet_time && ran < longest;
+    if !silence(copy, &mut played, closed, loud) {
+        return Ok(());
+    }
+    copy.restart()?;
+    let warm = warm_frames(rate);
+    silence(copy, &mut played, closed, |ran, _| ran < warm);
+    Ok(())
+}
+
+/// Runs silent blocks of a copy while `more` says so before each block:
+/// `more` gets the frames of the run so far and the counts of the copy.
+/// `played` keeps the counts after the last block. False when `closed`
+/// stopped the run between 2 blocks.
+fn silence(
+    copy: &mut impl Flushed,
+    played: &mut Played,
+    closed: &dyn Fn() -> bool,
+    more: impl Fn(u64, Played) -> bool,
+) -> bool {
+    let mut ran = 0;
+    while more(ran, *played) {
+        if closed() {
+            return false;
+        }
+        *played = copy.silent_block();
+        ran += MAX_BLOCK as u64;
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A copy of a test: the peak of each silent block by the number of
+    /// the block, the counts of the flush, and the blocks and the restarts
+    /// the flush ran.
+    struct Peaks {
+        peak: fn(usize) -> f32,
+        played: Played,
+        blocks: usize,
+        restarts: usize,
+    }
+
+    impl Flushed for Peaks {
+        fn silent_block(&mut self) -> Played {
+            self.played.add(MAX_BLOCK, (self.peak)(self.blocks), false);
+            self.blocks += 1;
+            self.played
+        }
+
+        fn restart(&mut self) -> Result<(), String> {
+            self.restarts += 1;
+            Ok(())
+        }
+    }
+
+    /// A copy that ran no frame skips the flush, and so does a quiet copy.
+    /// A copy quiet for less than its tail, or one that decays, takes a
+    /// restart and the quiet check. A latency past 3 s counts as 3 s in the
+    /// check. A copy that stays loud runs the long flush, 3 s at most, and a
+    /// closed host stops a flush.
+    #[test]
+    fn a_flush_plays_out_the_tail_of_a_loud_copy_only() {
+        const RATE: u32 = 48_000;
+        let quarter = u64::from(RATE) / 4;
+        let blocks = |frames: u64| frames.div_ceil(MAX_BLOCK as u64) as usize;
+        // The build leaves its counts at 0 after its warm-up: see
+        // `Loaded::activate`.
+        assert!(Played::default().skips(quarter, false));
+        let mut quiet = Played::default();
+        for _ in 0..blocks(quarter) {
+            quiet.add(MAX_BLOCK, QUIET_PEAK, false);
+        }
+        assert!(quiet.skips(quarter, false));
+        assert!(!quiet.skips(quarter, true), "a copy that holds a note");
+        let mut held = quiet;
+        held.add(MAX_BLOCK, 0.0, true);
+        assert_eq!(held.quiet, 0, "a block that ends with a note");
+
+        // The blocks and the restarts of a flush of a copy with no latency.
+        let flush = |peak: fn(usize) -> f32, quiet_time: u64, closed: &dyn Fn() -> bool| {
+            let mut copy = Peaks {
+                peak,
+                played: Played::default(),
+                blocks: 0,
+                restarts: 0,
+            };
+            play_out(&mut copy, quiet_time, 0, RATE, closed).expect("the flush");
+            (copy.blocks, copy.restarts)
+        };
+        let open = || false;
+        // A copy quiet 0.25 s inside a tail of 0.5 s takes the quick path: a
+        // restart and the quiet check. So does a copy that decays in the
+        // quiet check.
+        assert!(!quiet.skips(2 * quarter, false));
+        assert_eq!(flush(|_| 0.0, 2 * quarter, &open), (CHECK_BLOCKS, 1));
+        let decays = |block| [0.1, 0.01, 0.001].get(block).copied().unwrap_or(0.0);
+        assert_eq!(flush(decays, quarter, &open), (CHECK_BLOCKS, 1));
+        // A copy loud at the end of the check: silence until the copy is
+        // quiet for its quiet time, 3 s at most, then a restart and 0.1 s.
+        let warm = blocks(warm_frames(RATE));
+        let late = |block| if block < 10 { 0.5 } else { 0.0 };
+        assert_eq!(
+            flush(late, quarter, &open),
+            (10 + blocks(quarter) + warm, 2)
+        );
+        let longest = blocks(3 * u64::from(RATE));
+        let loud = flush(|_| 0.5, quarter, &open);
+        assert_eq!(loud, (CHECK_BLOCKS + longest + warm, 2));
+        // A latency past 3 s counts as 3 s in the quiet check.
+        let mut copy = Peaks {
+            peak: |_| 0.0,
+            played: Played::default(),
+            blocks: 0,
+            restarts: 0,
+        };
+        play_out(&mut copy, quarter, u64::from(u32::MAX), RATE, &open).expect("the flush");
+        assert_eq!((copy.blocks, copy.restarts), (longest + CHECK_BLOCKS, 1));
+        let asked = std::cell::Cell::new(0);
+        let closes = || {
+            asked.set(asked.get() + 1);
+            asked.get() > 20
+        };
+        assert_eq!(flush(|_| 0.5, quarter, &closes), (20, 1));
     }
 }

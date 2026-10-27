@@ -5,8 +5,10 @@
 //!
 //! Plugins are part of the same wait, and the session decides it. A start
 //! waits for the plugin copies of its first window: see
-//! [`rustel_runtime::Session::plugins_pending`]. An edit and a launch wait
-//! while the session holds their text for its plugin copies: see
+//! [`rustel_runtime::Session::plugins_pending`]. In [`LoadMode::Async`] a
+//! start waits a short time for the copies a close of the output sent home:
+//! see [`rustel_runtime::Session::plugins_returning`]. An edit and a launch
+//! wait while the session holds their text for its plugin copies: see
 //! [`rustel_runtime::Session::reload_live`].
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -113,6 +115,10 @@ pub(super) struct LoadState {
     /// of the wait: see [`StudioEngine::look_at_start_copies`].
     #[cfg(feature = "vst")]
     start_progress: Option<Instant>,
+    /// The start of the wait of a start in [`LoadMode::Async`] for the
+    /// copies a close sent home: see [`StudioEngine::start_returns`].
+    #[cfg(feature = "vst")]
+    start_returning: Option<Instant>,
     pub(super) held_edit: Option<HeldEdit>,
     /// Sounds skipped as still loading since the last late-sounds line.
     late: BTreeSet<String>,
@@ -507,15 +513,19 @@ impl StudioEngine {
 
     /// Follow what a start's first window plays, and hold its cycle zero
     /// for it in [`LoadMode::Wait`]. The plugin copies of the window hold
-    /// the start too.
+    /// the start too. In [`LoadMode::Async`] the start waits a short time
+    /// for the copies a close sent home: see [`Self::start_returns`].
     pub(super) fn follow_start(&mut self, source: &str) -> Result<(), RuntimeError> {
         self.load.installed = self.followed_in_first_window(source)?;
         #[cfg(feature = "vst")]
         {
             self.load.start_plugins = 0;
             self.load.start_progress = None;
+            self.load.start_returning = None;
             if self.waits_for_sounds() {
                 self.look_at_start_copies()?;
+            } else if self.session.plugins_returning() > 0 {
+                self.load.start_returning = Some(Instant::now());
             }
         }
         self.load.start_held = self.waits_for_sounds()
@@ -532,19 +542,24 @@ impl StudioEngine {
     /// sliders can move, and cycle zero stays just ahead. False once the
     /// first window's sounds have loaded and its plugin copies are ready,
     /// when the start goes on. A look that fails ends the wait for the
-    /// copies.
+    /// copies. In [`LoadMode::Async`] a start holds while it waits for the
+    /// copies a close sent home: see [`Self::start_returns`].
     pub(super) fn hold_start(
         &mut self,
         emit: &mut impl FnMut(StudioUpdate) -> StudioUpdateSendResult,
     ) -> bool {
-        if !self.start_is_held() {
+        #[cfg(feature = "vst")]
+        let returning = self.start_returns();
+        #[cfg(not(feature = "vst"))]
+        let returning = false;
+        if !returning && !self.start_is_held() {
             return false;
         }
         #[cfg(feature = "vst")]
         if self.load.start_plugins > 0 && self.look_at_start_copies().is_err() {
             self.load.start_plugins = 0;
         }
-        if !self.loading_among(&self.load.installed) && self.load.start_plugins == 0 {
+        if !returning && !self.loading_among(&self.load.installed) && self.load.start_plugins == 0 {
             self.load.start_held = false;
             return false;
         }
@@ -556,6 +571,31 @@ impl StudioEngine {
         self.ui
             .observe_layout(&mut self.session, &mut self.pending_diagnostics, emit);
         true
+    }
+
+    /// True while a start in [`LoadMode::Async`] waits for the plugin copies
+    /// a close of the output sent home: the door of the copies on their way
+    /// home gives more than 0, and less than [`rustel_runtime::SEAM_WAIT`]
+    /// passed since the start. Each turn asks the door again: see
+    /// [`rustel_runtime::Session::plugins_returning`]. Then the start goes
+    /// on, and a note of a copy not yet home plays with no plugin.
+    #[cfg(feature = "vst")]
+    fn start_returns(&mut self) -> bool {
+        let Some(since) = self.load.start_returning else {
+            return false;
+        };
+        if since.elapsed() < rustel_runtime::SEAM_WAIT && self.session.plugins_returning() > 0 {
+            return true;
+        }
+        self.load.start_returning = None;
+        false
+    }
+
+    /// Ends the wait of a start in [`LoadMode::Async`] for the copies a close
+    /// sent home, so the start goes on: an edit or a launch comes first.
+    #[cfg(feature = "vst")]
+    pub(super) fn end_start_returning(&mut self) {
+        self.load.start_returning = None;
     }
 
     /// Replace a held start with `source`, from its own cycle zero and
@@ -735,7 +775,10 @@ impl StudioEngine {
         self.load.start_held = false;
         self.load.start_plugins = 0;
         #[cfg(feature = "vst")]
-        self.session.cancel_plugin_hold();
+        {
+            self.load.start_returning = None;
+            self.session.cancel_plugin_hold();
+        }
         let late = self.late_sounds();
         self.say_late(late);
         self.resolve_alerts();

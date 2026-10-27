@@ -62,6 +62,10 @@ impl StudioEngine {
         if cancelled() {
             return Err(RuntimeError::Cancelled);
         }
+        // The edit comes before the copies a close sent home: the start goes
+        // on, and the edit plays as in the async mode.
+        #[cfg(feature = "vst")]
+        self.end_start_returning();
         if self.start_is_held() {
             return self.replace_held_start(source, mini);
         }

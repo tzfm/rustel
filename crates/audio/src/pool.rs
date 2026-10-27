@@ -52,8 +52,8 @@ use crate::mmcss::WorkerWake;
 use crate::insert::{EFFECT_CHAIN, MAX_INSERT_BUSES, NO_STAGE, OrbitInsert};
 use crate::reverb::REVERB_BLOCK;
 use crate::scalar::{
-    InsertMix, effect_stage_wakes, enable_denormal_flush, fade_effect_stage, ordered_stages,
-    render_leaving_insert, settle_insert_block,
+    InsertMix, drain_insert_block, effect_stage_wakes, enable_denormal_flush, fade_effect_stage,
+    ordered_stages, render_leaving_insert, settle_insert_block,
 };
 use crate::tripwire;
 
@@ -120,6 +120,9 @@ impl JobKind {
 pub(crate) struct Job {
     /// The frames of the block, 1 to 128.
     pub(crate) frames: usize,
+    /// Set for a job of a stopped output: each box of the job drains a block
+    /// of silence, and the job keeps no output. See [`drain_insert_block`].
+    pub(crate) drain: bool,
     /// The input of an effect job, and the output of each job.
     pub(crate) block: [[f32; REVERB_BLOCK]; 2],
     /// The boxes of the bus while the job is out. An instrument job holds
@@ -136,7 +139,8 @@ pub(crate) struct Job {
     /// The block of a leaving copy: the output of a leaving instrument on
     /// silence, or of a leaving effect on `dry`.
     pub(crate) leaving_block: [[f32; REVERB_BLOCK]; 2],
-    /// The frames each effect stage had no input and no output.
+    /// The frames each effect stage had no input and no output. A drain job
+    /// keeps the count of each of its boxes here, at the places of `boxes`.
     pub(crate) idle: [u32; EFFECT_CHAIN],
     /// The effect stages that run, in signal order, with [`NO_STAGE`] after
     /// the last.
@@ -163,6 +167,7 @@ impl Default for Job {
     fn default() -> Self {
         Self {
             frames: 0,
+            drain: false,
             block: [[0.0; REVERB_BLOCK]; 2],
             boxes: Default::default(),
             leaving: Default::default(),
@@ -1129,6 +1134,7 @@ fn work(shared: &PoolShared, worker: usize, mut promoted: u64) {
 fn run_job(kind: JobKind, job: &mut Job, worker: Option<usize>) {
     let started = Instant::now();
     let run = std::panic::catch_unwind(AssertUnwindSafe(|| match kind {
+        _ if job.drain => run_drain_job(job),
         JobKind::Instrument => run_instrument_job(job),
         JobKind::Effect => run_effect_job(job),
     }));
@@ -1206,6 +1212,24 @@ fn run_effect_job(job: &mut Job) {
             effect_stage_wakes(effect, left, right, idle[stage], *idle_limit, &mixes[stage])
                 .map(|fed| (place, fed))
         });
+    }
+}
+
+/// Each box of a job of a stopped output drains a block of silence, and its
+/// idle frames move as on the callback: see [`drain_insert_block`]. The job
+/// keeps no output.
+fn run_drain_job(job: &mut Job) {
+    let Job {
+        frames,
+        block,
+        boxes,
+        idle,
+        ..
+    } = job;
+    for (insert, idle) in boxes.iter_mut().zip(idle) {
+        if let Some(insert) = insert {
+            drain_insert_block(insert.as_mut(), block, *frames, idle);
+        }
     }
 }
 
@@ -1676,7 +1700,8 @@ mod tests {
         pool.shared.follow_stream(480, 48_000);
         pool.shared.set_power_saving(cfg!(miri));
         // An instrument job has 1 probe. An effect job runs stages 0 and 1
-        // and skips stage 2, which is not in its order.
+        // and skips stage 2, which is not in its order. A drain job drains
+        // each probe it holds on silence.
         let mut chains: Vec<Chain> = Vec::new();
         let mut runs = Vec::new();
         for slot in 0..JOB_SLOTS {
@@ -1696,11 +1721,14 @@ mod tests {
         for round in 0..rounds {
             let frames = 1 + (round % 128) as usize;
             let input = (round % 1000) as f32 + 1.0;
+            // Each other round drains, as a stopped output does.
+            let drain = round % 2 == 1;
             let mut guard = handle.begin();
             for (slot, chain) in chains.iter_mut().enumerate() {
                 let (kind, bus) = (JobKind::of(slot), slot % MAX_INSERT_BUSES);
                 let job = guard.job(kind, bus);
                 job.frames = frames;
+                job.drain = drain;
                 for channel in &mut job.block {
                     channel[..frames].fill(input);
                 }
@@ -1725,6 +1753,14 @@ mod tests {
                 assert!(caught(|| _ = guard.job(JobKind::Effect, 0)).is_err());
             }
             for (kind, output) in [(JobKind::Instrument, 1.0), (JobKind::Effect, input + 2.0)] {
+                // Each probe of a drain job adds 1 to silence, so its block
+                // sounds and its idle frames go to 0.
+                let (output, idle) = match (drain, kind) {
+                    (true, JobKind::Instrument) => (1.0, [0, 5, 5, 5]),
+                    (true, JobKind::Effect) => (1.0, [0, 0, 0, 5]),
+                    // The stages that ran are fed.
+                    (false, _) => (output, [0, 0, 5, 5]),
+                };
                 let mut left = u64::MAX;
                 while left != 0 {
                     let bus = guard.join(kind, left);
@@ -1736,8 +1772,8 @@ mod tests {
                             "round {round}, {kind:?} job of bus {bus}"
                         );
                     }
-                    if kind == JobKind::Effect {
-                        assert_eq!(job.idle, [0, 0, 5, 5], "the stages that ran are fed");
+                    if drain || kind == JobKind::Effect {
+                        assert_eq!(job.idle, idle, "round {round}, {kind:?} job of bus {bus}");
                     }
                     inline += u64::from(job.worker.is_none());
                     chains[kind.slot(bus)] = std::mem::take(&mut job.boxes);
@@ -1745,7 +1781,8 @@ mod tests {
             }
         }
         for (slot, stage, count) in &runs {
-            let expected = if *stage == 2 { 0 } else { rounds };
+            // Stage 2 runs only in a drain.
+            let expected = if *stage == 2 { rounds / 2 } else { rounds };
             assert_eq!(
                 count.load(Ordering::SeqCst),
                 expected,

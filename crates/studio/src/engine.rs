@@ -2553,20 +2553,31 @@ fn output_recovery_cancelled(requested: Option<&DevicePlaybackError>) -> Runtime
     }
 }
 
+/// Arms the refill of the replacement output at `now`, at its rate. `waits`
+/// is the load mode: in the wait mode the first window of the new output
+/// waits for the plugin copies the close sent home, and in the async mode a
+/// short time at most.
 fn arm_output_recovery_after_recycle(
     session: &mut Session,
     producer: &mut LiveFileProducer,
     now: f64,
     sample_rate: u32,
+    waits: bool,
 ) -> Result<(), RuntimeError> {
     // The replacement output is already open. New decodes must follow its
     // rate even if requery fails; retained PCM keeps its own rate.
     if let Some(library) = session.sample_library() {
         library.set_render_rate(sample_rate);
     }
-    // A held start counts its plugin copies at this rate too.
+    // A held start counts its plugin copies at this rate too, and the first
+    // window holds by the load mode of now.
     #[cfg(feature = "vst")]
-    session.set_plugin_rate(sample_rate);
+    {
+        session.set_plugin_rate(sample_rate);
+        session.set_plugin_wait(waits);
+    }
+    #[cfg(not(feature = "vst"))]
+    let _ = waits;
     session.consume_audio_confirmations();
     let requery = session.requery_after_output_recycle_at(now);
     session.consume_audio_confirmations();

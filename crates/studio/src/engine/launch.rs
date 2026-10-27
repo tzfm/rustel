@@ -78,6 +78,10 @@ impl StudioEngine {
             self.recent_rewind = None;
             return Ok(None);
         }
+        // The launch comes before the copies a close sent home: the start
+        // goes on, and the launch arms as in the async mode.
+        #[cfg(feature = "vst")]
+        self.end_start_returning();
         // A start still holding its cycle zero has no line yet: the launch
         // replaces it now, from its own cycle zero.
         if self.start_is_held() {

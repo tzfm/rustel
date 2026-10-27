@@ -362,6 +362,15 @@ impl LiveScalarBackend {
         self.published_refusals = refusals;
     }
 
+    /// Takes each insert this backend holds, for the producer once the
+    /// callback ended: see [`ScalarBackend::take_inserts`].
+    #[cfg(feature = "device-audio")]
+    pub(crate) fn take_inserts(
+        &mut self,
+    ) -> impl Iterator<Item = Box<dyn crate::insert::OrbitInsert>> {
+        self.scalar.take_inserts()
+    }
+
     /// Prepare one graph per worklet before this backend enters the callback.
     /// Repeated calls reuse compatible idle state. Use `install_kabel` to
     /// supply additional independent processors for overlapping voices.
@@ -800,6 +809,7 @@ impl LiveScalarBackend {
             // Ramp running voices to exactly zero over 10 ms, carrying the
             // fade across as many host blocks as necessary.
             let fade_pos = self.stop_fade_pos.get_or_insert(0);
+            let past_ramp = *fade_pos >= fade_total;
             if *fade_pos < fade_total {
                 // A stop admits nothing: an onset still pending must not
                 // start a voice under the ramp.
@@ -834,14 +844,24 @@ impl LiveScalarBackend {
             // After the ramp, reset_at runs on every stopped block. The
             // call is cheap once the voices are gone (orbit lines clear only
             // while still active) and keeps the clock aligned for a host
-            // which resumes without tearing the device down.
+            // which resumes without tearing the device down. Each block past
+            // the ramp then plays out the tail of each insert with no sound
+            // out. The block that ends the ramp ran each insert in its
+            // render, so it drains none.
             if *fade_pos >= fade_total {
                 self.scalar
                     .reset_at(start_frame.saturating_add(frames as u64));
+                if past_ramp {
+                    self.scalar.drain_stopped_inserts(frames);
+                }
             }
             return LiveBlockReport::default();
         }
-        self.stop_fade_pos = None;
+        // The first block after a stop ends its drain, so the next stop
+        // drains for its whole time.
+        if self.stop_fade_pos.take().is_some() {
+            self.scalar.end_insert_drain();
+        }
 
         // Reload takeover: the producer publishes (before the generation
         // flip) the frame where the NEW generation's re-query cursor starts.

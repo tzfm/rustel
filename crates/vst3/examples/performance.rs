@@ -492,8 +492,14 @@ fn run() -> Result<(), String> {
         } else {
             InsertSlot::effect(slot as u64, 0)
         };
-        let insert = host
-            .insert(key, rate, insert_slot, true)
+        // A copy for live play, as an output takes it: the first call starts
+        // the build, and the call after the build takes the copy.
+        let take = || host.insert(key, rate, insert_slot, false);
+        let insert = take()
+            .or_else(|| {
+                host.wait_idle();
+                take()
+            })
             .ok_or_else(|| format!("{name}: instance build failed: {:?}", host.take_errors()))?;
         startup.push(json!({
             "plugin": plugin.name(),

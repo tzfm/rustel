@@ -1063,7 +1063,11 @@ impl Chains {
     /// keeps for the session. An owner wants the copy of each stage it sits
     /// on, until [`CHAIN_GRACE`] after the body of its lane lost the plugin:
     /// see [`Chain::lost`]. A chain wants the copy of a key it lost
-    /// [`CHAIN_GRACE`] more: see [`Chain::dropped`].
+    /// [`CHAIN_GRACE`] more: see [`Chain::dropped`]. Of the keys a slot lost
+    /// in that time, the slot wants the oldest and the newest. So a run of
+    /// preset changes keeps the copy in use, the copy before and the copy of
+    /// the preset the run started from: 3 copies of the slot at most. Its
+    /// undo builds nothing.
     fn wanted(&self) -> (Vec<CopyName<'_>>, Vec<u64>) {
         let young = |at: Duration| self.clock.saturating_sub(at) < CHAIN_GRACE;
         let plan = self.plan.iter().map(|(_, planned)| planned);
@@ -1080,10 +1084,20 @@ impl Chains {
                     copies.push((slot, plugin.name.as_str(), plugin.preset.as_deref()));
                 }
             }
-            let dropped = chain.dropped.iter().filter(|(_, at)| young(*at));
-            let dropped =
-                dropped.map(|(copy, _)| (copy.slot, copy.name.as_str(), copy.preset.as_deref()));
-            copies.extend(dropped);
+            // The keys of each slot in the order they left. The sort keeps
+            // the order of the list for keys of one time.
+            let mut dropped: Vec<&(WantedCopy, Duration)> =
+                chain.dropped.iter().filter(|(_, at)| young(*at)).collect();
+            dropped.sort_by_key(|(copy, at)| (copy.slot, *at));
+            for (place, (copy, _)) in dropped.iter().enumerate() {
+                let first = place == 0 || dropped[place - 1].0.slot != copy.slot;
+                let last = dropped
+                    .get(place + 1)
+                    .is_none_or(|(next, _)| next.slot != copy.slot);
+                if first || last {
+                    copies.push((copy.slot, copy.name.as_str(), copy.preset.as_deref()));
+                }
+            }
         }
         copies.sort_unstable();
         copies.dedup();
@@ -1147,15 +1161,17 @@ impl Chains {
     }
 }
 
-/// The host forgets the copies and the chains of a session that ends: see
-/// [`Host::keep`]. Its parked copies stay until the host needs their place.
+/// The host ends the chains of a session that ends: each chain the last
+/// call of [`Host::keep`] named, so each chain with a copy the session
+/// wanted. Their copies end, and a copy an engine holds ends when it comes
+/// home. The host keeps no copy for a session that is gone.
 impl Drop for Chains {
     fn drop(&mut self) {
         let (copies, named) = &self.kept;
         if (!copies.is_empty() || !named.is_empty())
             && let Some(host) = started()
         {
-            host.keep(self.caller, Vec::new(), Vec::new(), Vec::new());
+            host.keep(self.caller, Vec::new(), Vec::new(), named.clone());
         }
     }
 }
@@ -1799,7 +1815,8 @@ pub(crate) fn load(names: &mut Vec<String>) {
 /// wait, at the sample rate of the output. The builds run in the order of
 /// the list, so a caller gives the copies of the lanes that sound first.
 /// Gives the copies of lanes that play and that are not ready: a plugin in
-/// its load, or a copy in its build. Gives also the line of each copy the
+/// its load, a copy in its build, or a copy an engine gave back on its way
+/// home, which needs no build. Gives also the line of each copy the
 /// host cannot make, with its reason, as the note of the copy or the host
 /// says it. A copy with a build in the line gets no second build, so a
 /// caller looks as often as it needs.
@@ -1816,6 +1833,12 @@ pub(crate) fn ensure(wants: &[Want], sample_rate: u32) -> (Vec<&Want>, Vec<Strin
         let (host, preset) = (host(), preset.as_deref());
         match host.prepared(name, preset, *instrument, sample_rate, *slot) {
             rustel_vst3::Prepared::Ready(_) => {}
+            // The copy comes home from an engine, and needs no build.
+            rustel_vst3::Prepared::Returning => {
+                if *sounds {
+                    pending.push(want);
+                }
+            }
             rustel_vst3::Prepared::Unavailable(reason) => {
                 let call = if *instrument { "vsti" } else { "vst" };
                 lines.push(format!("{call} skipped: {reason}"));
@@ -1830,6 +1853,18 @@ pub(crate) fn ensure(wants: &[Want], sample_rate: u32) -> (Vec<&Want>, Vec<Strin
         }
     }
     (pending, lines)
+}
+
+/// The copies on their way home that the chains of a session want, for a
+/// live output at the rate `sample_rate`: see [`Host::returning`]. The call
+/// starts the retune of each such copy that waits at another rate. Chains
+/// that want no copy ask the host nothing.
+pub(crate) fn returning(chains: &Mutex<Chains>, sample_rate: u32) -> usize {
+    let chains = locked(chains);
+    if chains.kept.0.is_empty() {
+        return 0;
+    }
+    started().map_or(0, |host| host.returning(chains.caller, sample_rate))
 }
 
 #[cfg(test)]
@@ -2449,6 +2484,17 @@ mod tests {
         let dark_preset = Some("Dark".to_owned());
         assert_eq!(presets(&registry, start), [None, dark_preset.clone()]);
         assert_eq!(presets(&registry, later), [dark_preset]);
+        // Of a run of 4 presets in CHAIN_GRACE, the slot keeps the copy in
+        // use, the copy before and the copy of the preset the run started
+        // from, and not the copy between them.
+        let second = Duration::from_secs(1);
+        for (at, name) in [(1, "Soft"), (2, "Hard")] {
+            let picked = with_preset(owners(1)[0].clone(), instrument, name);
+            registry.score_changed(lanes.playing(), start + second * at);
+            assert_eq!(chain_of(&mut registry, picked, start + second * at), serum);
+        }
+        let [hard, soft] = ["Hard", "Soft"].map(|name| Some(name.to_owned()));
+        assert_eq!(presets(&registry, start + second * 2), [None, hard, soft]);
 
         // 2 arms of a stack with one plugin keep their chains when a third
         // arm asks first.
@@ -2664,6 +2710,14 @@ mod tests {
         assert_eq!(seated(&mut registry, three, at(8)), stages(&[0, 1, 2]));
         let flanger = fx_of(&[(30, "chorus"), (31, "eq"), (32, "flanger")]);
         assert_eq!(seated(&mut registry, flanger, at(8)), stages(&[1, 2, 3]));
+        // One plugin in place of another takes a stage of its own. Its undo
+        // in CHAIN_GRACE puts the plugin back on the stage of its dropped
+        // key, so the copy of that stage plays again.
+        let swapped = fx_of(&[(30, "chorus"), (31, "phaser"), (32, "flanger")]);
+        assert_eq!(seated(&mut registry, swapped, at(8)), stages(&[1, 0, 3]));
+        let undone = fx_of(&[(30, "chorus"), (31, "eq"), (32, "flanger")]);
+        assert_eq!(seated(&mut registry, undone, at(8)), stages(&[1, 2, 3]));
+        assert!(effects(&registry, at(8), fx).contains(&copy(2, "eq", None)));
 
         // A lane with no statement: a `$` lane above moves the name of each
         // lane after it, and a call above moves each call number. An owner
@@ -3181,13 +3235,20 @@ mod tests {
         // The host of a live output hears each change of the copies the
         // chains want: an assignment, a plan, a plan that goes, a look, a
         // commit and a chain that ends. With no change it hears nothing. A
-        // session the host keeps copies for tells the host when it ends.
+        // session the host keeps copies for tells the host when it ends. The
+        // door of the copies on their way home asks the host only for chains
+        // that want a copy.
         let (mut lanes, chains) = (LaneTable::default(), Mutex::new(Chains::new()));
         play(&mut lanes, both);
         score_changed(&chains, &lanes, Some(both), true);
         let calls = kept(&chains);
+        assert_eq!(returning(&chains, 48_000), 0);
+        assert_eq!(HOST_CALLS.get(), calls, "a door with no copy");
         assign(&chains, &lanes, &csound, [&serum], true);
         assert_eq!(HOST_CALLS.get(), calls + 1, "an assignment");
+        let calls = kept(&chains);
+        returning(&chains, 48_000);
+        assert_eq!(HOST_CALLS.get(), calls + 1, "a door with a copy");
         let calls = kept(&chains);
         assign(&chains, &lanes, &csound, [&serum], true);
         score_changed(&chains, &lanes, Some(both), true);

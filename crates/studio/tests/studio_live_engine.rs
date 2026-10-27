@@ -1017,7 +1017,9 @@ fn a_live_note_plays_through_its_plugin() {
 /// takes the first line after the load. In the async mode the first notes
 /// of a start and an edit play dry, and a launch plays on its line. A launch
 /// whose text takes longer to read than its countdown takes a later line.
-/// Each output runs the plugin on 2 plugin workers.
+/// A Stop, a new output while stopped and a start again on one engine play
+/// no note before the plugin, and build no copy. Each output runs the plugin
+/// on 2 plugin workers. The drop of an engine ends each copy of its chains.
 #[cfg(feature = "vst")]
 #[test]
 fn a_wait_start_and_a_wait_edit_play_no_note_before_their_plugin() {
@@ -1110,12 +1112,77 @@ fn a_wait_start_and_a_wait_edit_play_no_note_before_their_plugin() {
         let landed =
             !held || play == Play::Start || matches!(engine.take_launch_outcome(), Some(Ok(_)));
         engine.stop(Duration::from_millis(200)).expect("stop");
+        // The drop of the engine ends the chains of its session, and so each
+        // copy of the bundle of the case.
+        drop(engine);
+        no_plugin_work();
+        let plugins = rustel_runtime::vst::host().plugins();
+        let copies: usize = plugins.iter().map(|plugin| plugin.running).sum();
+        assert_eq!(copies, 0, "{mode:?}, {play:?}: a copy runs on");
         (peak, first_onset, countdown, held && landed)
     };
     let (peak, first_onset, _, held) = heard(LoadMode::Wait, Play::Start, score);
     assert!(held, "the start waits, and the header counts 1 plugin");
     assert_eq!(peak, 0.0, "a note of the start played with no plugin");
     assert_eq!(first_onset, Some(0.0), "the start began on cycle 0");
+    // On one engine: a start, a Stop that parks the output with the copy,
+    // and a new output while stopped, which closes the parked output and
+    // sends the copy home. The next start waits for the copy, and builds
+    // none. Each copy writes a line to a mark file at its end, so an end at
+    // the close shows.
+    {
+        let marks = tempfile::tempdir().expect("mark folder");
+        let ends = marks.path().join("ends");
+        let lines = || {
+            let marked = std::fs::read_to_string(&ends).unwrap_or_default();
+            marked.lines().count()
+        };
+        // SAFETY: as above.
+        unsafe { std::env::set_var(rustel_vst3_fixture::PROCESS_MARK_ENV, &ends) };
+        let _plugins = fixture_plugins();
+        let mut engine = silent_engine();
+        let master = engine.master_bus();
+        master.set_load_mode(LoadMode::Wait);
+        let copies = || -> usize {
+            let plugins = rustel_runtime::vst::host().plugins();
+            plugins.iter().map(|plugin| plugin.running).sum()
+        };
+        engine.evaluate_and_start(score, false).expect("a start");
+        let started = Instant::now();
+        while !rustel_runtime::vst::engine_holds_unkept(&[]) {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the plugin did not take the lane"
+            );
+            tick_for(&mut engine, Duration::from_millis(50), &mut || {});
+        }
+        // The load of the plugin made a copy of each class and ended it,
+        // each with its line.
+        no_plugin_work();
+        let (running, ended) = (copies(), lines());
+        // A stop parks the output only when its callback confirms the stop
+        // in time, so a slow machine needs the full stop time.
+        let _ = engine.stop(engine.stop_timeout());
+        engine.set_output_device("silent").expect("a new output");
+        engine.evaluate_and_start(score, false).expect("a start");
+        let mut peak = 0.0_f32;
+        master.take_levels();
+        tick_for(&mut engine, Duration::from_millis(1_200), &mut || {
+            peak = peak.max(master.take_levels().peak);
+        });
+        assert_eq!(peak, 0.0, "a note after a new output played with no plugin");
+        assert_eq!(
+            (copies(), lines()),
+            (running, ended),
+            "a new output built a copy"
+        );
+        engine.stop(Duration::from_millis(200)).expect("stop");
+        drop(engine);
+        no_plugin_work();
+        assert_eq!(copies(), 0, "a copy runs on");
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(rustel_vst3_fixture::PROCESS_MARK_ENV) };
+    }
     for edit in [score, helper] {
         let (peak, _, _, held) = heard(LoadMode::Wait, Play::Edit, edit);
         assert!(held, "the edit waits for the load, then lands: {edit}");
@@ -1435,8 +1502,12 @@ fn the_idle_sweep_unloads_a_plugin_no_tab_names() {
 /// the start gets its copy during the mute, and a lane with its first note
 /// 6 cycles ahead gets its copy before that note. The plugin is the fixture
 /// at gain 0, so a note with no plugin makes sound. A lane that leaves the
-/// score gives its copy back. The output runs the plugin on 2 plugin
-/// workers.
+/// score gives its copy back. In the wait mode an undo in 5 s of play takes
+/// the copy before and builds nothing: the undo of a preset, of a run of
+/// presets, through a new output, and of 2 effects back in another call
+/// order. A new buffer size keeps each copy: the lanes play on with no dry
+/// note, and 4 lanes of the fixture tone sound again in 0.5 s, in each mode.
+/// The output runs the plugin on 2 plugin workers.
 #[cfg(feature = "vst")]
 #[test]
 fn a_plugin_lane_keeps_its_copy_through_edits_above_and_gives_it_back_at_its_end() {
@@ -1505,6 +1576,19 @@ fn a_plugin_lane_keeps_its_copy_through_edits_above_and_gives_it_back_at_its_end
     engine.evaluate(&open, false).expect("the end of the mute");
     assert_eq!(peak_of(&mut engine, 800), 0.0, "a dry note after the mute");
     assert_eq!(copies(), 2, "the end of the mute built a copy");
+    // A new buffer size closes the output while the lanes play. Each copy
+    // comes home, and the first window of the new output waits for it.
+    engine
+        .set_output_buffer_frames(Some(256))
+        .expect("a new buffer size");
+    for _ in 0..3 {
+        assert_eq!(
+            peak_of(&mut engine, 300),
+            0.0,
+            "a dry note after a new buffer size"
+        );
+    }
+    assert_eq!(copies(), 2, "a new buffer size built a copy");
     // A lane with its first note 6 cycles ahead gets its copy 4 cycles or
     // more before that note, and the note plays through the plugin. The
     // output asks for a copy about a second before its note at most. The
@@ -1528,17 +1612,245 @@ fn a_plugin_lane_keeps_its_copy_through_edits_above_and_gives_it_back_at_its_end
     }
     assert_eq!(copies(), 3, "the copy of the later lane");
     // The plugin lanes leave the score: their copies end after the tail.
-    engine
-        .evaluate("$: note('c5').s('sine').gain(0)", false)
-        .expect("a score with no plugin");
-    let started = Instant::now();
-    while copies() > 0 {
-        peak_of(&mut engine, 300);
-        assert!(
-            started.elapsed() < Duration::from_secs(20),
-            "the copy of the removed lane stays"
-        );
+    let leave = |engine: &mut StudioEngine| {
+        engine
+            .evaluate("$: note('c5').s('sine').gain(0)", false)
+            .expect("a score with no plugin");
+        let started = Instant::now();
+        while copies() > 0 {
+            peak_of(engine, 300);
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the copy of the removed lane stays"
+            );
+        }
+    };
+    leave(&mut engine);
+
+    // An undo in 5 s of play takes the copy before, in the wait mode. Each
+    // preset of this preset folder sets the gain to 0, so a note with no
+    // plugin is heard. Each build takes 400 ms more here, so an edit with a
+    // new copy holds for its build. Each copy built from here writes a line
+    // to a mark file at its end.
+    let presets = tempfile::tempdir().expect("preset folder");
+    let of_fixture = presets.path().join(rustel_vst3_fixture::NAME);
+    std::fs::create_dir_all(&of_fixture).expect("preset folder");
+    for name in ["A", "B", "C", "D"] {
+        let file = of_fixture.join(format!("{name}.vstpreset"));
+        std::fs::write(file, rustel_vst3_fixture::preset(0.0, 0.0)).expect("preset file");
     }
+    let host = vst::host();
+    host.set_preset_folder(presets.path().to_path_buf());
+    // The first ask arms the read of the folders, and the wait sees its end.
+    host.presets(rustel_vst3_fixture::NAME);
+    host.wait_idle();
+    let marks = tempfile::tempdir().expect("mark folder");
+    let ends = marks.path().join("ends");
+    // SAFETY: one engine test runs at a time, the score has no plugin, and
+    // the plugin thread has no work. So no other thread of this process
+    // reads a variable now.
+    unsafe {
+        std::env::set_var(rustel_vst3_fixture::PROCESS_MARK_ENV, &ends);
+        std::env::set_var(rustel_vst3_fixture::SLOW_CLASS_ENV, "400");
+    }
+    let lines = || {
+        let marked = std::fs::read_to_string(&ends).unwrap_or_default();
+        marked.lines().count()
+    };
+    master.set_load_mode(LoadMode::Wait);
+    // A swap of 2 copies fades one into the other. The rounding of their 2
+    // levels lets a trace of the input through, far below a note with no
+    // plugin.
+    const TRACE: f32 = 1e-4;
+    let dry = |engine: &mut StudioEngine, window: u64| peak_of(engine, window) >= TRACE;
+    // Plays until `done` says so, with no note that plays with no plugin.
+    let play_until = |engine: &mut StudioEngine, what: &str, done: &dyn Fn() -> bool| {
+        let started = Instant::now();
+        while !done() {
+            assert!(!dry(engine, 100), "a dry note: {what}");
+            assert!(started.elapsed() < Duration::from_secs(20), "{what}");
+        }
+    };
+    // Plays an edit until it lands. True when it held for a copy.
+    let land = |engine: &mut StudioEngine, edit: &str| {
+        let held = engine.evaluate(edit, false).expect("an edit").held;
+        let landed =
+            |engine: &mut StudioEngine| matches!(engine.take_launch_outcome(), Some(Ok(_)));
+        let started = Instant::now();
+        while held && !landed(engine) {
+            assert!(!dry(engine, 50), "a dry note before: {edit}");
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the edit did not land: {edit}"
+            );
+        }
+        held
+    };
+    let lane = |preset: &str| {
+        format!("$: note('c3').s('sine').vst('rustel fixture', {{ preset: '{preset}' }}).fast(8)")
+    };
+    assert!(
+        land(&mut engine, &lane("A")),
+        "the first copy holds the edit"
+    );
+    play_until(&mut engine, "the copy of A", &|| copies() == 1);
+    assert!(!dry(&mut engine, 300), "a dry note of A");
+    // A note of the new preset plays, so the copy before goes home.
+    assert!(
+        land(&mut engine, &lane("B")),
+        "the new preset holds the edit"
+    );
+    assert!(!dry(&mut engine, 800), "a dry note of B");
+    let ended = lines();
+    assert!(!land(&mut engine, &lane("A")), "the undo lands at once");
+    assert!(!dry(&mut engine, 800), "a dry note of the undo");
+    assert_eq!((copies(), lines()), (2, ended), "the undo");
+    // Back and forth 3 times builds nothing.
+    for preset in ["B", "A", "B", "A", "B", "A"] {
+        assert!(!land(&mut engine, &lane(preset)), "{preset} lands at once");
+        assert!(!dry(&mut engine, 300), "a dry note of {preset}");
+    }
+    assert_eq!((copies(), lines()), (2, ended), "back and forth");
+    // The lane plays A, and after 5 s of play the copy of B ends. In a run
+    // of preset changes in 5 s of play, a slot keeps the copy in use, the
+    // copy before and the copy of the preset the run started from. So the
+    // pick of A after B and C builds nothing.
+    play_until(&mut engine, "the end of B", &|| lines() == ended + 1);
+    assert_eq!(copies(), 1, "the copy of A");
+    let ended = lines();
+    for preset in ["B", "C"] {
+        assert!(land(&mut engine, &lane(preset)), "{preset} holds the edit");
+        assert!(!dry(&mut engine, 300), "a dry note of {preset}");
+    }
+    assert!(!land(&mut engine, &lane("A")), "A lands at once");
+    assert!(!dry(&mut engine, 300), "a dry note of A");
+    play_until(&mut engine, "the end of B", &|| lines() == ended + 1);
+    assert_eq!(copies(), 2, "A and C");
+    assert!(land(&mut engine, &lane("D")), "D holds the edit");
+    assert!(!dry(&mut engine, 300), "a dry note of D");
+    play_until(&mut engine, "the end of C", &|| lines() == ended + 2);
+    assert_eq!(copies(), 2, "D and A");
+    // A preset edit, a Stop, a new output, a Start and the undo, in 5 s of
+    // play. The close of the output sends the copy home. 2 builds of 400 ms
+    // in the line of the plugin thread hold the copy on its way home, so
+    // the Start waits for it. The undo builds nothing.
+    assert!(!land(&mut engine, &lane("A")), "A lands at once");
+    assert!(!dry(&mut engine, 300), "a dry note of A");
+    // A stop parks the output only when its callback confirms the stop in
+    // time, so a slow machine needs the full stop time.
+    let _ = engine.stop(engine.stop_timeout());
+    assert!(
+        engine.device_report().is_some(),
+        "the stop parks the output"
+    );
+    let builds = [1, 2];
+    for chain in builds {
+        let slot = rustel_audio::InsertSlot::effect(chain, 0);
+        host.prepare(rustel_vst3_fixture::NAME, Some("B"), false, 48_000, slot);
+    }
+    engine.set_output_device("silent").expect("a new output");
+    engine
+        .evaluate_and_start(&lane("A"), false)
+        .expect("a start");
+    assert!(!dry(&mut engine, 1_200), "a dry note of the start");
+    // The copies of those builds end with their chains.
+    let ended = lines();
+    host.keep(u64::MAX, Vec::new(), Vec::new(), builds.to_vec());
+    play_until(&mut engine, "the end of the builds", &|| {
+        lines() == ended + 2
+    });
+    assert_eq!(copies(), 2, "D and A");
+    let ended = lines();
+    assert!(!land(&mut engine, &lane("D")), "the undo lands at once");
+    assert!(!dry(&mut engine, 300), "a dry note of the undo");
+    assert_eq!(
+        (copies(), lines()),
+        (2, ended),
+        "the undo after a new output"
+    );
+    // A lane with 3 calls of the fixture loses 2 of them. An undo in 5 s of
+    // play brings them back in another call order: each call takes the
+    // stage of its dropped key, so its copy plays again, and nothing
+    // builds. The same undo after 5 s of play builds both.
+    leave(&mut engine);
+    let three = |first: &str, second: &str| {
+        format!(
+            "$: note('c3').s('sine').vst('rustel fixture', {{ preset: '{first}' }})\
+             .vst('rustel fixture', {{ preset: '{second}' }})\
+             .vst('rustel fixture', {{ gain: 0 }}).fast(8)"
+        )
+    };
+    let one = "$: note('c3').s('sine').vst('rustel fixture', { gain: 0 }).fast(8)";
+    assert!(land(&mut engine, &three("A", "B")), "3 calls hold the edit");
+    play_until(&mut engine, "the copies of 3 calls", &|| copies() == 3);
+    let ended = lines();
+    assert!(!land(&mut engine, one), "one call lands at once");
+    assert!(!dry(&mut engine, 300), "a dry note of one call");
+    assert!(
+        !land(&mut engine, &three("B", "A")),
+        "the undo lands at once"
+    );
+    assert!(!dry(&mut engine, 300), "a dry note of the undo");
+    assert_eq!((copies(), lines()), (3, ended), "the undo of 2 calls");
+    assert!(!land(&mut engine, one), "one call lands at once");
+    play_until(&mut engine, "the end of A and B", &|| lines() == ended + 2);
+    assert_eq!(copies(), 1, "the copy of one call");
+    assert!(
+        land(&mut engine, &three("B", "A")),
+        "a late undo holds the edit"
+    );
+    play_until(&mut engine, "the copies of the late undo", &|| {
+        copies() == 3
+    });
+    leave(&mut engine);
+    vst::host().wait_idle();
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_CLASS_ENV) };
+    master.set_load_mode(LoadMode::Async);
+
+    // 4 lanes of the fixture tone sound, each copy with a note at the close
+    // of the output for a new buffer size. Each copy ends its note, turns off
+    // and on, and comes home, so the tone sounds again in 0.5 s, in each
+    // mode. No copy ends or builds again.
+    let tones: Vec<String> = ["c3", "e3", "g3", "b3"]
+        .iter()
+        .map(|key| format!("$: note('{key}').vsti('rustel fixture tone').fast(8)"))
+        .collect();
+    let tones = tones.join("\n");
+    for mode in [LoadMode::Wait, LoadMode::Async] {
+        master.set_load_mode(mode);
+        engine.evaluate(&tones, false).expect("4 tone lanes");
+        let started = Instant::now();
+        while copies() != 4 || peak_of(&mut engine, 300) < 0.05 {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the tone lanes did not sound: {mode:?}"
+            );
+        }
+        vst::host().wait_idle();
+        let ended = lines();
+        engine
+            .set_output_buffer_frames(Some(256))
+            .expect("a new buffer size");
+        let reopened = Instant::now();
+        while peak_of(&mut engine, 50) < 0.05 {
+            let late = reopened.elapsed();
+            assert!(
+                late < Duration::from_millis(500),
+                "the tone sounds {late:?} after a new buffer size: {mode:?}"
+            );
+        }
+        assert_eq!(
+            (copies(), lines()),
+            (4, ended),
+            "a new buffer size built a copy: {mode:?}"
+        );
+        leave(&mut engine);
+    }
+    vst::host().wait_idle();
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(rustel_vst3_fixture::PROCESS_MARK_ENV) };
+    master.set_load_mode(LoadMode::Async);
     engine.stop(Duration::from_millis(200)).expect("stop");
     rustel_audio::set_plugin_pool_for_test(None);
 }
@@ -3607,4 +3919,276 @@ fn piano_over_playback_tail_acknowledges_stop() {
 #[test]
 fn piano_over_playback_tail_acknowledges_immediate_stop() {
     piano_over_playback_tail_stops(true);
+}
+
+/// A Stop parks the output with the copy of a plugin lane, and a new output
+/// right before the next start closes it, as the refresh of the Linux
+/// default output does at each start. The copy goes home, and the start
+/// takes it with no build and no dry note, in each mode. A park slower than
+/// SEAM_WAIT holds an async start that long at most: the notes before the
+/// copy is home play dry, and each note after plays through the copy. The
+/// first window of a new buffer size waits by the load mode of now, also
+/// with no edit since the mode changed. An edit or the arm of a launch ends
+/// the wait of a start at once. A copy with an echo plays its echo out
+/// while the output is stopped, so no old echo sounds under the first note
+/// of the next start, on the parked output and on a new output.
+#[cfg(feature = "vst")]
+#[test]
+fn a_new_default_output_after_a_stop_keeps_the_plugin_copies() {
+    use rustel_runtime::vst;
+    use rustel_studio::settings::LoadMode;
+    let _engine = one_engine();
+    let copies = || -> usize {
+        let plugins = vst::host().plugins();
+        plugins.iter().map(|plugin| plugin.running).sum()
+    };
+    // The peak of the output over `window` ms of play.
+    let peak_of = |engine: &mut StudioEngine, window: u64| {
+        let master = engine.master_bus();
+        master.take_levels();
+        let mut peak = 0.0_f32;
+        tick_for(engine, Duration::from_millis(window), &mut || {
+            peak = peak.max(master.take_levels().peak);
+        });
+        peak
+    };
+    // Plays until an engine holds the copy of the lane.
+    let take_copy = |engine: &mut StudioEngine| {
+        let started = Instant::now();
+        while !vst::engine_holds_unkept(&[]) {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the plugin did not take the lane"
+            );
+            tick_for(engine, Duration::from_millis(20), &mut || {});
+        }
+    };
+    let lane = |gain: &str| {
+        format!("$: note('c3').s('sine').vst('rustel fixture', {{ gain: {gain} }}).fast(16)")
+    };
+    // The plugin thread reads a variable of the process when it builds the
+    // fixture.
+    let no_plugin_work = || vst::host().wait_idle();
+    // Each copy of the loop writes a line to a mark file at its end, so an
+    // end at the close shows.
+    let marks = tempfile::tempdir().expect("mark folder");
+    let ends = marks.path().join("ends");
+    let lines = || {
+        let marked = std::fs::read_to_string(&ends).unwrap_or_default();
+        marked.lines().count()
+    };
+    no_plugin_work();
+    // SAFETY: one engine test runs at a time, and the plugin thread has no
+    // work. So no other thread of this process reads a variable now.
+    unsafe { std::env::set_var(rustel_vst3_fixture::PROCESS_MARK_ENV, &ends) };
+    for mode in [LoadMode::Wait, LoadMode::Async] {
+        let _plugins = fixture_plugins();
+        let mut engine = silent_engine();
+        engine.master_bus().set_load_mode(mode);
+        engine
+            .evaluate_and_start(&lane("0"), false)
+            .expect("a start");
+        take_copy(&mut engine);
+        // The load of the plugin made a copy of each class and ended it,
+        // each with its line.
+        no_plugin_work();
+        let (running, ended) = (copies(), lines());
+        // A stop parks the output only when its callback confirms the stop
+        // in time, so a slow machine needs the full stop time.
+        let _ = engine.stop(engine.stop_timeout());
+        engine.set_output_device("silent").expect("a new output");
+        engine
+            .evaluate_and_start(&lane("0"), false)
+            .expect("a start");
+        assert_eq!(peak_of(&mut engine, 1_200), 0.0, "a dry note: {mode:?}");
+        assert_eq!(
+            (copies(), lines()),
+            (running, ended),
+            "a new output built a copy: {mode:?}"
+        );
+        engine.stop(Duration::from_millis(200)).expect("stop");
+        drop(engine);
+        no_plugin_work();
+    }
+    no_plugin_work();
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(rustel_vst3_fixture::PROCESS_MARK_ENV) };
+
+    // A park slower than SEAM_WAIT, in the async mode. Each setActive call
+    // of the copy sleeps 400 ms, and the output closes right after the Stop,
+    // before the copy is quiet for its quiet time. So the park turns the
+    // copy off and on, 800 ms. The host reads no preset file in that time.
+    // The start waits SEAM_WAIT at most: its first notes play dry, and each
+    // note after the copy is home plays at 0.5. The start has no pre-roll
+    // here, so the time to its first note is the time of its wait.
+    let _plugins = fixture_plugins();
+    let presets = tempfile::tempdir().expect("preset folder");
+    let host = vst::host();
+    host.set_preset_folder(presets.path().to_path_buf());
+    // The first ask arms the read of the folders, and the wait sees its end.
+    host.presets(rustel_vst3_fixture::NAME);
+    no_plugin_work();
+    // SAFETY: as above.
+    unsafe { std::env::set_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV, "400") };
+    let mut engine = silent_engine_with(StudioConfig {
+        start_preroll: Duration::ZERO,
+        ..StudioConfig::default()
+    });
+    engine.master_bus().set_load_mode(LoadMode::Async);
+    engine
+        .evaluate_and_start(&lane("0.5"), false)
+        .expect("a start");
+    let (mut dry, started) = (0.0_f32, Instant::now());
+    while !vst::engine_holds_unkept(&[]) {
+        dry = dry.max(peak_of(&mut engine, 20));
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the plugin did not take the lane"
+        );
+    }
+    assert!(dry > 0.05, "no dry note while the copy turns on");
+    peak_of(&mut engine, 300);
+    let through = peak_of(&mut engine, 600);
+    assert!(
+        (through / dry - 0.5).abs() < 0.1,
+        "the gain of the copy: {through} of {dry}"
+    );
+    let _ = engine.stop(engine.stop_timeout());
+    engine.set_output_device("silent").expect("a new output");
+    engine
+        .evaluate_and_start(&lane("0.5"), false)
+        .expect("a start");
+    let started = Instant::now();
+    let (heard, mut first) = loop {
+        let peak = peak_of(&mut engine, 10);
+        if peak > 0.05 {
+            break (started.elapsed(), peak);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the start did not sound"
+        );
+    };
+    first = first.max(peak_of(&mut engine, 80));
+    // The wait of the start began in the call of the start.
+    let held = rustel_runtime::SEAM_WAIT - Duration::from_millis(30);
+    assert!(heard >= held, "the first note {heard:?} after the start");
+    assert!(first > 0.75 * dry, "the first note: {first} of {dry}");
+    take_copy(&mut engine);
+    peak_of(&mut engine, 300);
+    let through = peak_of(&mut engine, 600);
+    assert!(
+        (through / dry - 0.5).abs() < 0.1,
+        "a note after the copy came home: {through} of {dry}"
+    );
+    assert_eq!(copies(), 1, "a new output built a copy");
+    // A new buffer size closes the output while the lane plays. No edit set
+    // the load mode, and the first window of the new output still waits by
+    // it: SEAM_WAIT at most, so the notes before the copy is home play dry.
+    engine
+        .set_output_buffer_frames(Some(256))
+        .expect("a new buffer size");
+    let (mut early, started) = (0.0_f32, Instant::now());
+    while !vst::engine_holds_unkept(&[]) {
+        early = early.max(peak_of(&mut engine, 20));
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the copy did not come home"
+        );
+    }
+    assert!(
+        early > 0.75 * dry,
+        "a note before the copy: {early} of {dry}"
+    );
+    // An edit or the arm of a launch in the wait of a start ends the wait:
+    // the start goes on at once, and cycle zero stays where it is.
+    let edit = lane("0.5").replace("c3", "d3");
+    // The time of cycle zero on the clock of the output.
+    let cycle_zero = |engine: &mut StudioEngine| {
+        let snapshot = engine.snapshot();
+        snapshot.device_time - snapshot.cycle / snapshot.cps
+    };
+    for launch in [false, true] {
+        take_copy(&mut engine);
+        peak_of(&mut engine, 300);
+        let _ = engine.stop(engine.stop_timeout());
+        engine.set_output_device("silent").expect("a new output");
+        engine
+            .evaluate_and_start(&lane("0.5"), false)
+            .expect("a start");
+        let anchor = cycle_zero(&mut engine);
+        if launch {
+            engine
+                .arm_launch(&edit, false, 1.0, false)
+                .expect("a launch");
+        } else {
+            engine.evaluate(&edit, false).expect("an edit");
+        }
+        // A turn of a held start runs no step.
+        let turn = engine.tick(accepted_update).expect("a turn");
+        assert!(
+            matches!(turn, StudioTick::Running { step: Some(_), .. }),
+            "the start still waits: launch {launch}"
+        );
+        assert!(
+            (cycle_zero(&mut engine) - anchor).abs() < 1e-3,
+            "cycle zero moved: launch {launch}"
+        );
+    }
+    engine.stop(Duration::from_millis(200)).expect("stop");
+    drop(engine);
+    no_plugin_work();
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV) };
+
+    // A copy with an echo of 500 ms plays its first note at gain 1, and a
+    // Stop comes before the echo. The stopped output plays the echo out with
+    // no sound. The same lane at gain 0 starts 1.5 s later: no old echo
+    // sounds under its first note, on the parked output and on a new output.
+    let _plugins = fixture_plugins();
+    // SAFETY: as above.
+    unsafe { std::env::set_var(rustel_vst3_fixture::ECHO_ENV, "500") };
+    let mut engine = silent_engine();
+    engine.master_bus().set_load_mode(LoadMode::Wait);
+    engine
+        .evaluate_and_start(&lane("1"), false)
+        .expect("a start");
+    take_copy(&mut engine);
+    let _ = engine.stop(engine.stop_timeout());
+    // The copy read the variable at its build.
+    no_plugin_work();
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(rustel_vst3_fixture::ECHO_ENV) };
+    for new_output in [false, true] {
+        engine
+            .evaluate_and_start(&lane("1"), false)
+            .expect("a start");
+        let started = Instant::now();
+        while peak_of(&mut engine, 10) < 0.05 {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the note did not sound"
+            );
+        }
+        let _ = engine.stop(engine.stop_timeout());
+        std::thread::sleep(Duration::from_millis(1_500));
+        if new_output {
+            engine.set_output_device("silent").expect("a new output");
+        }
+        engine
+            .evaluate_and_start(&lane("0"), false)
+            .expect("a start");
+        // The first turn takes the levels the parked output kept from the
+        // note before the Stop. Cycle zero comes later.
+        peak_of(&mut engine, 1);
+        assert_eq!(
+            peak_of(&mut engine, 1_200),
+            0.0,
+            "an old echo: new output {new_output}"
+        );
+        engine.stop(Duration::from_millis(200)).expect("stop");
+    }
+    assert_eq!(copies(), 1, "the copy with the echo");
+    drop(engine);
+    no_plugin_work();
 }

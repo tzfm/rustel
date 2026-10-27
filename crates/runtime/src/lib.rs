@@ -168,7 +168,7 @@ pub use session::LIVE_REPLACEMENT_MIN_HEADROOM;
 #[cfg(any(test, feature = "test-support"))]
 pub use session::SessionPanicPoint;
 #[cfg(all(feature = "vst", feature = "device-audio"))]
-pub use session::{LiveReload, PLUGIN_WAIT};
+pub use session::{LiveReload, PLUGIN_WAIT, SEAM_WAIT};
 pub use session::{catch_score_panic, panic_is_contained};
 pub use watch::{
     FileWatch, MAX_WATCH_SOURCE_BYTES, ReloadEvent, ReloadStatus, WatchLanguage, WatchPoll,

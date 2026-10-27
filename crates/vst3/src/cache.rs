@@ -39,9 +39,10 @@ pub(crate) struct Scanned {
     pub fault: Option<String>,
 }
 
-/// The files of a bundle at one time: the count, and a mark from the path,
-/// the size and the change time of each file. A different stamp is a
-/// different plugin.
+/// The files of a bundle or of one file at one time: the count, and a mark
+/// from the path, the size and the change time of each file. A different
+/// stamp is a changed bundle or file. A changed bundle is a different
+/// plugin.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Stamp {
     files: u32,
@@ -56,11 +57,19 @@ impl Stamp {
             self.mark = (self.mark ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
         }
     }
+
+    /// The stamp as one number, as the cell of a plugin copy keeps the
+    /// stamp of its preset file. A file that is not there has a number of
+    /// its own.
+    pub(crate) fn number(self) -> u64 {
+        self.mark
+    }
 }
 
-/// Reads the stamp of a bundle. A link counts as its target, so the stamp
-/// of a bridge bundle changes with the plugin behind the bridge.
-pub(crate) fn stamp(bundle: &Path) -> Stamp {
+/// Reads the stamp of a bundle or of a file. A link counts as its target,
+/// so the stamp of a bridge bundle changes with the plugin behind the
+/// bridge.
+pub(crate) fn stamp(path: &Path) -> Stamp {
     fn add(path: &Path, depth: usize, stamp: &mut Stamp) {
         let Ok(data) = std::fs::metadata(path) else {
             return;
@@ -90,7 +99,7 @@ pub(crate) fn stamp(bundle: &Path) -> Stamp {
         files: 0,
         mark: 0xcbf2_9ce4_8422_2325,
     };
-    add(bundle, MAX_DEPTH, &mut stamp);
+    add(path, MAX_DEPTH, &mut stamp);
     stamp
 }
 

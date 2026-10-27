@@ -27,6 +27,7 @@ use effects::voice_fx_pre_distort;
 use inserts::claim_insert_bus;
 use inserts::deliver;
 use inserts::displace_insert;
+pub(crate) use inserts::drain_insert_block;
 pub(crate) use inserts::effect_stage_wakes;
 pub(crate) use inserts::fade_effect_stage;
 use inserts::order_insert_stages;
@@ -168,6 +169,9 @@ const INSERT_SILENCE: f32 = 1e-6;
 /// An insert output with this many silent frames in a row makes no sound:
 /// a sound that goes through zero is silent for 1 frame or 2.
 const INSERT_QUIET_FRAMES: u16 = 64;
+/// The drain of a stop lasts this long at most, in seconds, also for an
+/// insert with a longer tail.
+const INSERT_DRAIN_SECONDS: u32 = 3;
 /// The values sliders moved that the notes in the queue take: see
 /// [`ScalarBackend::set_insert_value`].
 const MAX_INSERT_VALUES: usize = 64;
@@ -1253,6 +1257,10 @@ pub struct ScalarBackend {
     /// Frames each insert had no input and no output. A long idle insert
     /// sleeps until a note asks for the effect again.
     insert_idle_frames: Vec<u32>,
+    /// The frames a stopped output drained its inserts since the stop. A
+    /// block with no copy to drain sets the whole time of the drain: see
+    /// [`Self::drain_stopped_inserts`].
+    insert_drained: u32,
     /// The stages of each chain that run, in signal order, with
     /// [`crate::insert::NO_STAGE`] after the last: the stages that served
     /// the newest note with an effect, in the order of its calls, and each
@@ -1799,17 +1807,18 @@ impl ScalarBackend {
         self.insert_last_used.fill(frame);
         self.insert_fade_from.fill(u64::MAX);
         // Each chain is silent until a note owns it again. Some inserts keep a
-        // tail through their reset. The level of 0 keeps that tail silent
-        // after a resume. The next note of the chain moves the level up from
-        // 0, and the kept tail then sounds under that note.
+        // tail through their reset, and a stopped output drains it. The level
+        // of 0 keeps a tail that is still there silent after a resume. The
+        // next note of the chain moves the level up from 0, and that tail
+        // then sounds under the note.
         for gain in &mut self.instrument_gains {
             gain.gain = crate::live_control::Ramp::new(0, 0.0);
             // An instrument that feeds effects sets the level after them.
             gain.postgain = crate::live_control::Ramp::new(0, 0.0);
         }
         self.instrument_filters.fill([FilterChain::default(); 2]);
-        // No insert runs while the output is stopped, so each chain keeps its
-        // count of silent frames.
+        // Each chain keeps its count of silent frames. The drain of a stopped
+        // output adds to it: see `drain_stopped_inserts`.
         for gain in &mut self.insert_postgains {
             *gain = InsertPostgain::silent(gain.quiet);
         }

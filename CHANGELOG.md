@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A new output takes the plugin copies of the score back with no load: for another device, for a new buffer size, after a device stops, and for the Linux default device after a Stop. While the output is stopped, each plugin plays out its tail with no sound. A start after that has no old tail under its first note. An undo in 5 seconds of play takes the copy before back with no load, also through a Stop or a new output, and a run of preset changes keeps the preset it started from ready. A preset file you save again ends the waiting copies of its old state.
 - The talkit speech synthesizer lives in its own repository, [rustel-talkit](https://github.com/tzfm/rustel-talkit), and the build takes it as a pinned package from release v0.1.0. Scores speak as before, and the talkit command installs from that repository.
 - The Hydra video synth lives in its own repository, [rustel-hydra](https://github.com/tzfm/rustel-hydra), and the build takes it as a pinned package from release v0.1.0. Visuals draw as before, with the same character-checked shaders.
 - While one score plays, auto evaluate applies an edit of that score alone. An edit of another score of the set stays in its file until the evaluate key runs it, and the typing pause says so.

@@ -31,6 +31,11 @@ pub const INSERT_SLOTS: usize = (EFFECT_CHAIN + 1) * MAX_INSERT_BUSES;
 /// No stage. An effect with no stage takes the stage of its place in the
 /// note, and a list of stages ends here.
 pub const NO_STAGE: u8 = u8::MAX;
+/// The shortest quiet time of an insert, in seconds. A stopped output
+/// drains an insert until it is quiet for its tail, and for this long at
+/// least: see [`OrbitInsert::drain`]. The plugin host takes the same time
+/// for its flush, so a copy the drain made quiet skips its flush.
+pub const INSERT_DRAIN_QUIET_SECONDS: f32 = 0.25;
 
 /// A logical chain and its effect or instrument position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -310,16 +315,33 @@ pub trait OrbitInsert: Send {
     }
 
     /// True when the blocks of this insert run on any thread. The engine
-    /// then makes the block calls (`submit`, `collect` and `busy`) on the
-    /// audio callback or on a plugin worker of the output, one thread at a
-    /// time. Between the start of a block and its join, the engine makes no
-    /// other call on the insert. Each other call stays on the callback.
+    /// then makes the block calls (`submit`, `collect`, `drain` and `busy`)
+    /// on the audio callback or on a plugin worker of the output, one thread
+    /// at a time. Between the start of a block and its join, the engine makes
+    /// no other call on the insert. Each other call stays on the callback.
     fn any_thread(&self) -> bool {
         false
     }
 
     /// Ends each note and drops the tail after a clock reset.
     fn reset(&mut self) {}
+
+    /// The frames the insert sounds after its input goes silent, as the
+    /// tail of a reverb or a delay: 3 s at most. The default has no tail.
+    fn tail_frames(&self) -> u32 {
+        0
+    }
+
+    /// Plays one block of silence while the output is stopped, after
+    /// `reset`. The output of the block goes nowhere. Both slices have the
+    /// same length, from 1 to 128 frames. A stopped output drains an insert
+    /// until it is quiet for its tail, or for 0.25 s when that is longer,
+    /// and for 3 s at most: see [`Self::tail_frames`]. So an insert that
+    /// keeps its tail through a reset has no tail left at its next note. The
+    /// default processes the block.
+    fn drain(&mut self, left: &mut [f32], right: &mut [f32]) {
+        self.process(left, right);
+    }
 }
 
 /// Builds the insert for a key, a sample rate and a slot, outside the

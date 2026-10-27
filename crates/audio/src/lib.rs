@@ -83,9 +83,10 @@ pub use device_facts::{
 pub use dispatch::DspDispatch;
 pub use distortion::{DISTORTION_ALGORITHMS, DistortControls};
 pub use insert::{
-    EFFECT_CHAIN, INSERT_SLOTS, InsertChains, InsertControls, InsertKey, InsertNames, InsertNote,
-    InsertParam, InsertProvider, InsertSlot, InsertTurn, InsertValue, InsertValues,
-    MAX_INSERT_BUSES, MAX_INSERT_PARAMS, NO_STAGE, OrbitInsert, effect_slot, instrument_slot,
+    EFFECT_CHAIN, INSERT_DRAIN_QUIET_SECONDS, INSERT_SLOTS, InsertChains, InsertControls,
+    InsertKey, InsertNames, InsertNote, InsertParam, InsertProvider, InsertSlot, InsertTurn,
+    InsertValue, InsertValues, MAX_INSERT_BUSES, MAX_INSERT_PARAMS, NO_STAGE, OrbitInsert,
+    effect_slot, instrument_slot,
 };
 pub use limiter::{Character as LimiterCharacter, DEFAULT_THRESHOLD_DB, Limiter};
 pub use live::{

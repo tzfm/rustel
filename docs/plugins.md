@@ -180,6 +180,11 @@ status line says which plugin. A file with the name of a preset already in
 the folder is not copied. The scan cache of an earlier version has no plugin
 classes. After an upgrade, rescan once so a dropped file finds its plugin.
 
+When you save a preset file again, the next read of the folders ends each
+copy of the preset that waits in the plugin host. A new copy of the preset
+then loads the saved file. A copy that plays keeps the state it loaded until
+it leaves the output.
+
 ## Chains
 
 - `.vsti()` gives the plugin the pitch, the `velocity` and the length of each
@@ -254,13 +259,21 @@ before. A new preset of the instrument, or a new instrument in a chain that
 keeps an effect, fades the copy before out under its first note. Each fade
 takes 5 ms. A silent chain changes with no fade.
 
-The copy before ends after its fade, and so does the copy of an effect you
-remove. On a lane with a note in the next 16 cycles but no note in 5 seconds
-of play, such a copy ends 5 seconds of play after the edit, once the chain
-is silent. An instrument you remove ends 5 seconds of play after the edit on
-any lane, once it is silent. Time counts only while the score plays, so a
-Stop ends no chain. An undo before a copy ends loads nothing, and an undo
-after it loads the copy again.
+The copy before leaves the chain after its fade, and so does the copy of an
+effect you remove. On a lane with a note in the next 16 cycles but no note in
+5 seconds of play, such a copy ends 5 seconds of play after the edit, once
+the chain is silent. An instrument you remove ends 5 seconds of play after
+the edit on any lane, once it is silent. Time counts only while the score
+plays, so a Stop ends no chain.
+
+A copy that leaves its chain waits in the plugin host until 5 seconds of
+play after the edit, then ends. An undo in that time takes the copy back and
+loads nothing, also after the first note of the edit, and also through a
+Stop or a new output. An undo after that time loads the copy again. In a run
+of preset changes on one call in 5 seconds of play, as from the knobs
+column, the call keeps the copy before and the copy of the preset the run
+started from. So a return to that preset loads nothing, and a preset between
+the two loads again.
 
 A lane with no note in the next 16 cycles keeps its copies until it has such
 a note, also the copy before a new preset. A plugin name the lane loses
@@ -321,7 +334,8 @@ copies at its line. In the wait mode, a start waits for the plugin copies of
 its first 2 cycles, and an edit waits as above. If a copy of a launch is not
 ready at the line, the launch takes the first line after the copy is ready. In
 the async mode, the score starts at once, an edit plays at once, and a launch
-does not wait for its plugin copies.
+does not wait for its plugin copies. After a new output, the score waits for
+its copies 150 ms at most, as below.
 
 `rustel play` waits for the plugin copies of the first 4 cycles at its start.
 They load while the samples load. With `--watch`, a save with a plugin copy
@@ -342,14 +356,28 @@ call in a tab names its plugin, also with a part of the name. Another string
 names a plugin only with its whole name, as in `const fx = 'ott'`.
 
 At Stop, Studio keeps its output open with the plugin copies of the score. A
-start that reuses that output loads no copy. On Linux, with no output chosen,
-the next start after a Stop opens a new output to follow the default device,
-and the copies of the score load again. If you open Piano mode or play a note
+start that reuses that output loads no copy. While the output is stopped,
+each plugin plays out its tail with no sound, until it is quiet for as long
+as the tail it reports, 0.25 seconds at least and 3 seconds at most. A start
+after that has no old tail under its first note.
+
+On Linux, with no output chosen, the next start after a Stop opens a new
+output to follow the default device. If you open Piano mode or play a note
 in it before that start, Piano mode opens the new output. When the stopped
 output holds a copy of a plugin the cleanup unloads, the cleanup closes the
 output first. In Piano mode, the cleanup keeps the output open with its
 copies. The first cleanup after you leave Piano mode closes the output when
 it holds a copy of a plugin the cleanup unloads.
+
+A new output keeps the plugin copies of the score. Studio opens one for
+another output device, for a new buffer size, after a device stops, and at
+the start on Linux above. The new output takes each copy back with no load,
+also at a new sample rate. A copy that still sounds restarts and runs a short
+silence before it is back. In the wait mode, the score waits until its copies
+are back. If no copy comes back in 20 seconds, the wait ends. In the async
+mode, the score waits 150 ms at most, and a note before its copy is back plays
+with no plugin. `rustel play` opens a new output after its device stops, and
+waits as the wait mode does.
 
 ## Where the audio runs
 
@@ -398,8 +426,9 @@ For a plugin that breaks on another thread, turn on its switch
 row of the plugin and press Space. The row then ends in `audio thread only`,
 and the copies of the plugin stay on the audio thread. The other plugins keep
 the plugin workers. A copy that loads after the change follows the switch. A
-copy in play keeps its thread until it loads again, for example when you
-restart Studio.
+copy in play keeps its thread until it loads again or an output takes it back
+from the plugin host, for example when you restart Studio, set a new buffer
+size or undo an edit after its first note.
 
 Studio keeps the switches in `~/.rustel/rustel.json`, and `rustel play` reads
 them too. With no Studio, write the whole names of the plugins in the file.
@@ -459,7 +488,13 @@ rustel starts. yabridge 5.1.1 needs Wine Staging 9.21 or earlier.
 - A plugin call longer than the rest of the audio buffer crackles the whole
   output. Rustel does not render a plugin ahead of the audio.
 - An export runs its plugins on one thread.
-- A plugin that hangs stops the audio.
+- A copy that plays keeps the state its preset file had at its load, also
+  after you save the file again.
+- A plugin that reports no tail counts as silent once it is quiet for 0.25
+  seconds, at a Stop and at a new output. An echo that comes later stays in
+  the plugin and sounds under the next note of its chain.
+- A plugin that hangs stops the audio, and each close of the output waits
+  for it.
 - On Windows with the multimedia class scheduler service off, each plugin
   runs on the audio thread.
 - A plugin with its multicore option on waits for its own threads. Rustel

@@ -10,7 +10,8 @@ use rustel_audio::{
 };
 use rustel_vst3::{FoundPreset, Host, Prepared, Resolved, Status, WantedCopy, WorkerProgram};
 use rustel_vst3_fixture::{
-    COST_ENV, NAME, PARAM_BYPASS, PARAM_GAIN, PARAM_GATE, PROCESS_MARK_ENV, TONE_LEVEL, TONE_NAME,
+    COST_ENV, ECHO_ENV, NAME, PARAM_BYPASS, PARAM_GAIN, PARAM_GATE, PROCESS_MARK_ENV,
+    SLOW_ACTIVATE_ENV, TONE_LEVEL, TONE_NAME,
 };
 
 #[global_allocator]
@@ -191,21 +192,28 @@ fn a_plugin_runs_with_the_values_a_score_names() {
     assert!(start.elapsed() >= Duration::from_micros(200));
 
     // The audio callback sets a value and runs the plugin with no
-    // allocation, for each block size.
+    // allocation, for each block size, also through a copy for live play.
+    // The drain of a stopped output allocates nothing either.
+    let live = rig.host.provider(false);
+    let lent_slot = InsertSlot::effect(2, 0);
+    let mut lent = until(|| live(key, SAMPLE_RATE, lent_slot));
     let mut left = [1.0f32; 128];
     let mut right = [1.0f32; 128];
+    let (mut lent_left, mut lent_right) = ([1.0f32; 128], [1.0f32; 128]);
+    let (mut silent_left, mut silent_right) = ([0.0f32; 128], [0.0f32; 128]);
+    let quarter = InsertParam {
+        id: PARAM_GAIN,
+        value: 0.25,
+    };
     let before = Violations::capture();
     tripwire::audio_scope(|| {
-        insert.set_param(
-            InsertParam {
-                id: PARAM_GAIN,
-                value: 0.25,
-            },
-            0,
-        );
+        insert.set_param(quarter, 0);
         for frames in [128, 1, 37] {
             insert.process(&mut left[..frames], &mut right[..frames]);
         }
+        lent.set_param(quarter, 0);
+        lent.process(&mut lent_left, &mut lent_right);
+        lent.drain(&mut silent_left, &mut silent_right);
     });
     let delta = Violations::capture().since(before);
     assert!(
@@ -216,6 +224,67 @@ fn a_plugin_runs_with_the_values_a_score_names() {
     assert_eq!(left[0], 0.25 * 0.25 * 0.25);
     assert_eq!(left[1..37], [0.25 * 0.25; 36]);
     assert_eq!(left[37..], [0.25; 91]);
+    assert_eq!((lent_left, lent_right), ([0.25; 128], [0.25; 128]));
+    // The live copy goes home at its drop, and the next take of its slot
+    // builds nothing. Its next note puts back the start value of each
+    // parameter an earlier note set.
+    let running = || {
+        rig.host.wait_idle();
+        rig.host.plugins()[0].running
+    };
+    let copies = running();
+    drop(lent);
+    let home = |slot, rate| {
+        let ready = rig.host.prepared(NAME, None, false, rate, slot) == Prepared::Ready(key);
+        ready.then_some(())
+    };
+    until(|| home(lent_slot, SAMPLE_RATE));
+    let mut lent = live(key, SAMPLE_RATE, lent_slot).expect("the copy that came home");
+    assert_eq!(running(), copies);
+    lent.restore_params(0);
+    assert_eq!(block(lent.as_mut(), 1.0, 128), vec![1.0; 128]);
+
+    // The park turns a copy off and on only when the copy has a tail to
+    // play out. Each setActive call of this copy sleeps 300 ms, so a
+    // restart holds the park 600 ms or more, and the long flush 1.2 s or
+    // more. A copy that ran no frame since its build skips the flush. A copy
+    // loud at its drop takes one restart and the quiet check. A copy the
+    // drain made quiet for its quiet time, 0.25 s here, skips the flush.
+    let slow_slot = InsertSlot::effect(4, 0);
+    // SAFETY: as above. The plugin thread reads the variable in the build
+    // below.
+    unsafe { std::env::set_var(SLOW_ACTIVATE_ENV, "300") };
+    let slow = until(|| live(key, SAMPLE_RATE, slow_slot));
+    // SAFETY: as above. The copy read the variable at its build.
+    unsafe { std::env::remove_var(SLOW_ACTIVATE_ENV) };
+    let park = |slow: Box<dyn OrbitInsert>| {
+        let start = Instant::now();
+        drop(slow);
+        until(|| home(slow_slot, SAMPLE_RATE));
+        start.elapsed()
+    };
+    let restart = Duration::from_millis(600);
+    let parked = park(slow);
+    assert!(
+        parked < restart,
+        "the copy after its build parked in {parked:?}"
+    );
+    let mut slow = live(key, SAMPLE_RATE, slow_slot).expect("the copy that came home");
+    assert_eq!(block(slow.as_mut(), 1.0, 128), vec![1.0; 128]);
+    let parked = park(slow);
+    assert!(
+        (restart..2 * restart).contains(&parked),
+        "the loud copy parked in {parked:?}"
+    );
+    let mut slow = live(key, SAMPLE_RATE, slow_slot).expect("the copy that came home");
+    assert_eq!(block(slow.as_mut(), 1.0, 128), vec![1.0; 128]);
+    // 94 blocks of 128 frames: 12 032 frames, more than 0.25 s at 48 kHz.
+    for _ in 0..94 {
+        let (mut left, mut right) = ([0.0f32; 128], [0.0f32; 128]);
+        slow.drain(&mut left, &mut right);
+    }
+    let parked = park(slow);
+    assert!(parked < restart, "the drained copy parked in {parked:?}");
 
     // Two notes in one block give two values. Each value starts at the
     // frame of its note.
@@ -273,6 +342,31 @@ fn a_plugin_runs_with_the_values_a_score_names() {
             "a note carries 16 values for {NAME} at most, and 'gain' is one more"
         )]
     );
+
+    // A copy with an echo of 500 ms has a tail of 24 000 frames. Its input
+    // comes back one time, 24 000 frames later. At a new rate the copy
+    // keeps its echo of 500 ms: 22 050 frames at 44.1 kHz.
+    let echo_slot = InsertSlot::effect(3, 0);
+    // SAFETY: as above. The plugin thread reads the variable in the build
+    // below.
+    unsafe { std::env::set_var(ECHO_ENV, "500") };
+    let mut echo = until(|| live(key, SAMPLE_RATE, echo_slot));
+    // SAFETY: as above. The copy read the variable at its build.
+    unsafe { std::env::remove_var(ECHO_ENV) };
+    assert_eq!(echo.tail_frames(), 24_000);
+    let mut output = block(echo.as_mut(), 1.0, 128);
+    while output.len() < 24_256 {
+        output.extend(block(echo.as_mut(), 0.0, 128));
+    }
+    assert_eq!(output[..128], [1.0; 128]);
+    assert!(output[128..24_000].iter().all(|sample| *sample == 0.0));
+    assert_eq!(output[24_000..24_128], [1.0; 128]);
+    assert!(output[24_128..].iter().all(|sample| *sample == 0.0));
+    drop(echo);
+    until(|| home(echo_slot, SAMPLE_RATE));
+    assert!(live(key, 44_100, echo_slot).is_none(), "the retune runs");
+    let echo = until(|| live(key, 44_100, echo_slot));
+    assert_eq!(echo.tail_frames(), 22_050);
 
     // The copy writes its mark at its end, on the plugin thread. That
     // thread ran the first blocks at the build, and this thread ran the
@@ -577,27 +671,64 @@ fn a_preset_file_sets_the_state_of_the_plugin() {
     assert_eq!(output[1024..], [0.5; 1024]);
     drop(held);
     assert_eq!(rig.host.latency(default, SAMPLE_RATE, parked), Some(1024));
-    // The take made room for one more copy. A new file `default` gives the
-    // next copy of the key a delay of 2048 frames. The copy that waits for
-    // its slot in the chain `first` keeps the latency of its own build. A
-    // slot with no copy gives the latency of the last copy.
+    // The copy goes home at its drop. It takes the place the take freed,
+    // and waits for its slot again with the latency of its build.
+    until(|| (ready(0) == Prepared::Ready(default)).then_some(()));
+    assert_eq!(rig.host.latency(default, SAMPLE_RATE, parked), Some(1024));
+    // A new file `default` gives the next copy of the key a delay of 2048
+    // frames. The next read of the preset folders ends each copy of the
+    // file before that waits for its slot. The watch reads the folders 400
+    // ms after the write, and the read here comes first.
+    let read = || {
+        let version = rig.host.presets_version();
+        rig.host.set_preset_folders(Vec::new());
+        until(|| (rig.host.presets_version() > version).then_some(()));
+    };
     rig.write_preset(
         "default.vstpreset",
         &rustel_vst3_fixture::preset_with_delay(0.5, 0.0, 0.5),
     );
-    rig.host
-        .prepare(NAME, None, false, SAMPLE_RATE, InsertSlot::effect(more, 0));
-    rig.host.wait_idle();
+    read();
+    until(|| (ready(first) == Prepared::Unbuilt(default)).then_some(()));
+    assert_eq!(ready(0), Prepared::Unbuilt(default));
+    // The slot of the chain `first` builds a copy from the new file. A slot
+    // with no copy gives the latency of the last copy.
     let waiting = InsertSlot::effect(first, 0);
-    assert_eq!(rig.host.latency(default, SAMPLE_RATE, waiting), Some(1024));
-    assert_eq!(rig.host.latency(default, SAMPLE_RATE, parked), Some(2048));
-    // A note takes the copy that waits in the chain `first`. While the
-    // engine holds it, the slot gives the latency of that copy. After the
-    // drop, the slot gives the latency of the last copy.
-    let held = (rig.host.provider(false))(default, SAMPLE_RATE, waiting).expect("the waiting copy");
-    assert_eq!(rig.host.latency(default, SAMPLE_RATE, waiting), Some(1024));
-    drop(held);
+    rig.host.prepare(NAME, None, false, SAMPLE_RATE, waiting);
+    rig.host.wait_idle();
     assert_eq!(rig.host.latency(default, SAMPLE_RATE, waiting), Some(2048));
+    assert_eq!(rig.host.latency(default, SAMPLE_RATE, parked), Some(2048));
+    // A note takes that copy. A copy that plays keeps the state of its
+    // file: a file saved again changes nothing while the engine holds the
+    // copy, and the copy ends at its drop. After the drop, the slot gives
+    // the latency of the last copy.
+    let held = (rig.host.provider(false))(default, SAMPLE_RATE, waiting).expect("the waiting copy");
+    assert_eq!(rig.host.latency(default, SAMPLE_RATE, waiting), Some(2048));
+    rig.write_preset("default.vstpreset", &rustel_vst3_fixture::preset(0.5, 0.0));
+    read();
+    assert_eq!(rig.host.latency(default, SAMPLE_RATE, waiting), Some(2048));
+    let running = || {
+        rig.host.wait_idle();
+        rig.host.plugins()[0].running
+    };
+    let copies = running();
+    drop(held);
+    assert_eq!(running(), copies - 1);
+    assert_eq!(ready(first), Prepared::Unbuilt(default));
+    assert_eq!(rig.host.latency(default, SAMPLE_RATE, waiting), Some(2048));
+    // A copy that waits for its slot keeps the state of its file at its
+    // build. A take at another rate sets the copy up again, and a file
+    // saved since its build gives a new copy from the file.
+    rig.host.prepare(NAME, None, false, SAMPLE_RATE, waiting);
+    rig.host.wait_idle();
+    assert_eq!(rig.host.latency(default, SAMPLE_RATE, waiting), Some(0));
+    rig.write_preset(
+        "default.vstpreset",
+        &rustel_vst3_fixture::preset_with_delay(0.5, 0.0, 0.25),
+    );
+    rig.host.prepare(NAME, None, false, 44_100, waiting);
+    rig.host.wait_idle();
+    assert_eq!(rig.host.latency(default, 44_100, waiting), Some(1024));
 
     // A preset file from elsewhere goes to the folder of the plugin of its
     // class, one time. A file of a class no plugin has goes nowhere.
@@ -623,7 +754,14 @@ fn a_preset_file_sets_the_state_of_the_plugin() {
 #[test]
 fn a_plugin_gets_the_beat_position_of_each_block() {
     let rig = Rig::new("clock");
-    let mut insert = rig.insert(0).expect("insert");
+    // The copy is a take for live play, so the clock of a note goes
+    // through the box of the take.
+    let live = rig.host.provider(false);
+    let key = InsertKey {
+        plugin: rig.plugin(),
+        preset: 0,
+    };
+    let mut insert = until(|| live(key, SAMPLE_RATE, InsertSlot::effect(1, 0)));
     insert.set_param(
         InsertParam {
             id: PARAM_GATE,
@@ -661,10 +799,33 @@ fn a_plugin_gets_the_beat_position_of_each_block() {
     assert!(output[..54].iter().all(|sample| *sample == 1.0));
     assert!(output[74..23_990].iter().all(|sample| *sample == 0.0));
     assert!(output[24_074..47_990].iter().all(|sample| *sample == 1.0));
+
+    // A stopped output drains a copy for live play with silence, and the
+    // position stands. After 11 904 frames of play and a drain of 12 032
+    // frames, the gate is open for 96 more frames.
+    let mut lent = until(|| live(key, SAMPLE_RATE, InsertSlot::effect(2, 0)));
+    lent.set_param(
+        InsertParam {
+            id: PARAM_GATE,
+            value: 1.0,
+        },
+        0,
+    );
+    for _ in 0..93 {
+        block(lent.as_mut(), 1.0, 128);
+    }
+    for _ in 0..94 {
+        let (mut left, mut right) = ([0.0f32; 128], [0.0f32; 128]);
+        lent.drain(&mut left, &mut right);
+    }
+    let output = block(lent.as_mut(), 1.0, 128);
+    assert!(output[..86].iter().all(|sample| *sample == 1.0));
+    assert!(output[106..].iter().all(|sample| *sample == 0.0));
 }
 
 /// The second plugin of the bundle is an instrument. A note starts at its
-/// frame, sounds at its pitch and level, and ends after its length.
+/// frame, sounds at its pitch and level, and ends after its length. A copy
+/// for live play goes home with its note ended.
 #[test]
 fn an_instrument_plays_the_note_it_gets() {
     let rig = Rig::new("tone");
@@ -885,6 +1046,36 @@ fn an_instrument_plays_the_note_it_gets() {
         .contains(&line.as_str()),
         "{line}"
     );
+
+    // A copy for live play goes home at its drop with its note ended, and
+    // the next take of its slot builds nothing.
+    let live = rig.host.provider(false);
+    let slot = InsertSlot::instrument(4);
+    let mut lent = until(|| live(key, SAMPLE_RATE, slot));
+    let long = InsertNote {
+        frames: SAMPLE_RATE,
+        ..note
+    };
+    lent.note(long, 0);
+    let sounds = block(lent.as_mut(), 0.0, 128);
+    assert!(sounds.iter().any(|sample| *sample != 0.0));
+    let running = || {
+        rig.host.wait_idle();
+        let plugins = rig.host.plugins().into_iter();
+        let tone = plugins.filter(|plugin| plugin.name == TONE_NAME);
+        tone.map(|plugin| plugin.running).sum::<usize>()
+    };
+    let copies = running();
+    drop(lent);
+    let home = || rig.host.prepared(TONE_NAME, None, true, SAMPLE_RATE, slot);
+    until(|| (home() == Prepared::Ready(key)).then_some(()));
+    let mut lent = live(key, SAMPLE_RATE, slot).expect("the copy that came home");
+    assert_eq!(running(), copies);
+    assert!(
+        block(lent.as_mut(), 0.0, 128)
+            .iter()
+            .all(|sample| *sample == 0.0)
+    );
 }
 
 /// Not a test: the entry of a scan process. The scan test gives this binary
@@ -939,7 +1130,14 @@ fn worker_program(fault: Option<&str>) -> WorkerProgram {
 #[test]
 fn repeated_resets_cancel_old_events_and_keep_the_first_resumed_events() {
     let rig = Rig::new("reset");
-    let mut effect = rig.insert(0).expect("effect");
+    // The copies are takes for live play, so each reset and each cut goes
+    // through the box of the take.
+    let live = rig.host.provider(false);
+    let key = InsertKey {
+        plugin: rig.plugin(),
+        preset: 0,
+    };
+    let mut effect = until(|| live(key, SAMPLE_RATE, InsertSlot::effect(1, 0)));
     effect.set_param(
         InsertParam {
             id: PARAM_GAIN,
@@ -1007,8 +1205,7 @@ fn repeated_resets_cancel_old_events_and_keep_the_first_resumed_events() {
         panic!("the instrument did not load");
     };
     let key = InsertKey { plugin, preset: 0 };
-    let mut instrument =
-        (rig.host.provider(true))(key, SAMPLE_RATE, InsertSlot::instrument(1)).expect("instrument");
+    let mut instrument = until(|| live(key, SAMPLE_RATE, InsertSlot::instrument(1)));
     let note = InsertNote {
         pitch: 69.0,
         velocity: 0.5,
@@ -1067,7 +1264,14 @@ fn repeated_resets_cancel_old_events_and_keep_the_first_resumed_events() {
 #[test]
 fn parameter_restores_follow_note_time_and_survive_a_full_queue() {
     let rig = Rig::new("restore");
-    let mut insert = rig.insert(0).expect("effect");
+    // The copy is a take for live play, so a value set now goes through
+    // the box of the take.
+    let live = rig.host.provider(false);
+    let key = InsertKey {
+        plugin: rig.plugin(),
+        preset: 0,
+    };
+    let mut insert = until(|| live(key, SAMPLE_RATE, InsertSlot::effect(1, 0)));
     let gain = |value| InsertParam {
         id: PARAM_GAIN,
         value,
@@ -1504,7 +1708,8 @@ fn an_unused_bundle_unloads_and_keeps_its_plugin_numbers() {
         preset: 0,
     };
     let slot = InsertSlot::effect(1, 0);
-    let running = (rig.host.provider(true))(key, SAMPLE_RATE, slot).expect("insert");
+    let live = rig.host.provider(false);
+    let running = until(|| live(key, SAMPLE_RATE, slot));
     rig.host
         .prepare(NAME, None, false, SAMPLE_RATE, InsertSlot::effect(2, 0));
     rig.host.wait_idle();
@@ -1517,6 +1722,8 @@ fn an_unused_bundle_unloads_and_keeps_its_plugin_numbers() {
     drop(running);
     assert!(!rig.host.engine_holds_unkept(&[]));
     // The slot keeps the latency of its last copy until the plugin unloads.
+    // The copy goes home before the unload, in the line of the plugin
+    // thread, and the unload ends it.
     assert_eq!(rig.host.latency(key, SAMPLE_RATE, slot), Some(0));
     unload(&[]);
     assert_eq!(loaded(&rig), 0);
@@ -1550,7 +1757,8 @@ fn live_play_does_not_wait_for_a_plugin() {
     assert!(provider(key, SAMPLE_RATE, InsertSlot::effect(3, 0)).is_none());
     let mut insert = until(|| provider(key, SAMPLE_RATE, InsertSlot::effect(3, 0)));
     assert_eq!(block(insert.as_mut(), 0.5, 16), vec![0.5; 16]);
-    // The orbit took the plugin, so the next request builds a new one.
+    // The orbit holds the plugin of the slot, so the next request builds no
+    // second copy.
     assert!(provider(key, SAMPLE_RATE, InsertSlot::effect(3, 0)).is_none());
 
     // A start that waits for its plugins reads how far each one is. A
@@ -1578,11 +1786,11 @@ fn live_play_does_not_wait_for_a_plugin() {
     let waits = rig.host.prepared(NAME, None, false, 44_100, behind);
     assert_ne!(waits, Prepared::Unbuilt(key));
     until(|| (prepared(NAME, false) == Prepared::Ready(key)).then_some(()));
-    // The orbit has 2 copies, and each of the 3 prepared slots has one.
+    // The orbit has 1 copy, and each of the 3 prepared slots has one.
     rig.host.wait_idle();
     let built = rig.host.prepared(NAME, None, false, SAMPLE_RATE, early);
     assert_eq!(built, Prepared::Ready(key));
-    assert_eq!(rig.host.plugins()[0].running, 5);
+    assert_eq!(rig.host.plugins()[0].running, 4);
     let held = provider(key, 44_100, InsertSlot::effect(5, 0)).expect("the prepared plugin");
 
     // While the engine holds the plugin of the slot, a start has nothing
@@ -1620,14 +1828,87 @@ fn live_play_does_not_wait_for_a_plugin() {
     assert!(rig.host.keep(2, Vec::new(), vec![6], Vec::new()).is_empty());
     rig.host.keep(2, Vec::new(), Vec::new(), Vec::new());
     assert!(keep(&wanted).is_empty());
+
+    // The copy goes home at its drop and waits for its slot again: the next
+    // take builds nothing. A take at another rate sets the same copy up at
+    // the new rate.
+    let ready = |rate| rig.host.prepared(NAME, None, false, rate, slot);
     drop(held);
+    let home = ready(44_100);
+    assert!(
+        matches!(home, Prepared::Returning | Prepared::Ready(_)),
+        "{home:?}"
+    );
+    until(|| (ready(44_100) == Prepared::Ready(key)).then_some(()));
+    let held = provider(key, 44_100, slot).expect("the copy that came home");
+    assert_eq!(running(), 4);
+    drop(held);
+    until(|| (ready(44_100) == Prepared::Ready(key)).then_some(()));
+    assert!(
+        provider(key, SAMPLE_RATE, slot).is_none(),
+        "the retune runs"
+    );
+    let mut held = until(|| provider(key, SAMPLE_RATE, slot));
+    assert_eq!(block(held.as_mut(), 0.5, 16), vec![0.5; 16]);
+    assert_eq!(running(), 4);
+    assert_eq!(rig.host.latency(key, SAMPLE_RATE, slot), Some(0));
+    drop(held);
+    until(|| (ready(SAMPLE_RATE) == Prepared::Ready(key)).then_some(()));
     // The slot with no copy gives the latency of the last copy of its key
-    // at the rate.
+    // at the rate. The copy of a slot its chain does not want ends.
     assert_eq!(rig.host.latency(key, 44_100, slot), Some(0));
     assert_eq!(rig.host.latency(key, 22_050, slot), None);
+    // The door of the copies on their way home counts the copy caller 1
+    // wants at another rate, and starts its retune. A copy ready at the
+    // rate does not count, and nor does the build of a new copy. That build
+    // turns its plugin on slowly, so it still runs at the look.
+    assert_eq!(rig.host.returning(1, 44_100), 1, "the retune");
+    until(|| (ready(44_100) == Prepared::Ready(key)).then_some(()));
+    assert_eq!(rig.host.returning(1, 44_100), 0, "a copy at the rate");
+    let built = WantedCopy {
+        slot: InsertSlot::effect(5, 3),
+        ..other.clone()
+    };
+    let both = vec![wanted.clone(), built.clone()];
+    assert!(rig.host.keep(1, both, vec![5], Vec::new()).is_empty());
+    // SAFETY: the tests of this binary run one at a time, and the plugin
+    // thread reads the variable in the build below. No other thread reads a
+    // variable now.
+    unsafe { std::env::set_var(SLOW_ACTIVATE_ENV, "300") };
+    rig.host.prepare(NAME, None, false, 44_100, built.slot);
+    assert_eq!(rig.host.returning(1, 44_100), 0, "a build");
+    // The retune of the copy of `wanted` to SAMPLE_RATE waits in the line
+    // behind that build. keep() takes the build of the retune before the job
+    // runs, so the job ends the copy.
+    assert_eq!(
+        rig.host.returning(1, SAMPLE_RATE),
+        1,
+        "the retune in the line"
+    );
+    assert!(keep(&built).is_empty());
+    rig.host.wait_idle();
+    // SAFETY: as above. The copy read the variable at its build.
+    unsafe { std::env::remove_var(SLOW_ACTIVATE_ENV) };
+    assert_eq!(running(), 4, "the copy of the retune ended");
+    // At a new rate the slow copy turns off and on slowly too. The door
+    // counts it until its retune ends.
+    assert_eq!(rig.host.returning(1, SAMPLE_RATE), 1, "the slow retune");
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(rig.host.returning(1, SAMPLE_RATE), 1, "the retune runs");
+    rig.host.wait_idle();
+    assert_eq!(rig.host.returning(1, SAMPLE_RATE), 0, "the retune ended");
+    // The door counts nothing for the slot of the copy that ended in the
+    // line, and a prepare there builds a new copy.
+    assert!(keep(&wanted).is_empty());
+    assert_eq!(rig.host.returning(1, SAMPLE_RATE), 0, "no retune is left");
+    rig.host.prepare(NAME, None, false, SAMPLE_RATE, slot);
+    assert_ne!(ready(SAMPLE_RATE), Prepared::Unbuilt(key));
+    until(|| (ready(SAMPLE_RATE) == Prepared::Ready(key)).then_some(()));
     assert!(keep(&other).is_empty());
+    rig.host.wait_idle();
     rig.host.keep(1, Vec::new(), Vec::new(), Vec::new());
     assert_eq!(prepared(NAME, false), Prepared::Unbuilt(key));
+    assert_eq!(running(), 3);
 }
 
 #[test]
@@ -1679,6 +1960,11 @@ fn different_plugins_prepared_for_one_slot_stay_ready() {
     };
     assert_eq!(running(), 2);
     drop(held);
+    // Each copy goes home at its drop, and waits for the slot again.
+    for ((name, instrument), key) in requests.into_iter().zip(keys) {
+        until(|| (prepared(name, instrument) == Prepared::Ready(key)).then_some(()));
+    }
+    assert_eq!(running(), 2);
 
     // The chain drops the effect: its parked copy ends, and a prepare of
     // the effect builds nothing.
@@ -1774,7 +2060,10 @@ fn walk(folder: &std::path::Path) -> Vec<PathBuf> {
 /// copy of a key the chain dropped ends, and no build starts for a key the
 /// chain does not want. A key the chain wants again before the end of its
 /// copy keeps the copy. A chain no caller lists keeps its copies, and a
-/// second caller changes no chain of the first.
+/// second caller changes no chain of the first. A copy an engine holds ends
+/// when it comes home, for a chain that ended or a key its chain dropped. A
+/// copy whose chain ends during its park ends at the end of the park. A take
+/// of another slot during a park keeps the copy on its way home.
 #[test]
 fn a_copy_no_chain_of_the_score_takes_ends() {
     let rig = Rig::new("ended");
@@ -1934,4 +2223,49 @@ fn a_copy_no_chain_of_the_score_takes_ends() {
     rig.host.keep(1, Vec::new(), Vec::new(), Vec::new());
     rig.host.prepare(NAME, None, false, SAMPLE_RATE, live);
     assert_eq!(running(), 5);
+
+    // A copy an engine holds plays on when its chain ends, and ends when it
+    // comes home. So does a copy whose key its chain no longer wants.
+    let provider = rig.host.provider(false);
+    let ending = InsertSlot::effect(17, 0);
+    let mut held = until(|| provider(key, SAMPLE_RATE, ending));
+    let copies = running();
+    rig.host.keep(1, Vec::new(), Vec::new(), vec![17]);
+    assert_eq!(block(held.as_mut(), 1.0, 128), vec![1.0; 128]);
+    drop(held);
+    assert_eq!(running(), copies - 1);
+    let dropped = InsertSlot::effect(18, 0);
+    let held = until(|| provider(key, SAMPLE_RATE, dropped));
+    let copies = running();
+    rig.host
+        .keep(1, vec![wanted(dropped, Some("Half"))], vec![18], Vec::new());
+    drop(held);
+    assert_eq!(running(), copies - 1);
+
+    // A copy that played a loud block turns its plugin off and on in its
+    // park, 600 ms here. A take of another slot in that time keeps the copy
+    // on its way home: its slot is not Unbuilt. Its chain ends in that time,
+    // and the park ends the copy.
+    // SAFETY: the tests of this binary run one at a time, and the plugin
+    // thread reads the variable in the build below. No other thread reads a
+    // variable now.
+    unsafe { std::env::set_var(SLOW_ACTIVATE_ENV, "300") };
+    let parking = InsertSlot::effect(19, 0);
+    let mut held = until(|| provider(key, SAMPLE_RATE, parking));
+    // SAFETY: as above. The copy read the variable at its build.
+    unsafe { std::env::remove_var(SLOW_ACTIVATE_ENV) };
+    let next = InsertSlot::effect(20, 0);
+    rig.host.prepare(NAME, None, false, SAMPLE_RATE, next);
+    let copies = running();
+    assert_eq!(block(held.as_mut(), 1.0, 128), vec![1.0; 128]);
+    drop(held);
+    let _next = provider(key, SAMPLE_RATE, next).expect("the copy of the next slot");
+    let home = rig.host.prepared(NAME, None, false, SAMPLE_RATE, parking);
+    assert!(
+        matches!(home, Prepared::Returning | Prepared::Ready(_)),
+        "{home:?}"
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    rig.host.keep(1, Vec::new(), Vec::new(), vec![19]);
+    assert_eq!(running(), copies - 1);
 }
