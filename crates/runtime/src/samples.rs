@@ -2105,6 +2105,7 @@ pub(crate) mod wait_tests {
                     rustel_audio::DspDispatch::portable(),
                     128,
                     None,
+                    false,
                 );
                 let _ = finished.send(rendered);
             });

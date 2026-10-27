@@ -57,6 +57,9 @@ pub enum Length {
 pub struct ExportSettings {
     pub length: Length,
     pub mp3: bool,
+    /// Writes a `<name> stems` folder beside the bounce instead of the one
+    /// file, so it needs the wav format; the sheet keeps the two in step.
+    pub stems: bool,
     pub limiter_enabled: bool,
     /// Snapshot of the mixer, kept even when bypassed so the export can enable it.
     pub limiter: rustel_audio::RenderLimiter,
@@ -67,6 +70,7 @@ impl Default for ExportSettings {
         Self {
             length: Length::Cycles(16.0),
             mp3: false,
+            stems: false,
             limiter_enabled: false,
             limiter: rustel_audio::RenderLimiter {
                 settings: rustel_audio::LimiterSettings {
@@ -114,6 +118,7 @@ pub enum Field {
     Second,
     Format,
     Limiter,
+    Stems,
     /// The `to` line: the path itself, typed.
     Target,
 }
@@ -125,7 +130,8 @@ impl Field {
             (Self::First, true) => Self::Second,
             (Self::First, false) | (Self::Second, _) => Self::Format,
             (Self::Format, _) => Self::Limiter,
-            (Self::Limiter, _) => Self::Target,
+            (Self::Limiter, _) => Self::Stems,
+            (Self::Stems, _) => Self::Target,
             (Self::Target, _) => Self::Length,
         }
     }
@@ -138,7 +144,8 @@ impl Field {
             (Self::Format, true) => Self::Second,
             (Self::Format, false) => Self::First,
             (Self::Limiter, _) => Self::Format,
-            (Self::Target, _) => Self::Limiter,
+            (Self::Stems, _) => Self::Limiter,
+            (Self::Target, _) => Self::Stems,
         }
     }
 }
@@ -159,6 +166,8 @@ pub struct SheetLayout {
     pub mp3: Rect,
     pub limiter_off: Rect,
     pub limiter_on: Rect,
+    pub stems_off: Rect,
+    pub stems_on: Rect,
     pub target: Rect,
 }
 
@@ -169,6 +178,7 @@ pub enum Hit {
     Number(Field),
     Format { mp3: bool },
     Limiter { enabled: bool },
+    Stems { on: bool },
     Target,
 }
 
@@ -265,7 +275,10 @@ impl ExportSheet {
     /// Space toggles a choice on these lines. On a number or the path it
     /// is text, so Command keeps it out until Insert.
     pub(crate) fn space_changes_a_choice(&self) -> bool {
-        matches!(self.field, Field::Length | Field::Format | Field::Limiter)
+        matches!(
+            self.field,
+            Field::Length | Field::Format | Field::Limiter | Field::Stems
+        )
     }
 
     fn silence(&self) -> bool {
@@ -282,6 +295,16 @@ impl ExportSheet {
             .map(str::to_ascii_lowercase);
         if matches!(extension.as_deref(), None | Some("wav" | "mp3")) {
             self.target.set_extension(self.settings.extension());
+        }
+    }
+
+    /// Stems need the wav format, so the pair moves together: stems on
+    /// takes the format back to wav, and mp3 turns stems off.
+    fn set_stems(&mut self, stems: bool) {
+        self.settings.stems = stems;
+        if stems && self.settings.mp3 {
+            self.settings.mp3 = false;
+            self.retarget();
         }
     }
 
@@ -322,6 +345,9 @@ impl ExportSheet {
                 let mp3 = mp3 && MP3_EXPORT;
                 if self.settings.mp3 != mp3 {
                     self.settings.mp3 = mp3;
+                    if mp3 {
+                        self.settings.stems = false;
+                    }
                     self.retarget();
                 }
             }
@@ -329,6 +355,10 @@ impl ExportSheet {
             Hit::Limiter { enabled } => {
                 self.field = Field::Limiter;
                 self.settings.limiter_enabled = enabled;
+            }
+            Hit::Stems { on } => {
+                self.field = Field::Stems;
+                self.set_stems(on);
             }
         }
     }
@@ -371,10 +401,14 @@ impl ExportSheet {
                 let mp3 = direction > 0 && MP3_EXPORT;
                 if self.settings.mp3 != mp3 {
                     self.settings.mp3 = mp3;
+                    if mp3 {
+                        self.settings.stems = false;
+                    }
                     self.retarget();
                 }
             }
             Field::Limiter => self.settings.limiter_enabled = direction > 0,
+            Field::Stems => self.set_stems(direction > 0),
             Field::First => match &mut self.settings.length {
                 Length::Cycles(cycles) => {
                     *cycles = (*cycles
@@ -409,9 +443,16 @@ impl ExportSheet {
             }
             Field::Format => {
                 self.settings.mp3 = !self.settings.mp3 && MP3_EXPORT;
+                if self.settings.mp3 {
+                    self.settings.stems = false;
+                }
                 self.retarget();
             }
             Field::Limiter => self.settings.limiter_enabled = !self.settings.limiter_enabled,
+            Field::Stems => {
+                let stems = !self.settings.stems;
+                self.set_stems(stems);
+            }
             Field::First | Field::Second | Field::Target => {}
         }
     }
@@ -486,7 +527,10 @@ impl ExportSheet {
             KeyCode::Right => self.step(1),
             KeyCode::Backspace => self.backspace(),
             KeyCode::Char(' ')
-                if matches!(self.field, Field::Length | Field::Format | Field::Limiter) =>
+                if matches!(
+                    self.field,
+                    Field::Length | Field::Format | Field::Limiter | Field::Stems
+                ) =>
             {
                 self.toggle_choice()
             }
@@ -607,6 +651,8 @@ pub struct ExportJob {
     pub started: Instant,
     /// Ends by silence, so a percentage would be of a ceiling nobody chose.
     open_ended: bool,
+    /// Writes a stems folder beside the target instead of the one file.
+    stems: bool,
     receiver: Receiver<Result<f64, String>>,
     progress: Arc<Progress>,
     finish: Arc<AtomicBool>,
@@ -663,11 +709,22 @@ impl ExportJob {
             target,
             started: Instant::now(),
             open_ended: matches!(settings.length, Length::UntilSilence { .. }),
+            stems: settings.stems,
             receiver,
             progress,
             finish,
             finished_early: false,
         })
+    }
+
+    /// Where the files land: the stems folder when the bounce is stems, the
+    /// target itself when it is the one file.
+    pub fn output(&self) -> PathBuf {
+        if self.stems {
+            rustel_audio::stems_folder(&self.target)
+        } else {
+            self.target.clone()
+        }
     }
 
     /// Seconds rendered, or why not. `None` while it is still going.
@@ -729,6 +786,7 @@ fn render(
     // Seed cached files before setups can request them again.
     session.restore_csound_snapshot(&score.csound);
     session.set_export_limiter(settings.limiter_enabled.then_some(settings.limiter));
+    session.set_stems_export(settings.stems);
     // The render does not care what the CLI would print. A library that
     // cannot be reached leaves the synths sounding, and the export fails on
     // each sample it lacks.
@@ -843,7 +901,7 @@ pub struct ExportSheetView<'a> {
 
 impl ExportSheetView<'_> {
     pub fn geometry(available: Rect) -> Option<Rect> {
-        let height = 8;
+        let height = 9;
         if available.height < height + 2 || available.width < 44 {
             return None;
         }
@@ -892,7 +950,10 @@ impl ExportSheetView<'_> {
             y,
             &radio(sheet.settings.limiter_enabled, "on"),
         );
-        let target = Rect::new(x + 9, panel.y + 5, right.saturating_sub(x + 9), 1);
+        let y = panel.y + 5;
+        let stems_off = span(x + 9, y, &radio(!sheet.settings.stems, "off"));
+        let stems_on = span(stems_off.right() + 3, y, &radio(sheet.settings.stems, "on"));
+        let target = Rect::new(x + 9, panel.y + 6, right.saturating_sub(x + 9), 1);
         Some(SheetLayout {
             panel,
             cycles,
@@ -903,6 +964,8 @@ impl ExportSheetView<'_> {
             mp3,
             limiter_off,
             limiter_on,
+            stems_off,
+            stems_on,
             target,
         })
     }
@@ -927,6 +990,10 @@ impl ExportSheetView<'_> {
             Some(Hit::Limiter { enabled: false })
         } else if on(layout.limiter_on) {
             Some(Hit::Limiter { enabled: true })
+        } else if on(layout.stems_off) {
+            Some(Hit::Stems { on: false })
+        } else if on(layout.stems_on) {
+            Some(Hit::Stems { on: true })
         } else if y == layout.target.y && x >= layout.panel.x && x < layout.panel.right() {
             // The whole row: a short path is still the line to type on.
             Some(Hit::Target)
@@ -1071,13 +1138,25 @@ impl Widget for ExportSheetView<'_> {
             usize::from(panel.right().saturating_sub(2).saturating_sub(details_x)),
             Style::default().fg(theme.muted),
         );
+        // stems: one wav a sounding orbit, beside the bounce
+        label(buffer, panel.y + 5, "stems  ");
+        let active = sheet.field == Field::Stems;
+        paint_radio(
+            buffer,
+            layout.stems_off,
+            "off",
+            !sheet.settings.stems,
+            active,
+        );
+        paint_radio(buffer, layout.stems_on, "on", sheet.settings.stems, active);
         // The active field carries the same marker as the other sheets.
         let active_y = match sheet.field {
             Field::Length => panel.y + 1,
             Field::First | Field::Second => panel.y + 2,
             Field::Format => panel.y + 3,
             Field::Limiter => panel.y + 4,
-            Field::Target => panel.y + 5,
+            Field::Stems => panel.y + 5,
+            Field::Target => panel.y + 6,
         };
         buffer.set_string(
             panel.x + 1,
@@ -1086,7 +1165,7 @@ impl Widget for ExportSheetView<'_> {
             Style::default().fg(theme.accent),
         );
         // target: a text field, with the caret up while it is the one typed into
-        label(buffer, panel.y + 5, "to     ");
+        label(buffer, panel.y + 6, "to     ");
         let editing = sheet.field == Field::Target;
         let typing = editing && (!self.vim || sheet.vim_insert());
         let mut path = sheet.target.display().to_string();
@@ -1174,6 +1253,8 @@ mod tests {
         );
         sheet.key(KeyCode::Tab, false);
         assert_eq!(sheet.field, Field::Limiter);
+        sheet.key(KeyCode::Tab, false);
+        assert_eq!(sheet.field, Field::Stems);
         sheet.key(KeyCode::Tab, false);
         assert_eq!(sheet.field, Field::Target, "the to line is a field too");
         sheet.key(KeyCode::Tab, false);
@@ -1271,6 +1352,7 @@ mod tests {
             target: PathBuf::new(),
             started: Instant::now(),
             open_ended: false,
+            stems: false,
             receiver,
             progress: Arc::new(Progress {
                 frames_written: AtomicUsize::new(0),
@@ -1371,6 +1453,7 @@ mod tests {
         assert!(text.contains("● wav"), "{text}");
         assert_eq!(text.contains("mp3"), MP3_EXPORT, "{text}");
         assert!(text.contains("limiter  ● off   ○ on"), "{text}");
+        assert!(text.contains("stems    ● off   ○ on"), "{text}");
         assert!(text.contains("drums-1970-01-01T00-00-00.wav"), "{text}");
 
         let command = render(&sheet, true);
@@ -1423,6 +1506,16 @@ mod tests {
                 "no mp3 radio without the encoder"
             );
         }
+        let hit = ExportSheetView::hit(&sheet, area, layout.stems_on.x + 1, layout.stems_on.y);
+        assert_eq!(hit, Some(Hit::Stems { on: true }));
+        sheet.click(hit.expect("hit"));
+        assert!(sheet.settings.stems);
+        assert!(!sheet.settings.mp3, "stems need the wav format");
+        assert!(
+            sheet.target.to_string_lossy().ends_with(".wav"),
+            "{}",
+            sheet.target.display()
+        );
         assert_eq!(
             ExportSheetView::hit(&sheet, area, layout.panel.x + 3, layout.target.y),
             Some(Hit::Target),
@@ -1436,6 +1529,31 @@ mod tests {
     }
 
     #[test]
+    fn stems_need_the_wav_format_so_the_choices_move_together() {
+        let mut sheet = ExportSheet::open(
+            "drums".into(),
+            ExportSettings::default(),
+            Path::new("exports"),
+            0,
+        );
+        sheet.field = Field::Stems;
+        sheet.key(KeyCode::Char(' '), false);
+        assert!(sheet.settings.stems, "Space toggles the stems choice");
+        if MP3_EXPORT {
+            sheet.field = Field::Format;
+            sheet.key(KeyCode::Right, false);
+            assert!(sheet.settings.mp3);
+            assert!(!sheet.settings.stems, "mp3 turns stems off");
+            assert!(sheet.target.to_string_lossy().ends_with(".mp3"));
+            sheet.field = Field::Stems;
+            sheet.key(KeyCode::Right, false);
+            assert!(sheet.settings.stems);
+            assert!(!sheet.settings.mp3, "stems take the format back to wav");
+            assert!(sheet.target.to_string_lossy().ends_with(".wav"));
+        }
+    }
+
+    #[test]
     fn the_to_line_is_typed_into_and_keeps_its_own_extension() {
         let mut sheet = ExportSheet::open(
             "drums".into(),
@@ -1443,7 +1561,7 @@ mod tests {
             Path::new("exports"),
             0,
         );
-        for _ in 0..4 {
+        for _ in 0..5 {
             sheet.key(KeyCode::Tab, false);
         }
         assert_eq!(sheet.field, Field::Target);
@@ -1459,8 +1577,9 @@ mod tests {
         assert_eq!(sheet.target, PathBuf::from("/tmp/bounces/take one.wav"));
         // …and a flip of the format follows it, but never rewrites a
         // deliberate extension.
-        sheet.key(KeyCode::Tab, true);
-        sheet.key(KeyCode::Tab, true);
+        while sheet.field != Field::Format {
+            sheet.key(KeyCode::Tab, true);
+        }
         sheet.key(KeyCode::Right, false);
         let extension = if MP3_EXPORT { "mp3" } else { "wav" };
         assert_eq!(
@@ -1470,11 +1589,10 @@ mod tests {
         sheet.target = PathBuf::from("/tmp/bounces/take.final");
         sheet.key(KeyCode::Left, false);
         assert_eq!(sheet.target, PathBuf::from("/tmp/bounces/take.final"));
-        // Tab wraps back to the top through the limiter and to lines.
-        sheet.key(KeyCode::Tab, false);
-        sheet.key(KeyCode::Tab, false);
-        sheet.key(KeyCode::Tab, false);
-        assert_eq!(sheet.field, Field::Length);
+        // Tab wraps back to the top through the limiter, stems and to lines.
+        while sheet.field != Field::Length {
+            sheet.key(KeyCode::Tab, false);
+        }
     }
 
     #[test]

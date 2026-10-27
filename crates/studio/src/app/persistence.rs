@@ -277,6 +277,13 @@ impl App {
                 scene.saved_source_revision = source_revision;
                 scene.refresh_dirty();
                 self.clear_error(ErrorOwner::Save);
+                // The write changed the file, so the panel's foot may hold
+                // fields that moved. Re-read it where the panel is open,
+                // keeping the row the reader has selected.
+                if wrote {
+                    let keep = self.set_panel_selection();
+                    self.refresh_set_panel(keep);
+                }
                 if still_pending {
                     self.status = format!(
                         "saved editor revision {}; a newer save is still pending…",

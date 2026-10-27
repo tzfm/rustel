@@ -227,11 +227,16 @@ impl App {
 
     /// Whether the panel has a text field that owns held typing keys.
     fn panel_is_typing(&self, kind: PanelKind) -> bool {
+        // The set prompt types whether the vim surface below it answers
+        // or not.
+        if kind == PanelKind::Set && self.set_prompt.is_some() {
+            return true;
+        }
         if let Some(typing) = super::vim::surface_typing(self) {
             return typing;
         }
         match kind {
-            PanelKind::Set => self.set_prompt.is_some(),
+            PanelKind::Set => self.set_search_typing(),
             PanelKind::Viz => self.viz_docks[self.viz_focus]
                 .as_ref()
                 .is_some_and(|panel| panel.prompt.is_some()),
@@ -316,7 +321,9 @@ impl App {
                     && !primary
                     && !shift
                     && !alt
-                    && self.set_prompt.is_none() =>
+                    && self.set_prompt.is_none()
+                    // `n` is a letter the search box may be typing.
+                    && !self.set_search_typing() =>
             {
                 self.new_session();
                 true
@@ -467,7 +474,11 @@ impl App {
 
     /// Whether the focused surface has a use for an Option letter. A chord
     /// learnt over the action retires the letter, so it is not recovered.
+    /// An Option digit is the strip's own: it names a score on the strip.
     fn alt_panel_action_applies(&self, letter: char) -> bool {
+        if letter.is_ascii_digit() {
+            return self.strip_digit_applies(letter);
+        }
         if let Some(action) = self.panel_action_at(letter) {
             return !self.keybinds.overridden(action);
         }
@@ -477,6 +488,17 @@ impl App {
                 .reference_panel
                 .as_ref()
                 .is_some_and(|panel| crate::reference::tab_previews(panel.tab))
+    }
+
+    /// Whether an Alt digit picks a strip's score right now: the score has
+    /// the keyboard, and nothing over it is reading the digit. Alt is not a
+    /// chord the keybind table can hold, so no learnt key can retire it.
+    fn strip_digit_applies(&self, digit: char) -> bool {
+        matches!(digit, '1'..='9')
+            && self.focus == Focus::Editor
+            && !self.editor().find_open()
+            && self.smart_action.is_none()
+            && matches!(self.strip_mode, SceneStripMode::Idle)
     }
 
     pub(super) fn route_terminal_event(
@@ -1053,6 +1075,18 @@ impl App {
         alt: bool,
         letter: Option<char>,
     ) -> bool {
+        // An Alt digit selects that strip's score, the way the digit on
+        // its row in the set panel does, from wherever the score has the
+        // keyboard. The strip runs to nine; past that, the arrows.
+        if alt
+            && !primary
+            && !shift
+            && let KeyCode::Char(digit) = key.code
+            && self.strip_digit_applies(digit)
+        {
+            self.select_strip_by_number((digit as u8 - b'0') as usize);
+            return true;
+        }
         if primary && !shift && letter == Some('d') && !self.key_is_a_learnt_chord(key) {
             self.toggle_reference_at_caret();
             return true;
@@ -2820,6 +2854,122 @@ mod tests {
         }
     }
 
+    mod strip_digits {
+        //! Alt with a digit selects that strip's score, the way the digit
+        //! on its row in the set panel does - and nothing that shares the
+        //! editor's keyboard loses its keys to it.
+
+        use crate::app::keyboard::*;
+        use crate::app::tests::support::*;
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        /// A studio with two scores on the strip, the second current, and
+        /// the editor holding the keyboard.
+        fn app_with_two_scores(directory: &std::path::Path) -> App {
+            let mut app = app_over(directory);
+            std::fs::write(directory.join("second.strudel"), "$: s(\"hh\")\n")
+                .expect("a second score");
+            app.scenes
+                .open_file(&directory.join("second.strudel"))
+                .expect("open the second score");
+            app.land_on_current_scene();
+            app.focus = Focus::Editor;
+            app
+        }
+
+        #[test]
+        fn an_alt_digit_selects_that_strips_score() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_with_two_scores(directory.path());
+            assert_eq!(app.scenes.current().name(), "second");
+            press(&mut app, KeyCode::Char('1'), KeyModifiers::ALT);
+            assert_eq!(
+                app.scenes.current().name(),
+                "first",
+                "Alt+1 selects the strip's first score"
+            );
+            assert_eq!(app.status, "scene 1 - first");
+            press(&mut app, KeyCode::Char('2'), KeyModifiers::ALT);
+            assert_eq!(app.scenes.current().name(), "second");
+            // A number the strip does not hold says so and moves nothing.
+            press(&mut app, KeyCode::Char('9'), KeyModifiers::ALT);
+            assert_eq!(app.scenes.current().name(), "second");
+            assert_eq!(app.status, "no scene 9 on the strip");
+        }
+
+        /// The chord answers in vim mode too, from Insert as from Normal.
+        #[test]
+        fn an_alt_digit_selects_in_vim_mode() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_with_two_scores(directory.path());
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            assert!(!app.editor().vim_is_insert(), "the score opens in Normal");
+            press(&mut app, KeyCode::Char('1'), KeyModifiers::ALT);
+            assert_eq!(app.scenes.current().name(), "first");
+            press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            assert!(app.editor().vim_is_insert());
+            press(&mut app, KeyCode::Char('2'), KeyModifiers::ALT);
+            assert_eq!(
+                app.scenes.current().name(),
+                "second",
+                "Alt+2 selects from Insert"
+            );
+        }
+
+        /// The find bar keeps its digits: the chord waits until it is shut.
+        #[test]
+        fn the_find_bar_keeps_its_keys() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_with_two_scores(directory.path());
+            press(
+                &mut app,
+                KeyCode::Char('y'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            );
+            assert!(app.editor().find_open());
+            press(&mut app, KeyCode::Char('1'), KeyModifiers::ALT);
+            assert_eq!(
+                app.scenes.current().name(),
+                "second",
+                "the find bar had the keyboard"
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('1'), KeyModifiers::ALT);
+            assert_eq!(app.scenes.current().name(), "first");
+        }
+
+        /// On iTerm2, where Option composes text, the composed digit is
+        /// recovered into the chord - and only where the chord applies, so
+        /// the same character still types into the find bar.
+        #[test]
+        fn iterm2s_composed_digit_recovers_the_chord() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_with_two_scores(directory.path());
+            app.keybinds.set_reach(crate::keybinds::Reach {
+                enhanced: false,
+                terminal: "iTerm2".into(),
+            });
+            press(&mut app, KeyCode::Char('¡'), KeyModifiers::NONE);
+            assert_eq!(
+                app.scenes.current().name(),
+                "first",
+                "the composed digit reached the strip"
+            );
+            app.open_find();
+            assert!(app.editor().find_open());
+            press(&mut app, KeyCode::Char('¡'), KeyModifiers::NONE);
+            assert!(
+                app.editor()
+                    .find_footer_label()
+                    .is_some_and(|label| label.starts_with("FIND ¡")),
+                "the find bar types the composed digit: {:?}",
+                app.editor().find_footer_label()
+            );
+            assert_eq!(app.scenes.current().name(), "first");
+        }
+    }
+
     mod paging {
         //! Paging belongs to the visible, focused surface and uses its current size.
 
@@ -3870,6 +4020,45 @@ mod tests {
                 assert_eq!(app.ui_settings.terminal_profile.as_deref(), Some("kitty"));
                 assert!(app.keybinds.prefs().is_empty());
             }
+        }
+
+        /// iTerm2 with Option as Normal composes Alt+O into `ø` and sends
+        /// no Alt bit. The composed character still reveals the set panel's
+        /// selected file, because the terminal profile recovers the letter.
+        /// A chord learnt over the action retires the letter again, and the
+        /// character then reaches no panel.
+        #[test]
+        fn an_iterm2_composed_option_o_still_reveals_the_set_panels_selection() {
+            // SAFETY: process-global environment, held only by this test
+            // while the studio suite runs one test at a time. The reveal
+            // must answer headless, or the press opens the runner's desktop.
+            unsafe { std::env::set_var(crate::reveal::HEADLESS_ENV, "1") };
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_for(directory.path(), "iTerm2", false);
+            action(&mut app, BindAction::SetPanel);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Set));
+            assert!(app.set_prompt.is_none(), "{}", app.status);
+            app.status.clear();
+            app.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('ø'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+            assert!(app.reveal_pending.is_some(), "{}", app.status);
+            assert!(app.status.starts_with("opening"), "{}", app.status);
+            // The letter retires with a learnt chord, so `ø` types again.
+            app.reveal_pending = None;
+            app.status.clear();
+            app.keybinds
+                .learn(BindAction::ShowFile, KeyCombo::parse("ctrl+f9"));
+            app.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('ø'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+            assert!(app.reveal_pending.is_none(), "{}", app.status);
+            // SAFETY: give the environment back before other tests run.
+            unsafe { std::env::remove_var(crate::reveal::HEADLESS_ENV) };
         }
     }
 }

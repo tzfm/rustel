@@ -104,6 +104,18 @@ impl ScalarBackend {
         self.orbit_pairs = pairs;
     }
 
+    /// Keep the orbit taps of a stems render: every block after this
+    /// carries each orbit's finished stereo out beside the main mix. An
+    /// offline render's own ask; the live callback never makes it.
+    pub fn capture_stems(&mut self) {
+        self.stems = Some(Stems::new());
+    }
+
+    /// The orbit taps of a stems render, if one asked for them.
+    pub fn stems(&self) -> Option<&Stems> {
+        self.stems.as_ref()
+    }
+
     pub fn orbit_pairs(&self) -> [u8; MAX_ORBITS] {
         self.orbit_pairs
     }

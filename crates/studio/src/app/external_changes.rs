@@ -228,6 +228,10 @@ impl App {
         };
         let name = self.scenes.current().name();
         self.note_external_change(scene_id, now);
+        // The file changed on disk, so its row's fields and saved time did
+        // too. Keep the selection the reader has, not the file that moved.
+        let keep = self.set_panel_selection();
+        self.refresh_set_panel(keep);
         self.set_notice(format!("reloaded {name} from disk"));
         if mode == ExternalChanges::SyncAndEvaluate {
             self.apply_external_change();

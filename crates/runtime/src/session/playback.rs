@@ -687,6 +687,9 @@ impl Session {
                     session.config.dsp_dispatch,
                     session.max_polyphony(),
                     Some(&csound),
+                    // A set bounce writes no stems: the folder layout is the
+                    // single score export's.
+                    false,
                 )
             }
             .map_err(render_error)
@@ -735,6 +738,13 @@ impl Session {
     /// score-level `.limit()` effects are independent of this setting.
     pub fn set_export_limiter(&mut self, limiter: Option<rustel_audio::RenderLimiter>) {
         self.export_limiter = limiter;
+    }
+
+    /// Write a `<name> stems` folder beside each scalar WAV export:
+    /// `main.wav` plus one WAV a sounding orbit, tapped before the export
+    /// limiter. A format other than a scalar WAV refuses the render.
+    pub fn set_stems_export(&mut self, stems: bool) {
+        self.stems_export = stems;
     }
 
     pub fn stop_export_when_silent(&mut self, floor: f32, hold: std::time::Duration) {
@@ -832,6 +842,13 @@ impl Session {
         if format == RenderFormat::ScalarMp3 {
             crate::render::ensure_mp3_available()?;
         }
+        if self.stems_export
+            && !matches!(format, RenderFormat::ScalarWav | RenderFormat::ScalarF32Wav)
+        {
+            return Err(RuntimeError::Message(
+                "stems are written for a scalar WAV export, not another format".into(),
+            ));
+        }
         let play = self.play(duration_secs)?;
         // `--until-silence` ends the file early, so the requested duration is
         // a ceiling rather than a fact. Report what is actually on disk. The
@@ -911,6 +928,9 @@ impl Session {
                     session.config.dsp_dispatch,
                     session.max_polyphony(),
                     Some(&session.csound),
+                    // The staged WAV feeds the mp3 encoder; stems are refused
+                    // for mp3 before this point.
+                    false,
                 )
                 .map_err(render_error);
                 let encoded = rendered.and_then(|(bytes, refused)| {
@@ -949,6 +969,7 @@ impl Session {
                     session.config.dsp_dispatch,
                     session.max_polyphony(),
                     Some(&session.csound),
+                    session.stems_export,
                 )
                 .map(|(bytes, refused)| (Some(bytes), refused))
                 .map_err(render_error)
@@ -987,7 +1008,14 @@ impl Session {
                 RenderFormat::OnsetJson => "onset-json".into(),
                 RenderFormat::ScalarMp3 => "mp3-scalar-320k".into(),
             },
-            path: out_path.display().to_string(),
+            path: if self.stems_export {
+                rustel_audio::stems_folder(out_path)
+                    .join("main.wav")
+                    .display()
+                    .to_string()
+            } else {
+                out_path.display().to_string()
+            },
             audio_backend: match format {
                 RenderFormat::ScalarWav | RenderFormat::ScalarF32Wav | RenderFormat::ScalarMp3 => {
                     "scalar-rust".into()
@@ -996,7 +1024,16 @@ impl Session {
             },
             device_audio: "not-requested".into(),
             note: match format {
+                RenderFormat::ScalarWav if self.stems_export => {
+                    "Deterministic scalar PCM render, with a stem per sounding orbit beside it."
+                        .into()
+                }
                 RenderFormat::ScalarWav => "Deterministic scalar PCM render.".into(),
+                RenderFormat::ScalarF32Wav if self.stems_export => {
+                    "Deterministic scalar render, 32-bit float and unclamped, with a stem per \
+                     sounding orbit beside it."
+                        .into()
+                }
                 RenderFormat::ScalarF32Wav => {
                     "Deterministic scalar render, 32-bit float and unclamped.".into()
                 }
@@ -1622,6 +1659,72 @@ mod tests {
                 .zip(&all)
                 .any(|(a, b)| (a - b).abs() > 0.0001),
             "limiting polyphony must change actual audio"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stems_export_tests {
+    use super::*;
+    use crate::session::test_support::quiet_session;
+
+    const TWO_ORBITS: &str = r#"stack(
+        s("bd").orbit(1),
+        note("c3").s("sawtooth").orbit(2).gain(0.25),
+    )"#;
+
+    /// A stems bounce writes its main file inside the stems folder, one wav
+    /// a sounding orbit beside it, and the report says where the main went.
+    #[test]
+    fn a_stems_export_writes_main_and_one_wav_a_sounding_orbit() {
+        let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("render directory");
+        let out = directory.path().join("bounce.wav");
+        let mut session = quiet_session(TWO_ORBITS);
+        session.set_stems_export(true);
+        let report = session
+            .render(1.0, &out, RenderFormat::ScalarWav)
+            .expect("render");
+        let folder = rustel_audio::stems_folder(&out);
+        let mut names: Vec<String> = std::fs::read_dir(&folder)
+            .expect("stems folder")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, ["2.wav", "3.wav", "main.wav"]);
+        assert_eq!(
+            report.path,
+            folder.join("main.wav").display().to_string(),
+            "the report names the folder's main file"
+        );
+    }
+
+    /// Stems are a WAV-only mode: the one-file formats refuse the render
+    /// rather than half-write it.
+    #[test]
+    fn stems_are_refused_for_anything_but_a_scalar_wav() {
+        let directory = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("render directory");
+        let mut session = quiet_session(TWO_ORBITS);
+        session.set_stems_export(true);
+        let error = session
+            .render(
+                1.0,
+                &directory.path().join("bounce.json"),
+                RenderFormat::OnsetJson,
+            )
+            .expect_err("onset-json stems must be refused");
+        assert!(
+            error.to_string().contains("scalar WAV"),
+            "the refusal names the format it needs: {error}"
+        );
+        assert!(
+            !directory.path().join("bounce stems").exists(),
+            "the refusal writes no folder"
         );
     }
 }

@@ -148,6 +148,85 @@ fn enter_renders_the_scene_into_the_exports_folder() {
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
 }
 
+/// Stems from the sheet: beside the take a `<name> stems` folder holds the
+/// same bounce as `main.wav` plus one wav a sounding orbit, and the status
+/// names the folder, because the take itself is inside it.
+#[test]
+fn stems_write_the_main_and_one_wav_a_sounding_orbit() {
+    let mut studio = hermetic();
+    let set = studio.set_directory().to_path_buf();
+
+    studio.set_score("$: s(\"bd\").orbit(0)\n$: s(\"bd\").orbit(1)");
+    studio.chord("ctrl+shift+x");
+    // Down Down Down Down: Length → First → Format → Limiter → Stems.
+    for _ in 0..4 {
+        studio.press(KeyCode::Down, KeyModifiers::NONE);
+    }
+    studio.press(KeyCode::Right, KeyModifiers::NONE);
+    let row = row_containing(&studio.rows(), "stems");
+    assert!(
+        studio.rows()[row].contains("on"),
+        "the stems choice turned on: {}",
+        studio.rows()[row]
+    );
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        studio
+            .status()
+            .starts_with("exporting first (16 cycles) → "),
+        "{}",
+        studio.status()
+    );
+
+    wait_for_export(&mut studio);
+    let status = studio.status().to_owned();
+    assert!(status.starts_with("exported first - "), "{status}");
+    assert!(
+        status.contains("stems"),
+        "the status names the stems folder: {status}"
+    );
+
+    // The folder sits beside where the one file would have landed, holding
+    // the main bounce and one wav an orbit that sounded.
+    let exports = set.join("exports");
+    let mut stems_folders: Vec<_> = std::fs::read_dir(&exports)
+        .expect("exports directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    assert_eq!(stems_folders.len(), 1, "one stems folder, nothing else");
+    let folder = stems_folders.remove(0);
+    let folder_name = folder
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("folder named");
+    assert!(
+        folder_name.starts_with("first-") && folder_name.ends_with(" stems"),
+        "named for the take: {folder_name}"
+    );
+    let mut names: Vec<_> = std::fs::read_dir(&folder)
+        .expect("stems folder")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["1.wav", "2.wav", "main.wav"],
+        "one a sounding orbit"
+    );
+    for name in &names {
+        assert!(
+            std::fs::metadata(folder.join(name))
+                .expect("stem metadata")
+                .len()
+                > 44,
+            "{name} carries more than a bare WAV header"
+        );
+    }
+}
+
 /// Samples from outside the default library sound in the bounce: a folder
 /// imported as a sample source, then the set's own folder.
 #[test]

@@ -11,7 +11,36 @@ static AUDIO_CALLBACK_ALLOCATOR: rustel_audio::tripwire::TripwireAlloc =
     rustel_audio::tripwire::TripwireAlloc;
 
 use crossterm::event::{KeyCode, KeyModifiers};
-use rustel_studio_e2e::{Hermetic, hermetic, hermetic_recording, row_containing, wav_bytes};
+use rustel_studio_e2e::{
+    Hermetic, PanelKind, hermetic, hermetic_recording, row_containing, wav_bytes,
+};
+
+/// The settings sheet's editor keybindings page, walked to by the sheet's
+/// own keys. The same walk the vim suite makes.
+fn open_editor_keybindings(studio: &mut Hermetic) {
+    studio.chord("ctrl+o");
+    for _ in 0..9 {
+        studio.press(KeyCode::Home, KeyModifiers::NONE);
+        if studio.rows().iter().any(|row| row.contains("▸ Terminal")) {
+            studio.press(KeyCode::Down, KeyModifiers::NONE);
+            assert!(
+                studio
+                    .rows()
+                    .iter()
+                    .any(|row| row.contains("▸ Editor keybindings"))
+            );
+            return;
+        }
+        studio.press(KeyCode::Tab, KeyModifiers::NONE);
+    }
+    panic!("the editor keybindings row is missing");
+}
+
+fn enable_vim(studio: &mut Hermetic) {
+    open_editor_keybindings(studio);
+    studio.press(KeyCode::Right, KeyModifiers::NONE);
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+}
 
 /// How long a local import may take to walk its folder.
 const IMPORT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
@@ -124,6 +153,180 @@ fn set_browser_reveals_open_and_closed_scores_without_opening_or_editing_them() 
         studio.press(KeyCode::Down, KeyModifiers::NONE);
     }
     assert_eq!(std::fs::read_to_string(closed).unwrap(), "$: s(\"hh\")");
+}
+
+#[test]
+fn the_set_panel_opens_a_score_by_its_strip_number() {
+    let mut studio = hermetic();
+    std::fs::write(
+        studio.set_directory().join("second.strudel"),
+        "$: s(\"hh\")",
+    )
+    .unwrap();
+    studio.chord("ctrl+b");
+    studio.press(KeyCode::Down, KeyModifiers::NONE);
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(studio.scene_names(), ["first", "second"]);
+    assert_eq!(studio.score(), "$: s(\"hh\")");
+
+    // A number no score holds names what it missed, and the panel keeps
+    // the keyboard; a number on the strip opens its score, Enter on its
+    // row in one key.
+    studio.chord("ctrl+b");
+    studio.chord("ctrl+b");
+    studio.press(KeyCode::Char('5'), KeyModifiers::NONE);
+    assert_eq!(studio.status(), "no scene 5 on the strip");
+    assert_eq!(studio.focus(), Some(PanelKind::Set));
+    studio.press(KeyCode::Char('1'), KeyModifiers::NONE);
+    assert_eq!(studio.focus(), None, "the opened score takes the keyboard");
+    assert_eq!(studio.score(), "$: s(\"bd\")\n");
+    assert_eq!(studio.scene_names(), ["first", "second"], "no tab added");
+
+    studio.chord("ctrl+b");
+    studio.chord("ctrl+b");
+    studio.press(KeyCode::Char('2'), KeyModifiers::NONE);
+    assert_eq!(studio.score(), "$: s(\"hh\")", "strip 2 selected");
+    assert_eq!(studio.focus(), None);
+}
+
+/// The selected score's details stand at the foot of the set panel and
+/// follow the selection: the name, where it stands on the strip, the
+/// @fields its leading comments carry, and when it was last saved. No
+/// key opens or closes them. Vim mode changes none of it, the panel
+/// being a list, not a text surface.
+#[test]
+fn the_set_panel_shows_the_selected_scores_details_at_its_foot() {
+    let mut studio = hermetic();
+    std::fs::write(
+        studio.set_directory().join("night.strudel"),
+        "/*\n@title night drive\n@by you\n*/\n$: s(\"bd\")\n",
+    )
+    .unwrap();
+    enable_vim(&mut studio);
+
+    studio.chord("ctrl+b");
+    studio.settle();
+    assert_eq!(studio.focus(), Some(PanelKind::Set));
+    // The panel opens on the score on screen; the titled one is below it.
+    studio.press(KeyCode::Down, KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    for expected in ["night", "not open", "@title night drive", "@by you"] {
+        assert!(
+            rows.iter().any(|row| row.contains(expected)),
+            "the block says {expected}:\n{}",
+            rows.join("\n")
+        );
+    }
+    assert!(
+        rows.iter().any(|row| row.contains("saved ")),
+        "the block says when it was saved:\n{}",
+        rows.join("\n")
+    );
+
+    // The block follows the selection: back on the score on screen, the
+    // titled one's fields leave the foot.
+    studio.press(KeyCode::Up, KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    assert!(
+        rows.iter().all(|row| !row.contains("@title night drive")),
+        "the block followed the move:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// `/` filters the set panel: letters hide the scores the query does not
+/// answer - a name or any @field value - Enter leaves the filter
+/// standing, Esc restores the folder. In vim the box rests in command
+/// mode until `i` types, and the Esc ladder leaves insert before it
+/// drops the filter.
+#[test]
+fn the_set_panel_search_filters_and_restores() {
+    let mut studio = hermetic();
+    for (name, body) in [
+        ("alpha.strudel", "$: s(\"hh\")\n"),
+        (
+            "night.strudel",
+            "/*\n@title night drive\n*/\n$: s(\"bd\")\n",
+        ),
+    ] {
+        std::fs::write(studio.set_directory().join(name), body).unwrap();
+    }
+    studio.chord("ctrl+b");
+    studio.settle();
+    assert_eq!(studio.focus(), Some(PanelKind::Set));
+
+    studio.press(KeyCode::Char('/'), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('n'), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('i'), KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    assert!(
+        rows.iter().any(|row| row.contains("search: ni")),
+        "the panel shows the query:\n{}",
+        rows.join("\n")
+    );
+    row_containing(&rows, "night");
+    assert!(
+        rows.iter().all(|row| !row.contains("alpha")),
+        "a score that does not answer hides:\n{}",
+        rows.join("\n")
+    );
+
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    assert!(
+        rows.iter().any(|row| row.contains("alpha")),
+        "Esc restores the folder:\n{}",
+        rows.join("\n")
+    );
+    assert_eq!(studio.focus(), Some(PanelKind::Set), "Esc kept the panel");
+
+    // Vim: the box rests in command, `i` types, and the second Esc
+    // drops the filter. The panel goes away first, so the vim half
+    // opens it fresh, the way the studio does at startup.
+    studio.chord("ctrl+b");
+    assert_eq!(studio.focus(), None, "the panel is away");
+    enable_vim(&mut studio);
+    studio.chord("ctrl+b");
+    studio.settle();
+    assert_eq!(studio.focus(), Some(PanelKind::Set));
+    studio.press(KeyCode::Char('/'), KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    assert!(
+        rows.iter().any(|row| row.contains("search: i or a types")),
+        "in command mode the box says the way in:\n{}",
+        rows.join("\n")
+    );
+    studio.press(KeyCode::Char('i'), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('n'), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('i'), KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    assert!(
+        rows.iter().any(|row| row.contains("search: ni")),
+        "insert types into the box:\n{}",
+        rows.join("\n")
+    );
+    assert!(rows.iter().all(|row| !row.contains("alpha")));
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    assert!(
+        rows.iter().any(|row| row.contains("alpha")),
+        "the second Esc drops the filter:\n{}",
+        rows.join("\n")
+    );
+    assert_eq!(
+        studio.focus(),
+        Some(PanelKind::Set),
+        "Esc answered the box, not the panel"
+    );
 }
 
 /// File ▸ New set: a folder named after the day appears under the sets
@@ -395,4 +598,52 @@ fn rename_set_carries_a_sample_source_inside_it() {
         row.contains("sound(s)"),
         "the moved source reads its sounds: {row}"
     );
+}
+
+/// File ▸ Open set… with a typed path to a Strudel pattern export: the
+/// export becomes a set of its own under the sets folder, one score per
+/// entry, the first one open and the title naming the score that carries
+/// one.
+#[test]
+fn open_set_imports_a_strudel_pattern_export() {
+    let mut studio = hermetic();
+    let root = sets_root(&studio);
+    std::fs::create_dir_all(&root).expect("sets root made");
+    let export = studio.config_home().join("gig.json");
+    std::fs::write(
+        &export,
+        concat!(
+            "{\n",
+            "  \"V1StGXR8_Z5j\": { \"code\": \"// @title night drive\\n$: s(\\\"bd*4\\\")\" },\n",
+            "  \"kZ4_hT9pQw2x\": { \"code\": \"$: s(\\\"cp\\\")\" }\n",
+            "}\n"
+        ),
+    )
+    .expect("export");
+
+    drop_file_menu(&mut studio);
+    studio.press(KeyCode::Char('o'), KeyModifiers::NONE); // Open set…
+    studio.type_text(export.display().to_string().as_str());
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+
+    let status = studio.status();
+    assert!(
+        status.starts_with("imported gig - 2 scene(s)"),
+        "the status names the set made of the export: {status}"
+    );
+    assert_eq!(
+        studio.set_directory(),
+        root.join("gig"),
+        "the set lives beside the others"
+    );
+    assert_eq!(
+        studio.scene_names().as_slice(),
+        ["night drive", "kZ4_hT9pQw2x"],
+        "the title names the score that carries one"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("gig").join("night drive.strudel")).expect("score"),
+        "// @title night drive\n$: s(\"bd*4\")"
+    );
+    row_containing(&studio.rows(), "$: s(\"bd*4\")");
 }

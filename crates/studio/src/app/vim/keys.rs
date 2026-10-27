@@ -50,6 +50,24 @@ impl VimTextSurface for ReferencePanel {
     }
 }
 
+impl VimTextSurface for SetPanel {
+    fn panel_kind(&self) -> PanelKind {
+        PanelKind::Set
+    }
+
+    fn text_wanted(&self) -> bool {
+        self.search.is_some()
+    }
+
+    fn insert(&self) -> bool {
+        self.vim_insert
+    }
+
+    fn set_insert(&mut self, insert: bool) {
+        self.vim_insert = insert;
+    }
+}
+
 impl VimTextSurface for ThemePicker {
     fn panel_kind(&self) -> PanelKind {
         PanelKind::Theme
@@ -112,6 +130,7 @@ macro_rules! text_surfaces {
 
 text_surfaces! {
     PanelKind::Reference => reference_panel,
+    PanelKind::Set => set_panel,
     PanelKind::Theme => theme_picker,
     PanelKind::Export => export_sheet,
 }
