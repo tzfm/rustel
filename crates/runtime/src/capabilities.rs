@@ -585,7 +585,10 @@ mod tests {
                     rustel_audio::SupersawKernelKind::Avx2.compiled()
                         || rustel_audio::SupersawKernelKind::Neon.compiled()
                 )
-                + usize::from(rustel_audio::WavetableKernelKind::Avx2.compiled())
+                + usize::from(
+                    rustel_audio::WavetableKernelKind::Avx2.compiled()
+                        || rustel_audio::WavetableKernelKind::Neon.compiled()
+                )
         );
 
         let scalar = registry
