@@ -59,7 +59,13 @@ impl DspDispatch {
 
     pub const fn wavetable_kernel_kind(self) -> WavetableKernelKind {
         if self.wavetable.is_some() {
-            WavetableKernelKind::Avx2
+            // Exactly one accelerated variant is compiled in, named by the
+            // architecture this binary was built for.
+            if cfg!(target_arch = "aarch64") {
+                WavetableKernelKind::Neon
+            } else {
+                WavetableKernelKind::Avx2
+            }
         } else {
             WavetableKernelKind::Portable
         }

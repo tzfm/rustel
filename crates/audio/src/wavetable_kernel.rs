@@ -6,6 +6,8 @@
 
 use std::sync::OnceLock;
 
+#[cfg(target_arch = "aarch64")]
+mod aarch64;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod x86;
 
@@ -17,6 +19,8 @@ pub enum WavetableKernelKind {
     Portable,
     /// Eight-lane wavetable interpolation using x86 AVX2 instructions.
     Avx2,
+    /// Four-lane wavetable interpolation using aarch64 NEON instructions.
+    Neon,
 }
 
 impl WavetableKernelKind {
@@ -25,6 +29,7 @@ impl WavetableKernelKind {
         match self {
             Self::Portable => true,
             Self::Avx2 => cfg!(any(target_arch = "x86", target_arch = "x86_64")),
+            Self::Neon => cfg!(target_arch = "aarch64"),
         }
     }
 }
@@ -35,14 +40,16 @@ pub fn selected_wavetable_kernel_kind() -> WavetableKernelKind {
 }
 
 /// A target-feature implementation selected before the sample loop.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum WavetableKernel {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     Avx2,
+    #[cfg(target_arch = "aarch64")]
+    Neon,
 }
 
 /// No architecture-specific wavetable kernel is compiled for this target.
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WavetableKernel;
 
@@ -56,6 +63,10 @@ impl WavetableKernel {
             WavetableKernelKind::Avx2 => Some(Self::Avx2),
             #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
             WavetableKernelKind::Avx2 => unreachable!("AVX2 is not selectable on this target"),
+            #[cfg(target_arch = "aarch64")]
+            WavetableKernelKind::Neon => Some(Self::Neon),
+            #[cfg(not(target_arch = "aarch64"))]
+            WavetableKernelKind::Neon => unreachable!("NEON is not selectable on this target"),
         }
     }
 
@@ -64,7 +75,7 @@ impl WavetableKernel {
     ///
     /// Returns `false` without modifying `values` when the scalar path is
     /// required for an unusual or incomplete table.
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_interpolate(
         self,
@@ -77,7 +88,15 @@ impl WavetableKernel {
         values: &mut [f32],
         count: usize,
     ) -> bool {
-        if count < 8
+        // One full vector is the least a kernel is worth; the vector width
+        // is the implementation's own.
+        let minimum = match self {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            Self::Avx2 => 8,
+            #[cfg(target_arch = "aarch64")]
+            Self::Neon => 4,
+        };
+        if count < minimum
             || count > phases.len()
             || count > values.len()
             || frame_len == 0
@@ -97,6 +116,12 @@ impl WavetableKernel {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             Self::Avx2 => unsafe {
                 x86::avx2_interpolate_lanes(
+                    pcm, frame_len, frame_a, frame_b, interp, phases, values, count,
+                )
+            },
+            #[cfg(target_arch = "aarch64")]
+            Self::Neon => unsafe {
+                aarch64::neon_interpolate_lanes(
                     pcm, frame_len, frame_a, frame_b, interp, phases, values, count,
                 )
             },
@@ -140,6 +165,11 @@ fn detect_best_kernel() -> WavetableKernelKind {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if std::arch::is_x86_feature_detected!("avx2") {
         return WavetableKernelKind::Avx2;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        return WavetableKernelKind::Neon;
     }
 
     WavetableKernelKind::Portable

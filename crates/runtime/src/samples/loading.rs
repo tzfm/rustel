@@ -1173,6 +1173,7 @@ impl SampleLibrary {
 
 #[cfg(test)]
 pub(super) mod tests {
+    use super::codecs::decode_guarded;
     use super::*;
     #[cfg(test)]
     mod empty_font_tests {

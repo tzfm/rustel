@@ -20,6 +20,7 @@ pub enum CapabilityId {
     Avx2Supersaw,
     Avx2Wavetable,
     NeonSupersaw,
+    NeonWavetable,
 }
 
 impl CapabilityId {
@@ -30,6 +31,7 @@ impl CapabilityId {
             Self::Avx2Convolution => "avx2_convolution",
             Self::Avx2Supersaw => "avx2_supersaw",
             Self::Avx2Wavetable => "avx2_wavetable",
+            Self::NeonWavetable => "neon_wavetable",
             Self::NeonSupersaw => "neon_supersaw",
         }
     }
@@ -396,10 +398,15 @@ impl CapabilityRegistry {
                     .is_some_and(|status| status.detected()));
         let supersaw_selected =
             dispatch.supersaw_kernel_kind() != rustel_audio::SupersawKernelKind::Portable;
-        let wavetable_compiled = rustel_audio::WavetableKernelKind::Avx2.compiled();
-        let wavetable_detected = wavetable_compiled && avx2_feature_detected;
+        let wavetable_compiled = rustel_audio::WavetableKernelKind::Avx2.compiled()
+            || rustel_audio::WavetableKernelKind::Neon.compiled();
+        let wavetable_detected = wavetable_compiled
+            && (avx2_feature_detected
+                || cpu_features
+                    .status(CpuFeatureId::Neon)
+                    .is_some_and(|status| status.detected()));
         let wavetable_selected =
-            dispatch.wavetable_kernel_kind() == rustel_audio::WavetableKernelKind::Avx2;
+            dispatch.wavetable_kernel_kind() != rustel_audio::WavetableKernelKind::Portable;
         let accelerated = convolution_selected || supersaw_selected || wavetable_selected;
 
         let mut statuses = Vec::with_capacity(
@@ -465,8 +472,15 @@ impl CapabilityRegistry {
                 }
                 AccelerationPreference::Auto => CapabilityReason::CpuFeatureUnavailable,
             };
+            // Exactly one accelerated wavetable implementation is compiled
+            // in, named by the architecture this binary was built for.
+            let id = if rustel_audio::WavetableKernelKind::Avx2.compiled() {
+                CapabilityId::Avx2Wavetable
+            } else {
+                CapabilityId::NeonWavetable
+            };
             statuses.push(CapabilityStatus::new(
-                CapabilityId::Avx2Wavetable,
+                id,
                 true,
                 wavetable_detected,
                 wavetable_selected,
@@ -677,6 +691,26 @@ mod tests {
                 }
             );
         }
+        if rustel_audio::WavetableKernelKind::Neon.compiled() {
+            let neon = registry
+                .status(CapabilityId::NeonWavetable)
+                .expect("NEON wavetable");
+            let detected = registry
+                .cpu_features()
+                .status(CpuFeatureId::Neon)
+                .is_some_and(|status| status.detected());
+            assert!(neon.compiled());
+            assert_eq!(neon.detected(), detected);
+            assert_eq!(neon.selected(), detected);
+            assert_eq!(
+                neon.reason(),
+                if detected {
+                    CapabilityReason::SelectedByRuntime
+                } else {
+                    CapabilityReason::CpuFeatureUnavailable
+                }
+            );
+        }
     }
 
     #[test]
@@ -721,6 +755,13 @@ mod tests {
             assert!(!avx2.selected());
             assert_eq!(avx2.reason(), CapabilityReason::DisabledByPreference);
         }
+        if rustel_audio::WavetableKernelKind::Neon.compiled() {
+            let neon = portable
+                .status(CapabilityId::NeonWavetable)
+                .expect("NEON wavetable");
+            assert!(!neon.selected());
+            assert_eq!(neon.reason(), CapabilityReason::DisabledByPreference);
+        }
     }
 
     #[test]
@@ -758,6 +799,11 @@ mod tests {
                     CapabilityId::Avx2Wavetable,
                     rustel_audio::WavetableKernelKind::Avx2.compiled(),
                     dispatch.wavetable_kernel_kind() == rustel_audio::WavetableKernelKind::Avx2,
+                ),
+                (
+                    CapabilityId::NeonWavetable,
+                    rustel_audio::WavetableKernelKind::Neon.compiled(),
+                    dispatch.wavetable_kernel_kind() == rustel_audio::WavetableKernelKind::Neon,
                 ),
             ] {
                 let status = registry.status(id);
