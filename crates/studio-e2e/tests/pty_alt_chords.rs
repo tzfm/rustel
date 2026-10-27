@@ -642,13 +642,17 @@ fn alt_digits_select_strip_scores_in_both_wire_spellings() {
     );
 
     // Alt+2 as a kitty-protocol terminal sends it: CSI u with the base
-    // key's codepoint and the Alt modifier bit.
-    terminal.write(b"\x1b[50;3u");
-    assert!(
-        terminal.wait_for_screen("scene 2 - ", Duration::from_secs(10)),
-        "the CSI u Alt+2 never selected the second score:\n{}",
-        terminal.diagnostics()
-    );
+    // key's codepoint and the Alt modifier bit. Windows ConPTY does not
+    // carry the kitty spelling, so a Unix PTY alone drives this half.
+    #[cfg(unix)]
+    {
+        terminal.write(b"\x1b[50;3u");
+        assert!(
+            terminal.wait_for_screen("scene 2 - ", Duration::from_secs(10)),
+            "the CSI u Alt+2 never selected the second score:\n{}",
+            terminal.diagnostics()
+        );
+    }
 
     // A digit the strip does not hold says so, through the legacy spelling:
     // the chord reached the strip and the strip answered.
@@ -665,6 +669,11 @@ fn alt_digits_select_strip_scores_in_both_wire_spellings() {
 /// `¡`. The studio's recovery table turns it back into the chord, so the
 /// strip still answers - the third delivery path, proven under the
 /// identity that produces it.
+///
+/// Windows ConPTY does not deliver a composed Option key as text the
+/// studio can read. The recovery table has unit coverage in the
+/// terminal profile, the keybinds and the app's key dispatch.
+#[cfg(unix)]
 #[test]
 fn iterm2s_composed_digit_selects_the_strip_score() {
     let Some(binary) = rustel_binary() else {
