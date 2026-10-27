@@ -712,6 +712,7 @@ impl DeviceScanner {
         if std::thread::Builder::new()
             .name("studio-devices".into())
             .spawn(move || {
+                crate::background::demote();
                 let _ = sender.send(DeviceInventory::probe());
             })
             .is_ok()
