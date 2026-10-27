@@ -18,8 +18,13 @@ parent folder must exist.
 A path given to File > Open set can be a Strudel pattern export: a `.json`
 object that holds one pattern of code per entry. Such a file is not a set on
 disk, so Studio makes a set of it. The new set folder sits beside the others and
-takes its name from the export file. One score is written per entry, and a
-score that carries a `@title` field takes it as its file name.
+takes its name from the export file. One score is written per entry. A score
+that carries a `@title` field takes it as its file name, an entry keyed by a
+name takes the key, and the rest are numbered `pattern 1`, `pattern 2` and so on
+in the order the patterns were made. The open-set prompt offers these exports
+beside the sets, and File > Import Strudel patterns does the same import into
+the set already open: one score file an entry lands in the set's folder, and a
+name the set already holds is skipped and counted, never overwritten.
 
 Type or paste a score, then press **Ctrl+S** or **F5**. Press **Ctrl+G** or **F8**
 to stop. Editing does not change the playing score until you update it. If an

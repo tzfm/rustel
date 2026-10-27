@@ -447,6 +447,97 @@ fn open_set_lists_the_others_and_opens_one() {
     );
 }
 
+/// File ▸ Import Strudel patterns…: an export in strudel.cc's own shape -
+/// entries keyed by push ids, each an object with `code` and
+/// `created_at` - becomes named score files of the set already open.
+/// The prompt offers the export by name, the set panel lists what
+/// landed, and the score on screen stays the score on screen.
+#[test]
+fn import_strudel_patterns_adds_them_to_the_open_set() {
+    let mut studio = hermetic();
+    let set = studio.set_directory().to_path_buf();
+    let root = sets_root(&studio);
+    std::fs::create_dir_all(&root).expect("sets root made");
+    // The real export's shape, with synthetic patterns of the same make:
+    // push-id keys, code, created_at and collection fields, and one song
+    // titled in a leading comment rather than in its key.
+    let patterns = [
+        ("ALGnQXNiUsZ4", "\"$: s(\\\"bd\\\")\"", 10),
+        (
+            "SkySkxWlk9OI",
+            "\"// @title night drive\\n$: s(\\\"cp\\\")\"",
+            20,
+        ),
+        ("94Sl_PHsUiXX", "\"$: s(\\\"hh\\\")\"", 30),
+    ];
+    let entries: Vec<String> = patterns
+        .iter()
+        .map(|(id, code, created_at)| {
+            format!(
+                "  \"{id}\": {{ \"code\": {code}, \"created_at\": {created_at}, \"id\": \"{id}\", \"collection\": \"user\" }}"
+            )
+        })
+        .collect();
+    std::fs::write(
+        root.join("gig.json"),
+        format!("{{\n{}\n}}\n", entries.join(",\n")),
+    )
+    .expect("export");
+
+    drop_file_menu(&mut studio);
+    studio.press(KeyCode::Char('i'), KeyModifiers::NONE); // Import Strudel patterns…
+    assert_eq!(
+        studio.status(),
+        "import Strudel patterns - Enter adds every entry to this set · Tab browses · type a path · Esc back"
+    );
+    let rows = studio.rows();
+    let row = row_containing(&rows, "gig.json");
+    assert!(
+        rows[row].contains("3 patterns"),
+        "the export is offered with what it holds: {}",
+        rows[row]
+    );
+
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    let status = studio.status();
+    assert!(
+        status.starts_with("imported 3 patterns into "),
+        "the status counts what landed: {status}"
+    );
+    // Named the way the new-set import names them: the title leads, the
+    // rest are numbered in the order they were made.
+    for name in ["pattern 1", "night drive", "pattern 3"] {
+        let file = set.join(format!("{name}.strudel"));
+        assert!(file.is_file(), "{name} landed as a file of the set");
+        let body = std::fs::read_to_string(&file).unwrap();
+        assert!(body.contains("$: s("), "{name} carries its pattern: {body}");
+    }
+    assert_eq!(
+        studio.scene_names().as_slice(),
+        ["first"],
+        "the import wrote files, not tabs - the score on screen stands"
+    );
+
+    // The set panel lists them beside the score it had.
+    studio.chord("ctrl+b");
+    studio.settle();
+    let rows = studio.rows();
+    row_containing(&rows, "night drive");
+    row_containing(&rows, "pattern 1");
+
+    // The same export again: everything already there, said plainly.
+    drop_file_menu(&mut studio);
+    studio.press(KeyCode::Char('i'), KeyModifiers::NONE);
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        studio.status(),
+        format!(
+            "no new patterns - all 3 are already in {}",
+            set.file_name().and_then(|name| name.to_str()).unwrap()
+        )
+    );
+}
+
 /// File ▸ Open recent…: the set just left is offered, and Enter goes back
 /// to it - with the score exactly as it was left, because the set was
 /// written when the studio moved away from it.
@@ -611,8 +702,8 @@ fn rename_set_carries_a_sample_source_inside_it() {
 
 /// File ▸ Open set… with a typed path to a Strudel pattern export: the
 /// export becomes a set of its own under the sets folder, one score per
-/// entry, the first one open and the title naming the score that carries
-/// one.
+/// entry, the first one open, the title naming the score that carries
+/// one and the rest numbered in the order they were made.
 #[test]
 fn open_set_imports_a_strudel_pattern_export() {
     let mut studio = hermetic();
@@ -647,8 +738,8 @@ fn open_set_imports_a_strudel_pattern_export() {
     );
     assert_eq!(
         studio.scene_names().as_slice(),
-        ["night drive", "kZ4_hT9pQw2x"],
-        "the title names the score that carries one"
+        ["night drive", "pattern 2"],
+        "the title names the score that carries one, the rest are numbered"
     );
     assert_eq!(
         std::fs::read_to_string(root.join("gig").join("night drive.strudel")).expect("score"),

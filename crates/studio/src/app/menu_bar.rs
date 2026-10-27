@@ -464,6 +464,7 @@ impl App {
             Do::NewSession => self.new_session(),
             Do::OpenSet => self.open_set_prompt(SetPrompt::OpenSet),
             Do::OpenRecent => self.open_set_prompt(SetPrompt::OpenRecent),
+            Do::ImportStrudel => self.open_set_prompt(SetPrompt::ImportStrudel),
             Do::RenameSet => self.open_set_prompt(SetPrompt::RenameSet),
             Do::ConsolidateSamples => self.consolidate_samples(),
             Do::DeleteScene => self.arm_delete_scene(),

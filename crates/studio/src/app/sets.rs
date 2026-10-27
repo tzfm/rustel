@@ -872,6 +872,12 @@ impl App {
                     .collect();
                 FilePicker::new("open a recent set", "opens it", recent, &root).choosing_folders()
             }
+            SetPrompt::ImportStrudel => FilePicker::new(
+                "import Strudel patterns",
+                "adds them to this set",
+                export_candidates(&root),
+                &root,
+            ),
             SetPrompt::RenameSet => {
                 let mut picker = FilePicker::naming("rename the set", "renames its folder");
                 picker.offer(&self.scenes.name());
@@ -954,6 +960,10 @@ impl App {
             SetPrompt::OpenRecent => {
                 "open a recent set - Enter opens the chosen one · Esc back".into()
             }
+            SetPrompt::ImportStrudel => {
+                "import Strudel patterns - Enter adds every entry to this set · Tab browses · type a path · Esc back"
+                    .into()
+            }
             SetPrompt::RenameSet => {
                 "rename the set - type the new name and press Enter · Esc back".into()
             }
@@ -1019,15 +1029,16 @@ impl App {
                 }
                 self.status = match prompt {
                     SetPrompt::PickBankToRename | SetPrompt::RenameBank => "alias cancelled",
-                    SetPrompt::AddSampleSource | SetPrompt::EditSampleSource(_) => {
-                        "import cancelled"
-                    }
+                    SetPrompt::AddSampleSource
+                    | SetPrompt::EditSampleSource(_)
+                    | SetPrompt::ImportStrudel => "import cancelled",
                     _ => "set prompt closed",
                 }
                 .into();
             }
             PickerKey::Chose(path) => match prompt {
                 SetPrompt::OpenSet | SetPrompt::OpenRecent => self.open_set_at(&path),
+                SetPrompt::ImportStrudel => self.import_strudel_into_current(&path),
                 SetPrompt::RenameSet => {
                     let name = path.to_string_lossy().trim().to_owned();
                     self.rename_set(&name);
@@ -1167,6 +1178,69 @@ impl App {
             }
             Err(error) => report(self, format!("cannot import {}: {error}", path.display())),
         }
+    }
+
+    /// A Strudel pattern export read into the set already open: every
+    /// entry becomes a named score file of the set's folder, listed by
+    /// the set panel and none of them taken up as tabs. A name the set
+    /// already holds - on disk or open on the strip - is skipped and
+    /// counted, never overwritten, so the same file twice brings nothing
+    /// the second time and says so.
+    fn import_strudel_into_current(&mut self, path: &std::path::Path) {
+        let report = |app: &mut Self, error: String| {
+            if let Some((_, picker)) = app.set_prompt.as_mut() {
+                picker.error = Some(error);
+            }
+        };
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) => return report(self, format!("cannot read {}: {error}", path.display())),
+        };
+        let entries = match strudel_export(&text) {
+            Ok(entries) => entries,
+            Err(error) => return report(self, format!("{}: {error}", path.display())),
+        };
+        let scores = strudel_scores(entries);
+        let directory = self.scenes.directory().to_path_buf();
+        let mut written = 0usize;
+        let mut skipped = 0usize;
+        for (name, code) in &scores {
+            let file = directory.join(format!("{name}.{}", crate::scenes::SCENE_EXTENSION));
+            let taken = file.exists() || self.scenes.scores().any(|scene| scene.path == file);
+            if taken {
+                skipped += 1;
+                continue;
+            }
+            match std::fs::write(&file, code) {
+                Ok(()) => written += 1,
+                Err(error) => {
+                    return report(self, format!("cannot import {}: {error}", path.display()));
+                }
+            }
+        }
+        self.close_set_prompt();
+        // The panel lists what the folder holds now, without moving the
+        // reader's selection.
+        self.refresh_set_panel(None);
+        let set = self.scenes.name();
+        let plural = |count: usize| if count == 1 { "pattern" } else { "patterns" };
+        self.status = match (written, skipped) {
+            (0, skipped) => format!(
+                "no new {plural} - all {skipped} are already in {set}",
+                plural = plural(skipped)
+            ),
+            (written, skipped) => format!(
+                "imported {written} {imported} into {set}{skipped}",
+                imported = plural(written),
+                skipped = if skipped == 0 {
+                    String::new()
+                } else {
+                    format!(" - {skipped} skipped, already in the set")
+                }
+            ),
+        };
+        self.log.push(LogLevel::Info, "set", self.status.clone());
+        self.dirty_frame = true;
     }
 
     /// File > Rename set: the folder moves, and everything follows it -
@@ -1797,6 +1871,9 @@ pub(super) enum SetSwitch {
 pub(super) enum SetPrompt {
     OpenSet,
     OpenRecent,
+    /// A Strudel pattern export file, whose entries become score files of
+    /// the set already open.
+    ImportStrudel,
     RenameSet,
     SetsFolder,
     RecordingsFolder,
@@ -2373,6 +2450,77 @@ mod tests {
                 app.status
             );
             assert_eq!(app.scenes.directory(), sets.join("gig"));
+        }
+
+        /// File > Import Strudel patterns… reads an export into the set
+        /// already open: one named score file an entry, in the set's own
+        /// folder with no tab taken up, and a name the set already holds
+        /// skipped and counted, never overwritten. The same file twice
+        /// says there is nothing new in it.
+        #[test]
+        fn importing_strudel_patterns_adds_them_to_the_open_set() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let sets = directory.path().join("sets");
+            std::fs::create_dir_all(&sets).expect("sets");
+            let home = directory.path().join("home");
+            std::fs::create_dir_all(&home).expect("home");
+            let mut app = app_over(&home);
+            app.prefs.sets_directory = Some(sets.display().to_string());
+            // The set holds `first`; the export's `first` must lose to it.
+            let starter = std::fs::read_to_string(home.join("first.strudel")).expect("starter");
+
+            std::fs::write(
+                sets.join("gig.json"),
+                concat!(
+                    "{\n",
+                    "  \"XKOBdiQB6vMm\": { \"code\": \"$: s(\\\"oh\\\")\", \"created_at\": 30 },\n",
+                    "  \"ALGnQXNiUsZ4\": { \"code\": \"// @title night drive\\n$: s(\\\"bd\\\")\", \"created_at\": 20 },\n",
+                    "  \"first\": \"$: s(\\\"cp\\\")\"\n",
+                    "}\n"
+                ),
+            )
+            .expect("export");
+            app.open_set_prompt(SetPrompt::ImportStrudel);
+            let (_, picker) = app.set_prompt.as_ref().expect("the prompt is up");
+            assert_eq!(
+                picker
+                    .candidates
+                    .iter()
+                    .map(|candidate| (candidate.label.as_str(), candidate.detail.as_str()))
+                    .collect::<Vec<_>>(),
+                [("gig.json", "Strudel export - 3 patterns")]
+            );
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+            assert!(app.set_prompt.is_none(), "the prompt closed");
+            assert_eq!(
+                app.status, "imported 2 patterns into home - 1 skipped, already in the set",
+                "{}",
+                app.status
+            );
+            assert_eq!(
+                std::fs::read_to_string(home.join("night drive.strudel")).unwrap(),
+                "// @title night drive\n$: s(\"bd\")"
+            );
+            assert_eq!(
+                std::fs::read_to_string(home.join("pattern 3.strudel")).unwrap(),
+                "$: s(\"oh\")"
+            );
+            assert_eq!(
+                std::fs::read_to_string(home.join("first.strudel")).unwrap(),
+                starter,
+                "the set's own score was not overwritten"
+            );
+            assert_eq!(
+                app.scenes.score_count(),
+                1,
+                "the import writes files, not tabs"
+            );
+
+            // The same file again brings nothing new and says so.
+            app.open_set_prompt(SetPrompt::ImportStrudel);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.status, "no new patterns - all 3 are already in home");
         }
 
         /// A Strudel pattern export gives its patterns, or says what it is
