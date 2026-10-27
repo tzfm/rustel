@@ -810,18 +810,6 @@ pub mod profiles {
             .map(|row| row.reason.as_str())
     }
 
-    /// An Option chord this terminal composes into text instead of sending
-    /// as Alt. The physical chord is still named, such as `alt+t`.
-    pub fn alt_input_limitation(terminal: &str, chord: &str) -> Option<&'static str> {
-        table()
-            .terminals
-            .iter()
-            .filter(|known| matches_profile(terminal, &known.terminal))
-            .flat_map(|known| &known.alt_input)
-            .find(|row| row.chord.eq_ignore_ascii_case(chord))
-            .map(|row| row.reason.as_str())
-    }
-
     /// The Option letter a composed character stands for, where the
     /// terminal profile names one. This is how iTerm2's Option+T, which
     /// arrives as `†`, still reaches the panel that answers to Alt+T.
@@ -1031,17 +1019,12 @@ pub mod profiles {
         fn iterm2_option_letters_compose_and_recover() {
             for (letter, composed) in [('t', '†'), ('o', 'ø'), ('r', '®'), ('d', '∂'), ('a', 'å')]
             {
-                assert!(
-                    super::alt_input_limitation("iTerm2", &format!("alt+{letter}")).is_some(),
-                    "alt+{letter} is missing from the iTerm2 profile"
-                );
                 assert_eq!(
                     super::alt_input_letter("iTerm2", composed),
                     Some(letter),
                     "{composed} does not recover alt+{letter}"
                 );
             }
-            assert!(super::alt_input_limitation("Ghostty", "alt+t").is_none());
             assert_eq!(super::alt_input_letter("Ghostty", '†'), None);
         }
 
@@ -1059,10 +1042,6 @@ pub mod profiles {
                 ('9', 'ª'),
             ] {
                 for terminal in ["iTerm2", "Apple Terminal"] {
-                    assert!(
-                        super::alt_input_limitation(terminal, &format!("alt+{digit}")).is_some(),
-                        "alt+{digit} is missing from the {terminal} profile"
-                    );
                     assert_eq!(
                         super::alt_input_letter(terminal, composed),
                         Some(digit),
@@ -1070,7 +1049,6 @@ pub mod profiles {
                     );
                 }
             }
-            assert!(super::alt_input_limitation("Ghostty", "alt+1").is_none());
             assert_eq!(super::alt_input_letter("Ghostty", '¡'), None);
         }
 
