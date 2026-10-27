@@ -905,15 +905,13 @@ impl SceneSet {
     /// under `root`, named after the file the export came from, with one
     /// score written per entry, the first selected. The names arrive
     /// ready - already file names - and the folder's own rule keeps two
-    /// that collide apart.
+    /// that collide apart. Every entry is a file; more than the strip
+    /// holds stay files of the folder, open from it when wanted.
     pub fn import_in(
         root: &Path,
         name: &str,
         scores: &[(String, String)],
     ) -> Result<Self, SceneError> {
-        if scores.len() > MAX_SCENES {
-            return Err(SceneError::Full);
-        }
         std::fs::create_dir_all(root)?;
         let directory = free_set_folder(root, name);
         std::fs::create_dir(&directory)?;
@@ -922,7 +920,9 @@ impl SceneSet {
         for (name, code) in scores {
             let file = set.free_path(name);
             std::fs::write(&file, code)?;
-            set.push(file, code, true)?;
+            if set.score_count() < MAX_SCENES {
+                set.push(file, code, true)?;
+            }
         }
         set.select(0);
         Ok(set)
@@ -2810,16 +2810,19 @@ mod tests {
         .unwrap();
         assert_eq!(again.name(), "night drive b");
 
-        // More scores than a set holds is refused before anything is
-        // written.
+        // More scores than the strip holds: every entry is still a file,
+        // and the strip holds what it holds.
         let many: Vec<(String, String)> = (0..=MAX_SCENES)
             .map(|index| (format!("score {index}"), String::new()))
             .collect();
-        assert!(matches!(
-            SceneSet::import_in(&sets, "full", &many),
-            Err(SceneError::Full)
-        ));
-        assert!(!sets.join("full").exists(), "nothing was written");
+        let full = SceneSet::import_in(&sets, "full", &many).unwrap();
+        assert_eq!(full.score_count(), MAX_SCENES, "the strip is full, no more");
+        assert!(
+            sets.join("full")
+                .join(format!("score {MAX_SCENES}.strudel"))
+                .is_file(),
+            "the pattern past the strip is a file of the folder"
+        );
     }
 
     #[test]

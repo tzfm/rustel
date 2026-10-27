@@ -1132,9 +1132,10 @@ impl App {
 
     /// A Strudel pattern export read as a new set: one score per entry,
     /// in a folder of its own under the sets folder, named after the file
-    /// the export came from. A name with no usable characters
-    /// becomes `untitled`. The status says what was taken up, and the
-    /// panel lists the scores it made.
+    /// the export came from. Every entry is a named file, its `@title`
+    /// when the code carries one and `pattern N` in the order the
+    /// patterns were made when it does not. The status says what was
+    /// taken up, and the panel lists the scores it made.
     fn import_strudel_set(&mut self, path: &std::path::Path) {
         let report = |app: &mut Self, error: String| {
             if let Some((_, picker)) = app.set_prompt.as_mut() {
@@ -1154,19 +1155,7 @@ impl App {
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_default();
         let name = crate::scenes::sanitize_name(&stem).unwrap_or_else(|| "imported set".to_owned());
-        // Strudel keys its entries by an opaque id and names the song in a
-        // @title field inside the code. The title leads when it is there.
-        let scores: Vec<(String, String)> = entries
-            .into_iter()
-            .map(|(key, code)| {
-                let meta = crate::metadata::ScoreMeta::parse(&code);
-                let title = meta.first("title").unwrap_or(key.as_str());
-                let name = crate::scenes::sanitize_name(title)
-                    .or_else(|| crate::scenes::sanitize_name(&key))
-                    .unwrap_or_else(|| "untitled".to_owned());
-                (name, code)
-            })
-            .collect();
+        let scores = strudel_scores(entries);
         let root = self.sets_root();
         match SceneSet::import_in(&root, &name, &scores) {
             Ok(set) => {
@@ -1570,33 +1559,85 @@ pub(super) fn shorten_home(path: &std::path::Path) -> String {
     }
 }
 
+/// One pattern of a Strudel pattern export: its code, when Strudel says
+/// it was made, and whether its key is a name. The documented form keys
+/// each entry by its name, while strudel.cc's own export keys it by an
+/// opaque push id and names the song in a `@title` inside the code.
+#[derive(Clone, Debug, PartialEq)]
+struct StrudelPattern {
+    key: String,
+    code: String,
+    created_at: Option<i64>,
+    key_is_name: bool,
+}
+
 /// The pattern code of a Strudel pattern export: a JSON object whose
 /// entries hold code. Strudel writes each entry as an object with a `code`
-/// field, keyed by an id, and a plain string of code is taken too. An
-/// entry that holds neither shape is not a score.
-fn strudel_export(text: &str) -> Result<Vec<(String, String)>, String> {
+/// field, keyed by an id, and a plain string of code is taken too. The
+/// documented form's `import` and `export` URL fields are not scores, and
+/// an entry that holds none of these shapes is not one either.
+fn strudel_export(text: &str) -> Result<Vec<StrudelPattern>, String> {
     let value: serde_json::Value = serde_json::from_str(text)
         .map_err(|error| format!("not a Strudel pattern export: {error}"))?;
     let Some(object) = value.as_object() else {
         return Err("not a Strudel pattern export - not a JSON object".to_owned());
     };
-    let scores: Vec<(String, String)> = object
+    let patterns: Vec<StrudelPattern> = object
         .iter()
-        .filter_map(|(key, value)| {
-            let code = match value {
-                serde_json::Value::String(code) => Some(code.as_str()),
-                serde_json::Value::Object(fields) => {
-                    fields.get("code").and_then(|code| code.as_str())
-                }
-                _ => None,
-            }?;
-            Some((key.clone(), code.to_owned()))
+        .filter_map(|(key, value)| match value {
+            serde_json::Value::String(code) if !matches!(key.as_str(), "import" | "export") => {
+                Some(StrudelPattern {
+                    key: key.clone(),
+                    code: code.clone(),
+                    created_at: None,
+                    key_is_name: true,
+                })
+            }
+            serde_json::Value::Object(fields) => {
+                let code = fields.get("code")?.as_str()?.to_owned();
+                Some(StrudelPattern {
+                    key: key.clone(),
+                    code,
+                    created_at: fields.get("created_at").and_then(|at| at.as_i64()),
+                    key_is_name: false,
+                })
+            }
+            _ => None,
         })
         .collect();
-    if scores.is_empty() {
+    if patterns.is_empty() {
         return Err("not a Strudel pattern export - no scores in it".to_owned());
     }
-    Ok(scores)
+    Ok(patterns)
+}
+
+/// The scores a Strudel pattern export makes, named and in the order the
+/// patterns were made. The `@title` inside the code leads, then the
+/// entry's key when the export keys by name, then `pattern N` in the
+/// order they were made - a push id is never a file name. The set's own
+/// folder rule keeps two names that collide apart.
+fn strudel_scores(patterns: Vec<StrudelPattern>) -> Vec<(String, String)> {
+    // The sort is stable, so entries that say nothing about when they were
+    // made keep the order the file holds them in.
+    let mut patterns = patterns;
+    patterns.sort_by_key(|pattern| pattern.created_at.unwrap_or(0));
+    patterns
+        .into_iter()
+        .enumerate()
+        .map(|(index, pattern)| {
+            let titled = crate::metadata::ScoreMeta::parse(&pattern.code)
+                .first("title")
+                .and_then(crate::scenes::sanitize_name);
+            let keyed = pattern
+                .key_is_name
+                .then(|| crate::scenes::sanitize_name(&pattern.key))
+                .flatten();
+            let name = titled
+                .or(keyed)
+                .unwrap_or_else(|| format!("pattern {}", index + 1));
+            (name, pattern.code)
+        })
+        .collect()
 }
 
 /// The set folders under `root`, `current` left out: a folder with a set
@@ -2226,24 +2267,42 @@ mod tests {
             );
         }
 
-        /// A Strudel pattern export gives its scores, or says what it is
+        /// A Strudel pattern export gives its patterns, or says what it is
         /// not. Strudel writes each entry as an object with a `code` field,
         /// and a plain string of code is taken too. Entries that hold
-        /// neither shape are left out.
+        /// neither shape are left out, and so are the documented form's
+        /// `import` and `export` URL fields.
         #[test]
-        fn a_strudel_export_gives_its_scores_or_a_refusal() {
+        fn a_strudel_export_gives_its_patterns_or_a_refusal() {
             let strudel = r#"{
               "V1StGXR8_Z5j": { "code": "$: s(\"bd*4\")", "created_at": 1, "collection": "user" },
               "second": { "code": "$: s(\"cp\")" },
               "plain string": "$: s(\"hh\")",
+              "import": "https://strudel.cc/",
+              "export": "https://strudel.cc/whatever",
               "third": { "not": "code" }
             }"#;
             assert_eq!(
                 strudel_export(strudel).unwrap(),
                 [
-                    ("V1StGXR8_Z5j".to_owned(), "$: s(\"bd*4\")".to_owned()),
-                    ("second".to_owned(), "$: s(\"cp\")".to_owned()),
-                    ("plain string".to_owned(), "$: s(\"hh\")".to_owned()),
+                    StrudelPattern {
+                        key: "V1StGXR8_Z5j".to_owned(),
+                        code: "$: s(\"bd*4\")".to_owned(),
+                        created_at: Some(1),
+                        key_is_name: false,
+                    },
+                    StrudelPattern {
+                        key: "second".to_owned(),
+                        code: "$: s(\"cp\")".to_owned(),
+                        created_at: None,
+                        key_is_name: false,
+                    },
+                    StrudelPattern {
+                        key: "plain string".to_owned(),
+                        code: "$: s(\"hh\")".to_owned(),
+                        created_at: None,
+                        key_is_name: true,
+                    },
                 ]
             );
             assert!(
@@ -2263,10 +2322,55 @@ mod tests {
             );
         }
 
+        /// Every pattern takes a name a musician can read on a file. The
+        /// `@title` inside the code leads, then the key when the export
+        /// keys by name, then `pattern N` in the order the patterns were
+        /// made - a push id is never a file name.
+        #[test]
+        fn strudel_patterns_take_readable_names_in_the_order_they_were_made() {
+            // strudel.cc's own form: keys are push ids, and the file's key
+            // order need not be the order the patterns were made in.
+            let pushed = strudel_export(
+                r#"{
+                  "XKOBdiQB6vMm": { "code": "// @title night drive\n$: s(\"bd\")", "created_at": 30 },
+                  "ALGnQXNiUsZ4": { "code": "$: s(\"cp\")", "created_at": 10 },
+                  "SkySkxWlk9OI": { "code": "$: s(\"hh\")", "created_at": 20 }
+                }"#,
+            )
+            .unwrap();
+            assert_eq!(
+                strudel_scores(pushed)
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
+                ["pattern 1", "pattern 2", "night drive"],
+                "numbered by when they were made, the title leading its own"
+            );
+
+            // The documented form: keys are names, kept as they come.
+            let named = strudel_export(
+                r#"{
+                  "vamp bass": "$: s(\"bd*4\")",
+                  "beat": "$: s(\"cp\")",
+                  "///??": "$: s(\"oh\")"
+                }"#,
+            )
+            .unwrap();
+            assert_eq!(
+                strudel_scores(named)
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
+                ["vamp bass", "beat", "pattern 3"],
+                "a key with no usable characters falls back to its number"
+            );
+        }
+
         /// Opening a Strudel pattern export makes a set of it: a folder
         /// named after the export file, one score per entry, the title
-        /// naming the score that carries one. A file that is not an export
-        /// is refused and the prompt stays.
+        /// naming the score that carries one and the rest numbered in the
+        /// order they were made. A file that is not an export is refused
+        /// and the prompt stays.
         #[test]
         fn opening_a_strudel_export_makes_a_set() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -2306,8 +2410,8 @@ mod tests {
                     .scores()
                     .map(|scene| scene.name().to_owned())
                     .collect::<Vec<_>>(),
-                ["night drive", "kZ4_hT9pQw2x"],
-                "the title leads when it is there"
+                ["night drive", "pattern 2"],
+                "the title leads when it is there, the rest are numbered"
             );
             assert_eq!(app.scenes.current().name(), "night drive");
             assert_eq!(
