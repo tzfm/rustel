@@ -1576,7 +1576,10 @@ impl ScalarBackend {
             // a mouse update allocate inside the callback. Existing voices
             // already received the update above; new queries read the cell.
             self.live_control_targets.rotate_left(1);
-            *self.live_control_targets.last_mut().unwrap() = update;
+            *self
+                .live_control_targets
+                .last_mut()
+                .expect("the list has the entry") = update;
         }
     }
 
@@ -1607,13 +1610,19 @@ impl ScalarBackend {
         if let Some(at) = self.insert_values.iter().position(same) {
             // The new move goes last, so a full table drops the oldest move.
             self.insert_values[at..].rotate_left(1);
-            *self.insert_values.last_mut().unwrap() = value;
+            *self
+                .insert_values
+                .last_mut()
+                .expect("the list has the entry") = value;
         } else if self.insert_values.len() < self.insert_values.capacity() {
             self.insert_values.push(value);
         } else if !self.insert_values.is_empty() {
             // Bounded, so a move never allocates in the callback.
             self.insert_values.rotate_left(1);
-            *self.insert_values.last_mut().unwrap() = value;
+            *self
+                .insert_values
+                .last_mut()
+                .expect("the list has the entry") = value;
         }
     }
 

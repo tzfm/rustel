@@ -109,9 +109,10 @@ rustel-scheduler = { path = "../scheduler" }
 rustel-audio = { path = "../audio" }
 rustel-csound = { path = "../csound" }
 rustel-voice = { path = "../voice" }
-# The talkit speech synthesizer. Default features stay off: the runtime
-# renders, it never plays through an output device of its own.
-rustel-talkit = { path = "../talkit", default-features = false }
+# The talkit speech synthesizer, from its own repository. Default features
+# stay off: the runtime renders, it never plays through an output device of
+# its own.
+rustel-talkit = { git = "https://github.com/tzfm/rustel-talkit.git", tag = "v0.1.1", default-features = false }
 rustel-serial = { path = "../serial", optional = true }
 rustel-midi = { path = "../midi", optional = true }
 # Only for `midir::Ignore` on the input path; the MIDI stack itself is behind
@@ -130,7 +131,7 @@ log = { version = "0.4", optional = true }
 
 rustel-osc = { path = "../osc", optional = true }
 rustel-vst3 = { path = "../vst3", optional = true }
-rustel-hydra = { path = "../hydra", optional = true }
+rustel-hydra = { git = "https://github.com/tzfm/rustel-hydra.git", tag = "v0.1.0", optional = true }
 # Native Hydra sources. OxiMedia is one pure-Rust capture surface across
 # V4L2, AVFoundation and Media Foundation; pin the young API until its frame
 # contract has settled. `image` decodes guarded HTTP images and MJPEG frames.
@@ -223,3 +224,6 @@ rustel-vst3-fixture = { path = "../vst3-fixture" }
 # Temp directories for session-log and cache tests.
 tempfile = "3"
 libc = "0.2"
+
+[lints]
+workspace = true

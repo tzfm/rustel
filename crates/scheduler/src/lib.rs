@@ -408,16 +408,19 @@ pub struct Waker {
 
 impl Waker {
     pub fn signal(&self) {
-        let mut g = self.m.lock().unwrap();
+        let mut g = self.m.lock().expect("the lock is not poisoned");
         *g = true;
         self.cv.notify_one();
     }
 
     /// Park until signalled or `timeout` elapses. Returns true if signalled.
     pub fn wait(&self, timeout: std::time::Duration) -> bool {
-        let mut g = self.m.lock().unwrap();
+        let mut g = self.m.lock().expect("the lock is not poisoned");
         while !*g {
-            let (ng, r) = self.cv.wait_timeout(g, timeout).unwrap();
+            let (ng, r) = self
+                .cv
+                .wait_timeout(g, timeout)
+                .expect("the wait is not poisoned");
             g = ng;
             if r.timed_out() && !*g {
                 return false;

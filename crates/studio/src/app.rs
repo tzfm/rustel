@@ -539,6 +539,10 @@ fn status_file_path(path: &std::path::Path, full: bool) -> String {
 /// Enter the alternate screen and run until the user quits. Playback begins
 /// only after the first evaluate command, mirroring the REPL's explicit Play
 /// gesture while still allowing the score to be edited silently first.
+#[allow(
+    clippy::print_stderr,
+    reason = "the theme fallback is reported before the screen opens"
+)]
 fn run_once(options: StudioOptions) -> Result<Session, RuntimeError> {
     let starter = if options.mini {
         DEFAULT_MINI_SCORE
@@ -864,6 +868,10 @@ struct App {
     /// presets of that read.
     #[cfg(feature = "vst")]
     plugin_presets_version: u64,
+    /// The host read the preset folders at the last turn. The read runs on
+    /// the plugin thread, and the jobs sheet lists it while it runs.
+    #[cfg(feature = "vst")]
+    plugin_presets_reading: bool,
     /// The text of the settings vst page's plugin filter. The sheet holds
     /// only its state, for its rows and its keys.
     #[cfg(feature = "vst")]
@@ -1663,6 +1671,8 @@ impl App {
             plugin_scan: None,
             #[cfg(feature = "vst")]
             plugin_presets_version: 0,
+            #[cfg(feature = "vst")]
+            plugin_presets_reading: false,
             #[cfg(feature = "vst")]
             vst_filter: settings::VstFilter::default(),
             #[cfg(feature = "vst")]

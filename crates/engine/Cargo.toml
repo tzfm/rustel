@@ -37,3 +37,6 @@ serde_json = "1"
 [[example]]
 name = "session_callback"
 required-features = ["session"]
+
+[lints]
+workspace = true

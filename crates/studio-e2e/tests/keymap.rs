@@ -491,7 +491,9 @@ fn every_documented_chord_is_honoured() {
                     );
                     studio.press(KeyCode::Enter, KeyModifiers::NONE);
                     assert!(
-                        studio.status().starts_with("Tab between the fields"),
+                        studio
+                            .status()
+                            .starts_with("Tab or the arrows between the fields"),
                         "Enter on the menu opened the form: {}",
                         studio.status()
                     );

@@ -3679,6 +3679,10 @@ pub(super) mod tests {
     /// tick and stays frozen after the one that fires, so the caller sees
     /// the landing exactly as that tick left it; release it with
     /// [`hold_clock`] before driving time forward.
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "the deadline is the test failure"
+    )]
     pub(in crate::engine) fn tick_until_fired(
         engine: &mut StudioEngine,
     ) -> Result<StudioInstall, RuntimeError> {

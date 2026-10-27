@@ -361,7 +361,9 @@ impl App {
     }
 }
 
-/// The panels whose rows j k h l walk.
+/// The panels whose rows j k h l walk. The knobs column walks the same
+/// way: h and l stand in for its ← and →, the nudge of a rail and the
+/// chords of its presets section.
 pub(crate) fn panel_takes_list_navigation(kind: PanelKind) -> bool {
     matches!(
         kind,
@@ -371,6 +373,7 @@ pub(crate) fn panel_takes_list_navigation(kind: PanelKind) -> bool {
             | PanelKind::Log
             | PanelKind::Jobs
             | PanelKind::Reference
+            | PanelKind::Knobs
             | PanelKind::Theme
             | PanelKind::Export
             | PanelKind::Memory
@@ -382,6 +385,8 @@ mod tests {
     use super::*;
     use crate::app::tests::support::*;
     use crate::editor::{ByteOffset, Selection};
+    #[cfg(feature = "vst")]
+    use crate::reference::{PluginRow, VstSection};
 
     fn vim_app() -> (tempfile::TempDir, App) {
         let directory = tempfile::tempdir().expect("temp dir");
@@ -483,6 +488,125 @@ mod tests {
             app.reference_panel.as_ref().expect("panel").chord_query,
             "",
             "paging does not type"
+        );
+    }
+
+    /// l and h walk the vst tab the way → and ← do: a plugin opens onto
+    /// the rows of its halves, a half opens as the view of the tab, and h
+    /// goes back to the plugin list. The plugins are the test fixture, in
+    /// the one host of the process.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn hl_opens_a_plugin_and_its_halves_of_the_vst_tab() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+        app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+        app.ui_settings.vim_list_navigation = true;
+        app.sync_editor_keybindings();
+        let plugins = tempfile::tempdir().expect("plugin folder");
+        rustel_vst3_fixture::install(plugins.path());
+        rustel_runtime::vst::pin_standard_folders(vec![plugins.path().to_path_buf()]);
+        let host = rustel_runtime::vst::host();
+        host.wait_idle();
+        host.resolve(rustel_vst3_fixture::NAME, true);
+        host.wait_idle();
+        let mut panel = ReferencePanel::browse(&app.reference);
+        panel.select_tab(Tab::Vst);
+        app.set_reference_panel(Some(panel));
+        app.focus_panel(PanelKind::Reference);
+        app.sync_plugins();
+        let vst = |app: &App| {
+            let panel = app.reference_panel.as_ref().expect("panel");
+            (
+                panel.vst.inside(),
+                panel.vst.rows().to_vec(),
+                panel.vst.selected,
+            )
+        };
+
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+        let (inside, rows, selected) = vst(&app);
+        assert_eq!(inside, None, "l opened the plugin, not a half");
+        assert_eq!(rows[selected], PluginRow::Plugin(0));
+        assert_eq!(
+            &rows[1..3],
+            &[
+                PluginRow::Section(VstSection::Presets),
+                PluginRow::Section(VstSection::Params)
+            ][..]
+        );
+
+        // j j reaches the row of the parameters, l opens them as the view,
+        // and h goes back to the row of the half.
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+        let (inside, rows, selected) = vst(&app);
+        assert_eq!(inside, Some(VstSection::Params));
+        assert_eq!(rows[selected], PluginRow::Param(0));
+        press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+        let (inside, rows, selected) = vst(&app);
+        assert_eq!(inside, None);
+        assert_eq!(rows[selected], PluginRow::Section(VstSection::Params));
+    }
+
+    /// j k h l drive the knobs column the way the arrows do: the rows
+    /// walk, and the chords of the presets section open and close it. The
+    /// names of the section are set by hand: no plugin host is needed for
+    /// the keys.
+    #[test]
+    fn jkhl_drive_the_knobs_column_and_its_presets() {
+        use crate::knobs_panel::KnobPresets;
+        let directory = tempfile::tempdir().expect("temp dir");
+        let score = "$: s(\"bd\").vst(\"FX\", { gain: 1 })\n";
+        let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+        app.scenes.current_mut().editor = crate::editor::Editor::new(score).expect("score");
+        let _ = app
+            .editor_mut()
+            .set_selection(crate::editor::Selection::caret(crate::editor::ByteOffset(
+                score.len() - 3,
+            )));
+        app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+        app.ui_settings.vim_list_navigation = true;
+        app.sync_editor_keybindings();
+        app.open_knobs_panel(true);
+        app.refresh_knobs(Rect::default());
+        if let Some(panel) = app.knobs_panel.as_mut() {
+            panel.presets = Some(KnobPresets {
+                names: vec!["Dark Bass".into()],
+                version: 0,
+                open: false,
+            });
+        }
+        let knobs = app.knobs_rows.as_ref().expect("rows").knobs.len();
+        if let Some(panel) = app.knobs_panel.as_mut() {
+            panel.selected = knobs;
+        }
+        let presets = |app: &App| {
+            let panel = app.knobs_panel.as_ref().expect("panel");
+            (
+                panel.presets.as_ref().expect("the section").open,
+                panel.selected,
+            )
+        };
+
+        // l opens the heading, j walks to the name, Enter writes the
+        // preset into the call, and h closes the section.
+        press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+        assert_eq!(presets(&app), (true, knobs), "l opened the heading");
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(presets(&app), (true, knobs + 1), "j walked to the name");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            app.editor().source().contains("preset: \"Dark Bass\""),
+            "Enter wrote the preset:\n{}",
+            app.editor().source()
+        );
+        press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+        assert_eq!(
+            presets(&app),
+            (false, knobs),
+            "h closed the section and stands on the heading"
         );
     }
 

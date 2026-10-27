@@ -42,6 +42,10 @@ impl Session {
         })
     }
 
+    #[allow(
+        clippy::print_stderr,
+        reason = "log lines are the direct diagnostic channel"
+    )]
     fn play_window_guarded(
         &mut self,
         start_secs: f64,

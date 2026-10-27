@@ -1,8 +1,10 @@
 use super::*;
 
 fn comparison_runtime(method: &str) -> JsRuntime {
-    let runtime = JsRuntime::new().unwrap();
-    runtime.install_semantic_bindings().unwrap();
+    let runtime = JsRuntime::new().expect("the runtime builds");
+    runtime
+        .install_semantic_bindings()
+        .expect("the bindings install");
     runtime
         .eval(&format!(
             "globalThis.comparisonMethod = '{method}';
@@ -12,7 +14,7 @@ fn comparison_runtime(method: &str) -> JsRuntime {
             method == "eqt",
             method == "net",
         ))
-        .unwrap();
+        .expect("the script evaluates");
     runtime
 }
 

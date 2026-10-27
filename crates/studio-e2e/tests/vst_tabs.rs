@@ -280,10 +280,12 @@ fn open_vst_tab(studio: &mut Hermetic) {
 }
 
 /// The vst tab of the reference column lists the bundle by its name. →
-/// loads the bundle with no wait: the parameters of the effect show
-/// under its row, and the instrument of the bundle gets a row of its own.
-/// Enter writes `.vst()` for the effect and `.vsti()` for the instrument at
-/// the caret. The memory breakdown of the log then has a row for each.
+/// loads the bundle with no wait: the plugin opens onto the two rows of
+/// its halves, and → on the parameters row makes them the view of the tab,
+/// with the trail of the view on the search line and its own search. Esc
+/// goes back, and Enter writes `.vst()` for the effect and `.vsti()` for
+/// the instrument at the caret. The memory breakdown of the log then has a
+/// row for each.
 #[test]
 fn the_reference_tab_loads_a_plugin_and_writes_its_call() {
     let mut studio = hermetic();
@@ -297,16 +299,53 @@ fn the_reference_tab_loads_a_plugin_and_writes_its_call() {
     wait_for_row(&mut studio, "1 of 1 plugins");
     row_containing(&studio.rows(), "▸ Rustel Fixture");
 
+    // → loads the bundle and opens the plugin onto the rows of its halves.
     studio.press(KeyCode::Right, KeyModifiers::NONE);
-    studio.pump_until(LOAD_BUDGET, "the plugin loaded", |studio| {
-        studio.rows().iter().any(|row| row.contains("beatgate"))
+    // The marker of the row turns the moment the plugin opens; the two rows
+    // under it come with the end of the load.
+    studio.pump_until(LOAD_BUDGET, "the plugin opened", |studio| {
+        studio.rows().iter().any(|row| row.contains("▸ presets"))
     });
     let rows = studio.rows();
     assert!(rows[row_containing(&rows, "▾ Rustel Fixture")].contains("effect"));
-    assert!(rows[row_containing(&rows, "gain  Gain")].contains("     gain"));
-    row_containing(&rows, "beatgate  Beat Gate");
+    row_containing(&rows, "▸ presets (0)");
+    row_containing(&rows, "▸ parameters (4)");
     assert!(rows[row_containing(&rows, "▸ Rustel Fixture Tone")].contains("instrument"));
 
+    // → on the parameters row makes them the view of the tab, with the
+    // trail on the search line.
+    studio.press(KeyCode::Down, KeyModifiers::NONE);
+    studio.press(KeyCode::Down, KeyModifiers::NONE);
+    studio.press(KeyCode::Right, KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    row_containing(&rows, "Rustel Fixture > parameters");
+    assert!(rows[row_containing(&rows, "gain  Gain")].contains("gain"));
+    row_containing(&rows, "beatgate  Beat Gate");
+
+    // The search of the view reads its rows: `beat` keeps the beat gate
+    // alone, and the letters go when Backspace takes them off.
+    for letter in ['b', 'e', 'a', 't'] {
+        studio.press(KeyCode::Char(letter), KeyModifiers::NONE);
+    }
+    studio.settle();
+    let rows = studio.rows();
+    row_containing(&rows, "beatgate  Beat Gate");
+    assert!(
+        !rows.iter().any(|row| row.contains("gain  Gain")),
+        "the search of the view keeps the gain out:\n{}",
+        rows.join("\n")
+    );
+    for _ in 0..4 {
+        studio.press(KeyCode::Backspace, KeyModifiers::NONE);
+    }
+
+    // Esc goes back to the plugin list, the cursor on the row of the half,
+    // and Enter on the plugin row writes the call.
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.settle();
+    studio.press(KeyCode::Up, KeyModifiers::NONE);
+    studio.press(KeyCode::Up, KeyModifiers::NONE);
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();
     assert_eq!(studio.reference_tab(), None, "the column closed");
@@ -463,7 +502,8 @@ fn a_completion_in_a_plugin_call_lists_names_keys_and_presets() {
 }
 
 /// Switching from plugin-name completion to the vst tab keeps the plugin
-/// of the call open. A parameter choice edits this call, regardless of the
+/// of the call open. Ctrl+F in a call opens the parameters of its plugin
+/// as the view of the tab, so Enter picks from them, regardless of the
 /// caret's position, and never replaces a value already written there.
 #[test]
 fn a_plugins_parameters_are_available_throughout_its_call() {
@@ -481,8 +521,17 @@ fn a_plugins_parameters_are_available_throughout_its_call() {
         studio.press(KeyCode::Tab, KeyModifiers::NONE);
     }
     assert_eq!(studio.reference_tab(), Some("vst"));
-    wait_for_row(&mut studio, "beatgate  Beat Gate");
+    // The plugin of the call is open in the list. → on the row of its
+    // parameters makes them the view of the tab.
+    studio.pump_until(LOAD_BUDGET, "the plugin opened", |studio| {
+        studio.rows().iter().any(|row| row.contains("▸ presets"))
+    });
     studio.press(KeyCode::Down, KeyModifiers::NONE);
+    studio.press(KeyCode::Down, KeyModifiers::NONE);
+    studio.press(KeyCode::Right, KeyModifiers::NONE);
+    studio.settle();
+    row_containing(&studio.rows(), "Rustel Fixture > parameters");
+    row_containing(&studio.rows(), "beatgate  Beat Gate");
     studio.press(KeyCode::Enter, KeyModifiers::NONE);
     studio.settle();
     assert_eq!(
@@ -512,20 +561,19 @@ fn a_plugins_parameters_are_available_throughout_its_call() {
         studio.chord("ctrl+f");
         assert_eq!(studio.reference_tab(), Some("vst"), "{text}");
         wait_for_row(&mut studio, "beatgate  Beat Gate");
-        studio.press(KeyCode::Down, KeyModifiers::NONE);
         studio.press(KeyCode::Enter, KeyModifiers::NONE);
         studio.settle();
         assert_eq!(studio.score(), expected);
     }
 
     // The same context follows an instrument call. The fixture instrument
-    // has no parameters, but its own row opens instead of the effect's.
+    // has no parameters, so its view holds no row of the effect's.
     let text = "$: note(\"c\").vsti(\"Rustel Fixture Tone\", {})";
     studio.set_score(text);
     studio.set_caret(text.find(".vs").unwrap() + 3);
     studio.chord("ctrl+f");
     assert_eq!(studio.reference_tab(), Some("vst"));
-    wait_for_row(&mut studio, "▾ Rustel Fixture Tone");
+    wait_for_row(&mut studio, "Rustel Fixture Tone > parameters");
     assert!(studio.rows().iter().all(|row| !row.contains("beatgate")));
 }
 
@@ -551,13 +599,16 @@ fn a_preset_file_saved_while_the_studio_runs_reaches_the_open_plugin() {
     vst::pin_standard_folders(vec![plugins]);
 
     // The presets are the half of the plugin the saved file reaches. →
-    // opens the plugin on its parameters, Tab goes to the presets.
+    // opens the plugin, → on its presets row makes them the view.
     studio.press(KeyCode::End, KeyModifiers::NONE);
     open_vst_tab(&mut studio);
     wait_for_row(&mut studio, "1 of 1 plugins");
     studio.press(KeyCode::Right, KeyModifiers::NONE);
-    studio.settle();
-    studio.press(KeyCode::Tab, KeyModifiers::NONE);
+    studio.pump_until(LOAD_BUDGET, "the plugin opened", |studio| {
+        studio.rows().iter().any(|row| row.contains("▸ presets"))
+    });
+    studio.press(KeyCode::Down, KeyModifiers::NONE);
+    studio.press(KeyCode::Right, KeyModifiers::NONE);
     studio.settle();
     studio.pump_until(LOAD_BUDGET, "the presets of the read", |studio| {
         studio.rows().iter().any(|row| row.contains("Dark Bass"))
@@ -571,4 +622,11 @@ fn a_preset_file_saved_while_the_studio_runs_reaches_the_open_plugin() {
     studio.pump_until(LOAD_BUDGET, "the preset of the watch", |studio| {
         studio.rows().iter().any(|row| row.contains("Late Save"))
     });
+
+    // The host is the one of the process: leave its preset root over a
+    // folder with no files, so a later test counts no preset of this one.
+    // On Windows the loaded plugin holds this test's folder, so its preset
+    // files stay after the test ends.
+    let empty = tempfile::tempdir().expect("empty preset root");
+    vst::host().set_preset_folder(empty.path().to_path_buf());
 }

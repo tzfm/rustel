@@ -16,3 +16,6 @@ rustel-fraction = { path = "../fraction" }
 
 [dev-dependencies]
 rustel-jsruntime = { path = "../jsruntime", default-features = false }
+
+[lints]
+workspace = true

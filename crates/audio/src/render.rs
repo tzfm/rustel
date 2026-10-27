@@ -771,6 +771,10 @@ mod riff_limit_tests {
             fn name(&self) -> &'static str {
                 "never"
             }
+            #[expect(
+                clippy::panic_in_result_fn,
+                reason = "this test double must panic when called"
+            )]
             fn init(&mut self, _: u32) -> Result<(), String> {
                 panic!("the size refusal must come before the backend runs")
             }

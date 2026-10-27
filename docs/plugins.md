@@ -33,8 +33,10 @@ rustel vst --rescan
 one plugin. A second word keeps the parameters with the word in their group,
 name or key. In Studio, the vst tab of the reference panel lists the plugins,
 and Ctrl-F in a `vst()` or `vsti()` call completes plugin names, parameters
-and presets. Under an open plugin, Tab moves between its parameters and its
-presets, and a search lists the half the cursor is in.
+and presets. → on a plugin opens the two rows under it, its presets and its
+parameters, and → on one of the two makes that half the view of the tab, with
+its own search and a trail on the search line. ← and Esc go back, Tab flips
+the halves, and a search of the plugin list reads plugin names only.
 
 Rustel reads the standard VST3 folders:
 
@@ -119,7 +121,9 @@ s("hh*8").vst("valhalla supermassive", {
   plugin does not have. The note keeps its plugin.
 - Studio refuses an update with a wrong parameter name of a loaded plugin.
   The last score plays on, and Studio marks the name and gives the nearest
-  one.
+  one. A preset name no file of the loaded plugin has is refused and marked
+  the same way, read as the engine reads it, upper case, spaces and
+  punctuation aside.
 
 A plugin name with no plugin, a preset name with no file, or a dropped value
 gives one warning for each evaluation. The warning shows in the Studio log,
@@ -143,16 +147,24 @@ Any folder of `.vstpreset` files works too, in any structure: Settings ▸
 VST ▸ `add preset folder` adds one. Each file names its plugin in its
 header, so rustel finds the presets of a plugin in every folder you added,
 and the plugin rows of the page say the count. Enter on a plugin row lists
-its presets. The folders are watched while Studio runs: a preset saved or
-copied in while a score plays is there with no rescan, once the read of
-the folders ends, and the count line of the vst tab says where that read
-is.
+its presets. A change of the folders reads them again at once, on the
+plugin thread: the background-jobs sheet lists the read while it runs, and
+no ask waits for it. The folders are watched while Studio runs: a preset
+saved or copied in while a score plays is there with no rescan, once the
+read of the folders ends, and the count line of the vst tab says where
+that read is.
 
 In the vst tab, Enter on a preset writes the call with the preset. With the
 caret in a call of the same plugin, Enter on a preset changes only the
-preset, and Enter on the row of that plugin goes to its rows. The pick of a
-plugin name with Ctrl-F leaves the panel open on the presets of the plugin,
-so the next Enter picks one.
+preset, and Enter on the row of that plugin goes to the rows under it. The
+pick of a plugin name with Ctrl-F leaves the panel open in the presets of
+the plugin, so the next Enter picks one.
+
+The knobs column shows the presets of the plugin call under its rails, as
+a section closed until → opens it. Enter on a name, and a click on one,
+write the preset into the call, and the name the call holds carries the
+mark. ← closes the section, and the j k h l of Vim list keys work there
+as the arrows do.
 
 A plugin call with no `preset` plays `default.vstpreset` when the folder of
 the plugin has one. Save the start sound of a plugin there, and each call

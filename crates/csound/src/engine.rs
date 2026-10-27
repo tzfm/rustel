@@ -191,7 +191,7 @@ impl Engine {
             "--0dbfs=1".into(),
             format!("--sample-rate={sample_rate}"),
         ] {
-            let option = CString::new(option).unwrap();
+            let option = CString::new(option).expect("the option text has no interior zero byte");
             if unsafe { (engine.api.option)(handle, option.as_ptr()) } != 0 {
                 return Err(engine.error("Csound refused an audio option"));
             }

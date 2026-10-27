@@ -45,7 +45,10 @@ impl PianoSound {
 
     pub fn step(self, forwards: bool) -> Self {
         let sounds = [Self::Sine, Self::Triangle, Self::Square];
-        let index = sounds.iter().position(|sound| *sound == self).unwrap();
+        let index = sounds
+            .iter()
+            .position(|sound| *sound == self)
+            .expect("the item is in the list");
         sounds[(index + if forwards { 1 } else { sounds.len() - 1 }) % sounds.len()]
     }
 }

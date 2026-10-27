@@ -5,6 +5,7 @@
 //! otherwise drift between machines: theme, keyboard capabilities, graphics
 //! tier, terminal identity, directory layout, and the set folder's content.
 //! What a test then asserts is what the studio itself did, not where it ran.
+#![allow(clippy::print_stderr, reason = "golden updates report on stderr")]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};

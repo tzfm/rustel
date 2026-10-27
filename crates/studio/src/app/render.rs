@@ -1278,6 +1278,15 @@ impl App {
                     name: rows.name.as_deref(),
                     listed: rows.listed,
                     knobs: &rows.knobs,
+                    presets: panel
+                        .presets
+                        .as_ref()
+                        .filter(|presets| !presets.names.is_empty())
+                        .map(|presets| crate::knobs_panel::PresetsSection {
+                            open: presets.open,
+                            names: &presets.names,
+                            active: rows.preset.as_deref(),
+                        }),
                     panel,
                 }),
             mixer_selection: self.mixer_selection.as_ref(),
@@ -1870,6 +1879,7 @@ impl App {
 
     /// Leave each pane the map it was drawn with, and count the frame's
     /// time into the performance record.
+    #[allow(clippy::print_stderr, reason = "performance records are opt-in output")]
     fn finish_frame(&mut self, maps: Vec<ScreenMap>, started: Instant, stats: ProcessStats) {
         for (pane, map) in self.panes.iter_mut().zip(maps) {
             pane.last_map = Some(map);

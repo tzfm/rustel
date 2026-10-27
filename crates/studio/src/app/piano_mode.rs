@@ -295,7 +295,7 @@ impl App {
                     action,
                     Some(BindAction::Evaluate | BindAction::Stop | BindAction::RewindEvaluate)
                 ) {
-                    self.dispatch_bind_action(action.unwrap(), false)?;
+                    self.dispatch_bind_action(action.expect("the guard matched Some"), false)?;
                     return Ok(true);
                 }
                 if let Some(command) = transport_key(key, self.capabilities, &self.keybinds) {

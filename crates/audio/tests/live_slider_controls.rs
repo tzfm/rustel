@@ -27,7 +27,7 @@ fn lowpass(cutoff: Option<f32>, envelope: Option<FilterEnvelope>) -> FilterContr
 }
 
 fn tone_with(gain: f32, bindings: [u64; 4], filters: FilterControls) -> ScalarBackend {
-    let mut backend = ScalarBackend::prepared(RATE, 8).unwrap();
+    let mut backend = ScalarBackend::prepared(RATE, 8).expect("the backend prepares");
     assert!(
         backend.try_note_prepared(OnsetEvent::new(0, 1000.0, gain, 5.0).with_controls(
             OscillatorControls {

@@ -542,7 +542,10 @@ pub(super) fn install<'js>(ctx: Ctx<'js>, surface: &SemanticSurface<'js>) -> Res
             sidecars.extend(callback_sidecars);
             let callbacks = match callback_parts.len() {
                 0 => rustel_core::silence(),
-                1 => callback_parts.into_iter().next().unwrap(),
+                1 => callback_parts
+                    .into_iter()
+                    .next()
+                    .expect("the iterator yields the element"),
                 _ => rustel_core::fastcat(callback_parts),
             };
             derive_wrapper(

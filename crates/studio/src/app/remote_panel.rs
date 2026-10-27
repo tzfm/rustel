@@ -216,7 +216,7 @@ impl Widget for RemotePanelView<'_> {
             for x in input.x..input.right() {
                 buffer
                     .cell_mut((x, input.y))
-                    .unwrap()
+                    .expect("the coordinates are inside the buffer")
                     .set_symbol(" ")
                     .set_style(style);
             }

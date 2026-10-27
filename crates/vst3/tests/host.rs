@@ -342,6 +342,40 @@ fn the_watch_of_the_preset_folders_reads_the_disk_again() {
     assert_eq!(rig.host.presets_version(), settled);
 }
 
+/// A change of the preset folders reads them again on the plugin thread:
+/// the read runs from the change itself, no caller waits for it, and the
+/// presets of the folder the change brought are there when it ends.
+#[test]
+fn a_change_of_the_preset_folders_reads_them_in_the_background() {
+    let rig = Rig::new("folder-change");
+    // The load gives the plugin its class, so the names have an answer.
+    rig.plugin();
+    rig.host.wait_idle();
+    assert!(!rig.host.presets_reading());
+
+    // A folder the player added holds any structure: the header of each
+    // file names its plugin.
+    let added = rig.root.join("added");
+    std::fs::create_dir_all(&added).expect("folder");
+    std::fs::write(
+        added.join("Added Bass.vstpreset"),
+        rustel_vst3_fixture::preset(0.5, 0.0),
+    )
+    .expect("preset file");
+    rig.host.set_preset_folders(vec![added]);
+    assert!(
+        rig.host.presets_reading(),
+        "the read runs from the change, on the plugin thread"
+    );
+    rig.host.wait_idle();
+    assert!(!rig.host.presets_reading());
+    assert_eq!(
+        rig.host.presets(NAME),
+        Some(vec!["Added Bass".to_owned()]),
+        "the read of the change lists the presets of the folder"
+    );
+}
+
 #[test]
 fn a_preset_file_sets_the_state_of_the_plugin() {
     let rig = Rig::new("preset");
@@ -1721,7 +1755,10 @@ fn a_bundle_that_does_not_load_gives_the_reason() {
 
 fn walk(folder: &std::path::Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    for entry in std::fs::read_dir(folder).unwrap().flatten() {
+    for entry in std::fs::read_dir(folder)
+        .expect("the folder is listed")
+        .flatten()
+    {
         let path = entry.path();
         if path.is_dir() {
             files.extend(walk(&path));

@@ -727,7 +727,7 @@ fn a_direct_slider_after_pitch_transforms_updates_sustained_audio_before_the_nex
 /// a new bundle for the host, so each call gives a plugin not yet loaded.
 #[cfg(feature = "vst")]
 fn fixture_plugins() -> tempfile::TempDir {
-    let folder = tempfile::tempdir().unwrap();
+    let folder = tempfile::tempdir().expect("tempdir created");
     rustel_vst3_fixture::install(folder.path());
     rustel_runtime::vst::pin_standard_folders(vec![folder.path().to_path_buf()]);
     folder
@@ -792,6 +792,45 @@ fn a_live_note_plays_through_its_plugin() {
         ["Rustel Fixture has no parameter \"gian\" - did you mean \"gain\"?"]
     );
     assert!(rustel_runtime::lint::rejection(wrong, false, None).is_some());
+
+    // A preset name no file of the plugin has is a value error the same
+    // way: Studio refuses the update and marks the name in the score. The
+    // name reads as the engine reads it, upper case aside.
+    let presets = tempfile::tempdir().unwrap();
+    let of_fixture = presets.path().join(rustel_vst3_fixture::NAME);
+    std::fs::create_dir_all(&of_fixture).unwrap();
+    std::fs::write(
+        of_fixture.join("Dark Bass.vstpreset"),
+        rustel_vst3_fixture::preset(0.5, 0.0),
+    )
+    .unwrap();
+    let host = rustel_runtime::vst::host();
+    host.set_preset_folder(presets.path().to_path_buf());
+    // The first ask arms the read of the folders on the plugin thread; the
+    // next one sees its end.
+    host.presets(rustel_vst3_fixture::NAME);
+    host.wait_idle();
+    assert_eq!(
+        host.presets(rustel_vst3_fixture::NAME),
+        Some(vec!["Dark Bass".to_owned()])
+    );
+    let wrong_preset = "note('c3').s('sine').vst('rustel fixture', { preset: 'Dark Bss' }).fast(8)";
+    let marks = rustel_runtime::lint::lint(wrong_preset, false, None);
+    let messages: Vec<&str> = marks.iter().map(|mark| mark.message.as_str()).collect();
+    assert_eq!(
+        messages,
+        ["Rustel Fixture has no preset \"Dark Bss\" - did you mean \"Dark Bass\"?"]
+    );
+    assert_eq!(
+        &wrong_preset[marks[0].from..marks[0].to],
+        "Dark Bss",
+        "the mark sits on the name, between its quotes"
+    );
+    assert!(rustel_runtime::lint::rejection(wrong_preset, false, None).is_some());
+    let right_preset =
+        "note('c3').s('sine').vst('rustel fixture', { preset: 'dark bass' }).fast(8)";
+    assert!(rustel_runtime::lint::lint(right_preset, false, None).is_empty());
+    assert!(rustel_runtime::lint::rejection(right_preset, false, None).is_none());
 
     // The engine refuses no edit for a plugin problem, and gives each
     // problem as one warning. `reached` ends the wait.
@@ -1691,10 +1730,10 @@ fn tick_for(engine: &mut StudioEngine, how_long: Duration, each: &mut dyn FnMut(
 /// A set folder holding, for each `(bank, takes)` of `banks`, a bank of
 /// that many short silent takes.
 fn set_of_banks(banks: &[(&str, usize)]) -> tempfile::TempDir {
-    let set = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    let set = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("tempdir created");
     for &(bank, takes) in banks {
         let folder = set.path().join(bank);
-        std::fs::create_dir(&folder).unwrap();
+        std::fs::create_dir(&folder).expect("the directory is created");
         for take in 0..takes {
             rustel_runtime::write_silent_wav(folder.join(format!("{take}.wav")), 48_000, 1, 0.01)
                 .expect("a take on disk");
@@ -3467,7 +3506,12 @@ fn piano_over_playback_tail_stops(immediate: bool) {
             .as_ref()
             .is_some_and(|pressure| pressure.device.realtime_pressure.active_voices == 1)
     });
-    let stream = sounding.pressure.as_ref().unwrap().device.stream_id;
+    let stream = sounding
+        .pressure
+        .as_ref()
+        .expect("the wait confirmed the pressure")
+        .device
+        .stream_id;
 
     // The real producer has already scheduled a long score. Piano must sound
     // on its callback without waiting for that score's next onset.
@@ -3478,7 +3522,15 @@ fn piano_over_playback_tail_stops(immediate: bool) {
             .as_ref()
             .is_some_and(|pressure| pressure.device.realtime_pressure.active_voices == 2)
     });
-    assert_eq!(chord.pressure.as_ref().unwrap().device.stream_id, stream);
+    assert_eq!(
+        chord
+            .pressure
+            .as_ref()
+            .expect("the wait confirmed the pressure")
+            .device
+            .stream_id,
+        stream
+    );
     assert!(chord.playing);
 
     worker.request_stop();
@@ -3536,7 +3588,11 @@ fn piano_over_playback_tail_stops(immediate: bool) {
     });
     assert!(restarted.playing);
     assert_eq!(
-        restarted.pressure.unwrap().device.stream_id,
+        restarted
+            .pressure
+            .expect("the wait confirmed the pressure")
+            .device
+            .stream_id,
         stream,
         "the restart adopts the parked stream instead of opening one"
     );

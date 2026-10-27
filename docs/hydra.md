@@ -1,7 +1,8 @@
 # Visuals
 
 Hydra draws visuals behind the code in Studio. It is included in default
-builds. See [building](building.md) to make a build without it.
+builds. See [building](building.md) to make a build without it. The engine
+lives in its own repository, [rustel-hydra](https://github.com/tzfm/rustel-hydra).
 
 ## A set with a picture
 

@@ -24,6 +24,7 @@ later version.
 //! ```sh
 //! cargo test --release -p rustel --test memory_attribution -- --nocapture
 //! ```
+#![allow(clippy::print_stderr, reason = "the test prints its measurements")]
 
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
