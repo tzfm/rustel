@@ -62,7 +62,7 @@ mod soundfonts;
 mod speech;
 #[cfg(test)]
 use codecs::decode_ogg;
-use codecs::{codec_for, decode_guarded};
+use codecs::codec_for;
 pub use folders::without_verbatim_prefix;
 #[cfg(test)]
 use folders::{
