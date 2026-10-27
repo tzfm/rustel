@@ -17,6 +17,29 @@ pub(super) const CATALOGUE_REFRESH: Duration = Duration::from_millis(1_000);
 /// browser on its loading row for a full second.
 pub(super) const CATALOGUE_LOADING_REFRESH: Duration = Duration::from_millis(50);
 
+/// How long the loading cadence survives without the catalogue changing and
+/// without a download running. A manifest that hangs holds the loading state
+/// without progress, and rebuilding the catalogue twenty times a second then
+/// costs a slow machine most of a core while nothing new arrives.
+pub(super) const CATALOGUE_PROGRESS_WINDOW: Duration = Duration::from_secs(2);
+
+/// The catalogue refresh interval for this turn. While the library loads,
+/// follow it at [`CATALOGUE_LOADING_REFRESH`] for as long as the catalogue
+/// keeps changing or a download keeps running, and fall back to
+/// [`CATALOGUE_REFRESH`] once neither has happened for
+/// [`CATALOGUE_PROGRESS_WINDOW`].
+pub(super) fn catalogue_refresh_interval(
+    loading: bool,
+    downloading: bool,
+    since_progress: Duration,
+) -> Duration {
+    if loading && (downloading || since_progress <= CATALOGUE_PROGRESS_WINDOW) {
+        CATALOGUE_LOADING_REFRESH
+    } else {
+        CATALOGUE_REFRESH
+    }
+}
+
 /// The browser's `in` row grows one variant a channel once an input is
 /// open, so `s("in:1")` is a row to pick, not a number to know.
 pub(super) fn with_input_channels(
@@ -1801,6 +1824,30 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn loading_cadence_needs_progress_or_a_download() {
+        let loading = catalogue_refresh_interval(true, false, Duration::ZERO);
+        assert_eq!(loading, CATALOGUE_LOADING_REFRESH);
+        let progressing = catalogue_refresh_interval(
+            true,
+            false,
+            CATALOGUE_PROGRESS_WINDOW - Duration::from_millis(1),
+        );
+        assert_eq!(progressing, CATALOGUE_LOADING_REFRESH);
+        let downloading = catalogue_refresh_interval(true, true, Duration::from_secs(60));
+        assert_eq!(downloading, CATALOGUE_LOADING_REFRESH);
+        let stalled = catalogue_refresh_interval(
+            true,
+            false,
+            CATALOGUE_PROGRESS_WINDOW + Duration::from_millis(1),
+        );
+        assert_eq!(stalled, CATALOGUE_REFRESH);
+        let idle = catalogue_refresh_interval(false, false, Duration::MAX);
+        assert_eq!(idle, CATALOGUE_REFRESH);
+    }
+
     mod catalogue {
         //! Tests for catalogue.
 
