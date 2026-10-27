@@ -95,3 +95,24 @@ fn one_refused_statement_does_not_stop_the_rest() {
         .unwrap_or_else(|| panic!("one bad statement stopped every other one"));
     assert!(drawn.2 > 0, "the good statement still drew");
 }
+
+/// A score of only comments is a valid mute, and a mute must close the
+/// picture the previous score opened: the recording it hands over is
+/// empty, which the bridge reads as the instruction to stop drawing.
+#[test]
+fn a_comments_only_score_closes_the_picture() {
+    let mut session = rustel_runtime::Session::new().expect("session");
+    session
+        .evaluate("await initHydra()\nosc(10).out()")
+        .expect("the visuals score evaluates");
+    let candidate = session.take_pending_hydra().expect("a recording");
+    assert!(!candidate.is_empty(), "the first score drew something");
+
+    session
+        .evaluate("// @title night drive\n// @by someone\n")
+        .expect("the comments-only score evaluates");
+    let candidate = session
+        .take_pending_hydra()
+        .expect("a close after the mute");
+    assert!(candidate.is_empty(), "the mute leaves no picture standing");
+}
