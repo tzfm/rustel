@@ -306,6 +306,21 @@ A small buffer leaves little time for each callback: 32 frames at 48 kHz is
 the hint to raise the audio out latency. With reverb in the score, use 128
 frames, or 64 on a fast machine.
 
+On Linux through PulseAudio or PipeWire, a busy CPU can click the output even
+when rustel's own DSP is quick: the audio server drives the device on a
+normal-priority thread, and a saturated core delays it past its buffer. A
+server with a realtime grant, which rtkit provides, holds the output clean
+at any buffer size:
+
+```sh
+sudo apt-get install -y rtkit
+```
+
+Without one, a larger buffer is the cushion: on a small machine such as a
+Raspberry Pi 3, a fully loaded CPU clicked at 512 and 1024 frames in testing
+and held clean from 2048 up. Studio's audio out latency row is the same
+setting.
+
 A laptop in a power-saving mode keeps the CPU clock low for short, regular
 work such as an audio callback, and it changes the clock often. The same
 score can then need two to four times the DSP time, and some callbacks miss
