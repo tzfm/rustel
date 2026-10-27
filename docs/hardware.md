@@ -310,7 +310,8 @@ On Linux through PulseAudio or PipeWire, a busy CPU can click the output even
 when rustel's own DSP is quick: the audio server drives the device on a
 normal-priority thread, and a saturated core delays it past its buffer. A
 server with a realtime grant, which rtkit provides, holds the output clean
-at any buffer size:
+at any buffer size. rustelup offers to install rtkit when it finds a system
+that runs such a server without it; to install it by hand:
 
 ```sh
 sudo apt-get install -y rtkit

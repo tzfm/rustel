@@ -134,6 +134,83 @@ check_linux_build_deps() {
   exit 1
 }
 
+# The Linux audio server (PipeWire or PulseAudio) drives the sound card on a
+# normal-priority thread unless something grants it realtime. Without that
+# grant a busy CPU clicks the output even when the score is light. rtkit is
+# the standard daemon that grants it. After a successful install, check for
+# the daemon on a system that runs such a server and offer the one command
+# that fixes it. Nothing here may fail the install: every step is advisory.
+check_linux_audio_realtime() {
+  # Direct ALSA systems do not use rtkit; skip when no server is running.
+  if ! pgrep -x pipewire >/dev/null 2>&1 && ! pgrep -x pulseaudio >/dev/null 2>&1 \
+     && ! pgrep -xf "pipewire-pulse" >/dev/null 2>&1; then
+    return 0
+  fi
+  # Debian ships the daemon under /usr/libexec, not on PATH, so look at the
+  # usual locations and at the unit before concluding it is absent.
+  if [ -x /usr/libexec/rtkit-daemon ] || [ -x /usr/lib/rtkit-daemon ] \
+     || systemctl is-active rtkit-daemon >/dev/null 2>&1 \
+     || systemctl is-enabled rtkit-daemon >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local install
+  if command -v apt-get >/dev/null 2>&1; then
+    install="apt-get install -y rtkit"
+  elif command -v dnf >/dev/null 2>&1; then
+    install="dnf install -y rtkit"
+  elif command -v pacman >/dev/null 2>&1; then
+    install="pacman -S --needed rtkit"
+  elif command -v zypper >/dev/null 2>&1; then
+    install="zypper install -y rtkit"
+  elif command -v apk >/dev/null 2>&1; then
+    install="apk add rtkit"
+  else
+    install=""
+  fi
+  if [ -z "$install" ]; then
+    say "audio: this system runs PipeWire or PulseAudio without rtkit"
+    say "audio: install rtkit so a busy CPU cannot click the output"
+    return 0
+  fi
+
+  # A piped install (curl | bash) has no terminal to ask on: print the
+  # command instead of running anything.
+  if [ ! -t 0 ] || [ ! -t 1 ]; then
+    say "audio: this system runs PipeWire or PulseAudio without rtkit"
+    say "audio: without it, a busy CPU can click the output"
+    printf '    sudo %s\n' "$install"
+    return 0
+  fi
+
+  printf 'rustelup: this system runs PipeWire or PulseAudio without rtkit.\n'
+  printf 'rustelup: rtkit gives the audio server realtime, so a busy CPU cannot click the output.\n'
+  printf 'rustelup: install it now with sudo? [y/N] '
+  local answer=""
+  read -r answer || true
+  case "$answer" in
+    y|Y|yes|YES) ;;
+    *) say "skipped; to install later, run: sudo $install"; return 0 ;;
+  esac
+
+  local sudo=""
+  [ "$(id -u)" -eq 0 ] || sudo="sudo"
+  if ! $sudo $install; then
+    say "rtkit install failed; to retry, run: sudo $install"
+    return 0
+  fi
+  # Debian activates the daemon through dbus; enabling it also starts it
+  # where the unit exists. A failure here is advisory: dbus will start it
+  # on first use anyway.
+  $sudo systemctl enable --now rtkit-daemon >/dev/null 2>&1 || true
+  if systemctl is-active rtkit-daemon >/dev/null 2>&1 \
+     || command -v rtkit-daemon >/dev/null 2>&1; then
+    say "audio: rtkit installed; the audio server can now take realtime"
+  else
+    say "audio: rtkit installed; it starts on first audio use"
+  fi
+}
+
 # Build $BRANCH or $COMMIT in $SRC_DIR with the release profile. The checkout
 # and its `target` directory stay, so the next build compiles the changes only.
 build_from_source() {
@@ -292,6 +369,7 @@ fi
 
 [ -z "$REVISION" ] || VERSION="$VERSION at ${REVISION:0:12}"
 say "installed: $VERSION"
+[ "$PLATFORM" = "linux" ] && check_linux_audio_realtime
 say "run 'rustel studio' to open the studio, or 'rustel' for the CLI"
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
