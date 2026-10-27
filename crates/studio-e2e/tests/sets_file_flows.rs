@@ -238,9 +238,9 @@ fn the_set_panel_shows_the_selected_scores_details_at_its_foot() {
 
 /// `/` filters the set panel: letters hide the scores the query does not
 /// answer - a name or any @field value - Enter leaves the filter
-/// standing, Esc restores the folder. In vim the box rests in command
-/// mode until `i` types, and the Esc ladder leaves insert before it
-/// drops the filter.
+/// standing, Esc restores the folder. In vim `/` types at once, a second
+/// `/` retypes the standing query, and the Esc ladder leaves insert
+/// before it drops the filter.
 #[test]
 fn the_set_panel_search_filters_and_restores() {
     let mut studio = hermetic();
@@ -285,8 +285,8 @@ fn the_set_panel_search_filters_and_restores() {
     );
     assert_eq!(studio.focus(), Some(PanelKind::Set), "Esc kept the panel");
 
-    // Vim: the box rests in command, `i` types, and the second Esc
-    // drops the filter. The panel goes away first, so the vim half
+    // Vim: `/` types at once, and the Esc ladder leaves insert before
+    // it drops the filter. The panel goes away first, so the vim half
     // opens it fresh, the way the studio does at startup.
     studio.chord("ctrl+b");
     assert_eq!(studio.focus(), None, "the panel is away");
@@ -295,24 +295,33 @@ fn the_set_panel_search_filters_and_restores() {
     studio.settle();
     assert_eq!(studio.focus(), Some(PanelKind::Set));
     studio.press(KeyCode::Char('/'), KeyModifiers::NONE);
-    studio.settle();
-    let rows = studio.rows();
-    assert!(
-        rows.iter().any(|row| row.contains("search: i or a types")),
-        "in command mode the box says the way in:\n{}",
-        rows.join("\n")
-    );
-    studio.press(KeyCode::Char('i'), KeyModifiers::NONE);
     studio.press(KeyCode::Char('n'), KeyModifiers::NONE);
     studio.press(KeyCode::Char('i'), KeyModifiers::NONE);
     studio.settle();
     let rows = studio.rows();
     assert!(
         rows.iter().any(|row| row.contains("search: ni")),
-        "insert types into the box:\n{}",
+        "`/` types into the box at once:\n{}",
         rows.join("\n")
     );
     assert!(rows.iter().all(|row| !row.contains("alpha")));
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    assert!(
+        rows.iter().all(|row| !row.contains("alpha")),
+        "the first Esc leaves the filter standing:\n{}",
+        rows.join("\n")
+    );
+    studio.press(KeyCode::Char('/'), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('g'), KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    assert!(
+        rows.iter().any(|row| row.contains("search: nig")),
+        "a second `/` retypes the standing query:\n{}",
+        rows.join("\n")
+    );
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     studio.settle();

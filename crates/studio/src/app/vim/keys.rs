@@ -65,6 +65,13 @@ impl VimTextSurface for SetPanel {
 
     fn set_insert(&mut self, insert: bool) {
         self.vim_insert = insert;
+        // The box types exactly while it is in Insert: the keyboard it
+        // takes and the one it gives back move together, so `/`, i, and
+        // a retype, and Esc hands the list its keys back with the
+        // filter standing.
+        if let Some(search) = self.search.as_mut() {
+            search.typing = insert;
+        }
     }
 }
 
@@ -217,7 +224,7 @@ enum TextAction {
     FlushThenCommand,
 }
 
-/// The modal keys of a search box. `i` and `a` enter Insert, `p` pastes the
+/// The modal keys of a search box. `i`, `a`, and `/` enter Insert, `p` pastes the
 /// clipboard, Esc returns to Command, and Command keeps j k h l for the
 /// list and every other letter out of the query.
 pub(crate) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
@@ -264,6 +271,9 @@ pub(crate) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
         } else {
             match key.code {
                 KeyCode::Char('i' | 'a') => TextAction::EnterInsert,
+                // `/` retypes: the key that opened the box takes it
+                // back up, the way Vim's own search does.
+                KeyCode::Char('/') => TextAction::EnterInsert,
                 // Vim's paste, into the search or the field the form edits.
                 KeyCode::Char('p') => TextAction::Paste,
                 // Space keeps its surface meaning, such as auditioning

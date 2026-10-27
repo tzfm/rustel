@@ -203,6 +203,7 @@ impl App {
                 _ => self.pending_switch = None,
             }
         }
+        let vim = super::vim::applies(self);
         let Some(panel) = self.set_panel.as_mut() else {
             return false;
         };
@@ -228,9 +229,11 @@ impl App {
         }
         match code {
             // A filter standing drops on Esc, before the panel's own Esc
-            // hands the keyboard back.
+            // hands the keyboard back. The box's vim Insert stands down
+            // with it: nothing types into a box that is no longer there.
             KeyCode::Esc if panel.search.is_some() => {
                 panel.search = None;
+                panel.vim_insert = false;
                 panel.refilter();
             }
             // Zen has no docked furniture: the panel came up as a popup,
@@ -323,10 +326,15 @@ impl App {
             }
             // `/` opens the search box: it takes the keyboard, and the
             // list hides the scores the query does not answer. On a
-            // filter standing it takes the box back up to type. In vim,
-            // the box's letters belong to its own modes instead.
+            // filter standing it takes the box back up to type.
             KeyCode::Char('/') if !primary && panel.search.is_none() => {
                 panel.open_search();
+                // In Vim the box opens in Insert, the way Vim's own
+                // search does. The panel cannot see the editor's
+                // modes, so the arm that can arms it.
+                if vim {
+                    panel.vim_insert = true;
+                }
             }
             KeyCode::Char('/') if !primary => {
                 if let Some(search) = panel.search.as_mut() {
@@ -1964,6 +1972,10 @@ mod tests {
             press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
             press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
             assert_eq!(query(&app).as_deref(), Some("n"), "n types into the query");
+            assert!(
+                !app.set_panel.as_ref().unwrap().vim_insert,
+                "plain keys do not open the box in Insert"
+            );
             press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
             assert_eq!(
                 names(&app),
@@ -1993,21 +2005,18 @@ mod tests {
             );
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
 
-            // Vim: the box rests in command, `i` types, and the Esc
-            // ladder leaves insert before it drops the filter.
+            // Vim: `/` opens the box typing, the way Vim's own search does,
+            // and the Esc ladder leaves insert before it drops the filter.
             app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
             app.sync_editor_keybindings();
             press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
-            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
-            assert_eq!(
-                query(&app).as_deref(),
-                Some(""),
-                "in command mode a letter is not the box's"
+            assert!(
+                app.set_panel.as_ref().unwrap().vim_insert,
+                "`/` opens the box in insert"
             );
-            press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
             press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
             press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
-            assert_eq!(query(&app).as_deref(), Some("sp"), "insert types");
+            assert_eq!(query(&app).as_deref(), Some("sp"), "letters type at once");
             assert_eq!(names(&app), ["spare"]);
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
             assert!(
@@ -2015,6 +2024,23 @@ mod tests {
                 "the first Esc only leaves insert"
             );
             assert!(app.set_panel.as_ref().unwrap().search.is_some());
+            press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+            assert!(
+                app.set_panel.as_ref().unwrap().vim_insert,
+                "`/` on a standing filter retypes in insert"
+            );
+            press(&mut app, KeyCode::Char('o'), KeyModifiers::NONE);
+            assert_eq!(
+                query(&app).as_deref(),
+                Some("spo"),
+                "a retyped box continues its query"
+            );
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(
+                !app.set_panel.as_ref().unwrap().vim_insert,
+                "Enter stands the box down in Vim"
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
             assert!(app.set_panel.as_ref().unwrap().search.is_none());
         }

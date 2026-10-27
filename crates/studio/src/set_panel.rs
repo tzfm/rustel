@@ -431,7 +431,8 @@ impl SetPanel {
     /// query grows. Enter leaves the filter standing and moves the
     /// selection to the first score it kept. Up and Down leave it
     /// standing and move. Esc drops the filter whole, and the list is
-    /// the folder's again. Anything else is the box's silence.
+    /// the folder's again. Each stand-down closes the box's Vim Insert
+    /// with it. Anything else is the box's silence.
     pub fn search_key(&mut self, code: KeyCode) {
         let mut refilter = false;
         match code {
@@ -453,6 +454,7 @@ impl SetPanel {
                 if let Some(search) = self.search.as_mut() {
                     search.typing = false;
                 }
+                self.vim_insert = false;
                 // Enter reads as "go there": the cursor lands on the
                 // first score the filter kept.
                 if let Some(first) = self
@@ -467,10 +469,12 @@ impl SetPanel {
                 if let Some(search) = self.search.as_mut() {
                     search.typing = false;
                 }
+                self.vim_insert = false;
                 self.move_by(if code == KeyCode::Up { -1 } else { 1 });
             }
             KeyCode::Esc => {
                 self.search = None;
+                self.vim_insert = false;
                 refilter = true;
             }
             _ => {}
@@ -1034,17 +1038,9 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
             }
         } else if let Some(search) = &self.panel.search {
             // The search row, in the reference panel's look: what the
-            // filter holds, and in vim's command mode over an empty
-            // query, the way in.
-            let row = if search.typing
-                && search.query.is_empty()
-                && !self.panel.vim_insert
-                && self.keybinds.editor_keybindings() == super::editor::EditorKeybindings::Vim
-            {
-                "search: i or a types".to_owned()
-            } else {
-                format!("search: {}", search.query)
-            };
+            // filter holds. Vim's `/` lands in Insert, so a query it
+            // opens starts typing at once.
+            let row = format!("search: {}", search.query);
             buffer.set_stringn(
                 error.x,
                 error.y,
