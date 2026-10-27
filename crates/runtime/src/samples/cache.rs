@@ -80,6 +80,9 @@ pub(super) fn clear_sample_cache_at(base: &Path) -> Result<(), String> {
     // The score namespace has a lock and a marker protocol of its own, so
     // it is cleared through its own door rather than deleted from under it.
     clear_score_sample_cache_at(base)?;
+    // The decoded-PCM sidecars answer to no manifest of their own: the
+    // folder as a whole is this cache's, so the folder as a whole goes.
+    let _ = std::fs::remove_dir_all(base.join(super::decode_cache::DECODED_DIR));
     let Ok(entries) = std::fs::read_dir(base) else {
         return Ok(());
     };
@@ -862,7 +865,7 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
     }
 }
 
-fn ensure_private_dir(path: &Path) -> Result<(), String> {
+pub(super) fn ensure_private_dir(path: &Path) -> Result<(), String> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
             Ok(())

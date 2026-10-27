@@ -53,6 +53,7 @@ pub use catalog::{
 use manifests::*;
 
 mod codecs;
+mod decode_cache;
 mod folders;
 mod font_queue;
 mod local_names;
