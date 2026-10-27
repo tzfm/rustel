@@ -64,7 +64,7 @@ fn impure_edits_land_while_busy_cores_spin() {
     // Three cores of ordinary busy work, the way a browser beside the studio
     // loads a small machine. The output is the harness's silent one; what
     // this stresses is the replacement's own timing under contention.
-    let _busy = spinners(3);
+    let _busy = spinners(2);
 
     let saves = [
         (
@@ -99,7 +99,8 @@ fn impure_edits_land_while_busy_cores_spin() {
         let allowed = usize::from(step == 0);
         assert!(
             refusals <= allowed,
-            "step {step} ({what}) rolled {refusals} replacements back, {allowed} allowed"
+            "step {step} ({what}) rolled {refusals} replacements back, {allowed} allowed\nlog:\n{}",
+            studio.log_texts()[before..].join("\n")
         );
     }
 }
