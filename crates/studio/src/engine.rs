@@ -1145,6 +1145,11 @@ pub struct StudioEngine {
     /// playing score runs longer than the audio scheduled ahead of the clock
     /// (see [`Self::widen_horizon_for_evaluation`]).
     live_horizon: f64,
+    /// The last evaluation of the playing score, wall-clock. The first
+    /// replacement of a score sizes its takeover from this until the
+    /// producer has measured a cutover of its own (see
+    /// [`Self::match_replacement_headroom_to_producer`]).
+    last_live_evaluation: Duration,
     recovery_epoch: u64,
     launch_pads: Vec<(u8, u8)>,
     live: Option<StudioPlayback>,
@@ -1726,6 +1731,7 @@ impl StudioEngine {
             config,
             session,
             live_horizon: DEFAULT_HORIZON,
+            last_live_evaluation: Duration::ZERO,
             recovery_epoch: 0,
             launch_pads: Vec::new(),
             live: None,

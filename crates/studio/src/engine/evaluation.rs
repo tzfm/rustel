@@ -32,8 +32,12 @@ impl StudioEngine {
         }
         let started = std::time::Instant::now();
         let result = self.evaluate_guarded_inner(source, mini, cancelled);
+        // Recorded whether or not the engine was live: the first save of a
+        // session prices its takeover from the evaluation that started the
+        // set, which ran while the engine was still stopped.
+        self.last_live_evaluation = started.elapsed();
         if was_live {
-            self.widen_horizon_for_evaluation(started.elapsed());
+            self.widen_horizon_for_evaluation(self.last_live_evaluation);
         }
         self.sync_recovered_session();
         self.sync_polyphony();
@@ -67,6 +71,14 @@ impl StudioEngine {
     /// window publishes after its takeover and the edit rolls back. One
     /// measured turn plus the default response time keeps the window open as
     /// long as the machine needs, and no longer.
+    ///
+    /// Until the producer has measured a cutover of its own, the last
+    /// evaluation stands in for one: an evaluation and a first window cost
+    /// the same machine the same order of work, and the probe that prices
+    /// the takeover covers the query but not the conversion of the voices
+    /// the window installs. A first save on a slow machine bounced once and
+    /// landed on the retry before this; with the evaluation in the floor it
+    /// lands the first time.
     fn match_replacement_headroom_to_producer(&mut self) {
         let Some(playback) = self.live.as_ref() else {
             return;
@@ -76,6 +88,7 @@ impl StudioEngine {
             .observed_turn_high_water()
             .map(|turn| turn + LIVE_REPLACEMENT_MIN_HEADROOM)
             .unwrap_or(Duration::ZERO)
+            .max(self.last_live_evaluation + LIVE_REPLACEMENT_MIN_HEADROOM)
             .min(Duration::from_secs_f64(MAX_LIVE_HORIZON));
         self.session.set_replacement_headroom_floor(floor);
     }
