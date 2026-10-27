@@ -3,6 +3,7 @@
 ## Unreleased
 - The set panel reads each score's saved time once, with the folder. The details block asked the file system on every redraw, which costs nothing on local disk and seconds on a synced or network folder, where it landed on every search keypress.
 - A score of only comments stops the Hydra picture now. The close was staged only when an evaluation succeeded, so a mute left the previous score's picture standing.
+- The studio's terminal probe names the keyboard protocol, so a report from a terminal where the Alt digits stay dead carries whether the handshake answered.
 - `talkit` speech plays from a live score and a bounce. The lookups that wrap a host's sample bank, for control validation and for Csound scores, answered a speech request with the default that says the host has none, so no host could speak. Both hand speech to the bank they wrap now.
 - Alt with 1 to 9 selects that strip's score from the editor, as a digit on its row in the set panel does. The chord runs to nine, and a number the strip does not hold says so. On iTerm2 and Apple Terminal, where Option composes text, the composed digit is recovered into the chord.
 - The set panel's details block stands under a rule of its own, set off from the list the way the foot of a file manager's pane is.

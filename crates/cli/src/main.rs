@@ -2137,6 +2137,7 @@ fn run_command(
                     serde_json::json!({
                         "terminal": features.name,
                         "truecolor": features.truecolor,
+                        "keyboard": features.keyboard,
                         "kitty_graphics": features.kitty_graphics,
                         "sixel": features.sixel,
                         "fine_glyphs": features.fine_glyphs,
