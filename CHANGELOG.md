@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Ctrl with Shift and a digit selects the strip's score too. Option types real characters on some layouts, and those digits keep typing, so the Ctrl spelling is the one that holds on every layout: Ctrl composes nothing anywhere. A chord learnt over the key retires it, and the help names both spellings.
 - Alt with a digit reaches the strip on every terminal that carries the keyboard protocol, Ghostty and kitty among them. Those terminals report the digit with the Alt bit and its composed text beside it, and the studio took the text, typing `@` into the score where a Swedish layout composes it. An exotic composition, like the US Option+1 spelling `¡`, now gives up its Alt chord, while a plain typeable character keeps typing, so the one way to type `@` or `$` on a Swedish layout stays open.
 - The set panel reads each score's saved time once, with the folder. The details block asked the file system on every redraw, which costs nothing on local disk and seconds on a synced or network folder, where it landed on every search keypress.
 - A score of only comments stops the Hydra picture now. The close was staged only when an evaluation succeeded, so a mute left the previous score's picture standing.

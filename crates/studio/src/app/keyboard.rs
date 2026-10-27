@@ -1106,6 +1106,22 @@ impl App {
             self.select_strip_by_number((digit as u8 - b'0') as usize);
             return true;
         }
+        // Ctrl with Shift spells the same selection where Option types
+        // real characters, as the Swedish layout's Option row does for
+        // five of the nine digits: Ctrl composes nothing on any layout,
+        // so this spelling holds on every one of them. Unlike the Alt
+        // digit, a chord the keybind table learns over the key retires
+        // it, the way every other primary chord retires.
+        if primary
+            && shift
+            && !alt
+            && let KeyCode::Char(digit) = key.code
+            && self.strip_digit_applies(digit)
+            && !self.key_is_a_learnt_chord(key)
+        {
+            self.select_strip_by_number((digit as u8 - b'0') as usize);
+            return true;
+        }
         if primary && !shift && letter == Some('d') && !self.key_is_a_learnt_chord(key) {
             self.toggle_reference_at_caret();
             return true;
@@ -2933,6 +2949,52 @@ mod tests {
                 app.scenes.current().name(),
                 "second",
                 "Alt+2 selects from Insert"
+            );
+        }
+
+        /// Ctrl with Shift spells the same selection where Option types
+        /// real characters, as the Swedish layout's Option row does, and a
+        /// chord learnt over the key retires it.
+        #[test]
+        fn a_ctrl_shift_digit_selects_the_strip_score_and_retires() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_with_two_scores(directory.path());
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            press(
+                &mut app,
+                KeyCode::Char('1'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            );
+            assert_eq!(
+                app.scenes.current().name(),
+                "first",
+                "Ctrl+Shift+1 selected from vim Normal"
+            );
+            press(
+                &mut app,
+                KeyCode::Char('2'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            );
+            assert_eq!(
+                app.scenes.current().name(),
+                "second",
+                "Ctrl+Shift+2 selected too"
+            );
+            // A chord learnt over the key takes it back: the press now
+            // comments the line instead of selecting a score.
+            let chord =
+                crate::keybinds::KeyCombo::parse("ctrl+shift+1").expect("a parseable chord");
+            app.keybinds.learn(BindAction::ToggleComment, Some(chord));
+            press(
+                &mut app,
+                KeyCode::Char('1'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            );
+            assert_eq!(
+                app.scenes.current().name(),
+                "second",
+                "the learnt chord retired the strip digit"
             );
         }
 

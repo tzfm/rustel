@@ -738,6 +738,47 @@ fn alt_digits_select_strip_scores_in_both_wire_spellings() {
     );
 }
 
+/// Ctrl with Shift and a digit selects the strip's score in the kitty
+/// spelling, `CSI codepoint;6u`. The chord holds on every layout, because
+/// Ctrl composes nothing, where Option types real characters on some.
+#[cfg(unix)]
+#[test]
+fn a_ctrl_shift_digit_selects_the_strip_score_over_the_protocol() {
+    let Some(binary) = rustel_binary() else {
+        panic!("build the binary first");
+    };
+    let home = tempfile::tempdir().expect("temporary home");
+    std::fs::write(
+        home.path().join("live.strudel"),
+        "$: note(\"c4\").s(\"sine\")\n",
+    )
+    .expect("starter score");
+    let mut terminal = Terminal::open(&binary, 24, 80, home.path());
+    assert!(
+        terminal.wait_for(" ready", Duration::from_secs(30)),
+        "the studio never finished loading:\n{}",
+        terminal.diagnostics()
+    );
+    terminal.write(&[0x0e]);
+    assert!(
+        terminal.wait_for_screen("scene 2 - ", Duration::from_secs(10)),
+        "Ctrl+N never put a second score on the strip:\n{}",
+        terminal.diagnostics()
+    );
+    terminal.write(b"\x1b[49;6u");
+    assert!(
+        terminal.wait_for_screen("scene 1 - live", Duration::from_secs(10)),
+        "the CSI u Ctrl+Shift+1 never selected the first score:\n{}",
+        terminal.diagnostics()
+    );
+    terminal.write(b"\x1b[50;6u");
+    assert!(
+        terminal.wait_for_screen("scene 2 - ", Duration::from_secs(10)),
+        "the CSI u Ctrl+Shift+2 never selected the second score:\n{}",
+        terminal.diagnostics()
+    );
+}
+
 /// A negotiated keyboard delivers the Alt digit the way kitty and Ghostty
 /// do once the studio asks for the protocol: the Option press and release
 /// bracket the digit, which arrives as CSI u with the base key's codepoint
