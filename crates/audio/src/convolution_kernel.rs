@@ -7,6 +7,8 @@ use std::sync::OnceLock;
 
 use rustfft::num_complex::Complex;
 
+#[cfg(target_arch = "aarch64")]
+mod aarch64;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod x86;
 
@@ -20,6 +22,8 @@ pub enum ConvolutionKernelKind {
     Portable,
     /// Four-bin complex multiply-accumulate using x86 AVX2 instructions.
     Avx2,
+    /// Two-bin complex multiply-accumulate using aarch64 NEON instructions.
+    Neon,
 }
 
 impl ConvolutionKernelKind {
@@ -28,6 +32,7 @@ impl ConvolutionKernelKind {
         match self {
             Self::Portable => true,
             Self::Avx2 => cfg!(any(target_arch = "x86", target_arch = "x86_64")),
+            Self::Neon => cfg!(target_arch = "aarch64"),
         }
     }
 }
@@ -60,6 +65,10 @@ impl ConvolutionKernel {
             ConvolutionKernelKind::Avx2 => x86::AVX2,
             #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
             ConvolutionKernelKind::Avx2 => unreachable!("AVX2 is not selectable on this target"),
+            #[cfg(target_arch = "aarch64")]
+            ConvolutionKernelKind::Neon => aarch64::NEON,
+            #[cfg(not(target_arch = "aarch64"))]
+            ConvolutionKernelKind::Neon => unreachable!("NEON is not selectable on this target"),
         }
     }
 
@@ -93,6 +102,11 @@ fn detect_best_kernel() -> ConvolutionKernelKind {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if std::arch::is_x86_feature_detected!("avx2") {
         return ConvolutionKernelKind::Avx2;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        return ConvolutionKernelKind::Neon;
     }
 
     ConvolutionKernelKind::Portable
