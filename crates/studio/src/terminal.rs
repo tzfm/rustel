@@ -1759,9 +1759,14 @@ fn split_probe_bytes(bytes: &[u8]) -> (Vec<u8>, Vec<crossterm::event::Event>) {
     (replies, keys)
 }
 
+/// The startup questions. A terminal that cannot read some of them prints
+/// their text: Apple Terminal shows `pp` and the graphics query on the
+/// shell's screen, where it stays after the studio quits. The cursor is
+/// saved before the questions and put back after them, and what they left
+/// is erased.
 #[cfg(any(unix, windows))]
 const TERMINAL_CAPABILITY_QUERY: &[u8] =
-    b"\x1b[?2026$p\x1b[?1016$p\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[c";
+    b"\x1b7\x1b[?2026$p\x1b[?1016$p\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[c\x1b8\x1b[J";
 
 /// A wait as poll(2)'s whole milliseconds, rounded up. A floor would turn
 /// the last sub-millisecond of each paced wait into a zero-timeout poll,
