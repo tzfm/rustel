@@ -122,7 +122,16 @@ mod tests {
                 NEON.multiply_accumulate(&mut actual, &spectrum, &partition);
             }
             for (bin, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
-                assert_eq!(actual.to_bits(), expected.to_bits(), "bin {bin} of {count}");
+                assert_eq!(
+                    actual.re.to_bits(),
+                    expected.re.to_bits(),
+                    "re {bin} of {count}"
+                );
+                assert_eq!(
+                    actual.im.to_bits(),
+                    expected.im.to_bits(),
+                    "im {bin} of {count}"
+                );
             }
         }
     }
