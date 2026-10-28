@@ -24,7 +24,11 @@ name takes the key, and the rest are numbered `pattern 1`, `pattern 2` and so on
 in the order the patterns were made. The open-set prompt offers these exports
 beside the sets, and File > Import patterns does the same import into
 the set already open: one score file an entry lands in the set's folder, and a
-name the set already holds is skipped and counted, never overwritten.
+name the set already holds is skipped and counted, never overwritten. File >
+Export patterns writes the set's scores the other way: one pattern export at
+the sets root, keyed by name, the score on screen as it stands with its
+unsaved edits, and the export loads in strudel.cc and in the open-set prompt
+alike.
 
 Type or paste a score, then press **Ctrl+S** or **F5**. Press **Ctrl+G** or **F8**
 to stop. Editing does not change the playing score until you update it. If an

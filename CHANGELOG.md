@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- File ▸ Export patterns writes the open set's scores as one pattern export at the sets root, named after the set and the day: the shape strudel.cc's Patterns tab gives and takes, keyed by name, so the names come back on an import and the file loads in strudel.cc. A score on screen goes out as it stands, unsaved edits included, and the open-set prompt offers the export beside the sets.
 - The set panel's search box repaints on every key it takes. A held Backspace showed its work only when the caret's blink happened to repaint, so the query thinned a beat behind the key.
 - A panel search box in vim mode types every letter at once, `j` and `k` included. The shipped `jk` insert mapping, made to leave Insert in a score, held every `j` typed into a box and left Insert on `jk`, so the next list keys walked the rows mid query. A search box is a command line, and Vim's command line reads no insert mappings.
 - The set panel's search box shows a caret while it types, and a query that matches nothing says no match and blinks with the studio's caret, so a filter left standing cannot read as an empty folder.

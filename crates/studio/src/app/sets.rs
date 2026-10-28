@@ -1253,6 +1253,62 @@ impl App {
         self.dirty_frame = true;
     }
 
+    /// File > Export patterns: the open set's scores, written as one
+    /// pattern export beside the sets, in the shape strudel.cc's
+    /// Patterns tab gives and takes and this studio's prompts read back.
+    /// Keyed by name, so the names come back on an import, and an open
+    /// score goes out as it stands, unsaved edits included.
+    pub(super) fn export_patterns(&mut self) {
+        let set = &self.scenes;
+        let mut patterns = serde_json::Map::new();
+        for file in set.folder_files() {
+            let code = match file.open.and_then(|id| set.get(id)) {
+                Some(scene) => scene.editor.source().to_owned(),
+                None => match std::fs::read_to_string(&file.path) {
+                    Ok(code) => code,
+                    Err(error) => {
+                        self.status = format!("could not read {}: {error}", file.name);
+                        self.dirty_frame = true;
+                        return;
+                    }
+                },
+            };
+            patterns.insert(file.name, serde_json::Value::String(code));
+        }
+        if patterns.is_empty() {
+            self.status = "nothing to export - the set holds no scores".into();
+            self.dirty_frame = true;
+            return;
+        }
+        let count = patterns.len();
+        let name = format!("{} patterns {}.json", set.name(), super::today());
+        // The sets root, where the prompts look for exports, so the file
+        // is offered the moment it lands; beside the set where no root is
+        // configured.
+        let root = self.prefs.sets_directory().unwrap_or_else(|| {
+            set.directory()
+                .parent()
+                .unwrap_or(set.directory())
+                .to_path_buf()
+        });
+        let beside = root.join(&name);
+        let text = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&serde_json::Value::Object(patterns)).unwrap_or_default()
+        );
+        if let Err(error) =
+            std::fs::create_dir_all(&root).and_then(|()| std::fs::write(&beside, &text))
+        {
+            self.status = format!("could not write {name}: {error}");
+            self.dirty_frame = true;
+            return;
+        }
+        let plural = if count == 1 { "pattern" } else { "patterns" };
+        self.status = format!("exported {count} {plural} to {name}");
+        self.log.push(LogLevel::Info, "set", self.status.clone());
+        self.dirty_frame = true;
+    }
+
     /// File > Rename set: the folder moves, and everything follows it -
     /// the tape being written too, whose open file the desk keeps writing
     /// where it moved to, the samples the folder itself brought, whose
@@ -2614,6 +2670,74 @@ mod tests {
             app.open_set_prompt(SetPrompt::ImportStrudel);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
             assert_eq!(app.status, "no new patterns - all 3 are already in home");
+        }
+
+        /// File > Export patterns… writes the set's scores as one pattern
+        /// export beside the sets, in the shape strudel.cc gives and
+        /// takes: keyed by name, an open score as it stands - unsaved
+        /// edits included - a closed one as its file reads, and the file
+        /// the open-set prompt offers again.
+        #[test]
+        fn exporting_patterns_writes_the_set_as_strudel_takes_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let sets = directory.path().join("sets");
+            std::fs::create_dir_all(&sets).expect("sets");
+            let home = directory.path().join("home");
+            std::fs::create_dir_all(&home).expect("home");
+            let mut app = app_over(&home);
+            app.prefs.sets_directory = Some(sets.display().to_string());
+            std::fs::write(home.join("spare.strudel"), "$: s(\"cp\")").expect("spare");
+            let before = app.editor().source().to_owned();
+            press(&mut app, KeyCode::Char('z'), KeyModifiers::NONE);
+            let edited = app.editor().source().to_owned();
+            assert_ne!(edited, before, "the edit took");
+
+            app.export_patterns();
+            let file = sets.join(format!("home patterns {}.json", crate::app::today()));
+            let text = std::fs::read_to_string(&file).expect("the export");
+            let read: serde_json::Value = serde_json::from_str(&text).expect("the export is json");
+            let serde_json::Value::Object(rows) = &read else {
+                panic!("the export is not an object: {text}")
+            };
+            assert_eq!(rows.len(), 2, "one entry a score: {text}");
+            assert_eq!(
+                rows.get("first").and_then(|code| code.as_str()),
+                Some(edited.as_str()),
+                "an open score goes out as it stands"
+            );
+            assert_eq!(
+                rows.get("spare").and_then(|code| code.as_str()),
+                Some("$: s(\"cp\")"),
+                "a closed score goes out as its file reads"
+            );
+            assert_eq!(
+                app.status,
+                format!(
+                    "exported 2 patterns to {}",
+                    file.file_name().unwrap().to_string_lossy()
+                )
+            );
+
+            // The export's own names come back through the importer, so
+            // the round trip keeps them.
+            let scores = strudel_scores(strudel_export(&text).expect("the export"));
+            assert_eq!(
+                scores,
+                [
+                    ("first".to_owned(), edited),
+                    ("spare".to_owned(), "$: s(\"cp\")".to_owned())
+                ]
+            );
+
+            // The open-set prompt offers the export beside the sets.
+            app.open_set_prompt(SetPrompt::OpenSet);
+            let (_, picker) = app.set_prompt.as_ref().expect("the prompt is up");
+            assert!(
+                picker
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.detail == "Strudel export - 2 patterns")
+            );
         }
 
         /// A Strudel pattern export gives its patterns, or says what it is

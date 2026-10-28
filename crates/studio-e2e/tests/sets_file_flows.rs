@@ -585,6 +585,64 @@ fn import_strudel_patterns_adds_them_to_the_open_set() {
     );
 }
 
+/// File ▸ Export patterns…: the set's scores as one pattern export at
+/// the sets root, keyed by name, the open score as it stands on screen,
+/// and the file offered again by the open-set prompt.
+#[test]
+fn export_patterns_writes_the_sets_scores_beside_the_sets() {
+    let mut studio = hermetic();
+    let set = studio.set_directory();
+    let name = set
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap()
+        .to_owned();
+    // A closed score beside the open one, and an unsaved edit on screen.
+    std::fs::write(set.join("spare.strudel"), "$: s(\"cp\")\n").unwrap();
+    studio.type_text(" ");
+    let score = studio.score();
+
+    drop_file_menu(&mut studio);
+    studio.press(KeyCode::Char('x'), KeyModifiers::NONE); // Export patterns…
+    assert!(
+        studio
+            .status()
+            .starts_with(&format!("exported 2 patterns to {name} patterns ")),
+        "{}",
+        studio.status()
+    );
+    let root = sets_root(&studio);
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(&root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|file| file.to_str())
+                .is_some_and(|file| {
+                    file.starts_with(&format!("{name} patterns")) && file.ends_with(".json")
+                })
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "one export beside the sets");
+    let text = std::fs::read_to_string(found.remove(0)).unwrap();
+    let rows: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text).unwrap();
+    assert_eq!(rows.len(), 2, "one entry a score: {text}");
+    assert_eq!(
+        rows["first"].as_str(),
+        Some(score.as_str()),
+        "the open score goes out as it stands"
+    );
+    assert_eq!(rows["spare"].as_str(), Some("$: s(\"cp\")\n"));
+
+    // The open-set prompt offers the export beside the sets.
+    drop_file_menu(&mut studio);
+    studio.press(KeyCode::Char('o'), KeyModifiers::NONE); // Open set…
+    studio.settle();
+    let rows = studio.rows();
+    row_containing(&rows, "Strudel export - 2 patterns");
+}
+
 /// File ▸ Open recent…: the set just left is offered, and Enter goes back
 /// to it - with the score exactly as it was left, because the set was
 /// written when the studio moved away from it.
