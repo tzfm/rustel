@@ -87,9 +87,9 @@ fn read_sidecar(path: &std::path::Path) -> Option<DecodedSample> {
         .checked_mul(4)
         .filter(|bytes| *bytes <= rustel_audio::sample_pcm_ceiling())?;
     let mut pcm = vec![0.0f32; samples / 4];
-    let body = &bytes[HEADER_LEN..];
-    for (slot, chunk) in pcm.iter_mut().zip(body.chunks_exact(4)) {
-        *slot = f32::from_le_bytes(chunk.try_into().ok()?);
+    let (_, chunks) = bytes[HEADER_LEN..].as_chunks::<4>();
+    for (slot, chunk) in pcm.iter_mut().zip(chunks) {
+        *slot = f32::from_le_bytes(*chunk);
     }
     DecodedSample::from_parts(rate, channels, pcm).ok()
 }
