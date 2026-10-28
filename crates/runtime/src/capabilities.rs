@@ -19,7 +19,6 @@ pub enum CapabilityId {
     Avx2Convolution,
     Avx2Supersaw,
     Avx2Wavetable,
-    NeonConvolution,
     NeonSupersaw,
     NeonWavetable,
 }
@@ -32,7 +31,6 @@ impl CapabilityId {
             Self::Avx2Convolution => "avx2_convolution",
             Self::Avx2Supersaw => "avx2_supersaw",
             Self::Avx2Wavetable => "avx2_wavetable",
-            Self::NeonConvolution => "neon_convolution",
             Self::NeonWavetable => "neon_wavetable",
             Self::NeonSupersaw => "neon_supersaw",
         }
@@ -387,15 +385,10 @@ impl CapabilityRegistry {
         let avx2_feature_detected = cpu_features
             .status(CpuFeatureId::Avx2)
             .is_some_and(|status| status.detected());
-        let neon_feature_detected = cpu_features
-            .status(CpuFeatureId::Neon)
-            .is_some_and(|status| status.detected());
-        let convolution_compiled = rustel_audio::ConvolutionKernelKind::Avx2.compiled()
-            || rustel_audio::ConvolutionKernelKind::Neon.compiled();
-        let convolution_detected =
-            convolution_compiled && (avx2_feature_detected || neon_feature_detected);
+        let convolution_compiled = rustel_audio::ConvolutionKernelKind::Avx2.compiled();
+        let convolution_detected = convolution_compiled && avx2_feature_detected;
         let convolution_selected =
-            dispatch.convolution_kernel_kind() != rustel_audio::ConvolutionKernelKind::Portable;
+            dispatch.convolution_kernel_kind() == rustel_audio::ConvolutionKernelKind::Avx2;
         let supersaw_compiled = rustel_audio::SupersawKernelKind::Avx2.compiled()
             || rustel_audio::SupersawKernelKind::Neon.compiled();
         let supersaw_detected = supersaw_compiled
@@ -440,15 +433,8 @@ impl CapabilityRegistry {
                 }
                 AccelerationPreference::Auto => CapabilityReason::CpuFeatureUnavailable,
             };
-            // Exactly one accelerated convolution implementation is compiled
-            // in, named by the architecture this binary was built for.
-            let id = if rustel_audio::ConvolutionKernelKind::Avx2.compiled() {
-                CapabilityId::Avx2Convolution
-            } else {
-                CapabilityId::NeonConvolution
-            };
             statuses.push(CapabilityStatus::new(
-                id,
+                CapabilityId::Avx2Convolution,
                 true,
                 convolution_detected,
                 convolution_selected,
@@ -594,16 +580,15 @@ mod tests {
         assert_eq!(registry.audio(), None);
         assert_eq!(
             registry.statuses().len(),
-            1 + usize::from(
-                rustel_audio::ConvolutionKernelKind::Avx2.compiled()
-                    || rustel_audio::ConvolutionKernelKind::Neon.compiled()
-            ) + usize::from(
-                rustel_audio::SupersawKernelKind::Avx2.compiled()
-                    || rustel_audio::SupersawKernelKind::Neon.compiled()
-            ) + usize::from(
-                rustel_audio::WavetableKernelKind::Avx2.compiled()
-                    || rustel_audio::WavetableKernelKind::Neon.compiled()
-            )
+            1 + usize::from(rustel_audio::ConvolutionKernelKind::Avx2.compiled())
+                + usize::from(
+                    rustel_audio::SupersawKernelKind::Avx2.compiled()
+                        || rustel_audio::SupersawKernelKind::Neon.compiled()
+                )
+                + usize::from(
+                    rustel_audio::WavetableKernelKind::Avx2.compiled()
+                        || rustel_audio::WavetableKernelKind::Neon.compiled()
+                )
         );
 
         let scalar = registry
@@ -615,11 +600,11 @@ mod tests {
         assert_eq!(
             scalar.reason(),
             if rustel_audio::selected_convolution_kernel_kind()
-                != rustel_audio::ConvolutionKernelKind::Portable
+                == rustel_audio::ConvolutionKernelKind::Avx2
                 || rustel_audio::selected_supersaw_kernel_kind()
                     != rustel_audio::SupersawKernelKind::Portable
                 || rustel_audio::selected_wavetable_kernel_kind()
-                    != rustel_audio::WavetableKernelKind::Portable
+                    == rustel_audio::WavetableKernelKind::Avx2
             {
                 CapabilityReason::ReferenceAndFallback
             } else {
@@ -640,26 +625,6 @@ mod tests {
             assert_eq!(avx2.selected(), detected);
             assert_eq!(
                 avx2.reason(),
-                if detected {
-                    CapabilityReason::SelectedByRuntime
-                } else {
-                    CapabilityReason::CpuFeatureUnavailable
-                }
-            );
-        }
-        if rustel_audio::ConvolutionKernelKind::Neon.compiled() {
-            let neon = registry
-                .status(CapabilityId::NeonConvolution)
-                .expect("NEON convolution");
-            let detected = registry
-                .cpu_features()
-                .status(CpuFeatureId::Neon)
-                .is_some_and(|status| status.detected());
-            assert!(neon.compiled());
-            assert_eq!(neon.detected(), detected);
-            assert_eq!(neon.selected(), detected);
-            assert_eq!(
-                neon.reason(),
                 if detected {
                     CapabilityReason::SelectedByRuntime
                 } else {
@@ -772,13 +737,6 @@ mod tests {
             assert!(!avx2.selected());
             assert_eq!(avx2.reason(), CapabilityReason::DisabledByPreference);
         }
-        if rustel_audio::ConvolutionKernelKind::Neon.compiled() {
-            let neon = portable
-                .status(CapabilityId::NeonConvolution)
-                .expect("NEON convolution");
-            assert!(!neon.selected());
-            assert_eq!(neon.reason(), CapabilityReason::DisabledByPreference);
-        }
         if rustel_audio::SupersawKernelKind::Avx2.compiled() {
             let avx2 = portable
                 .status(CapabilityId::Avx2Supersaw)
@@ -829,11 +787,6 @@ mod tests {
                     CapabilityId::Avx2Convolution,
                     rustel_audio::ConvolutionKernelKind::Avx2.compiled(),
                     dispatch.convolution_kernel_kind() == rustel_audio::ConvolutionKernelKind::Avx2,
-                ),
-                (
-                    CapabilityId::NeonConvolution,
-                    rustel_audio::ConvolutionKernelKind::Neon.compiled(),
-                    dispatch.convolution_kernel_kind() == rustel_audio::ConvolutionKernelKind::Neon,
                 ),
                 (
                     CapabilityId::Avx2Supersaw,
