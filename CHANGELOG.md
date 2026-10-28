@@ -66,6 +66,7 @@
 - The prebakes open from the Options menu.
 - `register()` can replace any built-in name, as on strudel.cc. The log notes each replacement once, and the built-in comes back when the call is removed.
 - Prebake helpers such as window.bpm = b => setcpm(b/4) now pass. Writing over an engine name gives a hint.
+- A set opened from inside the studio runs its own local prebake, as a fresh start on it does. The last set's helpers no longer pass the check in its scores, so a score that plays also exports.
 - The mixer no longer shows "no gamepad". The camera warning clears when nothing asks for the camera.
 - New terminal and terminal-warm themes use your terminal's colours.
 - Plugin edits load only the copy that changed. Heavy sets spread plugin chains over several cores.

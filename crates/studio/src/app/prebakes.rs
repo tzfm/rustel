@@ -120,6 +120,31 @@ impl App {
         self.queue_prebakes(&chain, false);
     }
 
+    /// Run the setup of a set just taken up, as a studio opening on that
+    /// set would.
+    ///
+    /// What the last set's setup defined stays in the engine, but the
+    /// checker no longer accepts it: an export of this set, or the next
+    /// studio on it, runs this set's setup alone, and a score that leans on
+    /// the old one would fail there.
+    pub(super) fn take_up_set_prebake(&mut self) {
+        let index = PrebakeScope::Local.index();
+        self.set_first_request = self.next_request_id;
+        self.applied_setup[index] = Arc::default();
+        self.prebake_applied[index] = None;
+        self.lint_pending = true;
+        self.opening_prebake = if self.check_stored_prebake(PrebakeScope::Local) {
+            // Quietly, as the set's levels come back: the status line is
+            // the set being opened. A refusal still says so.
+            let opened = std::mem::take(&mut self.status);
+            let request = self.queue_prebakes(&[PrebakeScope::Local], false);
+            self.status = opened;
+            request
+        } else {
+            None
+        };
+    }
+
     /// Show a prebake in the focused pane, from the settings sheet, the
     /// Options menu, or a learnt chord.
     pub(super) fn open_prebake(&mut self, scope: PrebakeScope) {
@@ -295,7 +320,12 @@ impl App {
     }
 
     /// Queue setups in the order they must run, skipping the empty ones.
-    pub(super) fn queue_prebakes(&mut self, chain: &[PrebakeScope], reinstall_after: bool) {
+    /// Returns the last request queued, when there is one.
+    pub(super) fn queue_prebakes(
+        &mut self,
+        chain: &[PrebakeScope],
+        reinstall_after: bool,
+    ) -> Option<u64> {
         let first_request = self.next_request_id;
         let mut queued = Vec::new();
         for &scope in chain {
@@ -312,13 +342,12 @@ impl App {
                 reinstall_after: false,
             });
         }
-        let Some(last) = queued.last_mut() else {
-            return;
-        };
+        let last = queued.last_mut()?;
+        let last_request = last.request_id;
         if let Some(feedback) = &mut self.evaluation_feedback
             && feedback.last_request == first_request
         {
-            feedback.last_request = last.request_id;
+            feedback.last_request = last_request;
         }
         // Only the end of a chain re-installs, and only once.
         last.reinstall_after = reinstall_after;
@@ -330,6 +359,7 @@ impl App {
         self.prebake_queue.extend(queued);
         self.status = format!("applying the {names} prebake…");
         self.flush_pending_prebake();
+        Some(last_request)
     }
 
     /// Hand the next setup to the engine. One at a time, so the order the
@@ -374,6 +404,17 @@ impl App {
         };
         let success = outcome_success(&outcome.result);
         self.finish_evaluation_request(outcome.request_id, success);
+        // The last set's own setup, still out when another set was taken
+        // up, says nothing about the set open now or the chain queued for it.
+        if sent.scope == PrebakeScope::Local && sent.request_id < self.set_first_request {
+            self.flush_pending_prebake();
+            self.dirty_frame = true;
+            return;
+        }
+        let opening = self
+            .opening_prebake
+            .take_if(|request| *request == sent.request_id)
+            .is_some();
         if success != Some(true) {
             // A setup that does not apply clears the queue behind it, so a
             // gesture waiting there settles the same way.
@@ -403,7 +444,9 @@ impl App {
                     "setup",
                     format!("{} applied", sent.scope.tab_name()),
                 );
-                self.status = format!("{} applied", sent.scope.tab_name());
+                if !opening {
+                    self.status = format!("{} applied", sent.scope.tab_name());
+                }
                 if sent.reinstall_after && self.prebake_queue.is_empty() {
                     self.reinstall_audible_score();
                 }
@@ -965,6 +1008,134 @@ mod tests {
             assert!(app.errors.get(ErrorOwner::Setup).is_some());
             assert_eq!(app.scenes.score_count(), 1);
             assert_eq!(app.editor().source(), "$: s(\"bd\")\n");
+        }
+
+        const FIRST_SETUP: &str = "globalThis.first = () => note('c')";
+        const SECOND_SETUP: &str = "globalThis.second = () => note('e')";
+
+        /// A studio over `directory` whose set has a setup of its own, sent
+        /// to the engine as a studio opening on the set sends it.
+        fn app_with_setup(directory: &std::path::Path) -> App {
+            let mut app = app_over(directory);
+            app.scenes.set_local_prebake(FIRST_SETUP);
+            app.queue_startup_prebakes();
+            app
+        }
+
+        /// The set at `directory`, with `setup` as its own.
+        fn set_with_setup(directory: &std::path::Path, setup: &str) -> SceneSet {
+            std::fs::write(directory.join("second.strudel"), "$: s(\"hh\")\n").expect("scene");
+            let mut set = SceneSet::open(directory, "// starter").expect("set");
+            set.set_local_prebake(setup);
+            set
+        }
+
+        /// Whether the check lets a score call `helper`.
+        fn accepts(app: &mut App, helper: &str) -> bool {
+            let revision = app.editor().revision();
+            !app.refuse_unclean(revision, &Arc::<str>::from(format!("$: {helper}()")))
+        }
+
+        /// A set taken up runs its own setup, as the next studio on it and
+        /// its export do, and the last set's helpers are refused there. It
+        /// runs quietly: the status line stays with the set that opened.
+        #[test]
+        fn a_set_taken_up_runs_its_own_setup_in_place_of_the_last_one() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_with_setup(directory.path());
+            settle(&mut app);
+            assert!(accepts(&mut app, "first"));
+
+            let elsewhere = tempfile::tempdir().expect("second set");
+            app.switch_set(set_with_setup(elsewhere.path(), SECOND_SETUP), "opened set");
+            settle(&mut app);
+
+            assert!(
+                !app.status.contains("prebake"),
+                "the setup took the status line: {}",
+                app.status
+            );
+            assert_eq!(
+                app.prebake_rows()[PrebakeScope::Local.index()].verdict,
+                PrebakeVerdict::Applied
+            );
+            assert!(
+                accepts(&mut app, "second"),
+                "the new set's helper was refused"
+            );
+            assert!(
+                !accepts(&mut app, "first"),
+                "the last set's helper was still accepted"
+            );
+        }
+
+        /// A set with no setup of its own refuses the last set's helpers
+        /// too: its export and the next studio on it run no local setup.
+        #[test]
+        fn a_set_without_a_setup_refuses_the_last_sets_helpers() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_with_setup(directory.path());
+            settle(&mut app);
+            assert!(accepts(&mut app, "first"));
+
+            let elsewhere = tempfile::tempdir().expect("second set");
+            app.switch_set(set_with_setup(elsewhere.path(), ""), "opened set");
+
+            assert!(app.prebake_inflight.is_none() && app.prebake_queue.is_empty());
+            assert!(
+                !accepts(&mut app, "first"),
+                "the last set's helper was still accepted"
+            );
+        }
+
+        /// The last set's setup, still running when another set is taken
+        /// up, ends without a word about the new set: its helpers are not
+        /// accepted there, its failure is not reported there, and the new
+        /// set's own setup still goes out behind it.
+        #[test]
+        fn the_last_sets_setup_ending_late_leaves_the_new_set_alone() {
+            for fails in [false, true] {
+                let directory = tempfile::tempdir().expect("temp dir");
+                let mut app = app_with_setup(directory.path());
+                let late = app
+                    .prebake_inflight
+                    .as_ref()
+                    .expect("the first set's setup went out")
+                    .request_id;
+
+                let elsewhere = tempfile::tempdir().expect("second set");
+                app.switch_set(set_with_setup(elsewhere.path(), SECOND_SETUP), "opened set");
+                app.handle_prebake(PrebakeOutcome {
+                    request_id: late,
+                    scope: PrebakeScope::Local,
+                    result: if fails {
+                        Err(crate::worker::EngineFailure {
+                            kind: "evaluation".into(),
+                            message: "boom".into(),
+                            recoverable: true,
+                            playback_stopped: false,
+                        })
+                    } else {
+                        Ok(())
+                    },
+                });
+
+                assert!(
+                    app.errors.get(ErrorOwner::Setup).is_none(),
+                    "the last set's setup was reported against this one"
+                );
+                assert!(
+                    !accepts(&mut app, "first"),
+                    "the last set's helper was accepted (fails: {fails})"
+                );
+                assert_eq!(
+                    app.prebake_inflight
+                        .as_ref()
+                        .map(|request| &*request.source),
+                    Some(SECOND_SETUP),
+                    "the new set's setup did not go out (fails: {fails})"
+                );
+            }
         }
     }
 }
