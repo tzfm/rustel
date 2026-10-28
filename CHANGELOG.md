@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- Each open scene keeps its plugin copies, as an open project of a DAW keeps its plugins: a scene you play again loads nothing, and a lane 2 scenes share keeps one copy. A scene you close gives its copies back at once, also the stopped score in play, and the next cleanup unloads its plugins. The plugin host keeps 320 copies ready at most, and a copy for the scene in play ends the copies of the scene you left first. When Studio holds more than half of the memory of the machine, the scene that waited longest gives its copies back.
+- A new output takes the plugin copies of the score back with no load: for another device, for a new buffer size, after a device stops, and for the Linux default device after a Stop. While the output is stopped, each plugin plays out its tail with no sound. A start after that has no old tail under its first note. An undo in 5 seconds of play takes the copy before back with no load, also through a Stop or a new output, and a run of preset changes keeps the preset it started from ready. A preset file you save again ends the waiting copies of its old state.
 - `talkit` speech plays from a live score and a bounce. The lookups that wrap a host's sample bank, for control validation and for Csound scores, answered a speech request with the default that says the host has none, so no host could speak. Both hand speech to the bank they wrap now.
 - Alt with 1 to 9 selects that strip's score from the editor, as a digit on its row in the set panel does. The chord runs to nine, and a number the strip does not hold says so. On iTerm2 and Apple Terminal, where Option composes text, the composed digit is recovered into the chord.
 - The set panel's details block stands under a rule of its own, set off from the list the way the foot of a file manager's pane is.
@@ -39,7 +41,6 @@ format. Each stem is tapped after its orbit's delay, reverb, filter, duck and fa
 - On a terminal that composes Option+A into text, the Chords and Scales tabs read it as the auto preview toggle. Before, the composed character typed into the search box.
 - A click on the preview fader reads the bar it draws. Before, the click's bar was narrower than the drawn one, so a click on the knob set a gain a few dB higher.
 - Sample and manifest fetches retry a transient 429 or 5xx after a short rest, so a briefly overloaded sample host no longer fails a corpus run.
-
 - Settings has an Appearance page: the visual rows of the first page in one place. The Advanced page is gone, its rows sit at the end of General, and the first tab is renamed General. A beat line under the header keeps the tempo visible in pulse, travel and wave looks, and the evaluation animation row shapes the flash a run of code makes, with fades of three speeds, swipe, zap, steps, glitch and wave.
 - Auto evaluate no longer reinstalls a score when the edit adds no instruction. Typing a `$:`, a lane name, or a new line under a playing set leaves the sound alone, so an `oneshot` lane does not fire for it. A press, or a watched file, still applies.
 - `oneshot()` with no grid plays on the next cycle, the same as `oneshot(1)`. Before, it was silent.

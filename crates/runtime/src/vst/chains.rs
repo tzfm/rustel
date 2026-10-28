@@ -237,8 +237,11 @@ struct Chain {
     epoch: u64,
     /// The time of the last use.
     seen: Duration,
+    /// The document of the last use: see [`ChainRegistry::document`].
+    document: u64,
     /// The time the lane of the chain left the score in play: see
-    /// [`ChainRegistry::score_changed`].
+    /// [`ChainRegistry::score_changed`]. A closed chain has the time its
+    /// document left play, whatever its lane: see [`ChainRegistry::leave`].
     left: Option<Duration>,
     /// The time the body of the lane lost the plugin of each call of the
     /// owner, until the body names it again or a note uses the chain: see
@@ -264,6 +267,13 @@ impl Chain {
         let instrument = self.lost[rustel_audio::EFFECT_CHAIN];
         let starts = [self.left, instrument, last];
         starts.into_iter().flatten().min()
+    }
+
+    /// The chain goes to `document` in place of its end, with no grace: see
+    /// [`ChainRegistry::holders`].
+    fn hand_back(&mut self, document: u64) {
+        self.document = document;
+        (self.left, self.lost) = (None, Default::default());
     }
 }
 
@@ -414,6 +424,13 @@ fn wanted_copy((slot, name, preset): CopyName<'_>) -> WantedCopy {
 /// and so does a chain whose lane body lost its plugins: see
 /// [`Self::settle`].
 ///
+/// A chain belongs to the document of its last use: see [`LaneTable`]. A
+/// chain of the document of the registry is a chain in play, and a chain of
+/// a document at rest is a rest chain. A rest chain waits for the next play
+/// of its document: it keeps its marks, takes no place of the room and has
+/// no [`CHAIN_UNSEEN_LIMIT`]. Each other chain is a closed chain: it ends
+/// after its time.
+///
 /// Each session has a registry for its score in play, and the plan of a
 /// session is a registry too: see [`Chains`]. Each render to a file has a
 /// registry of its own: see [`render_chains`].
@@ -427,6 +444,18 @@ struct ChainRegistry {
     /// number. A lane that left keeps the names of its last body while a
     /// chain has the lane: see [`Self::leave`].
     bodies: HashMap<u64, Vec<String>>,
+    /// The document of the score.
+    document: u64,
+    /// Each document at rest, with its rest order and the time it went to
+    /// rest: see [`LaneTable::rest_orders`].
+    rest: HashMap<u64, (u64, Duration)>,
+    /// The chains a snapshot of a document at rest has a copy of, each with
+    /// the document of that snapshot, the one that went to rest last when 2
+    /// snapshots have the chain: see [`Chains::snapshots`]. Such a chain goes
+    /// to that document in place of its end, as a rest chain with no grace.
+    /// So a document that plays again finds the chain, also when another
+    /// document took it.
+    holders: HashMap<u64, u64>,
 }
 
 /// What one assignment gives: see [`ChainRegistry::assign`].
@@ -450,6 +479,9 @@ impl ChainRegistry {
             accessed: 0,
             epoch: 0,
             bodies: HashMap::new(),
+            document: 0,
+            rest: HashMap::new(),
+            holders: HashMap::new(),
         }
     }
 
@@ -460,23 +492,138 @@ impl ChainRegistry {
     /// now too: see [`Chain::grace`]. The chain stays when the body names
     /// the plugin again, or when a note uses the chain: such a note takes
     /// the plugin from a variable or a helper. The chains of the score
-    /// before stay for the new score to take.
+    /// before stay for the new score to take. A rest chain keeps its marks,
+    /// and a closed chain leaves: see [`Self::leave`].
     fn score_changed(&mut self, lanes: &ScoreLanes, now: Duration) {
         self.epoch += 1;
         self.leave(lanes, now);
+    }
+
+    /// The documents of a score change: `document` plays, and each document
+    /// of `rest` is at rest, with its rest order. A document that was at
+    /// rest in `before` keeps its time, and a document that goes to rest now
+    /// has the time `now`.
+    fn set_documents(
+        &mut self,
+        document: u64,
+        rest: impl IntoIterator<Item = (u64, u64)>,
+        before: &HashMap<u64, (u64, Duration)>,
+        now: Duration,
+    ) {
+        self.document = document;
+        let since = |at_rest: u64| before.get(&at_rest).map_or(now, |(_, since)| *since);
+        let rest = rest.into_iter();
+        self.rest = rest
+            .map(|(at_rest, order)| (at_rest, (order, since(at_rest))))
+            .collect();
+    }
+
+    /// Sets the holders from the snapshot of each document at rest: see
+    /// [`Self::holders`]. A snapshot of a document that is not at rest here
+    /// holds no chain: a plan of that document has the chains of its
+    /// snapshot in play.
+    fn hold(&mut self, snapshots: &HashMap<u64, Vec<WantedCopy>>) {
+        let mut holders: HashMap<u64, (u64, u64)> = HashMap::new();
+        for (document, copies) in snapshots {
+            let Some((order, _)) = self.rest.get(document) else {
+                continue;
+            };
+            for copy in copies {
+                let held = holders
+                    .entry(copy.slot.chain)
+                    .or_insert((*order, *document));
+                *held = (*held).max((*order, *document));
+            }
+        }
+        let holders = holders.into_iter();
+        self.holders = holders
+            .map(|(chain, (_, document))| (chain, document))
+            .collect();
+    }
+
+    /// The chains in play: the chains of the document of the registry.
+    fn in_play(&self) -> impl Iterator<Item = (&ChainOwner, &Chain)> {
+        let owners = self.owners.iter();
+        owners.filter(|(_, chain)| chain.document == self.document)
+    }
+
+    /// The copies the chains of `document` want now, for its snapshot: the
+    /// copy of each call with no lost mark of each chain of the document
+    /// with no grace, and no key a chain lost. See [`Chains::snapshots`].
+    fn snapshot(&self, document: u64) -> Vec<WantedCopy> {
+        let chains = self
+            .owners
+            .iter()
+            .filter(|(owner, chain)| chain.document == document && chain.grace(owner).is_none());
+        let mut copies: Vec<CopyName<'_>> = Vec::new();
+        for (owner, chain) in chains {
+            let calls = owner.plugins.iter().zip(chain.lost).enumerate();
+            for (place, (plugin, lost)) in calls {
+                if let Some(plugin) = plugin
+                    && lost.is_none()
+                {
+                    let slot = slot_of(chain.id, chain.stages, place);
+                    copies.push((slot, plugin.name.as_str(), plugin.preset.as_deref()));
+                }
+            }
+        }
+        copies.sort_unstable();
+        copies.into_iter().map(wanted_copy).collect()
+    }
+
+    /// `document` plays again after its rest: each chain of its snapshot
+    /// `copies` belongs to it again, and counts its [`CHAIN_UNSEEN_LIMIT`]
+    /// from `now`. A plan of the document does this too, so its chains stay
+    /// when the tab closes before the commit: see [`Chains::close`]. Each
+    /// copy of the snapshot that the owner of its chain does not sit on goes
+    /// to the keys the chain lost, with the time `now`. So the next owner of
+    /// the chain sits on that copy, and the host keeps it [`CHAIN_GRACE`]
+    /// more: see [`seat`].
+    fn come_back(&mut self, document: u64, copies: &[WantedCopy], now: Duration) {
+        for (owner, chain) in &mut self.owners {
+            let id = chain.id;
+            let held = copies.iter().filter(|copy| copy.slot.chain == id);
+            let mut held = held.peekable();
+            if held.peek().is_none() {
+                continue;
+            }
+            (chain.document, chain.seen) = (document, now);
+            let seated: Vec<(InsertSlot, &PluginOwner)> =
+                owner.copies(chain.id, chain.stages).collect();
+            for copy in held {
+                let on = |(slot, plugin): &(InsertSlot, &PluginOwner)| {
+                    *slot == copy.slot
+                        && canonical(&plugin.name) == canonical(&copy.name)
+                        && plugin.preset == copy.preset
+                };
+                if !seated.iter().any(on) {
+                    chain.dropped.retain(|(key, _)| key != copy);
+                    chain.dropped.push((copy.clone(), now));
+                }
+            }
+        }
     }
 
     /// Marks each chain of a lane with no statement in `lanes` with the time
     /// the lane left, and clears the mark of each chain of a lane in
     /// `lanes`. Marks each call of a chain whose plugin the body of the
     /// lane named before and does not name now, and clears the mark of each
-    /// call whose plugin the body names.
+    /// call whose plugin the body names. A rest chain keeps its marks: its
+    /// score does not play. Marks each closed chain, whatever its lane: its
+    /// document left play, and its score does not come back.
     fn leave(&mut self, lanes: &ScoreLanes, now: Duration) {
         let bodies: HashMap<u64, &[String]> = lanes
             .lanes()
             .map(|(number, .., plugins)| (number, plugins))
             .collect();
         for (owner, chain) in &mut self.owners {
+            if self.rest.contains_key(&chain.document) {
+                continue;
+            }
+            if chain.document != self.document {
+                chain.left = chain.left.or(Some(now));
+                continue;
+            }
             let Some(number) = owner.lane.number() else {
                 continue;
             };
@@ -528,13 +675,15 @@ impl ChainRegistry {
     /// ```
     ///
     /// An unused chain has no note since the last score change. An owner
-    /// with its own chain keeps the stages of the chain, and an owner that
-    /// takes the chain of another owner sits on its units: see [`seat`].
-    /// With no room, `spare` gives the chain that ends to make room. An
-    /// owner gets no chain when `spare` gives none. With more chains than
-    /// room and no chain that ends, the owner of each newest chain above
-    /// the room gets no chain too: the list of the output leaves that chain
-    /// out.
+    /// takes a chain of any document, and the chain then belongs to the
+    /// document of the registry. An owner with its own chain keeps the
+    /// stages of the chain, and an owner that takes the chain of another
+    /// owner sits on its units: see [`seat`]. The room counts the chains in
+    /// play. With no room, `spare` gives the chain in play that ends to make
+    /// room: see [`Self::make_room`]. An owner gets no chain when `spare`
+    /// gives none. With more chains in play than room and no chain that
+    /// ends, the owner of each newest chain above the room gets no chain
+    /// too: the list of the output leaves that chain out.
     fn assign(
         &mut self,
         owners: &[(ChainOwner, bool)],
@@ -555,12 +704,12 @@ impl ChainRegistry {
         self.pair(owners, &mut seats, now);
         let (mut ended, mut cut) = (Vec::new(), None);
         // A Csound chain that sounds now takes a place of the room.
-        while self.owners.len() > room {
+        while self.in_play().count() > room {
             let Some(old) = spare(self) else {
                 // The list of the output leaves out the newest chains above
                 // the room. Their notes play with no plugin, so they ask the
                 // output for no bus.
-                let mut ids: Vec<u64> = self.owners.values().map(|chain| chain.id).collect();
+                let mut ids: Vec<u64> = self.in_play().map(|(_, chain)| chain.id).collect();
                 ids.sort_unstable();
                 let over = &ids[room..];
                 for seat in &mut seats {
@@ -568,36 +717,54 @@ impl ChainRegistry {
                         *seat = None;
                     }
                 }
-                let newest = self.owners.iter().max_by_key(|(_, chain)| chain.id);
+                let newest = self.in_play().max_by_key(|(_, chain)| chain.id);
                 cut = newest.map(|(owner, _)| owner.lane.clone());
                 break;
             };
-            ended.extend(self.owners.remove(&old).map(|gone| gone.id));
+            ended.extend(self.make_room(&old));
         }
         for ((owner, _), seat) in owners.iter().zip(&mut seats) {
             if seat.is_some() {
                 continue;
             }
-            if self.owners.len() >= room {
+            if self.in_play().count() >= room {
                 let Some(old) = spare(self) else {
                     continue;
                 };
-                ended.extend(self.owners.remove(&old).map(|gone| gone.id));
+                ended.extend(self.make_room(&old));
             }
             *seat = Some(self.insert(owner, now));
         }
         Assignment { seats, ended, cut }
     }
 
+    /// Ends the chain of `old` to make room, and gives its number. A chain a
+    /// snapshot holds goes to the document of the snapshot in place of its
+    /// end, and leaves the room too: see [`Self::holders`].
+    fn make_room(&mut self, old: &ChainOwner) -> Option<u64> {
+        let chain = self.owners.get_mut(old)?;
+        if let Some(document) = self.holders.get(&chain.id) {
+            chain.hand_back(*document);
+            return None;
+        }
+        self.owners.remove(old).map(|gone| gone.id)
+    }
+
     /// The seat of `owner` on its chain, in use now: its use, its score
     /// change and its time. A use ends the mark of each plugin the body of
     /// the lane lost: the owner has a plugin at each stage of the chain.
-    /// `None` when the registry has no chain of the owner.
+    /// The chain belongs to the document of the registry now. A use by the
+    /// score of another document ends the mark of a lane that left too: the
+    /// lane of the note is in the text in play. `None` when the registry
+    /// has no chain of the owner.
     fn touch(&mut self, owner: &ChainOwner, now: Duration) -> Option<Seat> {
         let chain = self.owners.get_mut(owner)?;
         self.accessed += 1;
         (chain.used, chain.epoch) = (self.accessed, self.epoch);
         (chain.seen, chain.lost) = (now, Default::default());
+        if chain.document != self.document {
+            (chain.document, chain.left) = (self.document, None);
+        }
         Some(Seat {
             chain: chain.id,
             stages: chain.stages,
@@ -646,6 +813,7 @@ impl ChainRegistry {
             used: 0,
             epoch: self.epoch,
             seen: now,
+            document: self.document,
             left: None,
             lost: Default::default(),
             dropped: Vec::new(),
@@ -713,13 +881,10 @@ impl ChainRegistry {
         }
     }
 
-    /// The owner of the unused chain in grace with the oldest time, then
-    /// the lowest number: see [`Chain::grace`].
+    /// The owner of the unused chain in play in grace with the oldest time,
+    /// then the lowest number: see [`Chain::grace`].
     fn in_grace(&self) -> Option<ChainOwner> {
-        let unused = self
-            .owners
-            .iter()
-            .filter(|(_, chain)| chain.epoch < self.epoch);
+        let unused = self.in_play().filter(|(_, chain)| chain.epoch < self.epoch);
         let grace = unused.filter_map(|(owner, chain)| {
             let order = (chain.grace(owner)?, chain.id);
             Some((order, owner))
@@ -729,37 +894,36 @@ impl ChainRegistry {
             .map(|(_, owner)| owner.clone())
     }
 
-    /// The owner of the unused chain with the oldest use: see
+    /// The owner of the unused chain in play with the oldest use: see
     /// [`render_chains`].
     fn oldest_unused(&self) -> Option<ChainOwner> {
-        let unused = self
-            .owners
-            .iter()
-            .filter(|(_, chain)| chain.epoch < self.epoch);
+        let unused = self.in_play().filter(|(_, chain)| chain.epoch < self.epoch);
         unused
             .min_by_key(|(_, chain)| chain.used)
             .map(|(owner, _)| owner.clone())
     }
 
     /// Takes out the chains that left the score, after their time: see
-    /// [`Self::due`]. Gives their numbers.
+    /// [`Self::due`]. Gives their numbers. A chain a snapshot holds goes to
+    /// the document of the snapshot: see [`Self::end`].
     fn settle(&mut self, now: Duration) -> Vec<u64> {
         let gone = self.due(now);
-        self.end(&gone, now);
-        gone
+        self.take_out(gone, now)
     }
 
     /// The chains whose time passed at `now`. A chain ends [`CHAIN_GRACE`]
     /// after the start of its grace: see [`Chain::grace`]. A chain with a
     /// plugin the body of its lane does not name ends [`CHAIN_UNSEEN_LIMIT`]
     /// after its last note, when no note used it since the last score
-    /// change: see [`Self::unnamed`].
+    /// change: see [`Self::unnamed`]. A rest chain waits for the play of its
+    /// document with no such limit.
     fn due(&self, now: Duration) -> Vec<u64> {
         let past = |at: Option<Duration>, time: Duration| {
             at.is_some_and(|at| now.saturating_sub(at) >= time)
         };
         let due = self.owners.iter().filter(|(owner, chain)| {
             let unseen = chain.epoch < self.epoch
+                && !self.rest.contains_key(&chain.document)
                 && past(Some(chain.seen), CHAIN_UNSEEN_LIMIT)
                 && self.unnamed(owner, chain);
             unseen || past(chain.grace(owner), CHAIN_GRACE)
@@ -784,8 +948,18 @@ impl ChainRegistry {
 
     /// Takes out the chains with a number in `gone`, and each key a chain
     /// lost [`CHAIN_GRACE`] before `now` or earlier: see [`Chain::dropped`].
+    /// A chain a snapshot holds goes to the document of the snapshot in
+    /// place of its end: see [`Self::holders`].
     fn end(&mut self, gone: &[u64], now: Duration) {
-        self.owners.retain(|_, chain| !gone.contains(&chain.id));
+        let holders = &self.holders;
+        self.owners.retain(|_, chain| {
+            let ends = gone.contains(&chain.id);
+            let held = holders.get(&chain.id).filter(|_| ends);
+            if let Some(document) = held {
+                chain.hand_back(*document);
+            }
+            held.is_some() || !ends
+        });
         for chain in self.owners.values_mut() {
             chain
                 .dropped
@@ -793,11 +967,90 @@ impl ChainRegistry {
         }
     }
 
-    /// The chains the score has, the last used first.
-    fn named(&self) -> Vec<u64> {
-        let mut chains: Vec<&Chain> = self.owners.values().collect();
-        chains.sort_by_key(|chain| Reverse(chain.used));
+    /// Takes out the chains with a number in `gone`: see [`Self::end`].
+    /// Gives the chains that ended.
+    fn take_out(&mut self, mut gone: Vec<u64>, now: Duration) -> Vec<u64> {
+        self.end(&gone, now);
+        gone.retain(|chain| !self.holders.contains_key(chain));
+        gone
+    }
+
+    /// Each chain of `document`, a document at rest that closed or gives its
+    /// copies back, ends: see [`Chains::give_back`]. A chain a snapshot
+    /// holds goes to the document of the snapshot. A chain of a lane of
+    /// `lanes`, the lanes of the score of the registry, goes to the document
+    /// of the registry when no chain in play has the lane: the score shares
+    /// the lane, and no note of it took a chain yet. Such a chain counts its
+    /// [`CHAIN_UNSEEN_LIMIT`] from `now`, as a chain whose document comes
+    /// back from rest. Of the chains of one lane, a chain with a plugin the
+    /// body of the lane names goes first, then the lowest number. A note of
+    /// the lane takes only a chain with a plugin in common: see
+    /// [`ChainOwner::fit`]. Gives the chains that ended.
+    fn close(&mut self, document: u64, lanes: &ScoreLanes, now: Duration) -> Vec<u64> {
+        let shared: HashMap<u64, &[String]> = lanes
+            .lanes()
+            .map(|(number, .., plugins)| (number, plugins))
+            .collect();
+        let in_play = self.in_play().filter_map(|(owner, _)| owner.lane.number());
+        let mut chained: HashSet<u64> = in_play.collect();
+        let mut closing: Vec<(&ChainOwner, &mut Chain)> = self
+            .owners
+            .iter_mut()
+            .filter(|(_, chain)| chain.document == document)
+            .collect();
+        let named = |owner: &ChainOwner| {
+            let names = owner.lane.number().and_then(|lane| shared.get(&lane));
+            let mut plugins = owner.plugins.iter().flatten();
+            names
+                .is_some_and(|names| plugins.any(|plugin| names.contains(&canonical(&plugin.name))))
+        };
+        closing.sort_unstable_by_key(|(owner, chain)| (!named(owner), chain.id));
+        let mut ended = Vec::new();
+        for (owner, chain) in closing {
+            if let Some(holder) = self.holders.get(&chain.id) {
+                chain.hand_back(*holder);
+                continue;
+            }
+            let lane = owner.lane.number().filter(|lane| shared.contains_key(lane));
+            if lane.is_some_and(|lane| chained.insert(lane)) {
+                chain.hand_back(self.document);
+                chain.seen = now;
+                continue;
+            }
+            ended.push(chain.id);
+        }
+        self.owners.retain(|_, chain| !ended.contains(&chain.id));
+        ended
+    }
+
+    /// Each chain of a closed document ends: `closed` gives true for such a
+    /// document. A chain a snapshot holds goes to the document of the
+    /// snapshot. Gives the chains that ended. See [`Self::end`].
+    fn end_closed(&mut self, closed: impl Fn(u64) -> bool, now: Duration) -> Vec<u64> {
+        let chains = self.owners.values();
+        let gone = chains.filter(|chain| closed(chain.document));
+        let gone = gone.map(|chain| chain.id).collect();
+        self.take_out(gone, now)
+    }
+
+    /// The chains of the output, the last used first: the chains in play,
+    /// then the rest chains of each document that went to rest less than
+    /// [`CHAIN_GRACE`] before `now`, `room` chains in all at most. So a
+    /// document that plays again in that time finds its copies on their bus,
+    /// and a rest chain takes no place of a chain in play.
+    fn named(&self, room: usize, now: Duration) -> Vec<u64> {
+        let by_use = |chains: &mut Vec<&Chain>| chains.sort_by_key(|chain| Reverse(chain.used));
+        let mut chains: Vec<&Chain> = self.in_play().map(|(_, chain)| chain).collect();
+        by_use(&mut chains);
         chains.truncate(rustel_audio::MAX_INSERT_BUSES);
+        let young = |chain: &&Chain| {
+            let rest = self.rest.get(&chain.document);
+            rest.is_some_and(|(_, since)| now.saturating_sub(*since) < CHAIN_GRACE)
+        };
+        let mut resting: Vec<&Chain> = self.owners.values().filter(young).collect();
+        by_use(&mut resting);
+        let room = room.saturating_sub(chains.len());
+        chains.extend(resting.into_iter().take(room));
         chains.iter().map(|chain| chain.id).collect()
     }
 
@@ -856,12 +1109,31 @@ struct SliderLink {
 /// output: see [`Self::tick`]. The plugin host keeps the copies the chains
 /// want: see [`keep_now`]. The values source of the output reads the
 /// values the sliders of the score move: see [`slider_moved`].
+///
+/// A document that goes to rest keeps the copies its chains want, and the
+/// host keeps them for its next play, as an open project of a DAW keeps
+/// its plugins: see [`Self::snapshots`]. While the process holds more than
+/// half of the memory of the machine, a document at rest gives them back:
+/// see [`rest_floor`].
 pub(crate) struct Chains {
     /// The chains of the score in play.
     playing: ChainRegistry,
     /// The last text the session planned that is not in play, with the
-    /// registry as the commit of that text leaves it.
+    /// registry as the commit of that text leaves it. The registry has the
+    /// document of the read of the text.
     plan: Option<(String, ChainRegistry)>,
+    /// The snapshot of each document at rest: the copies its chains wanted
+    /// when it went to rest. See [`ChainRegistry::snapshot`]. A document
+    /// whose chains wanted no copy has no snapshot. The snapshot goes when
+    /// its document plays again or closes, or at the memory floor: see
+    /// [`rest_floor`].
+    snapshots: HashMap<u64, Vec<WantedCopy>>,
+    /// The copies of the snapshots, each one time with the rest order of its
+    /// document, the newest order for a copy of 2 snapshots: the copies the
+    /// host keeps at rest. See [`Host::keep`].
+    rest: Vec<(WantedCopy, u64)>,
+    /// The count of the changes of [`Self::rest`].
+    rest_changes: u64,
     /// The plugin lines of the chains since the last take: see
     /// [`take_problems`].
     problems: Vec<String>,
@@ -872,12 +1144,15 @@ pub(crate) struct Chains {
     ticked: Option<f64>,
     /// The number of the chains for the host: see [`Host::keep`].
     caller: u64,
-    /// The copies the chains want and the chains they name, as the host
-    /// has them from the last call of [`keep_now`].
-    kept: (Vec<WantedCopy>, Vec<u64>),
+    /// The copies the chains want, the chains they name and the count of
+    /// the changes of the copies at rest, as the host has them from the last
+    /// call of [`keep_now`].
+    kept: (Vec<WantedCopy>, Vec<u64>, u64),
     /// The copies an engine holds that the chains no longer want, as the
     /// last call of [`Host::keep`] gave them.
     gone: Vec<(InsertSlot, InsertKey)>,
+    /// The room of the last assignment: see [`Batch::room`].
+    room: usize,
     /// The counts of the live output at its last turn: see
     /// [`named_chains`].
     turn: InsertTurn,
@@ -903,12 +1178,16 @@ impl Chains {
         Self {
             playing: ChainRegistry::new(),
             plan: None,
+            snapshots: HashMap::new(),
+            rest: Vec::new(),
+            rest_changes: 0,
             problems: Vec::new(),
             clock: Duration::ZERO,
             ticked: None,
             caller: CALLERS.fetch_add(1, Ordering::Relaxed),
-            kept: (Vec::new(), Vec::new()),
+            kept: (Vec::new(), Vec::new(), 0),
             gone: Vec::new(),
+            room: rustel_audio::MAX_INSERT_BUSES,
             turn: InsertTurn::default(),
             told: InsertTurn::default(),
             links: Vec::new(),
@@ -933,12 +1212,11 @@ impl Chains {
     /// A turn of the producer of the live output, at the time `now` of the
     /// output in seconds. The clock of the chains goes on by the time since
     /// the turn before, 1 s at most, and by nothing when `now` goes back. So
-    /// a Stop, a held start or a pause of the producer ends no chain. A
-    /// session with no chain counts no turn.
+    /// no chain ends by its time through a Stop, a held start or a pause of
+    /// the producer. A session with no chain counts no turn.
     fn tick(&mut self, now: f64) {
-        let plan = self.plan.iter().map(|(_, planned)| planned);
-        let mut registries = std::iter::once(&self.playing).chain(plan);
-        if !now.is_finite() || registries.all(|registry| registry.owners.is_empty()) {
+        let empty = |registry: &ChainRegistry| registry.owners.is_empty();
+        if !now.is_finite() || self.registries().all(empty) {
             return;
         }
         if let Some(ticked) = self.ticked
@@ -949,45 +1227,85 @@ impl Chains {
         self.ticked = Some(now);
     }
 
-    /// Plans the chains of a score text that is not in play. `lanes` are
-    /// the lanes of the text. Gives the registry of the plan: a copy of the
-    /// registry of the score in play, with the score change of the text.
-    /// Each note of the text takes the number of its chain there. A session
-    /// with a plan starts from that plan, so a new lane keeps its number from
-    /// one try of an edit to the next. Gives also the chains the plan no
-    /// longer has: see [`ChainRegistry::catch_up`].
+    /// The registry of the score in play, then the plan.
+    fn registries(&self) -> impl Iterator<Item = &ChainRegistry> {
+        let plan = self.plan.iter().map(|(_, planned)| planned);
+        std::iter::once(&self.playing).chain(plan)
+    }
+
+    /// Plans the chains of a score text that is not in play. `lanes` has
+    /// the lanes of the text and its document: see [`LaneTable::read_of`].
+    /// Gives the registry of the plan: a copy of the registry of the score
+    /// in play, with the score change of the text. Each note of the text
+    /// takes the number of its chain there. A session with a plan of the
+    /// same document starts from that plan, so a new lane keeps its number
+    /// from one try of an edit to the next. Gives also the chains the plan
+    /// no longer has: see [`ChainRegistry::catch_up`]. A plan of another
+    /// document starts from the registry in play, and the chains only the
+    /// plan before made end: see [`Self::forget`]. The plan of a document
+    /// at rest takes the chains of its snapshot, as its commit does: see
+    /// [`ChainRegistry::come_back`].
     fn plan(
         &mut self,
         source: &str,
-        lanes: &ScoreLanes,
+        lanes: &LaneTable,
         now: Duration,
     ) -> (&mut ChainRegistry, Vec<u64>) {
-        let (mut planned, ended) = match self.plan.take() {
+        let (document, read) = lanes.read_of(source);
+        let same = self.plan.take_if(|(_, last)| last.document == document);
+        let (mut planned, ended) = match same {
             Some((_, mut last)) => {
                 let ended = last.catch_up(&self.playing);
                 (last, ended)
             }
-            None => (self.playing.clone(), Vec::new()),
+            None => (self.playing.clone(), self.forget()),
         };
-        planned.score_changed(lanes, now);
+        let rest = lanes.rest_orders_for(document);
+        planned.set_documents(document, rest, &self.playing.rest, now);
+        planned.hold(&self.snapshots);
+        if let Some(copies) = self.snapshots.get(&document) {
+            planned.come_back(document, copies, now);
+        }
+        planned.score_changed(read, now);
         let (_, planned) = self.plan.insert((source.to_owned(), planned));
         (planned, ended)
     }
 
-    /// A new score plays: see [`score_changed`]. `lanes` are the lanes of
-    /// its text. Gives the chains of the plan that end with this change.
-    /// The links of the sliders go, and the notes of the new score link
-    /// their sliders again: see [`link_sliders`]. A value a slider moved
-    /// still goes to the output.
+    /// A new score plays: see [`score_changed`]. `lanes` has the lanes of
+    /// its text, its document and the documents at rest. Gives the chains
+    /// of the plan that end with this change. The links of the sliders go,
+    /// and the notes of the new score link their sliders again: see
+    /// [`link_sliders`]. A value a slider moved still goes to the output.
+    ///
+    /// A document that goes to rest keeps the copies its chains want, as
+    /// the registry in play has them before the change: see
+    /// [`Self::snapshots`]. A document that comes back from rest takes the
+    /// chains of its snapshot again: see [`ChainRegistry::come_back`]. Each
+    /// of its chains counts its [`CHAIN_UNSEEN_LIMIT`] from now. The
+    /// change compares with the documents at rest of the score in play
+    /// before it, so the commit of a plan does the same.
     fn score_changed(
         &mut self,
         source: Option<&str>,
-        lanes: &ScoreLanes,
+        lanes: &LaneTable,
         now: Duration,
     ) -> Vec<u64> {
         self.links.clear();
         self.linked.store(false, Ordering::Relaxed);
-        match self.plan.take_if(|(text, _)| Some(text.as_str()) == source) {
+        let document = lanes.document();
+        let left = self.playing.document;
+        if left != document && lanes.rest_orders().any(|(at_rest, _)| at_rest == left) {
+            let snapshot = self.playing.snapshot(left);
+            if !snapshot.is_empty() {
+                self.snapshots.insert(left, snapshot);
+            }
+        }
+        let before = self.playing.rest.clone();
+        let snapshot = self.snapshots.remove(&document);
+        let same = self.plan.take_if(|(text, planned)| {
+            Some(text.as_str()) == source && planned.document == document
+        });
+        let ended = match same {
             // The plan made the score change of this text. A chain the
             // score in play made after the plan leaves with its lane too,
             // and loses each plugin the lane body in play named and this
@@ -999,7 +1317,11 @@ impl Chains {
             Some((_, mut planned)) => {
                 let ended = planned.catch_up(&self.playing);
                 planned.bodies = std::mem::take(&mut self.playing.bodies);
-                planned.leave(lanes, now);
+                planned.set_documents(document, lanes.rest_orders(), &before, now);
+                if let Some(copies) = &snapshot {
+                    planned.come_back(document, copies, now);
+                }
+                planned.leave(lanes.playing(), now);
                 let restart = |mark: Option<Duration>, kept: Option<Duration>| {
                     mark.map(|_| kept.unwrap_or(now))
                 };
@@ -1022,10 +1344,104 @@ impl Chains {
                 ended
             }
             None => {
-                self.playing.score_changed(lanes, now);
+                let playing = &mut self.playing;
+                playing.set_documents(document, lanes.rest_orders(), &before, now);
+                if let Some(copies) = &snapshot {
+                    playing.come_back(document, copies, now);
+                }
+                playing.score_changed(lanes.playing(), now);
                 Vec::new()
             }
+        };
+        if before.contains_key(&document) {
+            let chains = self.playing.owners.values_mut();
+            for chain in chains.filter(|chain| chain.document == document) {
+                chain.seen = now;
+            }
         }
+        self.set_rest();
+        ended
+    }
+
+    /// Sets the copies at rest for the host and the holders of each
+    /// registry from the snapshots: see [`Self::rest`] and
+    /// [`ChainRegistry::holders`].
+    fn set_rest(&mut self) {
+        let mut rest: Vec<(CopyName<'_>, u64)> = Vec::new();
+        for (document, copies) in &self.snapshots {
+            let Some((order, _)) = self.playing.rest.get(document) else {
+                continue;
+            };
+            let copies = copies.iter();
+            let copies = copies.map(|copy| (copy.slot, copy.name.as_str(), copy.preset.as_deref()));
+            rest.extend(copies.map(|copy| (copy, *order)));
+        }
+        // The newest order of a copy comes first, and stays.
+        rest.sort_unstable_by_key(|(copy, order)| (*copy, Reverse(*order)));
+        rest.dedup_by_key(|(copy, _)| *copy);
+        let rest: Vec<(WantedCopy, u64)> = rest
+            .into_iter()
+            .map(|(copy, order)| (wanted_copy(copy), order))
+            .collect();
+        if rest != self.rest {
+            (self.rest, self.rest_changes) = (rest, self.rest_changes + 1);
+        }
+        self.playing.hold(&self.snapshots);
+        if let Some((_, planned)) = &mut self.plan {
+            planned.hold(&self.snapshots);
+        }
+    }
+
+    /// The tab of `document` left: see [`LaneTable::forget`]. A document at
+    /// rest gives its copies back at once: see [`Self::give_back`]. A plan
+    /// of the document keeps its chains, so a held edit or a launch of the
+    /// document lands and plays as a closed score. The closed score in play
+    /// plays on: see [`Self::end_closed`]. `lanes` has the lanes of the
+    /// scores. Gives the chains that ended.
+    fn close(&mut self, document: u64, lanes: &LaneTable) -> Vec<u64> {
+        if self.playing.rest.remove(&document).is_none() {
+            return Vec::new();
+        }
+        if let Some((_, planned)) = &mut self.plan {
+            planned.rest.remove(&document);
+        }
+        self.give_back(document, lanes)
+    }
+
+    /// `document`, a document at rest, gives its copies back: its snapshot
+    /// goes, and each of its chains ends in the registry in play and in a
+    /// plan of another document, as [`ChainRegistry::close`] says. A plan
+    /// of the document keeps its chains. `lanes` has the lanes of the
+    /// scores. Gives the chains that ended.
+    fn give_back(&mut self, document: u64, lanes: &LaneTable) -> Vec<u64> {
+        self.snapshots.remove(&document);
+        self.set_rest();
+        let now = self.clock;
+        let mut ended = self.playing.close(document, lanes.playing(), now);
+        if let Some((source, planned)) = &mut self.plan
+            && planned.document != document
+        {
+            let (_, read) = lanes.read_of(source);
+            ended.extend(planned.close(document, read, now));
+        }
+        ended.sort_unstable();
+        ended.dedup();
+        ended
+    }
+
+    /// Ends each chain of each closed document in both registries: the
+    /// chains of a closed score in play, and each closed chain in its
+    /// grace. See [`LaneTable::is_closed`]. A chain a snapshot holds goes to
+    /// the document of the snapshot. Gives the chains that ended.
+    fn end_closed(&mut self, lanes: &LaneTable) -> Vec<u64> {
+        let (closed, now) = (|document| lanes.is_closed(document), self.clock);
+        let mut ended = self.playing.end_closed(closed, now);
+        if let Some((_, planned)) = &mut self.plan {
+            ended.extend(planned.end_closed(closed, now));
+        }
+        ended.sort_unstable();
+        ended.dedup();
+        ended
     }
 
     /// Drops the plan. Gives the chains only the plan made.
@@ -1042,7 +1458,9 @@ impl Chains {
     /// when its time passed in both, so a chain the plan uses stays, and so
     /// does a chain the score in play plays. A chain only one of them has
     /// ends after its time there. A chain that ends leaves both: the commit
-    /// of a plan brings back no chain whose copies the host ended.
+    /// of a plan brings back no chain whose copies the host ended. A chain a
+    /// snapshot holds goes to the document of the snapshot in both: see
+    /// [`ChainRegistry::end`].
     fn settle(&mut self, now: Duration) -> Vec<u64> {
         let Some((_, planned)) = &mut self.plan else {
             return self.playing.settle(now);
@@ -1053,22 +1471,26 @@ impl Chains {
             .filter(|id| ends.contains(id) || !planned.has(*id))
             .collect();
         gone.extend(ends.iter().filter(|id| !self.playing.has(**id)));
-        self.playing.end(&gone, now);
         planned.end(&gone, now);
-        gone
+        self.playing.take_out(gone, now)
     }
 
-    /// The plugin copies the chains want now, each one time and in order,
-    /// and the chains of the score in play and of the plan: what the host
-    /// keeps for the session. An owner wants the copy of each stage it sits
-    /// on, until [`CHAIN_GRACE`] after the body of its lane lost the plugin:
-    /// see [`Chain::lost`]. A chain wants the copy of a key it lost
-    /// [`CHAIN_GRACE`] more: see [`Chain::dropped`].
+    /// The plugin copies the chains in play want now, each one time and in
+    /// order, and the chains in play of the score in play and of the plan:
+    /// what the host keeps live for the session. An owner wants the copy of
+    /// each stage it sits on, until [`CHAIN_GRACE`] after the body of its
+    /// lane lost the plugin: see [`Chain::lost`]. A chain wants the copy of
+    /// a key it lost [`CHAIN_GRACE`] more: see [`Chain::dropped`]. Of the
+    /// keys a slot lost in that time, the slot wants the oldest and the
+    /// newest. So a run of preset changes keeps the copy in use, the copy
+    /// before and the copy of the preset the run started from: 3 copies of
+    /// the slot at most. Its undo builds nothing. A rest chain wants the
+    /// copies of its snapshot at rest: see [`Self::rest`].
     fn wanted(&self) -> (Vec<CopyName<'_>>, Vec<u64>) {
         let young = |at: Duration| self.clock.saturating_sub(at) < CHAIN_GRACE;
-        let plan = self.plan.iter().map(|(_, planned)| planned);
-        let registries = std::iter::once(&self.playing).chain(plan);
-        let chains: Vec<(&ChainOwner, &Chain)> = registries.flat_map(|one| &one.owners).collect();
+        let registries = self.registries();
+        let chains: Vec<(&ChainOwner, &Chain)> =
+            registries.flat_map(ChainRegistry::in_play).collect();
         let mut copies = Vec::new();
         for (owner, chain) in &chains {
             let calls = owner.plugins.iter().zip(chain.lost).enumerate();
@@ -1080,10 +1502,20 @@ impl Chains {
                     copies.push((slot, plugin.name.as_str(), plugin.preset.as_deref()));
                 }
             }
-            let dropped = chain.dropped.iter().filter(|(_, at)| young(*at));
-            let dropped =
-                dropped.map(|(copy, _)| (copy.slot, copy.name.as_str(), copy.preset.as_deref()));
-            copies.extend(dropped);
+            // The keys of each slot in the order they left. The sort keeps
+            // the order of the list for keys of one time.
+            let mut dropped: Vec<&(WantedCopy, Duration)> =
+                chain.dropped.iter().filter(|(_, at)| young(*at)).collect();
+            dropped.sort_by_key(|(copy, at)| (copy.slot, *at));
+            for (place, (copy, _)) in dropped.iter().enumerate() {
+                let first = place == 0 || dropped[place - 1].0.slot != copy.slot;
+                let last = dropped
+                    .get(place + 1)
+                    .is_none_or(|(next, _)| next.slot != copy.slot);
+                if first || last {
+                    copies.push((copy.slot, copy.name.as_str(), copy.preset.as_deref()));
+                }
+            }
         }
         copies.sort_unstable();
         copies.dedup();
@@ -1094,15 +1526,16 @@ impl Chains {
     }
 
     /// The plugin names of the chains of the score in play and of the
-    /// plan, as the notes write them, each one time. A chain in its grace
-    /// does not count: see [`Chain::grace`].
+    /// plan, and of the copies of each snapshot, as the notes write them,
+    /// each one time. A chain in its grace does not count: see
+    /// [`Chain::grace`].
     fn plugin_names(&self) -> Vec<String> {
-        let plan = self.plan.iter().map(|(_, planned)| planned);
-        let registries = std::iter::once(&self.playing).chain(plan);
-        let chains = registries.flat_map(|registry| &registry.owners);
+        let chains = self.registries().flat_map(|registry| &registry.owners);
         let kept = chains.filter(|(owner, chain)| chain.grace(owner).is_none());
         let plugins = kept.flat_map(|(owner, _)| owner.plugins.iter().flatten());
         let mut names: Vec<String> = plugins.map(|plugin| plugin.name.clone()).collect();
+        let rest = self.snapshots.values().flatten();
+        names.extend(rest.map(|copy| copy.name.clone()));
         names.sort_unstable();
         names.dedup();
         names
@@ -1147,15 +1580,35 @@ impl Chains {
     }
 }
 
-/// The host forgets the copies and the chains of a session that ends: see
-/// [`Host::keep`]. Its parked copies stay until the host needs their place.
+/// The host ends the chains of a session that ends: each chain the last
+/// call of [`Host::keep`] named, each chain of both registries and each
+/// chain of a snapshot. The host keeps the copies of a chain no call names,
+/// as of a rest chain or a closed chain, so the session names them all here.
+/// Their copies end, and a copy an engine holds ends when it comes home.
+/// The host keeps no copy for a session that is gone.
 impl Drop for Chains {
     fn drop(&mut self) {
-        let (copies, named) = &self.kept;
-        if (!copies.is_empty() || !named.is_empty())
+        let (copies, named, _) = &self.kept;
+        let away = |registry: &ChainRegistry| {
+            let mut chains = registry.owners.values();
+            chains.any(|chain| chain.document != registry.document)
+        };
+        if (!copies.is_empty() || !named.is_empty() || self.registries().any(away))
             && let Some(host) = started()
         {
-            host.keep(self.caller, Vec::new(), Vec::new(), Vec::new());
+            let chains = self
+                .registries()
+                .flat_map(|registry| registry.owners.values());
+            let held = self
+                .snapshots
+                .values()
+                .flatten()
+                .map(|copy| copy.slot.chain);
+            let chains = chains.map(|chain| chain.id).chain(held);
+            let mut ended: Vec<u64> = named.iter().copied().chain(chains).collect();
+            ended.sort_unstable();
+            ended.dedup();
+            host.keep(self.caller, Vec::new(), Vec::new(), Vec::new(), ended);
         }
     }
 }
@@ -1343,6 +1796,7 @@ pub(crate) fn assign<'a>(
     let room = batch.room(csound.orbit_chains());
     let mut chains = locked(chains);
     let now = chains.clock;
+    chains.room = room;
     let assignment = chains
         .playing
         .assign(&batch.owners, room, now, ChainRegistry::in_grace);
@@ -1384,18 +1838,22 @@ pub(crate) fn render_chains(onsets: &[&crate::OnsetEventJson]) -> Vec<NoteChain>
 }
 
 /// A new score plays in a session: `source` is its text, or `None` for a
-/// direct pattern. `lanes` has the lanes of the new score in play. The
-/// chains of the score before stay for the new score to take, and a chain
-/// of a lane that left ends after its time: see
-/// [`ChainRegistry::score_changed`]. When the session planned this text,
-/// the chains of the plan are the chains of the score, so each note has the
-/// number the plan gave: see [`plan`]. A plan of a different text stays.
+/// direct pattern. `lanes` has the lanes of the new score in play and its
+/// document. The chains of the score before stay for the new score to
+/// take, and a chain of a lane that left ends after its time: see
+/// [`ChainRegistry::score_changed`]. When the session planned this text in
+/// the same document, the chains of the plan are the chains of the score,
+/// so each note has the number the plan gave: see [`plan`]. A plan of a
+/// different text stays. A document that goes to rest keeps the copies of
+/// its chains: see [`Chains::score_changed`].
 ///
 /// `live` is false for a session with no live output: see
 /// `Session::attach_plugins`. Such a session counts no time, so each chain
 /// ends at once where it would end after its time, and the host hears
 /// nothing of it: no copy of such a chain exists. A session with a live
-/// output tells the host the copies its chains want: see [`keep_now`].
+/// output tells the host the copies its chains want: see [`keep_now`]. Each
+/// change checks the memory floor of its copies at rest: see
+/// [`rest_floor`].
 pub(crate) fn score_changed(
     chains: &Mutex<Chains>,
     lanes: &LaneTable,
@@ -1404,38 +1862,117 @@ pub(crate) fn score_changed(
 ) {
     let mut chains = locked(chains);
     let now = chains.clock;
-    let ended = chains.score_changed(source, lanes.playing(), now);
+    let mut ended = chains.score_changed(source, lanes, now);
     if live {
+        let memory = crate::process_stats::memory_now;
+        ended.extend(rest_floor(&mut chains, lanes, memory));
         keep_now(&mut chains, ended);
     } else {
         chains.settle(Duration::MAX);
     }
 }
 
-/// Forgets each lane that left the score in play and that no chain of the
-/// session has: see [`LaneTable::forget_away`]. A chain of the plan counts
-/// too. The commit of a score calls this after [`score_changed`].
+/// The memory floor of the copies at rest. While the process holds more
+/// than half of the memory of the machine, the document at rest with a
+/// snapshot and the lowest rest order gives its copies back: see
+/// [`Chains::give_back`]. It stays at rest with its lanes, and its next play
+/// builds its copies again. One document goes at each call, with one plugin
+/// line. `memory` gives the memory of the process and of the machine, each
+/// `None` with no reading: see [`crate::process_stats::memory_now`]. With no
+/// reading, nothing ends. A session with no copy at rest asks `memory`
+/// nothing. Gives the chains that ended.
+fn rest_floor(
+    chains: &mut Chains,
+    lanes: &LaneTable,
+    memory: impl FnOnce() -> (Option<u64>, Option<u64>),
+) -> Vec<u64> {
+    if chains.rest.is_empty() {
+        return Vec::new();
+    }
+    let (Some(process), Some(machine)) = memory() else {
+        return Vec::new();
+    };
+    if process <= machine / 2 {
+        return Vec::new();
+    }
+    let order = |document: &u64| chains.playing.rest.get(document).map(|(order, _)| *order);
+    let documents = chains.snapshots.keys();
+    let first = documents.filter_map(|document| Some((order(document)?, *document)));
+    let Some((_, document)) = first.min() else {
+        return Vec::new();
+    };
+    let line = "a scene that waits gave back its plugin copies: \
+                the studio holds more than half of the memory"
+        .to_owned();
+    if !chains.problems.contains(&line) {
+        chains.problems.push(line);
+    }
+    chains.give_back(document, lanes)
+}
+
+/// Forgets each lane that left the score in play, and each lane of a
+/// document at rest, that no chain of the session has: see
+/// [`LaneTable::forget_away`]. A chain of the plan counts too. The commit
+/// of a score calls this after [`score_changed`].
 pub(crate) fn forget_lanes_away(chains: &Mutex<Chains>, lanes: &mut LaneTable) {
     let chained: HashSet<u64> = {
         let chains = locked(chains);
-        let plan = chains.plan.iter().map(|(_, planned)| planned);
-        let registries = std::iter::once(&chains.playing).chain(plan);
-        let owners = registries.flat_map(|registry| registry.owners.keys());
+        let owners = chains
+            .registries()
+            .flat_map(|registry| registry.owners.keys());
         owners.filter_map(|owner| owner.lane.number()).collect()
     };
     lanes.forget_away(|lane| chained.contains(&lane));
 }
 
+/// The tab of `document` left: see [`LaneTable::forget`] and
+/// [`Chains::close`]. A document at rest gives its plugin copies back at
+/// once. The closed score in play plays on: see [`end_closed_documents`].
+/// With `live`, the host hears it, and the call gives true when an engine
+/// holds a copy of a chain that ended: the output gives it back at its
+/// close. A session with no closed document at rest asks the host nothing.
+pub(crate) fn forget_document(
+    chains: &Mutex<Chains>,
+    lanes: &mut LaneTable,
+    document: u64,
+    live: bool,
+) -> bool {
+    lanes.forget(document);
+    let mut chains = locked(chains);
+    let ended = chains.close(document, lanes);
+    live && kept_after(&mut chains, ended)
+}
+
+/// Ends the chains of each closed document, of the closed score in play
+/// too: see [`Chains::end_closed`]. The session calls this while its
+/// transport is stopped. With `live`, the host hears it, and the call gives
+/// true when an engine holds a copy of a chain that ended. A session with no
+/// chain of a closed document asks the host nothing.
+pub(crate) fn end_closed_documents(chains: &Mutex<Chains>, lanes: &LaneTable, live: bool) -> bool {
+    let mut chains = locked(chains);
+    let ended = chains.end_closed(lanes);
+    live && kept_after(&mut chains, ended)
+}
+
+/// Tells the host the copies the chains want after the end of the chains
+/// `ended`: see [`keep_now`]. Gives true when an engine holds a copy of a
+/// chain in `ended`: see [`engine_holds_chains`].
+fn kept_after(chains: &mut Chains, ended: Vec<u64>) -> bool {
+    keep_now(chains, ended.clone());
+    !ended.is_empty() && engine_holds_chains(&ended)
+}
+
 /// Plans the chains of the score text `source` before the text goes in
 /// play. `haps` are notes of the text, and `shadow` are notes of its lanes
-/// that do not play. `lanes` has the lanes of the text, and `csound` the
-/// Csound chains of the session. Gives the plugin copies the notes need,
-/// each for the chain its note has when the text is in play: see
-/// [`wants_of`].
+/// that do not play. `lanes` has the lanes of the text and its document,
+/// and `csound` the Csound chains of the session. Gives the plugin copies
+/// the notes need, each for the chain its note has when the text is in
+/// play: see [`wants_of`].
 /// The plan changes no chain of the score in play, and the commit of the
-/// text takes the plan: see [`score_changed`]. A new plan starts from the
-/// plan before. A new lane then keeps its chain, and so its copies, from one
-/// try of an edit to the next.
+/// text takes the plan: see [`score_changed`]. A new plan of the same
+/// document starts from the plan before. A new lane then keeps its chain,
+/// and so its copies, from one try of an edit to the next. A plan of
+/// another document starts from the score in play: see [`Chains::plan`].
 ///
 /// The chains settle while the session has a plan: see [`Chains::settle`].
 /// The session ends each plan: with the commit of its text, with a new
@@ -1451,11 +1988,12 @@ pub(crate) fn plan(
     haps: &[crate::HapJson],
     shadow: &[crate::HapJson],
 ) -> Vec<Want> {
-    let lanes = lanes.candidate(source).unwrap_or(lanes.playing());
-    let batch = Batch::of(notes(haps, shadow), Some(lanes));
+    let (_, read) = lanes.read_of(source);
+    let batch = Batch::of(notes(haps, shadow), Some(read));
     let room = batch.room(csound.orbit_chains());
     let mut chains = locked(chains);
     let now = chains.clock;
+    chains.room = room;
     let (planned, mut ended) = chains.plan(source, lanes, now);
     let assignment = planned.assign(&batch.owners, room, now, ChainRegistry::in_grace);
     ended.extend(assignment.ended);
@@ -1477,24 +2015,31 @@ pub(crate) fn forget_plan(chains: &Mutex<Chains>) {
     }
 }
 
-/// Tells the host the plugin copies the chains of a session want and the
-/// chains they name, when these changed since the last call or a chain
-/// ended: see [`Host::keep`] and [`Chains::wanted`]. `ended` has the
-/// chains that ended in a registry of the session. The host hears only the
-/// chains that no registry has now: a chain that one registry ends to make
-/// room stays while the other registry has it, as in [`Chains::settle`].
-/// The host ends each copy no chain wants, and builds no copy a live chain
-/// does not want. The host gives the copies an engine holds that no chain
-/// wants: see [`named_chains`]. Only a session with plugins on a live
-/// output calls this: no copy of the chains of another session exists.
+/// Tells the host the plugin copies the chains of a session want, the
+/// chains they name and the copies of the snapshots at rest, when these
+/// changed since the last call or a chain ended: see [`Host::keep`],
+/// [`Chains::wanted`] and [`Chains::rest`]. `ended` has the chains that
+/// ended in a registry of the session. The host hears only the chains that
+/// no registry names now: a chain that one registry ends to make room
+/// stays while the other registry has it, as in [`Chains::settle`]. A chain
+/// a snapshot holds does not end either. The host ends each copy no chain
+/// wants, and builds no copy a live chain does not want. The host gives the
+/// copies an engine holds that no chain wants: see [`named_chains`]. Only a
+/// session with plugins on a live output calls this: no copy of the chains
+/// of another session exists.
 fn keep_now(chains: &mut Chains, mut ended: Vec<u64>) {
     let (copies, named) = chains.wanted();
-    ended.retain(|chain| !named.contains(chain));
-    let (kept, kept_named) = &chains.kept;
+    let held = &chains.playing.holders;
+    ended.retain(|chain| !named.contains(chain) && !held.contains_key(chain));
+    let (kept, kept_named, rest_changes) = &chains.kept;
     let as_kept = kept
         .iter()
         .map(|copy| (copy.slot, copy.name.as_str(), copy.preset.as_deref()));
-    if ended.is_empty() && as_kept.eq(copies.iter().copied()) && *kept_named == named {
+    if ended.is_empty()
+        && as_kept.eq(copies.iter().copied())
+        && *kept_named == named
+        && *rest_changes == chains.rest_changes
+    {
         return;
     }
     // With no host, no copy exists. The next call tells the host.
@@ -1502,14 +2047,17 @@ fn keep_now(chains: &mut Chains, mut ended: Vec<u64>) {
         return;
     };
     let copies: Vec<WantedCopy> = copies.into_iter().map(wanted_copy).collect();
-    chains.gone = host.keep(chains.caller, copies.clone(), named.clone(), ended);
-    chains.kept = (copies, named);
+    let rest = chains.rest.clone();
+    chains.gone = host.keep(chains.caller, copies.clone(), named.clone(), rest, ended);
+    chains.kept = (copies, named, chains.rest_changes);
 }
 
 /// The chains the playing score has, for the audio output: see
 /// `LiveScalarDevice::set_named_insert_chains`. `turn` has the counts of
 /// the output: see [`take_output_lines`]. A chain that left the score is not
-/// in the list after its time: see [`Chains::settle`]. The host then hears
+/// in the list after its time: see [`Chains::settle`]. The chains of a
+/// document that went to rest stay in the list for that time, in the room of
+/// the last assignment: see [`ChainRegistry::named`]. The host then hears
 /// the copies the chains want, before the output asks for a copy: see
 /// [`keep_now`]. Gives also each copy an engine holds that the chains no
 /// longer want, [`CHAIN_GRACE`] after a chain lost its key: see
@@ -1523,14 +2071,16 @@ pub(crate) fn named_chains(chains: &Mutex<Chains>, turn: InsertTurn) -> InsertCh
     let left = chains.settle(now);
     keep_now(&mut chains, left);
     InsertChains {
-        named: chains.playing.named(),
+        named: chains.playing.named(chains.room, now),
         gone: chains.gone.clone(),
     }
 }
 
 /// The plugin names of the chains of a session, for the unload of the
 /// plugins no score uses: see [`Chains::plugin_names`]. The clock of the
-/// chains stands while the output is stopped, so a Stop ends no chain.
+/// chains stands while the output is stopped, so no chain ends by its time
+/// then. A Stop ends only the chains of a closed document: see
+/// [`end_closed_documents`].
 pub(crate) fn plugin_names(chains: &Mutex<Chains>) -> Vec<String> {
     locked(chains).plugin_names()
 }
@@ -1544,7 +2094,8 @@ pub(crate) fn tick(chains: &Mutex<Chains>, now: f64) {
 }
 
 /// The plugin lines of the chains of a session since the last call: each
-/// lane with no room for its chain. See [`assign`].
+/// lane with no room for its chain, and the line of the memory floor. See
+/// [`assign`] and [`rest_floor`].
 pub(crate) fn take_problems(chains: &Mutex<Chains>) -> Vec<String> {
     std::mem::take(&mut locked(chains).problems)
 }
@@ -1709,6 +2260,7 @@ pub(crate) fn wants(
     let room = batch.room(csound.orbit_chains());
     let mut chains = locked(chains);
     let now = chains.clock;
+    chains.room = room;
     let assignment = chains
         .playing
         .assign(&batch.owners, room, now, ChainRegistry::in_grace);
@@ -1799,7 +2351,8 @@ pub(crate) fn load(names: &mut Vec<String>) {
 /// wait, at the sample rate of the output. The builds run in the order of
 /// the list, so a caller gives the copies of the lanes that sound first.
 /// Gives the copies of lanes that play and that are not ready: a plugin in
-/// its load, or a copy in its build. Gives also the line of each copy the
+/// its load, a copy in its build, or a copy an engine gave back on its way
+/// home, which needs no build. Gives also the line of each copy the
 /// host cannot make, with its reason, as the note of the copy or the host
 /// says it. A copy with a build in the line gets no second build, so a
 /// caller looks as often as it needs.
@@ -1816,6 +2369,12 @@ pub(crate) fn ensure(wants: &[Want], sample_rate: u32) -> (Vec<&Want>, Vec<Strin
         let (host, preset) = (host(), preset.as_deref());
         match host.prepared(name, preset, *instrument, sample_rate, *slot) {
             rustel_vst3::Prepared::Ready(_) => {}
+            // The copy comes home from an engine, and needs no build.
+            rustel_vst3::Prepared::Returning => {
+                if *sounds {
+                    pending.push(want);
+                }
+            }
             rustel_vst3::Prepared::Unavailable(reason) => {
                 let call = if *instrument { "vsti" } else { "vst" };
                 lines.push(format!("{call} skipped: {reason}"));
@@ -1832,9 +2391,22 @@ pub(crate) fn ensure(wants: &[Want], sample_rate: u32) -> (Vec<&Want>, Vec<Strin
     (pending, lines)
 }
 
+/// The copies on their way home that the chains of a session want, for a
+/// live output at the rate `sample_rate`: see [`Host::returning`]. The call
+/// starts the retune of each such copy that waits at another rate. Chains
+/// that want no copy ask the host nothing.
+pub(crate) fn returning(chains: &Mutex<Chains>, sample_rate: u32) -> usize {
+    let chains = locked(chains);
+    if chains.kept.0.is_empty() {
+        return 0;
+    }
+    started().map_or(0, |host| host.returning(chains.caller, sample_rate))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process_stats::tests::MEMORY;
     use crate::vst::lanes::tests::play;
     use crate::vst::tests::HOST_CALLS;
 
@@ -1904,6 +2476,41 @@ mod tests {
         numbers
     }
 
+    /// Reads `score` in `document` and puts it in play: its lanes, then the
+    /// score change of the chains at `now`. Gives the lane number of each
+    /// labeled statement.
+    fn play_in(
+        lanes: &mut LaneTable,
+        chains: &mut Chains,
+        document: u64,
+        score: &str,
+        now: Duration,
+    ) -> Vec<u64> {
+        lanes.set_reading(document);
+        let numbers = play(lanes, score);
+        chains.score_changed(Some(score), lanes, now);
+        numbers
+    }
+
+    /// The rest order of `document`, a document at rest.
+    fn order_of(lanes: &LaneTable, document: u64) -> u64 {
+        let mut orders = lanes.rest_orders();
+        let order = orders.find(|(at_rest, _)| *at_rest == document);
+        order.expect("a document at rest").1
+    }
+
+    /// The copies `chains` want live now, as the host gets them.
+    fn live_copies(chains: &Chains) -> Vec<WantedCopy> {
+        let (copies, _) = chains.wanted();
+        copies.into_iter().map(wanted_copy).collect()
+    }
+
+    /// The chain with the number `id` of `registry`.
+    fn chain_with(registry: &ChainRegistry, id: u64) -> &Chain {
+        let mut chains = registry.owners.values();
+        chains.find(|chain| chain.id == id).expect("the chain")
+    }
+
     /// The copies the chains of `registry` want at `now`, as the host gets
     /// them: see [`Chains::wanted`].
     fn wanted(registry: &ChainRegistry, now: Duration) -> Vec<WantedCopy> {
@@ -1913,14 +2520,14 @@ mod tests {
         copies.into_iter().map(wanted_copy).collect()
     }
 
-    /// Gives the host the copies and the chains `chains` want now, as a
-    /// call of [`keep_now`] with a host does. Gives the calls of this thread
-    /// to the host so far.
+    /// Gives the host the copies and the chains `chains` want now, and the
+    /// copies at rest, as a call of [`keep_now`] with a host does. Gives the
+    /// calls of this thread to the host so far.
     fn kept(chains: &Mutex<Chains>) -> usize {
         let mut chains = locked(chains);
         let (copies, named) = chains.wanted();
         let copies = copies.into_iter().map(wanted_copy).collect();
-        chains.kept = (copies, named);
+        chains.kept = (copies, named, chains.rest_changes);
         HOST_CALLS.get()
     }
 
@@ -1986,6 +2593,9 @@ mod tests {
     /// A chain owner is its lane and its plugin calls: the values of a note
     /// change no owner. Only a note with no lane has its orbit in its owner.
     /// The lane of a note comes from its tag and from the lanes of its text.
+    /// A note with no lane is of the same lane in each document, so it takes
+    /// a chain of a document at rest. The host keeps the copy the take drops
+    /// for the next play of that document.
     #[test]
     fn plugin_ownership_separates_patterns_and_survives_control_edits() {
         let mut registry = ChainRegistry::new();
@@ -2069,6 +2679,39 @@ mod tests {
         assert!(lanes.read(bare).is_empty());
         let needed = plan(&chains, &lanes, &csound, bare, &[hap(&note(None))], &[]);
         assert_eq!(needed[0].slot.chain, playing[0]);
+
+        // A note with no lane is of the same lane in each document. Of
+        // document 2, it takes the chain of a note with no lane of document
+        // 1 at rest with a plugin in common, as in one document, and the chain
+        // is of 2. The host keeps the copy the take drops at rest. Back in 1,
+        // the note takes the chain again and sits on its old copy.
+        let (mut lanes, mut chains) = (LaneTable::default(), Chains::new());
+        let (now, later) = (Duration::ZERO, CHAIN_GRACE);
+        let (first, second) = ("lead: note(\"c\")", "kick: s(\"bd\")");
+        play_in(&mut lanes, &mut chains, 1, first, now);
+        let loose = |calls: &[(u32, &str)]| self::owner("", calls, None);
+        let wet = loose(&[(0, "ott"), (1, "verb")]);
+        let chain = chain_of(&mut chains.playing, wet.clone(), now);
+        play_in(&mut lanes, &mut chains, 2, second, now);
+        let delay = loose(&[(0, "ott"), (1, "delay")]);
+        assert_eq!(chain_of(&mut chains.playing, delay, now), chain);
+        assert_eq!(chain_with(&chains.playing, chain).document, 2);
+        let verb = wanted_copy((rustel_audio::effect_slot(chain, 1), "verb", None));
+        assert!(chains.rest.contains(&(verb.clone(), order_of(&lanes, 1))));
+        // The unload of the plugins keeps the plugin of the copy at rest.
+        assert_eq!(chains.plugin_names(), ["delay", "ott", "verb"]);
+        chains.clock = later;
+        play_in(&mut lanes, &mut chains, 1, first, later);
+        assert!(live_copies(&chains).contains(&verb));
+        // The key the take dropped takes the time of the return.
+        let dropped = chain_with(&chains.playing, chain).dropped.iter();
+        let keys: Vec<Duration> = dropped
+            .filter(|(key, _)| *key == verb)
+            .map(|(_, at)| *at)
+            .collect();
+        assert_eq!(keys, [later]);
+        let back = seats_of(&mut chains.playing, &[wet], later)[0];
+        assert_eq!((back.chain, back.stages), (chain, stages(&[0, 1])));
     }
 
     /// The output runs 64 chains. The owner of a 65th chain gets no chain,
@@ -2077,7 +2720,10 @@ mod tests {
     /// the chain of its orbit, so each Csound orbit takes a place, also in
     /// the first window after a commit. A chain that ends makes room, and
     /// its number does not come again. A chain that one registry ends to
-    /// make room stays in the host while the other registry has it.
+    /// make room stays in the host while the other registry has it. A chain
+    /// of a document at rest takes no place. The output runs it for 5 s of
+    /// play after its document goes to rest, in the room the chains in play
+    /// leave.
     #[test]
     fn plugin_registry_bounds_metadata_without_reusing_live_ids() {
         let line = |lane: usize| format!("l{lane}: note(\"c\").vsti(\"serum\").vst(\"ott\")\n");
@@ -2370,6 +3016,90 @@ mod tests {
             let (_, planned) = chains.plan.as_ref().expect("the plan");
             assert!(!chains.playing.has(full[0]) && planned.has(full[0]));
         }
+
+        // The chains of a document at rest take no place of the room. With 64
+        // chains of document 1 at rest, 64 owners of document 2 each get a
+        // chain, with no line, and the output names the 64 of 2 only. The
+        // 65th owner of 2 gets the line: a chain of 1 in its grace does not
+        // end for it.
+        let other = |lane: usize| format!("m{lane}: note(\"e\").vsti(\"vital\")\n");
+        let vital = |read: &[u64], at: usize| {
+            serde_json::json!({
+                "__rustel_lane": format!("#{}", read[at]),
+                "vsti": {"name": "vital", "__rustel_binding": format!("p{at}")},
+            })
+        };
+        let window_of = |read: &[u64], count: usize| -> Vec<crate::ValueJson> {
+            let notes = (0..count).map(|at| crate::ValueJson::Raw(vital(read, at)));
+            notes.collect()
+        };
+        let sorted = |mut chains: Vec<u64>| {
+            chains.sort_unstable();
+            chains
+        };
+        let named =
+            |chains: &Mutex<Chains>| sorted(named_chains(chains, InsertTurn::default()).named);
+        let (mut lanes, chains) = (LaneTable::default(), Mutex::new(Chains::new()));
+        lanes.set_reading(1);
+        play(&mut lanes, &in_play);
+        score_changed(&chains, &lanes, Some(in_play.as_str()), true);
+        let first = numbers(&assign(&chains, &lanes, &no_csound, &notes[..64], false));
+        play(&mut lanes, &rest);
+        score_changed(&chains, &lanes, Some(rest.as_str()), true);
+        let second: String = (0..65).map(other).collect();
+        lanes.set_reading(2);
+        let read = play(&mut lanes, &second);
+        score_changed(&chains, &lanes, Some(second.as_str()), true);
+        assert!(
+            locked(&chains).playing.has(first[0]),
+            "a chain of 1 in its grace"
+        );
+        let window = window_of(&read, 65);
+        let numbered = assign(&chains, &lanes, &no_csound, &window, false);
+        assert_eq!(numbered[64], NoteChain::Refused);
+        let refused = "the lane 'm64' at line 65 plays with no plugin: 64 chains play at most";
+        assert_eq!(take_problems(&chains), [refused]);
+        assert_eq!(named(&chains), sorted(numbers(&numbered)));
+        // With 32 chains of 2 and 32 rest chains of 1 that went to rest less
+        // than CHAIN_GRACE before, the output names the 64. With one Csound
+        // orbit in the last assignment, it names 31 of 1. After CHAIN_GRACE
+        // of play it names the 32 of 2 only.
+        let (mut lanes, chains) = (LaneTable::default(), Mutex::new(Chains::new()));
+        let half: String = (0..32).map(line).collect();
+        lanes.set_reading(1);
+        play(&mut lanes, &half);
+        score_changed(&chains, &lanes, Some(half.as_str()), false);
+        let resting = numbers(&assign(&chains, &lanes, &no_csound, &notes[..32], false));
+        let second: String = (0..32).map(other).collect();
+        lanes.set_reading(2);
+        let read = play(&mut lanes, &second);
+        score_changed(&chains, &lanes, Some(second.as_str()), false);
+        let window = window_of(&read, 32);
+        let playing = numbers(&assign(&chains, &lanes, &no_csound, &window, false));
+        assert_eq!(named(&chains), sorted([&playing[..], &resting].concat()));
+        let window: Vec<crate::ValueJson> = window.into_iter().chain([csound(2)]).collect();
+        assign(&chains, &lanes, &no_csound, &window, false);
+        let listed = named(&chains);
+        assert_eq!(listed.len(), 63);
+        assert!(playing.iter().all(|chain| listed.contains(chain)));
+        let rested = listed.iter().filter(|chain| resting.contains(chain));
+        assert_eq!(rested.count(), 31);
+        // A look and a plan keep the room of their assignment too.
+        let mut haps: Vec<crate::HapJson> = (0..32).map(|at| hap(&vital(&read, at))).collect();
+        wants(&chains, &lanes, &no_csound, &haps, &[]);
+        assert_eq!(named(&chains).len(), 64);
+        haps.push(hap(
+            &serde_json::json!({"s": "sine", "csound": "probe", "orbit": 2}),
+        ));
+        plan(&chains, &lanes, &no_csound, &second, &haps, &[]);
+        assert_eq!(named(&chains).len(), 63);
+        forget_plan(&chains);
+        locked(&chains).clock += CHAIN_GRACE;
+        assert_eq!(named(&chains), sorted(playing.clone()));
+        // A commit keeps the time each document went to rest.
+        play(&mut lanes, &second);
+        score_changed(&chains, &lanes, Some(second.as_str()), false);
+        assert_eq!(named(&chains), sorted(playing));
     }
 
     /// An edit that leaves a plugin call as it is keeps the chain of the
@@ -2383,6 +3113,9 @@ mod tests {
     /// sits on a stage of its chain, and keeps the stage through an edit. A
     /// lane with no statement takes a chain of a run-time lane that grows to
     /// it. The plan of an edit gives its chains before the edit is in play.
+    /// The first read of another document takes the chain of a lane it
+    /// shares, as an edit does. The host keeps the copy of the preset of the
+    /// document at rest for its next play.
     #[test]
     fn an_edit_keeps_the_chains_the_new_score_still_has() {
         let mut lanes = LaneTable::default();
@@ -2407,7 +3140,8 @@ mod tests {
         let chains: Vec<u64> = seats.iter().map(|seat| seat.chain).collect();
         let (serum, zyklop, fx) = (chains[0], chains[1], chains[2]);
         assert!(serum != zyklop && zyklop != fx);
-        assert_eq!(registry.named(), [fx, zyklop, serum]);
+        let room = rustel_audio::MAX_INSERT_BUSES;
+        assert_eq!(registry.named(room, start), [fx, zyklop, serum]);
         // A new chain sits the effects on its stages in call order.
         assert_eq!(seats[2].stages, stages(&[0, 1]));
 
@@ -2449,6 +3183,17 @@ mod tests {
         let dark_preset = Some("Dark".to_owned());
         assert_eq!(presets(&registry, start), [None, dark_preset.clone()]);
         assert_eq!(presets(&registry, later), [dark_preset]);
+        // Of a run of 4 presets in CHAIN_GRACE, the slot keeps the copy in
+        // use, the copy before and the copy of the preset the run started
+        // from, and not the copy between them.
+        let second = Duration::from_secs(1);
+        for (at, name) in [(1, "Soft"), (2, "Hard")] {
+            let picked = with_preset(owners(1)[0].clone(), instrument, name);
+            registry.score_changed(lanes.playing(), start + second * at);
+            assert_eq!(chain_of(&mut registry, picked, start + second * at), serum);
+        }
+        let [hard, soft] = ["Hard", "Soft"].map(|name| Some(name.to_owned()));
+        assert_eq!(presets(&registry, start + second * 2), [None, hard, soft]);
 
         // 2 arms of a stack with one plugin keep their chains when a third
         // arm asks first.
@@ -2664,6 +3409,14 @@ mod tests {
         assert_eq!(seated(&mut registry, three, at(8)), stages(&[0, 1, 2]));
         let flanger = fx_of(&[(30, "chorus"), (31, "eq"), (32, "flanger")]);
         assert_eq!(seated(&mut registry, flanger, at(8)), stages(&[1, 2, 3]));
+        // One plugin in place of another takes a stage of its own. Its undo
+        // in CHAIN_GRACE puts the plugin back on the stage of its dropped
+        // key, so the copy of that stage plays again.
+        let swapped = fx_of(&[(30, "chorus"), (31, "phaser"), (32, "flanger")]);
+        assert_eq!(seated(&mut registry, swapped, at(8)), stages(&[1, 0, 3]));
+        let undone = fx_of(&[(30, "chorus"), (31, "eq"), (32, "flanger")]);
+        assert_eq!(seated(&mut registry, undone, at(8)), stages(&[1, 2, 3]));
+        assert!(effects(&registry, at(8), fx).contains(&copy(2, "eq", None)));
 
         // A lane with no statement: a `$` lane above moves the name of each
         // lane after it, and a call above moves each call number. An owner
@@ -2776,17 +3529,17 @@ mod tests {
         // The plan of a text that is not in play changes no chain of the
         // score in play. The text has one more lane. Its next try has one
         // more call above that lane: the 2 plans give the lane one number.
-        let mut chains = Chains::new();
+        let (mut chains, table) = (Chains::new(), LaneTable::default());
         chains.playing = registry;
         let before = chains.playing.clone();
         let kept = named(1, 1)[0].clone();
         let harp = |lane: u32, call: u32| owner(&format!("${lane}"), &[], Some((call, "harp")));
-        let (planned, _) = chains.plan("a lane more", &none, start);
+        let (planned, _) = chains.plan("a lane more", &table, start);
         let tried = chains_of(planned, &[kept.clone(), harp(9, 11)], start);
         assert_eq!(tried[0], lead[0]);
         assert!(!before.has(tried[1]));
         let moved = harp(10, 12);
-        let (planned, ended) = chains.plan("a call more", &none, start);
+        let (planned, ended) = chains.plan("a call more", &table, start);
         assert_eq!(
             chains_of(planned, &[kept.clone(), moved.clone()], start),
             tried
@@ -2797,7 +3550,7 @@ mod tests {
         // session has the plan. An engine holds the copies of that chain:
         // the plan takes it, and the chain the plan made ends.
         let sounding = chain_of(&mut chains.playing, moved.clone(), start);
-        let (planned, ended) = chains.plan("a call more", &none, start);
+        let (planned, ended) = chains.plan("a call more", &table, start);
         assert_eq!(chain_of(planned, moved.clone(), start), sounding);
         assert_eq!(ended, [tried[1]]);
 
@@ -2808,19 +3561,64 @@ mod tests {
         let made = chain_of(&mut chains.playing, late.clone(), start);
         assert!(
             chains
-                .score_changed(Some("s('bd')"), &none, start)
+                .score_changed(Some("s('bd')"), &table, start)
                 .is_empty()
         );
         assert!(chains.plan.is_some());
         assert!(
             chains
-                .score_changed(Some("a call more"), &none, start)
+                .score_changed(Some("a call more"), &table, start)
                 .is_empty()
         );
         assert!(chains.plan.is_none());
         assert_eq!(chain_of(&mut chains.playing, moved, start), sounding);
         assert_eq!(chain_of(&mut chains.playing, kept, start), lead[0]);
         assert_eq!(chain_of(&mut chains.playing, late, start), made);
+
+        // The first read of document 2 has a plugin call above lead, and
+        // another preset on lead: the note of lead takes the chain of lead
+        // of 1, as in one document. The one new copy is the copy of the new
+        // preset, and the host keeps the copy of the preset of 1 at rest.
+        // Back in 1, the note of lead takes the chain and sits on that copy:
+        // the host builds no copy.
+        let (mut lanes, mut chains) = (LaneTable::default(), Chains::new());
+        let lead =
+            |name: &str| format!("lead: note(\"c\").vsti(\"serum\", {{ preset: \"{name}\" }})");
+        let serum = |call: u32, name: &str| {
+            with_preset(owner("#0", &[], Some((call, "serum"))), instrument, name)
+        };
+        let (dark, first) = (serum(0, "Dark"), lead("Dark"));
+        assert_eq!(play_in(&mut lanes, &mut chains, 1, &first, start), [0]);
+        let chain = chain_of(&mut chains.playing, dark.clone(), start);
+        let before = live_copies(&chains);
+        let second = format!("pad: s(\"hh\").vst(\"eq\")\n{}", lead("Soft"));
+        assert_eq!(play_in(&mut lanes, &mut chains, 2, &second, start), [1, 0]);
+        assert_eq!(
+            chain_of(&mut chains.playing, serum(1, "Soft"), start),
+            chain
+        );
+        let slot = rustel_audio::instrument_slot(chain);
+        let preset = |name: &str| wanted_copy((slot, "serum", Some(name)));
+        let taken = live_copies(&chains);
+        let new: Vec<&WantedCopy> = taken.iter().filter(|copy| !before.contains(copy)).collect();
+        assert_eq!(new, [&preset("Soft")]);
+        assert_eq!(chains.rest, [(preset("Dark"), order_of(&lanes, 1))]);
+        // Back in 1 through a plan with no note of lead yet. At its commit the
+        // key the take dropped and the key of the plan are old: the commit
+        // keeps the copy of 1 for the note of lead.
+        chains.clock = start + CHAIN_GRACE;
+        lanes.set_reading(1);
+        assert_eq!(lanes.read(&first), [0]);
+        chains.plan(&first, &lanes, chains.clock);
+        chains.clock += CHAIN_GRACE;
+        chains.settle(chains.clock);
+        lanes.install(&first);
+        chains.score_changed(Some(first.as_str()), &lanes, chains.clock);
+        assert_eq!(live_copies(&chains), [preset("Dark"), preset("Soft")]);
+        assert_eq!(chain_of(&mut chains.playing, dark, chains.clock), chain);
+        let back = live_copies(&chains);
+        assert!(back.contains(&preset("Dark")));
+        assert!(back.iter().all(|copy| taken.contains(copy)));
     }
 
     /// A chain that is new in the text takes no chain of a lane with a
@@ -2933,6 +3731,8 @@ mod tests {
     /// time when its lane leaves the text, or when the body of its lane
     /// loses its instrument or the plugin of each stage. A chain with a
     /// plugin the body does not name ends a long time after its last note.
+    /// A chain of a document at rest waits for its next play. It ends when
+    /// its document closes, or at the memory floor.
     #[test]
     fn a_chain_that_left_the_text_goes_after_its_time() {
         let mut lanes = LaneTable::default();
@@ -2968,7 +3768,7 @@ mod tests {
         // The lane leaves the text: its chain ends after 5 s of turns.
         let bass = "bass: note(\"c1\").vsti(\"zyklop\")";
         assert_eq!(play(&mut lanes, bass), [1]);
-        chains.score_changed(Some(bass), lanes.playing(), chains.clock);
+        chains.score_changed(Some(bass), &lanes, chains.clock);
         for turn in 1..=5 {
             assert!(chains.settle(chains.clock).is_empty(), "turn {turn}");
             chains.tick(700.25 + f64::from(turn));
@@ -3068,17 +3868,16 @@ mod tests {
         let mut chains = Chains::new();
         let both = "lead: note(\"c\").vsti(\"serum\")\nbass: note(\"c1\").vsti(\"zyklop\")";
         assert_eq!(play(&mut lanes, both), [0, 1]);
-        chains.score_changed(Some(both), lanes.playing(), start);
+        chains.score_changed(Some(both), &lanes, start);
         let bass = owner("#1", &[], Some((1, "zyklop")));
         let owners = [owner("#0", &[], Some((0, "serum"))), bass.clone()];
         let played = chains_of(&mut chains.playing, &owners, start);
         let kick = "kick: s(\"bd\").vst(\"ott\")";
         assert_eq!(play(&mut lanes, kick), [2]);
-        chains.score_changed(Some(kick), lanes.playing(), start);
+        chains.score_changed(Some(kick), &lanes, start);
         let first = "bass: note(\"c1\").vsti(\"zyklop\")\npad: note(\"e\").vsti(\"tone\")";
         assert_eq!(lanes.read(first), [1, 3]);
-        let read = lanes.candidate(first).expect("the read");
-        let (planned, _) = chains.plan(first, read, start);
+        let (planned, _) = chains.plan(first, &lanes, start);
         let owners = [bass.clone(), owner("#3", &[], Some((2, "tone")))];
         let made = chains_of(planned, &owners, start);
         assert_eq!(made[0], played[1]);
@@ -3088,13 +3887,12 @@ mod tests {
         assert_eq!(chains.plugin_names(), ["tone", "zyklop"]);
         let second = "bass: note(\"c1\").vsti(\"zyklop\")";
         assert_eq!(lanes.read(second), [1]);
-        let read = lanes.candidate(second).expect("the read");
-        let (planned, _) = chains.plan(second, read, start);
+        let (planned, _) = chains.plan(second, &lanes, start);
         assert_eq!(chain_of(planned, bass, start), played[1]);
         let late = chain_of(&mut chains.playing, owner("#2", &[(3, "ott")], None), start);
         let hat = "hat: note(\"c e g\").gain(0.5)";
         assert_eq!(play(&mut lanes, hat), [4]);
-        chains.score_changed(Some(hat), lanes.playing(), start);
+        chains.score_changed(Some(hat), &lanes, start);
         let mut gone = chains.settle(later);
         gone.sort_unstable();
         assert_eq!(gone, [played[0], made[1], late]);
@@ -3112,12 +3910,11 @@ mod tests {
         let mut lanes = LaneTable::default();
         let mut chains = Chains::new();
         assert_eq!(play(&mut lanes, &dark), [0]);
-        chains.score_changed(Some(dark.as_str()), lanes.playing(), start);
+        chains.score_changed(Some(dark.as_str()), &lanes, start);
         let lead = chain_of(&mut chains.playing, dark_owner, start);
         let text = format!("{soft}\npad: note(\"e\").vsti(\"tone\")");
         assert_eq!(lanes.read(&text), [0, 1]);
-        let read = lanes.candidate(&text).expect("the read");
-        let (planned, _) = chains.plan(&text, read, start);
+        let (planned, _) = chains.plan(&text, &lanes, start);
         let owners = [soft_owner, owner("#1", &[], Some((1, "tone")))];
         let made = chains_of(planned, &owners, start);
         assert_eq!(made[0], lead);
@@ -3134,17 +3931,16 @@ mod tests {
         chains.clock = start + 2 * CHAIN_GRACE;
         assert_eq!(presets(&chains), (both_presets.clone(), made.clone()));
         lanes.install(&text);
-        chains.score_changed(Some(text.as_str()), lanes.playing(), chains.clock);
+        chains.score_changed(Some(text.as_str()), &lanes, chains.clock);
         assert_eq!(presets(&chains).0, both_presets);
         // The commit of the next plan in that time keeps the time of the key
         // the score in play lost.
         chains.clock += CHAIN_GRACE / 2;
         let next = format!("{text}\nhat: s(\"hh\")");
         assert_eq!(lanes.read(&next), [0, 1, 2]);
-        let read = lanes.candidate(&next).expect("the read");
-        chains.plan(&next, read, chains.clock);
+        chains.plan(&next, &lanes, chains.clock);
         lanes.install(&next);
-        chains.score_changed(Some(next.as_str()), lanes.playing(), chains.clock);
+        chains.score_changed(Some(next.as_str()), &lanes, chains.clock);
         assert_eq!(presets(&chains).0, both_presets);
         chains.clock += CHAIN_GRACE / 2;
         assert_eq!(presets(&chains).0, [Some("Soft".to_owned())]);
@@ -3181,13 +3977,20 @@ mod tests {
         // The host of a live output hears each change of the copies the
         // chains want: an assignment, a plan, a plan that goes, a look, a
         // commit and a chain that ends. With no change it hears nothing. A
-        // session the host keeps copies for tells the host when it ends.
+        // session the host keeps copies for tells the host when it ends. The
+        // door of the copies on their way home asks the host only for chains
+        // that want a copy.
         let (mut lanes, chains) = (LaneTable::default(), Mutex::new(Chains::new()));
         play(&mut lanes, both);
         score_changed(&chains, &lanes, Some(both), true);
         let calls = kept(&chains);
+        assert_eq!(returning(&chains, 48_000), 0);
+        assert_eq!(HOST_CALLS.get(), calls, "a door with no copy");
         assign(&chains, &lanes, &csound, [&serum], true);
         assert_eq!(HOST_CALLS.get(), calls + 1, "an assignment");
+        let calls = kept(&chains);
+        returning(&chains, 48_000);
+        assert_eq!(HOST_CALLS.get(), calls + 1, "a door with a copy");
         let calls = kept(&chains);
         assign(&chains, &lanes, &csound, [&serum], true);
         score_changed(&chains, &lanes, Some(both), true);
@@ -3221,7 +4024,7 @@ mod tests {
         chain_of(&mut locked(&chains).playing, pad, start);
         let calls = kept(&chains);
         lanes.install(&text);
-        let ended = locked(&chains).score_changed(Some(text.as_str()), lanes.playing(), start);
+        let ended = locked(&chains).score_changed(Some(text.as_str()), &lanes, start);
         assert_eq!(ended, [made]);
         keep_now(&mut locked(&chains), ended);
         assert_eq!(HOST_CALLS.get(), calls + 1, "a commit");
@@ -3247,6 +4050,69 @@ mod tests {
             drop(chains);
             assert_eq!(HOST_CALLS.get(), calls + usize::from(any), "an end");
         }
+        // The host keeps the copies of a chain no call names, so a session
+        // whose chains rest, and a session whose one chain is a closed chain,
+        // tell the host when they end too.
+        for closed in [false, true] {
+            let (mut lanes, chains) = (LaneTable::default(), Mutex::new(Chains::new()));
+            lanes.set_reading(1);
+            play(&mut lanes, both);
+            score_changed(&chains, &lanes, Some(both), false);
+            assign(&chains, &lanes, &csound, [&serum], false);
+            if closed {
+                lanes.forget(1);
+            }
+            play_in(&mut lanes, &mut locked(&chains), 2, kick, start);
+            assert!(locked(&chains).wanted().1.is_empty());
+            let calls = kept(&chains);
+            drop(chains);
+            assert_eq!(HOST_CALLS.get(), calls + 1, "an end of chains that rest");
+        }
+        // A close of a document at rest ends its chains at once. With a live
+        // output the host hears it, and the call asks whether an engine holds
+        // a copy of a chain that ended. With no live output the host hears
+        // nothing. A Stop with no chain of a closed document asks the host
+        // nothing, and a Stop with one does as a close.
+        let (mut lanes, chains) = (LaneTable::default(), Mutex::new(Chains::new()));
+        lanes.set_reading(1);
+        play(&mut lanes, both);
+        score_changed(&chains, &lanes, Some(both), false);
+        assign(&chains, &lanes, &csound, [&serum], false);
+        play_in(&mut lanes, &mut locked(&chains), 3, kick, start);
+        let tone = crate::ValueJson::Raw(note("#2", 0, "tone"));
+        assign(&chains, &lanes, &csound, [&tone], false);
+        let hat = "hat: note(\"c e g\").gain(0.5)";
+        play_in(&mut lanes, &mut locked(&chains), 2, hat, start);
+        let calls = kept(&chains);
+        assert!(!end_closed_documents(&chains, &lanes, true));
+        assert!(!forget_document(&chains, &mut lanes, 1, false));
+        assert_eq!(HOST_CALLS.get(), calls, "no closed chain, no live output");
+        assert!(!forget_document(&chains, &mut lanes, 3, true));
+        assert_eq!(HOST_CALLS.get(), calls + 2, "a close");
+        lanes.forget(2);
+        let zyklop = crate::ValueJson::Raw(note("#3", 0, "zyklop"));
+        for live in [false, true] {
+            assign(&chains, &lanes, &csound, [&zyklop], false);
+            let calls = kept(&chains);
+            assert!(!end_closed_documents(&chains, &lanes, live));
+            let stop = 2 * usize::from(live);
+            assert_eq!(HOST_CALLS.get(), calls + stop, "a Stop with a closed chain");
+            assert!(locked(&chains).playing.owners.is_empty());
+        }
+        // A close of a document at rest whose chain another snapshot holds
+        // ends no chain, and the host hears the copies at rest that go.
+        let (mut lanes, chains) = (LaneTable::default(), Mutex::new(Chains::new()));
+        for document in [3, 1] {
+            lanes.set_reading(document);
+            play(&mut lanes, both);
+            score_changed(&chains, &lanes, Some(both), false);
+            assign(&chains, &lanes, &csound, [&serum], false);
+        }
+        play_in(&mut lanes, &mut locked(&chains), 2, kick, start);
+        let calls = kept(&chains);
+        assert!(!forget_document(&chains, &mut lanes, 1, true));
+        assert_eq!(HOST_CALLS.get(), calls + 1, "a close that moves its chain");
+        assert_eq!(locked(&chains).playing.owners.len(), 1);
 
         // The score in play makes the chains of pad and keys after the plan
         // of a text with no pad, and with a new instrument on keys. The
@@ -3282,7 +4148,7 @@ mod tests {
         let unnamed = chain_of(&mut chains.playing, loose.clone(), start);
         let text = "kick: s(\"bd\")\nkeys: note(\"e\").vsti(\"vital\")";
         assert_eq!(lanes.read(text), [0, 2]);
-        chains.plan(text, lanes.candidate(text).expect("the read"), start);
+        chains.plan(text, &lanes, start);
         let owners = [
             owner("#1", &[], Some((0, "tone"))),
             owner("#2", &[], Some((1, "tone"))),
@@ -3298,7 +4164,7 @@ mod tests {
         assert_eq!(chain_of(&mut chains.playing, loose, left), unnamed);
         assert_eq!(lanes.read(text), [0, 2]);
         lanes.install(text);
-        let ended = chains.score_changed(Some(text), lanes.playing(), commit);
+        let ended = chains.score_changed(Some(text), &lanes, commit);
         assert!(ended.is_empty());
         assert!(chains.settle(commit).is_empty());
         assert_eq!(chains.settle(left + CHAIN_GRACE), [lead]);
@@ -3307,6 +4173,403 @@ mod tests {
         assert_eq!(gone, made);
         assert!(chains.settle(start + CHAIN_UNSEEN_LIMIT).is_empty());
         assert_eq!(chains.settle(left + CHAIN_UNSEEN_LIMIT), [unnamed]);
+
+        // A document at rest keeps its chains, a chain with a plugin from a
+        // variable too. Document 1 plays a pad with its plugin from a
+        // variable, and document 2 plays: 700 s of turns end no chain of 1,
+        // and the host keeps the copy of the pad at rest, with the order of
+        // 1. Back in 1 through a plan, the pad keeps its chain, and its 600 s
+        // count from there.
+        let (mut lanes, mut chains) = (LaneTable::default(), Chains::new());
+        let pad = "const chorus = \"chorus\"\npad: s(\"hh\").vst(chorus)";
+        let hat = "hat: note(\"c e g\").gain(0.5)";
+        assert_eq!(play_in(&mut lanes, &mut chains, 1, pad, start), [0]);
+        let pad_owner = owner("#0", &[(0, "chorus")], None);
+        let chorus = chain_of(&mut chains.playing, pad_owner.clone(), start);
+        assert_eq!(play_in(&mut lanes, &mut chains, 2, hat, start), [1]);
+        for second in 0..=700 {
+            chains.tick(f64::from(second));
+        }
+        assert!(chains.settle(chains.clock).is_empty());
+        let copy = wanted_copy((rustel_audio::effect_slot(chorus, 0), "chorus", None));
+        assert_eq!(chains.rest, [(copy, order_of(&lanes, 1))]);
+        let back = chains.clock;
+        lanes.set_reading(1);
+        assert_eq!(lanes.read(pad), [0]);
+        chains.plan(pad, &lanes, back);
+        lanes.install(pad);
+        chains.score_changed(Some(pad), &lanes, back);
+        assert!(chains.rest.is_empty() && chains.plan.is_none());
+        for second in 701..1300 {
+            chains.tick(f64::from(second));
+        }
+        assert!(chains.settle(chains.clock).is_empty(), "599 s");
+        chains.tick(1300.0);
+        assert_eq!(chains.clock, back + CHAIN_UNSEEN_LIMIT);
+        assert_eq!(chains.settle(chains.clock), [chorus]);
+        // The tab of 1 closes while a launch of 1 waits for its line. The
+        // plan keeps the chain of the pad, the launch lands with it, and its
+        // 600 s count from the plan.
+        let (mut lanes, mut chains) = (LaneTable::default(), Chains::new());
+        assert_eq!(play_in(&mut lanes, &mut chains, 1, pad, start), [0]);
+        let chorus = chain_of(&mut chains.playing, pad_owner.clone(), start);
+        assert_eq!(play_in(&mut lanes, &mut chains, 2, hat, start), [1]);
+        for second in 0..=700 {
+            chains.tick(f64::from(second));
+        }
+        let back = chains.clock;
+        lanes.set_reading(1);
+        assert_eq!(lanes.read(pad), [0]);
+        chains.plan(pad, &lanes, back);
+        lanes.forget(1);
+        assert_eq!(chains.close(1, &lanes), [chorus]);
+        assert!(chains.settle(back).is_empty(), "the plan keeps the chain");
+        lanes.install(pad);
+        chains.score_changed(Some(pad), &lanes, back);
+        for second in 701..1300 {
+            chains.tick(f64::from(second));
+        }
+        assert!(chains.settle(chains.clock).is_empty(), "599 s");
+        chains.tick(1300.0);
+        assert_eq!(chains.settle(chains.clock), [chorus]);
+        // A close of 1 at rest gives the chain of the pad to 2 in play,
+        // which shares the lane and has no note on it yet. The chain counts
+        // its 600 s from the close, not from its last note in 1.
+        let (mut lanes, mut chains) = (LaneTable::default(), Chains::new());
+        assert_eq!(play_in(&mut lanes, &mut chains, 1, pad, start), [0]);
+        let chorus = chain_of(&mut chains.playing, pad_owner, start);
+        assert_eq!(play_in(&mut lanes, &mut chains, 2, pad, start), [0]);
+        for second in 0..=700 {
+            chains.tick(f64::from(second));
+        }
+        let closed = chains.clock;
+        lanes.forget(1);
+        assert!(chains.close(1, &lanes).is_empty());
+        assert_eq!(chain_with(&chains.playing, chorus).document, 2);
+        for second in 701..1300 {
+            chains.tick(f64::from(second));
+        }
+        assert!(chains.settle(chains.clock).is_empty(), "599 s");
+        chains.tick(1300.0);
+        assert_eq!(chains.clock, closed + CHAIN_UNSEEN_LIMIT);
+        assert_eq!(chains.settle(chains.clock), [chorus]);
+
+        // A chain of 1 whose lane lost its instrument before 2 played ends
+        // after its time, and no snapshot has its copy, and so does a chain
+        // of a lane that left the text of 1. Of a chain that lost one effect,
+        // the snapshot has the other copies. Keys takes its instrument from a
+        // variable, so in play its chain ends 600 s after its last note.
+        let (mut lanes, mut chains) = (LaneTable::default(), Chains::new());
+        let lead = "lead: note(\"c\").vsti(\"serum\")";
+        let keys = "keys: note(\"e\").vsti(tone).vst(\"ott\")";
+        let pad = "pad: note(\"g\").vsti(\"dexed\")";
+        let first = format!("const tone = \"tone\"\n{lead}\n{keys}\n{pad}");
+        assert_eq!(
+            play_in(&mut lanes, &mut chains, 1, &first, start),
+            [0, 1, 2]
+        );
+        let serum_owner = owner("#0", &[], Some((0, "serum")));
+        let serum = chain_of(&mut chains.playing, serum_owner.clone(), start);
+        let keys_owner = owner("#1", &[(2, "ott")], Some((1, "tone")));
+        let toned = chain_of(&mut chains.playing, keys_owner, start);
+        let padded = chain_of(
+            &mut chains.playing,
+            owner("#2", &[], Some((3, "dexed"))),
+            start,
+        );
+        let lost = start + Duration::from_secs(1);
+        let vital = lead.replace("serum", "vital");
+        let dry = keys.replace(".vst(\"ott\")", "");
+        let dry = format!("const tone = \"tone\"\n{vital}\n{dry}");
+        play_in(&mut lanes, &mut chains, 1, &dry, lost);
+        let rest_at = lost + Duration::from_secs(1);
+        play_in(&mut lanes, &mut chains, 2, hat, rest_at);
+        let tone = wanted_copy((rustel_audio::instrument_slot(toned), "tone", None));
+        assert_eq!(chains.snapshots[&1], std::slice::from_ref(&tone));
+        assert_eq!(chains.rest, [(tone.clone(), order_of(&lanes, 1))]);
+        let ends = lost + CHAIN_GRACE;
+        assert!(chains.settle(ends - Duration::from_millis(1)).is_empty());
+        let mut gone = chains.settle(ends);
+        gone.sort_unstable();
+        assert_eq!(gone, [serum, padded]);
+        // At rest the chain of keys keeps the mark of the effect it lost:
+        // 700 s of turns end no chain of 1. Back in 1 the host builds no
+        // copy of that effect.
+        for second in 0..=700 {
+            chains.tick(f64::from(second));
+        }
+        assert!(chains.settle(chains.clock).is_empty());
+        let back = chains.clock;
+        play_in(&mut lanes, &mut chains, 1, &dry, back);
+        assert_eq!(live_copies(&chains), [tone]);
+
+        // A close of 1 at rest ends each chain of 1 at once, and its copies
+        // leave the copies at rest. A chain 1 shares with 3 at rest goes to
+        // 3. A chain of 1 whose lane 2 in play shares, with no chain in play
+        // for it, goes to 2.
+        let (mut lanes, mut chains) = (LaneTable::default(), Chains::new());
+        let kick = "kick: s(\"bd\").vst(\"ott\")";
+        let bass = "bass: note(\"c1\").vsti(\"zyklop\")";
+        assert_eq!(play_in(&mut lanes, &mut chains, 3, kick, start), [0]);
+        let ott = owner("#0", &[(0, "ott")], None);
+        let shared = chain_of(&mut chains.playing, ott.clone(), start);
+        let first = format!("{kick}\n{lead}\n{bass}");
+        let numbers = play_in(&mut lanes, &mut chains, 1, &first, start);
+        assert_eq!(numbers, [0, 1, 2]);
+        // The bass lane of 1 has 2 chains. The chain whose plugin the bass of
+        // 2 names goes to 2, also with the higher number, and the other ends.
+        let owners = [
+            ott,
+            owner("#1", &[], Some((1, "serum"))),
+            owner("#2", &[], Some((3, "dexed"))),
+            owner("#2", &[], Some((2, "zyklop"))),
+        ];
+        let made = chains_of(&mut chains.playing, &owners, start);
+        assert_eq!(made[0], shared);
+        assert_eq!(play_in(&mut lanes, &mut chains, 2, bass, start), [2]);
+        // A copy of 2 snapshots has the newer order, and the chain goes to
+        // the document that went to rest last.
+        let kept = wanted_copy((rustel_audio::effect_slot(shared, 0), "ott", None));
+        assert!(chains.rest.contains(&(kept.clone(), order_of(&lanes, 1))));
+        assert!(!chains.rest.contains(&(kept, order_of(&lanes, 3))));
+        assert_eq!(chains.playing.holders[&shared], 1);
+        let held = chains.snapshots[&3].clone();
+        lanes.forget(1);
+        assert_eq!(chains.close(1, &lanes), [made[1], made[2]]);
+        assert!(!chains.snapshots.contains_key(&1));
+        let rest = held.into_iter().map(|copy| (copy, order_of(&lanes, 3)));
+        assert_eq!(chains.rest, rest.collect::<Vec<_>>());
+        assert_eq!(chains.playing.holders[&shared], 3);
+        let document = |chains: &Chains, id| chain_with(&chains.playing, id).document;
+        assert_eq!(document(&chains, shared), 3);
+        assert_eq!(document(&chains, made[3]), 2);
+        assert!(!chains.playing.has(made[1]));
+        // 2 in play closes, and plays on. A Stop ends each chain of 2 in
+        // play and in a plan, a chain of a note with no lane too, and no
+        // chain of 3.
+        let loose = chain_of(&mut chains.playing, owner("", &[(0, "ott")], None), start);
+        chains.plan(bass, &lanes, start);
+        assert!(chains.end_closed(&lanes).is_empty(), "2 is open");
+        lanes.forget(2);
+        assert!(chains.close(2, &lanes).is_empty());
+        let mut stopped = vec![made[3], loose];
+        stopped.sort_unstable();
+        assert_eq!(chains.end_closed(&lanes), stopped);
+        assert!(chains.playing.has(shared));
+        let (_, planned) = chains.plan.as_ref().expect("the plan");
+        assert!(!planned.has(loose) && planned.has(shared));
+
+        // A lane of 1 leaves its text, and 1 rests while the chain of the
+        // lane is in its grace. 2 has the lane, and its note takes the chain:
+        // the chain lives on.
+        let (mut lanes, mut chains) = (LaneTable::default(), Chains::new());
+        let both = format!("{lead}\n{bass}");
+        assert_eq!(play_in(&mut lanes, &mut chains, 1, &both, start), [0, 1]);
+        let zyklop = owner("#1", &[], Some((1, "zyklop")));
+        let bassed = chain_of(&mut chains.playing, zyklop.clone(), start);
+        play_in(&mut lanes, &mut chains, 1, lead, start);
+        assert_eq!(play_in(&mut lanes, &mut chains, 2, &both, start), [0, 1]);
+        assert_eq!(chain_of(&mut chains.playing, zyklop, start), bassed);
+        assert!(chains.settle(start + CHAIN_GRACE).is_empty());
+
+        // While the set plays, the closed score in play plays on. When
+        // another score plays, its chains end after their time, a chain of a
+        // note with no lane too, and the closed document keeps no snapshot.
+        let (mut lanes, mut chains) = (LaneTable::default(), Chains::new());
+        play_in(&mut lanes, &mut chains, 1, lead, start);
+        let led = chain_of(&mut chains.playing, serum_owner.clone(), start);
+        let loose = chain_of(&mut chains.playing, owner("", &[(0, "ott")], None), start);
+        lanes.forget(1);
+        assert!(chains.close(1, &lanes).is_empty());
+        play_in(&mut lanes, &mut chains, 2, hat, start);
+        assert!(!chains.snapshots.contains_key(&1));
+        let ends = start + CHAIN_GRACE;
+        assert!(chains.settle(ends - Duration::from_millis(1)).is_empty());
+        let mut gone = chains.settle(ends);
+        gone.sort_unstable();
+        let mut closed = vec![led, loose];
+        closed.sort_unstable();
+        assert_eq!(gone, closed);
+
+        // A plan of the text of 1 while 2 plays and 3 rests: the host keeps
+        // the chains of 2 and of the plan live, and the copies of 3 at rest
+        // with the order of 3. After the commit, the chains of 2 rest with
+        // the newest order, and the snapshot of 2 has their copies.
+        let (mut lanes, mut chains) = (LaneTable::default(), Chains::new());
+        play_in(&mut lanes, &mut chains, 3, kick, start);
+        let kicked = chain_of(&mut chains.playing, owner("#0", &[(0, "ott")], None), start);
+        play_in(&mut lanes, &mut chains, 2, lead, start);
+        let led = chain_of(
+            &mut chains.playing,
+            owner("#1", &[], Some((0, "serum"))),
+            start,
+        );
+        lanes.set_reading(1);
+        assert_eq!(lanes.read(bass), [2]);
+        let (planned, _) = chains.plan(bass, &lanes, start);
+        let bassed = chain_of(planned, owner("#2", &[], Some((0, "zyklop"))), start);
+        let mut named = vec![led, bassed];
+        named.sort_unstable();
+        assert_eq!(chains.wanted().1, named);
+        let ott = wanted_copy((rustel_audio::effect_slot(kicked, 0), "ott", None));
+        assert_eq!(chains.rest, [(ott.clone(), order_of(&lanes, 3))]);
+        lanes.install(bass);
+        assert!(chains.score_changed(Some(bass), &lanes, start).is_empty());
+        assert_eq!(chain_with(&chains.playing, led).document, 2);
+        let newest = lanes.rest_orders().map(|(_, order)| order).max();
+        assert_eq!(Some(order_of(&lanes, 2)), newest);
+        let serum = wanted_copy((rustel_audio::instrument_slot(led), "serum", None));
+        assert_eq!(chains.snapshots[&2], std::slice::from_ref(&serum));
+        assert!(chains.rest.contains(&(serum, order_of(&lanes, 2))));
+        assert_eq!(chains.wanted().1, [bassed]);
+
+        // 1 and 2 share a lane, and 2 removes it: after its time the chain
+        // does not end, and it rests with 1. Back in 1 the note takes it,
+        // and the host builds no copy.
+        let (mut lanes, mut chains) = (LaneTable::default(), Chains::new());
+        play_in(&mut lanes, &mut chains, 1, lead, start);
+        let led = chain_of(&mut chains.playing, serum_owner.clone(), start);
+        let before = live_copies(&chains);
+        let both = format!("{lead}\n{hat}");
+        assert_eq!(play_in(&mut lanes, &mut chains, 2, &both, start), [0, 1]);
+        assert_eq!(
+            chain_of(&mut chains.playing, serum_owner.clone(), start),
+            led
+        );
+        // A plan of 1 takes the chains of its snapshot, as its commit does:
+        // no snapshot holds a chain of the plan.
+        lanes.set_reading(1);
+        lanes.read(lead);
+        let (planned, _) = chains.plan(lead, &lanes, start);
+        assert_eq!(chain_with(planned, led).document, 1);
+        assert!(!planned.holders.contains_key(&led));
+        assert_eq!(chains.playing.holders[&led], 1);
+        chains.forget();
+        play_in(&mut lanes, &mut chains, 2, hat, start);
+        // A chain a snapshot holds that ends to make room goes to the
+        // document of the snapshot too.
+        let mut playing = chains.playing.clone();
+        let tone = owner("#1", &[], Some((1, "tone")));
+        let made = playing.assign(&[(tone, true)], 1, start, ChainRegistry::in_grace);
+        assert!(made.ended.is_empty() && made.seats[0].is_some());
+        assert_eq!(chain_with(&playing, led).document, 1);
+        assert!(chains.settle(start + CHAIN_GRACE).is_empty());
+        let rested = chain_with(&chains.playing, led);
+        assert!(rested.document == 1 && rested.grace(&serum_owner).is_none());
+        play_in(&mut lanes, &mut chains, 1, lead, start + CHAIN_GRACE);
+        assert!(chain_with(&chains.playing, led).dropped.is_empty());
+        assert_eq!(
+            chain_of(&mut chains.playing, serum_owner.clone(), start),
+            led
+        );
+        assert_eq!(live_copies(&chains), before);
+
+        // A held plan of 1 has a chain for a new lane. A plan of 2 starts
+        // from the registry in play, and the chain the plan of 1 made ends.
+        // The commit of the same text in another document takes no plan.
+        let (mut lanes, mut chains) = (LaneTable::default(), Chains::new());
+        play_in(&mut lanes, &mut chains, 1, lead, start);
+        let edit = format!("{lead}\n{bass}");
+        lanes.set_reading(1);
+        assert_eq!(lanes.read(&edit), [0, 1]);
+        let (planned, _) = chains.plan(&edit, &lanes, start);
+        let held = chain_of(planned, owner("#1", &[], Some((1, "zyklop"))), start);
+        lanes.set_reading(2);
+        lanes.read(hat);
+        let (planned, ended) = chains.plan(hat, &lanes, start);
+        assert!(!planned.has(held));
+        assert_eq!(ended, [held]);
+        lanes.set_reading(3);
+        play(&mut lanes, hat);
+        chains.score_changed(Some(hat), &lanes, start);
+        assert!(chains.plan.is_some());
+        // A text with no scan changes no lane at its install, so its plan is
+        // of the document in play, and its commit takes the plan.
+        let deep = format!(
+            "$: {}",
+            "(".repeat(rustel_transpiler::MAX_SOURCE_NESTING + 1)
+        );
+        lanes.set_reading(4);
+        assert!(lanes.read(&deep).is_empty());
+        chains.plan(&deep, &lanes, start);
+        lanes.install(&deep);
+        chains.score_changed(Some(deep.as_str()), &lanes, start);
+        assert!(chains.plan.is_none() && lanes.document() == 3);
+
+        // A close of 1 at rest ends its chains in a plan of another document
+        // too. A plan of 1 keeps them, so a held edit of 1 lands.
+        for same in [true, false] {
+            let (mut lanes, mut chains) = (LaneTable::default(), Chains::new());
+            play_in(&mut lanes, &mut chains, 1, lead, start);
+            let led = chain_of(&mut chains.playing, serum_owner.clone(), start);
+            play_in(&mut lanes, &mut chains, 2, hat, start);
+            lanes.set_reading(if same { 1 } else { 3 });
+            lanes.read(lead);
+            chains.plan(lead, &lanes, start);
+            lanes.forget(1);
+            assert_eq!(chains.close(1, &lanes), [led]);
+            let (_, planned) = chains.plan.as_ref().expect("the plan");
+            assert_eq!(planned.has(led), same);
+        }
+
+        // The memory floor. 4 and 0 rest with no copy and keep no snapshot,
+        // and a session with no copy at rest reads no memory. 1 shares the
+        // bass lane of 2, and 1 and 3 rest while 2 plays. A process of 9
+        // bytes on a machine of 16 gives back the copies of 1, the document
+        // with the lower order: the chain of lead ends, the chain of bass
+        // goes to 2 with no chain in play for its lane, 1 stays at rest, and
+        // 3 keeps its chains. A process of 8 ends nothing, and so does no
+        // reading. The next commit of a session with a live output gives back
+        // 3, and the host hears the chain that ends. The line stays one line.
+        let (mut lanes, mut chains) = (LaneTable::default(), Chains::new());
+        assert_eq!(play_in(&mut lanes, &mut chains, 4, hat, start), [0]);
+        assert_eq!(play_in(&mut lanes, &mut chains, 2, bass, start), [1]);
+        assert!(chains.snapshots.is_empty(), "no snapshot with no copy");
+        let read = std::cell::Cell::new(false);
+        let no_copy = rest_floor(&mut chains, &lanes, || {
+            read.set(true);
+            (Some(9), Some(16))
+        });
+        assert!(
+            no_copy.is_empty() && !read.get(),
+            "a read with no copy at rest"
+        );
+        let both = format!("{lead}\n{bass}");
+        assert_eq!(play_in(&mut lanes, &mut chains, 1, &both, start), [2, 1]);
+        let serum = owner("#2", &[], Some((0, "serum")));
+        let led = chain_of(&mut chains.playing, serum, start);
+        let zyklop = owner("#1", &[], Some((1, "zyklop")));
+        let bassed = chain_of(&mut chains.playing, zyklop, start);
+        assert_eq!(play_in(&mut lanes, &mut chains, 3, kick, start), [3]);
+        let ott = owner("#3", &[(0, "ott")], None);
+        let kicked = chain_of(&mut chains.playing, ott, start);
+        assert_eq!(play_in(&mut lanes, &mut chains, 2, bass, start), [1]);
+        assert!(order_of(&lanes, 4) < order_of(&lanes, 1));
+        assert!(order_of(&lanes, 1) < order_of(&lanes, 3));
+        for (process, machine) in [(Some(8), Some(16)), (None, Some(16)), (Some(9), None)] {
+            let ended = rest_floor(&mut chains, &lanes, || (process, machine));
+            assert!(ended.is_empty(), "{process:?} of {machine:?}");
+        }
+        assert!(chains.problems.is_empty() && chains.snapshots.contains_key(&1));
+        let floor = || (Some(9), Some(16));
+        assert_eq!(rest_floor(&mut chains, &lanes, floor), [led]);
+        assert!(!chains.snapshots.contains_key(&1) && chains.playing.rest.contains_key(&1));
+        assert_eq!(chain_with(&chains.playing, bassed).document, 2);
+        assert_eq!(chain_with(&chains.playing, kicked).document, 3);
+        let copy = wanted_copy((rustel_audio::effect_slot(kicked, 0), "ott", None));
+        assert_eq!(chains.rest, [(copy, order_of(&lanes, 3))]);
+        let chains = Mutex::new(chains);
+        let calls = self::kept(&chains);
+        MEMORY.set(Some((9, 16)));
+        play(&mut lanes, bass);
+        score_changed(&chains, &lanes, Some(bass), true);
+        MEMORY.set(None);
+        assert_eq!(HOST_CALLS.get(), calls + 1, "a floor at a commit");
+        let chains = locked(&chains);
+        assert!(!chains.playing.has(kicked) && chains.rest.is_empty());
+        let line = "a scene that waits gave back its plugin copies: \
+                    the studio holds more than half of the memory";
+        assert_eq!(chains.problems, [line]);
     }
 
     /// A lane keeps its number through an edit. A muted lane plays no note.
@@ -3463,7 +4726,8 @@ mod tests {
         let chain = registry.owners.values().next().expect("the chain");
         assert_eq!(chain.dropped.len(), 1, "the effect before");
         assert!(registry.settle(start + CHAIN_GRACE).is_empty());
-        assert_eq!(registry.named(), [after]);
+        let room = rustel_audio::MAX_INSERT_BUSES;
+        assert_eq!(registry.named(room, start), [after]);
         registry.score_changed(&none, start);
         assert_eq!(registry.settle(start + CHAIN_UNSEEN_LIMIT), [after]);
     }

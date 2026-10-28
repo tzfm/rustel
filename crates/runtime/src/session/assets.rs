@@ -455,6 +455,22 @@ impl Session {
         pending
     }
 
+    /// The plugin copies a close of the live output sent home that the
+    /// chains of this session still want, at the rate of the output: see
+    /// [`crate::vst::Host::returning`]. A caller that holds the first window
+    /// of a new output, or a start, counts them. The call queries no score,
+    /// and starts the retune of a copy that waits at another rate. Chains
+    /// that want no copy ask the host nothing. A session with no live output
+    /// waits for no copy: the count is 0, with no call to the plugin host.
+    #[cfg(feature = "vst")]
+    pub fn plugins_returning(&self) -> usize {
+        if !self.plugins_live() {
+            return 0;
+        }
+        let rate = self.plugin_rate.load(std::sync::atomic::Ordering::Relaxed);
+        crate::vst::returning(&self.chains, rate)
+    }
+
     /// Makes the plugin host build each plugin copy that the haps of the
     /// score in play need, at the rate of the output: see
     /// [`Self::ensure_wants`]. `shadow` has the haps of the lanes that do not

@@ -1,10 +1,11 @@
 //! Rate-limited process CPU, memory and machine-wide CPU telemetry.
 //!
-//! The runtime needs four facts - this process's CPU share, the memory it
-//! owns, its resident set, and the whole machine's CPU load - not a process
-//! table, so each platform is read directly. Every probe may fail;
-//! unavailable values remain `None`, missing machine CPU readings briefly
-//! retain the last value, and none of it ever prevents playback or drawing.
+//! The runtime needs five facts, not a process table: this process's CPU
+//! share, the memory it owns, its resident set, and the CPU load and the
+//! memory of the whole machine. So the runtime reads each platform directly.
+//! A probe that fails gives `None`, and a missing machine CPU reading keeps
+//! the last value for a short time. None of it ever stops playback or
+//! drawing.
 
 use std::time::{Duration, Instant};
 
@@ -41,6 +42,30 @@ impl ProcessStats {
     pub fn memory_bytes(&self) -> Option<u64> {
         self.footprint_bytes.or(self.resident_bytes)
     }
+}
+
+/// The memory this process holds now, as [`ProcessStats::memory_bytes`]
+/// gives it, and the memory of the machine. Each is `None` where the
+/// platform gives no value. The memory floor of the plugin copies at rest
+/// reads it.
+#[cfg_attr(
+    not(feature = "vst"),
+    expect(
+        dead_code,
+        reason = "only the memory floor of the plugin copies reads it"
+    )
+)]
+pub(crate) fn memory_now() -> (Option<u64>, Option<u64>) {
+    #[cfg(test)]
+    if let Some((process, machine)) = tests::MEMORY.get() {
+        return (Some(process), Some(machine));
+    }
+    let stats = ProcessStats {
+        resident_bytes: resident_bytes(),
+        footprint_bytes: footprint_bytes(),
+        ..ProcessStats::default()
+    };
+    (stats.memory_bytes(), machine_memory_bytes())
 }
 
 /// Minimum wall time between platform samples.
@@ -407,9 +432,71 @@ fn footprint_bytes() -> Option<u64> {
     None
 }
 
+/// The physical memory of the machine: the `hw.memsize` value of `sysctl`.
+#[cfg(target_os = "macos")]
+fn machine_memory_bytes() -> Option<u64> {
+    let mut bytes = 0u64;
+    let mut size = std::mem::size_of::<u64>();
+    // SAFETY: the name is a C string. `hw.memsize` is a 64-bit value, and
+    // `sysctlbyname` writes at most `size` bytes, the size of `bytes`,
+    // through the pointer. The call sets no value and retains no pointer.
+    let status = unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            std::ptr::addr_of_mut!(bytes).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (status == 0).then_some(bytes)
+}
+
+/// The physical memory of the machine: `MemTotal` of `/proc/meminfo`.
+#[cfg(target_os = "linux")]
+fn machine_memory_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let total = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?;
+    let kib = total.split_whitespace().next()?.parse::<u64>().ok()?;
+    Some(kib.saturating_mul(1024))
+}
+
+/// The physical memory of the machine, from the memory status of the
+/// system.
+#[cfg(windows)]
+fn machine_memory_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut status = MEMORYSTATUSEX {
+        dwLength: u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>()).ok()?,
+        ..MEMORYSTATUSEX::default()
+    };
+    // SAFETY: `dwLength` gives the size of `status`, as the call asks. The
+    // call writes the fields of `status` and retains no pointer.
+    let read = unsafe { GlobalMemoryStatusEx(&mut status) };
+    (read != 0).then_some(status.ullTotalPhys)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn machine_memory_bytes() -> Option<u64> {
+    None
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    // The reading `memory_now` gives on this thread in place of the
+    // reading of the platform. A test never holds half of the memory of
+    // the machine, so the test of the memory floor sets the reading of its
+    // own thread.
+    std::thread_local! {
+        pub(crate) static MEMORY: std::cell::Cell<Option<(u64, u64)>> = const {
+            std::cell::Cell::new(None)
+        };
+    }
 
     #[test]
     fn the_first_sample_has_no_cpu_share_and_the_second_is_bounded() {
@@ -491,6 +578,12 @@ mod tests {
         assert!(
             displayed > 1024 * 1024,
             "implausible memory size {displayed}"
+        );
+        // The machine holds more memory than this process.
+        let machine = machine_memory_bytes().expect("machine memory");
+        assert!(
+            machine > displayed,
+            "machine memory {machine} below {displayed}"
         );
     }
 

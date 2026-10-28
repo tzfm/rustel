@@ -339,6 +339,8 @@ impl Session {
                 .scheduler
                 .time_at_cycle(rustel_fraction::Fraction::ZERO),
             evaluated_cycle: self.installed_cycle,
+            #[cfg(feature = "vst")]
+            document: self.lanes.document(),
         });
         let book = self
             .audio_confirmations

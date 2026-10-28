@@ -35,7 +35,8 @@ impl StudioEngine {
             self.session.clear_next_from_zero();
         }
         // Taken by the install; one that never ran leaves it for nobody.
-        self.next_install_preview = false;
+        // The document stays for the next install.
+        self.next_install.preview = false;
         result
     }
 
@@ -62,6 +63,10 @@ impl StudioEngine {
         if cancelled() {
             return Err(RuntimeError::Cancelled);
         }
+        // The edit comes before the copies a close sent home: the start goes
+        // on, and the edit plays as in the async mode.
+        #[cfg(feature = "vst")]
+        self.end_start_returning();
         if self.start_is_held() {
             return self.replace_held_start(source, mini);
         }
@@ -126,13 +131,13 @@ impl StudioEngine {
     /// producer publishes the cutover transactionally. `None` when the
     /// session holds the edit for its plugin copies: see
     /// [`rustel_runtime::Session::reload_live`]. Nothing installs then, and
-    /// the preview mark stays for the next install.
+    /// the install mark stays for the next install.
     pub(super) fn reload_live(
         &mut self,
         source: &str,
         mini: bool,
     ) -> Result<Option<StudioInstall>, RuntimeError> {
-        let preview = std::mem::take(&mut self.next_install_preview);
+        let mark = self.next_install.take();
         self.ensure_input();
         // A reload evaluates the score's own tempo; when an outside clock is
         // followed the next tick puts it straight back, not a fifth of a
@@ -157,13 +162,14 @@ impl StudioEngine {
             #[cfg(feature = "vst")]
             let generation_after = {
                 self.session.set_plugin_wait(waits);
+                self.session.set_plugin_document(mark.document);
                 let reloaded =
                     self.session
                         .reload_live(source, mini, transport.stopped_flag(), clock)?;
                 match reloaded {
                     rustel_runtime::LiveReload::Installed(generation) => generation,
                     rustel_runtime::LiveReload::Waiting => {
-                        self.next_install_preview = preview;
+                        self.next_install = mark;
                         return Ok(None);
                     }
                 }
@@ -188,7 +194,7 @@ impl StudioEngine {
         // running after the audition finishes.
         live.audition_owned = false;
         self.warm_source(source, LIVE_RELOAD_SAMPLE_WARM_BUDGET)?;
-        self.note_install_for_played(generation_after, preview, source);
+        self.note_install_for_played(generation_after, mark.preview, source);
         self.follow_edit(source, mini);
         // The room has been replaced by `source`, whatever the launch or edit
         // that asked for it: a fired rewind remembered for the grace no
@@ -205,11 +211,12 @@ impl StudioEngine {
 
     /// Prepares the plugin copies of a text that plays later: see
     /// [`rustel_runtime::Session::prepare_reload`]. The text plays from
-    /// `from_cycle`. In the wait mode the session holds the text while a
-    /// copy is not ready. In the async mode the builds start, and nothing
-    /// waits. The shield keeps the score in play sounding through the
-    /// evaluation. A text that fails here fails again when it plays, and
-    /// says so then.
+    /// `from_cycle`, and is of `document`: see
+    /// [`Self::mark_next_install_document`]. In the wait mode the session
+    /// holds the text while a copy is not ready. In the async mode the
+    /// builds start, and nothing waits. The shield keeps the score in play
+    /// sounding through the evaluation. A text that fails here fails again
+    /// when it plays, and says so then.
     ///
     /// The call prepares nothing for a session with no plugins on its
     /// output, or for a text with no `vst` in a session where no evaluation
@@ -225,6 +232,7 @@ impl StudioEngine {
         source: &str,
         mini: bool,
         from_cycle: f64,
+        document: u64,
     ) -> Option<bool> {
         if mini
             || !self.session.plugins_live()
@@ -243,6 +251,7 @@ impl StudioEngine {
             return Some(false);
         }
         self.session.set_plugin_wait(self.waits_for_sounds());
+        self.session.set_plugin_document(document);
         let live = self.live.as_ref().expect("checked live playback");
         let transport = self.session.transport();
         let _ =
@@ -275,7 +284,8 @@ impl StudioEngine {
         } else {
             pending.boundary_cycle
         };
-        let Some(ran) = self.prepare_live(&source, mini, from_cycle) else {
+        let document = pending.mark.document;
+        let Some(ran) = self.prepare_live(&source, mini, from_cycle, document) else {
             return;
         };
         if let Some(pending) = self.pending_launch.as_mut() {
@@ -455,7 +465,7 @@ impl StudioEngine {
         mini: bool,
         was_piano_output: bool,
     ) -> Result<StudioInstall, RuntimeError> {
-        let preview = std::mem::take(&mut self.next_install_preview);
+        let mark = self.next_install.take();
         // Log what opened, once: the host, the device and the buffer
         // size. It is a log note, so it does not take the status line
         // from the install that follows ("playing from the top").
@@ -469,6 +479,8 @@ impl StudioEngine {
             .set_continuity_margin(device.continuity_margin_seconds());
 
         let transport = self.session.transport();
+        #[cfg(feature = "vst")]
+        self.session.set_plugin_document(mark.document);
         let evaluation = self.session.reload_at_cancellable(
             source,
             mini,
@@ -550,6 +562,12 @@ impl StudioEngine {
         self.piano_has_score_tail = false;
         self.piano_tail_silent_since = None;
         self.stopped_device_time = None;
+        // The output plays now, and gives back each copy its chains do not
+        // name.
+        #[cfg(feature = "vst")]
+        {
+            self.closed_plugin_copies = false;
+        }
         // The install below starts the performer's score, unless it is a
         // preview's.
         self.awaiting_score = true;
@@ -573,7 +591,7 @@ impl StudioEngine {
             audition_owned: false,
         });
 
-        self.note_install_for_played(generation, preview, source);
+        self.note_install_for_played(generation, mark.preview, source);
 
         Ok(StudioInstall {
             generation,
@@ -675,10 +693,17 @@ impl StudioEngine {
 
     /// Open the output on silence, for a preview or a take while nothing
     /// plays. Silence is no score of the performer's, so what the last one
-    /// sounded stays kept for it.
+    /// sounded stays kept for it. It is of no scene either: it installs in
+    /// [`rustel_runtime::PREVIEW_DOCUMENT`], and the document mark stays.
     pub(super) fn start_silence(&mut self) -> Result<(), RuntimeError> {
-        self.next_install_preview = true;
-        self.evaluate_and_start("silence", false).map(drop)
+        let document = self.next_install.document;
+        self.next_install = InstallMark {
+            preview: true,
+            document: rustel_runtime::PREVIEW_DOCUMENT,
+        };
+        let started = self.evaluate_and_start("silence", false).map(drop);
+        self.next_install.document = document;
+        started
     }
 
     /// Say whether the score handed over next is a snippet previewed under
@@ -686,7 +711,18 @@ impl StudioEngine {
     /// [`Self::played_before_preview`]. The worker says it with every
     /// evaluation, the way it plants a rewind.
     pub fn mark_next_install_preview(&mut self, preview: bool) {
-        self.next_install_preview = preview;
+        self.next_install.preview = preview;
+    }
+
+    /// Say the document of the score handed over next: the scene id of its
+    /// tab, or [`rustel_runtime::PREVIEW_DOCUMENT`] for a snippet heard
+    /// alone. The session keeps the plugin copies of each open scene that
+    /// does not play: see [`rustel_runtime::Session::set_plugin_document`].
+    /// The worker says it with every evaluation. The mark stays until the
+    /// next mark, so an install with no mark of its own is of the document
+    /// before.
+    pub fn mark_next_install_document(&mut self, document: u64) {
+        self.next_install.document = document;
     }
 
     pub(super) fn restore_failed_start_device(

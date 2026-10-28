@@ -52,8 +52,8 @@ use crate::mmcss::WorkerWake;
 use crate::insert::{EFFECT_CHAIN, MAX_INSERT_BUSES, NO_STAGE, OrbitInsert};
 use crate::reverb::REVERB_BLOCK;
 use crate::scalar::{
-    InsertMix, effect_stage_wakes, enable_denormal_flush, fade_effect_stage, ordered_stages,
-    render_leaving_insert, settle_insert_block,
+    InsertMix, drain_insert_block, effect_stage_wakes, enable_denormal_flush, fade_effect_stage,
+    ordered_stages, render_leaving_insert, settle_insert_block,
 };
 use crate::tripwire;
 
@@ -120,6 +120,9 @@ impl JobKind {
 pub(crate) struct Job {
     /// The frames of the block, 1 to 128.
     pub(crate) frames: usize,
+    /// Set for a job of a stopped output: each box of the job drains a block
+    /// of silence, and the job keeps no output. See [`drain_insert_block`].
+    pub(crate) drain: bool,
     /// The input of an effect job, and the output of each job.
     pub(crate) block: [[f32; REVERB_BLOCK]; 2],
     /// The boxes of the bus while the job is out. An instrument job holds
@@ -136,7 +139,8 @@ pub(crate) struct Job {
     /// The block of a leaving copy: the output of a leaving instrument on
     /// silence, or of a leaving effect on `dry`.
     pub(crate) leaving_block: [[f32; REVERB_BLOCK]; 2],
-    /// The frames each effect stage had no input and no output.
+    /// The frames each effect stage had no input and no output. A drain job
+    /// keeps the count of each of its boxes here, at the places of `boxes`.
     pub(crate) idle: [u32; EFFECT_CHAIN],
     /// The effect stages that run, in signal order, with [`NO_STAGE`] after
     /// the last.
@@ -163,6 +167,7 @@ impl Default for Job {
     fn default() -> Self {
         Self {
             frames: 0,
+            drain: false,
             block: [[0.0; REVERB_BLOCK]; 2],
             boxes: Default::default(),
             leaving: Default::default(),
@@ -257,6 +262,9 @@ pub(crate) struct PoolShared {
     /// Workers take no job while this is set.
     #[cfg(test)]
     holding: AtomicBool,
+    /// The ticks a test gives the workers in place of [`thread_ticks`].
+    #[cfg(test)]
+    given_ticks: std::sync::OnceLock<Arc<AtomicU64>>,
     /// Jobs the callback leaves to a worker.
     #[cfg(any(test, feature = "test-support"))]
     worker_only: [AtomicU64; 2],
@@ -272,7 +280,8 @@ pub(crate) struct PoolShared {
 // Release RMW after its last write, and the Acquire load of that bit gives
 // the job back to the callback. One handle at a time holds the pool, so one
 // callback posts. No thread writes `late_rule` or `origin` after `new`. The
-// other fields are atomics, and a wake is Sync.
+// other fields are atomics, and a wake and the `OnceLock` of the given ticks
+// are Sync.
 unsafe impl Sync for PoolShared {}
 
 impl PoolShared {
@@ -304,6 +313,8 @@ impl PoolShared {
             origin: Instant::now(),
             #[cfg(test)]
             holding: AtomicBool::new(false),
+            #[cfg(test)]
+            given_ticks: std::sync::OnceLock::new(),
             #[cfg(any(test, feature = "test-support"))]
             worker_only: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
@@ -512,7 +523,7 @@ impl PoolShared {
     fn lost_nanos(&self, started: Option<u64>, run: u64) -> u64 {
         let Some(ticks) = started
             .filter(|_| run > LATE_WAIT_NANOS)
-            .and_then(|started| Some(thread_ticks()?.saturating_sub(started)))
+            .and_then(|started| Some(self.worker_ticks()?.saturating_sub(started)))
         else {
             return 0;
         };
@@ -525,6 +536,16 @@ impl PoolShared {
             .saturating_mul(1_000)
             .checked_div(most)
             .map_or(0, |ran| run.saturating_sub(ran))
+    }
+
+    /// The ticks of the calling worker: [`thread_ticks`], or the ticks a
+    /// test gives.
+    fn worker_ticks(&self) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(ticks) = self.given_ticks.get() {
+            return Some(ticks.load(Ordering::Relaxed));
+        }
+        thread_ticks()
     }
 }
 
@@ -540,6 +561,12 @@ impl PoolShared {
     /// waits for it at the join.
     pub(crate) fn claim_before_join(&self, kind: JobKind, bus: usize) {
         self.worker_only[kind.index()].fetch_or(1 << bus, Ordering::SeqCst);
+    }
+
+    /// The workers read the ticks of `clock` in place of [`thread_ticks`].
+    /// A test gives one clock, before the first job.
+    fn give_ticks(&self, clock: Arc<AtomicU64>) {
+        self.given_ticks.set(clock).expect("one given clock");
     }
 
     /// True while jobs post.
@@ -1078,7 +1105,7 @@ fn work(shared: &PoolShared, worker: usize, mut promoted: u64) {
             enable_denormal_flush();
             // SAFETY: the claim gives this worker the job until its done bit.
             let job = unsafe { shared.job(slot) };
-            let started = shared.late_rule.then(thread_ticks).flatten();
+            let started = shared.late_rule.then(|| shared.worker_ticks()).flatten();
             run_job(JobKind::of(slot), job, Some(worker));
             job.lost_nanos = shared.lost_nanos(started, job.run_nanos);
             shared.finish(slot);
@@ -1107,6 +1134,7 @@ fn work(shared: &PoolShared, worker: usize, mut promoted: u64) {
 fn run_job(kind: JobKind, job: &mut Job, worker: Option<usize>) {
     let started = Instant::now();
     let run = std::panic::catch_unwind(AssertUnwindSafe(|| match kind {
+        _ if job.drain => run_drain_job(job),
         JobKind::Instrument => run_instrument_job(job),
         JobKind::Effect => run_effect_job(job),
     }));
@@ -1184,6 +1212,24 @@ fn run_effect_job(job: &mut Job) {
             effect_stage_wakes(effect, left, right, idle[stage], *idle_limit, &mixes[stage])
                 .map(|fed| (place, fed))
         });
+    }
+}
+
+/// Each box of a job of a stopped output drains a block of silence, and its
+/// idle frames move as on the callback: see [`drain_insert_block`]. The job
+/// keeps no output.
+fn run_drain_job(job: &mut Job) {
+    let Job {
+        frames,
+        block,
+        boxes,
+        idle,
+        ..
+    } = job;
+    for (insert, idle) in boxes.iter_mut().zip(idle) {
+        if let Some(insert) = insert {
+            drain_insert_block(insert.as_mut(), block, *frames, idle);
+        }
     }
 }
 
@@ -1551,6 +1597,9 @@ mod tests {
 
     /// An insert that adds 1 to each sample after `spin` of work and a
     /// `pause` off the CPU, or panics with a fault, and counts its calls.
+    /// With `ticks`, each call adds its time less its pause to that clock,
+    /// one tick a nanosecond. So a stop of the thread in the call reads as
+    /// work, and only the pause reads as lost time.
     #[derive(Default)]
     struct Probe {
         runs: Arc<AtomicU64>,
@@ -1558,6 +1607,7 @@ mod tests {
         spin: Duration,
         pause: Duration,
         fault: bool,
+        ticks: Option<Arc<AtomicU64>>,
     }
 
     impl OrbitInsert for Probe {
@@ -1576,14 +1626,22 @@ mod tests {
             while start.elapsed() < self.spin {
                 std::hint::spin_loop();
             }
-            if !self.pause.is_zero() {
+            let paused = if self.pause.is_zero() {
+                Duration::ZERO
+            } else {
+                let since = Instant::now();
                 thread::sleep(self.pause);
-            }
+                since.elapsed()
+            };
             if self.fault {
                 panic!("a plugin fault");
             }
             for sample in left.iter_mut().chain(right.iter_mut()) {
                 *sample += 1.0;
+            }
+            if let Some(ticks) = &self.ticks {
+                let ran = start.elapsed().saturating_sub(paused);
+                ticks.fetch_add(nanos(ran), Ordering::SeqCst);
             }
             self.runs.fetch_add(1, Ordering::SeqCst);
             self.in_call.store(false, Ordering::SeqCst);
@@ -1598,6 +1656,7 @@ mod tests {
             spin,
             pause: Duration::ZERO,
             fault,
+            ticks: None,
         };
         (Box::new(probe), runs)
     }
@@ -1641,7 +1700,8 @@ mod tests {
         pool.shared.follow_stream(480, 48_000);
         pool.shared.set_power_saving(cfg!(miri));
         // An instrument job has 1 probe. An effect job runs stages 0 and 1
-        // and skips stage 2, which is not in its order.
+        // and skips stage 2, which is not in its order. A drain job drains
+        // each probe it holds on silence.
         let mut chains: Vec<Chain> = Vec::new();
         let mut runs = Vec::new();
         for slot in 0..JOB_SLOTS {
@@ -1661,11 +1721,14 @@ mod tests {
         for round in 0..rounds {
             let frames = 1 + (round % 128) as usize;
             let input = (round % 1000) as f32 + 1.0;
+            // Each other round drains, as a stopped output does.
+            let drain = round % 2 == 1;
             let mut guard = handle.begin();
             for (slot, chain) in chains.iter_mut().enumerate() {
                 let (kind, bus) = (JobKind::of(slot), slot % MAX_INSERT_BUSES);
                 let job = guard.job(kind, bus);
                 job.frames = frames;
+                job.drain = drain;
                 for channel in &mut job.block {
                     channel[..frames].fill(input);
                 }
@@ -1690,6 +1753,14 @@ mod tests {
                 assert!(caught(|| _ = guard.job(JobKind::Effect, 0)).is_err());
             }
             for (kind, output) in [(JobKind::Instrument, 1.0), (JobKind::Effect, input + 2.0)] {
+                // Each probe of a drain job adds 1 to silence, so its block
+                // sounds and its idle frames go to 0.
+                let (output, idle) = match (drain, kind) {
+                    (true, JobKind::Instrument) => (1.0, [0, 5, 5, 5]),
+                    (true, JobKind::Effect) => (1.0, [0, 0, 0, 5]),
+                    // The stages that ran are fed.
+                    (false, _) => (output, [0, 0, 5, 5]),
+                };
                 let mut left = u64::MAX;
                 while left != 0 {
                     let bus = guard.join(kind, left);
@@ -1701,8 +1772,8 @@ mod tests {
                             "round {round}, {kind:?} job of bus {bus}"
                         );
                     }
-                    if kind == JobKind::Effect {
-                        assert_eq!(job.idle, [0, 0, 5, 5], "the stages that ran are fed");
+                    if drain || kind == JobKind::Effect {
+                        assert_eq!(job.idle, idle, "round {round}, {kind:?} job of bus {bus}");
                     }
                     inline += u64::from(job.worker.is_none());
                     chains[kind.slot(bus)] = std::mem::take(&mut job.boxes);
@@ -1710,7 +1781,8 @@ mod tests {
             }
         }
         for (slot, stage, count) in &runs {
-            let expected = if *stage == 2 { 0 } else { rounds };
+            // Stage 2 runs only in a drain.
+            let expected = if *stage == 2 { rounds / 2 } else { rounds };
             assert_eq!(
                 count.load(Ordering::SeqCst),
                 expected,
@@ -1889,19 +1961,18 @@ mod tests {
         }
     }
 
-    #[cfg(any(
-        windows,
-        all(
-            feature = "device-audio",
-            any(target_os = "macos", target_os = "linux")
-        )
-    ))]
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "a shared macOS runner stops a worker inside a job of 1 ms, and the late rule fires on its own"
-    )]
     fn a_late_job_cools_its_worker_down() {
+        // Where the system gives the ticks of a thread, they move while the
+        // thread spins.
+        if let Some(start) = thread_ticks() {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while thread_ticks().is_none_or(|now| now <= start) {
+                assert!(Instant::now() < deadline, "the thread ticks did not move");
+                std::hint::spin_loop();
+            }
+        }
+        let ticks = Arc::new(AtomicU64::new(0));
         // A job of `spin` of work and a `pause` off the CPU on the worker of
         // `handle`. The callback joins it at once, or once it is done when
         // `done` is true. Gives the late jobs so far.
@@ -1909,6 +1980,7 @@ mod tests {
             let insert = Box::new(Probe {
                 spin: Duration::from_millis(spin),
                 pause: Duration::from_millis(pause),
+                ticks: Some(Arc::clone(&ticks)),
                 ..Probe::default()
             });
             let mut guard = handle.begin();
@@ -1947,15 +2019,11 @@ mod tests {
             let pool = PluginPool::start(1, 480, 48_000).expect("a pool");
             assert_eq!(pool.shared.late_rule, crate::mmcss::cycles_at_fixed_rate());
         }
-        // The late rule reads the ticks of a worker. On Windows on Arm they
-        // count at no fixed rate, and a change of the clock reads as lost
-        // time. The test of the rule stops there.
-        #[cfg(windows)]
-        if !crate::mmcss::cycles_at_fixed_rate() {
-            return;
-        }
+        // The probes the worker runs give the ticks of this pool, so its
+        // late rule reads no thread time of the system.
         let (pool, mut handle) = ready_pool(1);
         let shared = Arc::clone(&pool.shared);
+        shared.give_ticks(Arc::clone(&ticks));
         shared.claim_before_join(JobKind::Instrument, 0);
         // Runs of 1 ms of work give the pool the ticks of a microsecond.
         for _ in 0..8 {
@@ -1991,7 +2059,10 @@ mod tests {
         assert_eq!(guard.job(JobKind::Instrument, 1).worker, None);
         guard.job(JobKind::Instrument, 1).boxes[0] = None;
         // After its cool-down the worker takes jobs again.
-        let (insert, _) = probe(Duration::ZERO, false);
+        let insert = Box::new(Probe {
+            ticks: Some(Arc::clone(&ticks)),
+            ..Probe::default()
+        });
         post(&mut guard, JobKind::Instrument, 0, insert);
         let deadline = Instant::now() + Duration::from_secs(5);
         while guard.try_join(JobKind::Instrument, 1).is_none() {
@@ -2003,8 +2074,8 @@ mod tests {
         guard.job(JobKind::Instrument, 0).boxes[0] = None;
         drop(guard);
         // A slow job that ends while another job of its set is out is not
-        // late. The last job of the set takes each spin of the set. It does
-        // no work, so a busy machine cannot hold it up past the late wait.
+        // late. The last job of the set takes each spin of the set. It has
+        // no pause, so the pool finds no lost time in it.
         shared.claim_before_join(JobKind::Instrument, 2);
         let late = handle.figures.late_jobs;
         let mut guard = handle.begin();
@@ -2012,6 +2083,7 @@ mod tests {
             let insert = Box::new(Probe {
                 spin: Duration::from_millis(spin),
                 pause: Duration::from_millis(pause),
+                ticks: Some(Arc::clone(&ticks)),
                 ..Probe::default()
             });
             post(&mut guard, JobKind::Instrument, bus, insert);

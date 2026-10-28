@@ -1,8 +1,8 @@
 use super::*;
 
-/// Takes a lock of the insert state. The insert provider is host code and
-/// runs with these locks. A panic in that code does not end the output: the
-/// next turn reads the value as the panic left it.
+/// Takes a lock of the producer state. The insert provider is host code and
+/// runs with the insert locks. A panic in that code does not end the output:
+/// the next turn reads the value as the panic left it.
 fn locked<T>(lock: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     lock.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -233,11 +233,11 @@ impl LiveScalarDevice {
     /// it, and a repeat call with unchanged params is a cache hit.
     pub fn ensure_reverb(&self, orbit: usize, params: crate::reverb::ReverbParams) {
         let orbit = orbit.min(crate::scalar::MAX_ORBITS - 1);
+        self.reclaim_assets();
         let mut cache = self.reverb_cache.lock().expect("producer reverb cache");
         if cache[orbit].is_some_and(|(cached, _)| cached == params) {
             return;
         }
-        self.reclaim_assets();
         let reverb = Box::new(crate::reverb::OrbitReverb::generate_with_dispatch(
             self.sample_rate,
             params,
@@ -647,30 +647,34 @@ impl LiveScalarDevice {
     }
 
     pub(super) fn reclaim_assets(&self) {
-        let mut cache = self
-            .fx_reverb_cache
-            .lock()
-            .expect("producer fx reverb cache");
-        let mut kabel = self.kabel_cache.lock().expect("producer KabelSalat cache");
-        let mut programs = self
-            .program_cache
-            .lock()
-            .expect("producer KabelSalat program cache");
-        let mut inserts = locked(&self.insert_cache);
-        self.shared.samples.reclaim_with_inserts(
-            |returned| {
-                cache.retain(|(_, _, installed)| *installed != returned as usize);
-            },
-            |returned| {
-                kabel.retain(|entry| entry.pointer != returned as usize);
-            },
-            |returned| {
-                programs.retain(|entry| entry.pointer != returned as usize);
-            },
-            |returned| {
-                inserts.retain(|(_, _, installed)| *installed != returned as *mut () as usize);
-            },
-        );
+        let mut boxes = Vec::new();
+        {
+            // The drop of the device reclaims too, so a lock that a panic
+            // poisoned does not panic here.
+            let mut cache = locked(&self.fx_reverb_cache);
+            let mut kabel = locked(&self.kabel_cache);
+            let mut programs = locked(&self.program_cache);
+            let mut inserts = locked(&self.insert_cache);
+            self.shared.samples.reclaim_with_inserts(
+                |returned| {
+                    cache.retain(|(_, _, installed)| *installed != returned as usize);
+                },
+                |returned| {
+                    kabel.retain(|entry| entry.pointer != returned as usize);
+                },
+                |returned| {
+                    programs.retain(|entry| entry.pointer != returned as usize);
+                },
+                |insert| {
+                    let returned = &*insert as *const dyn crate::insert::OrbitInsert as *const ();
+                    inserts.retain(|(_, _, installed)| *installed != returned as usize);
+                    boxes.push(insert);
+                },
+            );
+        }
+        // A returned insert drops after the locks: the drop of a Csound
+        // insert joins its worker.
+        drop(boxes);
     }
 
     /// Sets the source of the chain names: the output asks the source
@@ -758,6 +762,26 @@ impl LiveScalarDevice {
 }
 
 impl LiveScalarDevice {
+    /// Drops each insert of a closed stream on the producer: each copy in the
+    /// line to the callback, each copy the backend holds, then each copy the
+    /// callback gave back. No box drops while a lock of the device is held.
+    /// A close asks the names source nothing.
+    ///
+    /// Call it after the callback retired and its stream closed.
+    pub(super) fn hand_back_inserts(&mut self) {
+        for install in self.shared.samples.insert_installs.drain_available() {
+            // SAFETY: the old callback joined. This unconsumed box has one owner.
+            drop(unsafe { Box::from_raw(install.insert) });
+        }
+        if let Some(cell) = self.backend.take() {
+            // SAFETY: the callback retired, so no render uses the backend
+            // again, and this thread holds no other reference to it.
+            let backend = unsafe { cell.get() };
+            backend.take_inserts().for_each(drop);
+        }
+        self.reclaim_assets();
+    }
+
     pub(super) fn clear_reverb_caches(&self) {
         // The old callback joined. Its replacement starts with an empty
         // backend, so the producer must prepare its assets again.
@@ -1267,7 +1291,8 @@ mod tests {
     /// The producer builds an insert one time for an orbit, the running
     /// callback keeps the instance when its output orbit changes,
     /// and a displaced insert comes back for the producer to free. A copy
-    /// the score no longer has comes back too.
+    /// the score no longer has comes back too. Each copy drops on the
+    /// producer, also the copies of a closed stream.
     #[test]
     fn the_callback_installs_and_returns_the_insert_of_an_orbit() {
         use std::sync::atomic::AtomicUsize;
@@ -1279,7 +1304,10 @@ mod tests {
             busy: AtomicBool,
             processed: [AtomicUsize; 2],
             parameters: [AtomicUsize; 2],
-            dropped: AtomicUsize,
+            /// The thread of each drop.
+            dropped: std::sync::Mutex<Vec<std::thread::ThreadId>>,
+            /// Each drop panics.
+            fault: AtomicBool,
         }
         struct Probe(crate::insert::InsertKey, Arc<Seen>, usize);
         impl crate::insert::OrbitInsert for Probe {
@@ -1299,12 +1327,23 @@ mod tests {
         }
         impl Drop for Probe {
             fn drop(&mut self) {
-                self.1.dropped.fetch_add(1, Ordering::Relaxed);
+                let thread = std::thread::current().id();
+                self.1.dropped.lock().unwrap().push(thread);
+                if self.1.fault.load(Ordering::Relaxed) {
+                    panic!("a drop fault");
+                }
             }
         }
 
         let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
         let seen = Arc::new(Seen::default());
+        // The count of drops. Each drop ran on this thread.
+        let producer = std::thread::current().id();
+        let dropped = || {
+            let threads = seen.dropped.lock().unwrap();
+            assert!(threads.iter().all(|thread| *thread == producer));
+            threads.len()
+        };
         let key = |plugin| crate::insert::InsertKey { plugin, preset: 0 };
         // A note with no provider plays dry, and a later request tries again.
         device.ensure_insert(crate::insert::effect_slot(1, 0), key(1));
@@ -1376,7 +1415,7 @@ mod tests {
         }
         assert!(device.holds_insert(crate::insert::effect_slot(1, 0), key(1)));
         assert!(!device.holds_insert(crate::insert::effect_slot(2, 0), key(1)));
-        assert_eq!(seen.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(dropped(), 0);
 
         device.ensure_insert(crate::insert::effect_slot(1, 0), key(2));
         assert_eq!(seen.built.load(Ordering::Relaxed), 2);
@@ -1402,10 +1441,10 @@ mod tests {
             seen.processed[1].load(Ordering::Relaxed) > 0
                 && device.shared.samples.insert_returns.len() == 1
         });
-        assert_eq!(seen.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(dropped(), 0);
         // A turn with no request frees the copy that came back.
         LiveReverbBatch::default().flush_inserts(&device);
-        assert_eq!(seen.dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(dropped(), 1);
         assert!(device.holds_insert(crate::insert::effect_slot(1, 0), key(2)));
         assert!(!device.holds_insert(crate::insert::effect_slot(1, 0), key(1)));
 
@@ -1454,7 +1493,7 @@ mod tests {
             device.shared.samples.insert_returns.len() == 1
         });
         LiveReverbBatch::default().flush_inserts(&device);
-        assert_eq!(seen.dropped.load(Ordering::Relaxed), 2);
+        assert_eq!(dropped(), 2);
         assert!(!device.holds_insert(slot, key(2)));
         assert_eq!(sent(), None);
 
@@ -1477,7 +1516,7 @@ mod tests {
             device.shared.samples.insert_returns.len() == 1
         });
         LiveReverbBatch::default().flush_inserts(&device);
-        assert_eq!(seen.dropped.load(Ordering::Relaxed), 3);
+        assert_eq!(dropped(), 3);
         assert!(!device.holds_insert(slot, key(2)));
         device.resume();
         seen.busy.store(false, Ordering::Relaxed);
@@ -1488,11 +1527,12 @@ mod tests {
         });
 
         // Stop consumption so the next copy stays in the line during the
-        // recycle. A copy that is not ready waits for the next turn.
+        // recycle. A copy that is not ready waits for the next turn. The
+        // device keeps the backend of the stopped thread and its copy.
         device.silent.as_mut().unwrap().stop();
         seen.reject.store(true, Ordering::Relaxed);
         device.ensure_insert(crate::insert::effect_slot(1, 0), key(1));
-        assert_eq!(seen.dropped.load(Ordering::Relaxed), 4);
+        assert_eq!(dropped(), 3);
         assert_eq!(device.shared.samples.insert_installs.len(), 0);
         assert_eq!(
             device
@@ -1529,6 +1569,30 @@ mod tests {
         seen.reject.store(false, Ordering::Relaxed);
         device.ensure_insert(crate::insert::effect_slot(1, 0), key(1));
         assert_eq!(device.shared.samples.insert_installs.len(), 1);
+
+        // A copy that came back drops after the locks of the device, so a
+        // drop that panics poisons none of them. A turn that asks for a new
+        // orbit reverb frees the copy first.
+        let faulty = Arc::new(Seen::default());
+        faulty.fault.store(true, Ordering::Relaxed);
+        let copy = Box::new(Probe(key(1), faulty, 0)) as Box<dyn crate::insert::OrbitInsert>;
+        let returned = crate::assets::ReturnedInsert(Box::into_raw(copy));
+        assert!(device.shared.samples.insert_returns.push(returned).is_ok());
+        let room = crate::reverb::ReverbParams {
+            size_secs: 0.025,
+            fade_secs: 0.01,
+            lp_start_hz: 15_000.0,
+            lp_end_hz: 1_000.0,
+            ir: None,
+        };
+        let turn = std::panic::AssertUnwindSafe(|| {
+            let mut batch = LiveReverbBatch::default();
+            batch.request_orbit(0, room);
+            batch.flush(&device);
+        });
+        assert!(std::panic::catch_unwind(turn).is_err());
+        assert!(!device.reverb_cache.is_poisoned() && !device.insert_cache.is_poisoned());
+        assert!(!device.fx_reverb_cache.is_poisoned());
 
         // With a full line the provider keeps its copy, and the slot
         // waits for the next turn.
@@ -1570,6 +1634,9 @@ mod tests {
             crate::insert::INSERT_SLOTS * 3
         );
 
+        // A host that keeps the callback after its stream closed keeps the
+        // backend. The close takes each copy out of it all the same.
+        let held = device.backend.clone();
         assert!(
             device
                 .recycle_output_to_with(
@@ -1581,7 +1648,10 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(seen.dropped.load(Ordering::Relaxed), 5);
+        // The close drops the queued copy of key 1 and the copy of key 2
+        // the backend held.
+        assert_eq!(dropped(), 5);
+        drop(held);
         assert_eq!(device.shared.samples.insert_installs.len(), 0);
         assert!(!device.holds_insert(crate::insert::effect_slot(1, 0), key(1)));
         assert!(device.insert_waiting.lock().unwrap().is_empty());
@@ -1613,6 +1683,13 @@ mod tests {
         }));
         LiveReverbBatch::default().flush_inserts(&device);
         assert!(device.holds_insert(slot, key(2)));
+        // The close reclaims also with a cache lock that a panic poisoned.
+        let fault = std::panic::AssertUnwindSafe(|| {
+            let _cache = device.fx_reverb_cache.lock();
+            panic!("a reverb fault");
+        });
+        assert!(std::panic::catch_unwind(fault).is_err());
+        drop(device);
     }
 
     /// A moved value reaches the copy of its key after one turn, and a note
@@ -1900,10 +1977,11 @@ mod tests {
         assert_eq!(batch.requested.iter().flatten().count(), 2);
     }
 
-    /// The names source hears the counts of the output at each turn.
+    /// The names source hears the counts of the output at each turn. A close
+    /// gives the source no turn.
     #[test]
     fn the_names_source_hears_the_counts_of_the_output() {
-        let device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
+        let mut device = LiveScalarDevice::start_silent(48_000, 7).expect("silent output");
         let turns = Arc::new(std::sync::Mutex::new(Vec::new()));
         device.set_insert_names(Arc::new({
             let turns = Arc::clone(&turns);
@@ -1925,6 +2003,17 @@ mod tests {
             late_jobs: 2,
             inline_jobs: 3,
         };
+        assert_eq!(*turns.lock().unwrap(), [turn]);
+        assert!(
+            device
+                .recycle_output_to_with(
+                    Some(SILENT_OUTPUT_NAME),
+                    |_| unreachable!("silent output needs no discovery"),
+                    |_, _| Err(DevicePlaybackError::Unavailable("no output".into())),
+                )
+                .is_err()
+        );
+        drop(device);
         assert_eq!(*turns.lock().unwrap(), [turn]);
     }
 }

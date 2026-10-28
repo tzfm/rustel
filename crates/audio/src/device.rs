@@ -211,6 +211,10 @@ pub struct LiveScalarDevice {
     /// What the callback's backend wrote when it was prepared, read before
     /// the callback took it: see [`LiveScalarBackend::prepared_bytes`].
     backend_bytes: usize,
+    /// The backend of the stream. The callback uses it until it retires,
+    /// then a close gives each insert of it back on the producer: see
+    /// [`Self::hand_back_inserts`]. None for a manual output.
+    backend: Option<Arc<BackendCell>>,
 }
 
 /// What an open output holds in memory, as the producer can see it without
@@ -618,10 +622,47 @@ const CALLBACK_RETIRED: u8 = 3;
 /// Pending callbacks must not consume assets or change the running clock.
 struct CallbackGate {
     state: AtomicU8,
-    errors_in_flight: AtomicUsize,
+    /// The renders and the error reports that run now. Retirement waits
+    /// until none runs.
+    in_flight: AtomicUsize,
 }
 
 struct CallbackErrorGuard<'a>(&'a AtomicUsize);
+
+/// The backend of a stream, which its callback and the device share. One
+/// thread at a time uses it: the callback while it renders, until
+/// [`CallbackGate::retire`] returns, then the producer. So a close gives each
+/// insert of the backend back on the producer.
+struct BackendCell(std::cell::UnsafeCell<LiveScalarBackend>);
+
+// SAFETY: one thread at a time uses the backend. The callback uses it only in
+// the render of `CallbackGate::render_or_silence`, which counts itself in
+// flight before it reads the state, and renders only in the active state.
+// `retire` stores the retired state, then waits until no render is in
+// flight, also after a render that panicked. Both sides use SeqCst, so each
+// render ends before `retire` returns, or it reads the retired state and
+// leaves the backend alone. The producer uses the backend only after `retire`
+// returned. The backend is `Send`.
+unsafe impl Sync for BackendCell {}
+
+impl BackendCell {
+    fn new(backend: LiveScalarBackend) -> Self {
+        Self(std::cell::UnsafeCell::new(backend))
+    }
+
+    /// The backend, for the thread that uses it now.
+    ///
+    /// # Safety
+    ///
+    /// The calling thread uses the backend alone: the callback in its render,
+    /// or the producer after [`CallbackGate::retire`] returned. No other
+    /// reference to the backend lives.
+    #[allow(clippy::mut_from_ref, reason = "one thread at a time uses the backend")]
+    unsafe fn get(&self) -> &mut LiveScalarBackend {
+        // SAFETY: the caller uses the backend alone, as this function requires.
+        unsafe { &mut *self.0.get() }
+    }
+}
 
 enum OutputHandle {
     Native(cpal::Stream),
@@ -638,6 +679,9 @@ struct PreparedLiveOutput {
     /// See [`LiveScalarDevice::memory`]: read here, the last moment the
     /// backend is not the callback's.
     backend_bytes: usize,
+    /// The backend the callback renders with. The device takes it at the
+    /// activation. None for a manual output, which keeps its own backend.
+    backend: Option<Arc<BackendCell>>,
 }
 
 /// The silent output's handle: its stop flag and the thread running it.

@@ -5,8 +5,10 @@
 //!
 //! Plugins are part of the same wait, and the session decides it. A start
 //! waits for the plugin copies of its first window: see
-//! [`rustel_runtime::Session::plugins_pending`]. An edit and a launch wait
-//! while the session holds their text for its plugin copies: see
+//! [`rustel_runtime::Session::plugins_pending`]. In [`LoadMode::Async`] a
+//! start waits a short time for the copies a close of the output sent home:
+//! see [`rustel_runtime::Session::plugins_returning`]. An edit and a launch
+//! wait while the session holds their text for its plugin copies: see
 //! [`rustel_runtime::Session::reload_live`].
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,8 +20,9 @@ use rustel_runtime::{RuntimeError, SAMPLE_LOADING_DIAGNOSTIC};
 
 use super::super::settings::LoadMode;
 use super::{
-    STARTUP_SAMPLE_WARM_BUDGET, StudioDiagnostic, StudioEngine, StudioInstall, StudioUpdate,
-    StudioUpdateSendResult, TakeoverCut, next_boundary, queue_diagnostic, source_revision,
+    InstallMark, STARTUP_SAMPLE_WARM_BUDGET, StudioDiagnostic, StudioEngine, StudioInstall,
+    StudioUpdate, StudioUpdateSendResult, TakeoverCut, next_boundary, queue_diagnostic,
+    source_revision,
 };
 
 /// How far a start's first window reaches, in cycles.
@@ -93,7 +96,7 @@ pub(super) struct HeldEdit {
     source: String,
     mini: bool,
     rewind: bool,
-    preview: bool,
+    mark: InstallMark,
     followed: Vec<Followed>,
 }
 
@@ -113,6 +116,10 @@ pub(super) struct LoadState {
     /// of the wait: see [`StudioEngine::look_at_start_copies`].
     #[cfg(feature = "vst")]
     start_progress: Option<Instant>,
+    /// The start of the wait of a start in [`LoadMode::Async`] for the
+    /// copies a close sent home: see [`StudioEngine::start_returns`].
+    #[cfg(feature = "vst")]
+    start_returning: Option<Instant>,
     pub(super) held_edit: Option<HeldEdit>,
     /// Sounds skipped as still loading since the last late-sounds line.
     late: BTreeSet<String>,
@@ -341,7 +348,8 @@ impl StudioEngine {
         #[cfg(feature = "vst")]
         let plugins = {
             let cycle = self.session.cycle_at_time(self.device_time());
-            self.prepare_live(source, mini, if rewind { 0.0 } else { cycle });
+            let from_cycle = if rewind { 0.0 } else { cycle };
+            self.prepare_live(source, mini, from_cycle, self.next_install.document);
             self.session.waits_for_plugins(source)
         };
         #[cfg(not(feature = "vst"))]
@@ -350,7 +358,7 @@ impl StudioEngine {
             source: source.to_owned(),
             mini,
             rewind,
-            preview: std::mem::take(&mut self.next_install_preview),
+            mark: self.next_install.take(),
             followed,
         });
         self.ask_for_waited();
@@ -363,14 +371,14 @@ impl StudioEngine {
     /// [`rustel_runtime::Session::reload_live`]. The last score keeps
     /// playing, [`Self::advance_held_edit`] lands the edit when its copies
     /// are ready, and [`Self::take_launch_outcome`] answers it then. The
-    /// edit keeps its from-zero request and its preview mark.
+    /// edit keeps its from-zero request and its install mark.
     pub(super) fn hold_for_plugins(&mut self, source: &str, mini: bool) -> StudioInstall {
         self.launch_outcome = None;
         self.load.held_edit = Some(HeldEdit {
             source: source.to_owned(),
             mini,
             rewind: self.session.take_next_from_zero(),
-            preview: std::mem::take(&mut self.next_install_preview),
+            mark: self.next_install.take(),
             followed: Vec::new(),
         });
         self.log_launch("update waits for its plugins");
@@ -429,14 +437,14 @@ impl StudioEngine {
         if held.rewind {
             self.session.start_next_from_zero();
         }
-        self.next_install_preview = held.preview;
+        self.next_install = held.mark;
         match self.reload_live(&held.source, held.mini) {
             Ok(Some(install)) => self.launch_outcome = Some(Ok(install)),
             // The session holds the edit for its plugin copies again: the
-            // edit keeps its from-zero request and its preview mark.
+            // edit keeps its from-zero request and its install mark.
             Ok(None) => {
                 self.session.clear_next_from_zero();
-                held.preview = std::mem::take(&mut self.next_install_preview);
+                held.mark = self.next_install.take();
                 self.load.held_edit = Some(held);
             }
             Err(error) => {
@@ -507,15 +515,19 @@ impl StudioEngine {
 
     /// Follow what a start's first window plays, and hold its cycle zero
     /// for it in [`LoadMode::Wait`]. The plugin copies of the window hold
-    /// the start too.
+    /// the start too. In [`LoadMode::Async`] the start waits a short time
+    /// for the copies a close sent home: see [`Self::start_returns`].
     pub(super) fn follow_start(&mut self, source: &str) -> Result<(), RuntimeError> {
         self.load.installed = self.followed_in_first_window(source)?;
         #[cfg(feature = "vst")]
         {
             self.load.start_plugins = 0;
             self.load.start_progress = None;
+            self.load.start_returning = None;
             if self.waits_for_sounds() {
                 self.look_at_start_copies()?;
+            } else if self.session.plugins_returning() > 0 {
+                self.load.start_returning = Some(Instant::now());
             }
         }
         self.load.start_held = self.waits_for_sounds()
@@ -532,19 +544,24 @@ impl StudioEngine {
     /// sliders can move, and cycle zero stays just ahead. False once the
     /// first window's sounds have loaded and its plugin copies are ready,
     /// when the start goes on. A look that fails ends the wait for the
-    /// copies.
+    /// copies. In [`LoadMode::Async`] a start holds while it waits for the
+    /// copies a close sent home: see [`Self::start_returns`].
     pub(super) fn hold_start(
         &mut self,
         emit: &mut impl FnMut(StudioUpdate) -> StudioUpdateSendResult,
     ) -> bool {
-        if !self.start_is_held() {
+        #[cfg(feature = "vst")]
+        let returning = self.start_returns();
+        #[cfg(not(feature = "vst"))]
+        let returning = false;
+        if !returning && !self.start_is_held() {
             return false;
         }
         #[cfg(feature = "vst")]
         if self.load.start_plugins > 0 && self.look_at_start_copies().is_err() {
             self.load.start_plugins = 0;
         }
-        if !self.loading_among(&self.load.installed) && self.load.start_plugins == 0 {
+        if !returning && !self.loading_among(&self.load.installed) && self.load.start_plugins == 0 {
             self.load.start_held = false;
             return false;
         }
@@ -558,6 +575,31 @@ impl StudioEngine {
         true
     }
 
+    /// True while a start in [`LoadMode::Async`] waits for the plugin copies
+    /// a close of the output sent home: the door of the copies on their way
+    /// home gives more than 0, and less than [`rustel_runtime::SEAM_WAIT`]
+    /// passed since the start. Each turn asks the door again: see
+    /// [`rustel_runtime::Session::plugins_returning`]. Then the start goes
+    /// on, and a note of a copy not yet home plays with no plugin.
+    #[cfg(feature = "vst")]
+    fn start_returns(&mut self) -> bool {
+        let Some(since) = self.load.start_returning else {
+            return false;
+        };
+        if since.elapsed() < rustel_runtime::SEAM_WAIT && self.session.plugins_returning() > 0 {
+            return true;
+        }
+        self.load.start_returning = None;
+        false
+    }
+
+    /// Ends the wait of a start in [`LoadMode::Async`] for the copies a close
+    /// sent home, so the start goes on: an edit or a launch comes first.
+    #[cfg(feature = "vst")]
+    pub(super) fn end_start_returning(&mut self) {
+        self.load.start_returning = None;
+    }
+
     /// Replace a held start with `source`, from its own cycle zero and
     /// waiting for its own first window. A score that fails to evaluate
     /// leaves the held start as it was.
@@ -566,7 +608,7 @@ impl StudioEngine {
         source: &str,
         mini: bool,
     ) -> Result<StudioInstall, RuntimeError> {
-        let preview = std::mem::take(&mut self.next_install_preview);
+        let mark = self.next_install.take();
         let transport = self.session.transport();
         let now = self
             .live
@@ -574,6 +616,8 @@ impl StudioEngine {
             .expect("a held start is live")
             .device
             .clock_seconds();
+        #[cfg(feature = "vst")]
+        self.session.set_plugin_document(mark.document);
         let generation =
             self.session
                 .reload_at_cancellable(source, mini, now, transport.stopped_flag())?;
@@ -587,7 +631,7 @@ impl StudioEngine {
         live.initial_start_generation = Some(generation);
         live.audition_owned = false;
         self.warm_source(source, STARTUP_SAMPLE_WARM_BUDGET)?;
-        self.note_install_for_played(generation, preview, source);
+        self.note_install_for_played(generation, mark.preview, source);
         self.follow_start(source)?;
         Ok(StudioInstall {
             generation,
@@ -735,7 +779,10 @@ impl StudioEngine {
         self.load.start_held = false;
         self.load.start_plugins = 0;
         #[cfg(feature = "vst")]
-        self.session.cancel_plugin_hold();
+        {
+            self.load.start_returning = None;
+            self.session.cancel_plugin_hold();
+        }
         let late = self.late_sounds();
         self.say_late(late);
         self.resolve_alerts();
@@ -1414,6 +1461,13 @@ pub(super) mod tests {
             });
             rustel_runtime::vst::host().wait_idle();
             slots
+        }
+
+        /// The document the next install reads in: see
+        /// [`StudioEngine::mark_next_install_document`].
+        #[cfg(feature = "vst")]
+        pub(crate) fn document_mark(engine: &StudioEngine) -> u64 {
+            engine.next_install.document
         }
 
         /// Changing controls must not wait again for the plugin copies of the

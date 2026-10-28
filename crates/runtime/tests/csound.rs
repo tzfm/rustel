@@ -207,7 +207,7 @@ fn recorded_sets_keep_the_orchestra_of_each_accepted_save() {
         let saves = [
             (0.0, source(0.025)),
             (0.0, source(0.05)),
-            (0.25, "note('c4').csound('probe').fast(4)".into()),
+            (0.25, "note('c4').csound('probe').fast(4).clip(2)".into()),
             (
                 0.5,
                 "loadCSound`instr probe\nthis_is_not_an_opcode\nendin`\nnote('c4').csound('probe')"
@@ -244,9 +244,9 @@ fn recorded_sets_keep_the_orchestra_of_each_accepted_save() {
         );
         // Both revisions land inside the same 128-frame render block, each on
         // its own frame. From that frame the new orchestra plays at its full
-        // level, and the orchestra before plays at most at its level while
-        // it fades out in 5 ms (40 frames at 8 kHz). Then the new one plays
-        // alone.
+        // level. The orchestra before sounds through each swap and fades out
+        // in 5 ms (40 frames at 8 kHz). In the first 4 frames of the fade it
+        // plays at 0.9 of its level or more. Then the new one plays alone.
         let near = |frame: usize, level: f32| {
             for channel in 0..2 {
                 let actual = decoded.pcm()[frame * 2 + channel];
@@ -260,7 +260,7 @@ fn recorded_sets_keep_the_orchestra_of_each_accepted_save() {
             for channel in 0..2 {
                 let actual = decoded.pcm()[frame * 2 + channel];
                 assert!(
-                    actual > new - 3.0 / 32_768.0 && actual < new + before + 3.0 / 32_768.0,
+                    actual > new + before / 2.0 && actual < new + before + 3.0 / 32_768.0,
                     "frame {frame}, channel {channel}: {actual} is not {new} with a fade of {before}"
                 );
             }

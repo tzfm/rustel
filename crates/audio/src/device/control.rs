@@ -1266,7 +1266,9 @@ impl LiveScalarDevice {
     /// Resume this stream after its stop ramp completes. An already-running
     /// output keeps its voices. Events queued after resume wait for the ramp.
     /// A stopped output keeps the inserts of its chains, and each chain is
-    /// silent until its next note.
+    /// silent until its next note. While the output is stopped, each insert
+    /// plays out its tail with no sound out: until it is quiet for its tail,
+    /// or for 0.25 s when that is longer, 3 s at most.
     pub fn resume(&self) {
         self.shared.stop.resume();
     }

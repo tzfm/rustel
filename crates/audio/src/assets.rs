@@ -388,17 +388,17 @@ impl SampleChannel {
         returned_kabel: impl FnMut(*mut rustel_kabel::Graph),
         returned_program: impl FnMut(*mut PreparedKabelProgram),
     ) {
-        self.reclaim_with_inserts(returned_fx, returned_kabel, returned_program, |_| {});
+        self.reclaim_with_inserts(returned_fx, returned_kabel, returned_program, drop);
     }
 
-    /// Like [`Self::reclaim_with_programs`], and `returned_insert` sees each
-    /// insert the callback gave back before the insert is freed.
+    /// Like [`Self::reclaim_with_programs`], and `returned_insert` takes each
+    /// insert the callback gave back. The caller frees it.
     pub fn reclaim_with_inserts(
         &self,
         mut returned_fx: impl FnMut(*mut crate::reverb::OrbitReverb),
         mut returned_kabel: impl FnMut(*mut rustel_kabel::Graph),
         mut returned_program: impl FnMut(*mut PreparedKabelProgram),
-        mut returned_insert: impl FnMut(*mut dyn crate::insert::OrbitInsert),
+        mut returned_insert: impl FnMut(Box<dyn crate::insert::OrbitInsert>),
     ) {
         while let Some(returned) = self.program_returns.pop() {
             returned_program(returned.0);
@@ -426,9 +426,8 @@ impl SampleChannel {
             drop(unsafe { Box::from_raw(returned.0) });
         }
         while let Some(returned) = self.insert_returns.pop() {
-            returned_insert(returned.0);
             // SAFETY: same pass for inserts displaced by the callback.
-            drop(unsafe { Box::from_raw(returned.0) });
+            returned_insert(unsafe { Box::from_raw(returned.0) });
         }
     }
 }

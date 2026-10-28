@@ -411,6 +411,13 @@ impl Session {
         self.requery_anchor_time = None;
     }
 
+    /// True while a rewind is installed and its first window is not out:
+    /// its takeover carries a cut.
+    #[cfg(all(feature = "vst", feature = "device-audio"))]
+    pub(crate) fn rewind_pending(&self) -> bool {
+        self.requery_takeover_cut != TakeoverCut::None
+    }
+
     /// The live producer published `generation` to its device, to take over
     /// on `takeover_frame` with `cut`. The ledger of latency-compensated
     /// events follows the flip: it keeps what the device keeps of the

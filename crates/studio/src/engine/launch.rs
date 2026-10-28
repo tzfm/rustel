@@ -78,6 +78,10 @@ impl StudioEngine {
             self.recent_rewind = None;
             return Ok(None);
         }
+        // The launch comes before the copies a close sent home: the start
+        // goes on, and the launch arms as in the async mode.
+        #[cfg(feature = "vst")]
+        self.end_start_returning();
         // A start still holding its cycle zero has no line yet: the launch
         // replaces it now, from its own cycle zero.
         if self.start_is_held() {
@@ -186,7 +190,7 @@ impl StudioEngine {
             boundary_time,
             rewind,
             unit_cycles,
-            preview: std::mem::take(&mut self.next_install_preview),
+            mark: self.next_install.take(),
             followed: self.new_in_text(source, mini),
             waited: false,
             #[cfg(feature = "vst")]
@@ -498,7 +502,7 @@ impl StudioEngine {
             // previous launch's held flip, not this one.
             self.line_cut_withdrawn = false;
         }
-        self.next_install_preview = pending.preview;
+        self.next_install = pending.mark;
         let outcome = self.reload_live(&pending.source, pending.mini);
         if let Ok(Some(install)) = &outcome {
             self.landing = Some(Landing {
@@ -526,8 +530,8 @@ impl StudioEngine {
             // The session holds the launch for its plugin copies: the launch
             // takes the first line after them.
             Ok(None) => {
-                let preview = std::mem::take(&mut self.next_install_preview);
-                self.pending_launch = Some(PendingLaunch { preview, ..pending });
+                let mark = self.next_install.take();
+                self.pending_launch = Some(PendingLaunch { mark, ..pending });
                 self.launch_takes_next_line(self.device_time(), &launch_wait_message(false, true));
             }
             Err(error) => {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::pool::{JobKind, PoolHandle};
 
 pub(super) fn claim_insert_bus(chains: &mut [Option<u64>], chain: u64) -> Option<usize> {
     if let Some(bus) = chains.iter().position(|held| *held == Some(chain)) {
@@ -70,6 +71,44 @@ pub(crate) fn render_leaving_insert(
     }
     leaving.collect(left, right);
     settle_insert_block(left, right);
+}
+
+/// Drains one block of silence through a copy of a stopped output, in
+/// `block`: see [`crate::insert::OrbitInsert::drain`]. The output goes
+/// nowhere. A quiet block adds its frames to `idle`, the idle frames of the
+/// copy, and a block with sound sets 0.
+pub(crate) fn drain_insert_block(
+    insert: &mut dyn crate::insert::OrbitInsert,
+    block: &mut [[f32; crate::reverb::REVERB_BLOCK]; 2],
+    frames: usize,
+    idle: &mut u32,
+) {
+    let [left, right] = block;
+    let (left, right) = (&mut left[..frames], &mut right[..frames]);
+    left.fill(0.0);
+    right.fill(0.0);
+    insert.drain(left, right);
+    *idle = if settle_insert_block(left, right) {
+        idle.saturating_add(frames as u32)
+    } else {
+        0
+    };
+}
+
+/// The stages of the bits of `stages`: an effect stage at its number, and
+/// the instrument at [`crate::insert::EFFECT_CHAIN`].
+fn stages_of(stages: u8) -> impl Iterator<Item = usize> {
+    (0..=crate::insert::EFFECT_CHAIN).filter(move |stage| stages & (1 << stage) != 0)
+}
+
+/// The bits of `stages` by the kind of their job: the instrument, then the
+/// effect stages.
+fn by_job(stages: u8) -> [(JobKind, u8); 2] {
+    let instrument = 1 << crate::insert::EFFECT_CHAIN;
+    [
+        (JobKind::Instrument, stages & instrument),
+        (JobKind::Effect, stages & (instrument - 1)),
+    ]
 }
 
 /// Ends the block of an effect stage while a level of its slot moves: see
@@ -296,10 +335,11 @@ impl Default for InsertPostgain {
 
 impl InsertPostgain {
     /// The level after a reset: 0 until a note owns the chain. The chain
-    /// keeps its count of silent frames. No insert runs while the output is
-    /// stopped, so a tail at the end of the stop ramp is still there after
-    /// the resume. The next note then moves the level up from 0, also in the
-    /// first block after the resume.
+    /// keeps its count of silent frames, and the drain of a stopped output
+    /// adds to it: see [`ScalarBackend::drain_stopped_inserts`]. A chain that
+    /// drained its tail takes its level at once at its next note. When a
+    /// tail is still there after the resume, the next note moves the level
+    /// up from 0, also in the first block after the resume.
     pub(super) fn silent(quiet: u16) -> Self {
         Self {
             value: 0.0,
@@ -421,6 +461,21 @@ impl ScalarBackend {
 
     pub(crate) fn take_retired_insert(&mut self) -> Option<Box<dyn crate::insert::OrbitInsert>> {
         self.retired_inserts.pop()
+    }
+
+    /// Takes each copy the backend holds: the active, the waiting, the
+    /// leaving and the retired copies. A closed output gives them to the
+    /// producer, which frees them.
+    #[cfg(feature = "device-audio")]
+    pub(crate) fn take_inserts(
+        &mut self,
+    ) -> impl Iterator<Item = Box<dyn crate::insert::OrbitInsert>> {
+        self.orbit_inserts
+            .iter_mut()
+            .chain(&mut self.prepared_inserts)
+            .chain(&mut self.leaving_inserts)
+            .filter_map(Option::take)
+            .chain(self.retired_inserts.drain(..))
     }
 
     /// The insert a logical slot currently holds.
@@ -729,6 +784,150 @@ impl ScalarBackend {
         } else {
             leave_order(&mut self.effect_order[bus], slot.stage);
         }
+    }
+
+    /// Drains the copies of a stopped output past its stop ramp, for the
+    /// `frames` of one block: see [`crate::insert::OrbitInsert::drain`]. The
+    /// active copy of each effect stage in the order and of each instrument
+    /// slot plays blocks of silence, with no sound out. A copy drains while
+    /// it is quiet for less than its quiet time: its tail, and
+    /// [`crate::insert::INSERT_DRAIN_QUIET_SECONDS`] at least. The drain of a
+    /// stop ends at the first block in which no copy drains, and after
+    /// [`INSERT_DRAIN_SECONDS`] at most. A copy that renders ahead gets no
+    /// drain. A quiet block adds its frames to the idle frames of the copy
+    /// and to the silent frames of its chain, and a block with sound sets
+    /// them to 0. So a chain that drained its tail takes its level at once at
+    /// its next note. The copies of a chain that run on any thread drain in a
+    /// job of the plugin workers while their gate is open, and the callback
+    /// joins the job in the same block. A host calls this after
+    /// [`Self::reset_at`] in each block of a stop that renders nothing, and
+    /// [`Self::end_insert_drain`] when the output plays again.
+    pub fn drain_stopped_inserts(&mut self, frames: usize) {
+        let rate = self.sample_rate;
+        let longest = rate.saturating_mul(INSERT_DRAIN_SECONDS);
+        let least = (crate::insert::INSERT_DRAIN_QUIET_SECONDS * rate as f32) as u32;
+        let mut start = 0;
+        while start < frames && self.insert_drained < longest {
+            let sub_len = (frames - start).min(crate::reverb::REVERB_BLOCK);
+            start += sub_len;
+            self.insert_drained = self.insert_drained.saturating_add(sub_len as u32);
+            // The copies of each bus that drain, and the copies that drain in
+            // a job: the bit of each effect stage, and the bit of
+            // EFFECT_CHAIN for the instrument.
+            let mut draining = [0u8; crate::insert::MAX_INSERT_BUSES];
+            let mut pooled = [0u8; crate::insert::MAX_INSERT_BUSES];
+            for (bus, chain) in self.insert_chains.iter().enumerate() {
+                if chain.is_none() {
+                    continue;
+                }
+                let order = ordered_stages(&self.effect_order[bus], 0).map(|(_, stage)| stage);
+                for stage in order.chain([crate::insert::EFFECT_CHAIN]) {
+                    let slot = stage * crate::insert::MAX_INSERT_BUSES + bus;
+                    let idle = self.insert_idle_frames[slot];
+                    let drains = self.orbit_inserts[slot].as_ref().is_some_and(|insert| {
+                        !insert.renders_ahead() && idle < insert.tail_frames().max(least)
+                    });
+                    draining[bus] |= u8::from(drains) << stage;
+                }
+            }
+            // With no copy to drain, the drain of the stop ends. A stopped
+            // output runs no copy outside the drain, and it puts each new
+            // copy in the waiting place. So no copy needs a drain later.
+            if draining.iter().all(|stages| *stages == 0) {
+                self.insert_drained = longest;
+                break;
+            }
+            let mut jobs = self
+                .plugin_pool
+                .as_mut()
+                .filter(|pool| pool.runs(sub_len))
+                .map(PoolHandle::begin);
+            // The buses with a job out, for each kind of `by_job`.
+            let mut posted = [0u64; 2];
+            if let Some(jobs) = jobs.as_mut() {
+                for (bus, stages) in draining.iter().enumerate() {
+                    for ((kind, copies), posted) in by_job(*stages).into_iter().zip(&mut posted) {
+                        let any_thread = stages_of(copies).all(|stage| {
+                            let slot = stage * crate::insert::MAX_INSERT_BUSES + bus;
+                            self.orbit_inserts[slot]
+                                .as_ref()
+                                .is_some_and(|insert| insert.any_thread())
+                        });
+                        if copies == 0 || !any_thread {
+                            continue;
+                        }
+                        let job = jobs.job(kind, bus);
+                        job.frames = sub_len;
+                        job.drain = true;
+                        for stage in stages_of(copies) {
+                            let slot = stage * crate::insert::MAX_INSERT_BUSES + bus;
+                            // An instrument job holds its instrument at 0.
+                            let place = stage % crate::insert::EFFECT_CHAIN;
+                            job.boxes[place] = self.orbit_inserts[slot].take();
+                            job.idle[place] = self.insert_idle_frames[slot];
+                        }
+                        jobs.post(kind, bus);
+                        *posted |= 1u64 << bus;
+                        pooled[bus] |= copies;
+                    }
+                }
+            }
+            // Each other copy drains on the callback while the jobs run.
+            let mut block = [[0.0f32; crate::reverb::REVERB_BLOCK]; 2];
+            for (bus, stages) in draining.iter().enumerate() {
+                for stage in stages_of(stages & !pooled[bus]) {
+                    let slot = stage * crate::insert::MAX_INSERT_BUSES + bus;
+                    if let Some(insert) = self.orbit_inserts[slot].as_deref_mut() {
+                        let idle = &mut self.insert_idle_frames[slot];
+                        drain_insert_block(insert, &mut block, sub_len, idle);
+                    }
+                }
+            }
+            // Each job joins in the order it ends, and its copies and their
+            // idle frames come back.
+            if let Some(jobs) = jobs.as_mut() {
+                for ((kind, copies), mut buses) in by_job(u8::MAX).into_iter().zip(posted) {
+                    while buses != 0 {
+                        let bus = jobs.join(kind, buses);
+                        buses &= !(1u64 << bus);
+                        let job = jobs.job(kind, bus);
+                        for stage in stages_of(pooled[bus] & copies) {
+                            let slot = stage * crate::insert::MAX_INSERT_BUSES + bus;
+                            let place = stage % crate::insert::EFFECT_CHAIN;
+                            self.orbit_inserts[slot] = job.boxes[place].take();
+                            self.insert_idle_frames[slot] = job.idle[place];
+                        }
+                    }
+                }
+            }
+            // The silent frames of each chain that drained move. A copy that
+            // drained a block with sound has no idle frame.
+            for (bus, stages) in draining.into_iter().enumerate() {
+                for (kind, copies) in by_job(stages) {
+                    if copies == 0 {
+                        continue;
+                    }
+                    let sounds = stages_of(copies).any(|stage| {
+                        self.insert_idle_frames[stage * crate::insert::MAX_INSERT_BUSES + bus] == 0
+                    });
+                    let quiet = match kind {
+                        JobKind::Instrument => &mut self.instrument_gains[bus].quiet,
+                        JobKind::Effect => &mut self.insert_postgains[bus].quiet,
+                    };
+                    *quiet = if sounds {
+                        0
+                    } else {
+                        quiet.saturating_add(sub_len as u16)
+                    };
+                }
+            }
+        }
+    }
+
+    /// Ends the drain of a stop when the output plays again, so the next
+    /// stop drains for its whole time: see [`Self::drain_stopped_inserts`].
+    pub fn end_insert_drain(&mut self) {
+        self.insert_drained = 0;
     }
 
     /// Offline renders build a missing insert at activation with this
@@ -1184,6 +1383,113 @@ mod tests {
                     0.25 + 0.125 * fade.next()
                 };
                 assert_eq!(*samples, [level; 2], "frame {frame}");
+            }
+
+            /// Renders ahead as `Ahead` does, and plays each score for its
+            /// length in frames, as a Csound note plays for its p3. It keeps
+            /// its last 2 notes.
+            struct Notes {
+                ahead: Ahead,
+                frame: u64,
+                notes: [(u64, u64); 2],
+            }
+            impl OrbitInsert for Notes {
+                fn key(&self) -> InsertKey {
+                    self.ahead.key()
+                }
+                fn set_param(&mut self, _: InsertParam, _: u32) {}
+                fn score(&mut self, length: u64, frames: u32) {
+                    let start = self.frame + u64::from(frames);
+                    self.notes = [self.notes[1], (start, start + length)];
+                }
+                fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+                    self.collect(left, right);
+                }
+                fn submit(&mut self, _: &mut [f32], _: &mut [f32]) {}
+                fn collect(&mut self, left: &mut [f32], right: &mut [f32]) {
+                    self.ahead.collect(left, right);
+                    for (left, right) in left.iter_mut().zip(right) {
+                        let frame = self.frame;
+                        let sounds = self
+                            .notes
+                            .iter()
+                            .any(|&(start, end)| (start..end).contains(&frame));
+                        if !sounds {
+                            (*left, *right) = (0.0, 0.0);
+                        }
+                        self.frame += 1;
+                    }
+                }
+                fn flush(&mut self, frames: usize) {
+                    self.ahead.flush(frames);
+                }
+                fn renders_ahead(&self) -> bool {
+                    true
+                }
+            }
+            // The swaps of a recorded set with Csound, at 8 kHz. The second
+            // note of plugin 1 ends on the frame of the swap to plugin 2, or
+            // sounds 64 frames past it. Both swaps are heard, and the
+            // instrument that leaves fades out in 5 ms (40 frames).
+            for length in [2000, 2064] {
+                let mut backend = ScalarBackend::prepared(8_000, 8).unwrap();
+                backend.render_offline();
+                backend.set_insert_provider(Arc::new(|key, _, _| {
+                    let notes = Notes {
+                        ahead: Ahead(key, 0),
+                        frame: 0,
+                        notes: [(0, 0); 2],
+                    };
+                    Some(Box::new(notes) as Box<dyn OrbitInsert>)
+                }));
+                for (frame, plugin, frames) in [
+                    (0, 1, 2000),
+                    (2000, 1, length),
+                    (4000, 2, 2000),
+                    (4064, 3, 2000),
+                ] {
+                    let mut event = OnsetEvent::new(frame, 440.0, 1.0, 0.02);
+                    event.controls.orbit = 0;
+                    let controls = InsertControls::new(InsertKey { plugin, preset: 0 });
+                    event.controls.instrument = Some(controls.with_score(frames));
+                    backend.note(event);
+                }
+                let fade = || {
+                    let mut fade = Ramp::new(0, 0.0);
+                    fade.declick_from(Ramp::new(0, 1.0), 8_000);
+                    fade
+                };
+                let (mut first, mut second) = (fade(), fade());
+                // Plugin 1 plays in its fade only while its note lasts.
+                let before = if length > 2000 { 0.125 } else { 0.0 };
+                // Checks the output of a render that starts on frame `start`.
+                let mut check = |output: &[f32], start: usize| {
+                    for (frame, samples) in output.as_chunks::<2>().0.iter().enumerate() {
+                        let frame = start + frame;
+                        let level = if frame < 4000 {
+                            0.125
+                        } else if frame < 4064 {
+                            0.25 + before * first.next()
+                        } else {
+                            0.375 + 0.25 * second.next()
+                        };
+                        assert_eq!(*samples, [level; 2], "frame {frame}, length {length}");
+                    }
+                };
+                let mut output = vec![0.0; 2 * 4032];
+                backend.process_block(&mut output, 4032);
+                check(&output, 0);
+                // The swap at 4000 is heard, so plugin 1 fades out in the
+                // leaving place, also when its note ended.
+                let slot = crate::insert::instrument_slot(0).physical(0);
+                let leaving = backend.leaving_inserts[slot].as_ref();
+                let plugin = leaving.map(|insert| insert.key().plugin);
+                let mix = backend.insert_mixes[slot];
+                assert_eq!(plugin, Some(1), "length {length}");
+                assert!(mix.leaving.is_moving(), "length {length}");
+                let mut output = vec![0.0; 2 * 192];
+                backend.process_block(&mut output, 192);
+                check(&output, 4032);
             }
 
             let ring = Arc::new(crate::input::InputRing::new());

@@ -156,6 +156,10 @@ impl Session {
         self.requery_takeover_cut = TakeoverCut::None;
         self.requery_anchor_time = None;
         self.requeried_generation = Some(generation_after);
+        // The new output holds no plugin copy yet, so the looks at the
+        // cycles ahead start again at the cycle in play.
+        #[cfg(feature = "vst")]
+        self.plugin_ahead.restart();
         // Nor does it hold a latency-compensated event from before the
         // cursor: the recovery generation sounds every onset it queries.
         self.compensated_onsets.clear();

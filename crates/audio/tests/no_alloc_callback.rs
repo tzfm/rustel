@@ -172,6 +172,9 @@ static WORKER_CALLS: AtomicU64 = AtomicU64::new(0);
 /// The calls of the [`GainInsert`] of plugin 7, on any thread.
 static PLUGIN_7_CALLS: AtomicU64 = AtomicU64::new(0);
 
+/// The drain calls of a [`GainInsert`], on any thread.
+static DRAIN_CALLS: AtomicU64 = AtomicU64::new(0);
+
 /// A gain as an orbit insert that runs on any thread. Parameter 1 is the
 /// gain.
 struct GainInsert {
@@ -207,6 +210,11 @@ impl rustel_audio::OrbitInsert for GainInsert {
 
     fn any_thread(&self) -> bool {
         true
+    }
+
+    fn drain(&mut self, left: &mut [f32], right: &mut [f32]) {
+        DRAIN_CALLS.fetch_add(1, Ordering::Relaxed);
+        self.process(left, right);
     }
 }
 
@@ -383,6 +391,59 @@ fn an_orbit_insert_installs_and_processes_without_callback_allocation() {
         );
         assert!(output.iter().all(|sample| *sample == 0.0));
         assert_eq!(backend.missing_insert_events(), 0);
+
+        // A stopped output drains both stages with silence, on a worker when
+        // the chain has workers. A copy of a stage out of the order of the
+        // chain gets no drain. The blocks of the drain allocate and free
+        // nothing.
+        let unheard = Box::new(GainInsert {
+            key: rustel_audio::InsertKey { plugin: 10, ..key },
+            gain: 1.0,
+        });
+        let slot = rustel_audio::InsertSlot::effect(1, 2);
+        assert!(backend.install_insert(slot, unheard).is_none());
+        let drains = DRAIN_CALLS.load(Ordering::Relaxed);
+        let worker_calls = WORKER_CALLS.load(Ordering::Relaxed);
+        let before = Violations::capture();
+        tripwire::audio_scope(|| {
+            for block in 0..4 {
+                backend.reset_at(768 + block * 128);
+                backend.drain_stopped_inserts(128);
+            }
+        });
+        let delta = Violations::capture().since(before);
+        assert!(
+            delta.clean(),
+            "the drain of a stopped output allocated or freed in the callback: {delta:?}"
+        );
+        assert_eq!(DRAIN_CALLS.load(Ordering::Relaxed) - drains, 2 * 4);
+        if workers.is_some() {
+            assert!(
+                WORKER_CALLS.load(Ordering::Relaxed) > worker_calls,
+                "no drain ran on a worker"
+            );
+        }
+
+        // The stages drain until they are quiet for 0.25 s. The first block
+        // with no copy to drain ends the drain of the stop, so a copy put in
+        // place after that block gets no drain.
+        for block in 4..100 {
+            backend.reset_at(768 + block * 128);
+            backend.drain_stopped_inserts(128);
+        }
+        let late = Box::new(GainInsert {
+            key: rustel_audio::InsertKey { plugin: 11, ..key },
+            gain: 1.0,
+        });
+        let slot = rustel_audio::InsertSlot::instrument(1);
+        assert!(backend.install_insert(slot, late).is_none());
+        let drains = DRAIN_CALLS.load(Ordering::Relaxed);
+        backend.drain_stopped_inserts(128);
+        assert_eq!(
+            DRAIN_CALLS.load(Ordering::Relaxed),
+            drains,
+            "the drain went on"
+        );
     }
 }
 

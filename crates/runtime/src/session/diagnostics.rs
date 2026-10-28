@@ -70,7 +70,7 @@ impl Session {
         // its line joins here. Only the session of the live output takes the
         // lines of the host and of the output. A session with no live output
         // leaves them. The chains of this session give the lanes with no
-        // room for a chain.
+        // room for a chain, and the line of the memory floor.
         #[cfg(feature = "vst")]
         {
             if self.plugins_live() {

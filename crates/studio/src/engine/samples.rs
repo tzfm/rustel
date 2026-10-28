@@ -318,6 +318,8 @@ impl StudioEngine {
         self.adopt_idle_ready_samples();
         let now = Instant::now();
         self.enforce_sample_memory(now);
+        #[cfg(feature = "vst")]
+        self.close_output_of_closed_tabs();
         self.free_memory_when_due(now);
     }
 
@@ -408,6 +410,18 @@ impl StudioEngine {
         }
         #[cfg(feature = "vst")]
         {
+            // The scene of a tab that left gives its plugin copies back.
+            let closed = &material.closed_documents;
+            if let Some(gone) = closed.get(self.live_documents_closed..)
+                && !gone.is_empty()
+            {
+                for document in gone {
+                    self.closed_plugin_copies |= self.session.forget_plugin_document(*document);
+                }
+                self.live_documents_closed = closed.len();
+                self.ask_idle_sweep();
+            }
+            self.close_output_of_closed_tabs();
             // A plugin the column shows no more goes with the next sweep.
             // A text edit asks for no sweep, as for the sounds.
             if material.plugins != self.live_plugins_shown {
@@ -850,7 +864,10 @@ impl StudioEngine {
     /// [`rustel_runtime::vst::whole_names`]. Each chain of the score keeps
     /// its plugins too, also after a Stop: see
     /// [`rustel_runtime::Session::plugin_names`]. So a plugin from a setup
-    /// text, an import or a name the score computes stays loaded.
+    /// text, an import or a name the score computes stays loaded. So does
+    /// the plugin of each copy an open scene keeps while it does not play.
+    /// The chains of a closed score end first: see
+    /// [`rustel_runtime::Session::end_closed_plugin_document`].
     /// The host keeps each plugin with a running copy, so an unload waits
     /// for the output of its score to close. A stop parks the output with
     /// the copies of its score. The sweep closes a parked output that holds
@@ -881,20 +898,45 @@ impl StudioEngine {
         }
         // Another string keeps a plugin by its whole name only.
         keep.extend(rustel_runtime::vst::whole_names(&strings));
+        // The chains of a closed score end while the output is stopped.
+        if self.live.is_none() {
+            self.closed_plugin_copies |= self.session.end_closed_plugin_document();
+        }
         keep.extend(self.session.plugin_names());
         // The close sends the copies to the plugin thread before the unload.
         // Piano mode, a key that rings out or a score tail keeps the output
         // open. Its copies keep their plugins loaded.
-        if self.live.is_none()
+        if self.parked_output_idle() && rustel_runtime::vst::engine_holds_unkept(&keep) {
+            self.close_piano_output();
+        }
+        rustel_runtime::vst::unload_unused(&keep);
+    }
+
+    /// True when the parked output closes with no sound lost: no score
+    /// plays, Piano mode is closed, and no key or score tail rings out.
+    #[cfg(feature = "vst")]
+    fn parked_output_idle(&self) -> bool {
+        self.live.is_none()
             && self.piano_output.is_some()
             && !self.piano_mode
             && self.piano.iter().all(Option::is_none)
             && !self.piano_has_score_tail
-            && rustel_runtime::vst::engine_holds_unkept(&keep)
-        {
+    }
+
+    /// Closes the parked output while it holds a plugin copy of a chain that
+    /// a closed tab ended, so the copy ends with no wait for the sweep:
+    /// see [`Self::closed_plugin_copies`]. Piano mode, a key that rings out
+    /// or a score tail keeps the output open, and a later turn closes it.
+    /// The plugins stay loaded for the next sweep to judge. With no output
+    /// open, it clears [`Self::closed_plugin_copies`]: each copy left with
+    /// the output that held it.
+    #[cfg(feature = "vst")]
+    pub(super) fn close_output_of_closed_tabs(&mut self) {
+        if self.audio_device().is_none() {
+            self.closed_plugin_copies = false;
+        } else if self.closed_plugin_copies && self.parked_output_idle() {
             self.close_piano_output();
         }
-        rustel_runtime::vst::unload_unused(&keep);
     }
 
     pub(super) fn enforce_sample_memory(&mut self, now: Instant) {
@@ -1893,7 +1935,7 @@ mod tests {
             boundary_time: 8.0,
             rewind: false,
             unit_cycles: 1.0,
-            preview: false,
+            mark: InstallMark::default(),
             followed: Vec::new(),
             waited: false,
             #[cfg(feature = "vst")]
@@ -2085,8 +2127,9 @@ mod tests {
         );
 
         // An armed launch carries the mark to its line, and Stop keeps the
-        // set as it stood.
+        // set as it stood. The document mark stays for the next install.
         engine.mark_next_install_preview(true);
+        engine.mark_next_install_document(4);
         engine
             .arm_launch("s(\"piano\")", false, 1.0, false)
             .expect("arm");
@@ -2094,9 +2137,10 @@ mod tests {
             engine
                 .pending_launch
                 .as_ref()
-                .is_some_and(|pending| pending.preview)
+                .is_some_and(|pending| pending.mark.preview && pending.mark.document == 4)
         );
-        assert!(!engine.next_install_preview);
+        assert!(!engine.next_install.preview);
+        assert_eq!(engine.next_install.document, 4);
         assert!(engine.stop(Duration::from_millis(500)).is_some());
         assert!(engine.played_before_preview.is_none());
         assert_eq!(

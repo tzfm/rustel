@@ -69,6 +69,10 @@ pub(super) struct RecoveryPrebake {
 
 struct RecoveryCheckpoint {
     source: Option<(Arc<str>, bool)>,
+    /// The document of `source`: the replay reads the source in it. See
+    /// [`Session::set_plugin_document`].
+    #[cfg(feature = "vst")]
+    document: u64,
     prebakes: Arc<Vec<RecoveryPrebake>>,
     csound: crate::CsoundSnapshot,
     settings: RuntimeSettings,
@@ -204,8 +208,17 @@ impl Session {
             .audible_source
             .as_ref()
             .map_or(csound, |source| source.csound.clone());
+        #[cfg(feature = "vst")]
+        let document = self.lanes.document();
+        #[cfg(all(feature = "vst", feature = "device-audio"))]
+        let document = self
+            .audible_source
+            .as_ref()
+            .map_or(document, |source| source.document);
         RecoveryCheckpoint {
             source,
+            #[cfg(feature = "vst")]
+            document,
             settings,
             prebakes: self.recovery_prebakes.clone(),
             csound,
@@ -341,6 +354,10 @@ impl Session {
             // Setup restores globals. The audible score keeps its later settings.
             self.js.adopt_runtime_settings(&settings);
             if let Some((source, mini)) = &checkpoint.source {
+                // The source reads in its document, so each of its lanes
+                // keeps its number and its chain.
+                #[cfg(feature = "vst")]
+                self.lanes.set_reading(checkpoint.document);
                 self.reload_at_cancellable(source, *mini, now, &NEVER_CANCELLED)?;
                 // Score evaluation resets join. Restore the later host selection.
                 let join = settings.with(rustel_core::compose::default_alignment);
@@ -370,6 +387,8 @@ impl Session {
                     cps: checkpoint.cps,
                     cycle_zero_time: now - checkpoint.cycle / checkpoint.cps,
                     evaluated_cycle: self.installed_cycle,
+                    #[cfg(feature = "vst")]
+                    document: checkpoint.document,
                 });
             }
             return Ok(checkpoint.source.is_some());
@@ -488,6 +507,8 @@ mod tests {
         let source = GOOD.to_owned();
         #[cfg(feature = "vst")]
         let source = {
+            // The source plays in document 7.
+            session.set_plugin_document(7);
             let source = format!("$: {GOOD}.vst('Delay').orbit(1)");
             session.evaluate(&source).expect("plugin source");
             // A new lane above: the plugin lane keeps its number.
@@ -497,6 +518,9 @@ mod tests {
         };
         #[cfg(feature = "vst")]
         let chain = super::super::tests::plugin_chain(&session);
+        // The next text of the host is of document 8.
+        #[cfg(feature = "vst")]
+        session.set_plugin_document(8);
         // The session plays through the plugins of a live output.
         #[cfg(feature = "vst")]
         session
@@ -518,7 +542,8 @@ mod tests {
         assert_panic(error, "Query");
         assert_eq!(session.active_source(), Some(source.as_str()));
         // The rebuilt session keeps the chains its output reads. A new
-        // registry gives a new number.
+        // registry gives a new number. The replay reads the source in its
+        // document.
         #[cfg(feature = "vst")]
         assert_eq!(super::super::tests::plugin_chain(&session), chain);
         #[cfg(feature = "vst")]
@@ -527,6 +552,8 @@ mod tests {
             "#0",
             "the rebuilt session lost its lanes"
         );
+        #[cfg(feature = "vst")]
+        assert_eq!(session.lanes.document(), 7, "the document of the source");
         #[cfg(feature = "vst")]
         assert!(
             Arc::ptr_eq(
@@ -567,6 +594,12 @@ mod tests {
                 .is_empty()
         });
         assert!(scheduled, "the restored score never scheduled");
+        // The table reads in the document of the source after the replay.
+        #[cfg(feature = "vst")]
+        {
+            session.evaluate(&source).expect("the source again");
+            assert_eq!(session.lanes.document(), 7);
+        }
     }
 
     #[test]
@@ -1399,6 +1432,8 @@ mod tests {
             let relaxed = std::sync::atomic::Ordering::Relaxed;
             session.plugins_live.store(true, relaxed);
             session.plugin_rate.store(48_000, relaxed);
+            // The audible plugin score is of document 1.
+            session.set_plugin_document(1);
             let source = r#"$: s("sine").vst("Delay").orbit(1)"#;
             session.evaluate(source).expect("audible plugin source");
             session
@@ -1425,11 +1460,14 @@ mod tests {
                 .expect("move to three");
             assert_eq!(plugin_note(&session)["__rustel_lane"], "#0");
             assert_eq!(plugin_chain(&session), chain);
-            // A score with no plugin lane is not audible too. The rollback
-            // gives the plugin lane the number it had.
+            // A score of document 2 with no plugin lane is not audible too.
+            // The rollback reads in document 1, and gives the plugin lane
+            // the number it had.
+            session.set_plugin_document(2);
             session
                 .reload_at(other, false, 0.25)
                 .expect("no plugin lane");
+            assert_eq!(session.lanes.document(), 2);
             assert_eq!(
                 session
                     .rollback_to_previous_source(0.3)
@@ -1439,6 +1477,7 @@ mod tests {
             assert_eq!(session.active_source(), Some(source));
             assert_eq!(plugin_note(&session)["__rustel_lane"], "#0");
             assert_eq!(plugin_chain(&session), chain);
+            assert_eq!(session.lanes.document(), 1);
 
             // A plugin with no copy ready. An edit waits, and a rollback in
             // the same state plays at once. The commit of the rollback reads
@@ -1465,6 +1504,40 @@ mod tests {
             assert_eq!(rollback.expect("rollback"), RollbackAttempt::Applied);
             assert_eq!(session.active_source(), Some(edit.as_str()));
             assert!(!session.holds_edit(&edit));
+
+            // A query panic while 2 plays and 1 is audible replays the score
+            // of 1 in document 1, and the plugin lane keeps its number.
+            let mut session = Session::new().expect("session");
+            session.set_direct_diagnostic_logging(false);
+            session.plugins_live.store(true, relaxed);
+            session.plugin_rate.store(48_000, relaxed);
+            session.set_plugin_document(1);
+            session.evaluate(source).expect("audible plugin source");
+            session
+                .mark_audible_generation(session.generation())
+                .expect("retain playing source");
+            session.set_plugin_document(2);
+            session
+                .reload_at(other, false, 0.1)
+                .expect("no plugin lane");
+            session.inject_panic_for_test(SessionPanicPoint::Query);
+            let error = session
+                .schedule_through(0.1, 0.6)
+                .expect_err("scheduler query panics");
+            assert_panic(error, "Query");
+            assert_eq!(session.active_source(), Some(source));
+            assert_eq!(session.lanes.document(), 1);
+            assert_eq!(plugin_note(&session)["__rustel_lane"], "#0");
+            // The replayed score stays the audible score of document 1, so a
+            // second panic replays it in document 1 too.
+            session.set_plugin_document(2);
+            session.inject_panic_for_test(SessionPanicPoint::Evaluation);
+            let error = session
+                .reload_at(other, false, 0.7)
+                .expect_err("evaluation panics");
+            assert_panic(error, "Evaluation");
+            assert_eq!(session.active_source(), Some(source));
+            assert_eq!(session.lanes.document(), 1);
         }
     }
 

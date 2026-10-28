@@ -21,8 +21,11 @@ use super::*;
 /// plugin copies waits by the same rule: see [`Session::plugins_pending`].
 pub const PLUGIN_WAIT: Duration = Duration::from_secs(20);
 /// The longest wait at the commit seam. A light plugin builds one more copy
-/// in this time, so the edit goes in play with no second evaluation.
-const SEAM_WAIT: Duration = Duration::from_millis(150);
+/// in this time, so the edit goes in play with no second evaluation. With
+/// the wait off, a caller holds the first window of a new output, or a
+/// start, this long at most for the copies on their way home: see
+/// [`Session::plugins_returning`].
+pub const SEAM_WAIT: Duration = Duration::from_millis(150);
 /// The time between 2 looks of the wait at the commit seam.
 const SEAM_LOOK_EVERY: Duration = Duration::from_millis(2);
 /// The cycles of a candidate the commit seam reads first: the cycle in play
@@ -420,9 +423,18 @@ impl Session {
     /// Whether an edit waits for its plugin copies. On at the start. With the
     /// wait off, an edit goes in play at once, and a note plays with no
     /// plugin until its copy is ready. An edit that waits goes in play at
-    /// the next call of its door.
+    /// the next call of its door. With the wait on, the first window of a
+    /// new output waits for the copies its close sent home, until no copy
+    /// became ready in [`PLUGIN_WAIT`]. With the wait off, it waits
+    /// [`SEAM_WAIT`] at most. The first install of a producer that never
+    /// published waits for its copies only with the wait on.
     pub fn set_plugin_wait(&mut self, on: bool) {
         self.plugin_wait = on;
+    }
+
+    /// True when the wait is on: see [`Self::set_plugin_wait`].
+    pub(crate) fn plugin_wait(&self) -> bool {
+        self.plugin_wait
     }
 
     /// True when the session holds the edit with the text `source`.
@@ -1118,7 +1130,8 @@ mod tests {
     /// starts the looks again at the cycle in play. A shield looks at
     /// nothing, also with its cover full. A look that does not end in its
     /// time reads its cycle again. A score that a panic recovery restored
-    /// looks at nothing until the next commit.
+    /// looks at nothing until the next commit. A new output starts the looks
+    /// again at the cycle in play.
     #[test]
     fn the_looks_ahead_load_the_copies_of_later_notes() {
         let (_one, folder) = fixture_plugins();
@@ -1212,6 +1225,10 @@ mod tests {
         assert_eq!(session.plugin_ahead.next, None, "a restored score");
         session.reload_at(score, false, 5.0).expect("a commit");
         look_until(&mut session, 5.0, 3, false);
+        // A new output starts the looks again at the cycle in play.
+        let requery = session.requery_after_output_recycle_at(5.0);
+        assert!(requery.expect("a new output").is_some());
+        assert_eq!(session.plugin_ahead.next, None, "a new output");
     }
 
     /// The plan of a start, of an edit and of a launch has the notes of the
@@ -1348,8 +1365,14 @@ mod tests {
     /// chain that a Csound orbit ends to make room. A turn of an output with
     /// no plugins counts nothing. A session with no live output keeps no
     /// plugin. A live output gives back a copy the chain no longer wants, 5 s
-    /// after the chain lost its key. A session that ends tells the host, so
-    /// the slot of its chain takes the copy then.
+    /// after the chain lost its key. The score rests while a score of another
+    /// document plays. After 5 s of play the output names its chain no more,
+    /// and the chain keeps the copy of its preset. Its slot takes no copy of
+    /// another preset. The score plays again, and its tab closes while it
+    /// plays. When a score of another document plays, its chain is a closed
+    /// chain in its grace, and it keeps its copy. A session that ends ends
+    /// its chains at the host, a closed chain too. Its copy ends, and the
+    /// slot of its chain takes no copy then.
     #[test]
     fn a_chain_of_a_setup_pattern_leaves_after_its_time() {
         let (_one, folder) = fixture_plugins();
@@ -1503,11 +1526,43 @@ mod tests {
         rustel_audio::LiveReverbBatch::install_inserts(output.device(), &[]);
         assert!(!output.device().holds_insert(slot, key));
         drop(output);
+        // The score rests while a score of another document plays. After
+        // 5 s of play the output names its chain no more, and the chain
+        // keeps the copy of its preset. Its slot takes no copy of another
+        // preset.
+        host.prepare(fixture, Some("half"), false, 48_000, slot);
+        session.set_plugin_document(1);
+        session.evaluate(kick).expect("a score of another document");
+        for now in 35..41 {
+            turn(&mut session, f64::from(now), steady);
+        }
+        assert!(insert_chains(&session).named.is_empty(), "a rest chain");
+        assert_eq!(copies_in(folder.path()), 1, "the copy of a rest chain");
+        host.prepare(fixture, None, false, 48_000, slot);
+        assert_eq!(
+            copies_in(folder.path()),
+            1,
+            "a copy the rest chain does not want"
+        );
+        // The score plays again, and its tab closes while the transport
+        // runs, so the score plays on. A score of another document plays:
+        // the chain is a closed chain in its grace. No call of the host
+        // names it, and the host keeps its copy.
+        session.set_plugin_document(0);
+        session.evaluate(&score).expect("the score again");
+        assert_eq!(plugin_chain(&session), slot.chain);
+        assert!(
+            !session.forget_plugin_document(0),
+            "the closed score plays on"
+        );
+        session.set_plugin_document(1);
+        session.evaluate(kick).expect("a score of another document");
+        assert_eq!(copies_in(folder.path()), 1, "the copy of a closed chain");
         drop(session);
         host.prepare(fixture, Some("half"), false, 48_000, slot);
         assert_eq!(
             copies_in(folder.path()),
-            1,
+            0,
             "a slot of a session that ended"
         );
     }

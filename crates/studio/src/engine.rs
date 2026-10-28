@@ -128,6 +128,12 @@ pub struct LiveMaterial {
     /// them, so a move here owes one more. A count rather than an event:
     /// a send the full queue refused is sent again with the latest.
     pub tabs_closed: u64,
+    /// The scene id of each tab that has left the studio, in order: closed,
+    /// deleted, or put down with its set. A scene id is the document of the
+    /// text of its tab, and the engine closes the document of each new id:
+    /// see [`rustel_runtime::Session::forget_plugin_document`]. A list
+    /// rather than an event, for the reason of the count above.
+    pub closed_documents: Vec<u64>,
     /// Whether a setup picks sample variants: a setup open in a tab, or
     /// either setup as the studio stores it. See
     /// [`rustel_runtime::sounds::variant_selection`].
@@ -948,9 +954,9 @@ struct PendingLaunch {
     /// The quantise unit the line was chosen on, in cycles. A fired
     /// rewind's grace is sized from it.
     unit_cycles: f64,
-    /// A snippet previewed under the set: see
-    /// [`StudioEngine::played_before_preview`].
-    preview: bool,
+    /// Whether it is a snippet previewed under the set, and the document of
+    /// its text: see [`InstallMark`].
+    mark: InstallMark,
     /// What its text needs; in wait mode it lands on the first line after
     /// all of it has loaded.
     followed: Vec<Followed>,
@@ -960,6 +966,28 @@ struct PendingLaunch {
     /// prepare: see [`StudioEngine::prepare_launch`].
     #[cfg(feature = "vst")]
     prepared: bool,
+}
+
+/// What the worker says of the score it hands over next, for its install.
+#[derive(Clone, Copy, Debug, Default)]
+struct InstallMark {
+    /// A snippet previewed under the set: see
+    /// [`StudioEngine::played_before_preview`]. One install takes it.
+    preview: bool,
+    /// The document of the text: the scene id of its tab, as the session
+    /// reads it. See [`StudioEngine::mark_next_install_document`]. It stays
+    /// for each install until the next mark.
+    document: u64,
+}
+
+impl InstallMark {
+    /// The mark of one install. The preview goes with the install, and the
+    /// document stays for the next.
+    fn take(&mut self) -> Self {
+        let mark = *self;
+        self.preview = false;
+        mark
+    }
 }
 
 /// A launch that has fired: its evaluation is done, the new generation is
@@ -1128,7 +1156,9 @@ pub struct StudioEngine {
     live: Option<StudioPlayback>,
     /// Output parked between transports: no score producer, transport or
     /// cycle ownership. A stop parks the stream here rather than closing
-    /// it, and the next start adopts it where it stands.
+    /// it, and the next start adopts it where it stands. Outside Piano mode,
+    /// a stop closes a stream that holds a plugin copy of a chain that a
+    /// closed tab ended: see [`Self::closed_plugin_copies`].
     piano_output: Option<LiveScalarDevice>,
     piano_close_when_idle: bool,
     /// Piano mode is open in the app: from [`Self::prepare_piano`] to
@@ -1305,13 +1335,24 @@ pub struct StudioEngine {
     /// earlier one, pushed after the score was put back over a preview,
     /// are the preview playing on to its cutover.
     played_from_generation: u64,
-    /// Whether the score handed over next - evaluated at once, or armed
-    /// for a line and carried there by [`PendingLaunch::preview`] - is a
-    /// snippet previewed under the set. Set by the worker with each
-    /// evaluation, and taken by the install.
-    next_install_preview: bool,
+    /// The install mark of the score handed over next: a snippet previewed
+    /// under the set or not, and the document of its text. The worker sets
+    /// it with each evaluation. A score armed for a line carries it there in
+    /// [`PendingLaunch::mark`]. The install takes the preview, and the
+    /// document stays until the next mark.
+    next_install: InstallMark,
     /// [`LiveMaterial::tabs_closed`] as last sent.
     live_tabs_closed: u64,
+    /// How many ids of [`LiveMaterial::closed_documents`] the engine took.
+    #[cfg(feature = "vst")]
+    live_documents_closed: usize,
+    /// An engine holds a plugin copy of a chain that a closed tab ended: see
+    /// [`rustel_runtime::Session::end_closed_plugin_document`]. The parked
+    /// output then closes, so the copy ends: see
+    /// [`Self::close_output_of_closed_tabs`]. Stays until the parked output
+    /// closes, a start adopts it, or no output is open.
+    #[cfg(feature = "vst")]
+    closed_plugin_copies: bool,
     /// The plugins the texts of the tabs name, as last sent.
     #[cfg(feature = "vst")]
     live_plugins_named: Vec<String>,
@@ -1771,8 +1812,12 @@ impl StudioEngine {
             awaiting_score: false,
             played_before_preview: None,
             played_from_generation: 0,
-            next_install_preview: false,
+            next_install: InstallMark::default(),
             live_tabs_closed: 0,
+            #[cfg(feature = "vst")]
+            live_documents_closed: 0,
+            #[cfg(feature = "vst")]
+            closed_plugin_copies: false,
             #[cfg(feature = "vst")]
             live_plugins_named: Vec::new(),
             #[cfg(feature = "vst")]
@@ -2464,6 +2509,9 @@ impl StudioEngine {
     /// Stop is idempotent at the Session level and ends the current playback.
     /// A healthy device stays open after an acknowledged Stop or a zero timeout.
     /// A later [`Self::evaluate`] adopts that stream rather than opening a new one.
+    /// Outside Piano mode, the device closes at the Stop while it holds a
+    /// plugin copy of a chain that a closed tab ended: see
+    /// [`Self::closed_plugin_copies`].
     /// An idle Linux default output is reopened to resolve its current route.
     ///
     /// This is the immediate form: the device declicks over ten milliseconds
@@ -2490,6 +2538,11 @@ impl StudioEngine {
         self.piano_has_score_tail = false;
         self.piano_tail_silent_since = None;
         self.session.transport().stop();
+        // The score of a tab that closed while it played ends its chains.
+        #[cfg(feature = "vst")]
+        {
+            self.closed_plugin_copies |= self.session.end_closed_plugin_document();
+        }
         self.session.consume_audio_confirmations();
         self.supersede_launch();
         if let Some(out) = self.clock_out.as_mut() {
@@ -2518,6 +2571,12 @@ impl StudioEngine {
         self.external_outputs().forget();
         let acknowledged = device.stop_and_wait(timeout);
         let report = device.report();
+        // A copy of a chain that a closed tab ended goes with its output.
+        // The output drained above, so it closes here with no second drain.
+        // Piano mode keeps it open.
+        #[cfg(feature = "vst")]
+        let keep_output =
+            keep_output && !(acknowledged && self.closed_plugin_copies && !self.piano_mode);
         // Reuse avoids host clicks from closing and reopening a stream.
         // A zero timeout leaves the stop ramp pending on a healthy callback;
         // an expired positive timeout means the callback cannot be reused.
@@ -2527,6 +2586,11 @@ impl StudioEngine {
         } else {
             drop(device);
         }
+        // A zero timeout parks the output before the end of its stop ramp.
+        // Its close waits for the ramp. An output that closed here sent its
+        // copies home.
+        #[cfg(feature = "vst")]
+        self.close_output_of_closed_tabs();
         // The parked output keeps its rings and pools until the next start
         // adopts them or a device change releases the stream. What the
         // session let go is still owed back.
@@ -2553,20 +2617,31 @@ fn output_recovery_cancelled(requested: Option<&DevicePlaybackError>) -> Runtime
     }
 }
 
+/// Arms the refill of the replacement output at `now`, at its rate. `waits`
+/// is the load mode: in the wait mode the first window of the new output
+/// waits for the plugin copies the close sent home, and in the async mode a
+/// short time at most.
 fn arm_output_recovery_after_recycle(
     session: &mut Session,
     producer: &mut LiveFileProducer,
     now: f64,
     sample_rate: u32,
+    waits: bool,
 ) -> Result<(), RuntimeError> {
     // The replacement output is already open. New decodes must follow its
     // rate even if requery fails; retained PCM keeps its own rate.
     if let Some(library) = session.sample_library() {
         library.set_render_rate(sample_rate);
     }
-    // A held start counts its plugin copies at this rate too.
+    // A held start counts its plugin copies at this rate too, and the first
+    // window holds by the load mode of now.
     #[cfg(feature = "vst")]
-    session.set_plugin_rate(sample_rate);
+    {
+        session.set_plugin_rate(sample_rate);
+        session.set_plugin_wait(waits);
+    }
+    #[cfg(not(feature = "vst"))]
+    let _ = waits;
     session.consume_audio_confirmations();
     let requery = session.requery_after_output_recycle_at(now);
     session.consume_audio_confirmations();
@@ -3783,7 +3858,7 @@ pub(super) mod tests {
             boundary_time,
             rewind: true,
             unit_cycles: 0.25,
-            preview: false,
+            mark: InstallMark::default(),
             followed: Vec::new(),
             waited: false,
             #[cfg(feature = "vst")]

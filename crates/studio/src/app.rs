@@ -1384,8 +1384,13 @@ struct App {
     /// Tabs by most recent visit, and material last accepted by the engine.
     scene_visits: Vec<SceneId>,
     tabs_closed: u64,
+    /// The id of each tab that left, in order: see
+    /// [`LiveMaterial::closed_documents`].
+    closed_documents: Vec<u64>,
     live_material_sent: Option<Vec<(SceneId, LiveTextMark, bool)>>,
     tabs_closed_sent: u64,
+    /// How many of [`Self::closed_documents`] the engine accepted.
+    closed_documents_sent: usize,
     plugins_shown_sent: Vec<String>,
     setups_select_variants_sent: bool,
     sent_setup_selected_variants: bool,
@@ -1893,8 +1898,10 @@ impl App {
             launch_pads_sent: None,
             scene_visits: Vec::new(),
             tabs_closed: 0,
+            closed_documents: Vec::new(),
             live_material_sent: None,
             tabs_closed_sent: 0,
+            closed_documents_sent: 0,
             plugins_shown_sent: Vec::new(),
             setups_select_variants_sent: false,
             sent_setup_selected_variants: false,
@@ -2281,6 +2288,7 @@ impl App {
         self.live_sliders.remove(&id);
         self.readiness.remove(&id);
         self.tabs_closed += 1;
+        self.closed_documents.push(id.0);
     }
 
     fn live_tabs(&self) -> Vec<(SceneId, bool)> {
@@ -2331,6 +2339,7 @@ impl App {
         let plugins = Vec::new();
         if (self.live_material_sent.as_ref() == Some(&key)
             && self.tabs_closed_sent == self.tabs_closed
+            && self.closed_documents_sent == self.closed_documents.len()
             && self.plugins_shown_sent == plugins)
             || now.duration_since(self.last_edit_at) < LINT_DEBOUNCE
         {
@@ -2362,6 +2371,7 @@ impl App {
                 .filter_map(|(id, _, _)| text(*id))
                 .collect(),
             tabs_closed: self.tabs_closed,
+            closed_documents: self.closed_documents.clone(),
             setups_select_variants,
             plugins: plugins.clone(),
         };
@@ -2390,6 +2400,7 @@ impl App {
         load_variants_ahead(&ahead, setups_select_variants, &library);
         self.live_material_sent = Some(key);
         self.tabs_closed_sent = self.tabs_closed;
+        self.closed_documents_sent = material.closed_documents.len();
         self.plugins_shown_sent = plugins;
         self.setups_select_variants_sent = setups_select_variants;
     }
@@ -3264,7 +3275,8 @@ mod tests {
 
         /// A closed tab holds nothing: its lint, its sliders, its readiness
         /// and its place among the visits go with it, and the count of tabs
-        /// let go moves, which is what has the engine sweep its sounds.
+        /// let go moves, which is what has the engine sweep its sounds. Its
+        /// id joins the closed documents, so the engine closes its scene.
         #[test]
         fn closing_a_scene_forgets_it() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -3279,6 +3291,7 @@ mod tests {
             assert!(app.scenes.get(closed).is_none(), "closed: {}", app.status);
             assert!(!holds_anything_of(&app, closed));
             assert_eq!(app.tabs_closed, before + 1);
+            assert_eq!(app.closed_documents, [closed.0]);
             assert!(!app.status.contains("pad"), "{}", app.status);
         }
 
@@ -3412,10 +3425,13 @@ mod tests {
             assert!(!path.exists(), "deleted: {}", app.status);
             assert!(!holds_anything_of(&app, deleted));
             assert_eq!(app.tabs_closed, before + 1);
+            assert_eq!(app.closed_documents, [deleted.0]);
         }
 
         /// A set put down takes every tab with it, and what was kept for each
-        /// goes whole - as one move of the count, not one per tab.
+        /// goes whole, as one move of the count, not one per tab. The id of
+        /// each score tab joins the closed documents. A setup tab has no
+        /// document.
         #[test]
         fn switching_sets_forgets_every_tab_of_the_old_one() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -3426,6 +3442,8 @@ mod tests {
             for id in [first, second] {
                 remember_something_of(&mut app, id);
             }
+            app.open_prebake(PrebakeScope::Local);
+            assert!(app.scenes.current().prebake().is_some(), "{}", app.status);
             let before = app.tabs_closed;
 
             let elsewhere = tempfile::tempdir().expect("second set");
@@ -3438,6 +3456,7 @@ mod tests {
                 assert!(!holds_anything_of(&app, id), "{id:?}");
             }
             assert_eq!(app.tabs_closed, before + 1);
+            assert_eq!(app.closed_documents, [first.0, second.0]);
             assert_eq!(
                 app.scene_visits,
                 [app.scenes.current().id],
@@ -3482,7 +3501,8 @@ mod tests {
         /// A tape's tab is not live material, so closing one leaves the tabs
         /// the engine was sent as they were. The count of tabs let go is sent
         /// on its own, or what only the tape played would wait out a sweep
-        /// that had already run.
+        /// that had already run. The id of the tape goes with the count, so
+        /// the engine closes its scene.
         #[test]
         fn closing_a_tape_is_news_to_the_engine() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -3493,6 +3513,7 @@ mod tests {
             let tape = write_tape(&tapes, "2026-09-05T12-09-48", &[(0.0, "$: s(\"bd\")")]);
             app.open_replay_tab(&tape);
             assert!(app.scenes.current().is_replay(), "{}", app.status);
+            let replay = app.scenes.current().id;
             let later = Instant::now() + LINT_DEBOUNCE;
             app.sync_live_material(later);
             let sent = app.live_material_sent.clone().expect("the tabs were sent");
@@ -3505,6 +3526,11 @@ mod tests {
             assert_eq!(
                 app.tabs_closed_sent, app.tabs_closed,
                 "and the tape leaving went with them"
+            );
+            assert_eq!(app.closed_documents, [replay.0]);
+            assert_eq!(
+                app.closed_documents_sent, 1,
+                "the id of the tape went with them"
             );
         }
 
