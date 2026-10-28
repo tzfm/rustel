@@ -222,6 +222,8 @@ Options > Global prebake or Options > Local prebake, or from Settings. Learn a
 key for either on Settings > Keybinds. The global file is
 `<rustel-config>/prebake.strudel`. The local prebake
 is stored in the set. Studio runs the global code first, then the local code.
+Opening another set runs its local prebake. Helpers from the last set's local
+prebake do not pass the check there.
 
 Update checks and saves the prebake, then applies it to the playing score. It
 does not start playback when Studio is stopped. Use `globalThis` or `register`

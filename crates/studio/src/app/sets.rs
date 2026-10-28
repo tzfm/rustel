@@ -1602,6 +1602,8 @@ impl App {
         // Its levels come with it for the same reason.
         self.restore_set_levels();
         self.adopt_set_samples();
+        // And its setup, once its samples are in for the check to read.
+        self.take_up_set_prebake();
         self.note_kept_manifest();
         self.dirty_frame = true;
     }

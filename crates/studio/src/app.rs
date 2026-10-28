@@ -1164,6 +1164,12 @@ struct App {
     /// Only a setup that ran counts: what a refused one managed before it
     /// threw is on the heap, but which names those are cannot be known.
     applied_setup: [Arc<rustel_transpiler::SetupDefinitions>; 2],
+    /// The first request of the set open now. A local setup sent before it
+    /// is the last set's.
+    set_first_request: u64,
+    /// The local setup that opening the set queued, which runs without
+    /// taking the status line from the set being opened.
+    opening_prebake: Option<u64>,
     /// The rename prompt still shows the old name: the first key replaces it.
     rename_untouched: bool,
     /// What this terminal can do, found out when it was entered.
@@ -1625,6 +1631,8 @@ impl App {
             prebake_applied: [None, None],
             prebake_rejected: [None, None],
             applied_setup: [Arc::default(), Arc::default()],
+            set_first_request: 0,
+            opening_prebake: None,
             registry: rustel_runtime::capability_registry_for_dispatch(
                 options.session.dsp_dispatch,
             ),
