@@ -1252,11 +1252,25 @@ fn a_wait_start_and_a_wait_edit_play_no_note_before_their_plugin() {
 /// lane whose plugin comes from a helper of a setup text keeps its parked
 /// copy through a sweep while the score plays. A lane a setup text builds
 /// and a plugin name the score computes keep the plugin through a Stop.
+/// The close of the tab of the stopped score in play ends its copy at once
+/// and closes the parked output, with the sweep off too. The score of a
+/// tab closed while it plays plays on, and its copy ends at the Stop. A
+/// scene closed while stopped ends the copy of its own lane, after Piano
+/// mode when it is open. A lane it shares with another open scene keeps its
+/// copy for that scene. A scene closed in its 5 s at rest while the set
+/// plays gives its copy back in play, and the Stop keeps the parked output.
+/// When Piano mode opens in the tail of a Stop, the keyboard takes the
+/// output, and the copy of a score whose tab closed while it played ends
+/// there, with the sweep off too. A start in Piano mode adopts a parked
+/// output that holds the copy of a scene closed in Piano mode. The output
+/// gives the copy back as it plays, and the Stop after Piano mode parks the
+/// output.
 #[cfg(feature = "vst")]
 #[test]
 fn the_idle_sweep_unloads_a_plugin_no_tab_names() {
     use rustel_runtime::vst;
     use rustel_studio::engine::LiveMaterial;
+    use rustel_studio::settings::LoadMode;
     let _engine = one_engine();
     let _plugins = fixture_plugins();
     let mut engine = silent_engine_with(StudioConfig {
@@ -1493,6 +1507,192 @@ fn the_idle_sweep_unloads_a_plugin_no_tab_names() {
         (true, true),
         "a plugin name the score computes"
     );
+
+    // The tab of the stopped score in play, in document 0, closes with the
+    // sweep off. Its copy ends at once, and the parked output closes.
+    let closed = |documents: &[u64]| LiveMaterial {
+        closed_documents: documents.to_vec(),
+        ..LiveMaterial::default()
+    };
+    engine.set_sample_memory_policy(0, Duration::ZERO);
+    engine.set_live_material(&closed(&[0]));
+    vst::host().wait_idle();
+    assert_eq!(copies(), 0, "the copy of the closed score");
+    assert!(engine.device_report().is_none(), "the parked output");
+    assert!(loaded(), "the sweep ran");
+    engine.set_sample_memory_policy(0, Duration::from_millis(1));
+    assert_eq!(sweep(&mut engine), None);
+    assert!(!loaded(), "the sweep kept the plugin");
+    // Each copy built from here writes a line to the mark file at its end.
+    let end_marks = || lines().lines().count();
+    // Plays `text` in `document` until the output holds `count` copies, then
+    // waits for the plugin thread. In the async mode a note with no copy
+    // plays dry at once, and the fixture at gain 0 makes a note through it
+    // silent. So a silent window says that each lane plays through its copy.
+    let master = engine.master_bus();
+    master.set_load_mode(LoadMode::Async);
+    let play_until = |engine: &mut StudioEngine, document: u64, text: &str, count: usize| {
+        engine.mark_next_install_document(document);
+        engine.evaluate_and_start(text, false).expect("a score");
+        let started = Instant::now();
+        loop {
+            let mut peak = 0.0_f32;
+            tick_for(engine, Duration::from_millis(300), &mut || {
+                peak = peak.max(master.take_levels().peak);
+            });
+            if peak == 0.0 && copies() == count {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the copies of {text}"
+            );
+        }
+        vst::host().wait_idle();
+    };
+    vst::host().wait_idle();
+    // SAFETY: as above.
+    unsafe { std::env::set_var(rustel_vst3_fixture::PROCESS_MARK_ENV, &ends) };
+    // The tab of the score in play closes while the score plays. The score
+    // plays on, and the Stop ends its copy and closes the parked output.
+    let lane = "$: note('c3').s('sine').vst('rustel fixture', { gain: 0 }).fast(8)";
+    engine.set_live_material(&LiveMaterial {
+        pinned: vec![lane.into()],
+        ..closed(&[0])
+    });
+    play_until(&mut engine, 6, lane, 1);
+    let ended = end_marks();
+    engine.set_live_material(&closed(&[0, 6]));
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(1) {
+        tick_for(&mut engine, Duration::from_millis(50), &mut || {});
+        assert!(vst::engine_holds_unkept(&[]), "the closed score stopped");
+    }
+    assert_eq!((copies(), end_marks()), (1, ended), "the closed score");
+    let _ = engine.stop(engine.stop_timeout());
+    vst::host().wait_idle();
+    assert_eq!((copies(), end_marks()), (0, ended + 1), "the Stop");
+    assert!(engine.device_report().is_none(), "the parked output");
+    assert_eq!(sweep(&mut engine), None);
+    assert!(!loaded(), "the sweep kept the plugin");
+    // Scene 8 has the lane of scene 7 and a second lane. The close of 8
+    // while stopped ends the copy of its second lane. Piano mode keeps the
+    // parked output with that copy, and the first idle turn after Piano
+    // mode closes it. The shared lane keeps its copy for 7, whose tab names
+    // the plugin. The close of 7 ends that copy.
+    let shared = |documents: &[u64]| LiveMaterial {
+        pinned: vec![lane.into()],
+        ..closed(documents)
+    };
+    engine.set_live_material(&shared(&[0, 6]));
+    play_until(&mut engine, 7, lane, 1);
+    let both = format!("{lane}\n{}", lane.replace("c3", "e3"));
+    play_until(&mut engine, 8, &both, 2);
+    let ended = end_marks();
+    let _ = engine.stop(engine.stop_timeout());
+    engine.prepare_piano().expect("the keyboard output");
+    engine.set_live_material(&shared(&[0, 6, 8]));
+    vst::host().wait_idle();
+    assert_eq!((copies(), end_marks()), (2, ended), "Piano mode");
+    assert!(engine.device_report().is_some(), "Piano mode");
+    engine.close_piano_mode();
+    assert_eq!(sweep(&mut engine), None, "the parked output");
+    assert_eq!((copies(), end_marks()), (1, ended + 1), "the close of 8");
+    assert!(loaded(), "the sweep unloaded the plugin of 7");
+    engine.set_live_material(&closed(&[0, 6, 8, 7]));
+    vst::host().wait_idle();
+    assert_eq!(copies(), 0, "the close of 7");
+    // Scene 9 rests while scene 10 plays, and its tab closes in its 5 s of
+    // play. The playing output gives its copy back, and the Stop keeps the
+    // parked output.
+    play_until(&mut engine, 9, lane, 1);
+    let ended = end_marks();
+    engine.mark_next_install_document(10);
+    engine
+        .evaluate("$: note('c5').s('sine').gain(0)", false)
+        .expect("scene 10");
+    engine.set_live_material(&shared(&[0, 6, 8, 7, 9]));
+    let started = Instant::now();
+    while copies() != 0 {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the output kept the copy of 9"
+        );
+        tick_for(&mut engine, Duration::from_millis(50), &mut || {});
+    }
+    vst::host().wait_idle();
+    assert_eq!(end_marks(), ended + 1, "the close of 9");
+    let _ = engine.stop(engine.stop_timeout());
+    assert!(engine.device_report().is_some(), "the parked output");
+    // Scene 11 plays, and its tab closes while it plays, with the sweep
+    // off. Piano mode opens while the tail of a Stop rings, so the keyboard
+    // takes the output at the end of the tail. The chain of the closed
+    // score ends there. The idle turns after Piano mode close the parked
+    // output, and its copy ends with no second Stop.
+    engine.set_sample_memory_policy(0, Duration::ZERO);
+    play_until(&mut engine, 11, lane, 1);
+    let ended = end_marks();
+    engine.set_live_material(&closed(&[0, 6, 8, 7, 9, 11]));
+    engine.request_stop();
+    engine.prepare_piano().expect("the keyboard output");
+    let started = Instant::now();
+    loop {
+        match engine.tick(accepted_update).expect("a turn") {
+            StudioTick::Stopping => {}
+            StudioTick::Idle => break,
+            other => panic!("the keyboard did not take the output: {other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the tail did not end"
+        );
+        std::thread::sleep(Duration::from_millis(3));
+    }
+    assert!(engine.device_report().is_some(), "the keyboard output");
+    engine.close_piano_mode();
+    let started = Instant::now();
+    while engine.device_report().is_some() {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the parked output stayed"
+        );
+        engine.idle_turn(accepted_update);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    vst::host().wait_idle();
+    assert_eq!(
+        (copies(), end_marks()),
+        (0, ended + 1),
+        "the Stop in Piano mode"
+    );
+    // Scene 12 stops, and its tab closes in Piano mode, so the parked output
+    // keeps its copy. A start in Piano mode adopts that output, and the
+    // output gives the copy back as it plays. So the Stop after Piano mode
+    // parks the output.
+    play_until(&mut engine, 12, lane, 1);
+    let ended = end_marks();
+    let _ = engine.stop(engine.stop_timeout());
+    engine.prepare_piano().expect("the keyboard output");
+    engine.set_live_material(&closed(&[0, 6, 8, 7, 9, 11, 12]));
+    vst::host().wait_idle();
+    assert_eq!(
+        (copies(), end_marks()),
+        (1, ended),
+        "the close in Piano mode"
+    );
+    let stream = engine.device_report().expect("the parked output").stream_id;
+    play_until(&mut engine, 13, "$: note('c5').s('sine').gain(0)", 0);
+    assert_eq!(end_marks(), ended + 1, "the start in Piano mode");
+    engine.close_piano_mode();
+    let _ = engine.stop(engine.stop_timeout());
+    vst::host().wait_idle();
+    assert_eq!(
+        engine.device_report().map(|report| report.stream_id),
+        Some(stream),
+        "the Stop after the start"
+    );
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(rustel_vst3_fixture::PROCESS_MARK_ENV) };
 }
 
 /// An edit that leaves a plugin call as it is keeps the copy of the call: a
@@ -1507,11 +1707,19 @@ fn the_idle_sweep_unloads_a_plugin_no_tab_names() {
 /// presets, through a new output, and of 2 effects back in another call
 /// order. A new buffer size keeps each copy: the lanes play on with no dry
 /// note, and 4 lanes of the fixture tone sound again in 0.5 s, in each mode.
-/// The output runs the plugin on 2 plugin workers.
+/// Each open scene keeps its copies. A scene change and a return build
+/// nothing and end nothing, in 5 s of play or after. So do a snippet
+/// previewed under a scene, a lane 2 scenes share, a Stop with the sweep,
+/// a start, a launch, and a take of 8 s while stopped with a start after it.
+/// The close of both scenes while stopped ends their copies. When a text of
+/// another scene takes the place of a start that waits for its copy, the
+/// scene of the start keeps that copy through 8 s of play. The output runs
+/// the plugin on 2 plugin workers.
 #[cfg(feature = "vst")]
 #[test]
 fn a_plugin_lane_keeps_its_copy_through_edits_above_and_gives_it_back_at_its_end() {
     use rustel_runtime::vst;
+    use rustel_studio::engine::LiveMaterial;
     use rustel_studio::settings::LoadMode;
     let _engine = one_engine();
     let _plugins = fixture_plugins();
@@ -1755,7 +1963,13 @@ fn a_plugin_lane_keeps_its_copy_through_edits_above_and_gives_it_back_at_its_end
     assert!(!dry(&mut engine, 1_200), "a dry note of the start");
     // The copies of those builds end with their chains.
     let ended = lines();
-    host.keep(u64::MAX, Vec::new(), Vec::new(), builds.to_vec());
+    host.keep(
+        u64::MAX,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        builds.to_vec(),
+    );
     play_until(&mut engine, "the end of the builds", &|| {
         lines() == ended + 2
     });
@@ -1852,6 +2066,163 @@ fn a_plugin_lane_keeps_its_copy_through_edits_above_and_gives_it_back_at_its_end
     unsafe { std::env::remove_var(rustel_vst3_fixture::PROCESS_MARK_ENV) };
     master.set_load_mode(LoadMode::Async);
     engine.stop(Duration::from_millis(200)).expect("stop");
+
+    // Each open scene keeps its copies. A is the lane of the start in scene
+    // 1, and B a lane with no plugin in scene 2. P is A with a lane of no
+    // plugin after it, as a snippet previewed under scene 1. C plays the
+    // lane of A on another note in scene 2, with a second lane of the
+    // fixture. Each copy built from here writes a line to the mark file at
+    // its end.
+    let a = one;
+    let b = "$: note('c5').s('sine').gain(0)";
+    let p = format!("{a}\n{b}");
+    let c = format!(
+        "{}\n$: note('g3').s('sine').vst('rustel fixture', {{ gain: 0 }}).fast(8)",
+        a.replace("c3", "e3")
+    );
+    vst::host().wait_idle();
+    // SAFETY: as above.
+    unsafe { std::env::set_var(rustel_vst3_fixture::PROCESS_MARK_ENV, &ends) };
+    engine.mark_next_install_document(1);
+    engine.evaluate_and_start(a, false).expect("a start");
+    let started = Instant::now();
+    while peak_of(&mut engine, 300) > 0.0 || copies() != 1 {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the plugin did not take A"
+        );
+    }
+    let ended = lines();
+    // In the async mode a note with no copy plays dry at once. A scene change
+    // and a return in 5 s of play, after 8 s of play, and with a snippet
+    // previewed under the scene play no dry note, and build and end nothing.
+    let play = |engine: &mut StudioEngine, document: u64, text: &str, window: u64| {
+        engine.mark_next_install_document(document);
+        engine.evaluate(text, false).expect("a scene");
+        assert_eq!(peak_of(engine, window), 0.0, "a dry note: {text}");
+        assert_eq!(copies(), 1, "{text}");
+    };
+    play(&mut engine, 2, b, 800);
+    play(&mut engine, 1, a, 800);
+    play(&mut engine, 2, b, 8_000);
+    play(&mut engine, 1, a, 800);
+    engine.mark_next_install_preview(true);
+    play(&mut engine, 1, &p, 800);
+    play(&mut engine, 1, a, 800);
+    assert_eq!(lines(), ended, "a scene change ended a copy");
+    // In the wait mode C builds the copy of its second lane alone: its first
+    // lane takes the chain of A, as a lane 2 scenes share.
+    master.set_load_mode(LoadMode::Wait);
+    engine.mark_next_install_document(2);
+    land(&mut engine, &c);
+    play_until(&mut engine, "the copy of the second lane", &|| {
+        copies() == 2
+    });
+    for (document, text) in [(1, a), (2, c.as_str())] {
+        engine.mark_next_install_document(document);
+        assert!(!land(&mut engine, text), "{text} lands at once");
+        assert_eq!(peak_of(&mut engine, 800), 0.0, "a dry note: {text}");
+    }
+    assert_eq!((copies(), lines()), (2, ended), "the shared lane");
+    // A Stop and the sweep keep the copies of both scenes.
+    let _ = engine.stop(engine.stop_timeout());
+    engine.set_sample_memory_policy(0, Duration::from_millis(1));
+    let quiet = Instant::now();
+    while quiet.elapsed() < Duration::from_millis(200) {
+        engine.idle_turn(accepted_update);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    vst::host().wait_idle();
+    let plugins = vst::host().plugins();
+    let loaded = plugins
+        .iter()
+        .any(|plugin| plugin.status == vst::Status::Ready);
+    assert!(loaded, "the sweep unloaded the plugin of the scenes");
+    assert_eq!((copies(), lines()), (2, ended), "the sweep");
+    // A start of scene 1 and a launch of scene 2 build nothing.
+    engine.mark_next_install_document(1);
+    engine.evaluate_and_start(a, false).expect("a start");
+    assert_eq!(peak_of(&mut engine, 1_200), 0.0, "a dry note of the start");
+    assert_eq!(copies(), 2, "the start of scene 1");
+    engine.mark_next_install_document(2);
+    engine.arm_launch(&c, false, 1.0, false).expect("a launch");
+    let started = Instant::now();
+    while !matches!(engine.take_launch_outcome(), Some(Ok(_))) {
+        assert_eq!(
+            peak_of(&mut engine, 50),
+            0.0,
+            "a dry note before the launch"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the launch did not land"
+        );
+    }
+    assert_eq!(peak_of(&mut engine, 2_500), 0.0, "a dry note of the launch");
+    assert_eq!((copies(), lines()), (2, ended), "the launch of scene 2");
+    // A take while stopped plays a silence of no scene. The copies of both
+    // scenes wait through 8 s of its play. The mark keeps scene 2, so a
+    // start with no new mark plays C with its copies.
+    let _ = engine.stop(engine.stop_timeout());
+    let take = tempfile::tempdir().expect("a take folder");
+    engine
+        .start_recording(take.path().join("take.wav"))
+        .expect("a take");
+    peak_of(&mut engine, 8_000);
+    let _ = engine.stop_recording();
+    let _ = engine.stop(engine.stop_timeout());
+    vst::host().wait_idle();
+    assert_eq!((copies(), lines()), (2, ended), "the take");
+    engine.evaluate_and_start(&c, false).expect("a start");
+    assert_eq!(
+        peak_of(&mut engine, 1_200),
+        0.0,
+        "a dry note after the take"
+    );
+    assert_eq!((copies(), lines()), (2, ended), "the start after the take");
+    // The close of both scenes while stopped ends each copy at once.
+    let _ = engine.stop(engine.stop_timeout());
+    engine.set_live_material(&LiveMaterial {
+        closed_documents: vec![1, 2],
+        ..LiveMaterial::default()
+    });
+    vst::host().wait_idle();
+    assert_eq!(
+        (copies(), lines()),
+        (0, ended + 2),
+        "the close of both scenes"
+    );
+    // A start of scene 3 waits for the copy of A, and a text of scene 4
+    // takes its place before it plays. Scene 3 rests with that copy: after
+    // 8 s of play of scene 4, its return builds nothing and ends nothing.
+    engine.mark_next_install_document(3);
+    engine.evaluate_and_start(a, false).expect("a start");
+    let cue = engine.snapshot().loading;
+    assert!(
+        cue.is_some_and(|cue| cue.waiting && cue.plugins == 1),
+        "the start waits for the copy of A"
+    );
+    engine.mark_next_install_document(4);
+    engine.evaluate(b, false).expect("scene 4");
+    vst::host().wait_idle();
+    let ended = lines();
+    peak_of(&mut engine, 8_000);
+    vst::host().wait_idle();
+    assert_eq!((copies(), lines()), (1, ended), "scene 3 at rest");
+    engine.mark_next_install_document(3);
+    assert!(!land(&mut engine, a), "the return of scene 3 lands at once");
+    assert_eq!(peak_of(&mut engine, 800), 0.0, "a dry note of scene 3");
+    assert_eq!((copies(), lines()), (1, ended), "the return of scene 3");
+    // The close of scenes 3 and 4 while stopped ends that copy.
+    let _ = engine.stop(engine.stop_timeout());
+    engine.set_live_material(&LiveMaterial {
+        closed_documents: vec![1, 2, 3, 4],
+        ..LiveMaterial::default()
+    });
+    vst::host().wait_idle();
+    assert_eq!((copies(), lines()), (0, ended + 1), "the close of scene 3");
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(rustel_vst3_fixture::PROCESS_MARK_ENV) };
     rustel_audio::set_plugin_pool_for_test(None);
 }
 

@@ -2,10 +2,12 @@
 //! through an edit.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustel_transpiler::LaneStatement;
 
 use super::*;
+use crate::PREVIEW_DOCUMENT;
 
 /// A lane of a score: a labeled statement, or a score with no label.
 #[derive(Clone)]
@@ -22,7 +24,7 @@ struct Lane {
 }
 
 /// The lanes of one score text, as the chains of a session read them: see
-/// [`LaneTable::playing`] and [`LaneTable::candidate`].
+/// [`LaneTable::playing`] and [`LaneTable::read_of`].
 #[derive(Default)]
 pub(super) struct ScoreLanes {
     /// The lanes in text order. A score with no label has one lane, with
@@ -55,6 +57,22 @@ impl ScoreLanes {
     }
 }
 
+/// The lanes of a document at rest: see [`LaneTable`].
+struct RestDocument {
+    /// The lanes of its score in play when the document went to rest.
+    lanes: Vec<Lane>,
+    /// The lanes that left the score of the document while a chain has
+    /// their number: see [`LaneTable::forget_away`].
+    away: Vec<Lane>,
+    /// The rest order: a document that goes to rest later has a higher
+    /// order. See [`REST_ORDERS`].
+    order: u64,
+}
+
+/// The count of the rest orders. One count serves each lane table of the
+/// process, so the host compares the documents at rest of 2 sessions.
+static REST_ORDERS: AtomicU64 = AtomicU64::new(0);
+
 /// The lanes of the scores of one session.
 ///
 /// An edit gives a lane a new place, a new label, a mute mark or a new
@@ -63,21 +81,37 @@ impl ScoreLanes {
 /// its chain keeps its lane: see `ChainOwner`. A lane that leaves the text
 /// keeps its number while a chain has it, so a lane that comes back from a
 /// comment finds its chain.
+///
+/// Each score text is of a document: a key the caller gives, as the scene
+/// id in Studio. The CLI, an embedder and a test read in document 0. An
+/// open document that does not play is at rest, and the table keeps its
+/// lanes, so a document that plays again finds its lanes. A document that
+/// plays for the first time shares the lanes of the score in play: see
+/// [`Self::read`]. A document closes when its tab leaves: see
+/// [`Self::forget`].
 #[derive(Default)]
 pub(crate) struct LaneTable {
     /// The lanes of the score in play.
     playing: ScoreLanes,
-    /// The last text the session read that is not in play, with its lanes.
-    /// A new lane then keeps its number from one try of an edit to the
-    /// next.
-    candidate: Option<(String, ScoreLanes)>,
-    /// The lanes of the score the output plays, until the output plays the
-    /// score in play. A rollback puts that score back. Each of its lanes
-    /// then keeps its number.
-    audible: Vec<Lane>,
+    /// The document of the score in play.
+    document: u64,
+    /// The document of the next read: see [`Self::set_reading`].
+    reading: u64,
+    /// The last text the session read that is not in play, with its
+    /// document and its lanes. A new lane then keeps its number from one
+    /// try of an edit to the next.
+    candidate: Option<(u64, String, ScoreLanes)>,
+    /// The lanes of the score the output plays, with its document, until
+    /// the output plays the score in play. A rollback puts that score back.
+    /// Each of its lanes then keeps its number.
+    audible: (u64, Vec<Lane>),
     /// The lanes that left the score in play, while a chain has their
     /// number: see [`Self::forget_away`].
     away: Vec<Lane>,
+    /// The lanes of each document at rest, by document.
+    rest: HashMap<u64, RestDocument>,
+    /// The closed documents: see [`Self::forget`].
+    closed: HashSet<u64>,
     /// True when the output plays the score in play.
     heard: bool,
     /// The number of the next new lane. No number comes a second time.
@@ -85,25 +119,52 @@ pub(crate) struct LaneTable {
 }
 
 impl LaneTable {
-    /// Reads the lanes of a score text before its evaluation. Gives the
-    /// lane number of each labeled statement, in text order, for
+    /// Reads the lanes of a score text of the reading document before its
+    /// evaluation: see [`Self::set_reading`]. Gives the lane number of each
+    /// labeled statement, in text order, for
     /// [`rustel_transpiler::TranspileOptions::lane_numbers`]. A text with
     /// no scan gets no numbers and changes no lane, also when it goes in
     /// play.
+    ///
+    /// A statement first takes a lane of its own document: a lane of its
+    /// score in play or at rest, of its last read, a lane away, or a lane of
+    /// its score the output plays. See [`pair`]. For a document that is not
+    /// in play, each statement with no lane then takes a lane of the score
+    /// in play as a statement of the document in play does. Such a lane is
+    /// a lane of both documents. So a document that plays for the first
+    /// time keeps the lanes it shares with the score in play, and a document
+    /// that plays again finds its own lanes first.
     pub(crate) fn read(&mut self, source: &str) -> Vec<u64> {
         let Some(statements) = rustel_transpiler::lane_statements(source) else {
             self.candidate = None;
             return Vec::new();
         };
+        let reading = self.reading;
+        let none: &[Lane] = &[];
+        // The lanes of the document of the read come first.
+        let (playing, away) = if reading == self.document {
+            (&self.playing.lanes[..], &self.away[..])
+        } else {
+            let rest = self.rest.get(&reading);
+            rest.map_or((none, none), |rest| (&rest.lanes[..], &rest.away[..]))
+        };
         let tried = self.candidate.as_ref();
-        let tried = tried.map_or(&[][..], |(_, read)| &read.lanes);
-        let paired = pair(
-            &statements,
-            &self.playing.lanes,
-            tried,
-            &self.away,
-            &self.audible,
-        );
+        let tried = tried.filter(|(document, ..)| *document == reading);
+        let tried = tried.map_or(none, |(.., read)| &read.lanes);
+        let (audible_in, audible) = &self.audible;
+        let (own, other) = if *audible_in == reading {
+            (&audible[..], none)
+        } else {
+            (none, &audible[..])
+        };
+        let mut paired = vec![None; statements.len()];
+        pair(&statements, &mut paired, playing, tried, away, own);
+        // A document that is not in play shares the lanes of the score in
+        // play.
+        if reading != self.document {
+            let (playing, away) = (&self.playing.lanes, &self.away);
+            pair(&statements, &mut paired, playing, none, away, other);
+        }
         let lane = |(statement, number): (LaneStatement, Option<u64>)| Lane {
             number: number.unwrap_or_else(|| {
                 self.next += 1;
@@ -122,52 +183,102 @@ impl LaneTable {
             lanes,
             places: false,
         };
-        self.candidate = Some((source.to_owned(), read));
+        self.candidate = Some((reading, source.to_owned(), read));
         numbers
+    }
+
+    /// The next reads are of `document`: see [`Self::read`].
+    pub(crate) fn set_reading(&mut self, document: u64) {
+        self.reading = document;
     }
 
     /// The score with the text `source` goes in play: the lanes of the last
     /// read are now the lanes of the score in play, with the flag of
-    /// [`Self::wrote_places`]. A read of a different text changes nothing
-    /// here. A score with no read, such as a mini-notation score, has no
-    /// lanes of its own. Each lane of the score before with no statement in
-    /// this text is away: see [`Self::forget_away`]. The lanes of the score
-    /// before stay for a rollback when the output plays that score: see
+    /// [`Self::wrote_places`], and the document of that read is in play. A
+    /// read of a different text changes nothing here. A score with no read,
+    /// such as a mini-notation score, has no lanes of its own. Each lane of
+    /// the score before with no statement in this text is away: see
+    /// [`Self::forget_away`]. The lanes of the score before stay for a
+    /// rollback when the output plays that score: see
     /// [`Self::mark_audible`].
+    ///
+    /// The install of a read of another document puts the document in play
+    /// at rest with its lanes and its lanes away, or drops them when that
+    /// document is closed: see [`Self::is_closed`]. The document of the read
+    /// leaves rest. The score before is then its score at rest, and its
+    /// lanes away stay away unless they came back.
     pub(crate) fn install(&mut self, source: &str) {
-        let read = self.candidate.take_if(|(text, _)| text == source);
-        if let Some((_, read)) = read {
-            self.put_in_play(read);
+        let read = self.candidate.take_if(|(_, text, _)| text == source);
+        if let Some((document, _, read)) = read {
+            self.put_in_play(document, read);
         }
     }
 
     /// A direct pattern goes in play: a score with no text, so with no
-    /// lanes. Each lane of the score before is away.
+    /// lanes. Each lane of the score before is away. The document in play
+    /// stays in play.
     pub(crate) fn install_pattern(&mut self) {
-        self.put_in_play(ScoreLanes::default());
+        self.put_in_play(self.document, ScoreLanes::default());
     }
 
-    /// The lanes of `read` are now the lanes of the score in play: see
-    /// [`Self::install`].
-    fn put_in_play(&mut self, read: ScoreLanes) {
-        let before = std::mem::replace(&mut self.playing, read).lanes;
+    /// The lanes of `read`, a read of `document`, are now the lanes of the
+    /// score in play: see [`Self::install`].
+    fn put_in_play(&mut self, document: u64, read: ScoreLanes) {
+        let mut before = std::mem::replace(&mut self.playing, read).lanes;
+        let left = std::mem::replace(&mut self.document, document);
+        // The output plays the score before until it plays this one.
+        let heard = std::mem::take(&mut self.heard);
+        if left != document {
+            // The document before goes to rest. The score before is the
+            // score of the document of the read at rest.
+            let back = self.rest.remove(&document);
+            let back = back.map(|rest| (rest.lanes, rest.away));
+            let (lanes, away) = back.unwrap_or_default();
+            let played = std::mem::replace(&mut before, lanes);
+            let away = std::mem::replace(&mut self.away, away);
+            if heard {
+                self.audible = (left, played.clone());
+            }
+            if !self.is_closed(left) {
+                let order = REST_ORDERS.fetch_add(1, Ordering::Relaxed);
+                let rest = RestDocument {
+                    lanes: played,
+                    away,
+                    order,
+                };
+                self.rest.insert(left, rest);
+            }
+        }
         let kept: HashSet<u64> = self.playing.lanes.iter().map(|lane| lane.number).collect();
         // A lane that came back is in play again.
         self.away.retain(|lane| !kept.contains(&lane.number));
-        let left = before.iter().filter(|lane| !kept.contains(&lane.number));
-        self.away.extend(left.cloned());
-        // The output plays the score before until it plays this one.
-        if std::mem::take(&mut self.heard) {
-            self.audible = before;
+        let gone = before.iter().filter(|lane| !kept.contains(&lane.number));
+        self.away.extend(gone.cloned());
+        if heard && left == document {
+            self.audible = (left, before);
         }
     }
 
-    /// Forgets each lane away with no chain. `chained` gives true for the
-    /// number of a lane with a chain. A lane away comes back with its
-    /// number by rules 1 to 3 of [`pair`]. A lane that comes back after
-    /// this is a new lane.
+    /// Forgets each lane away with no chain, and each lane of a document at
+    /// rest with no chain: a document at rest with no chain keeps no lane.
+    /// `chained` gives true for the number of a lane with a chain. A lane
+    /// away comes back with its number by rules 1 to 3 of [`pair`]. A lane
+    /// that comes back after this is a new lane.
     pub(super) fn forget_away(&mut self, chained: impl Fn(u64) -> bool) {
         self.away.retain(|lane| chained(lane.number));
+        for rest in self.rest.values_mut() {
+            rest.lanes.retain(|lane| chained(lane.number));
+            rest.away.retain(|lane| chained(lane.number));
+        }
+    }
+
+    /// The tab of `document` left: the document is closed, and never goes
+    /// to rest again. A document at rest leaves rest, and the table drops
+    /// its lanes and its lanes away. The document in play keeps its lanes
+    /// until another document goes in play.
+    pub(super) fn forget(&mut self, document: u64) {
+        self.closed.insert(document);
+        self.rest.remove(&document);
     }
 
     /// The output plays the score in play. A rollback then puts this score
@@ -175,7 +286,7 @@ impl LaneTable {
     #[cfg(any(feature = "device-audio", test))]
     pub(crate) fn mark_audible(&mut self) {
         self.heard = true;
-        self.audible.clear();
+        self.audible.1.clear();
     }
 
     /// The label rewrite of the last read wrote places, and not the lane
@@ -184,7 +295,7 @@ impl LaneTable {
     /// of a note of that text is then a place. The score in play keeps the
     /// flag when the text goes in play.
     pub(crate) fn wrote_places(&mut self) {
-        if let Some((_, read)) = &mut self.candidate {
+        if let Some((.., read)) = &mut self.candidate {
             read.places = true;
         }
     }
@@ -194,10 +305,46 @@ impl LaneTable {
         &self.playing
     }
 
-    /// The lanes of the last read, when it read the text `source`.
-    pub(super) fn candidate(&self, source: &str) -> Option<&ScoreLanes> {
-        let read = self.candidate.as_ref().filter(|(text, _)| text == source);
-        read.map(|(_, read)| read)
+    /// The document and the lanes of the score the install of the text
+    /// `source` puts in play: the last read, when it read `source`, and
+    /// else the score in play. See [`Self::install`].
+    pub(super) fn read_of(&self, source: &str) -> (u64, &ScoreLanes) {
+        let read = self.candidate.as_ref();
+        let read = read.filter(|(_, text, _)| text == source);
+        read.map_or((self.document, &self.playing), |(document, _, read)| {
+            (*document, read)
+        })
+    }
+
+    /// The document of the score in play.
+    pub(crate) fn document(&self) -> u64 {
+        self.document
+    }
+
+    /// True for a closed document, and for [`PREVIEW_DOCUMENT`]: such a
+    /// document never goes to rest.
+    pub(super) fn is_closed(&self, document: u64) -> bool {
+        document == PREVIEW_DOCUMENT || self.closed.contains(&document)
+    }
+
+    /// Each document at rest, with its rest order: see
+    /// [`RestDocument::order`].
+    pub(super) fn rest_orders(&self) -> impl Iterator<Item = (u64, u64)> {
+        let rest = self.rest.iter();
+        rest.map(|(document, rest)| (*document, rest.order))
+    }
+
+    /// The documents at rest, with their rest orders, as the install of a
+    /// read of `document` leaves them: `document` leaves rest, and the
+    /// document in play goes to rest with the next order when it is another
+    /// document that is not closed.
+    pub(super) fn rest_orders_for(&self, document: u64) -> impl Iterator<Item = (u64, u64)> {
+        let resting = self.document != document && !self.is_closed(self.document);
+        let next = REST_ORDERS.load(Ordering::Relaxed);
+        let in_play = resting.then_some((self.document, next));
+        let rest = self.rest_orders();
+        let rest = rest.filter(move |(at_rest, _)| *at_rest != document);
+        rest.chain(in_play)
     }
 }
 
@@ -218,21 +365,25 @@ fn rule_key<'a>(rule: u8, label: &'a str, body: &'a str) -> Option<(&'a str, &'a
 /// The most pairs of a statement and a lane that rule 4 of [`pair`]
 /// compares: 512 statements with 512 lanes. The compare runs before each
 /// evaluation, so its time has a limit. With more pairs, each statement
-/// that rules 1 to 3 did not pair is a new lane.
+/// that rules 1 to 3 did not pair is a new lane. A read of a document that
+/// is not in play makes the compare 2 times: see [`LaneTable::read`].
 const MAX_LANE_PAIRS: usize = 1 << 18;
 
-/// Gives each statement of a new score text its lane.
+/// Gives each statement of a new score text with no lane its lane.
+/// `numbers` has the number of the lane of each statement, or `None` for a
+/// statement with no lane yet. No number of `numbers` goes to a second
+/// statement.
 ///
-/// `playing` has the lanes of the score in play. `tried` has the lanes of
-/// the last text the session read. It gives only its new lanes: a text that
-/// did not go in play moves no lane of the score in play. `away` has the
-/// lanes that left the score in play while a chain has them. It gives a
-/// lane by rules 1 to 3, after `playing` and `tried`. `audible` has the
-/// lanes of the score the output plays, when that score is not in play. It
-/// gives a lane by rule 1 only: a rollback reads the text of that score
-/// again. The result has the number of the lane of each statement, or
-/// `None` for a new lane. A statement takes a lane by the first rule that
-/// fits:
+/// `playing` has the lanes of the score in play of a document: see
+/// [`LaneTable::read`]. `tried` has the lanes of the last text the session
+/// read. It gives only its new lanes: a text that did not go in play moves
+/// no lane of the score in play. `away` has the lanes that left the score
+/// in play while a chain has them. It gives a lane by rules 1 to 3, after
+/// `playing` and `tried`. `audible` has the lanes of the score the output
+/// plays, when that score is not in play. It gives a lane by rule 1 only: a
+/// rollback reads the text of that score again. `numbers` then has the
+/// number of the lane of each statement, or `None` for a new lane. A
+/// statement takes a lane by the first rule that fits:
 ///
 /// ```text
 ///   1. the same label and the same body
@@ -250,14 +401,14 @@ const MAX_LANE_PAIRS: usize = 1 << 18;
 /// pair is a new lane, and a lane with no pair left the score.
 fn pair(
     statements: &[LaneStatement],
+    numbers: &mut [Option<u64>],
     playing: &[Lane],
     tried: &[Lane],
     away: &[Lane],
     audible: &[Lane],
-) -> Vec<Option<u64>> {
-    let mut numbers: Vec<Option<u64>> = vec![None; statements.len()];
+) {
     // The numbers with a statement, and the numbers of the score in play.
-    let mut taken = HashSet::new();
+    let mut taken: HashSet<u64> = numbers.iter().flatten().copied().collect();
     let kept: HashSet<u64> = playing.iter().map(|lane| lane.number).collect();
     // True for a lane with no statement yet. `tried` gives its new lanes
     // only.
@@ -307,7 +458,7 @@ fn pair(
     }
     let count = open.len().saturating_mul(left.len());
     if count == 0 || count > MAX_LANE_PAIRS {
-        return numbers;
+        return;
     }
     let mut pairs = Vec::new();
     for at in open {
@@ -334,7 +485,6 @@ fn pair(
             numbers[at] = Some(number);
         }
     }
-    numbers
 }
 
 /// Pairs the statements and the lanes that fit one rule, each as its place
@@ -403,7 +553,13 @@ pub(super) mod tests {
         numbers
     }
 
-    /// The rules of [`pair`], each before the next one.
+    /// The number of each lane of `lanes`.
+    fn numbers(lanes: &[Lane]) -> Vec<u64> {
+        lanes.iter().map(|lane| lane.number).collect()
+    }
+
+    /// The rules of [`pair`], each before the next one, and the lanes of
+    /// each document.
     #[test]
     fn a_statement_takes_its_lane_by_the_first_rule_that_fits() {
         // Rule 1 before rule 2: a mute mark stays with its lane when 2 lanes
@@ -484,7 +640,7 @@ pub(super) mod tests {
         // is away, and keeps its number.
         lanes.read(lead);
         lanes.wrote_places();
-        assert!(lanes.candidate(lead).is_some_and(ScoreLanes::places));
+        assert!(lanes.read_of(lead).1.places());
         lanes.install(lead);
         assert!(lanes.playing().places());
         assert_eq!(play(&mut lanes, &format!("{lead}\n{clap}")), [0, 1]);
@@ -586,5 +742,112 @@ pub(super) mod tests {
             session.evaluate(score).expect("score");
         }
         assert_eq!(lane(&session), "#4");
+
+        // A document that plays for the first time shares the lanes of the
+        // score in play: kick by rule 1, and the bass by rule 4 with the
+        // plugin of the lead. The hat is a new lane.
+        let play_in = |lanes: &mut LaneTable, document: u64, score: &str| {
+            lanes.set_reading(document);
+            play(lanes, score)
+        };
+        let mut lanes = LaneTable::default();
+        let (lead, kick) = (r#"lead: note("c2").vsti("serum")"#, r#"kick: s("bd")"#);
+        let (bass, hat) = (r#"bass: note("c1").vsti("serum")"#, r#"hat: s("hh")"#);
+        assert_eq!(play_in(&mut lanes, 1, &format!("{lead}\n{kick}")), [0, 1]);
+        let score = format!("{kick}\n{bass}\n{hat}");
+        assert_eq!(play_in(&mut lanes, 2, &score), [1, 0, 2]);
+        // Back in 1, the lead on a new note keeps its number, and kick is
+        // away. A read of 1 with kick gives it its number by rule 1.
+        let lead = lead.replace("c2", "e2");
+        assert_eq!(play_in(&mut lanes, 1, &lead), [0]);
+        assert_eq!((lanes.document(), numbers(&lanes.away)), (1, vec![1]));
+        lanes.set_reading(1);
+        assert_eq!(lanes.read(&format!("{lead}\n{kick}")), [0, 1]);
+
+        // Own lanes first. 2 plays kick and a snare. 1 plays, and adds a
+        // snare of its own: a new lane. A read of 2 gives its snare the
+        // number of 2, and not the number of the snare of 1 in play.
+        let mut lanes = LaneTable::default();
+        let snare = r#"snare: sound("sd")"#;
+        let (first, second) = (format!("{lead}\n{kick}"), format!("{kick}\n{snare}"));
+        let third = format!("{first}\n{snare}");
+        assert_eq!(play_in(&mut lanes, 1, &first), [0, 1]);
+        assert_eq!(play_in(&mut lanes, 2, &second), [1, 2]);
+        assert_eq!(play_in(&mut lanes, 1, &first), [0, 1]);
+        assert_eq!(play_in(&mut lanes, 1, &third), [0, 1, 3]);
+        lanes.set_reading(2);
+        assert_eq!(lanes.read(&second), [1, 2]);
+        // 1 is audible and 2 plays. An edit of 2 takes no lane of 1: its
+        // lead is a new lane. A first read in 3 takes the lead of 1 by rule
+        // 1, from the lanes the output plays. With no chain, no lane stays
+        // at rest. A rollback reads the text of 1 in 1, and each lane of 1
+        // keeps its number by the lanes the output plays.
+        lanes.mark_audible();
+        assert_eq!(play_in(&mut lanes, 2, &second), [1, 2]);
+        lanes.set_reading(2);
+        assert_eq!(lanes.read(&format!("{second}\n{lead}")), [1, 2, 4]);
+        lanes.set_reading(3);
+        assert_eq!(lanes.read(&lead), [0]);
+        lanes.forget_away(|_| false);
+        lanes.set_reading(1);
+        assert_eq!(lanes.read(&third), [0, 1, 3]);
+        // An install in the preview document puts the document in play at
+        // rest. The next install drops the lanes of the preview.
+        let preview = r#"$: note("c4").vsti("serum")"#;
+        assert_eq!(play_in(&mut lanes, PREVIEW_DOCUMENT, preview), [5]);
+        assert_eq!(lanes.document(), PREVIEW_DOCUMENT);
+        assert_eq!(numbers(&lanes.rest[&2].lanes), [1, 2]);
+        assert_eq!(play_in(&mut lanes, 1, &third), [0, 1, 3]);
+        assert!(!lanes.rest.contains_key(&PREVIEW_DOCUMENT));
+        // A close of 2 at rest drops its lanes and its lanes away. A close
+        // of 1 in play keeps its lanes, and the next install drops them. A
+        // direct pattern keeps the document in play.
+        assert_eq!(play_in(&mut lanes, 2, kick), [1]);
+        assert_eq!(play_in(&mut lanes, 1, &third), [0, 1, 3]);
+        lanes.forget(2);
+        assert!(lanes.is_closed(2) && !lanes.rest.contains_key(&2));
+        lanes.forget(1);
+        assert_eq!(numbers(&lanes.playing.lanes), [0, 1, 3]);
+        assert_eq!(play_in(&mut lanes, 3, kick), [1]);
+        assert!(!lanes.rest.contains_key(&1));
+        lanes.install_pattern();
+        assert_eq!((lanes.document(), numbers(&lanes.away)), (3, vec![1]));
+
+        // The document that went to rest first has the lower rest order. An
+        // install of a read of 2 while 1 plays puts 1 at rest with the
+        // highest order, and takes 2 out of rest. One count serves each
+        // table.
+        let mut lanes = LaneTable::default();
+        let first = first.as_str();
+        for (document, score) in [(2, first), (2, kick), (3, kick), (1, first)] {
+            play_in(&mut lanes, document, score);
+        }
+        let orders: HashMap<u64, u64> = lanes.rest_orders().collect();
+        assert!(orders[&0] < orders[&2] && orders[&2] < orders[&3]);
+        let after: HashMap<u64, u64> = lanes.rest_orders_for(2).collect();
+        assert_eq!((after[&0], after[&3]), (orders[&0], orders[&3]));
+        assert!(after.len() == 3 && after[&1] > orders[&3]);
+        assert_eq!(lanes.rest_orders_for(1).collect::<HashMap<_, _>>(), orders);
+        let mut other = LaneTable::default();
+        play_in(&mut other, 1, kick);
+        assert!(other.rest_orders().all(|(_, order)| order > orders[&3]));
+        // A number serves one lane of a document: the second kick of 2 is a
+        // new lane. The lanes away of 2 stay with 2.
+        lanes.set_reading(2);
+        assert_eq!(lanes.read(&format!("{kick}\n{kick}")), [1, 3]);
+        assert_eq!(lanes.read(first), [0, 1]);
+        assert_eq!(play_in(&mut lanes, 2, kick), [1]);
+        assert_eq!(numbers(&lanes.away), [0]);
+        // A lane at rest with a chain stays. With no chain, a document at
+        // rest keeps no lane, and stays at rest. A closed document in play
+        // does not go to rest.
+        lanes.forget_away(|lane| lane == 1);
+        assert_eq!(numbers(&lanes.rest[&1].lanes), [1]);
+        lanes.forget_away(|_| false);
+        let empty = |rest: &RestDocument| rest.lanes.is_empty() && rest.away.is_empty();
+        assert!(lanes.rest.values().all(empty));
+        assert_eq!(lanes.rest_orders().count(), 3);
+        lanes.forget(2);
+        assert!(lanes.rest_orders_for(3).all(|(document, _)| document != 2));
     }
 }

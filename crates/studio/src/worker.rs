@@ -142,6 +142,9 @@ enum EngineCommand {
         /// score is put back. See
         /// [`StudioEngine::mark_next_install_preview`].
         preview: bool,
+        /// The document of the text, as the scene id of its tab: see
+        /// [`StudioEngine::mark_next_install_document`].
+        document: u64,
     },
     /// Setup JavaScript for the session heap.
     ///
@@ -429,7 +432,8 @@ impl StudioWorker {
 
     /// Queue an evaluation without ever waiting behind the engine. Ownership
     /// is returned when the two-slot queue is full so the app can coalesce it
-    /// with a newer editor revision.
+    /// with a newer editor revision. The text is of document 0: see
+    /// [`Self::try_evaluate_document`].
     pub fn try_evaluate(
         &self,
         request_id: u64,
@@ -439,6 +443,22 @@ impl StudioWorker {
         launch: Launch,
         rewind: bool,
     ) -> Result<(), EvaluationSendError> {
+        self.try_evaluate_document(request_id, editor_revision, source, mini, launch, rewind, 0)
+    }
+
+    /// [`Self::try_evaluate`] for a text of `document`, the scene id of its
+    /// tab: see [`StudioEngine::mark_next_install_document`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_evaluate_document(
+        &self,
+        request_id: u64,
+        editor_revision: u64,
+        source: Arc<str>,
+        mini: bool,
+        launch: Launch,
+        rewind: bool,
+        document: u64,
+    ) -> Result<(), EvaluationSendError> {
         self.send_evaluate(
             request_id,
             editor_revision,
@@ -447,11 +467,15 @@ impl StudioWorker {
             launch,
             rewind,
             false,
+            document,
         )
     }
 
-    /// [`Self::try_evaluate`] for a snippet previewed under the set: see
-    /// [`StudioEngine::mark_next_install_preview`].
+    /// [`Self::try_evaluate_document`] for a snippet previewed under the
+    /// set: see [`StudioEngine::mark_next_install_preview`]. Such a snippet
+    /// is of the document of its scene. A snippet heard alone is of
+    /// [`rustel_runtime::PREVIEW_DOCUMENT`].
+    #[allow(clippy::too_many_arguments)]
     pub fn try_evaluate_snippet_preview(
         &self,
         request_id: u64,
@@ -460,6 +484,7 @@ impl StudioWorker {
         mini: bool,
         launch: Launch,
         rewind: bool,
+        document: u64,
     ) -> Result<(), EvaluationSendError> {
         self.send_evaluate(
             request_id,
@@ -469,6 +494,7 @@ impl StudioWorker {
             launch,
             rewind,
             true,
+            document,
         )
     }
 
@@ -482,6 +508,7 @@ impl StudioWorker {
         launch: Launch,
         rewind: bool,
         preview: bool,
+        document: u64,
     ) -> Result<(), EvaluationSendError> {
         if self.shutdown_requested.load(Ordering::Acquire) {
             return Err(EvaluationSendError::Disconnected(source));
@@ -496,6 +523,7 @@ impl StudioWorker {
             launch,
             rewind,
             preview,
+            document,
         }) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(EngineCommand::Evaluate { source, .. })) => {
@@ -1361,6 +1389,7 @@ fn process_command(
             launch,
             rewind,
             preview,
+            document,
         } => {
             let cancelled = || {
                 shutdown_requested.load(Ordering::Acquire)
@@ -1410,9 +1439,11 @@ fn process_command(
                     }),
                 );
             }
-            // Said before the arm or the evaluation and taken by the
-            // install, as a rewind is.
+            // Said before the arm or the evaluation. The install takes the
+            // preview mark, as it takes a rewind. The document mark stays
+            // until the next mark.
             engine.mark_next_install_preview(preview);
+            engine.mark_next_install_document(document);
             if let Launch::Quantised { unit_cycles } = launch
                 && !cancelled()
             {
@@ -3109,6 +3140,7 @@ mod tests {
                 launch: Launch::Now,
                 rewind: false,
                 preview: false,
+                document: 0,
             },
             &epoch,
             &shutdown,
@@ -3141,6 +3173,7 @@ mod tests {
             launch: Launch::Quantised { unit_cycles: 0.25 },
             rewind: true,
             preview: false,
+            document: 0,
         }
     }
 
@@ -3747,17 +3780,22 @@ mod tests {
 
     /// An edit the session holds for its plugin copies keeps the last score
     /// playing. The worker arms its request, and answers it when the edit
-    /// lands.
+    /// lands. The worker marks the document of each text, so the edit reads
+    /// in its own document after a text of another tab.
     #[cfg(feature = "vst")]
     #[test]
     fn a_held_plugin_edit_is_answered_when_it_lands() {
-        use super::super::engine::load_mode_tests::{fixture_plugins, start_with_plugins, studio};
+        use super::super::engine::load_mode_tests::{
+            document_mark, fixture_plugins, start_with_plugins, studio,
+        };
         use super::super::settings::LoadMode;
         let _plugins = fixture_plugins();
         let library = Arc::new(rustel_runtime::samples::SampleLibrary::empty());
         let mut engine = studio(LoadMode::Wait, &library);
         let playing = "$: s(\"sine\")";
         start_with_plugins(&mut engine, playing);
+        // The last text was of another tab.
+        engine.mark_next_install_document(3);
         // The load of the plugin takes 600 ms, so the edit waits for its
         // copy.
         // SAFETY: one fixture test runs at a time, and the plugin thread has
@@ -3776,10 +3814,16 @@ mod tests {
             launch: Launch::Now,
             rewind: false,
             preview: false,
+            document: 0,
         };
         press(&mut engine, command, &mut armed, &mut pending);
         collect_outcomes(&mut pending, &mut outcomes);
         assert!(armed.is_some() && outcomes.is_empty(), "{outcomes:?}");
+        assert_eq!(
+            document_mark(&engine),
+            0,
+            "the edit reads in its own document"
+        );
         assert_eq!(engine.active_source(), Some(playing));
         drive_worker(
             &mut engine,

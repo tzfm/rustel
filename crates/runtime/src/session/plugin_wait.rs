@@ -1365,8 +1365,14 @@ mod tests {
     /// chain that a Csound orbit ends to make room. A turn of an output with
     /// no plugins counts nothing. A session with no live output keeps no
     /// plugin. A live output gives back a copy the chain no longer wants, 5 s
-    /// after the chain lost its key. A session that ends ends its chains at
-    /// the host, so the slot of its chain takes no copy then.
+    /// after the chain lost its key. The score rests while a score of another
+    /// document plays. After 5 s of play the output names its chain no more,
+    /// and the chain keeps the copy of its preset. Its slot takes no copy of
+    /// another preset. The score plays again, and its tab closes while it
+    /// plays. When a score of another document plays, its chain is a closed
+    /// chain in its grace, and it keeps its copy. A session that ends ends
+    /// its chains at the host, a closed chain too. Its copy ends, and the
+    /// slot of its chain takes no copy then.
     #[test]
     fn a_chain_of_a_setup_pattern_leaves_after_its_time() {
         let (_one, folder) = fixture_plugins();
@@ -1520,6 +1526,38 @@ mod tests {
         rustel_audio::LiveReverbBatch::install_inserts(output.device(), &[]);
         assert!(!output.device().holds_insert(slot, key));
         drop(output);
+        // The score rests while a score of another document plays. After
+        // 5 s of play the output names its chain no more, and the chain
+        // keeps the copy of its preset. Its slot takes no copy of another
+        // preset.
+        host.prepare(fixture, Some("half"), false, 48_000, slot);
+        session.set_plugin_document(1);
+        session.evaluate(kick).expect("a score of another document");
+        for now in 35..41 {
+            turn(&mut session, f64::from(now), steady);
+        }
+        assert!(insert_chains(&session).named.is_empty(), "a rest chain");
+        assert_eq!(copies_in(folder.path()), 1, "the copy of a rest chain");
+        host.prepare(fixture, None, false, 48_000, slot);
+        assert_eq!(
+            copies_in(folder.path()),
+            1,
+            "a copy the rest chain does not want"
+        );
+        // The score plays again, and its tab closes while the transport
+        // runs, so the score plays on. A score of another document plays:
+        // the chain is a closed chain in its grace. No call of the host
+        // names it, and the host keeps its copy.
+        session.set_plugin_document(0);
+        session.evaluate(&score).expect("the score again");
+        assert_eq!(plugin_chain(&session), slot.chain);
+        assert!(
+            !session.forget_plugin_document(0),
+            "the closed score plays on"
+        );
+        session.set_plugin_document(1);
+        session.evaluate(kick).expect("a score of another document");
+        assert_eq!(copies_in(folder.path()), 1, "the copy of a closed chain");
         drop(session);
         host.prepare(fixture, Some("half"), false, 48_000, slot);
         assert_eq!(

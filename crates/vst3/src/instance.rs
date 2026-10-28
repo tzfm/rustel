@@ -793,12 +793,13 @@ pub(crate) struct Instance {
 // SAFETY: one thread owns an instance at a time and makes each call on it:
 // the plugin thread at the build, then the audio engine, which runs the
 // blocks in the callback or on a plugin worker, one thread at a time. The
-// drop of a `Lent` sends a live copy back to the plugin thread in a job of
-// the line. The plugin thread plays out its tail or sets it up at a new
-// rate while no engine holds it. The copy then waits for its slot under
-// the lock of the host, and the next engine takes it under that lock. The
-// pointers go to memory the instance owns, and the plugin objects go back
-// to the plugin thread at the end.
+// drop of a `Lent` runs on the thread that drops the live copy, after the
+// last block. It parks a quiet copy there with no plugin call, or sends the
+// copy back to the plugin thread in a job of the line, which plays out its
+// tail or sets it up at a new rate while no engine holds it. The copy then
+// waits for its slot under the lock of the host, and the next engine takes
+// it under that lock. The pointers go to memory the instance owns, and the
+// plugin objects go back to the plugin thread at the end.
 unsafe impl Send for Instance {}
 
 impl Instance {
@@ -929,7 +930,7 @@ impl Instance {
     }
 
     /// Starts the clock of the copy again from frame 0, after its build, a
-    /// flush or a retune, and the counts of the flush with it. Each value a
+    /// park or a retune, and the counts of the flush with it. Each value a
     /// note gave the copy before then is a value of the life before: the
     /// next note of the copy restores it. Makes no plugin call.
     pub(crate) fn rebase(&mut self) {

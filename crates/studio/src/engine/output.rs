@@ -1060,11 +1060,19 @@ mod tests {
         let mut engine = silent_engine_for_output_selection();
         let stream = engine.live.as_ref().unwrap().device.stream_id();
         assert!(!engine.live.as_ref().unwrap().device.output_failed());
+        // The output holds a copy of a chain a closed tab ended.
+        #[cfg(feature = "vst")]
+        {
+            engine.closed_plugin_copies = true;
+        }
         let stop = engine
             .stop_output(Duration::from_millis(500), false)
             .expect("stop output");
         assert!(stop.acknowledged);
         assert!(engine.piano_output.is_none());
+        // The copy left with the output, so no later output closes for it.
+        #[cfg(feature = "vst")]
+        assert!(!engine.closed_plugin_copies);
         start_selected_output(&mut engine);
         assert_ne!(engine.live.as_ref().unwrap().device.stream_id(), stream);
     }

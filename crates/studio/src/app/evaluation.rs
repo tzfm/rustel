@@ -671,19 +671,11 @@ impl App {
         let Some(pending) = self.pending_evaluation.take() else {
             return;
         };
-        // A snippet previewed under the set is removed when the score is
-        // restored. Its install must be marked as a preview in the engine.
-        #[cfg(feature = "hydra")]
-        let preview = self
-            .snippet_preview
-            .as_ref()
-            .is_some_and(|preview| preview.source == pending.source);
-        #[cfg(not(feature = "hydra"))]
-        let preview = false;
+        let (preview, document) = self.install_mark(&pending);
         let send = if preview {
             StudioWorker::try_evaluate_snippet_preview
         } else {
-            StudioWorker::try_evaluate
+            StudioWorker::try_evaluate_document
         };
         match send(
             &self.worker,
@@ -693,6 +685,7 @@ impl App {
             self.options.mini,
             pending.launch,
             pending.rewind,
+            document,
         ) {
             Ok(()) => {
                 self.inflight.insert(pending.request_id, pending);
@@ -704,6 +697,34 @@ impl App {
                 self.mark_engine_disconnected();
             }
         }
+    }
+
+    /// Whether `pending` is a snippet preview, and the document of its text:
+    /// see [`StudioWorker::try_evaluate_document`].
+    pub(super) fn install_mark(&self, pending: &PendingEvaluation) -> (bool, u64) {
+        // A snippet previewed under the set is removed when the score is
+        // restored. Its install must be marked as a preview in the engine.
+        #[cfg(feature = "hydra")]
+        let snippet = self
+            .snippet_preview
+            .as_ref()
+            .filter(|preview| preview.source == pending.source);
+        #[cfg(feature = "hydra")]
+        let (preview, alone) = (
+            snippet.is_some(),
+            snippet.is_some_and(|preview| preview.restore.is_none()),
+        );
+        #[cfg(not(feature = "hydra"))]
+        let (preview, alone) = (false, false);
+        // The text is of the scene it went out for. A snippet previewed
+        // under the set is a part of that scene, and a snippet heard alone
+        // is of no scene.
+        let document = if alone {
+            rustel_runtime::PREVIEW_DOCUMENT
+        } else {
+            pending.scene.0
+        };
+        (preview, document)
     }
 
     pub(super) fn drain_engine(&mut self) {
@@ -1409,7 +1430,8 @@ mod tests {
 
         /// The apply itself: queued while the set plays, and no flash, because
         /// a flash confirms a press and nobody pressed anything. The launch
-        /// row is off by default, so the edit lands at once.
+        /// row is off by default, so the edit lands at once. The edit is of
+        /// its scene.
         #[test]
         fn a_paused_edit_applies_itself_without_a_flash() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -1419,6 +1441,11 @@ mod tests {
             assert_eq!(queued.len(), 1, "the paused edit was queued");
             assert_eq!(&*queued[0].source, "$: s(\"bd\")\n");
             assert_eq!(queued[0].launch, Launch::Now);
+            assert_eq!(
+                app.install_mark(&queued[0]),
+                (false, scene.0),
+                "the edit is of its scene"
+            );
             assert!(
                 app.evaluation_feedback.is_none(),
                 "an auto apply begins no flash"

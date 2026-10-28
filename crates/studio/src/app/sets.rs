@@ -1219,6 +1219,11 @@ impl App {
         self.live_sliders.clear();
         self.readiness.clear();
         self.tabs_closed += 1;
+        // A setup tab plays no score, so it has no document to close.
+        let tabs = self.scenes.scenes().iter();
+        let documents = tabs.filter(|scene| scene.prebake().is_none());
+        self.closed_documents
+            .extend(documents.map(|scene| scene.id.0));
         self.scenes = set;
         // The tapes open were the old set's.
         self.replay_view = None;

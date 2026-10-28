@@ -132,6 +132,12 @@ pub(crate) const MIN_LIVE_QUERY_JS_BUDGET: Duration = Duration::from_millis(25);
 /// painters, never queued to the audio - so it can never collide with the
 /// scheduler's dense counter, which starts at zero.
 pub const PREVIEW_ONSET_ID_FLAG: u64 = 1 << 63;
+/// The document of a snippet preview with no set under it, and of the
+/// silence that opens the output while nothing plays. A document is the key
+/// a caller gives a score text, as the scene id in Studio. This document
+/// never goes to rest: a preview is no scene of the set, so the session
+/// keeps none of its lanes for a later play.
+pub const PREVIEW_DOCUMENT: u64 = u64::MAX;
 
 /// The JavaScript a preview query may run. It runs on the engine thread
 /// between producer steps, so a callback-bearing score gets the live
@@ -433,6 +439,10 @@ struct AudibleSource {
     cycle_zero_time: f64,
     /// The cycle that `getTime()` returned while this source evaluated.
     evaluated_cycle: f64,
+    /// The document of the source: see [`Session::set_plugin_document`]. A
+    /// rollback and a panic replay read the source in it.
+    #[cfg(feature = "vst")]
+    document: u64,
 }
 
 /// Settings a Session is built with; [`Session::with_config`] validates them.
@@ -1350,19 +1360,61 @@ impl Session {
     }
 
     /// The plugin names of the chains of the score in play and of the text
-    /// the session plans, as the notes write them, each one time. A chain in
-    /// its grace does not count: its lane left the text, or the lane lost
-    /// the instrument or each plugin of the chain. A Stop ends no chain, so
-    /// the names stay while the transport is stopped. A caller that unloads
-    /// the plugins no score uses keeps these plugins: also a plugin from a
-    /// setup text, an import or a name the score computes. Empty for a
-    /// session with no live output: see [`Self::attach_plugins`].
+    /// the session plans, and of the copies each document at rest keeps, as
+    /// the notes write them, each one time. A chain in its grace does not
+    /// count: its lane left the text, or the lane lost the instrument or each
+    /// plugin of the chain. A Stop ends only the chains of a closed document:
+    /// see [`Self::end_closed_plugin_document`]. The other names stay while
+    /// the transport is stopped. A caller that unloads the plugins no score
+    /// uses keeps these plugins: also a plugin from a setup text, an import
+    /// or a name the score computes. Empty for a session with no live
+    /// output: see [`Self::attach_plugins`].
     #[cfg(feature = "vst")]
     pub fn plugin_names(&self) -> Vec<String> {
         if !self.plugins_live() {
             return Vec::new();
         }
         crate::vst::plugin_names(&self.chains)
+    }
+
+    /// The next score texts of this session are of `document`: the key a
+    /// caller gives each score text, as the scene id in Studio. The CLI and an
+    /// embedder read in document 0. An open document that does not play is
+    /// at rest: the plugin copies of its chains wait for its next play, so a
+    /// document that plays again loads nothing. A document that plays for the
+    /// first time shares the lanes of the score in play, with their copies.
+    #[cfg(feature = "vst")]
+    pub fn set_plugin_document(&mut self, document: u64) {
+        self.lanes.set_reading(document);
+    }
+
+    /// The tab of `document` left. A document at rest gives its plugin
+    /// copies back at once. The score in play plays on, and its copies end
+    /// at the next Stop, or 5 s of play after another score plays: see
+    /// [`Self::end_closed_plugin_document`]. Gives true when an engine holds
+    /// a copy of a chain that ended while the transport is stopped: the
+    /// output gives it back at its close. With the transport running, the
+    /// output gives back the copy of each chain it does not name, and the
+    /// call gives false.
+    #[cfg(feature = "vst")]
+    pub fn forget_plugin_document(&mut self, document: u64) -> bool {
+        let live = self.plugins_live();
+        let held = crate::vst::forget_document(&self.chains, &mut self.lanes, document, live);
+        self.end_closed_plugin_document() || (held && self.transport.is_stopped())
+    }
+
+    /// Ends the plugin chains of each closed document while the transport
+    /// is stopped: the chains of the closed score in play, and of a closed
+    /// score in its 5 s. Gives true when an engine holds a copy of a chain
+    /// that ended: the output gives it back at its close. With the transport
+    /// running, nothing ends.
+    #[cfg(feature = "vst")]
+    pub fn end_closed_plugin_document(&self) -> bool {
+        if !self.transport.is_stopped() {
+            return false;
+        }
+        let live = self.plugins_live();
+        crate::vst::end_closed_documents(&self.chains, &self.lanes, live)
     }
 
     /// Keeps the plugin name of each plugin call an evaluation ran. `names`
@@ -2043,6 +2095,9 @@ pub(crate) mod tests {
         session.set_direct_diagnostic_logging(false);
         session.set_schedule_lead(0.0);
         session.set_continuity_margin(0.0);
+        // Each score is of a document of its own.
+        #[cfg(feature = "vst")]
+        session.set_plugin_document(1);
         if mini {
             session.evaluate_mini(source_a).expect("source A");
         } else {
@@ -2093,6 +2148,8 @@ pub(crate) mod tests {
             )
             .expect("A shield");
         let generation_a = session.generation();
+        #[cfg(feature = "vst")]
+        session.set_plugin_document(2);
         let generation_b = session
             .reload_with_clock_cancellable(source_b, mini, transport.stopped_flag(), || now)
             .expect("B evaluates");
@@ -2107,6 +2164,8 @@ pub(crate) mod tests {
 
         // The host is deliberately not invoked for B. C is valid native mini
         // syntax, but its bare string haps cannot become scalar voice objects.
+        #[cfg(feature = "vst")]
+        session.set_plugin_document(3);
         let generation_c = session
             .reload_with_clock_cancellable("c4*64", true, transport.stopped_flag(), || now)
             .expect("C installs before conversion");
@@ -2158,6 +2217,13 @@ pub(crate) mod tests {
             Some(if delayed_b { source_b } else { source_a }),
             "only a copied window may select its retained rollback source"
         );
+        // The rollback reads the score it puts back in the document of that
+        // score. A mini score reads no lane.
+        #[cfg(feature = "vst")]
+        if !mini {
+            let document = if delayed_b { 2 } else { 1 };
+            assert_eq!(session.lanes.document(), document);
+        }
     }
     #[test]
     fn max_polyphony_is_transactional_and_isolated_per_session() {

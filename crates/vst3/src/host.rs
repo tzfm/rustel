@@ -33,9 +33,21 @@ pub struct WorkerProgram {
 
 /// The plugins the host keeps ready for a slot that did not take them yet.
 /// One score needs one for each slot at most, so a start that waits for
-/// its plugins finds all of them. A copy of a chain a caller names stays:
-/// see [`Host::keep`].
+/// its plugins finds all of them. A new build at the bound ends a failed
+/// build first, then a copy of a chain no caller names, then a copy a
+/// caller keeps at rest. A copy of a chain a caller names stays, unless
+/// only copies at rest ask for it: see [`Host::keep`] and
+/// [`State::make_room`]. A render ends no copy at rest: with no other build
+/// to end, it builds past the bound. The bound does not count the build of
+/// a render and does not end it before the render takes its copy. A copy
+/// that comes home from an engine ends a build of a lower rank only: see
+/// [`State::park`].
 const MAX_PARKED: usize = rustel_audio::INSERT_SLOTS;
+/// The copies one job of [`Host::keep`] ends at most. A job at the end of
+/// the line ends the others, so a build or a park that joins the line
+/// meanwhile waits for these ends only. One end job at most is in the line,
+/// also after many calls.
+const ENDS_PER_JOB: usize = 4;
 /// A prepared plugin waits behind the read of the folders and the load:
 /// its build goes to the end of the line this many times at most.
 const PREPARE_TRIES: u32 = 4;
@@ -235,8 +247,9 @@ pub enum Prepared {
     Unavailable(String),
 }
 
-/// A plugin copy a live chain wants: the slot of the copy, and the plugin
-/// and the preset by name, as a score writes them. See [`Host::keep`].
+/// A plugin copy a chain wants, live or at rest: the slot of the copy, and
+/// the plugin and the preset by name, as a score writes them. See
+/// [`Host::keep`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WantedCopy {
     pub slot: InsertSlot,
@@ -312,6 +325,19 @@ enum Build {
     Failed(u64, String),
 }
 
+/// The place of a build in the order the bound of the parked copies ends
+/// builds: the lowest rank ends first. See [`State::make_room`].
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Rank {
+    /// A failed build, by the count of the builds at the failure.
+    Failed(u64),
+    /// A copy of a chain no caller names, by the order of the copy.
+    Unnamed(u64),
+    /// A copy with copies at rest that ask for its key, by the highest rest
+    /// order among them, then by the order of the copy: see [`Host::keep`].
+    Rest(u64, u64),
+}
+
 #[derive(Default)]
 struct State {
     /// The number of a plugin is its place here plus 1. Rows are only added.
@@ -347,6 +373,10 @@ struct State {
     /// the folders, and its answer may have changed.
     presets_version: u64,
     builds: HashMap<(InsertKey, u32, InsertSlot), Build>,
+    /// The builds a render claimed and did not take yet: see
+    /// [`Host::insert`]. The bound of the parked copies does not count such a
+    /// build and does not end it.
+    rendering: HashSet<(InsertKey, u32, InsertSlot)>,
     /// The builds an engine took for live play, with the cell of each copy:
     /// the cell says while the engine holds the plugin, and while the copy
     /// comes home. See [`Host::insert`].
@@ -365,6 +395,11 @@ struct State {
     /// second time, so a chain here gets no new build. An engine holds the
     /// copy of such a chain until the end of its tail.
     ended: HashSet<u64>,
+    /// The ready copies the end job of [`Host::keep`] ends: see
+    /// [`Host::end_unwanted`]. `None` while no end job is in the line of the
+    /// plugin thread or runs, so one end job at most is in the line. A later
+    /// call adds its copies to that job.
+    ending: Option<Vec<(InsertKey, u32, InsertSlot)>>,
     /// What each caller of [`Host::keep`] keeps, by the number of the
     /// caller.
     callers: HashMap<u64, Kept>,
@@ -395,6 +430,9 @@ struct Kept {
     wanted: HashMap<u64, Vec<WantedCopy>>,
     /// The chains the caller names.
     named: HashSet<u64>,
+    /// The copies the caller keeps at rest, by chain, each with the rest
+    /// order of its score.
+    rest: HashMap<u64, Vec<(WantedCopy, u64)>>,
 }
 
 /// The read of each bundle with no plugin names yet, on a thread of its
@@ -524,17 +562,21 @@ impl State {
         self.ended.contains(&build.2.chain)
     }
 
-    /// True for a build for a slot of a live chain with a key no copy of
-    /// the slot asks for: see [`Host::keep`]. A chain no caller lists asks
-    /// for each key.
+    /// True for a build for a slot of a listed chain with a key no copy of
+    /// the slot asks for, live or at rest: see [`Host::keep`]. A chain no
+    /// caller lists asks for each key.
     fn unwanted(&self, build: &(InsertKey, u32, InsertSlot)) -> bool {
         let (key, _, slot) = build;
-        let mut lists = self.callers.values();
-        let Some(copies) = lists.find_map(|kept| kept.wanted.get(&slot.chain)) else {
+        let lists = |kept: &&Kept| {
+            kept.wanted.contains_key(&slot.chain) || kept.rest.contains_key(&slot.chain)
+        };
+        let Some(kept) = self.callers.values().find(lists) else {
             return false;
         };
+        let live = kept.wanted.get(&slot.chain).into_iter().flatten();
+        let rest = kept.rest.get(&slot.chain).into_iter().flatten();
         let asks = |copy: &WantedCopy| copy.slot == *slot && self.asks_for(copy, *key);
-        !copies.iter().any(asks)
+        !live.chain(rest.map(|(copy, _)| copy)).any(asks)
     }
 
     /// True when `copy` asks for the copy with `key`. The name and the
@@ -542,7 +584,13 @@ impl State {
     /// folder. A name with no answer yet asks for each key: the host reads
     /// the folders, the plugin loads, or no call asked for the preset yet.
     fn asks_for(&self, copy: &WantedCopy, key: InsertKey) -> bool {
-        let Some(row) = self.find(&copy.name) else {
+        self.asks_for_row(self.find(&copy.name), copy, key)
+    }
+
+    /// [`State::asks_for`] with `row`, the row [`State::find`] gives for the
+    /// name of `copy`.
+    fn asks_for_row(&self, row: Option<usize>, copy: &WantedCopy, key: InsertKey) -> bool {
+        let Some(row) = row else {
             return self.scans > 0;
         };
         match &self.entries[row].stage {
@@ -577,6 +625,142 @@ impl State {
         self.callers
             .values()
             .any(|kept| kept.named.contains(&chain))
+    }
+
+    /// The row [`State::find`] gives for each name [`State::rank`] reads: the
+    /// name of each copy at rest, and of each live copy of a chain with
+    /// copies at rest. [`State::make_room`] finds each name one time, and not
+    /// one time for each build it ranks.
+    fn rank_rows(&self) -> HashMap<String, Option<usize>> {
+        let mut rows = HashMap::new();
+        let lists = || self.callers.values();
+        for (chain, rest) in lists().flat_map(|kept| &kept.rest) {
+            let live = lists().filter_map(|kept| kept.wanted.get(chain)).flatten();
+            for copy in rest.iter().map(|(copy, _)| copy).chain(live) {
+                rows.entry(copy.name.clone())
+                    .or_insert_with(|| self.find(&copy.name));
+            }
+        }
+        rows
+    }
+
+    /// The rank of a ready copy of `build` with the order `order` at the
+    /// bound of the parked copies: see [`State::make_room`]. A ready copy
+    /// of a chain a caller names has no rank and stays, unless only copies
+    /// at rest ask for its key. When copies at rest ask for the key of a
+    /// ready copy, the copy ranks by the highest rest order among them.
+    /// Each other ready copy ranks under each such copy. `rows` has the row
+    /// of each name from [`State::rank_rows`]. A name not in `rows` resolves
+    /// here.
+    fn rank(
+        &self,
+        build: &(InsertKey, u32, InsertSlot),
+        order: u64,
+        rows: &HashMap<String, Option<usize>>,
+    ) -> Option<Rank> {
+        let (key, _, slot) = build;
+        let row = |copy: &WantedCopy| {
+            let found = rows.get(&copy.name).copied();
+            found.unwrap_or_else(|| self.find(&copy.name))
+        };
+        let asks =
+            |copy: &WantedCopy| copy.slot == *slot && self.asks_for_row(row(copy), copy, *key);
+        let lists = || self.callers.values();
+        let rest = lists().filter_map(|kept| kept.rest.get(&slot.chain));
+        let rest = rest.flatten().filter(|(copy, _)| asks(copy));
+        let rest = rest.map(|(_, rest)| *rest).max();
+        let named = self.named(slot.chain);
+        let live = || {
+            let live = lists().filter_map(|kept| kept.wanted.get(&slot.chain));
+            live.flatten().any(asks)
+        };
+        match rest {
+            Some(rest) if !named || !live() => Some(Rank::Rest(rest, order)),
+            _ if named => None,
+            _ => Some(Rank::Unnamed(order)),
+        }
+    }
+
+    /// The builds the bound of the parked copies counts: each build but a
+    /// build a render did not take yet. See [`State::rendering`].
+    fn parked(&self) -> usize {
+        let rendering = self.rendering.iter();
+        let rendering = rendering.filter(|build| self.builds.contains_key(build));
+        self.builds.len() - rendering.count()
+    }
+
+    /// Ends the build of the lowest rank under `below` until the bound of
+    /// the parked copies has room for one more build: see [`MAX_PARKED`].
+    /// With no `below`, a build of any rank ends. A build that runs has no
+    /// rank, and a copy of a named chain has none: see [`State::rank`]. A
+    /// build a render did not take yet has no rank and does not count: see
+    /// [`State::rendering`]. False when the bound has no room and no build
+    /// ranks under `below`. The names of the copies resolve one time for the
+    /// whole call: see [`State::rank_rows`].
+    fn make_room(&mut self, below: Option<Rank>) -> bool {
+        if self.parked() < MAX_PARKED {
+            return true;
+        }
+        let rows = self.rank_rows();
+        while self.parked() >= MAX_PARKED {
+            let ranks = self.builds.iter().filter_map(|(build, built)| {
+                let rank = match built {
+                    _ if self.rendering.contains(build) => None,
+                    Build::Failed(order, _) => Some(Rank::Failed(*order)),
+                    Build::Ready(copy) => self.rank(build, copy.order(), &rows),
+                    Build::Running => None,
+                };
+                let under = rank.filter(|rank| below.is_none_or(|below| *rank < below));
+                under.map(|rank| (*build, rank))
+            });
+            let Some((lowest, _)) = ranks.min_by_key(|(_, rank)| *rank) else {
+                return false;
+            };
+            self.builds.remove(&lowest);
+        }
+        true
+    }
+
+    /// True when a copy an engine gave back ends at its park: the chain of
+    /// its slot ended, its slot does not want its key, or it has the preset
+    /// mark: see [`CopyState::preset_changed`].
+    fn ends_at_park(&self, build: &(InsertKey, u32, InsertSlot), copy: &Instance) -> bool {
+        self.chain_ended(build)
+            || self.unwanted(build)
+            || copy.cell().preset_changed.load(Ordering::Relaxed)
+    }
+
+    /// The park of a copy an engine gave back, in one lock: see
+    /// [`Host::park`]. The copy leaves the taken builds, and waits for its
+    /// slot again at the rate of its build. At the bound of the parked
+    /// copies it ends a build of a lower rank only, and the order of the
+    /// copies does not count: a copy at rest ends a failed build, a copy of
+    /// a chain no caller names or a copy at rest of a lower rest order. A
+    /// copy of a chain no caller names ends a failed build only. A copy of
+    /// a named chain has no rank: it ends a build of any rank, and parks
+    /// past the bound when no build ranks. See [`State::make_room`]. Gives
+    /// the copy back when it ends at its park or finds no room: the caller
+    /// ends it on the plugin thread. A copy the bound ends leaves the list
+    /// here, and its plugin ends on the plugin thread too.
+    fn park(
+        &mut self,
+        build: (InsertKey, u32, InsertSlot),
+        copy: Box<Instance>,
+    ) -> Option<Box<Instance>> {
+        self.taken.remove(&build);
+        if self.ends_at_park(&build, &copy) {
+            return Some(copy);
+        }
+        // With the order 0, no build of the kind and the rest order of the
+        // copy ranks under it.
+        let below = self.rank(&build, 0, &HashMap::new());
+        if !self.make_room(below) && below.is_some() {
+            return Some(copy);
+        }
+        copy.cell().set_place(Place::Home);
+        self.latencies.insert((build.0, build.1), copy.latency());
+        self.builds.insert(build, Build::Ready(copy));
+        None
     }
 
     /// Takes the ready copies of the builds that `ends` names out of the
@@ -1747,6 +1931,17 @@ impl Host {
         })
     }
 
+    /// True while an engine holds a copy for a slot of a chain in `chains`.
+    /// A chain that ends keeps such a copy until the engine gives it back:
+    /// see [`Host::keep`].
+    pub fn engine_holds_chains(&self, chains: &[u64]) -> bool {
+        let state = self.state();
+        state
+            .taken
+            .iter()
+            .any(|(build, cell)| cell.place() == Place::Engine && chains.contains(&build.2.chain))
+    }
+
     /// The names in `names` that are the whole name or the bundle name of a
     /// plugin. A part of a name is not: `piano` is no name of `Pianoteq 8`.
     pub fn whole_names(&self, names: &[String]) -> Vec<String> {
@@ -1758,20 +1953,29 @@ impl Host {
     /// Tells the host the plugin copies the chains of one caller want.
     /// `caller` is the number of the caller, as the chains of one session.
     /// `live` has each copy a live chain of the caller wants. `named` has
-    /// the chains the caller names: the bound of the parked copies ends no
-    /// copy of such a chain. A call takes the place of the last call of the
-    /// same caller, so a second caller unnames no chain of the first.
-    /// `ended` has the chains that ended: no score has these chains now.
+    /// the chains the caller names. `rest` has each copy the caller keeps
+    /// at rest, for an open score that does not play now, with the rest
+    /// order of the score: a score that went to rest later has a higher
+    /// order. A copy at rest keeps its build as a live copy does. The bound
+    /// of the parked copies ends no copy of a named chain, unless only a
+    /// copy at rest asks for it. It ends the copies at rest after each copy
+    /// of a chain no caller names, the lowest order first. A call takes the
+    /// place of the last call of the same caller, so a second caller
+    /// unnames no chain of the first. `ended` has the chains that ended: no
+    /// score has these chains now.
     ///
     /// Each build of an ended chain ends, and so does each build for a slot
-    /// of a live chain with a key no copy of the slot asks for. So no
-    /// engine takes such a copy, a build in the line makes no copy, and no
-    /// later call starts one. A ready copy ends in a job of the plugin
-    /// thread. A call that wants the copy again before that job keeps the
-    /// copy. A copy an engine gives back for such a slot ends when it comes
-    /// home. A chain no caller lists keeps its builds. The host resolves
-    /// each name and preset as [`Host::key`] does, with no load and no read
-    /// of a folder. A name with no answer yet keeps each key of its slot.
+    /// of a listed chain with a key no copy of the slot asks for, live or
+    /// at rest. So no engine takes such a copy, a build in the line makes
+    /// no copy, and no later call starts one. A ready copy ends in the end
+    /// job of the plugin thread. One end job at most is in the line, and a
+    /// call while it waits adds its copies to it. The job ends 4 copies at
+    /// most, and a job at the end of the line ends the others. A call that
+    /// wants the copy again before its job keeps the copy. A copy an engine
+    /// gives back for such a slot ends when it comes home. A chain no caller
+    /// lists keeps its builds. The host resolves each name and preset as
+    /// [`Host::key`] does, with no load and no read of a folder. A name with
+    /// no answer yet keeps each key of its slot.
     ///
     /// Gives the slot and the key of each copy an engine holds for a chain
     /// the caller names, with a key no copy of its slot asks for. The engine
@@ -1782,6 +1986,7 @@ impl Host {
         caller: u64,
         live: Vec<WantedCopy>,
         named: Vec<u64>,
+        rest: Vec<(WantedCopy, u64)>,
         ended: Vec<u64>,
     ) -> Vec<(InsertSlot, InsertKey)> {
         let mut state = self.state();
@@ -1793,7 +1998,11 @@ impl Host {
         for copy in live {
             kept.wanted.entry(copy.slot.chain).or_default().push(copy);
         }
-        if kept.wanted.is_empty() && kept.named.is_empty() {
+        for (copy, order) in rest {
+            let chain = copy.slot.chain;
+            kept.rest.entry(chain).or_default().push((copy, order));
+        }
+        if kept.wanted.is_empty() && kept.named.is_empty() && kept.rest.is_empty() {
             state.callers.remove(&caller);
         } else {
             state.callers.insert(caller, kept);
@@ -1821,26 +2030,58 @@ impl Host {
         state
             .builds
             .retain(|build, built| matches!(built, Build::Ready(_)) || !gone.contains(build));
-        if !gone.iter().any(|build| state.builds.contains_key(build)) {
-            return held;
+        let ready: Vec<(InsertKey, u32, InsertSlot)> = gone
+            .into_iter()
+            .filter(|build| state.builds.contains_key(build))
+            .collect();
+        // One end job at most is in the line. A copy joins its list one
+        // time, and the first copy starts the job.
+        let start = state.ending.is_none() && !ready.is_empty();
+        if !ready.is_empty() {
+            let ending = state.ending.get_or_insert_default();
+            for build in ready {
+                if !ending.contains(&build) {
+                    ending.push(build);
+                }
+            }
         }
         drop(state);
+        if start {
+            self.end_unwanted();
+        }
+        held
+    }
+
+    /// Ends the ready copies of [`State::ending`] that no chain wants, on
+    /// the plugin thread: [`ENDS_PER_JOB`] copies in a job, then a job at the
+    /// end of the line with the others and the copies later calls of
+    /// [`Host::keep`] added. A copy that a call of [`Host::keep`] wants again
+    /// before its job stays.
+    fn end_unwanted(&self) {
         let host = self.clone();
         self.enqueue(move || {
             let copies = {
                 let mut state = host.state();
+                let mut gone = state.ending.take().unwrap_or_default();
                 // A later call that wants a copy again keeps it.
-                let gone: HashSet<(InsertKey, u32, InsertSlot)> = gone
-                    .into_iter()
-                    .filter(|build| state.chain_ended(build) || state.unwanted(build))
-                    .collect();
+                gone.retain(|build| state.chain_ended(build) || state.unwanted(build));
+                // The others stay in the list while this job ends its
+                // copies, so a call meanwhile adds to the list and starts no
+                // job.
+                state.ending = Some(gone.split_off(gone.len().min(ENDS_PER_JOB)));
                 state.take_ready(|build| gone.contains(build))
             };
             for copy in copies {
                 copy.end_here();
             }
+            let mut state = host.state();
+            if state.ending.as_ref().is_some_and(Vec::is_empty) {
+                state.ending = None;
+            } else {
+                drop(state);
+                host.end_unwanted();
+            }
         });
-        held
     }
 
     /// Runs on the plugin thread.
@@ -2103,13 +2344,23 @@ impl Host {
 
     /// Builds a plugin for one slot of the audio engine. With `wait`, the
     /// call returns the plugin: this is for a render to a file, and the copy
-    /// ends at its drop. With no wait, the first call starts the work and a
-    /// later call returns the plugin: this is for live play, where the
-    /// caller has no time to lose. A live copy goes home at its drop: the
-    /// plugin thread plays out its tail and keeps it for the slot, so a
-    /// later call for the slot builds nothing. While an engine holds such a
-    /// copy or gives it back, no call builds a second copy of its key for
-    /// the slot, at any rate.
+    /// ends at its drop. A render ends no copy a caller keeps at rest to
+    /// make room under the bound of the parked copies: with no other copy
+    /// to end, it builds past the bound. The bound does not count the build
+    /// of a render and does not end it before the render takes its copy.
+    /// See [`Host::keep`]. With no wait, the first call starts the work and
+    /// a later call returns the plugin: this is for live play, where the
+    /// caller has no time to lose. A live copy goes home at its drop and
+    /// waits for the slot again, so a later call for the slot builds
+    /// nothing. A quiet copy parks at once, on the thread of the drop. The
+    /// plugin thread plays out the tail of each other copy first. At the
+    /// bound of the parked copies, a copy that comes home takes the place of
+    /// a failed build. A copy at rest also takes the place of a copy of a
+    /// chain no caller names or of a copy at rest of a lower order. With no
+    /// such place, the copy ends. A copy of a named chain takes the place of
+    /// any copy the bound ends, and parks past the bound with none. While an
+    /// engine holds such a copy or gives it back, no call builds a second
+    /// copy of its key for the slot, at any rate.
     pub fn insert(
         &self,
         key: InsertKey,
@@ -2118,23 +2369,26 @@ impl Host {
         wait: bool,
     ) -> Option<Box<dyn OrbitInsert>> {
         let build = (key, sample_rate, slot);
-        let take = |state: &mut State| match state.builds.remove(&build) {
-            Some(Build::Ready(mut copy)) => {
-                copy.set_any_thread(!state.on_audio_thread(key.plugin));
-                if wait {
-                    return Some(copy as Box<dyn OrbitInsert>);
+        let take = |state: &mut State| {
+            state.rendering.remove(&build);
+            match state.builds.remove(&build) {
+                Some(Build::Ready(mut copy)) => {
+                    copy.set_any_thread(!state.on_audio_thread(key.plugin));
+                    if wait {
+                        return Some(copy as Box<dyn OrbitInsert>);
+                    }
+                    state.taken.retain(|_, cell| cell.place() != Place::Home);
+                    state.taken.insert(build, copy.hold());
+                    let host = Arc::downgrade(&self.shared);
+                    let copy = Some(copy);
+                    Some(Box::new(Lent { build, copy, host }) as Box<dyn OrbitInsert>)
                 }
-                state.taken.retain(|_, cell| cell.place() != Place::Home);
-                state.taken.insert(build, copy.hold());
-                let host = Arc::downgrade(&self.shared);
-                let copy = Some(copy);
-                Some(Box::new(Lent { build, copy, host }) as Box<dyn OrbitInsert>)
+                Some(other) => {
+                    state.builds.insert(build, other);
+                    None
+                }
+                None => None,
             }
-            Some(other) => {
-                state.builds.insert(build, other);
-                None
-            }
-            None => None,
         };
         // The build is marked and its job joins the line under one lock,
         // so a caller that waits behind this build finds the job there.
@@ -2149,7 +2403,10 @@ impl Host {
                 }
                 return take(&mut state);
             }
-            let claimed = Self::claim(&mut state, build)?;
+            let claimed = Self::claim(&mut state, build, wait)?;
+            if wait {
+                state.rendering.insert(build);
+            }
             let host = self.clone();
             self.enqueue(move || host.finish(build, claimed))
         };
@@ -2191,11 +2448,13 @@ impl Host {
     /// for a caller that holds its play at the rate `sample_rate` until they
     /// are back: see [`Host::keep`]. Such a copy comes home from an engine,
     /// takes a new rate now, or waits for its slot at another rate with no
-    /// build at `sample_rate`. It counts when a copy of its slot in the last
-    /// call of [`Host::keep`] of `caller` asks for its key. The call starts
-    /// the retune of each such copy that waits at another rate, so the count
-    /// is of the work it waits for. The build of a new copy does not count.
-    /// The call makes no plugin call, starts no load and reads no folder.
+    /// build at `sample_rate`. It counts when a live copy of its slot in the
+    /// last call of [`Host::keep`] of `caller` asks for its key. A copy the
+    /// caller keeps at rest does not count, and keeps its rate until its
+    /// score plays again. The call starts the retune of each counted copy
+    /// that waits at another rate, so the count is of the work it waits
+    /// for. The build of a new copy does not count. The call makes no plugin
+    /// call, starts no load and reads no folder.
     pub fn returning(&self, caller: u64, sample_rate: u32) -> usize {
         let mut state = self.state();
         let wanted = |state: &State, (key, _, slot): &(InsertKey, u32, InsertSlot)| {
@@ -2220,7 +2479,7 @@ impl Host {
             // itself too. The build is marked and its job joins the line
             // under one lock, as in `Host::insert`.
             let build = (key, sample_rate, slot);
-            if let Some(claimed) = Self::claim(&mut state, build) {
+            if let Some(claimed) = Self::claim(&mut state, build, false) {
                 let host = self.clone();
                 self.enqueue(move || host.finish(build, claimed));
                 count += 1;
@@ -2288,7 +2547,7 @@ impl Host {
         // The build is marked and its job joins the line under one lock,
         // as in `Host::insert`.
         let mut state = self.state();
-        if let Some(claimed) = Self::claim(&mut state, build) {
+        if let Some(claimed) = Self::claim(&mut state, build, false) {
             let host = self.clone();
             self.enqueue(move || host.finish(build, claimed));
         }
@@ -2315,7 +2574,7 @@ impl Host {
                 return;
             };
             let build = (key, request.sample_rate, request.slot);
-            let claimed = Self::claim(&mut host.state(), build);
+            let claimed = Self::claim(&mut host.state(), build, false);
             if let Some(claimed) = claimed {
                 host.finish(build, claimed);
             }
@@ -2323,17 +2582,20 @@ impl Host {
     }
 
     /// Marks a build as started and gives what the build needs. `None`
-    /// means the build exists already, the chain of its slot ended, no live
+    /// means the build exists already, the chain of its slot ended, no
     /// chain wants the key for the slot, the host has no such plugin, or
     /// the parked copies leave no room. `None` also while an engine holds a
     /// copy of the key for the slot or gives one back, at any rate: that
     /// copy comes home, so a second copy would stay parked. A copy of the
     /// key that waits for the slot at another rate goes to the build, which
     /// sets it up at its rate. Such a build makes no copy, so the bound does
-    /// not count it.
+    /// not count it. A `render` build ends no copy at rest to make room,
+    /// and builds past the bound when no other build ends: see
+    /// [`MAX_PARKED`].
     fn claim(
         state: &mut State,
         build: (InsertKey, u32, InsertSlot),
+        render: bool,
     ) -> Option<(Arc<Plugin>, Option<PathBuf>)> {
         let (key, _, slot) = build;
         if state.builds.contains_key(&build)
@@ -2363,34 +2625,22 @@ impl Host {
             return Some((plugin, preset));
         }
         // A plugin prepared for a score that no longer asks for it stays
-        // parked. Bound copies, failures and queued builds together. Old
-        // failures go first, then the oldest copy of a chain no caller
-        // names. A copy of a named chain stays: with no other, the build
-        // does not start, with one line.
-        while state.builds.len() >= MAX_PARKED {
-            let oldest = state
-                .builds
-                .iter()
-                .filter_map(|(build, built)| match built {
-                    Build::Failed(order, _) => Some((*build, (0, *order))),
-                    Build::Ready(copy) if !state.named(build.2.chain) => {
-                        Some((*build, (1, copy.order())))
-                    }
-                    Build::Ready(_) | Build::Running => None,
-                })
-                .min_by_key(|(_, order)| *order)
-                .map(|(build, _)| build);
-            let Some(oldest) = oldest else {
-                let (call, name) = (plugin.call(), plugin.name());
-                let line = format!(
-                    "{call} skipped: {name} did not start: the host keeps {MAX_PARKED} copies ready at most"
-                );
-                if !state.errors.contains(&line) {
-                    state.errors.push(line);
-                }
-                return None;
-            };
-            state.builds.remove(&oldest);
+        // parked. Bound copies, failures and queued builds together: the
+        // build of the lowest rank ends first. A render ends only a failure
+        // or a copy of a chain no caller names, the ranks under each copy
+        // at rest. With neither, it builds past the bound: it takes its copy
+        // at once. A live build with no build to end does not start, and
+        // gives one line.
+        let below = render.then_some(Rank::Rest(0, 0));
+        if !state.make_room(below) && !render {
+            let (call, name) = (plugin.call(), plugin.name());
+            let line = format!(
+                "{call} skipped: {name} did not start: the host keeps {MAX_PARKED} copies ready at most"
+            );
+            if !state.errors.contains(&line) {
+                state.errors.push(line);
+            }
+            return None;
         }
         state.builds.insert(build, Build::Running);
         Some((plugin, preset))
@@ -2398,9 +2648,9 @@ impl Host {
 
     /// Builds the plugin of a claimed build. Runs on the plugin thread. A
     /// build with no entry makes no copy: the chain of its slot ended, or no
-    /// live chain wants the key for the slot, and [`Host::keep`] took the
-    /// entry. A build no live chain wants now leaves the list here. When
-    /// this happens during the build, the copy ends here.
+    /// chain wants the key for the slot, and [`Host::keep`] took the entry.
+    /// A build no chain wants now leaves the list here. When this happens
+    /// during the build, the copy ends here.
     ///
     /// The build of a copy that waited for its slot at another rate sets the
     /// copy up at the rate of the build: see [`Instance::retune`]. A rate
@@ -2508,24 +2758,22 @@ impl Host {
     /// and with the preset mark: see [`CopyState::preset_changed`]. Each
     /// other copy plays out its tail with no lock ([`Instance::flush_tail`]),
     /// and waits for its slot again at the rate of its build, after the
-    /// same checks. The bound of the parked copies acts at the next claim.
+    /// same checks, when the bound of the parked copies has room for it:
+    /// see [`State::park`]. A quiet copy parks at its drop and takes no such
+    /// job: see [`Lent`].
     fn park(&self, build: (InsertKey, u32, InsertSlot), mut copy: Box<Instance>) {
-        let ends = |state: &State, copy: &Instance| {
-            self.shared.closed.load(Ordering::Relaxed)
-                || state.chain_ended(&build)
-                || state.unwanted(&build)
-                || copy.cell().preset_changed.load(Ordering::Relaxed)
-        };
+        let closed = || self.shared.closed.load(Ordering::Relaxed);
         let mut state = self.state();
-        if !ends(&state, &copy) {
+        if !closed() && !state.ends_at_park(&build, &copy) {
             drop(state);
             let flushed = copy.flush_tail(&self.shared.closed);
             state = self.state();
-            if flushed.is_ok() && !ends(&state, &copy) {
-                copy.cell().set_place(Place::Home);
-                state.taken.remove(&build);
-                state.latencies.insert((build.0, build.1), copy.latency());
-                state.builds.insert(build, Build::Ready(copy));
+            if flushed.is_ok() && !closed() {
+                let ended = state.park(build, copy);
+                drop(state);
+                if let Some(copy) = ended {
+                    copy.end_here();
+                }
                 return;
             }
         }
@@ -2555,8 +2803,11 @@ impl Host {
 }
 
 /// A plugin copy an engine took for live play: see [`Host::insert`]. Each
-/// call of the engine goes to the copy. The copy goes home at the drop: the
-/// plugin thread plays out its tail and keeps it for its slot.
+/// call of the engine goes to the copy. The copy goes home at the drop. A
+/// quiet copy parks there, on the thread of the drop: a copy with no tail
+/// to play out ([`Instance::skips_flush`]), no restart its plugin asked
+/// for, and no preset mark. The plugin thread plays out the tail of each
+/// other copy and keeps it for its slot: see [`Host::park`].
 struct Lent {
     /// The key, the rate and the slot the copy was built for.
     build: (InsertKey, u32, InsertSlot),
@@ -2673,7 +2924,7 @@ impl OrbitInsert for Lent {
 
 impl Drop for Lent {
     fn drop(&mut self) {
-        let Some(copy) = self.copy.take() else {
+        let Some(mut copy) = self.copy.take() else {
             return;
         };
         // With no host, the copy ends here as any copy does.
@@ -2681,8 +2932,26 @@ impl Drop for Lent {
             return;
         };
         let host = Host { shared };
+        let build = self.build;
+        // A quiet copy parks here with one lock and no plugin call, so the
+        // next take of its slot finds it at once, and not behind the builds
+        // in the line of the plugin thread. A copy this park refuses ends in
+        // a job of that thread.
+        copy.reset();
+        let cell = copy.cell();
+        let quiet = copy.skips_flush()
+            && !cell.latency_changed.load(Ordering::Acquire)
+            && !cell.preset_changed.load(Ordering::Relaxed);
+        if quiet && !host.shared.closed.load(Ordering::Relaxed) {
+            copy.rebase();
+            let ended = host.state().park(build, copy);
+            if let Some(copy) = ended {
+                host.enqueue(move || copy.end_here());
+            }
+            return;
+        }
         copy.cell().set_place(Place::Returning);
-        let (build, home) = (self.build, host.clone());
+        let home = host.clone();
         // After a shutdown the line takes no job, and the copy ends with
         // the job here.
         host.enqueue(move || home.park(build, copy));
@@ -2819,8 +3088,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("plugin folder");
         rustel_vst3_fixture::install(&root);
-        // SAFETY: no other test of this binary loads the fixture, and the
-        // host threads start after the variable.
+        // SAFETY: the tests of this binary run one at a time, and the host
+        // threads start after the variable.
         unsafe { std::env::set_var(rustel_vst3_fixture::BROKEN_TONE_ENV, "1") };
         let host = Host::new();
         host.scan(std::slice::from_ref(&root));
@@ -2862,5 +3131,78 @@ mod tests {
         assert_eq!(parked(), Prepared::Unbuilt(key));
         drop(host);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A quiet copy whose plugin asked for a restart for a new latency does
+    /// not park at its drop. It goes home in a job of the plugin thread,
+    /// which turns the plugin off and on before the copy waits for its slot
+    /// again.
+    #[test]
+    fn a_quiet_copy_with_a_new_latency_restarts_on_its_way_home() {
+        let root = std::env::temp_dir().join(format!("rustel-vst3-latency-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("plugin folder");
+        rustel_vst3_fixture::install(&root);
+        let host = Host::new();
+        host.scan(std::slice::from_ref(&root));
+        host.wait_idle();
+        let Resolved::Ready(plugin, _) = host.resolve(rustel_vst3_fixture::NAME, true) else {
+            panic!("the fixture plugin did not load");
+        };
+        let slot = InsertSlot::effect(1, 0);
+        let key = InsertKey { plugin, preset: 0 };
+        let build = (key, 48_000, slot);
+        let take = || host.insert(key, 48_000, slot, false);
+        assert!(take().is_none(), "the build starts");
+        host.wait_idle();
+        let held = take().expect("the built copy");
+        // The copy ran no block, so it is quiet. Its plugin asks for a
+        // restart, as the handler of the copy marks the cell.
+        let cell = Arc::clone(host.state().taken.get(&build).expect("the held copy"));
+        cell.latency_changed.store(true, Ordering::Release);
+        // A job holds the plugin thread, so the look reads the copy on its
+        // way home.
+        let (release, line) = mpsc::channel::<()>();
+        host.enqueue(move || {
+            let _ = line.recv();
+        });
+        drop(held);
+        assert_eq!(cell.place(), Place::Returning, "no park at the drop");
+        drop(release);
+        host.wait_idle();
+        assert!(!cell.latency_changed.load(Ordering::Acquire), "the restart");
+        assert!(matches!(
+            host.state().builds.get(&build),
+            Some(Build::Ready(_))
+        ));
+        drop(host);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A build a render did not take yet keeps its place at the bound of
+    /// the parked copies. A build for another slot ends one other build
+    /// only.
+    #[test]
+    fn the_bound_ends_no_build_a_render_did_not_take_yet() {
+        let build = |chain| {
+            let key = InsertKey {
+                plugin: 1,
+                preset: 0,
+            };
+            (key, 48_000, InsertSlot::effect(chain, 0))
+        };
+        let mut state = State::default();
+        for chain in 0..=MAX_PARKED as u64 {
+            state
+                .builds
+                .insert(build(chain), Build::Failed(chain, String::new()));
+        }
+        state.rendering.insert(build(0));
+        assert!(state.make_room(None));
+        assert!(
+            state.builds.contains_key(&build(0)),
+            "the build of the render"
+        );
+        assert_eq!(state.builds.len(), MAX_PARKED);
     }
 }

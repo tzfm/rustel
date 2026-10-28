@@ -11,7 +11,7 @@ use rustel_audio::{
 use rustel_vst3::{FoundPreset, Host, Prepared, Resolved, Status, WantedCopy, WorkerProgram};
 use rustel_vst3_fixture::{
     COST_ENV, ECHO_ENV, NAME, PARAM_BYPASS, PARAM_GAIN, PARAM_GATE, PROCESS_MARK_ENV,
-    SLOW_ACTIVATE_ENV, TONE_LEVEL, TONE_NAME,
+    SLOW_ACTIVATE_ENV, THREAD_MARK_ENV, TONE_LEVEL, TONE_NAME,
 };
 
 #[global_allocator]
@@ -80,6 +80,14 @@ fn block(insert: &mut dyn OrbitInsert, level: f32, frames: usize) -> Vec<f32> {
     insert.process(&mut left, &mut right);
     assert_eq!(left, right);
     left
+}
+
+/// 0.3 s of silence through the insert: past the quiet time of a plugin
+/// with no tail, 0.25 s.
+fn silence(insert: &mut dyn OrbitInsert) {
+    for _ in 0..SAMPLE_RATE / 10 * 3 / 128 + 1 {
+        block(insert, 0.0, 128);
+    }
 }
 
 fn until<T>(mut ready: impl FnMut() -> Option<T>) -> T {
@@ -379,7 +387,8 @@ fn a_plugin_runs_with_the_values_a_score_names() {
 
 /// The watch of the preset folders reads the disk again when a file comes
 /// in or goes out: a preset the player saves while the studio runs counts
-/// with no rescan and no ask. Each read takes the next number.
+/// with no rescan and no ask. Each read takes the next number. A file saved
+/// again ends the copies of its old state that wait for their slot.
 #[test]
 fn the_watch_of_the_preset_folders_reads_the_disk_again() {
     let rig = Rig::new("watch");
@@ -412,6 +421,54 @@ fn the_watch_of_the_preset_folders_reads_the_disk_again() {
         &rustel_vst3_fixture::preset(0.5, 0.0),
     );
     wait(&["Late Save"]);
+    // The read of the watch ends the copy that waits for its slot when the
+    // player saves the file again. The next take builds a copy of the saved
+    // file.
+    let slot = InsertSlot::effect(1, 0);
+    let late = Some("Late Save");
+    let prepared = || rig.host.prepared(NAME, late, false, SAMPLE_RATE, slot);
+    rig.host.prepare(NAME, late, false, SAMPLE_RATE, slot);
+    rig.host.wait_idle();
+    let Prepared::Ready(key) = prepared() else {
+        panic!("no copy waits for its slot");
+    };
+    // Each save gives the file a new length, so 2 saves in one tick of the
+    // file clock (1 s on HFS+, 2 s on FAT) still change the stamp. With a
+    // delay of 0, the state of 24 bytes plays as the state of 16 bytes.
+    let save = |bytes: &[u8]| rig.write_preset("Late Save.vstpreset", bytes);
+    save(&rustel_vst3_fixture::preset_with_delay(1.0, 0.0, 0.0));
+    until(|| (prepared() == Prepared::Unbuilt(key)).then_some(()));
+    let provider = rig.host.provider(false);
+    let mut held = until(|| provider(key, SAMPLE_RATE, slot));
+    assert_eq!(block(held.as_mut(), 1.0, 16), vec![1.0; 16]);
+    silence(held.as_mut());
+    // A copy that plays keeps the state of its file, and a read of the
+    // folders marks it. The mark takes the park at the drop away, also from
+    // a quiet copy: the copy goes home in a job of the plugin thread, and
+    // the park there ends it. A slow build for another slot holds that
+    // thread, so the job still waits at the look.
+    save(&rustel_vst3_fixture::preset(0.5, 0.0));
+    rig.host.set_preset_folders(Vec::new());
+    let running = || {
+        rig.host.wait_idle();
+        rig.host.plugins()[0].running
+    };
+    let copies = running();
+    // SAFETY: the tests of this binary run one at a time, and the plugin
+    // thread reads the variable in the build below. No other thread reads a
+    // variable now.
+    unsafe { std::env::set_var(SLOW_ACTIVATE_ENV, "200") };
+    rig.host
+        .prepare(NAME, late, false, SAMPLE_RATE, InsertSlot::effect(2, 0));
+    drop(held);
+    let home = prepared();
+    let after = running();
+    // SAFETY: as above. The copy read the variable at its build.
+    unsafe { std::env::remove_var(SLOW_ACTIVATE_ENV) };
+    assert_eq!(home, Prepared::Returning);
+    // The build adds one copy, and the park ends the marked copy.
+    assert_eq!(after, copies);
+    assert_eq!(prepared(), Prepared::Unbuilt(key));
     // A file that goes out leaves the list the same way.
     std::fs::remove_file(
         rig.root
@@ -608,14 +665,16 @@ fn a_preset_file_sets_the_state_of_the_plugin() {
         name: "fixture".into(),
         preset: None,
     };
-    rig.host.keep(1, vec![wanted.clone()], vec![0], Vec::new());
+    rig.host
+        .keep(1, vec![wanted.clone()], vec![0], Vec::new(), Vec::new());
     let bare = InsertKey { plugin, preset: 0 };
     assert!(
         provider(bare, SAMPLE_RATE, parked).is_none(),
         "the start state"
     );
     let first = capacity + 1;
-    rig.host.keep(2, Vec::new(), vec![first], Vec::new());
+    rig.host
+        .keep(2, Vec::new(), vec![first], Vec::new(), Vec::new());
     let ready = |chain| {
         rig.host
             .prepared(NAME, None, false, SAMPLE_RATE, InsertSlot::effect(chain, 0))
@@ -639,16 +698,142 @@ fn a_preset_file_sets_the_state_of_the_plugin() {
         };
         assert_eq!(ready(chain), answer, "chain {chain}");
     }
-    // With each chain named, a new build does not start. Two such builds
-    // give one line.
+    // The bound ends a copy a caller keeps at rest after each copy of a
+    // chain no caller names: the lowest rest order first, then the oldest
+    // copy. Caller 2 keeps 20 parked copies at rest, the older 10 with
+    // order 2 and the newer 10 with order 1, and the oldest of order 2 with
+    // order 1 too: the higher order counts. It keeps the copy caller 1
+    // wants too, and that copy stays. Caller 1 names the chains of order 1
+    // and each newer parked chain, and the new chains before their builds: a
+    // named copy that only a copy at rest asks for ends too.
+    let copy = |chain| WantedCopy {
+        slot: InsertSlot::effect(chain, 0),
+        ..wanted.clone()
+    };
+    let mut rest = vec![(wanted.clone(), 1)];
+    rest.extend((first + 2..first + 12).map(|chain| (copy(chain), 2)));
+    rest.extend((first + 12..first + 22).map(|chain| (copy(chain), 1)));
+    let whole = WantedCopy {
+        name: NAME.to_owned(),
+        ..copy(first + 2)
+    };
+    rest.push((whole, 1));
+    rig.host
+        .keep(2, Vec::new(), vec![first], rest.clone(), Vec::new());
+    let new = capacity * 2 + 3;
+    let extra = capacity * 3;
     let mut named = vec![0];
-    named.extend(first + 2..=capacity * 2);
-    rig.host.keep(1, vec![wanted], named, Vec::new());
-    let more = capacity * 2 + 1;
-    for chain in [more, more + 1] {
+    named.extend(first + 12..=capacity * 2);
+    named.extend(new..new + 14);
+    named.push(extra);
+    rig.host
+        .keep(1, vec![wanted.clone()], named, Vec::new(), Vec::new());
+    let ending = (first + 12..first + 22).chain([first + 2]);
+    for (chain, ends) in (new..new + 11).zip(ending) {
+        assert_eq!(ready(ends), Prepared::Ready(default), "chain {ends}");
         rig.host
             .prepare(NAME, None, false, SAMPLE_RATE, InsertSlot::effect(chain, 0));
+        rig.host.wait_idle();
+        assert_eq!(ready(chain), Prepared::Ready(default), "chain {chain}");
+        assert_eq!(ready(ends), Prepared::Unbuilt(default), "chain {ends}");
     }
+    // A render ends no copy at rest: with only copies at rest and copies of
+    // named chains parked, it builds past the bound. The bound does not
+    // count the build of the render and does not end it before the render
+    // takes its copy, so a live build in that time ends one copy at rest.
+    // SAFETY: the tests of this binary run one at a time, and the plugin
+    // thread reads the variable in the builds below. No other thread reads a
+    // variable now.
+    unsafe { std::env::set_var(SLOW_ACTIVATE_ENV, "300") };
+    let render = std::thread::scope(|scope| {
+        let render =
+            scope.spawn(|| provider(default, SAMPLE_RATE, InsertSlot::effect(new + 11, 0)));
+        // A slow test thread finds the render done, and the live build
+        // comes after the take.
+        until(|| (ready(new + 11) == Prepared::Pending || render.is_finished()).then_some(()));
+        rig.host
+            .prepare(NAME, None, false, SAMPLE_RATE, InsertSlot::effect(extra, 0));
+        render.join().expect("the render")
+    });
+    rig.host.wait_idle();
+    // SAFETY: as above. The copies read the variable at their builds.
+    unsafe { std::env::remove_var(SLOW_ACTIVATE_ENV) };
+    assert!(render.is_some(), "a render past the bound");
+    assert_eq!(ready(extra), Prepared::Ready(default));
+    assert_eq!(
+        ready(first + 3),
+        Prepared::Unbuilt(default),
+        "the live build"
+    );
+    for chain in first + 4..first + 12 {
+        assert_eq!(ready(chain), Prepared::Ready(default), "chain {chain}");
+    }
+    drop(render);
+    // A copy that comes home ends a build of a lower rank only, and the
+    // order of the copies does not count. An engine takes the copy of the
+    // newest chain at rest with order 2, and a build for a new named chain
+    // fills the bound again. No copy at rest has a lower order, so the copy
+    // ends when it comes home. It played a block, so it goes home in a job
+    // of the plugin thread.
+    let live = rig.host.provider(false);
+    let running = || {
+        rig.host.wait_idle();
+        rig.host.plugins()[0].running
+    };
+    let take = |chain| live(default, SAMPLE_RATE, InsertSlot::effect(chain, 0));
+    let build = |chain| {
+        rig.host
+            .prepare(NAME, None, false, SAMPLE_RATE, InsertSlot::effect(chain, 0));
+    };
+    let mut held = take(first + 11).expect("a copy at rest");
+    build(new + 12);
+    let copies = running();
+    assert_eq!(ready(new + 12), Prepared::Ready(default));
+    block(held.as_mut(), 1.0, 128);
+    drop(held);
+    assert_eq!(running(), copies - 1);
+    assert_eq!(ready(first + 11), Prepared::Unbuilt(default));
+    // Caller 2 gives one other chain at rest the order 1. A quiet copy of a
+    // chain at rest with order 2 then parks at its drop in place of the copy
+    // of order 1, which ends.
+    for (kept, order) in &mut rest {
+        if kept.slot.chain == first + 10 {
+            *order = 1;
+        }
+    }
+    rig.host.keep(2, Vec::new(), vec![first], rest, Vec::new());
+    let held = take(first + 9).expect("a copy at rest");
+    build(new + 13);
+    let copies = running();
+    drop(held);
+    assert_eq!(running(), copies - 1);
+    assert_eq!(ready(first + 9), Prepared::Ready(default));
+    assert_eq!(ready(first + 10), Prepared::Unbuilt(default));
+    // Caller 2 keeps no copy at rest now: a named copy that only a copy at
+    // rest asks for has a rank. No caller names the chains it kept at rest
+    // yet. A copy of a chain no caller names ends a failed build only: with
+    // none, the copy of the newest such chain ends when it comes home, and
+    // the oldest stays.
+    rig.host
+        .keep(2, Vec::new(), vec![first], Vec::new(), Vec::new());
+    let held = take(first + 9).expect("a copy of no named chain");
+    build(new + 14);
+    let copies = running();
+    drop(held);
+    assert_eq!(running(), copies - 1);
+    assert_eq!(ready(first + 9), Prepared::Unbuilt(default));
+    assert_eq!(ready(first + 4), Prepared::Ready(default));
+    // With each chain named, a new build does not start. Two such builds
+    // give one line.
+    let more = capacity * 2 + 1;
+    let mut named = vec![0];
+    named.extend(first + 2..=more);
+    named.extend(new..new + 15);
+    named.push(extra);
+    rig.host
+        .keep(1, vec![wanted], named, Vec::new(), Vec::new());
+    build(more);
+    build(more + 1);
     rig.host.wait_idle();
     assert_eq!(ready(more), Prepared::Unbuilt(default));
     assert_eq!(
@@ -657,11 +842,14 @@ fn a_preset_file_sets_the_state_of_the_plugin() {
             "vst skipped: {NAME} did not start: the host keeps {capacity} copies ready at most"
         )]
     );
-    // A note takes the parked copy with no second build. The slot gives the
+    // A note takes the parked copy with no second build, and a build of the
+    // named chain `more` takes the place the take freed. The slot gives the
     // latency of the copy while the engine holds it, and after. Through the
     // copy, the input comes out 1024 frames late.
-    let mut held =
-        (rig.host.provider(false))(default, SAMPLE_RATE, parked).expect("the parked copy");
+    let mut held = live(default, SAMPLE_RATE, parked).expect("the parked copy");
+    build(more);
+    rig.host.wait_idle();
+    assert_eq!(ready(more), Prepared::Ready(default));
     assert_eq!(rig.host.latency(default, SAMPLE_RATE, parked), Some(1024));
     let mut output = Vec::new();
     for _ in 0..16 {
@@ -671,8 +859,9 @@ fn a_preset_file_sets_the_state_of_the_plugin() {
     assert_eq!(output[1024..], [0.5; 1024]);
     drop(held);
     assert_eq!(rig.host.latency(default, SAMPLE_RATE, parked), Some(1024));
-    // The copy goes home at its drop. It takes the place the take freed,
-    // and waits for its slot again with the latency of its build.
+    // The copy goes home at its drop. Each parked copy is a copy of a named
+    // chain, so no build ranks: the copy of a named chain parks past the
+    // bound. It waits for its slot again with the latency of its build.
     until(|| (ready(0) == Prepared::Ready(default)).then_some(()));
     assert_eq!(rig.host.latency(default, SAMPLE_RATE, parked), Some(1024));
     // A new file `default` gives the next copy of the key a delay of 2048
@@ -702,15 +891,11 @@ fn a_preset_file_sets_the_state_of_the_plugin() {
     // file: a file saved again changes nothing while the engine holds the
     // copy, and the copy ends at its drop. After the drop, the slot gives
     // the latency of the last copy.
-    let held = (rig.host.provider(false))(default, SAMPLE_RATE, waiting).expect("the waiting copy");
+    let held = live(default, SAMPLE_RATE, waiting).expect("the waiting copy");
     assert_eq!(rig.host.latency(default, SAMPLE_RATE, waiting), Some(2048));
     rig.write_preset("default.vstpreset", &rustel_vst3_fixture::preset(0.5, 0.0));
     read();
     assert_eq!(rig.host.latency(default, SAMPLE_RATE, waiting), Some(2048));
-    let running = || {
-        rig.host.wait_idle();
-        rig.host.plugins()[0].running
-    };
     let copies = running();
     drop(held);
     assert_eq!(running(), copies - 1);
@@ -1722,8 +1907,8 @@ fn an_unused_bundle_unloads_and_keeps_its_plugin_numbers() {
     drop(running);
     assert!(!rig.host.engine_holds_unkept(&[]));
     // The slot keeps the latency of its last copy until the plugin unloads.
-    // The copy goes home before the unload, in the line of the plugin
-    // thread, and the unload ends it.
+    // The copy ran no block, so it parks at its drop, and the unload ends
+    // it.
     assert_eq!(rig.host.latency(key, SAMPLE_RATE, slot), Some(0));
     unload(&[]);
     assert_eq!(loaded(&rig), 0);
@@ -1821,12 +2006,20 @@ fn live_play_does_not_wait_for_a_plugin() {
         slot,
         ..other.clone()
     };
-    let keep = |copy: &WantedCopy| rig.host.keep(1, vec![copy.clone()], vec![5], Vec::new());
+    let keep = |copy: &WantedCopy| {
+        rig.host
+            .keep(1, vec![copy.clone()], vec![5], Vec::new(), Vec::new())
+    };
     assert_eq!(keep(&other), [(slot, key)]);
     assert_eq!(running(), parked - 1);
     assert_eq!(keep(&other), [(slot, key)]);
-    assert!(rig.host.keep(2, Vec::new(), vec![6], Vec::new()).is_empty());
-    rig.host.keep(2, Vec::new(), Vec::new(), Vec::new());
+    assert!(
+        rig.host
+            .keep(2, Vec::new(), vec![6], Vec::new(), Vec::new())
+            .is_empty()
+    );
+    rig.host
+        .keep(2, Vec::new(), Vec::new(), Vec::new(), Vec::new());
     assert!(keep(&wanted).is_empty());
 
     // The copy goes home at its drop and waits for its slot again: the next
@@ -1858,6 +2051,43 @@ fn live_play_does_not_wait_for_a_plugin() {
     // at the rate. The copy of a slot its chain does not want ends.
     assert_eq!(rig.host.latency(key, 44_100, slot), Some(0));
     assert_eq!(rig.host.latency(key, 22_050, slot), None);
+    // A quiet copy parks at its drop, on the thread of the drop: its slot is
+    // ready at once, also while the plugin thread builds. A value that waits
+    // for a later frame goes at the drop. A copy that sounds at its drop
+    // goes home in a job of the plugin thread, which plays out its tail.
+    // That copy turns its plugin off and on slowly, so its job still runs at
+    // the look.
+    let mut held = provider(key, SAMPLE_RATE, slot).expect("the parked copy");
+    silence(held.as_mut());
+    let later = InsertParam {
+        id: PARAM_GAIN,
+        value: 0.25,
+    };
+    held.set_param(later, 1_000);
+    let loud = InsertSlot::effect(7, 0);
+    // SAFETY: the tests of this binary run one at a time, and the plugin
+    // thread reads the variable in the build below. No other thread reads a
+    // variable now.
+    unsafe { std::env::set_var(SLOW_ACTIVATE_ENV, "200") };
+    assert!(provider(key, SAMPLE_RATE, loud).is_none());
+    drop(held);
+    assert_eq!(ready(SAMPLE_RATE), Prepared::Ready(key));
+    let held = provider(key, SAMPLE_RATE, slot).expect("the copy that parked at its drop");
+    drop(held);
+    let mut held = until(|| provider(key, SAMPLE_RATE, loud));
+    // SAFETY: as above. The copy read the variable at its build.
+    unsafe { std::env::remove_var(SLOW_ACTIVATE_ENV) };
+    assert_eq!(running(), 5);
+    assert_eq!(block(held.as_mut(), 0.5, 16), vec![0.5; 16]);
+    drop(held);
+    let home = || rig.host.prepared(NAME, None, false, SAMPLE_RATE, loud);
+    assert_eq!(home(), Prepared::Returning);
+    rig.host.wait_idle();
+    assert_eq!(home(), Prepared::Ready(key));
+    // The copy of the other slot ends with its chain.
+    rig.host
+        .keep(3, Vec::new(), Vec::new(), Vec::new(), vec![7]);
+    assert_eq!(running(), 4);
     // The door of the copies on their way home counts the copy caller 1
     // wants at another rate, and starts its retune. A copy ready at the
     // rate does not count, and nor does the build of a new copy. That build
@@ -1865,12 +2095,24 @@ fn live_play_does_not_wait_for_a_plugin() {
     assert_eq!(rig.host.returning(1, 44_100), 1, "the retune");
     until(|| (ready(44_100) == Prepared::Ready(key)).then_some(()));
     assert_eq!(rig.host.returning(1, 44_100), 0, "a copy at the rate");
+    // A copy a caller keeps at rest does not count, and keeps its rate: its
+    // score does not play.
+    let rest = vec![(wanted.clone(), 1)];
+    rig.host.keep(2, Vec::new(), Vec::new(), rest, Vec::new());
+    assert_eq!(rig.host.returning(2, SAMPLE_RATE), 0, "a copy at rest");
+    assert_eq!(ready(44_100), Prepared::Ready(key));
+    rig.host
+        .keep(2, Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let built = WantedCopy {
         slot: InsertSlot::effect(5, 3),
         ..other.clone()
     };
     let both = vec![wanted.clone(), built.clone()];
-    assert!(rig.host.keep(1, both, vec![5], Vec::new()).is_empty());
+    assert!(
+        rig.host
+            .keep(1, both, vec![5], Vec::new(), Vec::new())
+            .is_empty()
+    );
     // SAFETY: the tests of this binary run one at a time, and the plugin
     // thread reads the variable in the build below. No other thread reads a
     // variable now.
@@ -1906,7 +2148,8 @@ fn live_play_does_not_wait_for_a_plugin() {
     until(|| (ready(SAMPLE_RATE) == Prepared::Ready(key)).then_some(()));
     assert!(keep(&other).is_empty());
     rig.host.wait_idle();
-    rig.host.keep(1, Vec::new(), Vec::new(), Vec::new());
+    rig.host
+        .keep(1, Vec::new(), Vec::new(), Vec::new(), Vec::new());
     assert_eq!(prepared(NAME, false), Prepared::Unbuilt(key));
     assert_eq!(running(), 3);
 }
@@ -1924,7 +2167,8 @@ fn different_plugins_prepared_for_one_slot_stay_ready() {
         name: name.to_owned(),
         preset: None,
     });
-    rig.host.keep(1, wanted.to_vec(), vec![1], Vec::new());
+    rig.host
+        .keep(1, wanted.to_vec(), vec![1], Vec::new(), Vec::new());
     for (name, instrument) in requests {
         rig.host.prepare(name, None, instrument, SAMPLE_RATE, slot);
     }
@@ -1972,7 +2216,8 @@ fn different_plugins_prepared_for_one_slot_stay_ready() {
         rig.host.prepare(name, None, instrument, SAMPLE_RATE, slot);
     }
     assert_eq!(running(), 2);
-    rig.host.keep(1, wanted[1..].to_vec(), vec![1], Vec::new());
+    rig.host
+        .keep(1, wanted[1..].to_vec(), vec![1], Vec::new(), Vec::new());
     rig.host.prepare(NAME, None, false, SAMPLE_RATE, slot);
     assert_eq!(running(), 1);
     assert_eq!(prepared(NAME, false), Prepared::Unbuilt(keys[0]));
@@ -2009,7 +2254,8 @@ fn a_bundle_that_does_not_load_gives_the_reason() {
         name: "broken".into(),
         preset: None,
     };
-    rig.host.keep(1, vec![wanted.clone()], vec![1], Vec::new());
+    rig.host
+        .keep(1, vec![wanted.clone()], vec![1], Vec::new(), Vec::new());
     rig.host.prepare(NAME, None, false, SAMPLE_RATE, slot);
     rig.host.wait_idle();
     let copy = || rig.host.prepared(NAME, None, false, SAMPLE_RATE, slot);
@@ -2017,7 +2263,8 @@ fn a_bundle_that_does_not_load_gives_the_reason() {
     let Resolved::Failed(error) = rig.host.resolve("broken", true) else {
         panic!("a text file loaded as a plugin");
     };
-    rig.host.keep(1, vec![wanted], vec![1], Vec::new());
+    rig.host
+        .keep(1, vec![wanted], vec![1], Vec::new(), Vec::new());
     rig.host.wait_idle();
     assert_eq!(copy(), Prepared::Unbuilt(key));
     // The call of a score gives the reason, so the host adds no line.
@@ -2063,7 +2310,9 @@ fn walk(folder: &std::path::Path) -> Vec<PathBuf> {
 /// second caller changes no chain of the first. A copy an engine holds ends
 /// when it comes home, for a chain that ended or a key its chain dropped. A
 /// copy whose chain ends during its park ends at the end of the park. A take
-/// of another slot during a park keeps the copy on its way home.
+/// of another slot during a park keeps the copy on its way home. A chain at
+/// rest keeps its copies as a live chain does. The copies end a few at a
+/// time, so a build does not wait for each end.
 #[test]
 fn a_copy_no_chain_of_the_score_takes_ends() {
     let rig = Rig::new("ended");
@@ -2090,9 +2339,11 @@ fn a_copy_no_chain_of_the_score_takes_ends() {
     rig.host.prepare(NAME, None, false, SAMPLE_RATE, slot);
     until(|| (prepared() == Prepared::Ready(key)).then_some(()));
     assert_eq!(running(), 1);
-    rig.host.keep(1, Vec::new(), Vec::new(), vec![8]);
+    rig.host
+        .keep(1, Vec::new(), Vec::new(), Vec::new(), vec![8]);
     assert_eq!(running(), 1);
-    rig.host.keep(1, Vec::new(), Vec::new(), vec![9]);
+    rig.host
+        .keep(1, Vec::new(), Vec::new(), Vec::new(), vec![9]);
     assert_eq!(running(), 0);
     assert_eq!(prepared(), Prepared::Unbuilt(key));
 
@@ -2103,7 +2354,8 @@ fn a_copy_no_chain_of_the_score_takes_ends() {
     let (stays, ends) = (InsertSlot::effect(10, 0), InsertSlot::effect(11, 0));
     rig.host.prepare(NAME, None, false, SAMPLE_RATE, stays);
     rig.host.prepare(NAME, None, false, SAMPLE_RATE, ends);
-    rig.host.keep(1, Vec::new(), Vec::new(), vec![11]);
+    rig.host
+        .keep(1, Vec::new(), Vec::new(), Vec::new(), vec![11]);
     rig.host.prepare(NAME, fails, false, SAMPLE_RATE, ends);
     rig.host.prepare(NAME, None, false, SAMPLE_RATE, ends);
     assert_eq!(running(), 1);
@@ -2118,8 +2370,13 @@ fn a_copy_no_chain_of_the_score_takes_ends() {
         name: "fixture".into(),
         preset: preset.map(str::to_owned),
     };
-    rig.host
-        .keep(1, vec![wanted(live, Some("Half"))], vec![12], Vec::new());
+    rig.host.keep(
+        1,
+        vec![wanted(live, Some("Half"))],
+        vec![12],
+        Vec::new(),
+        Vec::new(),
+    );
     rig.host.prepare(NAME, None, false, SAMPLE_RATE, live);
     assert_eq!(running(), 2);
     rig.host
@@ -2141,7 +2398,7 @@ fn a_copy_no_chain_of_the_score_takes_ends() {
         wanted(live, Some("Half")),
         wanted(failing, fails),
     ];
-    rig.host.keep(1, both, vec![12], Vec::new());
+    rig.host.keep(1, both, vec![12], Vec::new(), Vec::new());
     rig.host.prepare(NAME, fails, false, SAMPLE_RATE, failing);
     rig.host.prepare(NAME, None, false, SAMPLE_RATE, empty);
     assert_eq!(running(), 3);
@@ -2153,7 +2410,7 @@ fn a_copy_no_chain_of_the_score_takes_ends() {
     assert!(matches!(failed(), Prepared::Unavailable(_)));
     assert!(rig.host.key(NAME, Some("Gone"), false).is_err());
     let one = vec![wanted(live, Some("Half")), wanted(missing, Some("Gone"))];
-    rig.host.keep(1, one, vec![12], Vec::new());
+    rig.host.keep(1, one, vec![12], Vec::new(), Vec::new());
     assert_eq!(running(), 2);
     assert_eq!(failed(), Prepared::Unbuilt(wrong));
     rig.host.prepare(NAME, fails, false, SAMPLE_RATE, failing);
@@ -2172,8 +2429,13 @@ fn a_copy_no_chain_of_the_score_takes_ends() {
 
     // A second caller changes no chain of the first.
     let other = InsertSlot::effect(13, 0);
-    rig.host
-        .keep(2, vec![wanted(other, None)], vec![13], Vec::new());
+    rig.host.keep(
+        2,
+        vec![wanted(other, None)],
+        vec![13],
+        Vec::new(),
+        Vec::new(),
+    );
     rig.host.prepare(NAME, None, false, SAMPLE_RATE, live);
     rig.host.prepare(NAME, None, false, SAMPLE_RATE, other);
     assert_eq!(running(), 3);
@@ -2195,14 +2457,25 @@ fn a_copy_no_chain_of_the_score_takes_ends() {
         name: "no such plugin".into(),
         ..wanted(unknown, None)
     });
-    rig.host.keep(1, copies, vec![12, 15, 16], Vec::new());
+    rig.host
+        .keep(1, copies, vec![12, 15, 16], Vec::new(), Vec::new());
     rig.host.prepare(NAME, None, false, SAMPLE_RATE, slow);
     // The end of a key the chain drops waits behind the slow build. A key
     // the chain wants again before that end keeps its copy.
-    rig.host
-        .keep(2, vec![wanted(other, Some("Half"))], vec![13], Vec::new());
-    rig.host
-        .keep(2, vec![wanted(other, None)], vec![13], Vec::new());
+    rig.host.keep(
+        2,
+        vec![wanted(other, Some("Half"))],
+        vec![13],
+        Vec::new(),
+        Vec::new(),
+    );
+    rig.host.keep(
+        2,
+        vec![wanted(other, None)],
+        vec![13],
+        Vec::new(),
+        Vec::new(),
+    );
     rig.host.prepare(NAME, None, false, SAMPLE_RATE, empty);
     assert_eq!(ready(empty), Prepared::Unbuilt(key));
     rig.host.prepare(NAME, None, false, SAMPLE_RATE, late);
@@ -2220,7 +2493,8 @@ fn a_copy_no_chain_of_the_score_takes_ends() {
 
     // A caller with no copy and no chain lists no chain: the slots of its
     // chains take each key again.
-    rig.host.keep(1, Vec::new(), Vec::new(), Vec::new());
+    rig.host
+        .keep(1, Vec::new(), Vec::new(), Vec::new(), Vec::new());
     rig.host.prepare(NAME, None, false, SAMPLE_RATE, live);
     assert_eq!(running(), 5);
 
@@ -2230,15 +2504,27 @@ fn a_copy_no_chain_of_the_score_takes_ends() {
     let ending = InsertSlot::effect(17, 0);
     let mut held = until(|| provider(key, SAMPLE_RATE, ending));
     let copies = running();
-    rig.host.keep(1, Vec::new(), Vec::new(), vec![17]);
+    rig.host
+        .keep(1, Vec::new(), Vec::new(), Vec::new(), vec![17]);
+    // The engine holds a copy of the chain that ended, and a name of its
+    // plugin keeps the plugin.
+    assert!(rig.host.engine_holds_chains(&[17]));
+    assert!(!rig.host.engine_holds_chains(&[16, 18]));
+    assert!(!rig.host.engine_holds_unkept(&["fixture".to_owned()]));
     assert_eq!(block(held.as_mut(), 1.0, 128), vec![1.0; 128]);
     drop(held);
+    assert!(!rig.host.engine_holds_chains(&[17]));
     assert_eq!(running(), copies - 1);
     let dropped = InsertSlot::effect(18, 0);
     let held = until(|| provider(key, SAMPLE_RATE, dropped));
     let copies = running();
-    rig.host
-        .keep(1, vec![wanted(dropped, Some("Half"))], vec![18], Vec::new());
+    rig.host.keep(
+        1,
+        vec![wanted(dropped, Some("Half"))],
+        vec![18],
+        Vec::new(),
+        Vec::new(),
+    );
     drop(held);
     assert_eq!(running(), copies - 1);
 
@@ -2266,6 +2552,71 @@ fn a_copy_no_chain_of_the_score_takes_ends() {
         "{home:?}"
     );
     std::thread::sleep(Duration::from_millis(100));
-    rig.host.keep(1, Vec::new(), Vec::new(), vec![19]);
+    rig.host
+        .keep(1, Vec::new(), Vec::new(), Vec::new(), vec![19]);
     assert_eq!(running(), copies - 1);
+
+    // A chain at rest keeps its parked copy, and a key it drops ends, as for
+    // a named chain.
+    let resting = InsertSlot::effect(21, 0);
+    rig.host.prepare(NAME, None, false, SAMPLE_RATE, resting);
+    let copies = running();
+    assert_eq!(ready(resting), Prepared::Ready(key));
+    let rest = vec![(wanted(resting, None), 1)];
+    rig.host.keep(1, Vec::new(), Vec::new(), rest, Vec::new());
+    assert_eq!(running(), copies);
+    assert_eq!(ready(resting), Prepared::Ready(key));
+    let rest = vec![(wanted(resting, Some("Half")), 1)];
+    rig.host.keep(1, Vec::new(), Vec::new(), rest, Vec::new());
+    assert_eq!(running(), copies - 1);
+    assert_eq!(ready(resting), Prepared::Unbuilt(key));
+
+    // keep() ends 4 copies in a job and puts the others in a job at the end
+    // of the line, with the copies of the calls that come meanwhile. A set
+    // change ends the copies of each scene it closes in a call of its own,
+    // as the 3 calls here do. So a build sent right after them waits for 4
+    // ends at most. The fixture marks each copy it makes and ends. These
+    // copies turn off in 10 ms each, so most ends come after the send of
+    // the build.
+    // SAFETY: the tests of this binary run one at a time, and the plugin
+    // thread reads the variable in the builds below. No other thread reads
+    // a variable now.
+    unsafe { std::env::set_var(SLOW_ACTIVATE_ENV, "10") };
+    let chains: Vec<u64> = (22..42).collect();
+    for chain in &chains {
+        let slot = InsertSlot::effect(*chain, 0);
+        rig.host.prepare(NAME, None, false, SAMPLE_RATE, slot);
+    }
+    let copies = running();
+    // SAFETY: as above. The copies read the variable at their builds.
+    unsafe { std::env::remove_var(SLOW_ACTIVATE_ENV) };
+    let marks = rig.root.join("marks");
+    // SAFETY: as above. The plugin thread reads the variable at the ends and
+    // at the build below.
+    unsafe { std::env::set_var(THREAD_MARK_ENV, &marks) };
+    for ended in [&chains[..12], &chains[12..16], &chains[16..]] {
+        rig.host
+            .keep(1, Vec::new(), Vec::new(), Vec::new(), ended.to_vec());
+    }
+    rig.host
+        .prepare(NAME, None, false, SAMPLE_RATE, InsertSlot::effect(42, 0));
+    // Each end before the build joined the line is in the file now, and
+    // the file comes with the first end. A slow test thread finds more ends
+    // here. The build waits for 4 more at most.
+    let sent = std::fs::read_to_string(&marks).unwrap_or_default();
+    let sent = sent.lines().filter(|line| line.starts_with("end ")).count();
+    until(|| (running() == copies - 19).then_some(()));
+    // A copy leaves the count as its end starts: the wait sees the last end
+    // through.
+    rig.host.wait_idle();
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(THREAD_MARK_ENV) };
+    let marks = std::fs::read_to_string(marks).expect("the mark file");
+    let lines: Vec<&str> = marks.lines().collect();
+    let ends = lines.iter().filter(|line| line.starts_with("end ")).count();
+    assert_eq!(ends, 20, "{marks}");
+    let made = lines.iter().position(|line| line.starts_with("make "));
+    let made = made.expect("the build");
+    let before = lines[..made].iter().filter(|line| line.starts_with("end "));
+    assert!(before.count() <= sent + 4, "{marks}");
 }

@@ -264,7 +264,7 @@ effect you remove. On a lane with a note in the next 16 cycles but no note in
 5 seconds of play, such a copy ends 5 seconds of play after the edit, once
 the chain is silent. An instrument you remove ends 5 seconds of play after
 the edit on any lane, once it is silent. Time counts only while the score
-plays, so a Stop ends no chain.
+plays, so a Stop ends no chain of an open tab.
 
 A copy that leaves its chain waits in the plugin host until 5 seconds of
 play after the edit, then ends. An undo in that time takes the copy back and
@@ -306,6 +306,7 @@ time keeps the chain. So does a note that still plays the plugin, as with a
 name in a variable. A chain with a plugin the text of its lane does not name
 ends after 10 minutes of play with no note. Such a plugin has its name in a
 variable or a function, or comes with a pattern from a prebake or an import.
+The 10 minutes count the play of the scene of the chain.
 
 ## Load time and memory
 
@@ -378,6 +379,37 @@ are back. If no copy comes back in 20 seconds, the wait ends. In the async
 mode, the score waits 150 ms at most, and a note before its copy is back plays
 with no plugin. `rustel play` opens a new output after its device stops, and
 waits as the wait mode does.
+
+Each open scene keeps the plugin copies of its chains, as an open project of a
+DAW keeps its plugins. A lane of a scene you play for the first time takes the
+copies of a lane of the scene in play by the rules of
+[Plugin copies and edits](#plugin-copies-and-edits). So the 2 scenes share
+them, and a scene change loads no copy that the scene in play has. When
+another scene plays, the copies of the scene you left wait. For 5 seconds of
+play they stay in the output, then they wait in the plugin host. When you play
+that scene again, its notes take these copies, and nothing loads. The chains
+of a scene that waits do not end, also after 10 minutes. An edit of a lane
+that 2 scenes share keeps the copies the other scene needs.
+
+A scene you close gives its copies back at once. When you close the tab of the
+score in play while the set is stopped, its copies end, and the next cleanup
+unloads its plugins. While the set plays, the score of a tab you close plays
+on. Its copies end at the next Stop, or 5 seconds of play after another score
+plays. After a close, the next start opens the output again. A snippet preview
+under a set is a part of its scene. A snippet preview with no set under it
+keeps no copy after it stops.
+
+The plugin host keeps 320 copies ready at most. A new copy for the scene in
+play first ends a copy no scene uses, then the copies of the scene you left
+first. A copy of the scene in play does not end this way, and an export ends
+no copy of a scene that waits. With no copy to end, the new copy does not
+start, and you get one warning, as
+`vsti skipped: Serum 2 did not start: the host keeps 320 copies ready at most`.
+Each open scene keeps its copies, so memory grows with the open scenes. When
+Studio holds more than half of the memory of the machine, the scene that
+waited longest gives its copies back at the next evaluation, with one warning:
+`a scene that waits gave back its plugin copies: the studio holds more than half of the memory`.
+Its next play loads them again.
 
 ## Where the audio runs
 

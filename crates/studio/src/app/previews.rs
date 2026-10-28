@@ -3305,7 +3305,7 @@ mod tests {
 
         /// A preview alone plays the snippet from its beginning. The install
         /// itself carries the from-zero flag, and the flag does not stay set
-        /// for the next evaluation.
+        /// for the next evaluation. It is of no scene.
         #[cfg(feature = "hydra")]
         #[test]
         fn a_preview_alone_begins_at_its_beginning_on_the_install_itself() {
@@ -3325,6 +3325,11 @@ mod tests {
                 sent.rewind,
                 "alone, the snippet installs from its own cycle zero"
             );
+            assert_eq!(
+                app.install_mark(sent),
+                (true, rustel_runtime::PREVIEW_DOCUMENT),
+                "alone, the snippet is of no scene"
+            );
             app.pending_evaluation = None;
             app.inflight.clear();
 
@@ -3334,7 +3339,8 @@ mod tests {
         }
 
         /// Under a playing score, a previewed snippet joins the cycle where it
-        /// stands. The install carries no from-zero flag.
+        /// stands. The install carries no from-zero flag. It is a part of the
+        /// scene of the set.
         #[cfg(feature = "hydra")]
         #[test]
         fn a_preview_under_a_score_keeps_the_set_s_place_in_the_cycle() {
@@ -3356,6 +3362,11 @@ mod tests {
             assert!(
                 !sent.rewind,
                 "under a score, the snippet keeps the set's place in the cycle"
+            );
+            assert_eq!(
+                app.install_mark(sent),
+                (true, scene.0),
+                "under a score, the snippet is a part of its scene"
             );
             assert!(!app.next_rewind, "and no flag lingers after it either");
         }

@@ -9,9 +9,9 @@ mod chains;
 mod lanes;
 
 pub(crate) use chains::{
-    Chains, NoteChain, Want, assign, ensure, forget_lanes_away, link_sliders, load, plugin_names,
-    render_chains, returning, score_changed, slider_links, slider_moved, take_output_lines,
-    take_problems, wants,
+    Chains, NoteChain, Want, assign, end_closed_documents, ensure, forget_document,
+    forget_lanes_away, link_sliders, load, plugin_names, render_chains, returning, score_changed,
+    slider_links, slider_moved, take_output_lines, take_problems, wants,
 };
 #[cfg(feature = "device-audio")]
 pub(crate) use chains::{forget_plan, named_chains, plan, take_slider_values, tick};
@@ -297,6 +297,12 @@ pub fn unload_unused(keep: &[String]) {
 /// [`Host::engine_holds_unkept`]. False before the host starts.
 pub fn engine_holds_unkept(keep: &[String]) -> bool {
     started().is_some_and(|host| host.engine_holds_unkept(keep))
+}
+
+/// True while an engine holds a copy of a chain in `chains`: see
+/// [`Host::engine_holds_chains`]. False before the host starts.
+pub(crate) fn engine_holds_chains(chains: &[u64]) -> bool {
+    started().is_some_and(|host| host.engine_holds_chains(chains))
 }
 
 /// How long the end of the process waits for the plugin thread.

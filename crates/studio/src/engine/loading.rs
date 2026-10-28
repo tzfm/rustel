@@ -20,8 +20,9 @@ use rustel_runtime::{RuntimeError, SAMPLE_LOADING_DIAGNOSTIC};
 
 use super::super::settings::LoadMode;
 use super::{
-    STARTUP_SAMPLE_WARM_BUDGET, StudioDiagnostic, StudioEngine, StudioInstall, StudioUpdate,
-    StudioUpdateSendResult, TakeoverCut, next_boundary, queue_diagnostic, source_revision,
+    InstallMark, STARTUP_SAMPLE_WARM_BUDGET, StudioDiagnostic, StudioEngine, StudioInstall,
+    StudioUpdate, StudioUpdateSendResult, TakeoverCut, next_boundary, queue_diagnostic,
+    source_revision,
 };
 
 /// How far a start's first window reaches, in cycles.
@@ -95,7 +96,7 @@ pub(super) struct HeldEdit {
     source: String,
     mini: bool,
     rewind: bool,
-    preview: bool,
+    mark: InstallMark,
     followed: Vec<Followed>,
 }
 
@@ -347,7 +348,8 @@ impl StudioEngine {
         #[cfg(feature = "vst")]
         let plugins = {
             let cycle = self.session.cycle_at_time(self.device_time());
-            self.prepare_live(source, mini, if rewind { 0.0 } else { cycle });
+            let from_cycle = if rewind { 0.0 } else { cycle };
+            self.prepare_live(source, mini, from_cycle, self.next_install.document);
             self.session.waits_for_plugins(source)
         };
         #[cfg(not(feature = "vst"))]
@@ -356,7 +358,7 @@ impl StudioEngine {
             source: source.to_owned(),
             mini,
             rewind,
-            preview: std::mem::take(&mut self.next_install_preview),
+            mark: self.next_install.take(),
             followed,
         });
         self.ask_for_waited();
@@ -369,14 +371,14 @@ impl StudioEngine {
     /// [`rustel_runtime::Session::reload_live`]. The last score keeps
     /// playing, [`Self::advance_held_edit`] lands the edit when its copies
     /// are ready, and [`Self::take_launch_outcome`] answers it then. The
-    /// edit keeps its from-zero request and its preview mark.
+    /// edit keeps its from-zero request and its install mark.
     pub(super) fn hold_for_plugins(&mut self, source: &str, mini: bool) -> StudioInstall {
         self.launch_outcome = None;
         self.load.held_edit = Some(HeldEdit {
             source: source.to_owned(),
             mini,
             rewind: self.session.take_next_from_zero(),
-            preview: std::mem::take(&mut self.next_install_preview),
+            mark: self.next_install.take(),
             followed: Vec::new(),
         });
         self.log_launch("update waits for its plugins");
@@ -435,14 +437,14 @@ impl StudioEngine {
         if held.rewind {
             self.session.start_next_from_zero();
         }
-        self.next_install_preview = held.preview;
+        self.next_install = held.mark;
         match self.reload_live(&held.source, held.mini) {
             Ok(Some(install)) => self.launch_outcome = Some(Ok(install)),
             // The session holds the edit for its plugin copies again: the
-            // edit keeps its from-zero request and its preview mark.
+            // edit keeps its from-zero request and its install mark.
             Ok(None) => {
                 self.session.clear_next_from_zero();
-                held.preview = std::mem::take(&mut self.next_install_preview);
+                held.mark = self.next_install.take();
                 self.load.held_edit = Some(held);
             }
             Err(error) => {
@@ -606,7 +608,7 @@ impl StudioEngine {
         source: &str,
         mini: bool,
     ) -> Result<StudioInstall, RuntimeError> {
-        let preview = std::mem::take(&mut self.next_install_preview);
+        let mark = self.next_install.take();
         let transport = self.session.transport();
         let now = self
             .live
@@ -614,6 +616,8 @@ impl StudioEngine {
             .expect("a held start is live")
             .device
             .clock_seconds();
+        #[cfg(feature = "vst")]
+        self.session.set_plugin_document(mark.document);
         let generation =
             self.session
                 .reload_at_cancellable(source, mini, now, transport.stopped_flag())?;
@@ -627,7 +631,7 @@ impl StudioEngine {
         live.initial_start_generation = Some(generation);
         live.audition_owned = false;
         self.warm_source(source, STARTUP_SAMPLE_WARM_BUDGET)?;
-        self.note_install_for_played(generation, preview, source);
+        self.note_install_for_played(generation, mark.preview, source);
         self.follow_start(source)?;
         Ok(StudioInstall {
             generation,
@@ -1457,6 +1461,13 @@ pub(super) mod tests {
             });
             rustel_runtime::vst::host().wait_idle();
             slots
+        }
+
+        /// The document the next install reads in: see
+        /// [`StudioEngine::mark_next_install_document`].
+        #[cfg(feature = "vst")]
+        pub(crate) fn document_mark(engine: &StudioEngine) -> u64 {
+            engine.next_install.document
         }
 
         /// Changing controls must not wait again for the plugin copies of the

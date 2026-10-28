@@ -1787,6 +1787,8 @@ impl Session {
             cps: self.scheduler.cps(),
             cycle_zero_time: self.scheduler.time_at_cycle(Fraction::ZERO),
             evaluated_cycle: self.installed_cycle,
+            #[cfg(feature = "vst")]
+            document: self.lanes.document(),
         }))
     }
 
@@ -1848,6 +1850,10 @@ impl Session {
         // `self` for the &mut call below.
         let transport = Arc::clone(&self.transport);
         let cancellation = transport.stopped_flag();
+        // The score that comes back reads in its document, so each of its
+        // lanes finds its number and its chain.
+        #[cfg(feature = "vst")]
+        self.lanes.set_reading(previous.document);
         let attempt = self.evaluate_live_score_cancellable_seeded(
             &previous.source,
             previous.mini,
