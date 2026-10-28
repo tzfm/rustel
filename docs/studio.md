@@ -198,7 +198,10 @@ The sessions fold is never filtered. The box shows its caret while it types.
 When the query matches nothing, the row says no match and blinks, so an empty
 list cannot read as an empty folder. While a filter stands, Backspace takes the
 box back up and deletes from the query. It never starts a delete of a file. In
-vim mode the box rests in command mode: press `i` or `a` to type.
+vim mode `/` opens the box typing, as Vim's own search does. Every letter types
+at once, `j` and `k` included: the insert mappings of the score do not reach
+the box. Esc leaves typing, and `j k h l` walk the list again. Press `i` or
+`a` to type.
 
 Delete asks for confirmation before it removes a file. Confirming also discards
 its unsaved edits. Studio does not delete the last score or the active session

@@ -2196,6 +2196,22 @@ mod tests {
             press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
             assert_eq!(query(&app).as_deref(), Some("sp"), "letters type at once");
             assert_eq!(names(&app), ["spare"]);
+            // The list keys type too: none of j k h l waits for a mapping
+            // or walks the list while the box holds the keyboard.
+            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+            assert_eq!(
+                query(&app).as_deref(),
+                Some("spjk"),
+                "the list letters typed, at once"
+            );
+            assert!(
+                app.set_panel.as_ref().unwrap().vim_insert,
+                "the shipped jk mapping did not leave Insert"
+            );
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            assert_eq!(query(&app).as_deref(), Some("sp"), "back to the query");
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
             assert!(
                 !app.set_panel.as_ref().unwrap().vim_insert,

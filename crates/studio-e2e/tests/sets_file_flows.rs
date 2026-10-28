@@ -333,6 +333,25 @@ fn the_set_panel_search_filters_and_restores() {
         rows.join("\n")
     );
     assert!(rows.iter().all(|row| !row.contains("alpha")));
+    // The list letters type too: j is not held for the shipped jk
+    // mapping, and jk does not leave Insert for the list keys.
+    studio.press(KeyCode::Char('j'), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('k'), KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    assert!(
+        rows.iter().any(|row| row.contains("search: nijk")),
+        "j and k typed at once, not held or walked:\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        rows.iter().all(|row| !row.contains("command mode")),
+        "the shipped jk mapping did not leave Insert:\n{}",
+        rows.join("\n")
+    );
+    studio.press(KeyCode::Backspace, KeyModifiers::NONE);
+    studio.press(KeyCode::Backspace, KeyModifiers::NONE);
+    studio.settle();
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     studio.settle();
     let rows = studio.rows();
