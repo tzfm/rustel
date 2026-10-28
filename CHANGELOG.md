@@ -1,6 +1,15 @@
 # Changelog
 
 ## Unreleased
+- The studio keeps its core for the audio on a small machine. On Linux the frame loop, the catalogue worker and the device probes stand below the audio callback, an animated frame rate that does not fit its interval paints at a slower pace until it fits again, and a sample manifest that hangs no longer rebuilds the sound catalogue twenty times a second.
+- An edit of a playing score lands on a machine slower than its takeover window. The scheduling horizon grows with the time an evaluation takes, a replacement's takeover keeps the headroom the producer's own measured turns need, and a refused turn now counts toward that measurement, so the edit arrives late instead of rolling back with "replacement prefill finished after its takeover".
+- An edit that runs long to accept grows its own takeover runway: the scheduling probe measured how long the edit's first window needs, and the takeover keeps that much time instead of a fixed half second. A slow machine lands such an edit late instead of refusing it. The first edit of a set is priced from the evaluation that started it, so it lands the first time rather than bouncing once and landing on the retry.
+- Supersaw lanes render through a NEON kernel on 64-bit ARM, including Apple silicon. The kernel matches the scalar reference bit for bit, and the sound does not change. On a Raspberry Pi 3, a 32-voice supersaw renders about three times faster.
+- Wavetable interpolation runs a NEON kernel on 64-bit ARM as well, matching the scalar reference bit for bit.
+- A sample's decoded audio is kept beside its file in the cache, so the second time any score plays it the file loads without decoding again. The stored frames are the decoder's own, and the sound does not change. `rustel samples clear` removes them with everything else.
+- A `zzfx` voice skips the library math its parameters zero out: the curve power at the default curve of one, the modulation cosine at zero modulation, and the noise sine at zero noise. The sound is bit for bit the same, and a default voice renders about 10 percent faster on a small machine.
+- The sine oscillator reads a table like every other waveform, instead of calling the library sine for every sample. The table's linear interpolation differs from the library sine by less than -136 dB, which moves 53 corpus hashes by bits alone; event streams and levels are unchanged. Sine-heavy scores render about 30 percent faster on a small machine.
+- rustelup checks the audio system on Linux after an install. A machine that runs PipeWire or PulseAudio without rtkit can click its output when the CPU is busy. rustelup offers to install rtkit, and prints the command when it cannot ask. The check never fails the install.
 
 ## v0.1.6
 
