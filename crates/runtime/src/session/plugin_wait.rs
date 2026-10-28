@@ -55,7 +55,9 @@ pub(super) struct PluginHold {
     wants: Vec<crate::vst::Want>,
     /// The count of the copies not ready, at the last look.
     pending: usize,
-    /// The last time a copy became ready, or the start of the wait.
+    /// The last time a copy became ready, the start of the wait, or the last
+    /// press of the text in another document: see
+    /// [`Session::adopt_plugin_hold`].
     progress: Instant,
     /// The last look at the copies.
     looked: Instant,
@@ -208,7 +210,9 @@ impl Session {
     /// session holds the text. The caller asks again with the same text when
     /// [`Self::waits_for_plugins`] is false. The text then evaluates a second
     /// time and goes in play. A new text takes the place of the text that
-    /// waits.
+    /// waits. The same text in another document takes its place too, and
+    /// evaluates in that document with the read and the plan of the hold:
+    /// see [`Self::adopt_plugin_hold`].
     pub fn reload_live<F>(
         &mut self,
         source: &str,
@@ -219,7 +223,8 @@ impl Session {
     where
         F: FnMut() -> f64,
     {
-        if self.waits_for_plugins(source) {
+        let adopted = self.adopt_plugin_hold(source);
+        if !adopted && self.waits_for_plugins(source) {
             return Ok(LiveReload::Waiting);
         }
         let mut first_clock = Some(clock());
@@ -252,11 +257,14 @@ impl Session {
     /// text goes in play, also with each copy ready. The commit seam of the
     /// launch looks at them when no cycle fits before its line: see
     /// [`Self::plugin_seam`]. A new text, a cancel or the commit ends them.
+    /// The same text in another document keeps them, and evaluates in that
+    /// document: see [`Self::adopt_plugin_hold`].
     /// True when a copy of a lane that plays is not ready and the wait is
     /// on. The session then holds the text as [`Self::reload_live`] does,
     /// and the launch waits while [`Self::waits_for_plugins`] is true. A
-    /// wait of the same text that ended stays. The commit of the text ends
-    /// it with one line.
+    /// wait of the same text in the same document that ended stays. The
+    /// commit of the text ends it with one line. In another document the
+    /// wait counts again from the arm: see [`Self::adopt_plugin_hold`].
     pub fn prepare_reload<F>(
         &mut self,
         source: &str,
@@ -268,7 +276,8 @@ impl Session {
     where
         F: FnMut() -> f64,
     {
-        if self.waits_for_plugins(source) {
+        let adopted = self.adopt_plugin_hold(source);
+        if !adopted && self.waits_for_plugins(source) {
             return Ok(true);
         }
         // A mini score has no plugin, and a session with no live output
@@ -350,6 +359,7 @@ impl Session {
             .is_some_and(|held| held.pending > 0 && held.progress.elapsed() >= PLUGIN_WAIT);
         match first {
             Some(_) if ended => {
+                self.lanes.hold(Some(source));
                 self.plugin_hold = held;
                 Ok(false)
             }
@@ -359,6 +369,7 @@ impl Session {
             // Nothing waits. The fire of the launch looks at the copies.
             _ => {
                 let now = Instant::now();
+                self.lanes.hold(Some(source));
                 self.plugin_hold = Some(PluginHold {
                     source: Arc::from(source),
                     wants,
@@ -417,6 +428,7 @@ impl Session {
     /// plan.
     pub fn cancel_plugin_hold(&mut self) {
         self.plugin_hold = None;
+        self.lanes.hold(None);
         crate::vst::forget_plan(&self.chains);
     }
 
@@ -441,6 +453,34 @@ impl Session {
     pub(super) fn holds_edit(&self, source: &str) -> bool {
         let hold = self.plugin_hold.as_ref();
         hold.is_some_and(|hold| *hold.source == *source)
+    }
+
+    /// The same text in another document takes the place of the text that
+    /// waits, with its read and its plan: see [`crate::vst::adopt_plan`].
+    /// True when the read of the text was of another document. The door
+    /// then evaluates the text in that document. The lanes of that document
+    /// come first, then the lanes of the read of the hold, and the plan
+    /// starts from the plan of the hold. So the text waits only for a copy
+    /// it plays, and no copy builds again. The wait counts from the press,
+    /// with no second line. So a copy of a lane of that document gets the
+    /// whole [`PLUGIN_WAIT`], also a copy the hold did not wait for. The
+    /// plan moves only with its read, and the read of the hold moves with
+    /// them. A read of another text, such as a text that failed, leaves the
+    /// read of the hold: see [`crate::vst::LaneTable::hold`]. So an
+    /// evaluation that fails after the move leaves the read and the plan in
+    /// the document of the move, and the next door of the text takes both
+    /// from there. The caller sets the document of the text before each
+    /// door: see [`Self::set_plugin_document`].
+    fn adopt_plugin_hold(&mut self, source: &str) -> bool {
+        let adopted = self.holds_edit(source) && self.lanes.adopt_read(source);
+        if adopted {
+            crate::vst::adopt_plan(&self.chains, &self.lanes, source);
+            self.lanes.hold(Some(source));
+            if let Some(hold) = self.plugin_hold.as_mut() {
+                hold.progress = Instant::now();
+            }
+        }
+        adopted
     }
 
     /// The plugin copies the edit or the launch with the text `source` waits
@@ -647,12 +687,13 @@ impl Session {
     /// Holds the text of an edit with `pending` copies not ready, the copy
     /// of the plugin `first` among them. `held` is the wait of the same text
     /// before, or the copies its arm prepared, as the look of its door saw
-    /// it: see [`Self::waits_for_plugins`]. A wait with a copy not ready
-    /// keeps the last time a copy became ready. A wait with each copy ready
-    /// is over, so a copy not ready now starts a new wait. False when the
-    /// wait ends: no copy became ready in [`PLUGIN_WAIT`]. The edit then
-    /// plays, with one line. A text gives one line at the start of each
-    /// wait.
+    /// it, or as a press in another document left it: see
+    /// [`Self::waits_for_plugins`] and [`Self::adopt_plugin_hold`]. A wait
+    /// with a copy not ready keeps the last time a copy became ready. A wait
+    /// with each copy ready is over, so a copy not ready now starts a new
+    /// wait. False when the wait ends: no copy became ready in
+    /// [`PLUGIN_WAIT`]. The edit then plays, with one line. A text gives one
+    /// line at the start of each wait.
     fn hold_edit(
         &mut self,
         source: &str,
@@ -678,6 +719,8 @@ impl Session {
         if held.as_ref().is_none_or(|held| held.pending == 0) {
             self.report_plugin_wait(first);
         }
+        // A read of another text leaves the read of the hold.
+        self.lanes.hold(Some(source));
         self.plugin_hold = Some(PluginHold {
             source: Arc::from(source),
             wants,
@@ -1565,5 +1608,293 @@ mod tests {
             0,
             "a slot of a session that ended"
         );
+    }
+
+    /// 2 documents with one text share one copy. The text waits in
+    /// document 2, and the session holds it while its copy builds. The same
+    /// text in document 3 takes its place, with its read and its plan. A
+    /// text that throws in document 4 before that press leaves the read of
+    /// the hold. The copy of the hold serves that press: no second wait
+    /// starts, and the text lands in document 3 with one copy. A launch of a
+    /// held text in another document takes its place too: its arm builds
+    /// nothing, and nothing waits. A text that throws before the landing
+    /// leaves the plan in its document. A cancel ends the hold. The same
+    /// text in another document then takes no lane of the cancelled read,
+    /// and its new lane gets a new number. A document with a lane of its own
+    /// reads that lane first. A lane of its own with a new body comes first
+    /// too. The text waits in another document for a new copy, and the same
+    /// text in the document with the lane lands at once on its own copy. A
+    /// launch there arms from that lane too, and its arm waits for no copy.
+    /// A launch of a held text in another document needs a copy the hold
+    /// did not wait for. Its wait counts from its arm, with no second line,
+    /// also after the time of the wait before is over. A press in another
+    /// document whose evaluation fails after it took the read and the plan
+    /// leaves both there. The text pressed again in its first document takes
+    /// them back, and lands on the copy of the hold.
+    #[test]
+    fn the_held_text_pressed_in_another_document_lands_on_the_same_copy() {
+        let (_one, folder) = fixture_plugins();
+        let (host, fixture) = (crate::vst::host(), rustel_vst3_fixture::NAME);
+        // The plugin loads first. So each look puts the build of its copy in
+        // the line at once, and a wait for the plugin thread waits for it.
+        let loaded = host.resolve(fixture, true);
+        assert!(matches!(loaded, crate::vst::Resolved::Ready(..)));
+        assert!(
+            host.key(fixture, None, false)
+                .is_ok_and(|key| key.is_some())
+        );
+        host.wait_idle();
+        // Each new copy takes 300 ms in its build, so the copy of a text is
+        // not ready at its commit seam.
+        // SAFETY: one fixture test runs at a time, and the plugin thread has
+        // no work. So no other thread reads the variable now.
+        unsafe { std::env::set_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV, "300") };
+        let mut session = Session::new().expect("session");
+        session.set_direct_diagnostic_logging(false);
+        session.set_plugin_document(1);
+        let kick = r#"kick: s("sine").gain(0)"#;
+        session.evaluate(kick).expect("score in play");
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        session.plugins_live.store(true, relaxed);
+        session.plugin_rate.store(48_000, relaxed);
+        let stopped = AtomicBool::new(false);
+        session.schedule_through(0.1, 0.1).expect("cover");
+        let generation = session.generation();
+        let text = format!("{kick}\nlead: note(\"c3\").s(\"sine\").vst(\"rustel fixture\")");
+        let waits = |session: &mut Session| {
+            let mut lines = session.take_diagnostics().into_iter();
+            lines.any(|line| line.kind == SAMPLE_AWAITED_DIAGNOSTIC)
+        };
+        session.set_plugin_document(2);
+        let reload = session.reload_live(&text, false, &stopped, past_the_cover(0.15));
+        assert_eq!(reload.expect("the held text"), LiveReload::Waiting);
+        assert!(waits(&mut session), "the wait of document 2");
+        // A text that throws in document 4 takes the last read. The read of
+        // the hold stays.
+        session.set_plugin_document(4);
+        let typo = format!("{text}\nthrow new Error(\"typo\")");
+        let failed = session.reload_live(&typo, false, &stopped, || 0.15);
+        assert!(failed.is_err(), "the text that throws");
+        // The copy is ready, and the next look sees it.
+        let ready = |session: &mut Session| {
+            host.wait_idle();
+            let hold = session.plugin_hold.as_mut().expect("the wait");
+            hold.looked = hold.looked.checked_sub(PLUGIN_LOOK_EVERY).expect("uptime");
+            session.take_diagnostics();
+        };
+        ready(&mut session);
+        // The same text in document 3 evaluates there with the read and the
+        // plan of the hold. It lands at once on the copy of the hold.
+        session.set_plugin_document(3);
+        session.schedule_through(0.2, 0.2).expect("cover");
+        let landed = session.reload_live(&text, false, &stopped, || 0.25);
+        assert_eq!(
+            landed.expect("landing"),
+            LiveReload::Installed(generation + 1)
+        );
+        assert!(!waits(&mut session), "a second wait");
+        assert_eq!(session.lanes.document(), 3);
+        assert_eq!(copies_in(folder.path()), 1);
+
+        // A text with a new lane waits in document 4. A launch arms it in
+        // document 5 when its copy is ready, and keeps that copy.
+        let more = format!("{text}\npad: note(\"e3\").s(\"sine\").vst(\"rustel fixture\")");
+        session.set_plugin_document(4);
+        session.schedule_through(0.3, 0.3).expect("cover");
+        let reload = session.reload_live(&more, false, &stopped, past_the_cover(0.35));
+        assert_eq!(reload.expect("the held text"), LiveReload::Waiting);
+        ready(&mut session);
+        session.set_plugin_document(5);
+        session.schedule_through(0.4, 0.4).expect("cover");
+        let prepared = session.prepare_reload(&more, false, 0.0, &stopped, || 0.4);
+        assert!(!prepared.expect("prepare"), "the arm waits");
+        assert!(!waits(&mut session), "a wait of the arm");
+        // A text that throws in document 5 takes the last read. The plan of
+        // the held text stays in 5, so its landing builds no copy.
+        let broken = format!("{more}\nthrow new Error(\"typo\")");
+        let failed = session.reload_live(&broken, false, &stopped, || 0.42);
+        assert!(failed.is_err(), "the text that throws");
+        let landed = session.reload_live(&more, false, &stopped, || 0.45);
+        assert_eq!(
+            landed.expect("landing"),
+            LiveReload::Installed(generation + 2)
+        );
+        assert!(!waits(&mut session), "a wait after the throw");
+        assert_eq!(session.lanes.document(), 5);
+        assert_eq!(copies_in(folder.path()), 2);
+
+        // A cancel ends the hold of a text with a new lane in document 6.
+        // The same text in document 7 then reads its own lanes and the lanes
+        // in play: its new lane gets a new number, not the number of the
+        // cancelled read.
+        let last = format!("{more}\nbass: note(\"g2\").s(\"sine\").vst(\"rustel fixture\")");
+        session.set_plugin_document(6);
+        session.schedule_through(0.5, 0.5).expect("cover");
+        let reload = session.reload_live(&last, false, &stopped, past_the_cover(0.55));
+        assert_eq!(reload.expect("the held text"), LiveReload::Waiting);
+        assert!(waits(&mut session), "the wait of document 6");
+        let cancelled = session.lanes.read(&last);
+        session.cancel_plugin_hold();
+        session.set_plugin_document(7);
+        session.schedule_through(0.6, 0.6).expect("cover");
+        let reload = session.reload_live(&last, false, &stopped, past_the_cover(0.65));
+        assert_eq!(reload.expect("the held text"), LiveReload::Waiting);
+        assert!(waits(&mut session), "the wait of document 7");
+        let read = session.lanes.read(&last);
+        assert_eq!(read[..3], cancelled[..3], "the lanes in play");
+        assert_ne!(read[3], cancelled[3], "a lane of the cancelled read");
+        session.cancel_plugin_hold();
+        assert_eq!(copies_in(folder.path()), 2);
+
+        // Document 3 rests with its lane and its copy, and document 1 plays
+        // and is heard. The text waits in document 2, with no lane of its
+        // own, for a new copy. The same text in document 3 reads its own lane
+        // first: it lands at once on its copy, with no wait.
+        session.set_plugin_document(1);
+        session.schedule_through(0.7, 0.7).expect("cover");
+        let played = session.reload_live(kick, false, &stopped, || 0.75);
+        assert_eq!(played.expect("kick"), LiveReload::Installed(generation + 3));
+        session
+            .mark_audible_generation(generation + 3)
+            .expect("heard");
+        session.set_plugin_document(2);
+        session.schedule_through(0.8, 0.8).expect("cover");
+        let reload = session.reload_live(&text, false, &stopped, past_the_cover(0.85));
+        assert_eq!(reload.expect("the held text"), LiveReload::Waiting);
+        assert!(waits(&mut session), "the wait of document 2");
+        session.set_plugin_document(3);
+        session.schedule_through(0.9, 0.9).expect("cover");
+        let landed = session.reload_live(&text, false, &stopped, || 0.95);
+        assert_eq!(
+            landed.expect("landing"),
+            LiveReload::Installed(generation + 4)
+        );
+        assert!(!waits(&mut session), "a wait of document 3");
+        assert_eq!(session.plugins_waited_for(&text), None);
+        assert_eq!(session.lanes.document(), 3);
+        // The copy of the lead, the copy of the pad and the new copy of
+        // document 2: document 3 builds none.
+        assert_eq!(copies_in(folder.path()), 3);
+
+        // A text with a new lane waits in document 4. Document 5 rests with
+        // the lanes of that text, and a launch arms it there from those
+        // lanes: the arm waits for no copy, and the text lands.
+        session.set_plugin_document(4);
+        session.schedule_through(1.0, 1.0).expect("cover");
+        let reload = session.reload_live(&more, false, &stopped, past_the_cover(1.05));
+        assert_eq!(reload.expect("the held text"), LiveReload::Waiting);
+        assert!(waits(&mut session), "the wait of document 4");
+        session.set_plugin_document(5);
+        session.schedule_through(1.1, 1.1).expect("cover");
+        let prepared = session.prepare_reload(&more, false, 0.0, &stopped, || 1.1);
+        assert!(!prepared.expect("prepare"), "the arm of document 5 waits");
+        assert!(!waits(&mut session), "a wait of the arm of document 5");
+        let landed = session.reload_live(&more, false, &stopped, || 1.15);
+        assert_eq!(
+            landed.expect("landing"),
+            LiveReload::Installed(generation + 5)
+        );
+        assert_eq!(session.lanes.document(), 5);
+        // The new copy of document 4 joins the 3: document 5 builds none.
+        assert_eq!(copies_in(folder.path()), 4);
+
+        // Document 3 rests with the lead on c3 and its copy, and document 1
+        // plays and is heard. The lead on e3 waits in document 2 for a new
+        // copy. In document 3 the lead on e3 is its own lane with a new
+        // body: it keeps the number of that lane, and lands at once on its
+        // copy.
+        let other = text.replace("c3", "e3");
+        session.set_plugin_document(3);
+        let own = session.lanes.read(&other);
+        session.set_plugin_document(1);
+        session.schedule_through(1.2, 1.2).expect("cover");
+        let played = session.reload_live(kick, false, &stopped, || 1.25);
+        assert_eq!(played.expect("kick"), LiveReload::Installed(generation + 6));
+        session
+            .mark_audible_generation(generation + 6)
+            .expect("heard");
+        session.set_plugin_document(2);
+        session.schedule_through(1.3, 1.3).expect("cover");
+        let reload = session.reload_live(&other, false, &stopped, past_the_cover(1.35));
+        assert_eq!(reload.expect("the held text"), LiveReload::Waiting);
+        assert!(waits(&mut session), "the wait of document 2");
+        session.set_plugin_document(3);
+        session.schedule_through(1.4, 1.4).expect("cover");
+        let landed = session.reload_live(&other, false, &stopped, || 1.45);
+        assert_eq!(
+            landed.expect("landing"),
+            LiveReload::Installed(generation + 7)
+        );
+        assert!(!waits(&mut session), "a wait of document 3");
+        assert_eq!(session.lanes.read(&other), own, "the lead of document 3");
+        // The new copy of document 2 joins the 4: document 3 builds none.
+        assert_eq!(copies_in(folder.path()), 5);
+
+        // A text with a new hat and a lane that plays from cycle 16 waits in
+        // document 8 for the copy of the hat, and the wait is at its end. A
+        // launch arms the text in document 9 from cycle 16. Its arm needs the
+        // copy of the late lane, which the hold did not wait for, and waits
+        // from the arm with no second line.
+        let part = |label: &str, notes: &str| {
+            format!("\n{label}: note(\"{notes}\").s(\"sine\").vst(\"rustel fixture\")")
+        };
+        let sections = format!(
+            "{other}{}{}",
+            part("hat", "g3"),
+            part("late", "<~!16 c5!16>")
+        );
+        session.set_plugin_document(8);
+        session.schedule_through(1.5, 1.5).expect("cover");
+        let reload = session.reload_live(&sections, false, &stopped, past_the_cover(1.55));
+        assert_eq!(reload.expect("the held text"), LiveReload::Waiting);
+        assert!(waits(&mut session), "the wait of document 8");
+        let hold = session.plugin_hold.as_mut().expect("the wait");
+        hold.progress = hold.progress.checked_sub(PLUGIN_WAIT).expect("uptime");
+        session.set_plugin_document(9);
+        session.schedule_through(1.6, 1.6).expect("cover");
+        let prepared = session.prepare_reload(&sections, false, 16.0, &stopped, || 1.6);
+        assert!(prepared.expect("prepare"), "the arm of document 9 waits");
+        assert!(!waits(&mut session), "a second wait");
+        assert!(
+            session.waits_for_plugins(&sections),
+            "the wait of document 9"
+        );
+        // The cancel ends the copies of the hat and of the late lane.
+        session.cancel_plugin_hold();
+        assert_eq!(copies_in(folder.path()), 5);
+
+        // A text with a new tom waits in document 10. The same text in
+        // document 11 takes the read and the plan of the hold, and its
+        // evaluation fails on its clock. A text that throws in document 12
+        // takes the last read. The same text in document 10 again takes the
+        // read and the plan back from document 11, and lands on the copy of
+        // the hold.
+        let tom = format!("{text}{}", part("tom", "a3"));
+        session.set_plugin_document(10);
+        session.schedule_through(1.7, 1.7).expect("cover");
+        let reload = session.reload_live(&tom, false, &stopped, past_the_cover(1.75));
+        assert_eq!(reload.expect("the held text"), LiveReload::Waiting);
+        assert!(waits(&mut session), "the wait of document 10");
+        session.set_plugin_document(11);
+        let failed = session.reload_live(&tom, false, &stopped, || f64::NAN);
+        assert!(failed.is_err(), "a clock that fails");
+        session.set_plugin_document(12);
+        let typo = format!("{tom}\nthrow new Error(\"typo\")");
+        let failed = session.reload_live(&typo, false, &stopped, || 1.8);
+        assert!(failed.is_err(), "the text that throws");
+        ready(&mut session);
+        session.set_plugin_document(10);
+        session.schedule_through(1.9, 1.9).expect("cover");
+        let landed = session.reload_live(&tom, false, &stopped, || 1.95);
+        assert_eq!(
+            landed.expect("landing"),
+            LiveReload::Installed(generation + 8)
+        );
+        assert!(!waits(&mut session), "a second wait of document 10");
+        assert_eq!(session.lanes.document(), 10);
+        // The copy of the tom joins the 5: the landing builds none.
+        assert_eq!(copies_in(folder.path()), 6);
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV) };
     }
 }

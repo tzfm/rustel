@@ -1452,6 +1452,39 @@ impl Chains {
         made.map(|chain| chain.id).collect()
     }
 
+    /// The plan of the text `source` is now a plan of `document`. The session
+    /// holds that text, and the same text in `document` takes the place of
+    /// the text that waits: see [`adopt_plan`]. `rest` has the documents at
+    /// rest as the install of a read of `document` leaves them. Each chain of
+    /// the document of the plan moves with the plan, so it stays a chain in
+    /// play. The plan takes the chains of the snapshot of `document`, as a
+    /// plan of that document does: see [`Self::plan`]. A plan of another
+    /// text, or of `document`, stays as it is.
+    fn adopt_plan(
+        &mut self,
+        source: &str,
+        document: u64,
+        rest: impl IntoIterator<Item = (u64, u64)>,
+        now: Duration,
+    ) {
+        let Some((text, planned)) = &mut self.plan else {
+            return;
+        };
+        if text != source || planned.document == document {
+            return;
+        }
+        let before = planned.document;
+        let chains = planned.owners.values_mut();
+        for chain in chains.filter(|chain| chain.document == before) {
+            chain.document = document;
+        }
+        planned.set_documents(document, rest, &self.playing.rest, now);
+        planned.hold(&self.snapshots);
+        if let Some(copies) = self.snapshots.get(&document) {
+            planned.come_back(document, copies, now);
+        }
+    }
+
     /// Takes out the chains that left the score in play, after their time:
     /// see [`ChainRegistry::settle`]. The chains settle while the session
     /// has a plan too. A chain of the score in play and of the plan ends
@@ -2013,6 +2046,25 @@ pub(crate) fn forget_plan(chains: &Mutex<Chains>) {
         let made = chains.forget();
         keep_now(&mut chains, made);
     }
+}
+
+/// A session holds the text `source` for its plugin copies, and the same
+/// text in another document takes the place of the text that waits. The
+/// last read of the text is a read of that document now: see
+/// [`LaneTable::adopt_read`]. The plan of the text moves to the document of
+/// the read, with the chains of the document it leaves: see
+/// [`Chains::adopt_plan`]. So a plan of the text in that document starts
+/// from the plan of the hold, and no copy builds again. The caller asks only
+/// when [`LaneTable::adopt_read`] moved the read: for a text with no read,
+/// [`LaneTable::read_of`] gives the document in play. A session with no plan
+/// of the text changes nothing.
+// Only the session of a live output plans: see `Session::reload_live`.
+#[cfg_attr(not(feature = "device-audio"), allow(dead_code))]
+pub(crate) fn adopt_plan(chains: &Mutex<Chains>, lanes: &LaneTable, source: &str) {
+    let mut chains = locked(chains);
+    let (document, _) = lanes.read_of(source);
+    let now = chains.clock;
+    chains.adopt_plan(source, document, lanes.rest_orders_for(document), now);
 }
 
 /// Tells the host the plugin copies the chains of a session want, the
@@ -4495,6 +4547,32 @@ mod tests {
         lanes.install(&deep);
         chains.score_changed(Some(deep.as_str()), &lanes, start);
         assert!(chains.plan.is_none() && lanes.document() == 3);
+        // A held plan of 2 has a chain for a new lane while 1 plays. A read
+        // and a plan of another text stay. The same text in 3 takes the
+        // place of the text that waits: the read and the plan are of 3, and
+        // the chain of the plan is a chain in play of 3. A plan of 3 then
+        // starts from that plan, so the new lane keeps its number and its
+        // chain.
+        let (mut lanes, mut chains) = (LaneTable::default(), Chains::new());
+        play_in(&mut lanes, &mut chains, 1, lead, start);
+        lanes.set_reading(2);
+        assert_eq!(lanes.read(&edit), [0, 1]);
+        let (planned, _) = chains.plan(&edit, &lanes, start);
+        let zyklop = owner("#1", &[], Some((1, "zyklop")));
+        let held = chain_of(planned, zyklop.clone(), start);
+        lanes.set_reading(3);
+        assert!(!lanes.adopt_read(hat), "a read of another text");
+        chains.adopt_plan(hat, 3, lanes.rest_orders_for(3), start);
+        let (_, planned) = chains.plan.as_ref().expect("the plan");
+        assert!(planned.document == 2 && lanes.read_of(&edit).0 == 2);
+        assert!(lanes.adopt_read(&edit));
+        assert!(!lanes.adopt_read(&edit), "a read of 3");
+        chains.adopt_plan(&edit, 3, lanes.rest_orders_for(3), start);
+        assert_eq!(chains.wanted().1, [held]);
+        assert_eq!(lanes.read(&edit), [0, 1]);
+        let (planned, ended) = chains.plan(&edit, &lanes, start);
+        assert!(ended.is_empty());
+        assert_eq!(chain_of(planned, zyklop, start), held);
 
         // A close of 1 at rest ends its chains in a plan of another document
         // too. A plan of 1 keeps them, so a held edit of 1 lands.

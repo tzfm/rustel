@@ -25,7 +25,7 @@ struct Lane {
 
 /// The lanes of one score text, as the chains of a session read them: see
 /// [`LaneTable::playing`] and [`LaneTable::read_of`].
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct ScoreLanes {
     /// The lanes in text order. A score with no label has one lane, with
     /// the empty label.
@@ -99,8 +99,21 @@ pub(crate) struct LaneTable {
     reading: u64,
     /// The last text the session read that is not in play, with its
     /// document and its lanes. A new lane then keeps its number from one
-    /// try of an edit to the next.
+    /// try of an edit to the next. After a read of another text, the read
+    /// of the text the session holds takes its place again: see
+    /// [`Self::adopt_read`].
     candidate: Option<(u64, String, ScoreLanes)>,
+    /// True when the candidate is a read that moved to the reading
+    /// document from another document: see [`Self::adopt_read`]. The next
+    /// read pairs its lanes after the lanes of that document, and ends the
+    /// mark.
+    adopted: bool,
+    /// The read of the text the session holds for its plugin copies, with
+    /// its document and its lanes: see [`Self::hold`]. A read of another
+    /// text, such as a text that failed, takes the place of the candidate,
+    /// and this read stays.
+    #[cfg(any(feature = "device-audio", test))]
+    held: Option<(u64, String, ScoreLanes)>,
     /// The lanes of the score the output plays, with its document, until
     /// the output plays the score in play. A rollback puts that score back.
     /// Each of its lanes then keeps its number.
@@ -128,13 +141,18 @@ impl LaneTable {
     ///
     /// A statement first takes a lane of its own document: a lane of its
     /// score in play or at rest, of its last read, a lane away, or a lane of
-    /// its score the output plays. See [`pair`]. For a document that is not
-    /// in play, each statement with no lane then takes a lane of the score
-    /// in play as a statement of the document in play does. Such a lane is
-    /// a lane of both documents. So a document that plays for the first
-    /// time keeps the lanes it shares with the score in play, and a document
-    /// that plays again finds its own lanes first.
+    /// its score the output plays. See [`pair`]. A last read that moved to
+    /// the document from another document gives a lane after these, and
+    /// before the lanes of the score in play: see [`Self::adopt_read`]. For
+    /// a document that is not in play, each statement with no lane then
+    /// takes a lane of the score in play as a statement of the document in
+    /// play does. Such a lane is a lane of both documents. So a document
+    /// that plays for the first time keeps the lanes it shares with the
+    /// score in play, and a document that plays again finds its own lanes
+    /// first.
     pub(crate) fn read(&mut self, source: &str) -> Vec<u64> {
+        // The read takes the place of the candidate, with its mark.
+        let adopted = std::mem::take(&mut self.adopted);
         let Some(statements) = rustel_transpiler::lane_statements(source) else {
             self.candidate = None;
             return Vec::new();
@@ -151,6 +169,13 @@ impl LaneTable {
         let tried = self.candidate.as_ref();
         let tried = tried.filter(|(document, ..)| *document == reading);
         let tried = tried.map_or(none, |(.., read)| &read.lanes);
+        // A read that moved here from another document comes after the
+        // lanes of the document: see `Self::adopt_read`.
+        let (tried, moved) = if adopted {
+            (none, tried)
+        } else {
+            (tried, none)
+        };
         let (audible_in, audible) = &self.audible;
         let (own, other) = if *audible_in == reading {
             (&audible[..], none)
@@ -159,6 +184,9 @@ impl LaneTable {
         };
         let mut paired = vec![None; statements.len()];
         pair(&statements, &mut paired, playing, tried, away, own);
+        if adopted {
+            pair(&statements, &mut paired, none, moved, none, none);
+        }
         // A document that is not in play shares the lanes of the score in
         // play.
         if reading != self.document {
@@ -190,6 +218,47 @@ impl LaneTable {
     /// The next reads are of `document`: see [`Self::read`].
     pub(crate) fn set_reading(&mut self, document: u64) {
         self.reading = document;
+    }
+
+    /// The read of the text `source` is the last read, of the reading
+    /// document. The session holds that text for its plugin copies, and the
+    /// same text takes the place of the text that waits: see
+    /// `Session::reload_live`. After a read of another text, such as a text
+    /// that failed, the read of the hold is the last read again: see
+    /// [`Self::hold`]. Gives true when that read was of another document.
+    /// The next read then pairs the lanes of that read after the lanes of
+    /// the reading document, so a lane of that document keeps its number:
+    /// see [`Self::read`]. With no read of the text, the last read stays,
+    /// and the call gives false.
+    #[cfg(any(feature = "device-audio", test))]
+    pub(crate) fn adopt_read(&mut self, source: &str) -> bool {
+        let last = self.candidate.as_ref();
+        if last.is_none_or(|(_, text, _)| text != source) {
+            let held = self.held.as_ref();
+            let Some(held) = held.filter(|(_, text, _)| text == source) else {
+                return false;
+            };
+            self.candidate = Some(held.clone());
+        }
+        let reading = self.reading;
+        if let Some((document, ..)) = &mut self.candidate
+            && *document != reading
+        {
+            *document = reading;
+            self.adopted = true;
+            return true;
+        }
+        false
+    }
+
+    /// The session holds the text `source` for its plugin copies, or no
+    /// text with `None`. The last read, when it read `source`, stays for
+    /// [`Self::adopt_read`] until the next call.
+    #[cfg(any(feature = "device-audio", test))]
+    pub(crate) fn hold(&mut self, source: Option<&str>) {
+        let read = self.candidate.as_ref();
+        let read = read.filter(|(_, text, _)| Some(text.as_str()) == source);
+        self.held = read.cloned();
     }
 
     /// The score with the text `source` goes in play: the lanes of the last
@@ -366,7 +435,8 @@ fn rule_key<'a>(rule: u8, label: &'a str, body: &'a str) -> Option<(&'a str, &'a
 /// compares: 512 statements with 512 lanes. The compare runs before each
 /// evaluation, so its time has a limit. With more pairs, each statement
 /// that rules 1 to 3 did not pair is a new lane. A read of a document that
-/// is not in play makes the compare 2 times: see [`LaneTable::read`].
+/// is not in play makes the compare 2 times, and a read after
+/// [`LaneTable::adopt_read`] one time more: see [`LaneTable::read`].
 const MAX_LANE_PAIRS: usize = 1 << 18;
 
 /// Gives each statement of a new score text with no lane its lane.
@@ -849,5 +919,27 @@ pub(super) mod tests {
         assert_eq!(lanes.rest_orders().count(), 3);
         lanes.forget(2);
         assert!(lanes.rest_orders_for(3).all(|(document, _)| document != 2));
+
+        // 2 reads a text with a new lane while 1 plays, and 3 rests with the
+        // lead on another note. The session holds the text of 2, and 4 reads
+        // another text. 3 takes the read of the hold: the lanes of 3 come
+        // first, so the lead keeps its number by rule 3, and the pad that 3
+        // lacks takes the number of the read of 2.
+        let mut lanes = LaneTable::default();
+        let (lead, pad) = (
+            r#"lead: note("c3").vsti("serum")"#,
+            r#"pad: note("e3").vst("ott")"#,
+        );
+        assert_eq!(play_in(&mut lanes, 3, lead), [0]);
+        assert_eq!(play_in(&mut lanes, 1, kick), [1]);
+        let text = format!("{}\n{pad}", lead.replace("c3", "e3"));
+        lanes.set_reading(2);
+        assert_eq!(lanes.read(&text), [2, 3]);
+        lanes.hold(Some(text.as_str()));
+        lanes.set_reading(4);
+        assert_eq!(lanes.read(kick), [1]);
+        lanes.set_reading(3);
+        assert!(lanes.adopt_read(&text));
+        assert_eq!(lanes.read(&text), [0, 3]);
     }
 }

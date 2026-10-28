@@ -14,7 +14,7 @@ pub(crate) use chains::{
     slider_links, slider_moved, take_output_lines, take_problems, wants,
 };
 #[cfg(feature = "device-audio")]
-pub(crate) use chains::{forget_plan, named_chains, plan, take_slider_values, tick};
+pub(crate) use chains::{adopt_plan, forget_plan, named_chains, plan, take_slider_values, tick};
 pub(crate) use lanes::LaneTable;
 
 use std::path::PathBuf;

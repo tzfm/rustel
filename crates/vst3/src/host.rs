@@ -375,7 +375,8 @@ struct State {
     builds: HashMap<(InsertKey, u32, InsertSlot), Build>,
     /// The builds a render claimed and did not take yet: see
     /// [`Host::insert`]. The bound of the parked copies does not count such a
-    /// build and does not end it.
+    /// build and does not end it. A read of the preset folders does not end
+    /// it either: see [`State::stale_copies`].
     rendering: HashSet<(InsertKey, u32, InsertSlot)>,
     /// The builds an engine took for live play, with the cell of each copy:
     /// the cell says while the engine holds the plugin, and while the copy
@@ -835,9 +836,13 @@ impl State {
     /// build, at the end of a read of the preset folders. `stamps` has the
     /// stamp of each file now: see [`Host::stamp_preset_files`]. Each copy
     /// that waits for its slot leaves the list: the caller ends it after the
-    /// lock, and the next note of the slot builds a copy from the file. Each
-    /// other such copy gets the preset mark: see [`CopyState::preset_changed`].
-    /// A copy an engine holds keeps its state while it plays.
+    /// lock, and the next note of the slot builds a copy from the file. A
+    /// build a render did not take yet stays: the render takes its copy and
+    /// plays the state of its build. See [`State::rendering`]. Each other
+    /// such copy gets the preset mark: see [`CopyState::preset_changed`].
+    /// The copy a render takes gets the mark too. That copy ends at its
+    /// drop, so no park and no retune reads the mark. A copy an engine holds
+    /// keeps its state while it plays.
     #[allow(clippy::vec_box, reason = "a copy stays in the box an engine takes")]
     fn stale_copies(&mut self, stamps: &HashMap<PathBuf, u64>) -> Vec<Box<Instance>> {
         if stamps.is_empty() {
@@ -850,6 +855,7 @@ impl State {
         let mut gone = HashSet::new();
         for (build, built) in &self.builds {
             if let Build::Ready(copy) = built
+                && !self.rendering.contains(build)
                 && stale(build.0, copy.cell())
             {
                 gone.insert(*build);
@@ -1221,8 +1227,8 @@ impl Host {
     /// that was loaded before keeps its row and its copies over the load.
     /// So the read also ends each copy that waits for its slot with a file
     /// of this folder saved again or gone since its build, and marks each
-    /// other such copy, as [`Host::finish_presets`] does: see
-    /// [`State::stale_copies`].
+    /// other such copy, as [`Host::finish_presets`] does. A build a render
+    /// did not take yet stays: see [`State::stale_copies`].
     fn refresh_preset_folder(&self, plugin: &Scanned) {
         let root = self.state().preset_root.clone();
         let Some(root) = root else {
@@ -1258,8 +1264,8 @@ impl Host {
         state.presets_version += 1;
         let stale = state.stale_copies(&stamps);
         drop(state);
-        // A copy that waits for its slot keeps no state of a file saved
-        // again: it ends here, in the job of the load.
+        // Each copy the read ends keeps no state of a file saved again: it
+        // ends here, in the job of the load.
         for copy in stale {
             copy.end_here();
         }
@@ -1279,8 +1285,8 @@ impl Host {
     /// the job of a load, which a score asks for a preset right after. A
     /// read claimed while this one ran follows here at once. At its end the
     /// read ends each copy that waits for its slot with a preset file saved
-    /// again or gone since its build, in the job of the read: see
-    /// [`State::stale_copies`].
+    /// again or gone since its build, in the job of the read. A build a
+    /// render did not take yet stays: see [`State::stale_copies`].
     ///
     /// The folders the player added hold any structure, so the header of
     /// each file names its plugin. The root is the store of rustel, with
@@ -1329,8 +1335,8 @@ impl Host {
             let stale = state.stale_copies(&stamps);
             (std::mem::take(&mut state.presets_again), stale)
         };
-        // A copy that waits for its slot keeps no state of a file saved
-        // again: it ends here, in the job of the read.
+        // Each copy the read ends keeps no state of a file saved again: it
+        // ends here, in the job of the read.
         for copy in stale {
             copy.end_here();
         }
@@ -2348,12 +2354,14 @@ impl Host {
     /// make room under the bound of the parked copies: with no other copy
     /// to end, it builds past the bound. The bound does not count the build
     /// of a render and does not end it before the render takes its copy.
-    /// See [`Host::keep`]. With no wait, the first call starts the work and
-    /// a later call returns the plugin: this is for live play, where the
-    /// caller has no time to lose. A live copy goes home at its drop and
-    /// waits for the slot again, so a later call for the slot builds
-    /// nothing. A quiet copy parks at once, on the thread of the drop. The
-    /// plugin thread plays out the tail of each other copy first. At the
+    /// See [`Host::keep`]. A read of the preset folders does not end the
+    /// build of a render either: the render plays the state of its build,
+    /// also when its preset file changed since. With no wait, the first call
+    /// starts the work and a later call returns the plugin: this is for live
+    /// play, where the caller has no time to lose. A live copy goes home at
+    /// its drop and waits for the slot again, so a later call for the slot
+    /// builds nothing. A quiet copy parks at once, on the thread of the drop.
+    /// The plugin thread plays out the tail of each other copy first. At the
     /// bound of the parked copies, a copy that comes home takes the place of
     /// a failed build. A copy at rest also takes the place of a copy of a
     /// chain no caller names or of a copy at rest of a lower order. With no
@@ -3204,5 +3212,73 @@ mod tests {
             "the build of the render"
         );
         assert_eq!(state.builds.len(), MAX_PARKED);
+    }
+
+    /// A read of the preset folders ends no build a render did not take
+    /// yet, also when its preset file changed since the build. The render
+    /// takes the copy of its build, with no second build. A copy that waits
+    /// for a live slot with that file still ends.
+    #[test]
+    fn a_preset_read_ends_no_build_a_render_did_not_take_yet() {
+        let root = std::env::temp_dir().join(format!("rustel-vst3-render-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("plugin folder");
+        rustel_vst3_fixture::install(&root);
+        let host = Host::new();
+        host.scan(std::slice::from_ref(&root));
+        host.wait_idle();
+        let presets = root.join("presets");
+        let folder = presets.join(rustel_vst3_fixture::NAME);
+        std::fs::create_dir_all(&folder).expect("preset folder");
+        let file = folder.join("default.vstpreset");
+        std::fs::write(&file, rustel_vst3_fixture::preset(0.5, 0.0)).expect("preset file");
+        host.set_preset_folder(presets);
+        let effect = host.resolve(rustel_vst3_fixture::NAME, true);
+        assert!(matches!(effect, Resolved::Ready(..)));
+        let Ok(Some((key, _))) = host.key(rustel_vst3_fixture::NAME, None, false) else {
+            panic!("the fixture plugin has no key");
+        };
+        assert_ne!(key.preset, 0, "the copies of the file");
+        let live = InsertSlot::effect(2, 0);
+        let parked = || host.prepared(rustel_vst3_fixture::NAME, None, false, 48_000, live);
+        host.prepare(rustel_vst3_fixture::NAME, None, false, 48_000, live);
+        host.wait_idle();
+        assert_eq!(parked(), Prepared::Ready(key));
+
+        // One job of the plugin thread claims the build of a render and
+        // makes its copy. Then the file changes, and a read of the preset
+        // folders runs before the render takes its copy.
+        let slot = InsertSlot::effect(1, 0);
+        let build = (key, 48_000, slot);
+        let worker = host.clone();
+        let saved = rustel_vst3_fixture::preset_with_delay(0.5, 0.0, 0.25);
+        host.enqueue(move || {
+            let claimed = {
+                let mut state = worker.state();
+                let claimed = Host::claim(&mut state, build, true).expect("the render claim");
+                state.rendering.insert(build);
+                claimed
+            };
+            worker.finish(build, claimed);
+            // A new length changes the stamp, also in one tick of the clock
+            // of the file system.
+            std::fs::write(&file, saved).expect("preset file");
+            let root = worker.state().preset_root.clone();
+            worker.finish_presets(root, Vec::new());
+        });
+        host.wait_idle();
+        assert!(matches!(
+            host.state().builds.get(&build),
+            Some(Build::Ready(_))
+        ));
+        assert_eq!(parked(), Prepared::Unbuilt(key), "the live copy ends");
+        let built = host.state().built;
+        let copy = host.insert(key, 48_000, slot, true);
+        assert!(copy.is_some(), "the copy of the build");
+        assert_eq!(host.state().built, built, "no second build");
+        assert!(!host.state().rendering.contains(&build));
+        drop(copy);
+        drop(host);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

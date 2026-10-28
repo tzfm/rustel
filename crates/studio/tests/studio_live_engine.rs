@@ -4563,3 +4563,139 @@ fn a_new_default_output_after_a_stop_keeps_the_plugin_copies() {
     drop(engine);
     no_plugin_work();
 }
+
+/// 2 scenes with one text share their lanes, so they wait for one copy. In
+/// the wait mode scene 2 plays a text with a new plugin lane, and the worker
+/// holds the press while the copy builds. Scene 3 plays the same text
+/// before the copy is ready. Its press takes the place of the press of
+/// scene 2, with the copy that press waits for: the copy builds one time,
+/// no copy ends, and the notes of scene 3 play through the copy.
+#[cfg(feature = "vst")]
+#[test]
+fn two_scenes_with_one_text_wait_for_one_copy() {
+    use rustel_runtime::vst;
+    use rustel_studio::settings::LoadMode;
+    let _engine = one_engine();
+    let _plugins = fixture_plugins();
+    // The plugin loads before the marks, so its load writes no line.
+    let loaded = vst::host().resolve(rustel_vst3_fixture::NAME, true);
+    assert!(matches!(loaded, vst::Resolved::Ready(..)), "the fixture");
+    vst::host().wait_idle();
+    let copies = || -> usize {
+        let plugins = vst::host().plugins();
+        plugins.iter().map(|plugin| plugin.running).sum()
+    };
+    // Each copy from here writes a line to a mark file at its end. Each
+    // build takes 1 s, so the press of scene 3 comes before the copy is
+    // ready.
+    let marks = tempfile::tempdir().expect("mark folder");
+    let ends = marks.path().join("ends");
+    let lines = || {
+        let marked = std::fs::read_to_string(&ends).unwrap_or_default();
+        marked.lines().count()
+    };
+    // SAFETY: one engine test runs at a time, and the plugin thread has no
+    // work. So no other thread of this process reads a variable now.
+    unsafe {
+        std::env::set_var(rustel_vst3_fixture::PROCESS_MARK_ENV, &ends);
+        std::env::set_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV, "1000");
+    }
+    let mut worker = StudioWorker::spawn(
+        StudioConfig {
+            output: Some("silent".into()),
+            poll_interval: Duration::from_millis(2),
+            ..Default::default()
+        },
+        #[cfg(feature = "hydra")]
+        rustel_runtime::hydra::HydraBridge::new(),
+    )
+    .expect("worker");
+    let master = std::sync::Arc::clone(worker.master());
+    master.set_load_mode(LoadMode::Wait);
+    // Scene `scene` plays `text` now, as the request `scene`.
+    let press = |worker: &StudioWorker, scene: u64, text: &str| {
+        let text = std::sync::Arc::from(text);
+        let sent =
+            worker.try_evaluate_document(scene, scene, text, false, Launch::Now, false, scene);
+        sent.expect("a press");
+    };
+    // Reads the events of the worker until the answer of the press of
+    // `scene`. Gives the answer, the count of the presses the worker held
+    // meanwhile, and the highest level of the output in that time.
+    let answer = |worker: &StudioWorker, scene: u64| {
+        let started = Instant::now();
+        let (mut held, mut peak) = (0, 0.0_f32);
+        loop {
+            peak = peak.max(master.take_levels().peak);
+            match worker.try_recv_control() {
+                Ok(StudioControlEvent::Evaluation(outcome)) if outcome.request_id == scene => {
+                    return (outcome.result, held, peak);
+                }
+                Ok(StudioControlEvent::Diagnostic(note))
+                    if note.message.starts_with("update waits for its plugins") =>
+                {
+                    held += 1;
+                }
+                Ok(StudioControlEvent::EngineFailure(error)) => panic!("{error:?}"),
+                Ok(_) => {}
+                Err(TryRecvError::Disconnected) => panic!("worker disconnected"),
+                Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(2)),
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "no answer for scene {scene}"
+            );
+        }
+    };
+    let quiet = "$: note('c5').s('sine').gain(0)";
+    let text =
+        format!("{quiet}\n$: note('c3').s('sine').vst('rustel fixture', {{ gain: 0 }}).fast(8)");
+    press(&worker, 1, quiet);
+    let (start, _, _) = answer(&worker, 1);
+    start.expect("scene 1 plays");
+    // The worker takes the presses in their order, so the press of scene 3
+    // comes right after the hold of scene 2.
+    press(&worker, 2, &text);
+    press(&worker, 3, &text);
+    let (superseded, first, early) = answer(&worker, 2);
+    let failure = superseded.expect_err("the press of scene 3 takes its place");
+    assert_eq!(failure.kind, "cancelled");
+    let (landed, second, late) = answer(&worker, 3);
+    assert!(!landed.expect("scene 3 plays").held);
+    assert_eq!(
+        first + second,
+        2,
+        "the copy was ready at the press of scene 3"
+    );
+    assert_eq!(early.max(late), 0.0, "a dry note before the copy");
+    // The notes of scene 3 play through the copy: an engine takes it, and
+    // no note plays dry. The meter keeps the highest level until the next
+    // take. So the first take below holds each level since the landing.
+    let started = Instant::now();
+    while !vst::engine_holds_unkept(&[]) {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the plugin did not take the lane"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        while worker.try_recv_control().is_ok() {}
+    }
+    let started = Instant::now();
+    let mut peak = 0.0_f32;
+    while started.elapsed() < Duration::from_millis(800) {
+        std::thread::sleep(Duration::from_millis(20));
+        peak = peak.max(master.take_levels().peak);
+        while worker.try_recv_control().is_ok() {}
+    }
+    assert_eq!(peak, 0.0, "a dry note of scene 3");
+    vst::host().wait_idle();
+    assert_eq!((copies(), lines()), (1, 0), "one copy for both scenes");
+    worker.shutdown();
+    vst::host().wait_idle();
+    assert_eq!(copies(), 0, "a copy runs on");
+    // SAFETY: as above.
+    unsafe {
+        std::env::remove_var(rustel_vst3_fixture::PROCESS_MARK_ENV);
+        std::env::remove_var(rustel_vst3_fixture::SLOW_ACTIVATE_ENV);
+    }
+}
