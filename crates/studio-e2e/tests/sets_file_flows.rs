@@ -238,9 +238,9 @@ fn the_set_panel_shows_the_selected_scores_details_at_its_foot() {
 
 /// `/` filters the set panel: letters hide the scores the query does not
 /// answer - a name or any @field value - Enter leaves the filter
-/// standing, Esc restores the folder. In vim the box rests in command
-/// mode until `i` types, and the Esc ladder leaves insert before it
-/// drops the filter.
+/// standing, Esc restores the folder. In vim `/` types at once, a second
+/// `/` retypes the standing query, and the Esc ladder leaves insert
+/// before it drops the filter.
 #[test]
 fn the_set_panel_search_filters_and_restores() {
     let mut studio = hermetic();
@@ -285,8 +285,36 @@ fn the_set_panel_search_filters_and_restores() {
     );
     assert_eq!(studio.focus(), Some(PanelKind::Set), "Esc kept the panel");
 
-    // Vim: the box rests in command, `i` types, and the second Esc
-    // drops the filter. The panel goes away first, so the vim half
+    // Backspace over a standing filter edits the query, never the file
+    // under it: pressed twice over an empty query, nothing is asked
+    // about deleting and every score stays.
+    studio.press(KeyCode::Char('/'), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('n'), KeyModifiers::NONE);
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    for _ in 0..2 {
+        studio.press(KeyCode::Backspace, KeyModifiers::NONE);
+    }
+    studio.settle();
+    let rows = studio.rows();
+    assert!(
+        rows.iter().all(|row| !row.contains("Enter deletes")),
+        "no delete was armed:\n{}",
+        rows.join("\n")
+    );
+    assert_eq!(
+        studio.scene_names().as_slice(),
+        ["first"],
+        "every score is still on the strip"
+    );
+    assert!(
+        studio.set_directory().join("alpha.strudel").is_file()
+            && studio.set_directory().join("night.strudel").is_file(),
+        "every file is still on disk"
+    );
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+
+    // Vim: `/` types at once, and the Esc ladder leaves insert before
+    // it drops the filter. The panel goes away first, so the vim half
     // opens it fresh, the way the studio does at startup.
     studio.chord("ctrl+b");
     assert_eq!(studio.focus(), None, "the panel is away");
@@ -295,24 +323,52 @@ fn the_set_panel_search_filters_and_restores() {
     studio.settle();
     assert_eq!(studio.focus(), Some(PanelKind::Set));
     studio.press(KeyCode::Char('/'), KeyModifiers::NONE);
-    studio.settle();
-    let rows = studio.rows();
-    assert!(
-        rows.iter().any(|row| row.contains("search: i or a types")),
-        "in command mode the box says the way in:\n{}",
-        rows.join("\n")
-    );
-    studio.press(KeyCode::Char('i'), KeyModifiers::NONE);
     studio.press(KeyCode::Char('n'), KeyModifiers::NONE);
     studio.press(KeyCode::Char('i'), KeyModifiers::NONE);
     studio.settle();
     let rows = studio.rows();
     assert!(
         rows.iter().any(|row| row.contains("search: ni")),
-        "insert types into the box:\n{}",
+        "`/` types into the box at once:\n{}",
         rows.join("\n")
     );
     assert!(rows.iter().all(|row| !row.contains("alpha")));
+    // The list letters type too: j is not held for the shipped jk
+    // mapping, and jk does not leave Insert for the list keys.
+    studio.press(KeyCode::Char('j'), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('k'), KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    assert!(
+        rows.iter().any(|row| row.contains("search: nijk")),
+        "j and k typed at once, not held or walked:\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        rows.iter().all(|row| !row.contains("command mode")),
+        "the shipped jk mapping did not leave Insert:\n{}",
+        rows.join("\n")
+    );
+    studio.press(KeyCode::Backspace, KeyModifiers::NONE);
+    studio.press(KeyCode::Backspace, KeyModifiers::NONE);
+    studio.settle();
+    studio.press(KeyCode::Esc, KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    assert!(
+        rows.iter().all(|row| !row.contains("alpha")),
+        "the first Esc leaves the filter standing:\n{}",
+        rows.join("\n")
+    );
+    studio.press(KeyCode::Char('/'), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('g'), KeyModifiers::NONE);
+    studio.settle();
+    let rows = studio.rows();
+    assert!(
+        rows.iter().any(|row| row.contains("search: nig")),
+        "a second `/` retypes the standing query:\n{}",
+        rows.join("\n")
+    );
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     studio.press(KeyCode::Esc, KeyModifiers::NONE);
     studio.settle();
@@ -408,7 +464,7 @@ fn open_set_lists_the_others_and_opens_one() {
     studio.press(KeyCode::Char('o'), KeyModifiers::NONE); // Open set…
     assert_eq!(
         studio.status(),
-        "open a set - Enter opens the chosen set · Tab browses · type a path · Esc back"
+        "open a set or a Strudel export - Enter opens the chosen one · Tab browses · type a path · Esc back"
     );
     // The other set is offered by name, with what is in it.
     let rows = studio.rows();
@@ -436,6 +492,155 @@ fn open_set_lists_the_others_and_opens_one() {
         ["scene 1"],
         "the opened set's scene is on the strip"
     );
+}
+
+/// File ▸ Import patterns…: an export in strudel.cc's own shape -
+/// entries keyed by push ids, each an object with `code` and
+/// `created_at` - becomes named score files of the set already open.
+/// The prompt offers the export by name, the set panel lists what
+/// landed, and the score on screen stays the score on screen.
+#[test]
+fn import_strudel_patterns_adds_them_to_the_open_set() {
+    let mut studio = hermetic();
+    let set = studio.set_directory().to_path_buf();
+    let root = sets_root(&studio);
+    std::fs::create_dir_all(&root).expect("sets root made");
+    // The real export's shape, with synthetic patterns of the same make:
+    // push-id keys, code, created_at and collection fields, and one song
+    // titled in a leading comment rather than in its key.
+    let patterns = [
+        ("ALGnQXNiUsZ4", "\"$: s(\\\"bd\\\")\"", 10),
+        (
+            "SkySkxWlk9OI",
+            "\"// @title night drive\\n$: s(\\\"cp\\\")\"",
+            20,
+        ),
+        ("94Sl_PHsUiXX", "\"$: s(\\\"hh\\\")\"", 30),
+    ];
+    let entries: Vec<String> = patterns
+        .iter()
+        .map(|(id, code, created_at)| {
+            format!(
+                "  \"{id}\": {{ \"code\": {code}, \"created_at\": {created_at}, \"id\": \"{id}\", \"collection\": \"user\" }}"
+            )
+        })
+        .collect();
+    std::fs::write(
+        root.join("gig.json"),
+        format!("{{\n{}\n}}\n", entries.join(",\n")),
+    )
+    .expect("export");
+
+    drop_file_menu(&mut studio);
+    studio.press(KeyCode::Char('i'), KeyModifiers::NONE); // Import patterns…
+    assert_eq!(
+        studio.status(),
+        "import Strudel patterns - Enter adds every entry to this set · Tab browses · type a path · Esc back"
+    );
+    let rows = studio.rows();
+    let row = row_containing(&rows, "gig.json");
+    assert!(
+        rows[row].contains("3 patterns"),
+        "the export is offered with what it holds: {}",
+        rows[row]
+    );
+
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    let status = studio.status();
+    assert!(
+        status.starts_with("imported 3 patterns into "),
+        "the status counts what landed: {status}"
+    );
+    // Named the way the new-set import names them: the title leads, the
+    // rest are numbered in the order they were made.
+    for name in ["pattern 1", "night drive", "pattern 3"] {
+        let file = set.join(format!("{name}.strudel"));
+        assert!(file.is_file(), "{name} landed as a file of the set");
+        let body = std::fs::read_to_string(&file).unwrap();
+        assert!(body.contains("$: s("), "{name} carries its pattern: {body}");
+    }
+    assert_eq!(
+        studio.scene_names().as_slice(),
+        ["first"],
+        "the import wrote files, not tabs - the score on screen stands"
+    );
+
+    // The set panel lists them beside the score it had.
+    studio.chord("ctrl+b");
+    studio.settle();
+    let rows = studio.rows();
+    row_containing(&rows, "night drive");
+    row_containing(&rows, "pattern 1");
+
+    // The same export again: everything already there, said plainly.
+    drop_file_menu(&mut studio);
+    studio.press(KeyCode::Char('i'), KeyModifiers::NONE);
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        studio.status(),
+        format!(
+            "no new patterns - all 3 are already in {}",
+            set.file_name().and_then(|name| name.to_str()).unwrap()
+        )
+    );
+}
+
+/// File ▸ Export patterns…: the set's scores as one pattern export at
+/// the sets root, keyed by name, the open score as it stands on screen,
+/// and the file offered again by the open-set prompt.
+#[test]
+fn export_patterns_writes_the_sets_scores_beside_the_sets() {
+    let mut studio = hermetic();
+    let set = studio.set_directory();
+    let name = set
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap()
+        .to_owned();
+    // A closed score beside the open one, and an unsaved edit on screen.
+    std::fs::write(set.join("spare.strudel"), "$: s(\"cp\")\n").unwrap();
+    studio.type_text(" ");
+    let score = studio.score();
+
+    drop_file_menu(&mut studio);
+    studio.press(KeyCode::Char('x'), KeyModifiers::NONE); // Export patterns…
+    assert!(
+        studio
+            .status()
+            .starts_with(&format!("exported 2 patterns to {name} patterns ")),
+        "{}",
+        studio.status()
+    );
+    let root = sets_root(&studio);
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(&root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|file| file.to_str())
+                .is_some_and(|file| {
+                    file.starts_with(&format!("{name} patterns")) && file.ends_with(".json")
+                })
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "one export beside the sets");
+    let text = std::fs::read_to_string(found.remove(0)).unwrap();
+    let rows: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text).unwrap();
+    assert_eq!(rows.len(), 2, "one entry a score: {text}");
+    assert_eq!(
+        rows["first"].as_str(),
+        Some(score.as_str()),
+        "the open score goes out as it stands"
+    );
+    assert_eq!(rows["spare"].as_str(), Some("$: s(\"cp\")\n"));
+
+    // The open-set prompt offers the export beside the sets.
+    drop_file_menu(&mut studio);
+    studio.press(KeyCode::Char('o'), KeyModifiers::NONE); // Open set…
+    studio.settle();
+    let rows = studio.rows();
+    row_containing(&rows, "Strudel export - 2 patterns");
 }
 
 /// File ▸ Open recent…: the set just left is offered, and Enter goes back
@@ -602,8 +807,8 @@ fn rename_set_carries_a_sample_source_inside_it() {
 
 /// File ▸ Open set… with a typed path to a Strudel pattern export: the
 /// export becomes a set of its own under the sets folder, one score per
-/// entry, the first one open and the title naming the score that carries
-/// one.
+/// entry, the first one open, the title naming the score that carries
+/// one and the rest numbered in the order they were made.
 #[test]
 fn open_set_imports_a_strudel_pattern_export() {
     let mut studio = hermetic();
@@ -638,8 +843,8 @@ fn open_set_imports_a_strudel_pattern_export() {
     );
     assert_eq!(
         studio.scene_names().as_slice(),
-        ["night drive", "kZ4_hT9pQw2x"],
-        "the title names the score that carries one"
+        ["night drive", "pattern 2"],
+        "the title names the score that carries one, the rest are numbered"
     );
     assert_eq!(
         std::fs::read_to_string(root.join("gig").join("night drive.strudel")).expect("score"),

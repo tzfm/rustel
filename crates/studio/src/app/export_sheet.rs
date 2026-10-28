@@ -31,20 +31,19 @@ impl App {
             self.focus_panel(PanelKind::Export);
             return;
         }
-        if self.export_sheet.take().is_some() {
-            self.status = "export closed".into();
-            self.settle_focus();
-            self.dirty_frame = true;
-            return;
-        }
         if let Some(job) = self.export_job.as_mut() {
             // The tail is long enough: fade over a tenth of a second and
-            // keep everything rendered so far.
+            // keep everything rendered so far. Over the open sheet this is
+            // the render window's own abort.
             if !job.finished_early() {
                 job.finish();
                 self.status = format!("ending the export of {} - fading out", job.scene_name);
             }
             self.dirty_frame = true;
+            return;
+        }
+        if self.export_sheet.is_some() {
+            self.close_export_sheet();
             return;
         }
         self.dismiss_dialogs(Some(PanelKind::Export));
@@ -92,7 +91,11 @@ impl App {
             let hit = self.export_sheet.as_ref().and_then(|sheet| {
                 super::super::export::ExportSheetView::hit(sheet, self.frame, x, y)
             });
-            if let (Some(hit), Some(sheet)) = (hit, self.export_sheet.as_mut()) {
+            // Over a running bounce the settings face is not drawn, so its
+            // controls claim no clicks.
+            if self.export_job.is_none()
+                && let (Some(hit), Some(sheet)) = (hit, self.export_sheet.as_mut())
+            {
                 sheet.click(hit);
             }
             self.dirty_frame = true;
@@ -103,39 +106,64 @@ impl App {
 
     /// Returns true when the sheet consumed the key.
     pub(super) fn handle_export_key(&mut self, code: KeyCode, primary: bool, shift: bool) -> bool {
-        let Some(sheet) = self.export_sheet.as_mut() else {
+        if self.export_sheet.is_none() {
             return false;
-        };
-        if primary && shift && matches!(code, KeyCode::Char('x' | 'X')) {
-            self.export_sheet = None;
-            self.settle_focus();
-            self.dirty_frame = true;
+        }
+        // Over a running bounce the export chord is the render window's
+        // abort, so it falls through to the action, which ends the bounce
+        // early and keeps the file.
+        if primary && shift && matches!(code, KeyCode::Char('x' | 'X')) && self.export_job.is_none()
+        {
+            self.close_export_sheet();
             return true;
         }
         if primary {
             // Transport chords still belong to the transport.
             return false;
         }
+        if self.export_job.is_some() && !matches!(code, KeyCode::Esc) {
+            // No settings stand over a running bounce: the render face's
+            // hint says Esc runs on in the header, and the export chord
+            // ends it early and keeps the file.
+            self.dirty_frame = true;
+            return true;
+        }
+        let Some(sheet) = self.export_sheet.as_mut() else {
+            return false;
+        };
         match sheet.key(code, shift) {
             SheetAction::Nothing => {}
-            SheetAction::Close => {
-                self.export_sheet = None;
-                self.status = "export closed".into();
-                self.settle_focus();
-            }
+            SheetAction::Close => self.close_export_sheet(),
             SheetAction::Render => self.start_export(),
         }
         self.dirty_frame = true;
         true
     }
 
-    fn start_export(&mut self) {
-        let Some(mut sheet) = self.export_sheet.take() else {
-            return;
+    /// Close the export sheet. A bounce under it is not stopped: it runs
+    /// on, and the header carries its progress.
+    pub(super) fn close_export_sheet(&mut self) {
+        let running = self.export_job.is_some();
+        self.export_sheet = None;
+        self.status = if running {
+            "export closed - the bounce runs on, the header shows it".into()
+        } else {
+            "export closed".into()
         };
-        let settings = sheet.settings();
+        self.settle_focus();
+        self.dirty_frame = true;
+    }
+
+    fn start_export(&mut self) {
+        let (settings, scene_name, target) = match self.export_sheet.as_mut() {
+            Some(sheet) => {
+                let settings = sheet.settings();
+                (settings, sheet.scene_name.clone(), sheet.target.clone())
+            }
+            None => return,
+        };
         self.export_settings = settings;
-        self.remember_export_directory(&sheet.target.clone());
+        self.remember_export_directory(&target);
         let scene = self.scenes.current();
         let source = scene.editor.source().to_string();
         // What play runs, the bounce runs: both setups, global first, as
@@ -159,7 +187,7 @@ impl App {
             },
         };
         match ExportJob::start(
-            sheet.scene_name.clone(),
+            scene_name,
             score,
             settings,
             super::super::export::session_config(
@@ -169,7 +197,7 @@ impl App {
                 &self.prefs.import_origins,
                 self.csound_allowed,
             ),
-            sheet.target.clone(),
+            target,
         ) {
             Ok(job) => {
                 self.status = format!(
@@ -213,9 +241,17 @@ impl App {
             return;
         };
         let Some(outcome) = job.poll() else {
+            // The bounce runs: its progress moves, in the sheet's render
+            // face and in the header chip, so every poll draws again.
+            self.dirty_frame = true;
             return;
         };
         let job = self.export_job.take().expect("checked");
+        // The render window closes on its outcome, as a DAW's does, and
+        // the result lands on the status line.
+        if self.export_sheet.take().is_some() {
+            self.settle_focus();
+        }
         match outcome {
             Ok(seconds) => {
                 self.status = format!(
@@ -389,6 +425,76 @@ mod tests {
                 app.prefs.export_directory.as_deref(),
                 Some(bounces.to_string_lossy().as_ref())
             );
+        }
+
+        /// The sheet stays open over the bounce it starts, as a DAW's render
+        /// window does, and the keys change nothing while it runs.
+        #[test]
+        fn the_sheet_stays_open_over_its_bounce_and_esc_leaves_it_running() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            app.toggle_export_sheet();
+            assert!(app.handle_export_key(crossterm::event::KeyCode::Enter, false, false));
+            assert!(app.export_job.is_some(), "the bounce started");
+            assert!(app.export_sheet.is_some(), "the sheet stays open over it");
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Export));
+            // No setting stands while it runs: the key is taken and changes
+            // nothing, so a second Enter cannot start a second bounce.
+            assert!(app.handle_export_key(crossterm::event::KeyCode::Tab, false, false));
+            assert!(app.handle_export_key(crossterm::event::KeyCode::Enter, false, false));
+            let job = app.export_job.as_ref().expect("the one bounce");
+            assert!(!job.finished_early(), "Enter over the run changed nothing");
+            // Esc closes the sheet; the bounce runs on in the header.
+            assert!(app.handle_export_key(crossterm::event::KeyCode::Esc, false, false));
+            assert!(app.export_sheet.is_none());
+            assert!(app.export_job.is_some(), "the bounce runs on");
+            assert!(app.status.contains("runs on"), "{}", app.status);
+            let landed = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while app.export_job.is_some() && std::time::Instant::now() < landed {
+                app.poll_export();
+                if app.export_job.is_some() {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+            assert!(app.export_job.is_none(), "the bounce never landed");
+            assert!(app.status.starts_with("exported"), "{}", app.status);
+        }
+
+        /// The render window closes on its outcome, and the export chord
+        /// over it ends the bounce early, as the status says.
+        #[test]
+        fn the_render_window_closes_on_its_outcome_and_the_chord_ends_it_early() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            app.toggle_export_sheet();
+            assert!(app.handle_export_key(crossterm::event::KeyCode::Enter, false, false));
+            // The chord over the open render window ends the bounce, and
+            // leaves the window open to watch the fade land.
+            app.toggle_export_sheet();
+            assert!(app.export_sheet.is_some(), "the window stays for the fade");
+            assert!(
+                app.export_job
+                    .as_ref()
+                    .expect("still running")
+                    .finished_early()
+            );
+            assert!(app.status.contains("ending the export"), "{}", app.status);
+            let landed = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while app.export_job.is_some() && std::time::Instant::now() < landed {
+                app.poll_export();
+                if app.export_job.is_some() {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+            assert!(app.export_job.is_none(), "the bounce never landed");
+            assert!(
+                app.export_sheet.is_none(),
+                "the window closed with the outcome"
+            );
+            assert!(app.status.starts_with("exported"), "{}", app.status);
+            assert!(app.status.contains("ended early"), "{}", app.status);
         }
     }
 }

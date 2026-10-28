@@ -1253,7 +1253,10 @@ impl App {
                 .jobs_panel
                 .as_ref()
                 .map(|panel| (panel, inputs.background_jobs.as_slice())),
-            export: self.export_sheet.as_ref(),
+            export: self.export_sheet.as_ref().map(|sheet| view::ExportView {
+                sheet,
+                glance: inputs.export_glance.as_ref(),
+            }),
             theme_picker: self.theme_picker.as_ref(),
             set_panel: self.set_panel.as_ref(),
             set_prompt: self.set_prompt.as_ref().map(|(_, picker)| picker),

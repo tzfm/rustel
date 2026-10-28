@@ -89,6 +89,7 @@ use super::editor::{
     EditorEffect, EditorInput, HistoryMoment, KeyboardCapabilities, MemoryClipboard,
     PlatformClipboard, Revision, TerminalEventBatch, Transaction, VirtualRowSpec,
     composed_text_event, event_to_input_with_binds, is_plain_text_key_event, key_to_command,
+    sole_composed_character,
 };
 use super::engine::{DiagnosticAlert, Launch, LiveMaterial, StudioDiagnostic};
 use super::engine::{StudioConfig, StudioDeviceInfo, StudioDiagnosticLevel, StudioSnapshot};
@@ -1060,8 +1061,6 @@ struct App {
     /// re-learnt from there, so every surface asks the same table.
     keybinds: super::keybinds::Keybinds,
     vim_config: crate::vim_config::VimConfig,
-    /// Plain keys waiting for an insert mapping in a Vim text surface.
-    vim_insert_pending: String,
     /// This key came from remote control. A machine sends normal keys, not
     /// Vim modes, so the score reads it with its usual editing.
     remote_key_event: bool,
@@ -1762,7 +1761,6 @@ impl App {
             keybind_learn: None,
             keybinds: prefs.keybinds(),
             vim_config: crate::vim_config::VimConfig::default(),
-            vim_insert_pending: String::new(),
             remote_key_event: false,
             midi_cc_last: HashMap::new(),
             note_pressed_at: HashMap::new(),

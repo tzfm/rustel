@@ -808,6 +808,10 @@ impl Session {
                 match no_pattern {
                     NoPatternPolicy::Reject => Err(RuntimeError::NoPattern),
                     NoPatternPolicy::InstallSilence => {
+                        #[cfg(feature = "hydra")]
+                        self.stage_hydra_close_when_unstaged();
+                        // A mute draws nothing: stage the close, because the arm that
+                        // stages the recording was never reached by a failed evaluation.
                         Ok(EvaluatedScore::MiniFallback(rustel_core::silence()))
                     }
                 }
@@ -840,13 +844,15 @@ impl Session {
     }
 
     fn evaluate_with_fallback(
-        &self,
+        &mut self,
         source: &str,
         js_err: &str,
     ) -> Result<EvaluatedScore, RuntimeError> {
         // A score with no pattern installs silence, allowing a live edit to
         // mute the current part by commenting it out.
         if Self::score_holds_no_pattern_message(source, js_err).is_some() {
+            #[cfg(feature = "hydra")]
+            self.stage_hydra_close_when_unstaged();
             return Ok(EvaluatedScore::MiniFallback(rustel_core::silence()));
         }
         if let Some(mini_src) = extract_mini_fallback(source) {
@@ -854,7 +860,12 @@ impl Session {
                 .js
                 .with_runtime_settings(|| rustel_mini::mini(&mini_src))
             {
-                Ok(pattern) => Ok(EvaluatedScore::MiniFallback(pattern)),
+                Ok(pattern) => {
+                    #[cfg(feature = "hydra")]
+                    self.stage_hydra_close_when_unstaged();
+
+                    Ok(EvaluatedScore::MiniFallback(pattern))
+                }
                 Err(mini_err) => Err(RuntimeError::Message(format!(
                     "javascript eval failed ({js_err}); mini fallback also failed ({mini_err})"
                 ))),

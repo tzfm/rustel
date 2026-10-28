@@ -1222,6 +1222,13 @@ impl Session {
         }
     }
 
+    /// A score recovered from a failed evaluation draws nothing of its
+    /// own: close the picture, unless the evaluation already recorded one.
+    #[cfg(feature = "hydra")]
+    pub(crate) fn stage_hydra_close_when_unstaged(&mut self) {
+        self.staged_hydra.get_or_insert_with(Box::default);
+    }
+
     /// The visuals program a committed score installed, if there is a new one.
     ///
     /// Drained by whichever product surface owns the window, beside

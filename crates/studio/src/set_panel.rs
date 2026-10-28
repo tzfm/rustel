@@ -65,6 +65,11 @@ pub struct FileRow {
     pub dirty: bool,
     /// What its leading comments say about it, read off the file.
     pub meta: ScoreMeta,
+    /// When it was last saved, as the details block shows it. Read with
+    /// the folder, not on each redraw: a stat per redraw is invisible on
+    /// local disk and slow on a synced or network folder, where it lands
+    /// on every search keypress.
+    pub saved: Option<String>,
 }
 
 /// How many rows the details block at the panel's foot holds. Longer
@@ -189,6 +194,8 @@ impl SetPanel {
                     name: file.name,
                     path: file.path.clone(),
                     meta: ScoreMeta::read(&file.path),
+
+                    saved: saved_at(&file.path),
                     open: file.open,
                 }
             })
@@ -357,7 +364,7 @@ impl SetPanel {
                                 format!("@{key} {value}").trim_end().to_owned()
                             }),
                         );
-                        if let Some(saved) = saved_at(&file.path) {
+                        if let Some(saved) = &file.saved {
                             rows.push(format!("saved {saved}"));
                         }
                         rows
@@ -414,6 +421,18 @@ impl SetPanel {
         });
     }
 
+    /// Backspace over a filter standing: the box takes the keyboard back
+    /// and the key deletes from the query, as it does while typing - the
+    /// one key that must never reach the files under the panel.
+    pub fn resume_search(&mut self) {
+        if let Some(search) = self.search.as_mut() {
+            search.typing = true;
+            search.query.pop();
+        }
+        self.error = None;
+        self.refilter();
+    }
+
     /// The list, read against the filter again: the query changed.
     pub fn refilter(&mut self) {
         self.rebuild();
@@ -424,7 +443,8 @@ impl SetPanel {
     /// query grows. Enter leaves the filter standing and moves the
     /// selection to the first score it kept. Up and Down leave it
     /// standing and move. Esc drops the filter whole, and the list is
-    /// the folder's again. Anything else is the box's silence.
+    /// the folder's again. Each stand-down closes the box's Vim Insert
+    /// with it. Anything else is the box's silence.
     pub fn search_key(&mut self, code: KeyCode) {
         let mut refilter = false;
         match code {
@@ -446,6 +466,7 @@ impl SetPanel {
                 if let Some(search) = self.search.as_mut() {
                     search.typing = false;
                 }
+                self.vim_insert = false;
                 // Enter reads as "go there": the cursor lands on the
                 // first score the filter kept.
                 if let Some(first) = self
@@ -460,10 +481,12 @@ impl SetPanel {
                 if let Some(search) = self.search.as_mut() {
                     search.typing = false;
                 }
+                self.vim_insert = false;
                 self.move_by(if code == KeyCode::Up { -1 } else { 1 });
             }
             KeyCode::Esc => {
                 self.search = None;
+                self.vim_insert = false;
                 refilter = true;
             }
             _ => {}
@@ -734,8 +757,8 @@ fn readable_stamp(stamp: &str) -> Option<String> {
     ))
 }
 
-/// When the file was last saved, read off its mtime the moment details
-/// are opened: `Sep 24 03:15:30`. None when the file cannot be asked.
+/// When the file was last saved, read off its mtime when the panel
+/// reads the folder: `Sep 24 03:15:30`. None when the file cannot be asked.
 fn saved_at(path: &Path) -> Option<String> {
     let seconds = std::fs::metadata(path)
         .ok()?
@@ -803,6 +826,11 @@ pub struct SetPanelView<'a> {
     pub on_right: bool,
     pub focused: bool,
     pub keybinds: &'a super::keybinds::Keybinds,
+    /// Whether the studio's caret is lit this frame: the search box's
+    /// caret blinks in step with it, and a query with no match blinks
+    /// with it too, so the panel moves the way the rest of the studio
+    /// does.
+    pub caret_lit: bool,
 }
 
 impl ratatui::widgets::Widget for SetPanelView<'_> {
@@ -1027,24 +1055,45 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
             }
         } else if let Some(search) = &self.panel.search {
             // The search row, in the reference panel's look: what the
-            // filter holds, and in vim's command mode over an empty
-            // query, the way in.
-            let row = if search.typing
-                && search.query.is_empty()
-                && !self.panel.vim_insert
-                && self.keybinds.editor_keybindings() == super::editor::EditorKeybindings::Vim
-            {
-                "search: i or a types".to_owned()
-            } else {
+            // filter holds, with a caret while it types the way the
+            // picker's field does. A query with no match says so in the
+            // find bar's words, and blinks with the studio's caret, so a
+            // forgotten filter is not mistaken for an empty folder.
+            use unicode_width::UnicodeWidthStr;
+            let answers = self
+                .panel
+                .lines
+                .iter()
+                .any(|line| matches!(line, SetLine::File(_)));
+            let row = if answers {
                 format!("search: {}", search.query)
+            } else {
+                format!("search: {} · no match", search.query)
             };
+            let caret = "search: ".len() + search.query.width();
+            let room = usize::from(error.width);
             buffer.set_stringn(
                 error.x,
                 error.y,
                 &row,
-                usize::from(error.width),
-                Style::default().fg(theme.foreground),
+                room,
+                Style::default().fg(if answers {
+                    theme.foreground
+                } else if self.caret_lit {
+                    theme.error
+                } else {
+                    theme.muted
+                }),
             );
+            if self.panel.search_typing() && caret < room {
+                // The caret as a reversed cell, over the character it
+                // stands before - or the space after the text, as the
+                // picker's field draws it.
+                buffer.set_style(
+                    Rect::new(error.x + caret as u16, error.y, 1, 1),
+                    Style::default().add_modifier(Modifier::REVERSED),
+                );
+            }
         }
         if self.panel.error.is_none()
             && self.panel.deleting.is_none()
@@ -1072,7 +1121,11 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
         let live_tape_hint = format!("{reveal} reveal · n new first");
         let folder_hint = format!("{reveal} reveal · +/- size");
         let hints = if self.panel.search_typing() {
-            ["Enter keep · Esc drop", "type to filter the scores"]
+            if self.panel.vim_insert {
+                ["Enter keeps the filter", "Esc leaves insert"]
+            } else {
+                ["Enter keeps the filter", "Esc clears the filter"]
+            }
         } else if self.panel.unsaved.is_some() {
             ["Enter retry · Del leave", "Esc keep the set"]
         } else if let Some(tape) = self.panel.selected_tape() {
@@ -1269,8 +1322,23 @@ mod selection_tests {
             rows.join("\n")
         );
         assert!(
-            rows.iter().any(|row| row.contains("Enter keep · Esc drop")),
+            rows.iter()
+                .any(|row| row.contains("Enter keeps the filter")),
             "the box's hints stand in for the row hints:\n{}",
+            rows.join("\n")
+        );
+        panel.vim_insert = true;
+        let rows = rendered_rows(&panel, AREA, true);
+        assert!(
+            rows.iter().any(|row| row.contains("Esc leaves insert")),
+            "in Insert the hints say what the first Esc does:\n{}",
+            rows.join("\n")
+        );
+        panel.vim_insert = false;
+        let rows = rendered_rows(&panel, AREA, true);
+        assert!(
+            rows.iter().any(|row| row.contains("Esc clears the filter")),
+            "out of Insert the hints say what the second Esc does:\n{}",
             rows.join("\n")
         );
         panel.search_key(KeyCode::Enter);
@@ -1278,6 +1346,99 @@ mod selection_tests {
         let rows = rendered_rows(&panel, AREA, true);
         assert!(rows.iter().all(|row| !row.contains("search: ")));
         assert!(rows.iter().any(|row| row.contains("could not open")));
+    }
+
+    /// The search row says when a query matches nothing, in the find
+    /// bar's words, and moves with the studio: the row blinks between
+    /// the error and muted colours with the caret's phase, so a
+    /// forgotten filter cannot read as an empty folder, and while the
+    /// box types a reversed cell stands where the next character lands,
+    /// the way the picker's field draws it.
+    #[test]
+    fn the_search_row_blinks_with_no_match_and_shows_a_caret() {
+        use ratatui::widgets::Widget;
+        let directory = tempfile::tempdir().unwrap();
+        let mut panel = panel_with_a_tape(directory.path());
+        panel.open_search();
+        for character in "zz".chars() {
+            panel.search_key(KeyCode::Char(character));
+        }
+        assert!(
+            !panel
+                .lines
+                .iter()
+                .any(|line| matches!(line, SetLine::File(_))),
+            "the query answers nothing the folder holds"
+        );
+
+        let theme = Theme::built_in_default();
+        let draw = |panel: &SetPanel, caret_lit: bool| {
+            let mut buffer = Buffer::empty(AREA);
+            SetPanelView {
+                panel,
+                theme: &theme,
+                sidebar: AREA,
+                on_right: true,
+                focused: true,
+                keybinds: &crate::keybinds::Keybinds::default(),
+                caret_lit,
+            }
+            .render(AREA, &mut buffer);
+            let texts: Vec<String> = (0..AREA.height)
+                .map(|y| (0..AREA.width).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect();
+            let row = texts
+                .iter()
+                .position(|row| row.contains("search: zz"))
+                .expect("the search row");
+            // `find` hands back a byte offset, and the rule's "│" is three
+            // bytes wide, so count characters for the cell column.
+            let byte = texts[row]
+                .find("search")
+                .expect("where the row's text starts");
+            let start = texts[row][..byte].chars().count();
+            let cells: Vec<_> = (0..AREA.width)
+                .map(|x| buffer[(x, row as u16)].clone())
+                .collect();
+            (texts[row].clone(), start, cells)
+        };
+
+        // The box typing: the row says no match, blinks between
+        // the colours, and the caret cell is reversed at the caret's
+        // place - just past the query.
+        let (row, start, cells) = draw(&panel, true);
+        assert!(row.contains("no match"), "{row}");
+        assert!(
+            cells[start].style().fg == Some(theme.error),
+            "the lit phase shows the row in the error colour"
+        );
+        let (_, _, cells) = draw(&panel, false);
+        assert!(
+            cells[start].style().fg == Some(theme.muted),
+            "the dark phase rests the row in the muted colour"
+        );
+        let (_, _, cells) = draw(&panel, true);
+        let caret = start + "search: ".len() + "zz".len();
+        assert!(
+            cells[caret]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED),
+            "the caret stands just past the query: row {row}"
+        );
+
+        // The filter standing: the row keeps blinking, the caret rests.
+        panel.search_key(KeyCode::Enter);
+        let (row, start, cells) = draw(&panel, true);
+        assert!(row.contains("no match"), "{row}");
+        assert!(cells[start].style().fg == Some(theme.error));
+        assert!(
+            cells.iter().all(|cell| !cell
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED)),
+            "nothing is reversed while the box does not type"
+        );
     }
 }
 
@@ -1304,6 +1465,7 @@ mod tests {
             on_right: true,
             focused,
             keybinds: &crate::keybinds::Keybinds::default(),
+            caret_lit: true,
         }
         .render(area, &mut buffer);
         (0..area.height)
@@ -1574,6 +1736,7 @@ mod tests {
                 on_right: false,
                 focused: true,
                 keybinds: &crate::keybinds::Keybinds::default(),
+                caret_lit: true,
             }
             .render(area, &mut buffer);
             (0..area.height)

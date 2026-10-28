@@ -65,6 +65,13 @@ impl VimTextSurface for SetPanel {
 
     fn set_insert(&mut self, insert: bool) {
         self.vim_insert = insert;
+        // The box types exactly while it is in Insert: the keyboard it
+        // takes and the one it gives back move together, so `/`, i, and
+        // a retype, and Esc hands the list its keys back with the
+        // filter standing.
+        if let Some(search) = self.search.as_mut() {
+            search.typing = insert;
+        }
     }
 }
 
@@ -162,7 +169,6 @@ pub(crate) fn focus_changed(app: &mut App) {
     if !super::enabled(app) {
         return;
     }
-    super::mappings::reset(app);
     let insert = anchored(app);
     if let Some(surface) = surface_mut(app) {
         surface.set_insert(insert);
@@ -175,7 +181,6 @@ pub(crate) fn enter_insert(app: &mut App) {
     if !super::enabled(app) {
         return;
     }
-    super::mappings::reset(app);
     if let Some(surface) = surface_mut(app)
         && surface.text_wanted()
         && !surface.anchored()
@@ -190,7 +195,6 @@ pub(crate) fn leave_insert(app: &mut App) {
     if let Some(surface) = surface_mut(app) {
         surface.set_insert(false);
     }
-    super::mappings::reset(app);
     app.status = "command mode - i or a types".into();
     app.dirty_frame = true;
 }
@@ -209,17 +213,18 @@ enum TextAction {
     Paste,
     Arrow(PanelKind, KeyCode),
     EnterInsert,
-    /// Feed a plain character to the insert mapping table.
-    InsertKey,
-    /// A mapping prefix waited for a key this field cannot map.
-    FlushThenIgnored,
-    /// Flush a mapping prefix, then leave Insert for Command.
-    FlushThenCommand,
+    /// A character for the field, typed at once.
+    Type(char),
+    /// Leave Insert for Command.
+    Command,
 }
 
-/// The modal keys of a search box. `i` and `a` enter Insert, `p` pastes the
+/// The modal keys of a search box. `i`, `a`, and `/` enter Insert, `p` pastes the
 /// clipboard, Esc returns to Command, and Command keeps j k h l for the
-/// list and every other letter out of the query.
+/// list and every other letter out of the query. Insert types every letter
+/// at once, the way Vim's command line does: the score's insert mappings
+/// never reach a search box, so `jk` stays two letters rather than
+/// leaving Insert.
 pub(crate) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
     if key.kind == KeyEventKind::Release
         || matches!(key.code, KeyCode::Modifier(_))
@@ -237,7 +242,7 @@ pub(crate) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
         }
         if surface.insert() {
             if key.code == KeyCode::Esc && key.modifiers.is_empty() {
-                TextAction::FlushThenCommand
+                TextAction::Command
             } else if let KeyCode::Char(character) = key.code
                 && !character.is_control()
                 && !key.modifiers.intersects(
@@ -248,10 +253,13 @@ pub(crate) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
                         | KeyModifiers::META,
                 )
             {
-                // Insert text, or a mapping first, through one table.
-                TextAction::InsertKey
+                // Insert types at once, the way Vim's own command line
+                // does: the insert mappings of the score's engine do not
+                // reach a search box, so no letter waits for a `jk` that
+                // might follow it.
+                TextAction::Type(character)
             } else {
-                TextAction::FlushThenIgnored
+                TextAction::Ignored
             }
         } else if key.modifiers.intersects(
             KeyModifiers::CONTROL
@@ -262,8 +270,19 @@ pub(crate) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
         ) {
             TextAction::Ignored
         } else {
+            // The set panel shows this only over an open search box,
+            // where `/` retypes the standing query. The other surfaces
+            // take `/` as one more way into Insert, which the standing
+            // hint already covers.
+            let typing_hint = match surface.panel_kind() {
+                PanelKind::Set => "press i or a to type, or / to retype",
+                _ => "press i or a to type",
+            };
             match key.code {
                 KeyCode::Char('i' | 'a') => TextAction::EnterInsert,
+                // `/` retypes: the key that opened the box takes it
+                // back up, the way Vim's own search does.
+                KeyCode::Char('/') => TextAction::EnterInsert,
                 // Vim's paste, into the search or the field the form edits.
                 KeyCode::Char('p') => TextAction::Paste,
                 // Space keeps its surface meaning, such as auditioning
@@ -271,13 +290,13 @@ pub(crate) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
                 // none, it is text and Command keeps it out.
                 KeyCode::Char(' ') if surface.space_command() => TextAction::Ignored,
                 KeyCode::Char(' ') | KeyCode::Backspace | KeyCode::Delete => {
-                    TextAction::Message("press i or a to type")
+                    TextAction::Message(typing_hint)
                 }
                 KeyCode::Char(character) if !character.is_control() => {
                     if let Some(alias) = alias {
                         TextAction::Arrow(surface.panel_kind(), alias.code)
                     } else {
-                        TextAction::Message("press i or a to type")
+                        TextAction::Message(typing_hint)
                     }
                 }
                 _ => TextAction::Ignored,
@@ -285,18 +304,13 @@ pub(crate) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
         }
     };
     match action {
-        TextAction::Ignored => {
-            super::mappings::reset(app);
-            VimTextKey::Ignored
-        }
+        TextAction::Ignored => VimTextKey::Ignored,
         TextAction::Message(message) => {
-            super::mappings::reset(app);
             app.status = message.into();
             app.dirty_frame = true;
             VimTextKey::Consumed
         }
         TextAction::Paste => {
-            super::mappings::reset(app);
             let text = app.clipboard.get_text().unwrap_or_default();
             if text.is_empty() {
                 app.status = "the clipboard has no text".into();
@@ -306,26 +320,21 @@ pub(crate) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
             app.dirty_frame = true;
             VimTextKey::Consumed
         }
-        TextAction::Arrow(kind, code) => {
-            super::mappings::reset(app);
-            VimTextKey::Arrow(kind, code)
-        }
+        TextAction::Arrow(kind, code) => VimTextKey::Arrow(kind, code),
         TextAction::EnterInsert => {
             enter_insert(app);
             app.status = "insert mode - Esc returns to command".into();
             app.dirty_frame = true;
             VimTextKey::Consumed
         }
-        TextAction::InsertKey => {
-            let _ = super::mappings::insert_key(app, key);
+        TextAction::Type(character) => {
+            let typed = app.paste_to_prompt(&character.to_string());
+            if typed {
+                app.dirty_frame = true;
+            }
             VimTextKey::Consumed
         }
-        TextAction::FlushThenIgnored => {
-            super::mappings::flush(app);
-            VimTextKey::Ignored
-        }
-        TextAction::FlushThenCommand => {
-            super::mappings::flush(app);
+        TextAction::Command => {
             leave_insert(app);
             VimTextKey::Consumed
         }
@@ -694,40 +703,34 @@ mod tests {
     }
 
     #[test]
-    fn an_insert_mapping_leaves_the_search_in_command() {
+    fn insert_types_every_letter_at_once_with_no_mapping_wait() {
         let (_directory, mut app) = vim_app();
+        // The shipped `inoremap jk <Esc>` among the mappings: made for the
+        // score, where it leaves Insert. A search box is a command line,
+        // and Vim's command line does not read insert mappings.
         app.vim_config.set_mappings_for_test(
-            crate::vim_config::VimMappings::parse("inoremap jk <Esc>\n").expect("mapping"),
+            crate::vim_config::VimMappings::parse("inoremap jk <Esc>\ninoremap ,, ()\n")
+                .expect("mappings"),
         );
         press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
         let panel = app.reference_panel.as_ref().expect("panel");
-        assert_eq!(panel.chord_query, "", "j waits for the mapping");
-        assert!(panel.vim_insert(), "still Insert while it waits");
+        assert_eq!(panel.chord_query, "j", "j typed at once, not held for a k");
+        assert!(panel.vim_insert(), "still Insert");
 
         press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
         let panel = app.reference_panel.as_ref().expect("panel");
-        assert!(!panel.vim_insert(), "jk leaves Insert");
-        assert_eq!(panel.chord_query, "", "jk never reached the query");
-        assert!(app.status.contains("command mode"), "{}", app.status);
+        assert!(panel.vim_insert(), "jk stays two letters, not Esc");
+        assert_eq!(panel.chord_query, "jk", "both letters reached the query");
 
-        // A replacement with text types it and stays in Insert.
-        app.vim_config.set_mappings_for_test(
-            crate::vim_config::VimMappings::parse("inoremap ,, ()\n").expect("mapping"),
-        );
-        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        // A mapping that types text is held to the score as well: the box
+        // reads the keys it is given.
         press(&mut app, KeyCode::Char(','), KeyModifiers::NONE);
         press(&mut app, KeyCode::Char(','), KeyModifiers::NONE);
-        let panel = app.reference_panel.as_ref().expect("panel");
-        assert_eq!(panel.chord_query, "()", "the replacement typed");
-        assert!(panel.vim_insert(), "text mappings stay in Insert");
-
-        // A prefix that starts nothing types once it is settled.
-        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
-        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
         assert_eq!(
             app.reference_panel.as_ref().expect("panel").chord_query,
-            "()jx"
+            "jk,,",
+            "no replacement stood in for the keys"
         );
     }
 

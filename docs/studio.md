@@ -18,8 +18,17 @@ parent folder must exist.
 A path given to File > Open set can be a Strudel pattern export: a `.json`
 object that holds one pattern of code per entry. Such a file is not a set on
 disk, so Studio makes a set of it. The new set folder sits beside the others and
-takes its name from the export file. One score is written per entry, and a
-score that carries a `@title` field takes it as its file name.
+takes its name from the export file. One score is written per entry. A score
+that carries a `@title` field takes it as its file name, an entry keyed by a
+name takes the key, and the rest are numbered `pattern 1`, `pattern 2` and so on
+in the order the patterns were made. The open-set prompt offers these exports
+beside the sets, and File > Import patterns does the same import into
+the set already open: one score file an entry lands in the set's folder, and a
+name the set already holds is skipped and counted, never overwritten. File >
+Export patterns writes the set's scores the other way: one pattern export at
+the sets root, keyed by name, the score on screen as it stands with its
+unsaved edits, and the export loads in strudel.cc and in the open-set prompt
+alike.
 
 Type or paste a score, then press **Ctrl+S** or **F5**. Press **Ctrl+G** or **F8**
 to stop. Editing does not change the playing score until you update it. If an
@@ -189,8 +198,14 @@ filter keys.
 Press `/` to filter the scores: type, and the panel hides the scores the query
 does not answer. A query matches a name or any `@` field value. Enter leaves
 the filter standing and moves to the first match. Esc restores the full list.
-The sessions fold is never filtered. In vim mode the box rests in command
-mode: press `i` or `a` to type.
+The sessions fold is never filtered. The box shows its caret while it types.
+When the query matches nothing, the row says no match and blinks, so an empty
+list cannot read as an empty folder. While a filter stands, Backspace takes the
+box back up and deletes from the query. It never starts a delete of a file. In
+vim mode `/` opens the box typing, as Vim's own search does. Every letter types
+at once, `j` and `k` included: the insert mappings of the score do not reach
+the box. Esc leaves typing, and `j k h l` walk the list again. Press `i` or
+`a` to type.
 
 Delete asks for confirmation before it removes a file. Confirming also discards
 its unsaved edits. Studio does not delete the last score or the active session

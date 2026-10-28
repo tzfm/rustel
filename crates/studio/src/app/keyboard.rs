@@ -435,17 +435,32 @@ impl App {
         result
     }
 
+    /// Whether the text a terminal composed for an Option key spells the
+    /// Alt chord over typing. Only an exotic one-character composition
+    /// does: the US Option+2, ™, is no character anyone types. A plain
+    /// ASCII one steps aside, because on a Swedish layout Option+2 is the
+    /// one way to type @, and a longer composition pastes.
+    fn composition_spells_the_chord(text: &str) -> bool {
+        sole_composed_character(text).is_some_and(|character| !character.is_ascii())
+    }
+
     /// Recover an Option panel chord from the composed character a terminal
     /// sends. Only where the focused surface answers to that Option letter,
     /// so the same character types normally everywhere else.
+    ///
+    /// A terminal that carries the keyboard protocol reports Alt itself, in
+    /// the key the composition rides, so no terminal table is needed for
+    /// that spelling: the protocol is the fact. A legacy terminal sends the
+    /// composed character alone, and the table below reads it.
     fn option_panel_spelling(&self, event: Event) -> Event {
         match &event {
-            Event::KeyWithText { key, .. }
+            Event::KeyWithText { key, text }
                 if key.modifiers == KeyModifiers::ALT
                     && let KeyCode::Char(letter) = key.code =>
             {
                 let letter = letter.to_ascii_lowercase();
-                if self.alt_panel_action_applies(letter) && self.keybinds.composes_option(letter) {
+                if self.alt_panel_action_applies(letter) && Self::composition_spells_the_chord(text)
+                {
                     return Event::Key(KeyEvent::new_with_kind_and_state(
                         KeyCode::Char(letter),
                         KeyModifiers::ALT,
@@ -1083,6 +1098,22 @@ impl App {
             && !shift
             && let KeyCode::Char(digit) = key.code
             && self.strip_digit_applies(digit)
+        {
+            self.select_strip_by_number((digit as u8 - b'0') as usize);
+            return true;
+        }
+        // Ctrl with Shift spells the same selection where Option types
+        // real characters, as the Swedish layout's Option row does for
+        // five of the nine digits: Ctrl composes nothing on any layout,
+        // so this spelling holds on every one of them. Unlike the Alt
+        // digit, a chord the keybind table learns over the key retires
+        // it, the way every other primary chord retires.
+        if primary
+            && shift
+            && !alt
+            && let KeyCode::Char(digit) = key.code
+            && self.strip_digit_applies(digit)
+            && !self.key_is_a_learnt_chord(key)
         {
             self.select_strip_by_number((digit as u8 - b'0') as usize);
             return true;
@@ -2917,6 +2948,52 @@ mod tests {
             );
         }
 
+        /// Ctrl with Shift spells the same selection where Option types
+        /// real characters, as the Swedish layout's Option row does, and a
+        /// chord learnt over the key retires it.
+        #[test]
+        fn a_ctrl_shift_digit_selects_the_strip_score_and_retires() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_with_two_scores(directory.path());
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            press(
+                &mut app,
+                KeyCode::Char('1'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            );
+            assert_eq!(
+                app.scenes.current().name(),
+                "first",
+                "Ctrl+Shift+1 selected from vim Normal"
+            );
+            press(
+                &mut app,
+                KeyCode::Char('2'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            );
+            assert_eq!(
+                app.scenes.current().name(),
+                "second",
+                "Ctrl+Shift+2 selected too"
+            );
+            // A chord learnt over the key takes it back: the press now
+            // comments the line instead of selecting a score.
+            let chord =
+                crate::keybinds::KeyCombo::parse("ctrl+shift+1").expect("a parseable chord");
+            app.keybinds.learn(BindAction::ToggleComment, Some(chord));
+            press(
+                &mut app,
+                KeyCode::Char('1'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            );
+            assert_eq!(
+                app.scenes.current().name(),
+                "second",
+                "the learnt chord retired the strip digit"
+            );
+        }
+
         /// The find bar keeps its digits: the chord waits until it is shut.
         #[test]
         fn the_find_bar_keeps_its_keys() {
@@ -2967,6 +3044,42 @@ mod tests {
                 app.editor().find_footer_label()
             );
             assert_eq!(app.scenes.current().name(), "first");
+        }
+
+        /// A terminal that carries the keyboard protocol reports the Alt
+        /// key itself, with the composition riding beside it. The exotic
+        /// composition gives up the chord, with no terminal table at all.
+        /// A plain ASCII one keeps typing, because on a Swedish layout
+        /// Option+2 is the one way to type @.
+        #[test]
+        fn a_protocols_composed_digit_recovers_the_chord() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_with_two_scores(directory.path());
+            app.handle_terminal_event(Event::KeyWithText {
+                key: KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT),
+                text: "¡".into(),
+            })
+            .expect("composed digit");
+            assert_eq!(
+                app.scenes.current().name(),
+                "first",
+                "the protocol's Alt+1 reached the strip"
+            );
+            app.handle_terminal_event(Event::KeyWithText {
+                key: KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
+                text: "@".into(),
+            })
+            .expect("composed digit");
+            assert_eq!(
+                app.scenes.current().name(),
+                "first",
+                "the plain composition did not reach the strip"
+            );
+            assert!(
+                app.editor().source().contains('@'),
+                "the plain composition typed: {:?}",
+                app.editor().source()
+            );
         }
     }
 
@@ -4057,6 +4170,32 @@ mod tests {
             )))
             .unwrap();
             assert!(app.reveal_pending.is_none(), "{}", app.status);
+            // SAFETY: give the environment back before other tests run.
+            unsafe { std::env::remove_var(crate::reveal::HEADLESS_ENV) };
+        }
+
+        /// A terminal that carries the keyboard protocol composes Alt+O
+        /// into `ø` as well, but reports the Alt bit beside it. The chord
+        /// still reveals the set panel's selected file, with no terminal
+        /// table behind it.
+        #[test]
+        fn a_protocols_composed_option_o_still_reveals_the_set_panels_selection() {
+            // SAFETY: process-global environment, held only by this test
+            // while the studio suite runs one test at a time.
+            unsafe { std::env::set_var(crate::reveal::HEADLESS_ENV, "1") };
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_for(directory.path(), "Ghostty", true);
+            action(&mut app, BindAction::SetPanel);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Set));
+            assert!(app.set_prompt.is_none(), "{}", app.status);
+            app.status.clear();
+            app.handle_terminal_event(Event::KeyWithText {
+                key: KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT),
+                text: "ø".into(),
+            })
+            .unwrap();
+            assert!(app.reveal_pending.is_some(), "{}", app.status);
+            assert!(app.status.starts_with("opening"), "{}", app.status);
             // SAFETY: give the environment back before other tests run.
             unsafe { std::env::remove_var(crate::reveal::HEADLESS_ENV) };
         }

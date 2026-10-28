@@ -297,6 +297,13 @@ pub fn event_to_input_with_binds(
     }
 }
 
+/// The one character a terminal composed for a key, when it composed
+/// exactly one. A longer composition and none are left to their caller.
+pub fn sole_composed_character(text: &str) -> Option<char> {
+    let mut characters = text.chars();
+    characters.next().filter(|_| characters.next().is_none())
+}
+
 /// Use the text the terminal reports for a composed key.
 ///
 /// A composed key carries its text, such as Option+4 making `$`. One
@@ -307,9 +314,8 @@ pub fn composed_text_event(event: Event) -> Event {
         Event::KeyWithText { key, text }
             if key.kind != KeyEventKind::Release && matches!(key.code, KeyCode::Char(_)) =>
         {
-            let mut characters = text.chars();
-            match (characters.next(), characters.next()) {
-                (Some(character), None) if !character.is_control() => {
+            match sole_composed_character(&text) {
+                Some(character) if !character.is_control() => {
                     Event::Key(KeyEvent::new_with_kind_and_state(
                         KeyCode::Char(character),
                         KeyModifiers::NONE,
@@ -317,8 +323,9 @@ pub fn composed_text_event(event: Event) -> Event {
                         key.state,
                     ))
                 }
-                (Some(_), Some(_)) => Event::Paste(text),
-                _ => Event::Key(key),
+                Some(_) => Event::Key(key),
+                None if !text.is_empty() => Event::Paste(text),
+                None => Event::Key(key),
             }
         }
         Event::KeyWithText { key, .. } => Event::Key(key),

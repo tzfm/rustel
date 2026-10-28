@@ -1292,17 +1292,6 @@ impl Keybinds {
         !self.suppressed_hints.contains(&(key.code, key.modifiers))
     }
 
-    /// Whether this terminal's Option composes the letter into text, and
-    /// the panel recovers the Alt chord from it.
-    pub(crate) fn composes_option(&self, letter: char) -> bool {
-        !self.reach.terminal.is_empty()
-            && super::terminal::profiles::alt_input_limitation(
-                &self.reach.terminal,
-                &format!("alt+{letter}"),
-            )
-            .is_some()
-    }
-
     /// The Option letter a composed character stands for on this terminal.
     pub(crate) fn option_letter_for(&self, character: char) -> Option<char> {
         if self.reach.terminal.is_empty() {
@@ -2864,7 +2853,6 @@ mod tests {
             enhanced: false,
             terminal: "iTerm2".into(),
         });
-        assert!(binds.composes_option('t'));
         assert_eq!(binds.option_letter_for('†'), Some('t'));
         assert_eq!(binds.hint(BindAction::TrimSample), shortcut_label("Alt+T"));
         assert_eq!(
@@ -2876,7 +2864,6 @@ mod tests {
             enhanced: false,
             terminal: "Ghostty".into(),
         });
-        assert!(!binds.composes_option('t'));
         assert_eq!(binds.option_letter_for('†'), None);
     }
 

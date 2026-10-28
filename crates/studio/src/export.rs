@@ -585,6 +585,19 @@ pub struct ExportGlance {
     pub peaks: [f32; SCOPE_COLUMNS],
 }
 
+/// The peaks of a render in progress, as one line of block heights: the
+/// picture a DAW's render window gives of what it is writing.
+pub(crate) fn scope_line(peaks: &[f32; SCOPE_COLUMNS]) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    peaks
+        .iter()
+        .map(|peak| {
+            let level = peak.clamp(0.0, 1.0).sqrt();
+            BARS[((level * 7.0).round() as usize).min(7)]
+        })
+        .collect()
+}
+
 /// Snapshot the host default and any persisted score override for an isolated
 /// export. Re-evaluating source text can then override this inherited value.
 /// The export imports scripts from the origins of the permissions page, and
@@ -897,6 +910,11 @@ pub struct ExportSheetView<'a> {
     pub theme: &'a Theme,
     /// Vim text modes own the fields and the list keys.
     pub vim: bool,
+    /// The bounce the sheet stays open over, when one runs: the sheet
+    /// turns from its settings to the render's progress.
+    pub exporting: Option<&'a ExportGlance>,
+    /// The chord that ends the bounce early, as the keybind table spells it.
+    pub export_hint: &'a str,
 }
 
 impl ExportSheetView<'_> {
@@ -1029,6 +1047,55 @@ impl Widget for ExportSheetView<'_> {
         );
         let x = panel.x + 2;
         let width = usize::from(panel.width.saturating_sub(4));
+        if let Some(glance) = self.exporting {
+            // The render face, as a DAW's render window shows a render: how
+            // far it is, and whether there is still anything to hear.
+            let seconds = glance.seconds.max(0.0) as u64;
+            let how_far = match glance.percent {
+                Some(percent) => format!("{percent}%"),
+                None => format!("{}:{:02}", seconds / 60, seconds % 60),
+            };
+            buffer.set_stringn(
+                x,
+                panel.y + 1,
+                format!("rendering {} · {}", glance.scene_name, how_far),
+                width,
+                Style::default().fg(theme.foreground),
+            );
+            // A bar asks for a ceiling nobody chose with an open end, so
+            // there the moving scope alone carries the picture.
+            if let Some(percent) = glance.percent {
+                let filled = ((width as f64) * f64::from(percent) / 100.0).round() as usize;
+                let filled = filled.min(width);
+                let bar = format!("{}{}", "█".repeat(filled), "░".repeat(width - filled),);
+                buffer.set_stringn(
+                    x,
+                    panel.y + 2,
+                    bar,
+                    width,
+                    Style::default().fg(theme.accent),
+                );
+            }
+            buffer.set_stringn(
+                x,
+                panel.y + 3,
+                scope_line(&glance.peaks),
+                width,
+                Style::default().fg(theme.accent),
+            );
+            let hint = format!(
+                "{} ends it early and keeps the file · Esc runs on in the header",
+                self.export_hint
+            );
+            buffer.set_stringn(
+                x,
+                panel.bottom().saturating_sub(2),
+                &hint,
+                width,
+                Style::default().fg(theme.muted),
+            );
+            return;
+        }
         let label = |buffer: &mut Buffer, y: u16, text: &str| {
             buffer.set_stringn(x, y, text, width, Style::default().fg(theme.muted));
         };
@@ -1435,6 +1502,8 @@ mod tests {
                 sheet,
                 theme: &theme,
                 vim,
+                exporting: None,
+                export_hint: "Ctrl+Shift+E",
             }
             .render(area, &mut buffer);
             (0..area.height)
@@ -1464,6 +1533,71 @@ mod tests {
         let insert = render(&sheet, true);
         assert!(insert.contains("VIM INSERT"), "{insert}");
         assert!(insert.contains("Esc returns to Command"), "{insert}");
+    }
+
+    /// The sheet over a running bounce is the render window: how far, a
+    /// bar under a chosen ceiling, a moving scope, and the way out.
+    #[test]
+    fn the_sheet_draws_the_render_over_its_bounce() {
+        let theme = Theme::default();
+        let sheet = ExportSheet::open(
+            "drums".into(),
+            ExportSettings::default(),
+            Path::new("exports"),
+            0,
+        );
+        let area = Rect::new(0, 0, 100, 20);
+        let render = |glance: Option<&ExportGlance>| {
+            let mut buffer = Buffer::empty(area);
+            ExportSheetView {
+                sheet: &sheet,
+                theme: &theme,
+                vim: false,
+                exporting: glance,
+                export_hint: "Ctrl+Shift+E",
+            }
+            .render(area, &mut buffer);
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut peaks = [0.0f32; SCOPE_COLUMNS];
+        peaks.fill(0.25);
+        let bounded = ExportGlance {
+            scene_name: "drums".into(),
+            seconds: 6.0,
+            percent: Some(42),
+            peaks,
+        };
+        let text = render(Some(&bounded));
+        assert!(text.contains("rendering drums · 42%"), "{text}");
+        assert!(text.contains('█'), "{text}");
+        assert!(text.contains('░'), "{text}");
+        assert!(text.contains("▅▅▅▅"), "{text}");
+        assert!(
+            text.contains("Ctrl+Shift+E ends it early and keeps the file"),
+            "{text}"
+        );
+        assert!(text.contains("Esc runs on in the header"), "{text}");
+        assert!(!text.contains("Enter renders"), "{text}");
+
+        // An open end has no ceiling anyone chose, so no bar and no
+        // percent: the clock and the moving scope carry the picture.
+        let open = ExportGlance {
+            scene_name: "drums".into(),
+            seconds: 67.0,
+            percent: None,
+            peaks,
+        };
+        let text = render(Some(&open));
+        assert!(text.contains("rendering drums · 1:07"), "{text}");
+        assert!(!text.contains('%'), "{text}");
+        assert!(!text.contains('░'), "{text}");
     }
 
     #[test]
