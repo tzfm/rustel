@@ -2545,7 +2545,7 @@ mod tests {
             assert_eq!(app.scenes.directory(), sets.join("gig"));
         }
 
-        /// File > Import Strudel patterns… reads an export into the set
+        /// File > Import patterns… reads an export into the set
         /// already open: one named score file an entry, in the set's own
         /// folder with no tab taken up, and a name the set already holds
         /// skipped and counted, never overwritten. The same file twice

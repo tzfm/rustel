@@ -1403,7 +1403,7 @@ pub fn menus(cx: &MenuContext) -> Vec<Menu> {
             MenuItem::action(MenuAction::OpenRecent, "Open recent\u{2026}", 'r', ""),
             MenuItem::action(
                 MenuAction::ImportStrudel,
-                "Import Strudel patterns\u{2026}",
+                "Import patterns\u{2026}",
                 'i',
                 "",
             ),

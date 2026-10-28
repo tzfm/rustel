@@ -22,7 +22,7 @@ takes its name from the export file. One score is written per entry. A score
 that carries a `@title` field takes it as its file name, an entry keyed by a
 name takes the key, and the rest are numbered `pattern 1`, `pattern 2` and so on
 in the order the patterns were made. The open-set prompt offers these exports
-beside the sets, and File > Import Strudel patterns does the same import into
+beside the sets, and File > Import patterns does the same import into
 the set already open: one score file an entry lands in the set's folder, and a
 name the set already holds is skipped and counted, never overwritten.
 

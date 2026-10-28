@@ -494,7 +494,7 @@ fn open_set_lists_the_others_and_opens_one() {
     );
 }
 
-/// File ▸ Import Strudel patterns…: an export in strudel.cc's own shape -
+/// File ▸ Import patterns…: an export in strudel.cc's own shape -
 /// entries keyed by push ids, each an object with `code` and
 /// `created_at` - becomes named score files of the set already open.
 /// The prompt offers the export by name, the set panel lists what
@@ -532,7 +532,7 @@ fn import_strudel_patterns_adds_them_to_the_open_set() {
     .expect("export");
 
     drop_file_menu(&mut studio);
-    studio.press(KeyCode::Char('i'), KeyModifiers::NONE); // Import Strudel patterns…
+    studio.press(KeyCode::Char('i'), KeyModifiers::NONE); // Import patterns…
     assert_eq!(
         studio.status(),
         "import Strudel patterns - Enter adds every entry to this set · Tab browses · type a path · Esc back"
