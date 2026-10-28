@@ -207,7 +207,7 @@ classes. After an upgrade, rescan once so a dropped file finds its plugin.
 Rustel runs 64 chains at most. A Csound instrument takes one of them for each
 orbit it plays on, and a plugin chain never takes its place. When the 64 are
 in use, a new chain takes the place of a chain in its last 5 seconds, such as
-the chain of a lane you removed: see
+the chain of a lane you removed, and then of a chain an edit left over: see
 [Plugin copies and edits](#plugin-copies-and-edits). With no such chain, the
 notes of the new chain play with no plugin. An effect note then plays dry,
 and an instrument note is silent. A Csound note with a `.vst()` effect is
@@ -294,6 +294,12 @@ name in a variable. A chain with a plugin the text of its lane does not name
 ends after 10 minutes of play with no note. Such a plugin has its name in a
 variable or a function, or comes with a pattern from a prebake or an import.
 
+An edit that removes an arm of a `stack()`, an effect in `every()` or a
+preset of `"<a b>"` can leave a chain over: its lane has more chains of a
+plugin than calls of it. Such a chain with no note since the edit ends after
+10 minutes of play with no note. A chain with a note since the edit stays, so
+a lane that alternates presets keeps its chains.
+
 ## Load time and memory
 
 Rustel loads a plugin on a thread of its own when you evaluate a score. The
@@ -312,7 +318,7 @@ the edit plays. If no copy becomes ready in 20 seconds, the wait ends. The
 edit then plays, and a note with no copy plays with no plugin until its copy
 is ready.
 
-Studio has two load modes under Settings ▸ Advanced ▸ Playback. In each mode,
+Studio has two load modes under Settings ▸ General ▸ Playback. In each mode,
 Studio evaluates the text of a launch on a cycle line during the countdown,
 reads its notes, and loads its plugin copies. If this work still runs a short
 time before the line, the launch takes the first line after the work. Until a

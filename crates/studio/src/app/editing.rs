@@ -349,9 +349,14 @@ impl App {
                 // stop: the engine word would only come back as a second
                 // settle, which resets the advisories and discards the
                 // visual update the held frame is showing - a flicker on a
-                // picture at rest.
+                // picture at rest. An update already sent is on its way to
+                // playing, and only the engine's stop cancels it.
                 let mut said: Option<String> = None;
-                if self.is_playing() || self.is_stopping() || self.stop_requested {
+                if self.is_playing()
+                    || self.is_stopping()
+                    || self.stop_requested
+                    || !self.inflight.is_empty()
+                {
                     self.log
                         .push(LogLevel::Debug, "transport", "stop - the set goes quiet");
                     // The snapshot can trail the key by a frame. The local flag

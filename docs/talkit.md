@@ -84,10 +84,10 @@ playing score uses and renders them again when a score asks.
 
 ## From the command line
 
-Build the command from a copy of this repository:
+Install the command from its own repository, at the release rustel uses:
 
 ```sh
-cargo install --path crates/talkit
+cargo install --git https://github.com/tzfm/rustel-talkit --tag v0.1.1
 ```
 
 Then:

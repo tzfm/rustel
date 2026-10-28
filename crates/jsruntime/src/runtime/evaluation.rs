@@ -129,6 +129,14 @@ impl JsRuntime {
         self.evaluate_prelude_inner(source, options, budget, Some(cancellation))
     }
 
+    /// Give back every name the last score's `register` took over. A
+    /// prelude keeps what it registers as the surface the scores after it
+    /// start from, so it must start from the engine's names, not a score's.
+    pub fn restore_score_registrations(&self) -> Result<(), QueryError> {
+        with_ctx(&self.ctx, |ctx| restore_registration_surface(&ctx))
+            .map_err(|error| QueryError::Message(error.to_string()))
+    }
+
     pub(super) fn evaluate_prelude_inner(
         &self,
         source: &str,

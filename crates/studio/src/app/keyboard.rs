@@ -316,6 +316,10 @@ impl App {
             PanelKind::Set if alt && !primary && self.set_prompt.is_none() => {
                 self.handle_set_file_key(code)
             }
+            // A chord is not text: while the search box types, ^B, ^O and
+            // the rest go on to the studio's chords. Ctrl with Alt is how
+            // a legacy terminal sends AltGr, and AltGr still types.
+            PanelKind::Set if primary && !alt && self.set_search_typing() => false,
             PanelKind::Set
                 if code == KeyCode::Char('n')
                     && !primary
@@ -446,7 +450,8 @@ impl App {
 
     /// Recover an Option panel chord from the composed character a terminal
     /// sends. Only where the focused surface answers to that Option letter,
-    /// so the same character types normally everywhere else.
+    /// so the same character types normally everywhere else. Alt+., the
+    /// browser spelling of stop, answers on every surface.
     ///
     /// A terminal that carries the keyboard protocol reports Alt itself, in
     /// the key the composition rides, so no terminal table is needed for
@@ -459,8 +464,9 @@ impl App {
                     && let KeyCode::Char(letter) = key.code =>
             {
                 let letter = letter.to_ascii_lowercase();
-                if self.alt_panel_action_applies(letter) && Self::composition_spells_the_chord(text)
-                {
+                let chord = self.alt_panel_action_applies(letter)
+                    || self.keybinds.browser_spelling(key).is_some();
+                if chord && Self::composition_spells_the_chord(text) {
                     return Event::Key(KeyEvent::new_with_kind_and_state(
                         KeyCode::Char(letter),
                         KeyModifiers::ALT,
@@ -2072,6 +2078,48 @@ mod tests {
             assert_eq!(source.matches("generated").count(), 1, "{source:?}");
         }
 
+        /// A newer copy from another surface is put by Vim's rules: after
+        /// the caret, a copied line below the current one, and over a
+        /// Visual selection, which ends Visual. V keeps the line break.
+        #[test]
+        fn vim_p_puts_a_newer_copy_by_vim_rules() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.scenes.current_mut().editor =
+                crate::editor::Editor::new("one two\nthree\n").expect("editor");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.focus = Focus::Editor;
+            let copy = |app: &mut App, text: &str| {
+                app.clipboard.set_text(text.into()).expect("newer copy");
+            };
+
+            copy(&mut app, "X");
+            precision_key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            assert_eq!(
+                app.editor().source(),
+                "oXne two\nthree\n",
+                "after the caret"
+            );
+            copy(&mut app, "new\n");
+            precision_key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            assert_eq!(
+                app.editor().source(),
+                "oXne two\nnew\nthree\n",
+                "a copied line goes below"
+            );
+
+            copy(&mut app, "last");
+            precision_key(&mut app, KeyCode::Char('V'), KeyModifiers::SHIFT);
+            precision_key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            assert_eq!(
+                app.editor().source(),
+                "oXne two\nlast\nthree\n",
+                "the line it replaced keeps its line break"
+            );
+            assert!(app.editor().vim_is_normal(), "the put ends Visual");
+        }
+
         #[test]
         fn vim_list_keys_move_panels_and_follow_the_toggle() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -2854,6 +2902,23 @@ mod tests {
             assert!(app.editor().source().contains("ab"));
         }
 
+        /// Option+. stops on a terminal that reports the composed `≥` too:
+        /// the browser spelling of stop is a chord, not text.
+        #[test]
+        fn a_composed_option_period_stops_instead_of_typing() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "ax\n");
+            app.snapshot = Some(sounding(true, false));
+            let source = app.editor().source();
+            app.handle_terminal_event(Event::KeyWithText {
+                key: KeyEvent::new(KeyCode::Char('.'), KeyModifiers::ALT),
+                text: "≥".into(),
+            })
+            .expect("composed stop");
+            assert_eq!(app.editor().source(), source, "nothing typed");
+            assert!(app.stop_requested, "the stop reached the engine");
+        }
+
         #[test]
         fn composed_text_on_a_lock_key_does_not_type() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -3016,34 +3081,24 @@ mod tests {
             assert_eq!(app.scenes.current().name(), "first");
         }
 
-        /// On iTerm2, where Option composes text, the composed digit is
-        /// recovered into the chord - and only where the chord applies, so
-        /// the same character still types into the find bar.
+        /// iTerm2 without the keyboard protocol sends a composed Option
+        /// digit as its character alone, the way a layout's own key sends
+        /// it, so the character types and the strip stays.
         #[test]
-        fn iterm2s_composed_digit_recovers_the_chord() {
+        fn iterm2s_composed_digit_types() {
             let directory = tempfile::tempdir().expect("temp dir");
             let mut app = app_with_two_scores(directory.path());
             app.keybinds.set_reach(crate::keybinds::Reach {
                 enhanced: false,
                 terminal: "iTerm2".into(),
             });
-            press(&mut app, KeyCode::Char('¡'), KeyModifiers::NONE);
-            assert_eq!(
-                app.scenes.current().name(),
-                "first",
-                "the composed digit reached the strip"
-            );
-            app.open_find();
-            assert!(app.editor().find_open());
-            press(&mut app, KeyCode::Char('¡'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('§'), KeyModifiers::NONE);
+            assert_eq!(app.scenes.current().name(), "second", "the strip moved");
             assert!(
-                app.editor()
-                    .find_footer_label()
-                    .is_some_and(|label| label.starts_with("FIND ¡")),
-                "the find bar types the composed digit: {:?}",
-                app.editor().find_footer_label()
+                app.editor().source().contains('§'),
+                "the character typed: {:?}",
+                app.editor().source()
             );
-            assert_eq!(app.scenes.current().name(), "first");
         }
 
         /// A terminal that carries the keyboard protocol reports the Alt

@@ -1869,8 +1869,9 @@ fn valid_name(name: &str) -> bool {
 }
 
 /// The name a title becomes: the characters a name may not hold turn into
-/// `-`, a run of them becomes one, both ends are trimmed, and forty
-/// characters is the far end. `None` when nothing is left.
+/// `-`, a run of them becomes one, both ends are trimmed, and the length
+/// `valid_name` allows is the far end, cut at a character edge. `None`
+/// when nothing is left.
 pub(crate) fn sanitize_name(title: &str) -> Option<String> {
     let mut name = String::with_capacity(title.len());
     let mut dash = false;
@@ -1883,12 +1884,13 @@ pub(crate) fn sanitize_name(title: &str) -> Option<String> {
             dash = true;
         }
     }
-    let cut = |name: String| {
-        if name.chars().count() > 40 {
-            name.chars().take(40).collect()
-        } else {
-            name
+    // Every character kept is one a name may hold, so only the length can
+    // fail `valid_name`: characters come off the end until it passes.
+    let cut = |mut name: String| {
+        while !name.is_empty() && !valid_name(&name) {
+            name.pop();
         }
+        name
     };
     let trimmed = |name: String| {
         name.trim_matches(|character: char| character == '-' || character.is_whitespace())
@@ -2047,7 +2049,7 @@ mod tests {
         );
         assert_eq!(sanitize_name("///+").as_deref(), None);
         assert_eq!(sanitize_name("???").as_deref(), None);
-        // Forty characters is the far end, cut at a character edge.
+        // Forty bytes is the far end, cut at a character edge.
         let long = "x".repeat(60);
         assert_eq!(
             sanitize_name(&long).as_deref(),
@@ -2058,8 +2060,24 @@ mod tests {
             sanitize_name(&titled).as_deref(),
             Some("y".repeat(40).as_str())
         );
+        let cyrillic = "ж".repeat(30);
+        assert_eq!(
+            sanitize_name(&cyrillic).as_deref(),
+            Some("ж".repeat(20).as_str())
+        );
+        let cjk = "夜".repeat(20);
+        assert_eq!(
+            sanitize_name(&cjk).as_deref(),
+            Some("夜".repeat(13).as_str())
+        );
         // The name it makes is one the set accepts.
-        for title in ["night drive", "what? a remix!", "under_score-dash"] {
+        for title in [
+            "night drive",
+            "what? a remix!",
+            "under_score-dash",
+            cyrillic.as_str(),
+            cjk.as_str(),
+        ] {
             let name = sanitize_name(title).unwrap();
             assert!(valid_name(&name), "{name}");
         }

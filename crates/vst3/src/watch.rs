@@ -33,14 +33,9 @@ fn counts(kind: EventKind) -> bool {
     )
 }
 
-/// Watches `folder`, and everything under it: a preset folder holds a
-/// folder for each plugin, and a folder the player added holds any
-/// structure at all. A folder that is missing watches the folder nearest
-/// it that is there, which says when the folder itself comes.
-fn watch_at(watcher: &mut notify::RecommendedWatcher, folder: &Path) {
-    if watcher.watch(folder, RecursiveMode::Recursive).is_ok() {
-        return;
-    }
+/// The path a watch of `folder` reads: `folder` when it is there, else the
+/// folder nearest above it that is.
+pub fn watched_at(folder: &Path) -> PathBuf {
     let mut at = folder;
     while !at.exists()
         && let Some(above) = at.parent()
@@ -48,7 +43,24 @@ fn watch_at(watcher: &mut notify::RecommendedWatcher, folder: &Path) {
     {
         at = above;
     }
-    let _ = watcher.watch(at, RecursiveMode::Recursive);
+    at.to_path_buf()
+}
+
+/// The watch of `folder`: the folder and everything under it, for a
+/// preset folder holds a folder for each plugin, and a folder the player
+/// added holds any structure at all. A folder that is missing watches the
+/// folder nearest above it, that folder alone: its event says the folder
+/// came, and the read that follows gives the folder a watch of its own. A
+/// recursive watch there would read the whole tree, the user's home at
+/// worst.
+fn watch_of(folder: &Path) -> (PathBuf, RecursiveMode) {
+    let at = watched_at(folder);
+    let mode = if at == folder {
+        RecursiveMode::Recursive
+    } else {
+        RecursiveMode::NonRecursive
+    };
+    (at, mode)
 }
 
 /// Watches `folders`. Once the events went quiet for [`QUIET`], the thread
@@ -72,8 +84,17 @@ pub fn watch_folders(
         }
     })
     .ok()?;
-    for folder in &folders {
-        watch_at(&mut watcher, folder);
+    let watches: Vec<_> = folders.iter().map(|folder| watch_of(folder)).collect();
+    for (at, mode) in &watches {
+        // A path a whole-folder watch already reads takes no watch of its
+        // own: a second watch of one path replaces the first.
+        let read = matches!(mode, RecursiveMode::NonRecursive)
+            && watches.iter().any(|(whole, other)| {
+                matches!(other, RecursiveMode::Recursive) && at.starts_with(whole)
+            });
+        if !read {
+            let _ = watcher.watch(at, *mode);
+        }
     }
     std::thread::Builder::new()
         .name("rustel-vst3-watch".into())

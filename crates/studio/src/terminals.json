@@ -542,16 +542,7 @@
         {"chord": "alt+d", "received": "∂", "reason": "Option as Normal sends ∂; Studio recovers Alt+D where the focus uses it"},
         {"chord": "alt+o", "received": "ø", "reason": "Option as Normal sends ø; Studio recovers Alt+O where the focus uses it"},
         {"chord": "alt+r", "received": "®", "reason": "Option as Normal sends ®; Studio recovers Alt+R where the focus uses it"},
-        {"chord": "alt+t", "received": "†", "reason": "Option as Normal sends †; Studio recovers Alt+T where the focus uses it"},
-        {"chord": "alt+1", "received": "¡", "reason": "Option as Normal sends ¡; Studio recovers Alt+1 where the score has the keyboard"},
-        {"chord": "alt+2", "received": "™", "reason": "Option as Normal sends ™; Studio recovers Alt+2 where the score has the keyboard"},
-        {"chord": "alt+3", "received": "£", "reason": "Option as Normal sends £; Studio recovers Alt+3 where the score has the keyboard"},
-        {"chord": "alt+4", "received": "¢", "reason": "Option as Normal sends ¢; Studio recovers Alt+4 where the score has the keyboard"},
-        {"chord": "alt+5", "received": "∞", "reason": "Option as Normal sends ∞; Studio recovers Alt+5 where the score has the keyboard"},
-        {"chord": "alt+6", "received": "§", "reason": "Option as Normal sends §; Studio recovers Alt+6 where the score has the keyboard"},
-        {"chord": "alt+7", "received": "¶", "reason": "Option as Normal sends ¶; Studio recovers Alt+7 where the score has the keyboard"},
-        {"chord": "alt+8", "received": "•", "reason": "Option as Normal sends •; Studio recovers Alt+8 where the score has the keyboard"},
-        {"chord": "alt+9", "received": "ª", "reason": "Option as Normal sends ª; Studio recovers Alt+9 where the score has the keyboard"}
+        {"chord": "alt+t", "received": "†", "reason": "Option as Normal sends †; Studio recovers Alt+T where the focus uses it"}
       ]
     },
     {
@@ -600,17 +591,6 @@
       "steals": [
         {"chord": "ctrl+tab", "does": "switches terminal tab"},
         {"chord": "ctrl+shift+tab", "does": "switches terminal tab"}
-      ],
-      "alt_input": [
-        {"chord": "alt+1", "received": "¡", "reason": "Option sends ¡ unless Use Option as Meta Key is on; Studio recovers Alt+1 where the score has the keyboard"},
-        {"chord": "alt+2", "received": "™", "reason": "Option sends ™ unless Use Option as Meta Key is on; Studio recovers Alt+2 where the score has the keyboard"},
-        {"chord": "alt+3", "received": "£", "reason": "Option sends £ unless Use Option as Meta Key is on; Studio recovers Alt+3 where the score has the keyboard"},
-        {"chord": "alt+4", "received": "¢", "reason": "Option sends ¢ unless Use Option as Meta Key is on; Studio recovers Alt+4 where the score has the keyboard"},
-        {"chord": "alt+5", "received": "∞", "reason": "Option sends ∞ unless Use Option as Meta Key is on; Studio recovers Alt+5 where the score has the keyboard"},
-        {"chord": "alt+6", "received": "§", "reason": "Option sends § unless Use Option as Meta Key is on; Studio recovers Alt+6 where the score has the keyboard"},
-        {"chord": "alt+7", "received": "¶", "reason": "Option sends ¶ unless Use Option as Meta Key is on; Studio recovers Alt+7 where the score has the keyboard"},
-        {"chord": "alt+8", "received": "•", "reason": "Option sends • unless Use Option as Meta Key is on; Studio recovers Alt+8 where the score has the keyboard"},
-        {"chord": "alt+9", "received": "ª", "reason": "Option sends ª unless Use Option as Meta Key is on; Studio recovers Alt+9 where the score has the keyboard"}
       ]
     },
     {

@@ -342,6 +342,66 @@ fn the_watch_of_the_preset_folders_reads_the_disk_again() {
     assert_eq!(rig.host.presets_version(), settled);
 }
 
+/// A preset folder that is not there yet watches the folder above it, and
+/// that folder alone: a file written deeper in it reads nothing.
+#[test]
+fn a_missing_preset_folder_watches_only_the_folder_above_it() {
+    let rig = Rig::new("missing-folder");
+    let deeper = rig.root.join("elsewhere").join("deeper");
+    std::fs::create_dir_all(&deeper).expect("a folder beside");
+    rig.host.set_preset_folders(vec![rig.root.join("not-yet")]);
+    rig.host.wait_idle();
+    let mut settled = rig.host.presets_version();
+    let drain = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < drain {
+        std::thread::sleep(Duration::from_millis(100));
+        settled = rig.host.presets_version();
+    }
+
+    std::fs::write(deeper.join("notes.txt"), "not a preset").expect("a file elsewhere");
+    std::thread::sleep(Duration::from_secs(1));
+
+    assert_eq!(
+        rig.host.presets_version(),
+        settled,
+        "a write elsewhere read the preset folders"
+    );
+}
+
+/// A missing folder inside a folder of the list leaves the watch of that
+/// folder whole: a preset saved deep in it still reads the folders.
+#[test]
+fn a_missing_folder_inside_a_listed_folder_keeps_its_watch_whole() {
+    let rig = Rig::new("missing-inside");
+    rig.plugin();
+    let bank = rig.root.join("bank");
+    let deep = bank.join("Lead").join("Saws");
+    std::fs::create_dir_all(&deep).expect("a bank with folders");
+    rig.host
+        .set_preset_folders(vec![bank.clone(), bank.join("gone")]);
+    rig.host.wait_idle();
+    // The reads the change asked for settle first.
+    std::thread::sleep(Duration::from_secs(2));
+
+    std::fs::write(
+        deep.join("Deep Save.vstpreset"),
+        rustel_vst3_fixture::preset(0.5, 0.0),
+    )
+    .expect("a preset deep in the bank");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !rig
+        .host
+        .presets(NAME)
+        .is_some_and(|names| names.iter().any(|name| name == "Deep Save"))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the save deep in the bank was not read"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// A change of the preset folders reads them again on the plugin thread:
 /// the read runs from the change itself, no caller waits for it, and the
 /// presets of the folder the change brought are there when it ends.
@@ -374,6 +434,69 @@ fn a_change_of_the_preset_folders_reads_them_in_the_background() {
         Some(vec!["Added Bass".to_owned()]),
         "the read of the change lists the presets of the folder"
     );
+}
+
+/// A preset name of the root and of a folder the player added plays the
+/// file of the root, also in another case. A name keeps its number while
+/// the folders give its file, and resolves again when they do not: a file
+/// of the root takes the name, the file moves in its folder, or the folder
+/// leaves the list. A copy of the number before runs on.
+#[test]
+fn a_preset_name_plays_the_file_the_folders_give_now() {
+    let rig = Rig::new("preset-names");
+    let plugin = rig.plugin();
+    let added = rig.root.join("added");
+    std::fs::create_dir_all(added.join("bank")).expect("folder");
+    let (half, quarter) = (
+        rustel_vst3_fixture::preset(0.5, 0.0),
+        rustel_vst3_fixture::preset(0.25, 0.0),
+    );
+    std::fs::write(added.join("Pad.vstpreset"), &half).expect("preset file");
+    std::fs::write(added.join("Lead.vstpreset"), &half).expect("preset file");
+    rig.write_preset("pad.vstpreset", &quarter);
+    // A read of the preset folders, done when the call returns.
+    let read = |folders: Vec<PathBuf>| {
+        rig.host.set_preset_folders(folders);
+        rig.host.wait_idle();
+    };
+    read(vec![added.clone()]);
+    let number = |name: &str| match rig.host.preset(plugin, name) {
+        FoundPreset::Number(number) => number,
+        other => panic!("preset {name}: {other:?}"),
+    };
+    // The level of a copy of a preset: the gain of its file.
+    let level = |preset: u32| {
+        let mut insert = rig.insert(preset).expect("insert");
+        block(insert.as_mut(), 1.0, 64)[0]
+    };
+    let names = rig.host.presets(NAME).expect("the read");
+    assert_eq!(names, ["Lead", "pad"]);
+    assert_eq!(level(number("Pad")), 0.25);
+
+    // The player saves a file of the root with the name of an added file.
+    let lead = number("lead");
+    let mut running = rig.insert(lead).expect("a copy of the added file");
+    rig.write_preset("LEAD.vstpreset", &quarter);
+    read(vec![added.clone()]);
+    let saved = number("lead");
+    assert_ne!(saved, lead);
+    assert_eq!(level(saved), 0.25);
+    assert_eq!(block(running.as_mut(), 1.0, 64), vec![0.5; 64]);
+
+    // A file that moves in its folder: its copy builds from the new place.
+    std::fs::write(added.join("Bass.vstpreset"), &half).expect("preset file");
+    read(vec![added.clone()]);
+    let bass = number("bass");
+    let moved = added.join("bank").join("Bass.vstpreset");
+    std::fs::rename(added.join("Bass.vstpreset"), moved).expect("move");
+    read(vec![added.clone()]);
+    let after = number("bass");
+    assert_ne!(after, bass);
+    assert_eq!(level(after), 0.5);
+
+    // The folder leaves the list, and its presets with it.
+    read(Vec::new());
+    assert_eq!(rig.host.preset(plugin, "bass"), FoundPreset::Missing);
 }
 
 #[test]
@@ -458,13 +581,7 @@ fn a_preset_file_sets_the_state_of_the_plugin() {
 
     // Failed owners share the parked-copy bound. Forget the oldest
     // failure first, keep the ready copy and suppress a recent failure.
-    std::fs::remove_file(
-        rig.root
-            .join("presets")
-            .join(NAME)
-            .join("Other Plugin.vstpreset"),
-    )
-    .expect("remove the preset");
+    // Each build of the preset of the other plugin fails.
     let key = InsertKey {
         plugin,
         preset: wrong,
@@ -1405,8 +1522,9 @@ fn a_plugin_that_fails_its_scan_leaves_the_others_of_its_bundle() {
 
 /// A bundle that faults its scan keeps the fault in the cache file, with
 /// the stamp of its files. A host that starts again reads the fault and
-/// runs no new test of the bundle. A rescan empties the cache, so the
-/// bundle gets its new test.
+/// runs no new test of the bundle. A rescan empties the cache and its file,
+/// so the bundle gets its new test, also at the next start when the host
+/// ends before that test.
 #[test]
 fn a_scan_fault_stays_in_the_cache_until_a_rescan() {
     let root = std::env::temp_dir().join(format!("rustel-vst3-stay-{}", std::process::id()));
@@ -1455,6 +1573,18 @@ fn a_scan_fault_stays_in_the_cache_until_a_rescan() {
         matches!(plugins[0].status, Status::Failed(_)),
         "{plugins:?}"
     );
+
+    // A rescan with no scan process runs no test. A host that starts after
+    // it reads no fault of the cache file: the bundle waits for its test.
+    host.set_worker(None);
+    host.rescan(&folders);
+    host.wait_idle();
+    let again = Host::new();
+    again.set_preset_folder(root.join("presets"));
+    again.scan(&folders);
+    again.wait_idle();
+    assert_eq!(again.plugins()[0].status, Status::Found);
+    assert_eq!(runs(), 1);
 
     // A rescan with no fault gives the bundle its plugins again.
     host.set_worker(Some(with_mark(None)));

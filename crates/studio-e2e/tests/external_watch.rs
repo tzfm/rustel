@@ -118,6 +118,70 @@ fn sync_and_eval_switches_to_an_open_tab() {
     });
 }
 
+/// Turn the loop past the watch's two looks at a changed file.
+fn past_the_watch(studio: &mut Hermetic) {
+    for _ in 0..5 {
+        std::thread::sleep(Duration::from_millis(100));
+        studio.pump();
+    }
+}
+
+/// The studio's own write is no save from another program: a dirty tab
+/// closed in eval mode stays closed and silent.
+#[test]
+fn sync_and_eval_leaves_a_closed_tab_closed() {
+    let mut studio = hermetic();
+    turn_watch_to(&mut studio, 2);
+    studio.set_score("$: s(\"hh\")");
+    studio.chord("ctrl+n");
+    studio.settle();
+    studio.press(KeyCode::F(6), KeyModifiers::NONE);
+    studio.chord("ctrl+w");
+    studio.settle();
+    past_the_watch(&mut studio);
+
+    assert_eq!(
+        studio.scene_names(),
+        vec!["scene 1"],
+        "the closed tab came back"
+    );
+    assert!(!studio.is_playing(), "the closing write played");
+}
+
+/// Another set is a new baseline: opening it plays nothing, and a score
+/// off its strip stays off it.
+#[test]
+fn sync_and_eval_opens_another_set_as_it_is() {
+    let mut studio = hermetic();
+    let root = studio.config_home().join("sets");
+    std::fs::create_dir_all(&root).expect("sets root made");
+    rustel_studio::scenes::SceneSet::create_in(&root, "guest set", "$: s(\"cp\")")
+        .expect("the second set is made")
+        .persist_manifest()
+        .expect("the set file says its strip");
+    std::fs::write(
+        root.join("guest set").join("loose.strudel"),
+        "$: s(\"hh\")\n",
+    )
+    .expect("a score off the strip");
+    turn_watch_to(&mut studio, 2);
+
+    // File ▸ Open set…, and Enter on the one other set.
+    studio.press(KeyCode::F(1), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('f'), KeyModifiers::NONE);
+    studio.press(KeyCode::Char('o'), KeyModifiers::NONE);
+    studio.press(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(studio.set_directory(), root.join("guest set"));
+    past_the_watch(&mut studio);
+
+    assert_eq!(
+        studio.scene_names(),
+        vec!["scene 1"],
+        "a score off the strip opened"
+    );
+    assert!(!studio.is_playing(), "opening the set played it");
+}
+
 #[test]
 fn sync_keeps_the_inline_visualizer() {
     let mut studio = hermetic();

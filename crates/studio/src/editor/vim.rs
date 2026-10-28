@@ -160,6 +160,13 @@ impl Editor {
         (!self.vim.register.is_empty()).then_some(self.vim.register.as_str())
     }
 
+    /// Fill the unnamed register with text copied elsewhere. Text that
+    /// ends in a line break is linewise, as Vim reads a clipboard.
+    pub(crate) fn set_vim_register(&mut self, text: String) {
+        self.vim.linewise_register = text.ends_with(['\n', '\r']);
+        self.vim.register = text;
+    }
+
     /// Show a short Vim message in the footer's editor label.
     pub(crate) fn vim_say(&mut self, message: &'static str) {
         if self.vim.keybindings == EditorKeybindings::Vim {
@@ -377,7 +384,7 @@ impl Editor {
         if !entered_visual
             && !pending
             && self.vim.mode == Mode::Normal
-            && key.modifiers.contains(KeyModifiers::SHIFT)
+            && key.modifiers == KeyModifiers::SHIFT
             && let Some(motion) = selection_motion(key.code)
         {
             // The ordinary editor extends the selection exactly as it does
@@ -1285,5 +1292,46 @@ mod tests {
         assert_eq!(selection.anchor, ByteOffset(0));
         assert_eq!(line(&editor), 3, "the selection reaches the third line");
         assert!(selection.head.0 >= 6);
+    }
+
+    #[test]
+    fn j_and_d_continue_from_where_ctrl_d_took_the_visual_head() {
+        let mut editor = editor();
+        press(&mut editor, KeyCode::Char('V'), KeyModifiers::NONE);
+        press(&mut editor, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        press(&mut editor, KeyCode::Char('j'), KeyModifiers::NONE);
+        press(&mut editor, KeyCode::Char('d'), KeyModifiers::NONE);
+        assert_eq!(
+            editor.source(),
+            "a\n".repeat(7),
+            "V, Ctrl+D and j cover five lines"
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_arrows_are_left_to_the_studio() {
+        let mut editor = editor();
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            let handled = editor
+                .vim_key(
+                    KeyEvent::new(code, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+                    HistoryMoment(0),
+                    None,
+                )
+                .expect("key");
+            assert!(!handled, "Ctrl+Shift+{code:?} reaches the studio's chords");
+            assert!(editor.vim_is_normal(), "Ctrl+Shift+{code:?} left Normal");
+            assert!(
+                editor.primary_selection().is_empty(),
+                "Ctrl+Shift+{code:?} made a selection"
+            );
+        }
     }
 }

@@ -42,8 +42,13 @@ impl Editor {
     }
 
     fn vim_mapping_mode(&self) -> Option<VimMappingMode> {
+        // The key after r, g, or a text object's i or a is read as itself,
+        // as Vim reads it. gg and r{char} never wait for a mapping.
         if self.vim.keybindings != EditorKeybindings::Vim
             || self.vim.command.is_some()
+            || self.vim.replace.is_some()
+            || self.vim.g
+            || self.vim.text_object.is_some()
             || self.find_open()
         {
             return None;
@@ -115,16 +120,14 @@ impl Editor {
             self.vim_remap.pending.drain(..mapping.keys.len());
             Some((keys, std::mem::take(&mut self.vim_remap.pending)))
         } else {
-            // No mapping can match this sequence. The whole prefix goes
-            // out at once: keeping the tail pending would hold a built-in
-            // pair such as gg for the mapping timeout.
-            let keys = self
-                .vim_remap
-                .pending
-                .drain(..)
-                .map(VimMappedKey::Key)
-                .collect();
-            Some((keys, Vec::new()))
+            // No mapping can match this sequence. Its first key goes out
+            // as a built-in key, and the rest go back through the
+            // mappings, where a mapping that follows still runs.
+            let key = self.vim_remap.pending.remove(0);
+            Some((
+                vec![VimMappedKey::Key(key)],
+                std::mem::take(&mut self.vim_remap.pending),
+            ))
         }
     }
 
@@ -216,24 +219,89 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::editor::{Editor, HistoryMoment};
+    use crate::editor::{ByteOffset, Editor, HistoryMoment};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::sync::Arc;
 
+    fn key(character: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)
+    }
+
+    /// A prefix that is no mapping sends its first key alone and reads the
+    /// rest again, so `jjk` types one j and then leaves Insert.
     #[test]
-    fn an_unmatched_pair_flushes_at_once_instead_of_waiting() {
+    fn an_unmatched_prefix_sends_one_key_and_reads_the_rest_again() {
+        let mut editor = Editor::new("one\n").expect("editor");
+        editor.set_keybindings(EditorKeybindings::Vim);
+        editor.set_vim_mappings(Arc::new(
+            VimMappings::parse("inoremap jk <Esc>\n").expect("mapping"),
+        ));
+        editor
+            .vim_key(key('i'), HistoryMoment(0), None)
+            .expect("Insert");
+        assert!(editor.vim_queue_mapped_key(key('j'), HistoryMoment(1)));
+        assert!(editor.vim_queue_mapped_key(key('j'), HistoryMoment(2)));
+        let (mapped, remaining) = editor
+            .vim_take_mapped_keys(false)
+            .expect("jj is not a mapping");
+        assert_eq!(mapped, vec![VimMappedKey::Key(key('j'))], "one j types");
+        assert_eq!(remaining, vec![key('j')], "the other j is read again");
+        assert!(editor.vim_queue_mapped_key(key('j'), HistoryMoment(2)));
+        assert!(editor.vim_queue_mapped_key(key('k'), HistoryMoment(3)));
+        let (mapped, _) = editor.vim_take_mapped_keys(false).expect("jk is a mapping");
+        assert_eq!(
+            mapped,
+            vec![VimMappedKey::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE
+            ))],
+            "jk leaves Insert"
+        );
+    }
+
+    /// The key after g or r is read as itself, as Vim reads it: gg does
+    /// not wait beside a `gs` mapping, and r replaces with a mapped key.
+    #[test]
+    fn the_key_after_g_or_r_is_not_mapped() {
         let mut editor = Editor::new("one\ntwo\n").expect("editor");
         editor.set_keybindings(EditorKeybindings::Vim);
         editor.set_vim_mappings(Arc::new(
-            VimMappings::parse("nnoremap gs <Action:stop>\n").expect("mapping"),
+            VimMappings::parse("nnoremap gs <Action:stop>\nnnoremap Q dd\nvnoremap Q dd\n")
+                .expect("mappings"),
         ));
-        let g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
-        assert!(editor.vim_queue_mapped_key(g, HistoryMoment(0)));
-        assert!(editor.vim_queue_mapped_key(g, HistoryMoment(1)));
-        let (mapped, remaining) = editor
-            .vim_take_mapped_keys(false)
-            .expect("the pair is not a mapping");
-        assert!(remaining.is_empty(), "both keys go out at once");
-        assert_eq!(mapped, vec![VimMappedKey::Key(g), VimMappedKey::Key(g)]);
+        editor.vim_key(key('j'), HistoryMoment(0), None).expect("j");
+        editor.vim_key(key('g'), HistoryMoment(1), None).expect("g");
+        assert!(
+            !editor.vim_queue_mapped_key(key('g'), HistoryMoment(2)),
+            "the second g does not wait for gs"
+        );
+        editor
+            .vim_key(key('g'), HistoryMoment(2), None)
+            .expect("gg");
+        assert_eq!(editor.primary_selection().head, ByteOffset(0), "gg");
+
+        editor.vim_key(key('r'), HistoryMoment(3), None).expect("r");
+        assert!(
+            !editor.vim_queue_mapped_key(key('Q'), HistoryMoment(4)),
+            "the Q after r is not the Q mapping"
+        );
+        editor
+            .vim_key(key('Q'), HistoryMoment(4), None)
+            .expect("rQ");
+        assert_eq!(editor.source(), "Qne\ntwo\n");
+
+        for character in ['v', 'e', 'r'] {
+            editor
+                .vim_key(key(character), HistoryMoment(5), None)
+                .expect("key");
+        }
+        assert!(
+            !editor.vim_queue_mapped_key(key('Q'), HistoryMoment(6)),
+            "the Q after Visual r is not the Q mapping"
+        );
+        editor
+            .vim_key(key('Q'), HistoryMoment(6), None)
+            .expect("Visual rQ");
+        assert_eq!(editor.source(), "QQQ\ntwo\n");
     }
 }

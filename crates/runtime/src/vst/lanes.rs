@@ -17,7 +17,7 @@ struct Lane {
     /// The line of the label, counted from 1. With no label, the line where
     /// the body starts.
     line: usize,
-    /// The plugin names of the calls in the body: see [`body_plugin_names`].
+    /// The plugin name of each call in the body: see [`body_plugin_names`].
     plugins: Vec<String>,
 }
 
@@ -35,7 +35,7 @@ pub(super) struct ScoreLanes {
 
 impl ScoreLanes {
     /// Each lane in text order: its number, its label, its line and the
-    /// plugin names of its body.
+    /// plugin name of each call in its body.
     pub(super) fn lanes(&self) -> impl Iterator<Item = (u64, &str, usize, &[String])> {
         let lanes = self.lanes.iter();
         lanes.map(|lane| {
@@ -312,7 +312,9 @@ fn pair(
     let mut pairs = Vec::new();
     for at in open {
         let statement = &statements[at];
-        let names = body_plugin_names(&statement.body);
+        let mut names = body_plugin_names(&statement.body);
+        // A name with more calls counts one time.
+        names.dedup();
         for (place, lane) in &left {
             let shared = names
                 .iter()
@@ -375,9 +377,10 @@ fn equal_ends(one: &str, other: &str) -> usize {
     start + ends.take(rest).take_while(equal).count()
 }
 
-/// The plugin names of the calls in the code of a lane body, in their
-/// compare form. A call in a comment names no plugin: a comment is a
-/// removal. The body has no label, so no mute takes out a call here.
+/// The plugin name of each call in the code of a lane body, in its compare
+/// form, sorted: a name with 2 calls is in the list 2 times. A call in a
+/// comment names no plugin: a comment is a removal. The body has no label,
+/// so no mute takes out a call here.
 fn body_plugin_names(body: &str) -> Vec<String> {
     // A body with no `vst` in its text has no plugin call.
     if !body.contains("vst") {
@@ -386,7 +389,6 @@ fn body_plugin_names(body: &str) -> Vec<String> {
     let calls = crate::lint::live_plugins(body).into_iter();
     let mut names: Vec<String> = calls.map(|call| canonical(&call.name)).collect();
     names.sort();
-    names.dedup();
     names
 }
 

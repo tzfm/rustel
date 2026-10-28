@@ -98,7 +98,6 @@ impl Editor {
         count: Option<usize>,
     ) -> Result<(), EditorError> {
         let before = self.vim_head();
-        let visual = matches!(self.vim.mode, Mode::Visual { .. });
         match count {
             None => {
                 let motion = if down {
@@ -106,8 +105,25 @@ impl Editor {
                 } else {
                     super::super::Motion::HalfPageUp
                 };
-                self.move_selection(motion, visual)?;
-                if !visual {
+                if let Mode::Visual {
+                    anchor, linewise, ..
+                } = self.vim.mode
+                {
+                    // The half page moves the Visual head, not the edge of
+                    // the highlighted band. The goal column stays for j and k.
+                    let mut selection = self.primary_selection();
+                    selection.anchor = before;
+                    selection.head = before;
+                    self.selections.set_single(selection);
+                    self.move_selection(motion, false)?;
+                    let moved = self.primary_selection();
+                    let head = self.vim_clamp_normal(moved.head)?;
+                    self.vim_select_visual(anchor, head, linewise)?;
+                    let mut selection = self.primary_selection();
+                    selection.goal_column = moved.goal_column;
+                    self.selections.set_single(selection);
+                } else {
+                    self.move_selection(motion, false)?;
                     self.vim_normalize_caret()?;
                 }
             }

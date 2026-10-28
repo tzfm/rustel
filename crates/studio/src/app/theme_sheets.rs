@@ -1124,7 +1124,8 @@ impl App {
             // themes are a fixed vocabulary.
             KeyCode::Char('n' | 'N') if primary => {
                 let current = self.theme.clone();
-                let from_built_in = Theme::built_in_names().any(|known| known == current.name);
+                let from_built_in = Theme::built_in_names().any(|known| known == current.name)
+                    && !super::super::theme::user_theme_exists(&current.name);
                 self.open_theme_editor(&current, String::new(), from_built_in);
                 return true;
             }
@@ -1145,7 +1146,8 @@ impl App {
                         // The ROW is the identity: a file is a user theme
                         // whatever its inner name field claims (older saves
                         // wrote the base theme's name in there).
-                        let built_in = Theme::built_in_names().any(|known| known == name);
+                        let built_in = Theme::built_in_names().any(|known| known == name)
+                            && !super::super::theme::user_theme_exists(&name);
                         if !built_in {
                             theme.name = name.clone();
                         }
@@ -1157,14 +1159,16 @@ impl App {
                 return true;
             }
             // Deleting asks twice: the first d names what would go, the
-            // second lets it. A theme the studio ships has no file behind
-            // its name, so the first d says that and never arms: only a
+            // second lets it. A name only the studio ships has no file
+            // behind it, so the first d says that and never arms: only a
             // theme of the player's own is a file there is to remove.
             KeyCode::Char('d' | 'D') if primary => {
                 let Some(name) = picker.selected_name().map(str::to_owned) else {
                     return true;
                 };
-                if Theme::built_in_names().any(|known| known == name) {
+                if Theme::built_in_names().any(|known| known == name)
+                    && !super::super::theme::user_theme_exists(&name)
+                {
                     picker.deleting = None;
                     self.status =
                         format!("theme {name} ships with the studio and cannot be deleted");
@@ -1624,6 +1628,67 @@ mod tests {
                     .iter()
                     .any(|name| name == "a-yours"),
                 "the reopened list has no row for it"
+            );
+        }
+
+        /// A theme of the player's own saved under a name the studio ships
+        /// too stays theirs: the editor opens it under its name, a new
+        /// theme from it is no built-in's variation, and the modified d
+        /// deletes the file. Without the file the name is the shipped
+        /// theme's again.
+        #[test]
+        fn a_user_theme_under_a_shipped_name_is_edited_and_deleted_as_its_own() {
+            let _theme_dir = THEME_DIR_LOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let directory = tempfile::tempdir().expect("temp dir");
+            let themes = directory.path().join("themes");
+            std::fs::create_dir_all(&themes).expect("theme directory");
+            let mine = themes.join("terminal.json");
+            // A save names the file and the theme inside it alike.
+            let mut theme = Theme::built_in_default();
+            theme.name = "terminal".into();
+            std::fs::write(&mine, theme.to_json()).expect("theme file");
+            let _scoped = ScopedThemeDir::set(&themes);
+            let mut app = app_over(directory.path());
+            app.toggle_theme_picker();
+            for character in "terminal".chars() {
+                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+            }
+            assert_eq!(
+                app.theme_picker
+                    .as_ref()
+                    .expect("picker open")
+                    .selected_name(),
+                Some("terminal")
+            );
+            // The selection settles, as the event loop lets it.
+            app.preview_theme();
+
+            press(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+            let editor = app.theme_editor.as_ref().expect("editor open");
+            assert!(!editor.from_built_in, "the file is the player's");
+            assert_eq!(editor.name, "terminal", "a save keeps its name");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+            assert!(
+                !app.theme_editor
+                    .as_ref()
+                    .expect("editor open")
+                    .from_built_in,
+                "a new theme from the player's file is not a built-in's variation"
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert!(app.status.contains("again"), "asks first: {}", app.status);
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert!(!mine.is_file(), "the file is gone");
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert!(
+                app.status.contains("cannot be deleted"),
+                "the shipped theme is left: {}",
+                app.status
             );
         }
 

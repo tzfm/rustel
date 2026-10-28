@@ -732,14 +732,16 @@ impl App {
                 .is_some_and(|(name, _, _)| canonical(named) == canonical(name))
         });
         // The row of the plugin the call at the caret already names: the
-        // dive under the row. Nothing goes in.
+        // plugin of the row opens, and the cursor dives under the row.
+        // Nothing goes in, also while the plugin loads and has no row
+        // under it yet.
         if let (Some(selected), Some((named, _))) = (&selected, &call)
             && canonical(named) == canonical(selected)
-            && self
-                .reference_panel
-                .as_mut()
-                .is_some_and(|panel| panel.vst.select_under())
         {
+            if let Some(panel) = self.reference_panel.as_mut() {
+                panel.vst.expand();
+                panel.vst.select_under();
+            }
             self.dirty_frame = true;
             return None;
         }
@@ -1162,6 +1164,60 @@ mod tests {
         // of the halves of the plugin.
         assert_eq!(app.plugin_text_at_caret(".vsti(\"Serum 2\")".into()), None);
         let panel = app.reference_panel.as_ref().expect("the panel stays");
+        assert_eq!(
+            panel.vst.row(panel.vst.selected),
+            Some(PluginRow::Section(VstSection::Presets))
+        );
+        assert_eq!(app.editor().source(), before);
+    }
+
+    /// The row of the plugin the call names, with no plugin open or with
+    /// another plugin open: Enter opens the plugin of the row, the cursor
+    /// goes under its row, and nothing goes in.
+    #[test]
+    fn enter_on_the_plugin_the_call_names_opens_it_and_writes_nothing() {
+        let source = "$: n(\"c\").vsti(\"Serum 2\", {preset: \"Init\"})\n";
+        let caret = source.find("Serum 2").expect("the name") + 3;
+        let mut app = vst_app(source, caret);
+        let before = app.editor().source().to_owned();
+        let panel = app.reference_panel.as_mut().expect("the vst tab");
+        let serum = panel.vst.plugins()[0].clone();
+        let vital = PluginInfo {
+            name: "Vital".into(),
+            bundle: "/plugins/Vital.vst3".into(),
+            ..serum.clone()
+        };
+        panel.vst.set_plugins(vec![serum, vital]);
+        // ← on the row of the open plugin closes it.
+        assert!(panel.vst.collapse());
+        assert_eq!(panel.vst.open_name(), None);
+        let call = ".vsti(\"Serum 2\")";
+        assert_eq!(
+            app.plugin_text_at_caret(call.into()),
+            None,
+            "no plugin open"
+        );
+        let panel = app.reference_panel.as_mut().expect("the panel stays");
+        assert_eq!(panel.vst.open_name(), Some("Serum 2"));
+        assert_eq!(
+            panel.vst.row(panel.vst.selected),
+            Some(PluginRow::Section(VstSection::Presets))
+        );
+
+        // → on the row of Vital opens Vital, and the cursor goes back to
+        // the row of Serum 2.
+        assert_eq!(panel.vst.row(3), Some(PluginRow::Plugin(1)));
+        panel.vst.selected = 3;
+        assert!(panel.vst.expand());
+        assert_eq!(panel.vst.open_name(), Some("Vital"));
+        panel.vst.selected = 0;
+        assert_eq!(
+            app.plugin_text_at_caret(call.into()),
+            None,
+            "another plugin open"
+        );
+        let panel = app.reference_panel.as_ref().expect("the panel stays");
+        assert_eq!(panel.vst.open_name(), Some("Serum 2"));
         assert_eq!(
             panel.vst.row(panel.vst.selected),
             Some(PluginRow::Section(VstSection::Presets))

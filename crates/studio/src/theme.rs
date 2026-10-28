@@ -2627,10 +2627,11 @@ pub fn user_theme_exists(name: &str) -> bool {
 
 /// Write a theme into the theme directory under `name`, creating the
 /// directory on the way. The name is a file stem, never a path, and never
-/// a built-in's name: a changed built-in is saved as a new theme.
+/// a built-in's name unless a user theme of that name is already there: a
+/// changed built-in is saved as a new theme.
 pub fn save_named(theme: &Theme, name: &str) -> Result<std::path::PathBuf, ThemeError> {
     let name = valid_theme_name(name)?;
-    if Theme::built_in_names().any(|built_in| built_in == name) {
+    if Theme::built_in_names().any(|built_in| built_in == name) && !user_theme_exists(name) {
         return Err(ThemeError::Read {
             path: std::path::PathBuf::from(name),
             message: format!("{name} is built in - save your version under a new name"),
@@ -4035,13 +4036,36 @@ mod tests {
     }
 
     /// A theme name is a file stem, never a path.
-    /// Built-ins are a fixed vocabulary: a save can never take their name,
-    /// so nothing on disk ever shadows what the executable ships.
+    /// Built-ins are a fixed vocabulary: a save never gives their name to a
+    /// new file, so no save shadows what the executable ships.
     #[test]
     fn a_built_ins_name_cannot_be_saved_over() {
+        let _theme_dir = test_env::THEME_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let directory = tempfile::tempdir().expect("tempdir");
+        let _scoped = test_env::ScopedThemeDir::set(directory.path());
         let theme = Theme::built_in_default();
         let error = save_named(&theme, "rustel-dark").expect_err("refused");
         assert!(error.to_string().contains("built in"), "{error}");
+    }
+
+    /// A user theme saved under a name before the studio shipped a built-in
+    /// of that name stays the reader's: a save writes it in place.
+    #[test]
+    fn a_user_theme_under_a_built_ins_name_saves_in_place() {
+        let _theme_dir = test_env::THEME_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let directory = tempfile::tempdir().expect("tempdir");
+        let _scoped = test_env::ScopedThemeDir::set(directory.path());
+        let theme = Theme::built_in_default();
+        let file = directory.path().join("terminal.json");
+        std::fs::write(&file, theme.to_json()).expect("write");
+        assert_eq!(
+            save_named(&theme, "terminal").expect("saved in place"),
+            file
+        );
     }
 
     /// The first pane is the accent and the second is one other colour, the

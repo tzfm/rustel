@@ -220,7 +220,8 @@ fn call_order(binding: &str) -> (&str, u64) {
 const CHAIN_GRACE: Duration = Duration::from_secs(5);
 /// A chain with a plugin the body of its lane does not name ends after this
 /// much play with no note: a chain of a lane with no statement, of no lane,
-/// or with a plugin from a variable or a helper. See [`Chains::tick`].
+/// or with a plugin from a variable or a helper. A surplus chain ends after
+/// this time too: see [`ChainRegistry::surplus`]. See [`Chains::tick`].
 const CHAIN_UNSEEN_LIMIT: Duration = Duration::from_secs(600);
 
 /// A chain of a registry. Each time is a time of the clock of the chains:
@@ -423,9 +424,9 @@ struct ChainRegistry {
     accessed: u64,
     /// The count of score changes.
     epoch: u64,
-    /// The plugin names in the body of each lane of the score, by lane
-    /// number. A lane that left keeps the names of its last body while a
-    /// chain has the lane: see [`Self::leave`].
+    /// The plugin name of each call in the body of each lane of the score,
+    /// by lane number. A lane that left keeps the names of its last body
+    /// while a chain has the lane: see [`Self::leave`].
     bodies: HashMap<u64, Vec<String>>,
 }
 
@@ -714,15 +715,18 @@ impl ChainRegistry {
     }
 
     /// The owner of the unused chain in grace with the oldest time, then
-    /// the lowest number: see [`Chain::grace`].
+    /// the lowest number: see [`Chain::grace`]. With no such chain, the
+    /// owner of the unused surplus chain with the oldest note: see
+    /// [`Self::surplus`].
     fn in_grace(&self) -> Option<ChainOwner> {
         let unused = self
             .owners
             .iter()
             .filter(|(_, chain)| chain.epoch < self.epoch);
         let grace = unused.filter_map(|(owner, chain)| {
-            let order = (chain.grace(owner)?, chain.id);
-            Some((order, owner))
+            let start = chain.grace(owner);
+            let time = start.or_else(|| self.surplus(owner).then_some(chain.seen))?;
+            Some(((start.is_none(), time, chain.id), owner))
         });
         grace
             .min_by_key(|(order, _)| *order)
@@ -751,9 +755,10 @@ impl ChainRegistry {
 
     /// The chains whose time passed at `now`. A chain ends [`CHAIN_GRACE`]
     /// after the start of its grace: see [`Chain::grace`]. A chain with a
-    /// plugin the body of its lane does not name ends [`CHAIN_UNSEEN_LIMIT`]
-    /// after its last note, when no note used it since the last score
-    /// change: see [`Self::unnamed`].
+    /// plugin the body of its lane does not name, and a surplus chain, end
+    /// [`CHAIN_UNSEEN_LIMIT`] after the last note, when no note used the
+    /// chain since the last score change: see [`Self::unnamed`] and
+    /// [`Self::surplus`].
     fn due(&self, now: Duration) -> Vec<u64> {
         let past = |at: Option<Duration>, time: Duration| {
             at.is_some_and(|at| now.saturating_sub(at) >= time)
@@ -761,7 +766,7 @@ impl ChainRegistry {
         let due = self.owners.iter().filter(|(owner, chain)| {
             let unseen = chain.epoch < self.epoch
                 && past(Some(chain.seen), CHAIN_UNSEEN_LIMIT)
-                && self.unnamed(owner, chain);
+                && (self.unnamed(owner, chain) || self.surplus(owner));
             unseen || past(chain.grace(owner), CHAIN_GRACE)
         });
         due.map(|(_, chain)| chain.id).collect()
@@ -780,6 +785,32 @@ impl ChainRegistry {
         let mut kept =
             calls.filter_map(|(plugin, lost)| plugin.as_ref().filter(|_| lost.is_none()));
         kept.any(|plugin| !names.contains(&canonical(&plugin.name)))
+    }
+
+    /// True when more chains of the lane of `owner` hold one of its plugins
+    /// than the body of the lane has calls of it: an edit took out an arm
+    /// of a stack, an effect of `every` or a preset of an alternation, and
+    /// the body still names the plugin. Such a chain that no note used
+    /// since the last score change ends [`CHAIN_UNSEEN_LIMIT`] after its
+    /// last note, and an output with no room takes it after the chains in
+    /// grace: see [`Self::due`] and [`Self::in_grace`]. A chain a note used
+    /// since the change stays, so a lane that alternates presets keeps its
+    /// chains.
+    fn surplus(&self, owner: &ChainOwner) -> bool {
+        let Some(number) = owner.lane.number() else {
+            return false;
+        };
+        let names = self.bodies.get(&number).map_or(&[][..], Vec::as_slice);
+        let lane = || self.owners.keys().filter(|other| other.lane == owner.lane);
+        owner.plugins.iter().flatten().any(|plugin| {
+            let name = canonical(&plugin.name);
+            let calls = names.iter().filter(|called| **called == name).count();
+            let holds = |other: &&ChainOwner| {
+                let mut plugins = other.plugins.iter().flatten();
+                plugins.any(|theirs| canonical(&theirs.name) == name)
+            };
+            calls > 0 && lane().filter(holds).count() > calls
+        })
     }
 
     /// Takes out the chains with a number in `gone`, and each key a chain
@@ -3307,6 +3338,91 @@ mod tests {
         assert_eq!(gone, made);
         assert!(chains.settle(start + CHAIN_UNSEEN_LIMIT).is_empty());
         assert_eq!(chains.settle(left + CHAIN_UNSEEN_LIMIT), [unnamed]);
+    }
+
+    /// A lane whose body still names a plugin, with more chains of the
+    /// plugin than calls of it, ends each such chain no note used since the
+    /// score change, CHAIN_UNSEEN_LIMIT after its last note: the chain of an
+    /// arm of a stack, of the effect of `every` and of a preset the edit
+    /// took out. An output with no room takes such a chain after the chains
+    /// in grace. A chain a note used since the change stays, so a lane that
+    /// alternates presets keeps its chains.
+    #[test]
+    fn a_chain_the_lane_no_longer_uses_ends_while_the_lane_names_its_plugin() {
+        let start = Duration::ZERO;
+        let note = start + Duration::from_secs(1);
+        let unseen = start + CHAIN_UNSEEN_LIMIT;
+        // 2 arms of a stack, then one arm. Bass leaves the text in the same
+        // edit: its chain in grace goes first to make room.
+        let mut lanes = LaneTable::default();
+        let mut registry = ChainRegistry::new();
+        let score = concat!(
+            "keys: stack(note(\"c4\").vsti(\"serum\"), note(\"e4\").vsti(\"serum\"))\n",
+            "bass: note(\"c1\").vsti(\"zyklop\")",
+        );
+        assert_eq!(change(&mut lanes, &mut registry, score, start), [0, 1]);
+        let arm = |call: u32| owner("#0", &[], Some((call, "serum")));
+        let bass = owner("#1", &[], Some((2, "zyklop")));
+        let played = chains_of(&mut registry, &[arm(0), arm(1), bass.clone()], start);
+        let single = "keys: note(\"c4\").vsti(\"serum\")";
+        assert_eq!(change(&mut lanes, &mut registry, single, start), [0]);
+        assert_eq!(chain_of(&mut registry, arm(0), note), played[0]);
+        assert_eq!(registry.in_grace(), Some(bass));
+        assert_eq!(registry.settle(start + CHAIN_GRACE), [played[2]]);
+        assert_eq!(registry.in_grace(), Some(arm(1)));
+        assert!(
+            registry
+                .settle(unseen - Duration::from_millis(1))
+                .is_empty()
+        );
+        assert_eq!(registry.settle(unseen), [played[1]]);
+        assert!(registry.settle(note + CHAIN_UNSEEN_LIMIT).is_empty());
+
+        // The lead drops the effect of `every`: the chain of its notes with
+        // the effect ends, and the chain of its other notes stays.
+        let mut lanes = LaneTable::default();
+        let mut registry = ChainRegistry::new();
+        let every = "lead: note(\"c e\").vsti(\"serum\").every(2, x => x.vst(\"ott\"))";
+        assert_eq!(change(&mut lanes, &mut registry, every, start), [0]);
+        let dry = owner("#0", &[], Some((0, "serum")));
+        let wet = owner("#0", &[(1, "ott")], Some((0, "serum")));
+        let played = chains_of(&mut registry, &[dry.clone(), wet], start);
+        let plain = "lead: note(\"c e\").vsti(\"serum\")";
+        assert_eq!(change(&mut lanes, &mut registry, plain, start), [0]);
+        assert_eq!(chain_of(&mut registry, dry, note), played[0]);
+        assert_eq!(registry.settle(unseen), [played[1]]);
+
+        // A pad alternates 3 presets. After an edit each preset plays in a
+        // cycle of its own: each keeps its chain, also a long time after.
+        // An edit to one preset ends the chains of the other 2.
+        let mut lanes = LaneTable::default();
+        let mut registry = ChainRegistry::new();
+        let pad = |presets: &str| {
+            format!("pad: note(\"c\").vsti(\"serum\", {{ preset: \"{presets}\" }})")
+        };
+        let preset = |name: &str| {
+            let owner = owner("#0", &[], Some((0, "serum")));
+            with_preset(owner, rustel_audio::EFFECT_CHAIN, name)
+        };
+        let names = ["a", "b", "c"];
+        assert_eq!(
+            change(&mut lanes, &mut registry, &pad("<a b c>"), start),
+            [0]
+        );
+        let played = chains_of(&mut registry, &names.map(preset), start);
+        let slow = pad("<a b c>").replace("note(\"c\")", "note(\"c\").slow(2)");
+        assert_eq!(change(&mut lanes, &mut registry, &slow, start), [0]);
+        for (at, name) in names.into_iter().enumerate() {
+            let cycle = start + Duration::from_secs(2 * at as u64);
+            assert_eq!(chain_of(&mut registry, preset(name), cycle), played[at]);
+        }
+        let last = start + Duration::from_secs(4);
+        assert!(registry.settle(last + CHAIN_UNSEEN_LIMIT).is_empty());
+        assert_eq!(change(&mut lanes, &mut registry, &pad("a"), last), [0]);
+        assert_eq!(chain_of(&mut registry, preset("a"), last), played[0]);
+        let mut gone = registry.settle(last + CHAIN_UNSEEN_LIMIT);
+        gone.sort_unstable();
+        assert_eq!(gone, played[1..]);
     }
 
     /// A lane keeps its number through an edit. A muted lane plays no note.

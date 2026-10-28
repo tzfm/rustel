@@ -41,6 +41,9 @@ pub(super) struct ExternalWatch {
     /// The mode these files were gathered for. A switch starts over, so
     /// entering eval mode baselines the whole set instead of playing it.
     mode: ExternalChanges,
+    /// The set folder these files were gathered from. Another set starts
+    /// over the same way: its scores are a baseline, not saves.
+    directory: PathBuf,
     files: HashMap<PathBuf, WatchedFile>,
     /// The first poll after the mode turns on only records what is there.
     /// Otherwise every score in the set would open and play at once.
@@ -77,9 +80,11 @@ impl App {
         self.external_watch_checked_at = now;
 
         let paths = self.watched_paths(mode);
+        let directory = self.scenes.directory();
         let watch = self.external_watch.get_or_insert_default();
-        if watch.mode != mode {
+        if watch.mode != mode || watch.directory != directory {
             watch.mode = mode;
+            watch.directory = directory.to_path_buf();
             watch.files.clear();
             watch.started = false;
         }
@@ -121,6 +126,29 @@ impl App {
         settled.sort_by_key(|(_, modified)| *modified);
         for (path, _) in settled {
             self.apply_watched_change(&path, now);
+        }
+    }
+
+    /// Take a file as the watch's baseline, so a write of the studio's own
+    /// is not read back as another program's save. A file with a tab has
+    /// its saved text to tell. An import, and the file of a tab that
+    /// closes after its saves, have no tab to tell it.
+    pub(super) fn note_own_write(&mut self, path: &Path) {
+        let Some(watch) = self.external_watch.as_mut() else {
+            return;
+        };
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let stamp = FileStamp {
+                modified: metadata.modified().ok(),
+                len: metadata.len(),
+            };
+            watch.files.insert(
+                path.to_path_buf(),
+                WatchedFile {
+                    stamp,
+                    settling: false,
+                },
+            );
         }
     }
 

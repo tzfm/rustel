@@ -92,6 +92,9 @@ impl Session {
         self.ensure_voicings()?;
         self.js.set_cps(self.scheduler.cps());
         self.js.set_cycle_time(self.evaluation_cycle());
+        // The setup and its imports keep what they register for every
+        // score, so a score's own replacements go back before they run.
+        self.js.restore_score_registrations()?;
         self.load_script_imports(source, cancellation, ImportScope::Shared)
             .inspect_err(|_| self.js.show_last_good_imports())?;
         // Setup code is not the active editor document. Locations created
