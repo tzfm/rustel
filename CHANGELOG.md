@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.1.6
+
 - Sample and import downloads use rustls 0.23.46, which fixes four rustls advisories, the worst of medium severity.
 - File ▸ Export patterns writes the open set's scores as one pattern export at the sets root, named after the set and the day: the shape strudel.cc's Patterns tab gives and takes, keyed by name, so the names come back on an import and the file loads in strudel.cc. A score on screen goes out as it stands, unsaved edits included, and the open-set prompt offers the export beside the sets.
 - The set panel's search box repaints on every key it takes. A held Backspace showed its work only when the caret's blink happened to repaint, so the query thinned a beat behind the key.
@@ -28,8 +30,8 @@
 - Press / in the set panel to filter the scores: the panel hides the ones a query does not answer, matching names and @field values. Enter leaves the filter standing and moves to the first match, Esc restores the full list, and the sessions fold stays unfiltered. In vim mode `/` starts typing at once, as Vim's own search does, and Esc leaves Insert before the next Esc clears the filter. The box's hints say plainly what Enter and Esc do with the filter.
 - The set panel's foot shows the selected row's details and follows the selection: the name, its strip number and open state, the @fields its leading comments carry, and when the file was last saved. A tape's row shows its recording time and size, the sessions fold its count, and long detail is cut with a count of what did not fit.
 - Settings ▸ Set has sync with score metadata, on by default. An update renames the score's file to its @title field. The characters a name may not hold turn into dashes, a name already in use is refused with a ribbon, and a score with no @title is left alone.
-- The talkit speech synthesizer lives in its own repository, [rustel-talkit](https://github.com/tzfm/rustel-talkit), and the build takes it as a pinned package from release v0.1.1. Scores speak as before, and the talkit command installs from that repository.
-- The Hydra video synth lives in its own repository, [rustel-hydra](https://github.com/tzfm/rustel-hydra), and the build takes it as a pinned package from release v0.1.0. Visuals draw as before, with the same character-checked shaders.
+- The talkit speech synthesizer lives in its own repository, [rustel-talkit](https://github.com/tzfm/rustel-talkit), and the build takes it as a pinned package at tag v0.1.1. Scores speak as before, and the talkit command installs from that repository.
+- The Hydra video synth lives in its own repository, [rustel-hydra](https://github.com/tzfm/rustel-hydra), and the build takes it as a pinned package at tag v0.1.0. Visuals draw as before, with the same character-checked shaders.
 - While one score plays, auto evaluate applies an edit of that score alone. An edit of another score of the set stays in its file until the evaluate key runs it, and the typing pause says so.
 - The knobs column shows the presets of a plugin call under its rails, closed until → opens them. Enter on a name, and a click on one, write the preset into the call, and the name the call holds carries the mark. The Vim list keys drive the column now, as they do the other panels, and its value form walks its fields with ↑↓ and Tab, as the smart action's form does.
 - A slider() on `fm` moves the sounding voice, as the gain and filter sliders do: `s("in").fm(slider(2, 0, 8))` rides the depth live, with no wait for the next hap. This reaches every source; on `s("in")`, whose hap spans the cycle, it is the difference between now and a cycle late. The chain's other operators stay query-time, and a modulator aimed at `fm` keeps its own graph.
@@ -38,22 +40,18 @@
 - The vst tab of the reference column is a tree: → on a plugin opens the two rows under it, its presets and its parameters with their counts, and → on one of the two makes that half the view of the tab, with its own search and a trail on the search line. ← and Esc go back, also from an empty half. A search of the plugin list reads plugin names only. Ctrl+F in a plugin call opens the parameters view, and Ctrl+Space in a name keeps opening the presets.
 - A beat line chosen on its own survives a restart. Before, it went back to off unless an opacity changed too.
 - An edit another program saved while the studio was still finishing its own save is loaded, not left on disk for the next studio save to overwrite.
-- A sound under an explicit bank plays the bank's asset when the bank has one, and names the missing sound when it does not. A banked wavetable keeps its pitch and position controls, the same as its direct spelling.
 - An orbit sent to an output pair a mono device does not have still sounds, through the main pair.
 - A render or playback longer than the queue of pending events keeps every note. Before, notes past 8192 queued events disappeared before their time came.
-- LFO rates above the sample clock, and negative rates, keep moving through their cycle instead of sticking at a clamp.
 - Keys typed while the terminal answers the studio's startup questions reach the editor. Before, they vanished into the answers.
 - A rename that only changes capitalization works where the filesystem folds case, for a set, a scene and a tape.
 - midi-monitor shows packets it does not model, as raw bytes, in both text and --json output.
 - Hydra's fps option sets the frame rate of the score's visuals. Before, every value played at 30 frames a second.
 - The plugin list of the Settings vst page takes a filter: `/` starts it, the letters keep the plugins their names reach - a part of a name is enough, as the preset search reads it - Enter keeps it standing and Esc drops it. While it types, the keys the page binds are letters of it, so `a` adds no folder.
 - The header's tempo line reads cycle 0.00 while the studio is stopped, as before the first play. The stop freezes the clock for the canvas the player keeps, and the header kept saying the cycle the score stopped on. A canvas that is already stopped no longer takes a second stop word, and a stop pressed while the playback is already stopped no longer asks the engine to stop again: the word came back as a second settle, which reset the advisories and discarded the visual update the held frame was showing.
-- FM modulators now run from the start of the render, as in the browser reference. Before, each note restarted its modulator phase, so FM notes past the first cycle sounded different from strudel, and dense FM scores came out louder.
 - Copying samples into a set refuses bank names and links that could write outside the set folder.
 - On a terminal that composes Option+A into text, the Chords and Scales tabs read it as the auto preview toggle. Before, the composed character typed into the search box.
 - A click on the preview fader reads the bar it draws. Before, the click's bar was narrower than the drawn one, so a click on the knob set a gain a few dB higher.
 - Sample and manifest fetches retry a transient 429 or 5xx after a short rest, so a briefly overloaded sample host no longer fails a corpus run.
-
 - Settings has an Appearance page: the visual rows of the first page in one place. The Advanced page is gone, its rows sit at the end of General, and the first tab is renamed General. A beat line under the header keeps the tempo visible in pulse, travel and wave looks, and the evaluation animation row shapes the flash a run of code makes, with fades of three speeds, swipe, zap, steps, glitch and wave.
 - Auto evaluate no longer reinstalls a score when the edit adds no instruction. Typing a `$:`, a lane name, or a new line under a playing set leaves the sound alone, so an `oneshot` lane does not fire for it. A press, or a watched file, still applies.
 - `oneshot()` with no grid plays on the next cycle, the same as `oneshot(1)`. Before, it was silent.
@@ -73,7 +71,7 @@
 - Windows reports underruns, and Csound reports when it falls behind, in play and in an offline render.
 - Two memory leaks are fixed, in macOS gamepad polling and in the Chords tab.
 - all() returning undefined is an error now.
-- Pattern queries allocate less, and rustelup checks the Linux build packages first..
+- Pattern queries allocate less, and rustelup checks the Linux build packages first.
 - View ▸ Knobs or ^⇧K opens a column of sliders for the numbers of the call under the caret. A move writes the score. Counts stay whole, speeds move in quarters, and vst calls and documented options such as `_pianoroll` or `lfo` get their own rails.
 - A drag or a notch on any slider can land back on a whole number.
 - `getTime()` reads 0 when a score starts from its first cycle: Play after a stop, a restart or a rewind. Before, it kept the old cycle, so a pattern placed with it played late. A failed update that falls back to the last score gives that score its first value again.
@@ -86,6 +84,9 @@
 
 ### Sound changes
 
+- FM modulators now run from the start of the render, as in the browser reference. Before, each note restarted its modulator phase, so FM notes past the first cycle sounded different from strudel, and dense FM scores came out louder.
+- LFO rates above the sample clock, and negative rates, keep moving through their cycle instead of sticking at a clamp.
+- A sound under an explicit bank plays the bank's asset when the bank has one, and names the missing sound when it does not. A banked wavetable keeps its pitch and position controls, the same as its direct spelling.
 - `s("in")` takes the FM controls: `fm`, `fmh`, `fmwave` and the operator envelopes bend the playback rate of the incoming signal, and the route amounts set the bend while `note` still does not retune the input. Waveshaping already reached the input through `dist` and `diode`, and still does.
 - `partials` plays up to 2047 partials, or 4095 from a list of 4096, as Firefox does. Before, only the first 32 played, so a 128-partial sawtooth was too dark. The partials use Firefox's band-limited tables and normalization. Eight voices with 128 partials render 128 s of audio in 4.6 s instead of 62 s on a 4-core x86-64 Linux machine.
 - Sawtooth, square and triangle tables have 4096 samples at every sample rate, as in Firefox. At 44.1 kHz and 48 kHz the sound does not change.

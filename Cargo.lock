@@ -3678,7 +3678,7 @@ dependencies = [
 
 [[package]]
 name = "rustel"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "clap",
  "clap_complete",
@@ -3704,7 +3704,7 @@ dependencies = [
 
 [[package]]
 name = "rustel-audio"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "audio_thread_priority",
  "cpal",
@@ -3718,7 +3718,7 @@ dependencies = [
 
 [[package]]
 name = "rustel-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "dragonbox_ecma",
  "flate2",
@@ -3730,7 +3730,7 @@ dependencies = [
 
 [[package]]
 name = "rustel-csound"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "libloading 0.8.9",
  "rustel-audio",
@@ -3739,7 +3739,7 @@ dependencies = [
 
 [[package]]
 name = "rustel-engine"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "rustel-audio",
  "rustel-core",
@@ -3755,7 +3755,7 @@ dependencies = [
 
 [[package]]
 name = "rustel-ext"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "rustel-core",
  "rustel-fraction",
@@ -3766,7 +3766,7 @@ dependencies = [
 
 [[package]]
 name = "rustel-fraction"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "num-bigint",
  "num-traits",
@@ -3785,7 +3785,7 @@ dependencies = [
 
 [[package]]
 name = "rustel-jsruntime"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "num-bigint",
  "num-traits",
@@ -3801,7 +3801,7 @@ dependencies = [
 
 [[package]]
 name = "rustel-kabel"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -3809,7 +3809,7 @@ dependencies = [
 
 [[package]]
 name = "rustel-midi"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "libc",
  "midir",
@@ -3817,7 +3817,7 @@ dependencies = [
 
 [[package]]
 name = "rustel-mini"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "rustel-core",
  "rustel-fraction",
@@ -3826,11 +3826,11 @@ dependencies = [
 
 [[package]]
 name = "rustel-osc"
-version = "0.1.5"
+version = "0.1.6"
 
 [[package]]
 name = "rustel-runtime"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "coremidi",
  "gilrs",
@@ -3879,7 +3879,7 @@ dependencies = [
 
 [[package]]
 name = "rustel-scheduler"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "rustel-core",
  "rustel-fraction",
@@ -3888,14 +3888,14 @@ dependencies = [
 
 [[package]]
 name = "rustel-serial"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serialport",
 ]
 
 [[package]]
 name = "rustel-studio"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "arboard",
  "crossterm",
@@ -3934,7 +3934,7 @@ dependencies = [
 
 [[package]]
 name = "rustel-studio-e2e"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "crossterm",
  "font8x8",
@@ -3957,7 +3957,7 @@ source = "git+https://github.com/tzfm/rustel-talkit.git?tag=v0.1.1#6d6e5cd1bf81c
 
 [[package]]
 name = "rustel-transpiler"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "oxc_allocator",
  "oxc_ast",
@@ -3973,7 +3973,7 @@ dependencies = [
 
 [[package]]
 name = "rustel-voice"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "rustel-audio",
  "rustel-core",
@@ -3983,7 +3983,7 @@ dependencies = [
 
 [[package]]
 name = "rustel-vst3"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "cpal",
  "libc",
@@ -3998,7 +3998,7 @@ dependencies = [
 
 [[package]]
 name = "rustel-vst3-fixture"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "rustel-audio",
  "vst3",
