@@ -177,6 +177,11 @@ impl App {
             if let Some(panel) = self.set_panel.as_mut() {
                 panel.search_key(code);
             }
+            // The box's row or the list it filters changed: the frame is
+            // stale the moment the box takes a key. Nothing below marks
+            // it, and a held Backspace that waits for the caret's blink
+            // to show its work reads as lag.
+            self.dirty_frame = true;
             return true;
         }
         // A set that could not go because a score could not be saved:
@@ -2160,6 +2165,17 @@ mod tests {
                 ["spare"],
                 "the query answers a title, not a name"
             );
+            // A key the box takes marks the frame: a held Backspace
+            // repaints at the key's own pace, not the caret blink's.
+            app.dirty_frame = false;
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            assert_eq!(
+                query(&app).as_deref(),
+                Some("n"),
+                "Backspace popped a letter"
+            );
+            assert!(app.dirty_frame, "the box's key marked the frame");
+            press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
             {
                 let panel = app.set_panel.as_ref().unwrap();
