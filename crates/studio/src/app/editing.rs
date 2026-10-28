@@ -275,6 +275,11 @@ impl App {
                     }
                     self.save_replay_tab(id);
                 } else {
+                    // The file this write lands on may be about to take its
+                    // name from the score's `@title`, which is why the name
+                    // is settled first: the rename must never leave a save
+                    // in flight to the path the file just left.
+                    self.sync_name_from_title();
                     self.write_scene(scene, revision, Arc::clone(&source));
                 }
                 // Nothing to install: the sounding score is already this one,

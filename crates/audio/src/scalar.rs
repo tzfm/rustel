@@ -1098,6 +1098,66 @@ struct PendingEventSlot {
 #[derive(Clone, Copy, Debug)]
 pub struct OrbitGains(pub [f32; MAX_ORBITS]);
 
+/// The orbit taps of a stems render: every orbit's finished stereo for the
+/// block in hand, beside which orbits have made sound. Kept only while an
+/// offline stems render asks for them - the live path never pays for taps
+/// it cannot use.
+#[derive(Default)]
+pub struct Stems {
+    /// Interleaved stereo per orbit: `MAX_ORBITS` blocks of
+    /// [`crate::reverb::REVERB_BLOCK`] frames.
+    taps: Vec<f32>,
+    /// Which orbits put a nonzero sample into their tap: only those are
+    /// worth a stem file.
+    sounded: [bool; MAX_ORBITS],
+}
+
+impl Stems {
+    fn new() -> Self {
+        Self {
+            taps: vec![0.0; MAX_ORBITS * crate::reverb::REVERB_BLOCK * 2],
+            sounded: [false; MAX_ORBITS],
+        }
+    }
+
+    /// One orbit's taps for the last block rendered: `frames` interleaved
+    /// stereo frames. Past the block's end the taps are not the render's.
+    pub fn orbit(&self, orbit: usize, frames: usize) -> &[f32] {
+        let span = frames.min(crate::reverb::REVERB_BLOCK) * 2;
+        let from = orbit * crate::reverb::REVERB_BLOCK * 2;
+        &self.taps[from..from + span]
+    }
+
+    /// Which orbits have made sound this render.
+    pub fn sounded(&self) -> &[bool; MAX_ORBITS] {
+        &self.sounded
+    }
+
+    /// Zero the taps for the block in hand: a frame an orbit did not sound
+    /// must read as silence, not as the last block again.
+    fn start_block(&mut self) {
+        self.taps.fill(0.0);
+    }
+
+    /// A reused backend starts no render with an old verdict on an orbit.
+    fn reset(&mut self) {
+        self.sounded = [false; MAX_ORBITS];
+    }
+
+    /// The orbit's finished stereo for one frame of the block in hand.
+    fn tap(&mut self, orbit: usize, frame: usize, left: f32, right: f32) {
+        if frame >= crate::reverb::REVERB_BLOCK {
+            return;
+        }
+        let at = (orbit * crate::reverb::REVERB_BLOCK + frame) * 2;
+        self.taps[at] = left;
+        self.taps[at + 1] = right;
+        if left != 0.0 || right != 0.0 {
+            self.sounded[orbit] = true;
+        }
+    }
+}
+
 /// The level, the place and the sends of an instrument, from its last note.
 /// A note that changes one of them while the instrument sounds moves the
 /// value in a short ramp: a step is a click on the notes before.
@@ -1305,6 +1365,9 @@ pub struct ScalarBackend {
     /// `MAX_ORBITS` blocks of `ORBIT_MIX_FRAMES * 2`. Only written while
     /// some orbit is routed away.
     orbit_mix: Vec<f32>,
+    /// The orbit taps of a stems render, when one asked for them. `None`
+    /// costs the mix loop one register flag.
+    stems: Option<Stems>,
     /// Per-visual dry stereo sums for the current live render quantum.
     /// These are post-voice-DSP and pre-orbit: shared delay, reverb, ducking,
     /// DJF and orbit gain cannot be assigned to one receiver without mixing
@@ -1753,6 +1816,9 @@ impl ScalarBackend {
         self.pending.clear();
         self.pending_chokes.fill(None);
         self.preview_epoch = 0;
+        if let Some(stems) = self.stems.as_mut() {
+            stems.reset();
+        }
         self.live_control_targets.clear();
         self.insert_values.clear();
         while let Some(mut voice) = self.voices.pop() {

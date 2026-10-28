@@ -1046,6 +1046,35 @@ pub mod profiles {
         }
 
         #[test]
+        fn option_digits_compose_and_recover_on_the_mac_terminals() {
+            for (digit, composed) in [
+                ('1', '¡'),
+                ('2', '™'),
+                ('3', '£'),
+                ('4', '¢'),
+                ('5', '∞'),
+                ('6', '§'),
+                ('7', '¶'),
+                ('8', '•'),
+                ('9', 'ª'),
+            ] {
+                for terminal in ["iTerm2", "Apple Terminal"] {
+                    assert!(
+                        super::alt_input_limitation(terminal, &format!("alt+{digit}")).is_some(),
+                        "alt+{digit} is missing from the {terminal} profile"
+                    );
+                    assert_eq!(
+                        super::alt_input_letter(terminal, composed),
+                        Some(digit),
+                        "{composed} does not recover alt+{digit} on {terminal}"
+                    );
+                }
+            }
+            assert!(super::alt_input_limitation("Ghostty", "alt+1").is_none());
+            assert_eq!(super::alt_input_letter("Ghostty", '¡'), None);
+        }
+
+        #[test]
         fn legacy_f3_decoder_limit_is_distinct_from_a_terminal_steal() {
             let _platform = super::ForcePlatformForTest::set("linux");
             let _desktop = super::ForceDesktopForTest::set("");

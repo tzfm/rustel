@@ -850,6 +850,10 @@ pub struct Session {
     stop_when_silent: Option<rustel_audio::SilenceStop>,
     /// Optional master limiter for WAV/MP3 file exports.
     export_limiter: Option<rustel_audio::RenderLimiter>,
+    /// Whether a scalar WAV export also writes a `<name> stems` folder beside
+    /// the file: `main.wav` plus one WAV a sounding orbit. See
+    /// [`Self::set_stems_export`].
+    stems_export: bool,
     /// The input-channel warnings already said for this score and this
     /// input: a silent voice on `in:1` is news once, not once a window.
     input_warnings_reported: std::collections::BTreeSet<String>,
@@ -1167,6 +1171,7 @@ impl Session {
             prebake_selects_variants: false,
             stop_when_silent: None,
             export_limiter: None,
+            stems_export: false,
             input_warnings_reported: std::collections::BTreeSet::new(),
             refusals_reported: std::collections::BTreeSet::new(),
             plugin_lines_reported: std::collections::BTreeSet::new(),

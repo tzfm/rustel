@@ -15,6 +15,12 @@ plays it. Any other new path, such as `rustel studio set1`, creates a set folder
 with a starter scene. File > Open set does the same with a path you type. The
 parent folder must exist.
 
+A path given to File > Open set can be a Strudel pattern export: a `.json`
+object that holds one pattern of code per entry. Such a file is not a set on
+disk, so Studio makes a set of it. The new set folder sits beside the others and
+takes its name from the export file. One score is written per entry, and a
+score that carries a `@title` field takes it as its file name.
+
 Type or paste a score, then press **Ctrl+S** or **F5**. Press **Ctrl+G** or **F8**
 to stop. Editing does not change the playing score until you update it. If an
 update fails, the last good score keeps playing. An update that changes nothing
@@ -127,6 +133,11 @@ Selecting a scene changes the editor; it does not start playback. Update the
 selected scene to play it. The scene strip marks the playing scene with `▶`
 and unsaved edits with `●`.
 
+Alt with 1 to 9 selects the score that holds that number on the strip. It
+works while the editor has the keyboard, so you can switch scores without the
+set panel. The panel's rows show the numbers, and a number the strip does not
+hold says so in the footer.
+
 Use Ctrl+N for a new scene or F3 to duplicate the current scene. These actions
 create files. Scene > Rename scene renames the scene and its file. Rename has
 no default shortcut. You can assign one in Settings > Keybinds. Ctrl+W closes
@@ -164,8 +175,22 @@ uses the terminal's own selection.
 ### The set panel
 
 Press Ctrl+B. Use the arrows to select a score or session, then Enter to open
-it. Space folds a section. Esc returns to the editor. Use `+` and `-` to change
-the panel size.
+it. Press 1 to 9 to open the score that holds that number on the strip. Space
+folds a section. Esc returns to the editor. Use `+` and `-` to change the
+panel size.
+
+The panel's foot shows the selected row's details under its own rule: the
+name, its strip number and open state, the `@` fields its leading comments
+carry, and when it was last saved. The block follows the selection with no
+key of its own. A tape's row shows its recording time, and the sessions fold
+its count. The hint rows at the panel's bottom name the open, strip and
+filter keys.
+
+Press `/` to filter the scores: type, and the panel hides the scores the query
+does not answer. A query matches a name or any `@` field value. Enter leaves
+the filter standing and moves to the first match. Esc restores the full list.
+The sessions fold is never filtered. In vim mode the box rests in command
+mode: press `i` or `a` to type.
 
 Delete asks for confirmation before it removes a file. Confirming also discards
 its unsaved edits. Studio does not delete the last score or the active session
@@ -320,6 +345,24 @@ itself is ignored.
 
 A save from another program that changes the text replaces the open editor's
 text, including edits that are not saved yet. Studio does not merge the two.
+
+### Sync with score metadata
+
+A score can name its own file. Sync with score metadata, under Settings ▸ Set,
+is on by default. An update renames the score's file to its @title field:
+
+```javascript
+/*
+  @title night drive
+  @by you
+*/
+$: s("bd sd")
+```
+
+The characters a name may not hold turn into dashes, and both ends are
+trimmed. A name another score or file already holds is not taken. The ribbon
+says so, and the file keeps its name. A score with no @title is left
+alone.
 
 ### Stopping
 
@@ -1072,7 +1115,8 @@ folder, and your bank renames. Live playback continues.
 If the export cannot find or load a sound, or the engine refuses a note, the
 export fails and names the refusal. The file is still written. The check covers
 every note the export schedules, also notes after an early end.
-Use Tab and arrows to choose the length, WAV or MP3 format, and output path.
+Use Tab and arrows to choose the length, WAV or MP3 format, stems, and output
+path.
 
 Choose a fixed number of cycles or **until silence**. Until-silence export stops
 when audio stays below the threshold for the hold time. The defaults are
@@ -1088,6 +1132,14 @@ The export limiter starts with the current mixer setting. Changing it in
 the export dialog affects that export only. CLI exports do not inherit the set
 limiter. Match limiter, duration, sample rate, and voice limit when comparing
 an export with another render.
+
+Turn stems on to write a `<name> stems` folder beside the take instead of the
+one file. It holds `main.wav` with the same bounce, plus one stereo WAV for
+each orbit that sounds, named `1.wav` upward. Each stem is tapped after its
+orbit's delay, reverb, filter, duck and fader, before the master limiter, so
+the stems sum back to an unmastered main and mastering stays in the DAW. Stems
+need the WAV format: turning them on takes the format back to WAV, and MP3
+turns them off. The status names the folder, because the take lands inside it.
 
 Press Ctrl+Shift+X again to end an export early. Studio adds a fade and keeps
 the audio already rendered. Use Transport ▸ Reveal last export or take to

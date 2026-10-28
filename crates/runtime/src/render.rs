@@ -807,13 +807,15 @@ pub fn write_scalar_wav_controlled(
         DspDispatch::automatic(),
         rustel_audio::MAX_POLYPHONY,
         None,
+        false,
     )
     .map(|(bytes, _)| bytes)
 }
 
 /// [`write_scalar_wav_controlled`] with the prepared kernel selection and
 /// voice budget. Answers the bytes written and the distinct voices the
-/// render refused.
+/// render refused. With `stems`, the WAV lands inside a `<name> stems`
+/// folder beside `path`, one file a sounding orbit with it.
 #[allow(clippy::too_many_arguments)]
 #[allow(
     clippy::print_stderr,
@@ -832,6 +834,7 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
     dispatch: DspDispatch,
     max_polyphony: usize,
     csound: Option<&crate::csound::State>,
+    stems: bool,
 ) -> io::Result<(usize, Vec<String>)> {
     let cancelled = control.cancelled;
     let render_csound = csound.map(crate::csound::State::for_render);
@@ -938,6 +941,9 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
         ));
     }
     let mut backend = scalar_backend(dispatch, library, max_polyphony, csound);
+    if stems {
+        backend.capture_stems();
+    }
     let rustel_audio::RenderControl {
         mut observer,
         finish,
@@ -969,21 +975,34 @@ pub(crate) fn write_scalar_wav_controlled_with_dispatch(
             observer(tick);
         }
     };
-    let written = rustel_audio::write_wav_events_controlled(
-        path,
-        &mut backend,
-        sample_rate,
-        frames as usize,
-        events,
-        rustel_audio::RenderControl {
-            observer: Some(&mut observed),
-            cancelled,
-            finish,
-            stop_when_silent,
-            limiter,
-        },
-        format,
-    );
+    let control = rustel_audio::RenderControl {
+        observer: Some(&mut observed),
+        cancelled,
+        finish,
+        stop_when_silent,
+        limiter,
+    };
+    let written = if stems {
+        rustel_audio::write_stems_wav_events_controlled(
+            path,
+            &mut backend,
+            sample_rate,
+            frames as usize,
+            events,
+            control,
+            format,
+        )
+    } else {
+        rustel_audio::write_wav_events_controlled(
+            path,
+            &mut backend,
+            sample_rate,
+            frames as usize,
+            events,
+            control,
+            format,
+        )
+    };
     print_notice_tally(notices);
     print_plugin_problems();
     check_csound_errors(csound)?;

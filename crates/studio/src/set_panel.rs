@@ -11,12 +11,14 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use crossterm::event::KeyCode;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Modifier, Style},
 };
 
+use super::metadata::ScoreMeta;
 use super::scenes::{SceneId, SceneSet, SetFile};
 use super::theme::Theme;
 use rustel_runtime::product;
@@ -61,6 +63,25 @@ pub struct FileRow {
     pub strip: Option<usize>,
     pub current: bool,
     pub dirty: bool,
+    /// What its leading comments say about it, read off the file.
+    pub meta: ScoreMeta,
+}
+
+/// How many rows the details block at the panel's foot holds. Longer
+/// detail is cut, with a count of what did not fit.
+const DETAIL_ROWS: usize = 6;
+
+/// The `/` filter: what it holds, and whether the box still has the
+/// keyboard. While it stands, the list hides the scores it does not
+/// answer. The sessions fold and the tapes under it are not filtered:
+/// the question is about scores.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Search {
+    /// What the player typed.
+    pub query: String,
+    /// The box has the keyboard. Enter, or a move, leaves the filter
+    /// standing and gives the rows back. Esc drops it whole.
+    pub typing: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +103,11 @@ pub struct SetPanel {
     pub unsaved: Option<String>,
     /// What the last verb refused, shown under the list.
     pub error: Option<String>,
+    /// The `/` filter, while one stands.
+    pub search: Option<Search>,
+    /// Whether the search box is in Vim's Insert mode, the way every
+    /// text surface keeps its own word for it.
+    pub vim_insert: bool,
     /// The last click, for the second of a double click.
     last_click: Option<(usize, Instant)>,
     /// Lines scrolled past the top, so the selection stays in view with a
@@ -112,6 +138,8 @@ impl SetPanel {
             deleting: None,
             unsaved: None,
             error: None,
+            search: None,
+            vim_insert: false,
             last_click: None,
             hold_scroll: false,
             scroll: 0,
@@ -159,7 +187,8 @@ impl SetPanel {
                     current: file.open == Some(current),
                     dirty: scene.is_some_and(|scene| scene.dirty),
                     name: file.name,
-                    path: file.path,
+                    path: file.path.clone(),
+                    meta: ScoreMeta::read(&file.path),
                     open: file.open,
                 }
             })
@@ -230,9 +259,23 @@ impl SetPanel {
         }
     }
 
-    /// The lines: every score, then the fold and, open, the tapes under it.
+    /// The lines: the scores the filter still shows - all of them when
+    /// no filter stands - then the fold and, open, the tapes under it.
+    /// The fold and the tapes are never filtered: the question is about
+    /// scores.
     fn rebuild(&mut self) {
-        let mut lines: Vec<SetLine> = (0..self.files.len()).map(SetLine::File).collect();
+        let query = self
+            .search
+            .as_ref()
+            .map(|search| search.query.as_str())
+            .filter(|query| !query.is_empty());
+        let mut lines: Vec<SetLine> = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| query.is_none_or(|query| score_answers(file, query)))
+            .map(|(index, _)| SetLine::File(index))
+            .collect();
         lines.push(SetLine::Sessions);
         if self.sessions_open {
             lines.extend((0..self.tapes.len()).map(SetLine::Tape));
@@ -286,6 +329,150 @@ impl SetPanel {
         }
     }
 
+    /// The selected line's details, as the panel's foot shows them: one
+    /// row each. A score's name, where it stands on the strip, what its
+    /// leading comments say about it, and when the file was last saved;
+    /// a tape's name and recording time; the sessions fold's count. The
+    /// block follows the selection with no key of its own.
+    pub fn detail_rows(&self) -> Vec<String> {
+        match self.selected_line() {
+            Some(SetLine::File(index)) => {
+                self.files
+                    .get(index)
+                    .map(|file| {
+                        let mut rows = vec![file.name.clone()];
+                        let mut state = match file.strip {
+                            Some(strip) => format!("open · strip {strip}"),
+                            None => "not open".to_owned(),
+                        };
+                        if file.current {
+                            state.push_str(" · on screen");
+                        }
+                        if file.dirty {
+                            state.push_str(" · unsaved");
+                        }
+                        rows.push(state);
+                        rows.extend(
+                            file.meta.fields().iter().map(|(key, value)| {
+                                format!("@{key} {value}").trim_end().to_owned()
+                            }),
+                        );
+                        if let Some(saved) = saved_at(&file.path) {
+                            rows.push(format!("saved {saved}"));
+                        }
+                        rows
+                    })
+                    .unwrap_or_default()
+            }
+            Some(SetLine::Tape(index)) => self
+                .tapes
+                .get(index)
+                .map(|tape| {
+                    let note = if tape.recording {
+                        "recording".to_owned()
+                    } else {
+                        size_label(tape.bytes)
+                    };
+                    vec![
+                        tape_label(&tape.name),
+                        format!("recorded {} · {note}", tape.recorded),
+                    ]
+                })
+                .unwrap_or_default(),
+            Some(SetLine::Sessions) => vec![format!("{} tapes", self.tapes.len())],
+            None => Vec::new(),
+        }
+    }
+
+    /// The details as the foot has room for: the first rows, then a
+    /// count of the rest when the block cannot hold them all.
+    pub fn foot_detail_rows(&self) -> Vec<String> {
+        let rows = self.detail_rows();
+        if rows.len() <= DETAIL_ROWS {
+            return rows;
+        }
+        let more = rows.len() - (DETAIL_ROWS - 1);
+        let mut held = rows[..DETAIL_ROWS - 1].to_vec();
+        held.push(format!("+{more} more"));
+        held
+    }
+
+    /// Whether the search box holds the keyboard: the box typing, or the
+    /// panel's Insert mode over it in vim.
+    pub fn search_typing(&self) -> bool {
+        self.search
+            .as_ref()
+            .is_some_and(|search| search.typing || self.vim_insert)
+    }
+
+    /// `/` opens the search box, which takes the keyboard and reads the
+    /// query into the list as it grows.
+    pub fn open_search(&mut self) {
+        self.search = Some(Search {
+            query: String::new(),
+            typing: true,
+        });
+    }
+
+    /// The list, read against the filter again: the query changed.
+    pub fn refilter(&mut self) {
+        self.rebuild();
+    }
+
+    /// The search box's keys, while it holds the keyboard. Every letter
+    /// builds the query, and the list hides what does not answer as the
+    /// query grows. Enter leaves the filter standing and moves the
+    /// selection to the first score it kept. Up and Down leave it
+    /// standing and move. Esc drops the filter whole, and the list is
+    /// the folder's again. Anything else is the box's silence.
+    pub fn search_key(&mut self, code: KeyCode) {
+        let mut refilter = false;
+        match code {
+            KeyCode::Char(character) if !character.is_control() => {
+                if let Some(search) = self.search.as_mut() {
+                    search.query.push(character);
+                    self.error = None;
+                    refilter = true;
+                }
+            }
+            KeyCode::Backspace | KeyCode::Delete => {
+                if let Some(search) = self.search.as_mut() {
+                    search.query.pop();
+                    self.error = None;
+                    refilter = true;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(search) = self.search.as_mut() {
+                    search.typing = false;
+                }
+                // Enter reads as "go there": the cursor lands on the
+                // first score the filter kept.
+                if let Some(first) = self
+                    .lines
+                    .iter()
+                    .position(|line| matches!(line, SetLine::File(_)))
+                {
+                    self.selected = first;
+                }
+            }
+            KeyCode::Up | KeyCode::Down => {
+                if let Some(search) = self.search.as_mut() {
+                    search.typing = false;
+                }
+                self.move_by(if code == KeyCode::Up { -1 } else { 1 });
+            }
+            KeyCode::Esc => {
+                self.search = None;
+                refilter = true;
+            }
+            _ => {}
+        }
+        if refilter {
+            self.rebuild();
+        }
+    }
+
     /// Open or shut the fold the tapes sit under.
     pub fn toggle_sessions(&mut self) {
         self.sessions_open = !self.sessions_open;
@@ -335,8 +522,9 @@ impl SetPanel {
     }
 
     /// The panel's docked place: the sidebar, when the layout gave it one.
-    /// The rows are the title, the list, the error line and two hint rows;
-    /// the column on the editor's side is the rule between the two.
+    /// The rows are the title, the list, the details block under its own
+    /// rule, the error line and two hint rows; the column on the editor's
+    /// side is the rule between the two.
     pub fn docked_parts(sidebar: Rect, on_right: bool) -> Option<DockedParts> {
         if sidebar.is_empty() || sidebar.height < 5 || sidebar.width < 8 {
             return None;
@@ -349,13 +537,24 @@ impl SetPanel {
         };
         let title = Rect::new(inner_x, sidebar.y, inner_width, 1);
         let hints = 2u16.min(sidebar.height.saturating_sub(3));
-        let list_height = sidebar
+        // Between the list and the error line, the details block takes
+        // what it can: the list keeps one row, the block caps at a rule
+        // plus DETAIL_ROWS, and a short panel drops the block first - a
+        // rule over nothing is not a block.
+        let flex = sidebar
             .height
             .saturating_sub(1)
             .saturating_sub(1)
             .saturating_sub(hints);
+        let details = u16::try_from(DETAIL_ROWS)
+            .expect("the cap is small")
+            .saturating_add(1)
+            .min(flex.saturating_sub(1));
+        let details = u16::from(details > 1) * details;
+        let list_height = flex - details;
         let list = Rect::new(inner_x, sidebar.y + 1, inner_width, list_height);
-        let error = Rect::new(inner_x, list.bottom(), inner_width, 1);
+        let details = Rect::new(inner_x, list.bottom(), inner_width, details);
+        let error = Rect::new(inner_x, details.bottom(), inner_width, 1);
         let hint = Rect::new(inner_x, error.bottom(), inner_width, hints);
         let rule_x = if on_right {
             sidebar.x
@@ -366,6 +565,7 @@ impl SetPanel {
         Some(DockedParts {
             title,
             list,
+            details,
             error,
             hint,
             rule,
@@ -373,11 +573,12 @@ impl SetPanel {
     }
 
     /// The sheet form's place: bottom-right like the other sheets, a row
-    /// per line up to a screenful.
+    /// per line up to a screenful, the details block under the list.
     pub fn sheet_geometry(&self, available: Rect) -> Option<(Rect, Rect)> {
         let rows = (self.lines.len() as u16).clamp(1, 16);
-        // Title, the list, an error line, two hint lines, borders.
-        let height = rows + 6;
+        // Title, the list, the details block under its own rule, an error
+        // line, two hint lines, borders.
+        let height = rows + 7 + u16::try_from(DETAIL_ROWS).expect("the cap is small");
         let width = self
             .width
             .saturating_add(4)
@@ -430,6 +631,7 @@ impl SetPanel {
 pub struct DockedParts {
     pub title: Rect,
     pub list: Rect,
+    pub details: Rect,
     pub error: Rect,
     pub hint: Rect,
     pub rule: Rect,
@@ -510,18 +712,52 @@ fn tape_label(name: &str) -> String {
     {
         return name.to_owned();
     }
+    match readable_stamp(stamp) {
+        Some(readable) if suffix.is_empty() => readable,
+        Some(readable) => format!("{readable}{suffix}"),
+        None => name.to_owned(),
+    }
+}
+
+/// A dashed timestamp, `2026-09-24T03-15-30`, as it reads beside the
+/// list: `Sep 24 03:15:30`. None when the month is not a month.
+fn readable_stamp(stamp: &str) -> Option<String> {
     let months = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
     let month = stamp[5..7].parse::<usize>().unwrap_or(0);
-    let Some(month) = month.checked_sub(1).and_then(|n| months.get(n)) else {
-        return name.to_owned();
-    };
-    format!(
-        "{month} {} {}{suffix}",
+    let month = month.checked_sub(1).and_then(|number| months.get(number))?;
+    Some(format!(
+        "{month} {} {}",
         &stamp[8..10],
         stamp[11..].replace('-', ":")
-    )
+    ))
+}
+
+/// When the file was last saved, read off its mtime the moment details
+/// are opened: `Sep 24 03:15:30`. None when the file cannot be asked.
+fn saved_at(path: &Path) -> Option<String> {
+    let seconds = std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    readable_stamp(&rustel_runtime::session_log::dashed_timestamp(seconds))
+}
+
+/// Whether a score's row answers the filter: its name, or any value its
+/// leading `@` fields carry.
+fn score_answers(file: &FileRow, query: &str) -> bool {
+    let aliases: Vec<String> = file
+        .meta
+        .fields()
+        .iter()
+        .map(|(_, value)| value.clone())
+        .filter(|value| !value.is_empty())
+        .collect();
+    super::fuzzy::score(query, &file.name, &aliases, "").is_some()
 }
 
 /// Clip by terminal columns so a wide custom name cannot displace its size.
@@ -575,38 +811,53 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
         let bold = Style::default()
             .fg(theme.accent)
             .add_modifier(Modifier::BOLD);
-        let (title, list, error, hint) = match SetPanel::docked_parts(self.sidebar, self.on_right) {
-            Some(parts) => {
-                // Docked, the panel stands on the theme's own ground, so a
-                // theme's picture runs under it at the interface opacity
-                // as it does under the header; the sheet form is a sheet.
-                super::view::clear_surface(
-                    buffer,
-                    self.sidebar,
-                    Style::default().bg(theme.background).fg(theme.foreground),
-                );
-                let rule = Style::default().fg(theme.rule);
-                for y in parts.rule.y..parts.rule.bottom() {
-                    buffer.set_stringn(parts.rule.x, y, "│", 1, rule);
+        let (title, list, details, error, hint) =
+            match SetPanel::docked_parts(self.sidebar, self.on_right) {
+                Some(parts) => {
+                    // Docked, the panel stands on the theme's own ground, so a
+                    // theme's picture runs under it at the interface opacity
+                    // as it does under the header; the sheet form is a sheet.
+                    super::view::clear_surface(
+                        buffer,
+                        self.sidebar,
+                        Style::default().bg(theme.background).fg(theme.foreground),
+                    );
+                    let rule = Style::default().fg(theme.rule);
+                    for y in parts.rule.y..parts.rule.bottom() {
+                        buffer.set_stringn(parts.rule.x, y, "│", 1, rule);
+                    }
+                    (
+                        parts.title,
+                        parts.list,
+                        parts.details,
+                        parts.error,
+                        parts.hint,
+                    )
                 }
-                (parts.title, parts.list, parts.error, parts.hint)
-            }
-            None => {
-                let Some((sheet, list)) = self.panel.sheet_geometry(area) else {
-                    return;
-                };
-                super::view::clear_surface(
-                    buffer,
-                    sheet,
-                    Style::default().bg(theme.overlay).fg(theme.foreground),
-                );
-                super::devices::draw_border(buffer, sheet, theme);
-                let title = Rect::new(sheet.x + 2, sheet.y, sheet.width.saturating_sub(4), 1);
-                let error = Rect::new(list.x, list.bottom(), list.width, 1);
-                let hint = Rect::new(list.x, list.bottom() + 1, list.width, 2);
-                (title, list, error, hint)
-            }
-        };
+                None => {
+                    let Some((sheet, list)) = self.panel.sheet_geometry(area) else {
+                        return;
+                    };
+                    super::view::clear_surface(
+                        buffer,
+                        sheet,
+                        Style::default().bg(theme.overlay).fg(theme.foreground),
+                    );
+                    super::devices::draw_border(buffer, sheet, theme);
+                    let title = Rect::new(sheet.x + 2, sheet.y, sheet.width.saturating_sub(4), 1);
+                    let details = Rect::new(
+                        list.x,
+                        list.bottom(),
+                        list.width,
+                        u16::try_from(DETAIL_ROWS)
+                            .expect("the cap is small")
+                            .saturating_add(1),
+                    );
+                    let error = Rect::new(list.x, details.bottom(), list.width, 1);
+                    let hint = Rect::new(list.x, error.bottom(), list.width, 2);
+                    (title, list, details, error, hint)
+                }
+            };
         let name = format!(" {} ", self.panel.set_name);
         buffer.set_stringn(
             title.x,
@@ -705,6 +956,40 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
             let padded = format!("{text:<width$}");
             buffer.set_stringn(list.x, y, &padded, width, style);
         }
+        // The selected line's details, standing at the foot the way a
+        // file manager's pane does: the block follows the selection,
+        // with no key of its own. A rule heads the block, the first
+        // row under it names the thing, the rest is what the panel
+        // knows about it.
+        if !details.is_empty() {
+            let rule = "─".repeat(usize::from(details.width));
+            buffer.set_stringn(
+                details.x,
+                details.y,
+                &rule,
+                usize::from(details.width),
+                Style::default().fg(theme.rule),
+            );
+        }
+        for (row, text) in self
+            .panel
+            .foot_detail_rows()
+            .iter()
+            .take(usize::from(details.height).saturating_sub(1))
+            .enumerate()
+        {
+            buffer.set_stringn(
+                details.x,
+                details.y + 1 + row as u16,
+                text,
+                usize::from(details.width),
+                Style::default().fg(if row == 0 {
+                    theme.foreground
+                } else {
+                    theme.muted
+                }),
+            );
+        }
         if let Some(message) = &self.panel.error {
             buffer.set_stringn(
                 error.x,
@@ -740,10 +1025,31 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
                     Style::default().fg(theme.error),
                 );
             }
+        } else if let Some(search) = &self.panel.search {
+            // The search row, in the reference panel's look: what the
+            // filter holds, and in vim's command mode over an empty
+            // query, the way in.
+            let row = if search.typing
+                && search.query.is_empty()
+                && !self.panel.vim_insert
+                && self.keybinds.editor_keybindings() == super::editor::EditorKeybindings::Vim
+            {
+                "search: i or a types".to_owned()
+            } else {
+                format!("search: {}", search.query)
+            };
+            buffer.set_stringn(
+                error.x,
+                error.y,
+                &row,
+                usize::from(error.width),
+                Style::default().fg(theme.foreground),
+            );
         }
         if self.panel.error.is_none()
             && self.panel.deleting.is_none()
             && self.panel.unsaved.is_none()
+            && self.panel.search.is_none()
             && let Some(tape) = self.panel.selected_tape()
         {
             let recorded = tape.recorded.replace('T', " ");
@@ -765,7 +1071,9 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
         let reveal_hint = format!("{reveal} reveal · Del delete · +/- size");
         let live_tape_hint = format!("{reveal} reveal · n new first");
         let folder_hint = format!("{reveal} reveal · +/- size");
-        let hints = if self.panel.unsaved.is_some() {
+        let hints = if self.panel.search_typing() {
+            ["Enter keep · Esc drop", "type to filter the scores"]
+        } else if self.panel.unsaved.is_some() {
             ["Enter retry · Del leave", "Esc keep the set"]
         } else if let Some(tape) = self.panel.selected_tape() {
             [
@@ -777,9 +1085,12 @@ impl ratatui::widgets::Widget for SetPanelView<'_> {
                 },
             ]
         } else if self.panel.selected_file().is_some() {
-            ["Enter open · n new", reveal_hint.as_str()]
+            ["Enter · 1-9 open · / filter · n new", reveal_hint.as_str()]
         } else {
-            ["←/→ fold · n new", folder_hint.as_str()]
+            [
+                "←/→ fold · 1-9 open · / filter · n new",
+                folder_hint.as_str(),
+            ]
         };
         for (row, text) in hints.iter().enumerate().take(usize::from(hint.height)) {
             buffer.set_stringn(
@@ -800,7 +1111,7 @@ mod selection_tests {
     use super::tests::{rendered_rows, set_in};
     use super::*;
 
-    const AREA: Rect = Rect::new(0, 0, SIDEBAR_WIDTH, 12);
+    const AREA: Rect = Rect::new(0, 0, SIDEBAR_WIDTH, 20);
 
     /// A panel over a set of three scores and one tape.
     fn panel_with_a_tape(directory: &Path) -> SetPanel {
@@ -845,10 +1156,128 @@ mod selection_tests {
         let mut panel = panel_with_a_tape(directory.path());
         panel.selected = 0;
         let score = rendered_rows(&panel, AREA, true).join("\n");
-        assert!(score.contains("Enter open · n new"), "{score}");
+        assert!(
+            score.contains("Enter · 1-9 open · / filter · n new"),
+            "{score}"
+        );
         panel.selected = panel.files.len();
         let fold = rendered_rows(&panel, AREA, true).join("\n");
-        assert!(fold.contains("←/→ fold · n new"), "{fold}");
+        assert!(
+            fold.contains("←/→ fold · 1-9 open · / filter · n new"),
+            "{fold}"
+        );
+    }
+
+    #[test]
+    fn a_filter_hides_the_scores_that_do_not_answer() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("night.strudel"),
+            "/*\n@title night drive\n*/\n$: s(\"bd\")\n",
+        )
+        .unwrap();
+        let mut panel = panel_with_a_tape(directory.path());
+        panel.toggle_sessions();
+        let names = |panel: &SetPanel| {
+            panel
+                .lines
+                .iter()
+                .filter_map(|line| match line {
+                    SetLine::File(index) => panel.files.get(*index).map(|file| file.name.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        panel.open_search();
+        panel.search_key(KeyCode::Char('d'));
+        // The name `drop` answers, and so does the title of `night`.
+        assert_eq!(names(&panel), ["drop", "night"]);
+        assert!(
+            panel.lines.contains(&SetLine::Sessions),
+            "the fold is never filtered"
+        );
+        assert!(
+            panel.lines.contains(&SetLine::Tape(0)),
+            "the tapes under it are never filtered"
+        );
+        panel.search_key(KeyCode::Char('r'));
+        panel.search_key(KeyCode::Char('o'));
+        assert_eq!(names(&panel), ["drop"], "the title stopped answering");
+        panel.search_key(KeyCode::Esc);
+        assert_eq!(
+            names(&panel),
+            ["drop", "intro", "night", "spare"],
+            "Esc restores the folder"
+        );
+        assert!(
+            panel.search.is_none(),
+            "Esc drops the filter whole, not just the typing"
+        );
+    }
+
+    /// The box's keys: Enter leaves the filter standing and lands the
+    /// cursor on the first score it kept, a move leaves it standing and
+    /// walks the rows the filter kept, Esc drops it whole and keeps the
+    /// cursor where the row it names went.
+    #[test]
+    fn the_search_box_keeps_drops_and_hands_the_rows_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut panel = panel_with_a_tape(directory.path());
+        panel.open_search();
+        for character in "in".chars() {
+            panel.search_key(KeyCode::Char(character));
+        }
+        panel.search_key(KeyCode::Enter);
+        assert!(
+            !panel.search.as_ref().expect("the filter stands").typing,
+            "Enter ends the typing"
+        );
+        assert_eq!(
+            panel.selected_file().map(|file| file.name.as_str()),
+            Some("intro"),
+            "the cursor lands on the first score the filter kept"
+        );
+        panel.search_key(KeyCode::Down);
+        assert_eq!(
+            panel.selected_line(),
+            Some(SetLine::Sessions),
+            "a move leaves the filter standing and walks the kept rows"
+        );
+        panel.search_key(KeyCode::Esc);
+        assert_eq!(
+            panel.selected_file().map(|file| file.name.as_str()),
+            Some("intro"),
+            "Esc keeps the cursor where the row it names went"
+        );
+    }
+
+    /// The search row shows the query in the reference panel's look,
+    /// with the box's own hints under it, and gives way to an error when
+    /// one comes.
+    #[test]
+    fn the_search_row_shows_the_query_and_yields_to_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut panel = panel_with_a_tape(directory.path());
+        panel.open_search();
+        for character in "dr".chars() {
+            panel.search_key(KeyCode::Char(character));
+        }
+        let rows = rendered_rows(&panel, AREA, true);
+        assert!(
+            rows.iter().any(|row| row.contains("search: dr")),
+            "the row shows the query:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("Enter keep · Esc drop")),
+            "the box's hints stand in for the row hints:\n{}",
+            rows.join("\n")
+        );
+        panel.search_key(KeyCode::Enter);
+        panel.error = Some("could not open the score".to_owned());
+        let rows = rendered_rows(&panel, AREA, true);
+        assert!(rows.iter().all(|row| !row.contains("search: ")));
+        assert!(rows.iter().any(|row| row.contains("could not open")));
     }
 }
 
@@ -949,6 +1378,144 @@ mod tests {
         );
     }
 
+    /// The details block at the foot carries the selected score's name,
+    /// its @fields and its saved time, with no key to open: it follows
+    /// the selection. The fold says its count, a tape its recording
+    /// time, and long detail is cut with a count of what did not fit.
+    #[test]
+    fn details_carry_the_name_the_comments_and_the_saved_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut set = set_in(directory.path());
+        std::fs::write(
+            directory.path().join("spare.strudel"),
+            "/*\n@title night drive\n@by you\n*/\n$: s(\"bd\")\n",
+        )
+        .unwrap();
+        set.select(2);
+        set.close_current().unwrap();
+        let sessions = set.sessions_directory();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mut panel = SetPanel::open(&set, &sessions, None);
+
+        // The fold is not a score's row: its detail is its count.
+        panel.selected = panel.files.len();
+        assert_eq!(panel.detail_rows(), ["0 tapes".to_string()]);
+
+        let spare = panel
+            .lines
+            .iter()
+            .position(|line| match line {
+                SetLine::File(index) => panel.files[*index].name == "spare",
+                _ => false,
+            })
+            .expect("spare is listed");
+        panel.selected = spare;
+        let rows = panel.detail_rows();
+        assert_eq!(
+            rows[..4],
+            ["spare", "not open", "@title night drive", "@by you"]
+        );
+        assert!(
+            rows[4].starts_with("saved "),
+            "the saved time is there: {:?}",
+            rows[4]
+        );
+
+        // A tape's detail is its name and its recording time.
+        std::fs::write(
+            sessions.join("session-2026-09-24T03-15-30.rustel-session"),
+            "{\"recorded\":\"2026-09-24T03:15:30Z\"}\n",
+        )
+        .unwrap();
+        panel.refresh(&set, &sessions, None, None);
+        panel.toggle_sessions();
+        let tape = panel
+            .lines
+            .iter()
+            .position(|line| matches!(line, SetLine::Tape(_)))
+            .expect("a tape is listed");
+        panel.selected = tape;
+        let rows = panel.detail_rows();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[1], "recorded 2026-09-24T03:15:30Z · 36 B");
+    }
+
+    /// An open score's detail says which strip it is on, when it is the
+    /// one on screen, and when it holds edits the file does not have
+    /// yet.
+    #[test]
+    fn details_name_the_strip_the_screen_and_the_unsaved_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let set = set_in(directory.path());
+        let sessions = set.sessions_directory();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mut panel = SetPanel::open(&set, &sessions, None);
+        let current = panel
+            .files
+            .iter()
+            .position(|file| file.current)
+            .expect("a current score");
+        panel.files[current].dirty = true;
+        panel.selected = panel
+            .lines
+            .iter()
+            .position(|line| *line == SetLine::File(current))
+            .expect("the current score's line");
+        let file = &panel.files[current];
+        let rows = panel.detail_rows();
+        assert_eq!(rows[0], file.name);
+        assert_eq!(
+            rows[1],
+            format!("open · strip {} · on screen · unsaved", file.strip.unwrap())
+        );
+    }
+
+    /// Detail longer than the block is cut, and the last row counts what
+    /// did not fit.
+    #[test]
+    fn long_detail_is_cut_with_a_count_of_the_rest() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut set = set_in(directory.path());
+        std::fs::write(
+            directory.path().join("tagged.strudel"),
+            concat!(
+                "/*\n@title many tags\n",
+                "@tag one\n@tag two\n@tag three\n@tag four\n@tag five\n",
+                "*/\n$: s(\"bd\")\n",
+            ),
+        )
+        .unwrap();
+        set.select(2);
+        set.close_current().unwrap();
+        let sessions = set.sessions_directory();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mut panel = SetPanel::open(&set, &sessions, None);
+        let tagged = panel
+            .lines
+            .iter()
+            .position(|line| match line {
+                SetLine::File(index) => panel.files[*index].name == "tagged",
+                _ => false,
+            })
+            .expect("tagged is listed");
+        panel.selected = tagged;
+        let rows = panel.foot_detail_rows();
+        // name, state, title and two tags shown; the last row counts the
+        // three tags and the saved time that did not fit.
+        assert_eq!(
+            rows[..5],
+            [
+                "tagged",
+                "not open",
+                "@title many tags",
+                "@tag one",
+                "@tag two"
+            ]
+        );
+        assert_eq!(rows.len(), 6, "{rows:?}");
+        assert_eq!(rows.last(), Some(&"+4 more".to_owned()), "{rows:?}");
+    }
+
     #[test]
     fn generated_session_names_fit_beside_sizes_without_renaming_files() {
         use unicode_width::UnicodeWidthStr;
@@ -963,7 +1530,7 @@ mod tests {
         panel.selected = 3;
         panel.toggle_sessions();
         panel.move_by(1);
-        let rows = rendered_rows(&panel, Rect::new(0, 0, 30, 15), true);
+        let rows = rendered_rows(&panel, Rect::new(0, 0, 30, 16), true);
         let row = rows
             .iter()
             .find(|r| r.contains("Sep 24 03:15:30"))
@@ -1113,7 +1680,8 @@ mod tests {
         let sidebar = Rect::new(0, 2, SIDEBAR_WIDTH, 20);
         let parts = SetPanel::docked_parts(sidebar, false).unwrap();
         assert_eq!(parts.title, Rect::new(1, 2, 38, 1));
-        assert_eq!(parts.list, Rect::new(1, 3, 38, 16));
+        assert_eq!(parts.list, Rect::new(1, 3, 38, 9));
+        assert_eq!(parts.details, Rect::new(1, 12, 38, 7));
         assert_eq!(parts.error.y, 19);
         assert_eq!(parts.hint, Rect::new(1, 20, 38, 2));
         assert_eq!(parts.rule, Rect::new(39, 2, 1, 20));
@@ -1121,7 +1689,7 @@ mod tests {
         let right = Rect::new(70, 2, SIDEBAR_WIDTH, 20);
         let parts = SetPanel::docked_parts(right, true).unwrap();
         assert_eq!(parts.rule, Rect::new(70, 2, 1, 20));
-        assert_eq!(parts.list, Rect::new(72, 3, 38, 16));
+        assert_eq!(parts.list, Rect::new(72, 3, 38, 9));
         let frame = Rect::new(0, 0, 100, 30);
         assert_eq!(panel.row_at(sidebar, frame, 5, 4), Some(1));
         assert_eq!(panel.row_at(sidebar, frame, 5, 10), None, "past the lines");

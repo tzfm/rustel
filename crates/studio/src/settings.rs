@@ -1687,6 +1687,10 @@ pub struct UiSettings {
     /// What the studio does when another program saves the open score's
     /// file. Off by default: reading the file again is opted into.
     pub external_changes: ExternalChanges,
+    /// Whether an update renames the score's file to its `@title` field.
+    /// Off by default: a file's name is the player's own arrangement, and
+    /// files that moved on their own would be a surprise the first time.
+    pub sync_name_from_title: bool,
     pub load_mode: LoadMode,
     /// MIDI clock out, by port; none to send none.
     pub clock_out: Option<String>,
@@ -1869,6 +1873,7 @@ impl Default for UiSettings {
             auto_evaluate: false,
             typing_pause: TypingPause::Medium,
             external_changes: ExternalChanges::Off,
+            sync_name_from_title: true,
             load_mode: LoadMode::Wait,
             clock_out: None,
             clock_in: None,
@@ -1989,6 +1994,8 @@ enum Row {
     TypingPause,
     /// What happens when another program saves the open score's file.
     ExternalChanges,
+    /// Whether an update renames the score's file to its `@title` field.
+    SyncNameFromTitle,
     /// How a start or an edit meets sounds still loading.
     LoadMode,
     Animation,
@@ -2214,6 +2221,7 @@ const ROWS: &[Row] = &[
     Row::GlobalPrebake,
     Row::LocalPrebake,
     Row::TrimRecordings,
+    Row::SyncNameFromTitle,
     Row::ShowFullPaths,
     Row::LoadMode,
     Row::OutputLatency,
@@ -2463,6 +2471,7 @@ impl Row {
             | Self::GlobalPrebake
             | Self::LocalPrebake
             | Self::TrimRecordings
+            | Self::SyncNameFromTitle
             | Self::ShowFullPaths => "Set",
             Self::Rendering | Self::FrameRate => "Rendering",
             #[cfg(feature = "hydra")]
@@ -2534,6 +2543,7 @@ impl Row {
             Self::GlobalPrebake => "global prebake",
             Self::LocalPrebake => "local prebake",
             Self::TrimRecordings => "trim recordings",
+            Self::SyncNameFromTitle => "sync with score metadata",
             Self::SampleCeiling => "biggest sound",
             Self::PreviewBudget => "preview RAM",
             Self::UnusedSampleIdle => "drop unused",
@@ -2616,6 +2626,7 @@ impl Row {
             Self::GlobalPrebake => "setup run before every set · Enter opens it",
             Self::LocalPrebake => "this set's own setup · Enter opens it",
             Self::TrimRecordings => "a take's silence is trimmed before it is saved",
+            Self::SyncNameFromTitle => "an update renames the file to the score's @title field",
             Self::PianoSound => "instrument played by the F12 keyboard",
             Self::PianoVolume => "F12 volume · 100% is the original level · default 130%",
             Self::MaxPolyphony => {
@@ -3666,6 +3677,7 @@ impl SettingsSheet {
                     settings.evaluation_flash = settings.evaluation_flash.step(forwards);
                 }
                 Row::TrimRecordings => set_switch(&mut settings.trim_recordings),
+                Row::SyncNameFromTitle => set_switch(&mut settings.sync_name_from_title),
                 Row::HighlightFade => {
                     settings.highlight_fade = settings.highlight_fade.step(forwards);
                 }

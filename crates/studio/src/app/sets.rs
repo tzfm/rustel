@@ -98,6 +98,17 @@ impl App {
         self.dirty_frame = true;
     }
 
+    /// The row a refresh should keep: the score or tape the reader has
+    /// selected, so an update behind the scenes does not move the panel.
+    pub(super) fn set_panel_selection(&self) -> Option<PathBuf> {
+        self.set_panel.as_ref().and_then(|panel| {
+            panel
+                .selected_file()
+                .map(|file| file.path.clone())
+                .or_else(|| panel.selected_tape().map(|tape| tape.path.clone()))
+        })
+    }
+
     pub(super) fn set_reveal_target(&self) -> RevealTarget {
         if let Some(panel) = &self.set_panel {
             if let Some(file) = panel.selected_file() {
@@ -127,6 +138,11 @@ impl App {
         self.handle_session_file_key(code)
     }
 
+    /// Whether the set panel's search box holds the keyboard.
+    pub(super) fn set_search_typing(&self) -> bool {
+        self.set_panel.as_ref().is_some_and(SetPanel::search_typing)
+    }
+
     /// The set panel's keys. Returns true when the panel consumed the key.
     pub(super) fn handle_set_key(&mut self, code: KeyCode, primary: bool, shift: bool) -> bool {
         let where_it_stands = |app: &Self| {
@@ -154,6 +170,14 @@ impl App {
             // that outrank a prompt were already handled before dispatch.
             let handled = self.handle_set_prompt_key(code, primary, shift);
             return handled || self.set_prompt.is_some();
+        }
+        // The search box owns the keyboard the same way: while it types,
+        // every key is the box's.
+        if self.set_search_typing() {
+            if let Some(panel) = self.set_panel.as_mut() {
+                panel.search_key(code);
+            }
+            return true;
         }
         // A set that could not go because a score could not be saved:
         // Enter retries, Del leaves without the score, Esc keeps the set.
@@ -203,6 +227,12 @@ impl App {
             }
         }
         match code {
+            // A filter standing drops on Esc, before the panel's own Esc
+            // hands the keyboard back.
+            KeyCode::Esc if panel.search.is_some() => {
+                panel.search = None;
+                panel.refilter();
+            }
             // Zen has no docked furniture: the panel came up as a popup,
             // not the set's file tree standing beside the score, so Esc
             // closes it outright the way every other zen popup does -
@@ -256,6 +286,26 @@ impl App {
                 }
             }
             KeyCode::Enter if !primary => self.open_set_line(),
+            // A strip number opens its score the way Enter on its row does.
+            // The numbers run to nine; a strip past that stays on the arrows.
+            KeyCode::Char(digit @ '1'..='9') if !primary => {
+                let strip = (digit as u8 - b'0') as usize;
+                match panel
+                    .files
+                    .iter()
+                    .position(|file| file.strip == Some(strip))
+                {
+                    Some(row) => {
+                        panel.selected = panel
+                            .lines
+                            .iter()
+                            .position(|line| *line == SetLine::File(row))
+                            .unwrap_or(panel.selected);
+                        self.open_set_line();
+                    }
+                    None => self.status = format!("no scene {} on the strip", strip),
+                }
+            }
             KeyCode::Char(' ') if !primary => panel.toggle_sessions(),
             KeyCode::Char('+' | '=' | '-' | '_') if !primary => {
                 let grow = matches!(code, KeyCode::Char('+' | '='));
@@ -269,6 +319,18 @@ impl App {
                         "set panel is as {} as it goes",
                         if grow { "wide" } else { "narrow" }
                     );
+                }
+            }
+            // `/` opens the search box: it takes the keyboard, and the
+            // list hides the scores the query does not answer. On a
+            // filter standing it takes the box back up to type. In vim,
+            // the box's letters belong to its own modes instead.
+            KeyCode::Char('/') if !primary && panel.search.is_none() => {
+                panel.open_search();
+            }
+            KeyCode::Char('/') if !primary => {
+                if let Some(search) = panel.search.as_mut() {
+                    search.typing = true;
                 }
             }
             // The key the desk has for it: Delete, or the Mac's delete,
@@ -361,6 +423,24 @@ impl App {
             }
         }
         self.dirty_frame = true;
+    }
+
+    /// An Alt digit selects that strip's score, from one, the way the
+    /// digit on its row does: only a score already on the strip answers,
+    /// and the editor takes the keyboard back.
+    pub(super) fn select_strip_by_number(&mut self, strip: usize) {
+        let Some(id) = self.scenes.scores().nth(strip - 1).map(|scene| scene.id) else {
+            self.status = format!("no scene {strip} on the strip");
+            self.dirty_frame = true;
+            return;
+        };
+        if let Some(index) = self.scenes.index_of(id)
+            && self.select_scene(index)
+        {
+            self.refresh_set_panel(self.scenes.get(id).map(|scene| scene.path.clone()));
+            self.focus = Focus::Editor;
+            self.dirty_frame = true;
+        }
     }
 
     /// What the chosen line names, and its path; whether it is the tape
@@ -705,6 +785,15 @@ impl App {
     /// Open a set or source picker, retaining the initiating focus even
     /// when a bank chooser leads into another naming prompt.
     pub(super) fn open_set_prompt(&mut self, prompt: SetPrompt) {
+        // A prompt is the panel's next question, and it takes the
+        // keyboard: the search box stands down, and its vim modes with
+        // it, so a letter the prompt is waiting for cannot land in the
+        // box instead.
+        if let Some(panel) = self.set_panel.as_mut() {
+            panel.search = None;
+            panel.vim_insert = false;
+            panel.refilter();
+        }
         if self.set_prompt.is_none() {
             let settings_prompt = matches!(
                 prompt,
@@ -1005,6 +1094,20 @@ impl App {
 
     /// Open another set: a folder, or a score and its folder.
     fn open_set_at(&mut self, path: &std::path::Path) {
+        // A Strudel pattern export - a .json object of scores - is not a
+        // set on disk but the makings of one. The set's own file is a .json
+        // too, and stays a refusal.
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+            && !path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with(crate::scenes::SET_FILE_NAME)
+            })
+        {
+            self.import_strudel_set(path);
+            return;
+        }
         let starter = self.starter_score();
         match SceneSet::open(path, starter) {
             Ok(set) => {
@@ -1016,6 +1119,53 @@ impl App {
                     picker.error = Some(error.to_string());
                 }
             }
+        }
+    }
+
+    /// A Strudel pattern export read as a new set: one score per entry,
+    /// in a folder of its own under the sets folder, named after the file
+    /// the export came from. A name with no usable characters
+    /// becomes `untitled`. The status says what was taken up, and the
+    /// panel lists the scores it made.
+    fn import_strudel_set(&mut self, path: &std::path::Path) {
+        let report = |app: &mut Self, error: String| {
+            if let Some((_, picker)) = app.set_prompt.as_mut() {
+                picker.error = Some(error);
+            }
+        };
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) => return report(self, format!("cannot read {}: {error}", path.display())),
+        };
+        let entries = match strudel_export(&text) {
+            Ok(entries) => entries,
+            Err(error) => return report(self, format!("{}: {error}", path.display())),
+        };
+        let stem = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let name = crate::scenes::sanitize_name(&stem).unwrap_or_else(|| "imported set".to_owned());
+        // Strudel keys its entries by an opaque id and names the song in a
+        // @title field inside the code. The title leads when it is there.
+        let scores: Vec<(String, String)> = entries
+            .into_iter()
+            .map(|(key, code)| {
+                let meta = crate::metadata::ScoreMeta::parse(&code);
+                let title = meta.first("title").unwrap_or(key.as_str());
+                let name = crate::scenes::sanitize_name(title)
+                    .or_else(|| crate::scenes::sanitize_name(&key))
+                    .unwrap_or_else(|| "untitled".to_owned());
+                (name, code)
+            })
+            .collect();
+        let root = self.sets_root();
+        match SceneSet::import_in(&root, &name, &scores) {
+            Ok(set) => {
+                self.close_set_prompt();
+                self.switch_set(set, "imported");
+            }
+            Err(error) => report(self, format!("cannot import {}: {error}", path.display())),
         }
     }
 
@@ -1417,6 +1567,35 @@ pub(super) fn shorten_home(path: &std::path::Path) -> String {
     }
 }
 
+/// The pattern code of a Strudel pattern export: a JSON object whose
+/// entries hold code. Strudel writes each entry as an object with a `code`
+/// field, keyed by an id, and a plain string of code is taken too. An
+/// entry that holds neither shape is not a score.
+fn strudel_export(text: &str) -> Result<Vec<(String, String)>, String> {
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|error| format!("not a Strudel pattern export: {error}"))?;
+    let Some(object) = value.as_object() else {
+        return Err("not a Strudel pattern export - not a JSON object".to_owned());
+    };
+    let scores: Vec<(String, String)> = object
+        .iter()
+        .filter_map(|(key, value)| {
+            let code = match value {
+                serde_json::Value::String(code) => Some(code.as_str()),
+                serde_json::Value::Object(fields) => {
+                    fields.get("code").and_then(|code| code.as_str())
+                }
+                _ => None,
+            }?;
+            Some((key.clone(), code.to_owned()))
+        })
+        .collect();
+    if scores.is_empty() {
+        return Err("not a Strudel pattern export - no scores in it".to_owned());
+    }
+    Ok(scores)
+}
+
 /// The set folders under `root`, `current` left out: a folder with a set
 /// file or a score in it. Order: last changed first, then by name.
 fn set_candidates(root: &std::path::Path, current: &std::path::Path) -> Vec<Candidate> {
@@ -1639,6 +1818,212 @@ mod tests {
             assert_eq!(app.focus, Focus::Editor);
         }
 
+        /// A digit opens the score holding that strip number, the way Enter
+        /// on its row does. A digit no score holds names what it missed, and
+        /// the panel keeps the keyboard. Vim mode changes none of it: the
+        /// panel is a list, and a digit is not one of its letters.
+        #[test]
+        fn a_digit_opens_the_score_with_that_strip_number() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.new_scene(false);
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            // first holds strip 1, scene 1 holds strip 2.
+            press(&mut app, KeyCode::Char('3'), KeyModifiers::NONE);
+            assert_eq!(app.scenes.current().name(), "scene 1", "nothing opened");
+            assert!(app.status.contains("no scene 3"), "{}", app.status);
+            assert_eq!(
+                app.focus,
+                Focus::Panel(PanelKind::Set),
+                "the panel keeps the keyboard"
+            );
+            press(&mut app, KeyCode::Char('1'), KeyModifiers::NONE);
+            assert_eq!(app.scenes.current().name(), "first", "strip 1 opened");
+            assert_eq!(app.focus, Focus::Editor, "the score takes the keyboard");
+            let panel = app.set_panel.as_ref().expect("the panel stays open");
+            assert_eq!(panel.selected, 0, "the selection followed the scene");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Char('2'), KeyModifiers::NONE);
+            assert_eq!(
+                app.scenes.current().name(),
+                "scene 1",
+                "strip 2 in Vim mode"
+            );
+            assert_eq!(app.focus, Focus::Editor);
+        }
+
+        /// The details block stands at the panel's foot and follows the
+        /// selection: the selected score's detail is there with no key
+        /// and nothing to close. Vim mode changes none of it, the panel
+        /// being a list, not a text surface.
+        #[test]
+        fn the_details_block_follows_the_selection() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            std::fs::write(directory.path().join("second.strudel"), "$: s(\"hh\")").unwrap();
+            let mut app = app_over(directory.path());
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            assert_eq!(app.focus, Focus::Panel(PanelKind::Set));
+            assert_eq!(
+                app.set_panel.as_ref().unwrap().detail_rows()[0],
+                "first",
+                "the selected score's detail is up"
+            );
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            assert_eq!(
+                app.set_panel.as_ref().unwrap().detail_rows()[0],
+                "second",
+                "the block follows the selection"
+            );
+            // Vim mode: the same keys do the same job.
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            assert_eq!(
+                app.set_panel.as_ref().unwrap().detail_rows()[0],
+                "first",
+                "vim mode: the block still follows"
+            );
+        }
+
+        /// A save that lands re-reads the rows, so the foot follows the
+        /// file without the score being reopened, and the reader's
+        /// selection does not move while it happens.
+        #[test]
+        fn the_details_follow_a_save_without_reopening_the_score() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            std::fs::write(directory.path().join("second.strudel"), "// plain").unwrap();
+            let mut app = app_over(directory.path());
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            assert_eq!(app.set_panel.as_ref().unwrap().detail_rows()[0], "second");
+            // The header of the open score gains an author: the update
+            // writes it to disk behind the panel's back.
+            app.dispatch_editor(crate::editor::Command::Move {
+                motion: crate::editor::Motion::DocumentStart,
+                extend: false,
+            })
+            .expect("top");
+            app.dispatch_editor(crate::editor::Command::InsertText(
+                "/*\n@by you\n*/\n".into(),
+            ))
+            .expect("edit");
+            app.dispatch_editor(crate::editor::Command::Evaluate)
+                .expect("update");
+            app.wait_for_saves();
+            assert_eq!(
+                app.set_panel.as_ref().unwrap().detail_rows()[0],
+                "second",
+                "the save moved no row"
+            );
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+            let rows = app.set_panel.as_ref().unwrap().detail_rows();
+            assert!(
+                rows.contains(&"@by you".to_owned()),
+                "the foot reads the saved header: {rows:?}"
+            );
+        }
+
+        /// `/` opens a filter that owns the keyboard: letters hide the
+        /// scores the query does not answer - `n` types into the query
+        /// rather than starting anything - Enter leaves the filter
+        /// standing on the first score it kept, Esc drops it whole, and a
+        /// set prompt opening stands the box down. In vim the box keeps
+        /// its own modes: `i` types, Esc returns to command, and the
+        /// second Esc drops the filter.
+        #[test]
+        fn the_search_box_filters_keeps_and_drops() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            std::fs::write(
+                directory.path().join("spare.strudel"),
+                "/*\n@title night drive\n*/\n$: s(\"bd\")\n",
+            )
+            .expect("spare");
+            let mut app = app_over(directory.path());
+            app.new_scene(false);
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            let query = |app: &App| {
+                app.set_panel
+                    .as_ref()
+                    .unwrap()
+                    .search
+                    .as_ref()
+                    .map(|search| search.query.clone())
+            };
+            let names = |app: &App| {
+                let panel = app.set_panel.as_ref().unwrap();
+                panel
+                    .lines
+                    .iter()
+                    .filter_map(|line| match line {
+                        SetLine::File(index) => {
+                            panel.files.get(*index).map(|file| file.name.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE);
+            assert_eq!(query(&app).as_deref(), Some("n"), "n types into the query");
+            press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            assert_eq!(
+                names(&app),
+                ["spare"],
+                "the query answers a title, not a name"
+            );
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            {
+                let panel = app.set_panel.as_ref().unwrap();
+                assert!(!panel.search.as_ref().unwrap().typing, "Enter ends typing");
+                assert_eq!(panel.selected_file().unwrap().name, "spare");
+            }
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert_eq!(
+                names(&app),
+                ["first", "scene 1", "spare"],
+                "Esc restores the folder"
+            );
+
+            // A prompt takes the keyboard, so the box stands down.
+            press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+            assert!(app.set_panel.as_ref().unwrap().search.is_some());
+            app.open_set_prompt(SetPrompt::OpenSet);
+            assert!(
+                app.set_panel.as_ref().unwrap().search.is_none(),
+                "a prompt stands the search box down"
+            );
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+            // Vim: the box rests in command, `i` types, and the Esc
+            // ladder leaves insert before it drops the filter.
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+            assert_eq!(
+                query(&app).as_deref(),
+                Some(""),
+                "in command mode a letter is not the box's"
+            );
+            press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            assert_eq!(query(&app).as_deref(), Some("sp"), "insert types");
+            assert_eq!(names(&app), ["spare"]);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(
+                !app.set_panel.as_ref().unwrap().vim_insert,
+                "the first Esc only leaves insert"
+            );
+            assert!(app.set_panel.as_ref().unwrap().search.is_some());
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.set_panel.as_ref().unwrap().search.is_none());
+        }
+
         /// Delete in the panel asks and Enter answers: an open score off the
         /// strip and the disk, a closed one off the disk, and the last score
         /// never. Esc keeps what was asked about, and Scene > Delete scene
@@ -1818,6 +2203,116 @@ mod tests {
                     .as_ref()
                     .and_then(|(_, picker)| picker.error.clone())
             );
+        }
+
+        /// A Strudel pattern export gives its scores, or says what it is
+        /// not. Strudel writes each entry as an object with a `code` field,
+        /// and a plain string of code is taken too. Entries that hold
+        /// neither shape are left out.
+        #[test]
+        fn a_strudel_export_gives_its_scores_or_a_refusal() {
+            let strudel = r#"{
+              "V1StGXR8_Z5j": { "code": "$: s(\"bd*4\")", "created_at": 1, "collection": "user" },
+              "second": { "code": "$: s(\"cp\")" },
+              "plain string": "$: s(\"hh\")",
+              "third": { "not": "code" }
+            }"#;
+            assert_eq!(
+                strudel_export(strudel).unwrap(),
+                [
+                    ("V1StGXR8_Z5j".to_owned(), "$: s(\"bd*4\")".to_owned()),
+                    ("second".to_owned(), "$: s(\"cp\")".to_owned()),
+                    ("plain string".to_owned(), "$: s(\"hh\")".to_owned()),
+                ]
+            );
+            assert!(
+                strudel_export(r#"[{ "code": "$: s(\"oh\")" }]"#)
+                    .unwrap_err()
+                    .contains("not a JSON object")
+            );
+            assert!(
+                strudel_export("{ no closing brace")
+                    .unwrap_err()
+                    .contains("not a Strudel pattern export")
+            );
+            assert!(
+                strudel_export(r#"{ "import": {} }"#)
+                    .unwrap_err()
+                    .contains("no scores in it")
+            );
+        }
+
+        /// Opening a Strudel pattern export makes a set of it: a folder
+        /// named after the export file, one score per entry, the title
+        /// naming the score that carries one. A file that is not an export
+        /// is refused and the prompt stays.
+        #[test]
+        fn opening_a_strudel_export_makes_a_set() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let sets = directory.path().join("sets");
+            let home = directory.path().join("home");
+            std::fs::create_dir_all(&home).expect("home");
+            let mut app = app_over(&home);
+            app.prefs.sets_directory = Some(sets.display().to_string());
+
+            let export = directory.path().join("gig.json");
+            std::fs::write(
+                &export,
+                concat!(
+                    "{\n",
+                    "  \"V1StGXR8_Z5j\": { \"code\": \"// @title night drive\\n$: s(\\\"bd*4\\\")\" },\n",
+                    "  \"kZ4_hT9pQw2x\": { \"code\": \"$: s(\\\"cp\\\")\" }\n",
+                    "}\n"
+                ),
+            )
+            .expect("export");
+            app.open_set_prompt(SetPrompt::OpenSet);
+            for character in export.display().to_string().chars() {
+                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+            assert!(app.set_prompt.is_none(), "the prompt closed");
+            assert!(
+                app.status.starts_with("imported gig - 2 scene(s)"),
+                "{}",
+                app.status
+            );
+            assert_eq!(app.scenes.directory(), sets.join("gig"));
+            assert_eq!(app.focus, Focus::Editor);
+            assert_eq!(
+                app.scenes
+                    .scores()
+                    .map(|scene| scene.name().to_owned())
+                    .collect::<Vec<_>>(),
+                ["night drive", "kZ4_hT9pQw2x"],
+                "the title leads when it is there"
+            );
+            assert_eq!(app.scenes.current().name(), "night drive");
+            assert_eq!(
+                std::fs::read_to_string(sets.join("gig").join("night drive.strudel")).unwrap(),
+                "// @title night drive\n$: s(\"bd*4\")"
+            );
+
+            // A json file that is not an export says so and stays refused.
+            let not_an_export = directory.path().join("solo.json");
+            std::fs::write(&not_an_export, "[1, 2, 3]").expect("not an export");
+            app.open_set_prompt(SetPrompt::OpenSet);
+            for character in not_an_export.display().to_string().chars() {
+                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(
+                app.set_prompt
+                    .as_ref()
+                    .and_then(|(_, picker)| picker.error.as_deref())
+                    .is_some_and(|error| error.contains("not a Strudel pattern export")),
+                "{:?}",
+                app.set_prompt
+                    .as_ref()
+                    .and_then(|(_, picker)| picker.error.clone())
+            );
+            assert_eq!(app.scenes.directory(), sets.join("gig"), "still in the set");
         }
 
         /// The set list starts with the set changed last, whatever its name.

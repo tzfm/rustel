@@ -115,6 +115,7 @@ impl Widget for SettingsSheetView<'_> {
                 Row::Highlights => on_off(self.settings.highlights),
                 Row::EvaluationFlash => self.settings.evaluation_flash.label().to_owned(),
                 Row::TrimRecordings => on_off(self.settings.trim_recordings),
+                Row::SyncNameFromTitle => on_off(self.settings.sync_name_from_title),
                 Row::HighlightFade => self.settings.highlight_fade.label().to_owned(),
                 Row::MetricDetail => self.settings.metric_detail.label().to_owned(),
                 Row::PianoSound => self.settings.piano_sound.key().to_owned(),

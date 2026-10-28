@@ -72,6 +72,14 @@ loads helpers before the score, as for `play`.
 The output extension selects MP3 or JSON. Use `--format` to choose explicitly.
 Ctrl+C stops a WAV export and finalizes a partial file if writing has started.
 
+`--stems` writes a `<name> stems` folder beside the file: the same bounce as
+`main.wav`, plus one stereo WAV per sounding orbit, named `1.wav` upward, in
+the export format.
+The stems are tapped after each orbit's delay, reverb, filter, duck and fader,
+before the master, so they sum back to an unmastered main and mastering stays
+in the DAW. Stems need a WAV format and refuse to overwrite an existing
+folder.
+
 CLI export has no master limiter. Its voice limit is 128 unless the score
 calls `setMaxPolyphony`. Score-level `.limit()` still applies.
 [Studio export](studio.md#export) can use the live set's limiter and voice limit.

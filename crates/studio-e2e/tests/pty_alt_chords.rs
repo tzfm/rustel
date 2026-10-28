@@ -61,6 +61,19 @@ struct Terminal {
 
 impl Terminal {
     fn open(binary: &std::path::Path, rows: u16, cols: u16, cwd: &std::path::Path) -> Self {
+        Self::open_reported_as(binary, rows, cols, cwd, None)
+    }
+
+    /// The same studio, under a terminal that names itself: `TERM_PROGRAM`
+    /// decides the studio's terminal profile, which is where the Option
+    /// recovery table lives.
+    fn open_reported_as(
+        binary: &std::path::Path,
+        rows: u16,
+        cols: u16,
+        cwd: &std::path::Path,
+        term_program: Option<&str>,
+    ) -> Self {
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize {
@@ -104,6 +117,11 @@ impl Terminal {
             "RUSTEL_SESSION_DIR",
         ] {
             command.env_remove(key);
+        }
+        // The reported name goes on last, clear of the removals: the
+        // studio's terminal profile hangs off it.
+        if let Some(term_program) = term_program {
+            command.env("TERM_PROGRAM", term_program);
         }
         let child = pair
             .slave
@@ -579,4 +597,113 @@ fn probe_alt_chords_through_a_real_pty() {
     terminal.write(&[0x11]);
     std::thread::sleep(Duration::from_millis(500));
     println!("=== probe done ===");
+}
+
+/// Alt with a digit selects that strip's score, in both spellings a
+/// terminal delivers: the legacy ESC prefix, as Windows Terminal and a
+/// plain xterm send it, and the kitty protocol's CSI u, as Ghostty and
+/// kitty send it once the studio asks for disambiguation. Both must reach
+/// the same chord: the status line names the scene each digit selected.
+#[test]
+fn alt_digits_select_strip_scores_in_both_wire_spellings() {
+    let Some(binary) = rustel_binary() else {
+        panic!("build the binary first");
+    };
+    let home = tempfile::tempdir().expect("temporary home");
+    std::fs::write(
+        home.path().join("live.strudel"),
+        "$: note(\"c4\").s(\"sine\")\n",
+    )
+    .expect("starter score");
+    let mut terminal = Terminal::open(&binary, 24, 80, home.path());
+    assert!(
+        terminal.wait_for(" ready", Duration::from_secs(30)),
+        "the studio never finished loading:\n{}",
+        terminal.diagnostics()
+    );
+
+    // A second score on the strip, so the digits have somewhere to go.
+    let mark = terminal.buffer.lock().unwrap().len();
+    terminal.write(&[0x0e]); // Ctrl+N: a new scene, written beside the set
+    assert!(
+        terminal.wait_for_since(mark, "scene 2 - ", Duration::from_secs(10)),
+        "Ctrl+N never put a second score on the strip:\n{}",
+        terminal.diagnostics()
+    );
+
+    // Alt+1 as a legacy terminal sends it: ESC then the key in one chunk,
+    // which the input layer reads as one Alt+1 event. The first score,
+    // named `live` by its file, comes back.
+    terminal.write(&[0x1b, b'1']);
+    assert!(
+        terminal.wait_for_screen("scene 1 - live", Duration::from_secs(10)),
+        "the ESC-prefixed Alt+1 never selected the first score:\n{}",
+        terminal.diagnostics()
+    );
+
+    // Alt+2 as a kitty-protocol terminal sends it: CSI u with the base
+    // key's codepoint and the Alt modifier bit. Windows ConPTY does not
+    // carry the kitty spelling, so a Unix PTY alone drives this half.
+    #[cfg(unix)]
+    {
+        terminal.write(b"\x1b[50;3u");
+        assert!(
+            terminal.wait_for_screen("scene 2 - ", Duration::from_secs(10)),
+            "the CSI u Alt+2 never selected the second score:\n{}",
+            terminal.diagnostics()
+        );
+    }
+
+    // A digit the strip does not hold says so, through the legacy spelling:
+    // the chord reached the strip and the strip answered.
+    terminal.write(&[0x1b, b'9']);
+    assert!(
+        terminal.wait_for_screen("no scene 9 on the strip", Duration::from_secs(10)),
+        "the ESC-prefixed Alt+9 never reached the strip:\n{}",
+        terminal.diagnostics()
+    );
+}
+
+/// On iTerm2 with Option as Normal, Alt+1 never reaches the studio as a
+/// chord: the terminal composes the key into text and sends the bytes of
+/// `¡`. The studio's recovery table turns it back into the chord, so the
+/// strip still answers - the third delivery path, proven under the
+/// identity that produces it.
+///
+/// Windows ConPTY does not deliver a composed Option key as text the
+/// studio can read. The recovery table has unit coverage in the
+/// terminal profile, the keybinds and the app's key dispatch.
+#[cfg(unix)]
+#[test]
+fn iterm2s_composed_digit_selects_the_strip_score() {
+    let Some(binary) = rustel_binary() else {
+        panic!("build the binary first");
+    };
+    let home = tempfile::tempdir().expect("temporary home");
+    std::fs::write(
+        home.path().join("live.strudel"),
+        "$: note(\"c4\").s(\"sine\")\n",
+    )
+    .expect("starter score");
+    let mut terminal = Terminal::open_reported_as(&binary, 24, 80, home.path(), Some("iTerm.app"));
+    assert!(
+        terminal.wait_for(" ready", Duration::from_secs(30)),
+        "the studio never finished loading:\n{}",
+        terminal.diagnostics()
+    );
+    // A second score, so the digit has a selection to make: the studio
+    // does not repaint a scene the strip already shows.
+    let mark = terminal.buffer.lock().unwrap().len();
+    terminal.write(&[0x0e]); // Ctrl+N: a new scene, written beside the set
+    assert!(
+        terminal.wait_for_since(mark, "scene 2 - ", Duration::from_secs(10)),
+        "Ctrl+N never put a second score on the strip:\n{}",
+        terminal.diagnostics()
+    );
+    terminal.write("¡".as_bytes());
+    assert!(
+        terminal.wait_for_screen("scene 1 - live", Duration::from_secs(10)),
+        "the composed Option+1 never selected the first score:\n{}",
+        terminal.diagnostics()
+    );
 }

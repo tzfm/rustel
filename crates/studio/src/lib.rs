@@ -30,6 +30,7 @@ pub mod lint;
 pub mod log;
 pub mod memory;
 pub mod menu;
+pub mod metadata;
 pub mod meter;
 pub mod minimap;
 pub mod mixer_panel;

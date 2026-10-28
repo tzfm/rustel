@@ -244,10 +244,13 @@ impl HelpContext {
             ],
             Self::Set => [
                 (
-                    "Up/Down · Enter",
-                    "choose a score or a tape / open it (a double click too)",
+                    "Up/Down · Enter · 1-9",
+                    "choose a score / open it / open the strip's score",
                 ),
-                ("Space · n", "fold sessions / start a new session tape"),
+                (
+                    "Space · n · /",
+                    "fold sessions / start a new tape / filter by name and @fields",
+                ),
                 (
                     "Delete · Esc · ^B",
                     "delete (Enter confirms) / back to the score / hide the panel",
@@ -570,6 +573,10 @@ fn shortcut_rows_with_keybinds(
             "start a new session tape; keep scores and playback",
         ),
         HelpRow::new(
+            "/ in set panel",
+            "filter the scores by name or @field; Enter keeps, Esc restores",
+        ),
+        HelpRow::new(
             shortcut_with_alias(keybinds, BindAction::Log),
             "open the studio log",
         ),
@@ -588,6 +595,7 @@ fn shortcut_rows_with_keybinds(
             scene_switch(true),
             "split: cycle the focused pane, skipping the other pane's scene",
         ),
+        HelpRow::new("Alt+1-9", "open the strip's numbered score"),
         HelpRow::new(hint(BindAction::NewScene), "new scene"),
         HelpRow::new(
             shortcut_with_alias(keybinds, BindAction::DuplicateScene),

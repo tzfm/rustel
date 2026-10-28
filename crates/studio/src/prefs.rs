@@ -80,6 +80,10 @@ pub struct StudioPrefs {
     /// or `sync-eval`. Absent is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_changes: Option<String>,
+    /// Whether an update renames the score's file to its `@title` field.
+    /// Absent is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_name_from_title: Option<bool>,
     /// `wait` or `async`. `strudel-like` still reads as async.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_mode: Option<String>,
@@ -704,6 +708,9 @@ impl StudioPrefs {
                 .as_deref()
                 .map(super::settings::ExternalChanges::parse)
                 .unwrap_or(defaults.external_changes),
+            sync_name_from_title: self
+                .sync_name_from_title
+                .unwrap_or(defaults.sync_name_from_title),
             load_mode: self
                 .load_mode
                 .as_deref()
@@ -902,6 +909,7 @@ impl StudioPrefs {
         self.auto_evaluate = Some(settings.auto_evaluate);
         self.typing_pause = Some(settings.typing_pause.key().to_owned());
         self.external_changes = Some(settings.external_changes.key().to_owned());
+        self.sync_name_from_title = Some(settings.sync_name_from_title);
         self.load_mode = Some(settings.load_mode.key().to_owned());
         self.animation = Some(settings.animation);
         self.highlights = Some(settings.highlights);
@@ -1932,6 +1940,24 @@ mod tests {
                 serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
             assert_eq!(restored.ui_settings().vim_list_navigation, value);
         }
+    }
+
+    #[test]
+    fn sync_name_from_title_defaults_on_and_remembers_off() {
+        for json in ["{}", r#"{"sync_name_from_title":null}"#] {
+            let prefs: StudioPrefs = serde_json::from_str(json).unwrap();
+            assert!(prefs.ui_settings().sync_name_from_title);
+        }
+        let settings = super::super::settings::UiSettings {
+            sync_name_from_title: false,
+            ..Default::default()
+        };
+        let mut prefs = StudioPrefs::default();
+        prefs.set_ui_settings(&settings);
+        let encoded = serde_json::to_value(&prefs).unwrap();
+        assert_eq!(encoded["sync_name_from_title"], false);
+        let restored: StudioPrefs = serde_json::from_value(encoded).unwrap();
+        assert!(!restored.ui_settings().sync_name_from_title);
     }
 
     #[test]

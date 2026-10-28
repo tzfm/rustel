@@ -295,6 +295,10 @@ impl AudioBackend for ScalarBackend {
             .push(event.map_kabel(CompactKabelControls::from));
     }
 
+    fn stems(&self) -> Option<&Stems> {
+        self.stems.as_ref()
+    }
+
     fn process_block(&mut self, out: &mut [f32], frames: usize) {
         assert!(
             out.len() >= frames * 2,
@@ -312,6 +316,9 @@ impl AudioBackend for ScalarBackend {
         }
         if self.routing_active() {
             self.clear_orbit_mix(frames);
+        }
+        if let Some(stems) = self.stems.as_mut() {
+            stems.start_block();
         }
         // Reserve input for the whole callback before any instrument changes
         // split it into shorter spans.
@@ -3868,6 +3875,7 @@ impl ScalarBackend {
             let orbit_gains = self.orbit_gains.0;
             let orbit_peaks = &mut self.orbit_peaks;
             let orbit_mix = &mut self.orbit_mix;
+            let mut stems = self.stems.as_mut();
             for i in 0..sub_len {
                 let abs = start + (sub_start + i) as u64;
                 let frame = sub_start + i;
@@ -3891,6 +3899,16 @@ impl ScalarBackend {
                     let gain = ducks[orbit].value_at(abs) * orbit_gains[orbit];
                     let (ol, or) = (bl * gain, br * gain);
                     orbit_peaks[orbit] = orbit_peaks[orbit].max(ol.abs().max(or.abs()));
+                    // A stems render taps every orbit here: after its delay,
+                    // reverb, DJF, channel map, duck and fader, before the
+                    // pair it is routed to decides where it goes. Offline
+                    // renders route nothing away, so the taps sum to the
+                    // pre-limiter main mix - the only voice the main pair
+                    // seeds beyond them is the live keyboard's, which no
+                    // score can reach.
+                    if let Some(stems) = stems.as_deref_mut() {
+                        stems.tap(orbit, frame, ol, or);
+                    }
                     // An orbit routed to another pair is kept apart for the
                     // device to place; the main pair sums the rest.
                     if routing && orbit_pairs[orbit] != 0 {
