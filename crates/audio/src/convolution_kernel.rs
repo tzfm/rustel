@@ -269,13 +269,26 @@ mod tests {
                 ConvolutionKernelKind::Portable
             }
         );
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(
+            kind,
+            if std::arch::is_aarch64_feature_detected!("neon") {
+                ConvolutionKernelKind::Neon
+            } else {
+                ConvolutionKernelKind::Portable
+            }
+        );
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
         assert_eq!(kind, ConvolutionKernelKind::Portable);
 
         assert!(ConvolutionKernelKind::Portable.compiled());
         assert_eq!(
             ConvolutionKernelKind::Avx2.compiled(),
             cfg!(any(target_arch = "x86", target_arch = "x86_64"))
+        );
+        assert_eq!(
+            ConvolutionKernelKind::Neon.compiled(),
+            cfg!(target_arch = "aarch64")
         );
     }
 }
