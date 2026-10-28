@@ -371,6 +371,9 @@ struct StemTracks {
     /// Copied from the backend's taps every block, so the cleanup at the
     /// end knows what sounded even when the bounce was interrupted.
     sounded: [bool; crate::scalar::MAX_ORBITS],
+    /// Each orbit's tap, interleaved stereo and oldest first, held back by
+    /// the main file's limiter lookahead so a stem keeps the main's frames.
+    delays: Vec<std::collections::VecDeque<f32>>,
 }
 
 impl StemTracks {
@@ -391,7 +394,16 @@ impl StemTracks {
         Ok(Self {
             files,
             sounded: [false; crate::scalar::MAX_ORBITS],
+            delays: Vec::new(),
         })
+    }
+
+    /// Hold every stem back by `frames` of silence, the lookahead the
+    /// limiter adds to the main file before the render discards it.
+    fn hold_back(&mut self, frames: usize) {
+        self.delays = (0..self.files.len())
+            .map(|_| std::iter::repeat_n(0.0, frames * 2).collect())
+            .collect();
     }
 
     /// Patch every stem's header to the frames the main file kept.
@@ -456,6 +468,9 @@ fn write_render_wav_events(
         .as_ref()
         .map_or(0, |(processor, _)| processor.latency_frames());
     let mut skip = latency;
+    if let Some(tracks) = stems.as_deref_mut() {
+        tracks.hold_back(latency);
+    }
     // A tenth of a second: long enough not to click, short enough that a
     // stop is a stop.
     let fade_frames = (sample_rate as usize / 10).max(1);
@@ -531,6 +546,29 @@ fn write_render_wav_events(
         let discarded = skip.min(input_count);
         skip -= discarded;
         let count = input_count - discarded;
+        // A bounce with stems writes every orbit beside the main file. Each
+        // stem takes the delay the limiter gives the main, then the same
+        // discard, so every file starts on the same frame. The taps span
+        // what the block rendered, and the flushed tail is silence.
+        if let Some(tracks) = stems.as_deref_mut() {
+            let taps = backend
+                .stems()
+                .expect("a stems render is refused on a backend with no taps");
+            tracks.sounded = *taps.sounded();
+            for (orbit, delay) in tracks.delays.iter_mut().enumerate() {
+                let tap = if render_count > 0 {
+                    taps.orbit(orbit, render_count)
+                } else {
+                    &[]
+                };
+                delay.extend(tap);
+                delay.extend(std::iter::repeat_n(
+                    0.0,
+                    input_count * CHANNELS as usize - tap.len(),
+                ));
+                delay.drain(..discarded * CHANNELS as usize);
+            }
+        }
         if count == 0 {
             continue;
         }
@@ -592,24 +630,16 @@ fn write_render_wav_events(
         encode_samples(&pcm[..count * CHANNELS as usize], &mut encoded, format);
         file.write_all(&encoded[..count * CHANNELS as usize * width])
             .map_err(|error| error.to_string())?;
-        // A bounce with stems writes every orbit beside the main file,
-        // mirroring the limiter discard and the finish fade so all files
-        // land the same length.
+        // The stems take the main file's finish fade, so all files land the
+        // same length.
         if let Some(tracks) = stems.as_deref_mut() {
-            let taps = backend
-                .stems()
-                .expect("a stems render is refused on a backend with no taps");
-            tracks.sounded = *taps.sounded();
-            for orbit in 0..tracks.files.len() {
-                let tap = taps.orbit(orbit, input_count);
-                stem_pcm[..tap.len()].copy_from_slice(tap);
-                // The tap spans what the block rendered; the flushed tail
-                // stays zero, like the main file's.
-                stem_pcm[tap.len()..input_count * CHANNELS as usize].fill(0.0);
-                stem_pcm.copy_within(
-                    discarded * CHANNELS as usize..input_count * CHANNELS as usize,
-                    0,
-                );
+            for ((_, stem), delay) in tracks.files.iter_mut().zip(&mut tracks.delays) {
+                for (slot, sample) in stem_pcm
+                    .iter_mut()
+                    .zip(delay.drain(..count * CHANNELS as usize))
+                {
+                    *slot = sample;
+                }
                 if let Some(from) = fade_from {
                     for frame in 0..count {
                         let position = (offset + frame).saturating_sub(from);
@@ -619,9 +649,7 @@ fn write_render_wav_events(
                     }
                 }
                 encode_samples(&stem_pcm[..count * CHANNELS as usize], &mut encoded, format);
-                tracks.files[orbit]
-                    .1
-                    .write_all(&encoded[..count * CHANNELS as usize * width])
+                stem.write_all(&encoded[..count * CHANNELS as usize * width])
                     .map_err(|error| error.to_string())?;
             }
         }
@@ -1202,6 +1230,13 @@ mod stems_tests {
     }
 
     fn bounce(path: &std::path::Path) -> Result<usize, String> {
+        bounce_with(path, RenderControl::default())
+    }
+
+    fn bounce_with(
+        path: &std::path::Path,
+        control: RenderControl<'_, '_>,
+    ) -> Result<usize, String> {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
         let mut backend = ScalarBackend::prepared(48_000, 16).expect("backend");
         backend.capture_stems();
@@ -1211,9 +1246,46 @@ mod stems_tests {
             48_000,
             48_000 / 2,
             vec![note(0, 220.0, 0), note(0, 330.0, 1)],
-            RenderControl::default(),
+            control,
             WavSampleFormat::Float32,
         )
+    }
+
+    /// The stems are tapped before the limiter, so a limiter on the main
+    /// file leaves them as they were: on the main's frames, from the first.
+    #[test]
+    fn a_limiter_on_the_main_moves_no_stem() {
+        let dir = std::env::temp_dir().join(format!("rustel-stems-limiter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let plain = dir.join("plain").join("bounce.wav");
+        let limited = dir.join("limited").join("bounce.wav");
+
+        bounce(&plain).expect("plain bounce");
+        bounce_with(
+            &limited,
+            RenderControl {
+                limiter: Some(RenderLimiter {
+                    settings: crate::LimiterSettings {
+                        threshold_db: -12.0,
+                        character: crate::LimiterCharacter::Transparent,
+                    },
+                    makeup: false,
+                }),
+                ..RenderControl::default()
+            },
+        )
+        .expect("limited bounce");
+
+        for stem in ["1.wav", "2.wav"] {
+            let plain = float_wav(&stems_folder(&plain).join(stem));
+            assert!(plain.iter().any(|sample| *sample != 0.0), "{stem} sounds");
+            assert_eq!(
+                plain,
+                float_wav(&stems_folder(&limited).join(stem)),
+                "{stem} moved under the limiter"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The taps hold each orbit's exact contribution to the main mix, added

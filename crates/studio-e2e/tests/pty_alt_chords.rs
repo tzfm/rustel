@@ -832,18 +832,17 @@ fn negotiated_keyboards_option_digit_selects_the_strip_score() {
     );
 }
 
-/// On iTerm2 with Option as Normal, Alt+1 never reaches the studio as a
-/// chord: the terminal composes the key into text and sends the bytes of
-/// `¡`. The studio's recovery table turns it back into the chord, so the
-/// strip still answers - the third delivery path, proven under the
-/// identity that produces it.
+/// On iTerm2 with Option as Normal and no keyboard protocol, Option+6
+/// sends the bytes of `§`, the same bytes the `§` key of an ISO Mac
+/// keyboard sends. The studio cannot tell the two apart, so the character
+/// types into the score and the strip stays.
 ///
 /// Windows ConPTY does not deliver a composed Option key as text the
-/// studio can read. The recovery table has unit coverage in the
-/// terminal profile, the keybinds and the app's key dispatch.
+/// studio can read. The terminal profile and the app's key dispatch have
+/// unit coverage.
 #[cfg(unix)]
 #[test]
-fn iterm2s_composed_digit_selects_the_strip_score() {
+fn iterm2s_composed_digit_types_its_character() {
     let Some(binary) = rustel_binary() else {
         panic!("build the binary first");
     };
@@ -868,10 +867,17 @@ fn iterm2s_composed_digit_selects_the_strip_score() {
         "Ctrl+N never put a second score on the strip:\n{}",
         terminal.diagnostics()
     );
-    terminal.write("¡".as_bytes());
+    let mark = terminal.buffer.lock().unwrap().len();
+    terminal.write("§".as_bytes());
     assert!(
-        terminal.wait_for_screen("scene 1 - live", Duration::from_secs(10)),
-        "the composed Option+1 never selected the first score:\n{}",
+        terminal.wait_for_screen("§", Duration::from_secs(10)),
+        "the composed character never typed:\n{}",
+        terminal.diagnostics()
+    );
+    let after = terminal.text()[mark..].to_owned();
+    assert!(
+        !after.contains("scene 1 - live"),
+        "the composed character selected a strip score:\n{}",
         terminal.diagnostics()
     );
 }
@@ -879,7 +885,7 @@ fn iterm2s_composed_digit_selects_the_strip_score() {
 /// The composition a protocol terminal reports beside the Alt digit must
 /// not swallow the chord. Ghostty and kitty push the digit with the Alt
 /// bit and the composed character as text; the exotic composition gives
-/// up the chord, the way the US Option+1 spelling ¡ does.
+/// up the chord.
 #[test]
 #[cfg(unix)]
 fn a_negotiated_exotic_composition_selects_the_strip_score() {

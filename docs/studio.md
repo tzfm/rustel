@@ -23,8 +23,9 @@ that carries a `@title` field takes it as its file name, an entry keyed by a
 name takes the key, and the rest are numbered `pattern 1`, `pattern 2` and so on
 in the order the patterns were made. The open-set prompt offers these exports
 beside the sets, and File > Import patterns does the same import into
-the set already open: one score file an entry lands in the set's folder, and a
-name the set already holds is skipped and counted, never overwritten. File >
+the set already open: one score file an entry lands in the set's folder. An
+entry the set already holds under its name is skipped and counted, a name that
+holds other code goes on to `name 2`, and nothing is overwritten. File >
 Export patterns writes the set's scores the other way: one pattern export at
 the sets root, keyed by name, the score on screen as it stands with its
 unsaved edits, and the export loads in strudel.cc and in the open-set prompt
@@ -145,7 +146,10 @@ and unsaved edits with `●`.
 Alt with 1 to 9 selects the score that holds that number on the strip. It
 works while the editor has the keyboard, so you can switch scores without the
 set panel. The panel's rows show the numbers, and a number the strip does not
-hold says so in the footer.
+hold says so in the footer. Apple Terminal, and iTerm2 without the keyboard
+protocol, send Option with a digit as a typed character, such as `¡`. That is
+also what the `§` key of an ISO Mac keyboard sends, so there the character
+types. Press the digit in the set panel instead.
 
 Use Ctrl+N for a new scene or F3 to duplicate the current scene. These actions
 create files. Scene > Rename scene renames the scene and its file. Rename has

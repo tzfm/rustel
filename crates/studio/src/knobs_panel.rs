@@ -158,14 +158,16 @@ impl AddList {
 }
 
 /// One call of one scene, as the panel reads it: where its `(` stands, in
-/// the text of `revision`, and its name. Two calls of the same name are
-/// two calls, and an edit above a call moves its `(` but not the call.
+/// the text of `revision`, its name, and the plugin it names. Two calls of
+/// the same name are two calls, and an edit above a call moves its `(` but
+/// not the call. A new plugin name in the call makes it another call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallAt {
     pub scene: SceneId,
     pub open: usize,
     pub revision: Revision,
     pub name: String,
+    pub plugin: Option<String>,
 }
 
 /// The value editor, while `e` holds the panel.
@@ -522,7 +524,10 @@ impl Widget for KnobsView<'_> {
                 .chain(section.names.iter().filter(|_| section.open).map(Some));
             for (offset, name) in names.enumerate() {
                 let at = first + offset;
-                let row = at.saturating_sub(self.panel.scroll);
+                // A row above the scroll is out of view.
+                let Some(row) = at.checked_sub(self.panel.scroll) else {
+                    continue;
+                };
                 let Some((label, _)) = knob_row(body, row) else {
                     break;
                 };

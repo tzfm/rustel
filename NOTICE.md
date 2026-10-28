@@ -5,7 +5,7 @@ regenerate them whenever that graph changes. Source and asset attributions
 are maintained by hand.
 
 This project is AGPL-3.0-or-later (see `LICENSE`). It links the
-559 packages below. This file is the attribution notice that must
+576 packages below. This file is the attribution notice that must
 travel with any binary built from this tree.
 
 ## Licenses that place obligations beyond attribution
@@ -156,16 +156,17 @@ covered by the project's AGPL-3.0-or-later license.
 Not Cargo dependencies, so no generator will list them. Maintained by hand.
 
 - **hydra-synth 1.4.0** - AGPL-3.0 - https://github.com/ojack/hydra-synth.
-  The library itself is not used, fetched or shipped. This tree contains its
-  GLSL: `crates/hydra/src/glsl/table.rs` holds the 52 shader function bodies
-  from `src/glsl/glsl-functions.js`, character for character, generated from
-  that file rather than retyped, and `crates/hydra/src/glsl/compose.rs` is a
-  port of its `generate-glsl.js`. That makes this crate a derivative work of
-  hydra-synth, which is why its licence sits in
-  `crates/hydra/LICENSE-hydra-synth` and why the attribution stays whether or
-  not any JavaScript does. AGPL-3.0 is this project's own outbound licence, so
-  the combination raises no condition beyond the source-availability one that
-  already applies.
+  The library itself is not used, fetched or shipped. The `rustel-hydra`
+  package (https://github.com/tzfm/rustel-hydra), which the default build
+  links, contains its GLSL: `src/glsl/table.rs` holds the 52 shader function
+  bodies from `src/glsl/glsl-functions.js`, character for character,
+  generated from that file rather than retyped, and `src/glsl/compose.rs` is
+  a port of its `generate-glsl.js`. That makes the package a derivative work
+  of hydra-synth, which is why its licence sits in the package's
+  `LICENSE-hydra-synth`, the same AGPL-3.0 text as this project's `LICENSE`,
+  and why the attribution stays whether or not any JavaScript does. AGPL-3.0
+  is this project's own outbound licence, so the combination raises no
+  condition beyond the source-availability one that already applies.
 
 - **switchangel/pad** - Unlicense (public domain) -
   https://github.com/switchangel/pad. Five pad recordings by Switch Angel,
@@ -192,8 +193,8 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 
 | Count | License |
 | ---: | :--- |
-| 253 | MIT OR Apache-2.0 |
-| 128 | MIT |
+| 264 | MIT OR Apache-2.0 |
+| 131 | MIT |
 | 24 | MIT/Apache-2.0 |
 | 18 | Apache-2.0 |
 | 18 | Apache-2.0 OR MIT |
@@ -208,11 +209,13 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | 3 | BSD-3-Clause |
 | 3 | Zlib |
 | 2 | (MIT OR Apache-2.0) AND Unicode-3.0 |
+| 2 | AGPL-3.0-or-later |
 | 2 | BSD-2-Clause OR Apache-2.0 OR MIT |
 | 2 | BSD-2-Clause OR MIT OR Apache-2.0 |
 | 2 | BSD-3-Clause OR Apache-2.0 |
 | 2 | BSD-3-Clause OR MIT OR Apache-2.0 |
 | 2 | BSL-1.0 |
+| 2 | CC0-1.0 |
 | 2 | CDLA-Permissive-2.0 |
 | 2 | LGPL-3.0 |
 | 2 | MIT OR Apache-2.0 OR LGPL-2.1-or-later |
@@ -226,7 +229,6 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | 1 | Apache-2.0 OR GPL-2.0-only |
 | 1 | Apache-2.0 OR ISC OR MIT |
 | 1 | Apache-2.0 WITH LLVM-exception OR BSL-1.0 |
-| 1 | CC0-1.0 |
 | 1 | MIT / Apache-2.0 |
 | 1 | MIT AND Unicode-DFS-2016 |
 | 1 | MIT OR GPL-3.0-only |
@@ -363,6 +365,7 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | `foreign-types-macros` | 0.2.4 | MIT/Apache-2.0 |
 | `foreign-types-shared` | 0.3.1 | MIT/Apache-2.0 |
 | `form_urlencoded` | 1.2.2 | MIT OR Apache-2.0 |
+| `fsevent-sys` | 4.1.0 | MIT |
 | `futures` | 0.3.34 | MIT OR Apache-2.0 |
 | `futures-channel` | 0.3.34 | MIT OR Apache-2.0 |
 | `futures-core` | 0.3.34 | MIT OR Apache-2.0 |
@@ -433,6 +436,8 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | `kasuari` | 0.4.12 | MIT OR Apache-2.0 |
 | `khronos-egl` | 6.0.0 | MIT/Apache-2.0 |
 | `khronos_api` | 3.1.0 | Apache-2.0 |
+| `kqueue` | 1.2.1 | MIT |
+| `kqueue-sys` | 1.1.2 | MIT |
 | `lab` | 0.11.0 | MIT |
 | `lazy_static` | 1.5.0 | MIT OR Apache-2.0 |
 | `libc` | 0.2.189 | MIT OR Apache-2.0 |
@@ -475,6 +480,8 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | `nix` | 0.31.3 | MIT |
 | `nom` | 7.1.3 | MIT |
 | `nonmax` | 0.5.5 | MIT OR Apache-2.0 |
+| `notify` | 8.2.0 | CC0-1.0 |
+| `notify-types` | 2.1.0 | MIT OR Apache-2.0 |
 | `num-bigint` | 0.5.1 | MIT OR Apache-2.0 |
 | `num-complex` | 0.4.6 | MIT OR Apache-2.0 |
 | `num-conv` | 0.2.2 | MIT OR Apache-2.0 |
@@ -603,9 +610,11 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | `rustc-hash` | 1.1.0 | Apache-2.0/MIT |
 | `rustc-hash` | 2.1.3 | Apache-2.0 OR MIT |
 | `rustc_version` | 0.4.1 | MIT OR Apache-2.0 |
+| `rustel-hydra` | 0.1.0 | AGPL-3.0-or-later |
+| `rustel-talkit` | 0.1.1 | AGPL-3.0-or-later |
 | `rustfft` | 6.4.1 | MIT OR Apache-2.0 |
 | `rustix` | 1.1.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
-| `rustls` | 0.23.43 | Apache-2.0 OR ISC OR MIT |
+| `rustls` | 0.23.45 | Apache-2.0 OR ISC OR MIT |
 | `rustls-pki-types` | 1.15.1 | MIT OR Apache-2.0 |
 | `rustls-webpki` | 0.103.14 | ISC |
 | `rustversion` | 1.0.23 | MIT OR Apache-2.0 |
@@ -758,25 +767,35 @@ Not Cargo dependencies, so no generator will list them. Maintained by hand.
 | `windows-strings` | 0.5.1 | MIT OR Apache-2.0 |
 | `windows-sys` | 0.45.0 | MIT OR Apache-2.0 |
 | `windows-sys` | 0.52.0 | MIT OR Apache-2.0 |
+| `windows-sys` | 0.60.2 | MIT OR Apache-2.0 |
 | `windows-sys` | 0.61.2 | MIT OR Apache-2.0 |
 | `windows-targets` | 0.42.2 | MIT OR Apache-2.0 |
 | `windows-targets` | 0.52.6 | MIT OR Apache-2.0 |
+| `windows-targets` | 0.53.5 | MIT OR Apache-2.0 |
 | `windows-threading` | 0.2.1 | MIT OR Apache-2.0 |
 | `windows_aarch64_gnullvm` | 0.42.2 | MIT OR Apache-2.0 |
 | `windows_aarch64_gnullvm` | 0.52.6 | MIT OR Apache-2.0 |
+| `windows_aarch64_gnullvm` | 0.53.1 | MIT OR Apache-2.0 |
 | `windows_aarch64_msvc` | 0.42.2 | MIT OR Apache-2.0 |
 | `windows_aarch64_msvc` | 0.52.6 | MIT OR Apache-2.0 |
+| `windows_aarch64_msvc` | 0.53.1 | MIT OR Apache-2.0 |
 | `windows_i686_gnu` | 0.42.2 | MIT OR Apache-2.0 |
 | `windows_i686_gnu` | 0.52.6 | MIT OR Apache-2.0 |
+| `windows_i686_gnu` | 0.53.1 | MIT OR Apache-2.0 |
 | `windows_i686_gnullvm` | 0.52.6 | MIT OR Apache-2.0 |
+| `windows_i686_gnullvm` | 0.53.1 | MIT OR Apache-2.0 |
 | `windows_i686_msvc` | 0.42.2 | MIT OR Apache-2.0 |
 | `windows_i686_msvc` | 0.52.6 | MIT OR Apache-2.0 |
+| `windows_i686_msvc` | 0.53.1 | MIT OR Apache-2.0 |
 | `windows_x86_64_gnu` | 0.42.2 | MIT OR Apache-2.0 |
 | `windows_x86_64_gnu` | 0.52.6 | MIT OR Apache-2.0 |
+| `windows_x86_64_gnu` | 0.53.1 | MIT OR Apache-2.0 |
 | `windows_x86_64_gnullvm` | 0.42.2 | MIT OR Apache-2.0 |
 | `windows_x86_64_gnullvm` | 0.52.6 | MIT OR Apache-2.0 |
+| `windows_x86_64_gnullvm` | 0.53.1 | MIT OR Apache-2.0 |
 | `windows_x86_64_msvc` | 0.42.2 | MIT OR Apache-2.0 |
 | `windows_x86_64_msvc` | 0.52.6 | MIT OR Apache-2.0 |
+| `windows_x86_64_msvc` | 0.53.1 | MIT OR Apache-2.0 |
 | `winnow` | 1.0.4 | MIT |
 | `winreg` | 0.10.1 | MIT |
 | `wit-bindgen` | 0.57.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |

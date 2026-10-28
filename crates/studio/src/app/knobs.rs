@@ -191,14 +191,15 @@ fn steady(knobs: Vec<Knob>, order: &[KnobPlace]) -> Vec<Knob> {
 }
 
 /// Whether the call `now` reads is the call `held` was read as: the same
-/// scene and name, with its `(` where the edits since then moved it.
-/// Nothing held and nothing read is the same nothing.
+/// scene, name and plugin, with its `(` where the edits since then moved
+/// it. Nothing held and nothing read is the same nothing.
 fn same_call(editor: Option<&Editor>, held: Option<&CallAt>, now: Option<&CallAt>) -> bool {
     match (held, now) {
         (None, None) => true,
         (Some(held), Some(now)) => {
             held.scene == now.scene
                 && held.name == now.name
+                && held.plugin == now.plugin
                 && if held.revision == now.revision {
                     held.open == now.open
                 } else {
@@ -504,6 +505,7 @@ fn documented_number(
 /// stops at 64. A travel above zero stays above zero: `fast(0.125)` floors
 /// at its own value, on a step fine enough to reach it that still stops on
 /// whole numbers, so no move writes the `fast(0)` that silences a pattern.
+/// A remembered travel widens the same way.
 fn widened((min, max, step): (f64, f64, f64), value: f64) -> (f64, f64, f64) {
     let (min, step) = if value >= min {
         (min, step)
@@ -789,7 +791,9 @@ fn resolve_bounds(
         return;
     }
     let (min, max, step) = if let Some(range) = remembered.and_then(remembered_range) {
-        range
+        // A number past a remembered end moves that end, so no move pulls
+        // the number back inside.
+        widened(range, state.value)
     } else if let Some(param) = param {
         knob.default = param.default;
         (0.0, 1.0, param.step)
@@ -1025,13 +1029,15 @@ impl App {
         let params = cache.and_then(|cache| cache.params.as_deref());
         // What the hand holds - entries taken off, bounds deduced -
         // belongs to the one call it worked: another call, even of the
-        // same name, or another document empties the hand. An edit above
-        // the call moves the call, not the hand.
+        // same name, another plugin in the call, or another document
+        // empties the hand. An edit above the call moves the call, not
+        // the hand.
         let call_at = cache.zip(parse).map(|(cache, call)| CallAt {
             scene: cache.scene,
             open: call.open,
             revision: cache.revision,
             name: call.name.clone(),
+            plugin: call.plugin.clone(),
         });
         let editor = cache
             .and_then(|cache| self.scenes.get(cache.scene))
@@ -2076,15 +2082,23 @@ impl App {
             return;
         }
         let notches = direction as f64;
+        // A value the score writes short, `0.333` for a third, stands on
+        // the step it was written from, and the move starts there.
+        let snapped = snap_value(state.value, knob.min, knob.max, knob.step);
+        let value = if self.knob_text(snapped) == self.knob_text(state.value) {
+            snapped
+        } else {
+            state.value
+        };
         let target = if shift {
-            state.value + notches * knob.step
+            value + notches * knob.step
         } else {
             let travel = if knob.log {
                 Travel::Logarithmic
             } else {
                 Travel::Linear
             };
-            rail_stepped(travel, state.value, knob.min, knob.max, knob.step, notches)
+            rail_stepped(travel, value, knob.min, knob.max, knob.step, notches)
         };
         let moved = snap_value(target, knob.min, knob.max, knob.step);
         self.set_knob(&knob, moved);
@@ -2130,6 +2144,7 @@ impl App {
             open: call.open,
             revision: parse.revision,
             name: call.name.clone(),
+            plugin: call.plugin.clone(),
         })
     }
 
@@ -2207,13 +2222,20 @@ impl App {
             self.set_slider_with_smoothing(scene, &chip, value, false);
             return true;
         }
-        // The number is already there: a drag that stays on one cell is
-        // no edit, no undo step and no update.
-        if value == state.value {
-            return true;
-        }
+        // The number, or the text a write would leave, is already there: a
+        // drag that stays on one cell is no edit, no undo step and no
+        // update. A plugin value is written short: a third is `0.333`.
         let literal = state.literal.clone();
         let text = self.knob_text(value);
+        let unchanged = value == state.value
+            || self
+                .editor()
+                .document()
+                .slice(ByteOffset(literal.start)..ByteOffset(literal.end))
+                .is_ok_and(|written| written == text);
+        if unchanged {
+            return true;
+        }
         self.knobs_write(literal, &text)
     }
 
@@ -2592,11 +2614,14 @@ impl App {
                         presets.open = !presets.open;
                     }
                 }
+                // A closed section shows no names: a press under its
+                // heading is on blank space, and only selects.
                 offset => {
                     let name = self
                         .knobs_panel
                         .as_ref()
                         .and_then(|panel| panel.presets.as_ref())
+                        .filter(|presets| presets.open)
                         .and_then(|presets| presets.names.get(offset - 1))
                         .cloned();
                     if let Some(name) = name {
@@ -3136,6 +3161,45 @@ mod tests {
         );
     }
 
+    /// A remembered travel takes the score's own value: → on a cutoff past
+    /// the remembered top moves it up, not down to that top.
+    #[test]
+    fn a_remembered_travel_takes_the_score_value() {
+        use super::super::tests::support::{app_over, press};
+        use crate::editor::{ByteOffset, Selection};
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut app = app_over(directory.path());
+        let score = "$: s(\"saw\").lpf(5000)\n";
+        app.scenes.current_mut().editor = Editor::new(score).expect("score");
+        let caret = score.find("5000").expect("the cutoff");
+        let _ = app
+            .scenes
+            .current_mut()
+            .editor
+            .set_selection(Selection::caret(ByteOffset(caret)));
+        app.prefs
+            .knob_ranges
+            .get_or_insert_with(Default::default)
+            .insert(
+                "lpf:#0".into(),
+                KnobRange {
+                    min: "20".into(),
+                    max: "2000".into(),
+                    step: "1".into(),
+                },
+            );
+        app.open_knobs_panel(true);
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        let source = app.scenes.current().editor.source();
+        let cutoff: f64 = source
+            .split("lpf(")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .and_then(|number| number.parse().ok())
+            .expect("a number");
+        assert!(cutoff > 5000.0, "→ moved the cutoff up:\n{source}");
+    }
+
     /// A count stays whole: the arrows move `seg(16)` one segment at a
     /// time and back to 16, and a drag across its rail writes whole
     /// segments only.
@@ -3534,6 +3598,56 @@ mod tests {
         let source = app.scenes.current().editor.source();
         assert!(source.contains("mode: 0.333 "), "{source}");
         assert_eq!(app.status, "knobs: mode 0.333 · step 0.333");
+    }
+
+    /// A stepped plugin rail walks its steps both ways, though the score
+    /// writes a third as `0.333`, and a drag that stays on one cell writes
+    /// the score once.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn a_stepped_plugin_rail_walks_its_steps_both_ways() {
+        use super::super::tests::support::press;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut app = plugin_app(
+            directory.path(),
+            "$: s(\"bd\").vst(\"FX\", { mode: 0 })\n",
+            vec![plugin_param("mode", 3)],
+        );
+        // Each write reads the call again, and the host of a loaded plugin
+        // gives the new reading its parameters. This stands in for it.
+        let loaded = |app: &mut App| {
+            app.refresh_knobs(Rect::default());
+            if let Some(parse) = app.knobs_parse.as_mut() {
+                parse.params = Some(vec![plugin_param("mode", 3)]);
+            }
+        };
+        let mode = |app: &App| {
+            let source = app.scenes.current().editor.source();
+            let value = source.split("mode: ").nth(1).expect("the entry");
+            value[..value.find(' ').expect("the space after it")].to_owned()
+        };
+        for (code, expected) in [
+            (KeyCode::Right, "0.333"),
+            (KeyCode::Right, "0.667"),
+            (KeyCode::Right, "1"),
+            (KeyCode::Left, "0.667"),
+            (KeyCode::Left, "0.333"),
+        ] {
+            loaded(&mut app);
+            press(&mut app, code, KeyModifiers::NONE);
+            assert_eq!(mode(&app), expected, "{code:?}");
+        }
+        let rail = Rect::new(0, 0, 24, 1);
+        loaded(&mut app);
+        app.drag_knob(0, rail, 12);
+        let dragged = app.scenes.current().editor.revision();
+        loaded(&mut app);
+        app.drag_knob(0, rail, 12);
+        assert_eq!(
+            app.scenes.current().editor.revision(),
+            dragged,
+            "a drag that stays on one cell is no second edit"
+        );
     }
 
     /// A parameter added from the list is the rail under the keys at once,
@@ -4135,6 +4249,80 @@ mod tests {
         assert!(!panel.presets.as_ref().expect("the section").open);
         assert_eq!(panel.selected, knobs, "the hand stands on the heading");
         assert_eq!(app.knobs_row_count(), knobs + 1);
+    }
+
+    /// A press under a closed presets section is on blank space and takes
+    /// no preset. Once the heading opens the section, a press on a name
+    /// takes it into the call.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn a_press_takes_a_preset_only_from_the_open_section() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let score = "$: s(\"bd\").vst(\"FX\", { gain: 1 })\n";
+        let mut app = plugin_app(directory.path(), score, vec![plugin_param("gain", 0)]);
+        if let Some(panel) = app.knobs_panel.as_mut() {
+            panel.presets = Some(KnobPresets {
+                names: vec!["Dark Bass".into(), "Lead".into()],
+                version: 0,
+                open: false,
+            });
+        }
+        let area = Rect::new(0, 0, 26, 30);
+        let body = parts(area).expect("room for the column").body;
+        // The first line of the column's row `at`: a row is two lines.
+        let line = |at: usize| body.y + 2 * at as u16;
+        let heading = app.knobs_rows.as_ref().expect("rows").knobs.len();
+        for below in 1..=3 {
+            app.press_knobs(area, body.x, line(heading + below));
+        }
+        assert_eq!(app.editor().source(), score, "blank space takes no preset");
+        app.press_knobs(area, body.x, line(heading));
+        app.press_knobs(area, body.x, line(heading + 2));
+        let source = app.editor().source();
+        assert!(
+            source.contains("preset: \"Lead\""),
+            "the press took the name under it:\n{source}"
+        );
+    }
+
+    /// The column follows the plugin its call names: a new name in the
+    /// call lets go of the old plugin's presets and of the entry the hand
+    /// took off, so neither lands in the new plugin's call.
+    #[cfg(feature = "vst")]
+    #[test]
+    fn a_new_plugin_name_lets_go_of_the_old_plugin() {
+        use super::super::tests::support::press;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut app = plugin_app(
+            directory.path(),
+            "$: s(\"bd\").vst(\"Old FX\", { gain: 1, mix: 0.5 })\n",
+            vec![plugin_param("gain", 0), plugin_param("mix", 0)],
+        );
+        if let Some(panel) = app.knobs_panel.as_mut() {
+            panel.presets = Some(KnobPresets {
+                names: vec!["Old Pad".into()],
+                version: 0,
+                open: true,
+            });
+        }
+        // The gain goes off, and the hand holds it for the call.
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        type_over(&mut app, "Old FX", "New FX");
+        app.refresh_knobs(Rect::default());
+        let presets = app
+            .knobs_panel
+            .as_ref()
+            .and_then(|panel| panel.presets.as_ref());
+        assert!(
+            presets.is_none_or(|presets| !presets.names.iter().any(|name| name == "Old Pad")),
+            "the old plugin's presets are not the new one's"
+        );
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        let source = app.editor().source();
+        assert!(
+            !source.contains("gain"),
+            "the entry taken off the old plugin stays out:\n{source}"
+        );
     }
 
     /// The value form of a rail walks its fields with the same keys as the

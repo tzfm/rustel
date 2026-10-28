@@ -333,10 +333,11 @@ struct State {
     /// [`Host::arm_preset_watch`]. A channel that reads as gone ended its
     /// watch, and the folders are read when the player asks again.
     preset_watch: Option<Sender<Word>>,
-    /// The folders the watch of the preset folders was asked for, also when
-    /// a missing folder made it watch the folder nearest it that is there:
-    /// see [`Host::arm_preset_watch`].
-    preset_watched: Vec<PathBuf>,
+    /// Each preset folder the watch was armed for, with the path its watch
+    /// reads: the folder, or the folder nearest above a missing one. A
+    /// folder that comes in or goes moves its path, and the watch is armed
+    /// again: see [`Host::arm_preset_watch`].
+    preset_watched: Vec<(PathBuf, PathBuf)>,
     /// The reads of the preset folders so far. A caller that holds the
     /// number of its last read asks again when this moves: the watch read
     /// the folders, and its answer may have changed.
@@ -507,6 +508,41 @@ impl State {
                 entry.stage = Stage::Failed(fault.clone());
             }
         }
+    }
+
+    /// Keeps the answer for each preset name that the preset lists still
+    /// give: a number whose file is the file [`Host::preset`] finds for the
+    /// name now. A miss goes too, so a new file can answer it. A name whose
+    /// answer goes resolves again at its next ask: a file that left, moved
+    /// or gave way to a file of the root gets a new number, and a build of
+    /// the name reads the new file. A copy an engine holds with the old
+    /// number stays in its slot until a copy of the new key takes the slot,
+    /// as for a new preset in the score.
+    fn keep_preset_answers(&mut self) {
+        let State {
+            known_presets,
+            presets,
+            entries,
+            preset_index,
+            ..
+        } = self;
+        known_presets.retain(|(plugin, name), known| {
+            let KnownPreset::Number(number) = known else {
+                return false;
+            };
+            // The list of the plugin as `Host::preset` finds it: by the name
+            // of the plugin of the number.
+            let named = row_of(*plugin).and_then(|row| entries.get(row));
+            let entry = named.and_then(|named| entries.iter().find(|entry| entry.key == named.key));
+            let files = entry.and_then(|entry| preset_index.get(&entry.class.to_ascii_lowercase()));
+            let file = files
+                .into_iter()
+                .flatten()
+                .find(|(file, _)| canonical(file) == *name);
+            let stored = presets.get(*number as usize - 1);
+            file.zip(stored)
+                .is_some_and(|((_, path), (_, stored))| path == stored)
+        });
     }
 
     /// True for a build for a slot of a chain that ended.
@@ -850,8 +886,11 @@ impl Host {
 
     /// The folder with one folder of `.vstpreset` files for each plugin.
     /// The next ask for a preset reads the preset folders again - a read
-    /// that runs now reads them after its end, with the new folder.
+    /// that runs now reads them after its end, with the new folder. The
+    /// folder is the store of rustel, so it is made here: its watch then
+    /// reads the folder itself from the start.
     pub fn set_preset_folder(&self, folder: PathBuf) {
+        let _ = std::fs::create_dir_all(&folder);
         {
             let mut state = self.state();
             state.preset_root = Some(folder);
@@ -887,17 +926,24 @@ impl Host {
     /// host.
     fn arm_preset_watch(&self) {
         let folders = {
-            let mut state = self.state();
+            let state = self.state();
             let mut folders = state.preset_extra.clone();
             folders.extend(state.preset_root.iter().cloned());
-            if state.preset_watch.is_some() && state.preset_watched == folders {
+            folders
+        };
+        let watched: Vec<(PathBuf, PathBuf)> = folders
+            .iter()
+            .map(|folder| (folder.clone(), crate::watch::watched_at(folder)))
+            .collect();
+        {
+            let mut state = self.state();
+            if state.preset_watch.is_some() && state.preset_watched == watched {
                 return;
             }
             if let Some(watch) = state.preset_watch.take() {
                 let _ = watch.send(Word::Stop);
             }
-            folders
-        };
+        }
         if folders.is_empty() {
             return;
         }
@@ -919,7 +965,7 @@ impl Host {
             return;
         };
         let mut state = self.state();
-        state.preset_watched = folders;
+        state.preset_watched = watched;
         state.preset_watch = Some(word);
     }
 
@@ -962,7 +1008,7 @@ impl Host {
         let folder = preset_folder(&root, &plugin.name)
             .unwrap_or_else(|| root.join(folder_name(&plugin.name)));
         let files = crate::preset::read_folder(&folder);
-        let fresh: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
+        let fresh: Vec<String> = files.iter().map(|(name, _)| canonical(name)).collect();
         let mut state = self.state();
         let list = state
             .preset_index
@@ -970,15 +1016,16 @@ impl Host {
             .or_default();
         // Only the files of this folder give way. A name of both this
         // folder and a folder the player added keeps the file of this
-        // folder, as a read of the disk puts the root first.
-        list.retain(|(known, path)| !path.starts_with(&folder) && !fresh.contains(known));
+        // folder, as a read of the disk puts the root first. Names compare
+        // in the form of `canonical`, as a lookup does.
+        list.retain(|(known, path)| {
+            !path.starts_with(&folder) && !fresh.contains(&canonical(known))
+        });
         list.extend(files);
         list.sort();
-        // A file of the read can answer a preset that was missing before:
-        // a kept miss does not hold its missing past the read.
-        state
-            .known_presets
-            .retain(|_, known| matches!(known, KnownPreset::Number(_)));
+        // A file of the read can answer a preset that was missing before,
+        // and a file can leave or give way.
+        state.keep_preset_answers();
         state.presets_version += 1;
     }
 
@@ -1001,7 +1048,8 @@ impl Host {
     /// one folder for each plugin, so the folder names the plugin: a file
     /// of another plugin the player put there reaches the build, which
     /// refuses it with the reason. A name of the root and of an added
-    /// folder keeps the file of the root.
+    /// folder keeps the file of the root. Names compare in the form of
+    /// [`canonical`], as a lookup does.
     fn finish_presets(&self, root: Option<PathBuf>, extra: Vec<PathBuf>) {
         let mut index = crate::preset::scan_folders(&extra);
         let plugins = {
@@ -1019,9 +1067,9 @@ impl Host {
                     continue;
                 };
                 let files = crate::preset::read_folder(&folder);
-                let fresh: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
+                let fresh: Vec<String> = files.iter().map(|(name, _)| canonical(name)).collect();
                 let list = index.entry(class).or_default();
-                list.retain(|(known, _)| !fresh.contains(known));
+                list.retain(|(known, _)| !fresh.contains(&canonical(known)));
                 list.extend(files);
             }
         }
@@ -1032,10 +1080,8 @@ impl Host {
             let mut state = self.state();
             state.preset_index = index;
             // A file of the read can answer a preset that was missing
-            // before: a kept miss does not hold its missing past the read.
-            state
-                .known_presets
-                .retain(|_, known| matches!(known, KnownPreset::Number(_)));
+            // before, and a file can leave or give way.
+            state.keep_preset_answers();
             state.presets_version += 1;
             state.presets_read = true;
             state.presets_reading = false;
@@ -1090,20 +1136,27 @@ impl Host {
         names
     }
 
-    /// [`Host::scan`], and each bundle gets a new test: the scan cache is
-    /// empty before the read. A loaded plugin stays loaded.
+    /// [`Host::scan`], and each bundle gets a new test: the scan cache and
+    /// its file are empty before the read. A loaded plugin stays loaded.
     pub fn rescan(&self, folders: &[PathBuf]) {
         let folders = folders.to_vec();
         let host = self.clone();
         let mut state = self.state();
         state.scans += 1;
         self.enqueue(move || {
-            {
+            let root = {
                 let mut state = host.state();
                 state.cache = Cache::default();
                 state.cache_read = true;
+                state.preset_root.clone()
+            };
+            // A write keeps the entries of the file it finds, so the file
+            // goes: a bundle with no new test yet has no answer at the next
+            // start.
+            if let Some(root) = root {
+                let _one_writer = locked(&host.shared.saving);
+                let _ = std::fs::remove_file(root.join(cache::FILE_NAME));
             }
-            host.save_cache();
             host.finish_scan(&folders);
         });
     }
@@ -1443,19 +1496,19 @@ impl Host {
             .and_then(|()| std::fs::copy(file, &target))
             .map_err(|error| error.to_string())?;
         // The read of the preset folders knows the new file now: no read of
-        // the disk again. A preset of an added folder with this name gives
-        // way, as a read of the disk puts the root first.
+        // the disk again. A preset of an added folder with this name, in
+        // the form of `canonical`, gives way, as a read of the disk puts
+        // the root first.
         let mut state = self.state();
         let files = state
             .preset_index
             .entry(class.to_ascii_lowercase())
             .or_default();
-        files.retain(|(known, _)| known.as_str() != preset.as_ref());
+        let wanted = canonical(&preset);
+        files.retain(|(known, path)| path.starts_with(&folder) || canonical(known) != wanted);
         files.push((preset.clone().into_owned(), target));
         files.sort();
-        state
-            .known_presets
-            .retain(|_, known| matches!(known, KnownPreset::Number(_)));
+        state.keep_preset_answers();
         state.presets_version += 1;
         Ok((plugin, preset.into_owned()))
     }
@@ -1873,7 +1926,7 @@ impl Host {
     /// The number of a preset of a plugin, from the name of its file.
     pub fn preset(&self, plugin: u32, name: &str) -> FoundPreset {
         let wanted = (plugin, canonical(name));
-        let entry_name = {
+        let (entry_name, version) = {
             let state = self.state();
             // A note asks on each start. The answer for a name is kept,
             // and a name with no file gets a new look after `PRESET_RETRY`.
@@ -1886,7 +1939,7 @@ impl Host {
             }
             let entry = row_of(plugin).and_then(|row| state.entries.get(row));
             match entry {
-                Some(entry) => entry.name.clone(),
+                Some(entry) => (entry.name.clone(), state.presets_version),
                 None => return FoundPreset::Missing,
             }
         };
@@ -1894,6 +1947,11 @@ impl Host {
             return FoundPreset::Pending;
         };
         let mut state = self.state();
+        // A read that landed since the list was taken can give the name
+        // another file: the next ask takes the new list.
+        if state.presets_version != version {
+            return FoundPreset::Pending;
+        }
         let file = files
             .into_iter()
             .find(|(name, _)| canonical(name) == wanted.1);

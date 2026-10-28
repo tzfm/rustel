@@ -1495,21 +1495,29 @@ mod tests {
                             code[source..].lines().next()
                         );
                     }
-                    let mut session = rustel_runtime::Session::new().unwrap();
-                    session.evaluate(&block).unwrap();
-                    let events = session
-                        .query(
-                            rustel_fraction::Fraction::from(0),
-                            rustel_fraction::Fraction::from(2),
-                        )
+                    // On the stack the engine worker evaluates with.
+                    std::thread::Builder::new()
+                        .stack_size(rustel_runtime::QUERY_WORKER_STACK_BYTES)
+                        .spawn(move || {
+                            let mut session = rustel_runtime::Session::new().unwrap();
+                            session.evaluate(&block).unwrap();
+                            let events = session
+                                .query(
+                                    rustel_fraction::Fraction::from(0),
+                                    rustel_fraction::Fraction::from(2),
+                                )
+                                .unwrap();
+                            assert!(!events.is_empty());
+                            for event in events {
+                                assert_eq!(
+                                    event.value.get("__rustelPreview").cloned(),
+                                    Some(rustel_core::Value::F64(42.0))
+                                );
+                            }
+                        })
+                        .unwrap()
+                        .join()
                         .unwrap();
-                    assert!(!events.is_empty());
-                    for event in events {
-                        assert_eq!(
-                            event.value.get("__rustelPreview").cloned(),
-                            Some(rustel_core::Value::F64(42.0))
-                        );
-                    }
                 }
             }
         }

@@ -1028,28 +1028,20 @@ pub mod profiles {
             assert_eq!(super::alt_input_letter("Ghostty", '†'), None);
         }
 
+        /// A composed Option digit is also a key of some layout - `§` on
+        /// every ISO Mac keyboard, `£` on UK, `¡` on Spanish - and a legacy
+        /// terminal sends both the same way, so the character types.
         #[test]
-        fn option_digits_compose_and_recover_on_the_mac_terminals() {
-            for (digit, composed) in [
-                ('1', '¡'),
-                ('2', '™'),
-                ('3', '£'),
-                ('4', '¢'),
-                ('5', '∞'),
-                ('6', '§'),
-                ('7', '¶'),
-                ('8', '•'),
-                ('9', 'ª'),
-            ] {
+        fn option_digits_type_their_character_on_the_mac_terminals() {
+            for composed in ['¡', '™', '£', '¢', '∞', '§', '¶', '•', 'ª'] {
                 for terminal in ["iTerm2", "Apple Terminal"] {
                     assert_eq!(
                         super::alt_input_letter(terminal, composed),
-                        Some(digit),
-                        "{composed} does not recover alt+{digit} on {terminal}"
+                        None,
+                        "{composed} became a chord on {terminal}"
                     );
                 }
             }
-            assert_eq!(super::alt_input_letter("Ghostty", '¡'), None);
         }
 
         #[test]

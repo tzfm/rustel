@@ -65,7 +65,9 @@ impl ScoreMeta {
 }
 
 /// The leading run of the text that is comments: blank lines may sit between
-/// them, and the first line that is neither ends the run.
+/// them, and the first line that is neither ends the run. When the text ends
+/// inside a comment - a last line with no newline, or a block the head cut
+/// short - the whole text is the run.
 fn leading_comment_text(text: &str) -> &str {
     let mut end = 0;
     loop {
@@ -74,12 +76,12 @@ fn leading_comment_text(text: &str) -> &str {
         if let Some(stripped) = rest.strip_prefix("//") {
             match stripped.find('\n') {
                 Some(nl) => end = start + nl + 3,
-                None => return rest,
+                None => return text,
             }
         } else if let Some(stripped) = rest.strip_prefix("/*") {
             match stripped.find("*/") {
                 Some(close) => end = start + close + 4,
-                None => return rest,
+                None => return text,
             }
         } else {
             return &text[..end];
@@ -177,6 +179,18 @@ $: s(\"bd\")
     fn a_head_cut_mid_block_keeps_the_fields_before_the_cut() {
         let score = "/*\n@title cut\n@by mid-way thro"; // no close, cut short
         let meta = ScoreMeta::parse(score);
+        assert_eq!(meta.first("title"), Some("cut"));
+        assert_eq!(meta.first("by"), Some("mid-way thro"));
+    }
+
+    #[test]
+    fn a_run_that_reaches_the_end_keeps_its_earlier_fields() {
+        // The last line comment has no newline after it.
+        let meta = ScoreMeta::parse("// @title night drive\n// @by me");
+        assert_eq!(meta.first("title"), Some("night drive"));
+        assert_eq!(meta.first("by"), Some("me"));
+        // The head is cut inside a block that follows a line comment.
+        let meta = ScoreMeta::parse("// @title cut\n/*\n@by mid-way thro");
         assert_eq!(meta.first("title"), Some("cut"));
         assert_eq!(meta.first("by"), Some("mid-way thro"));
     }

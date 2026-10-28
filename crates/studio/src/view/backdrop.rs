@@ -631,24 +631,33 @@ impl Widget for EvaluationFlash<'_> {
 /// drifts toward the background colour and the ground toward the text
 /// colour, which at whole strength is the swap the reverse modifier makes
 /// and in between is every step of a fade. Terminal-owned colours with no
-/// measurable RGB start from the theme's own grounds.
+/// measurable RGB start from the theme's own grounds, and a spent wash
+/// leaves the cell as it is. Terminal-owned grounds give nothing to blend,
+/// so the wash snaps to the reverse modifier from half strength, as
+/// [`crate::theme::mix`] snaps.
 fn wash(cell: &mut Cell, theme: &Theme, level: f32) {
+    if level <= 0.0 {
+        return;
+    }
     let (Some(front), Some(back)) = (rgb(theme.foreground), rgb(theme.background)) else {
+        if level >= 0.5 {
+            cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+        }
         return;
     };
     let mix = |from: u8, toward: u8| {
         (f32::from(from) + (f32::from(toward) - f32::from(from)) * level).round() as u8
     };
-    let blend = |from: Color, toward: (u8, u8, u8)| match from {
-        Color::Rgb(red, green, blue) => Color::Rgb(
+    let blend = |from: Color, own: (u8, u8, u8), toward: (u8, u8, u8)| {
+        let (red, green, blue) = rgb(from).unwrap_or(own);
+        Color::Rgb(
             mix(red, toward.0),
             mix(green, toward.1),
             mix(blue, toward.2),
-        ),
-        _ => Color::Rgb(toward.0, toward.1, toward.2),
+        )
     };
-    cell.fg = blend(cell.fg, back);
-    cell.bg = blend(cell.bg, front);
+    cell.fg = blend(cell.fg, front, back);
+    cell.bg = blend(cell.bg, back, front);
 }
 
 fn rgb(color: Color) -> Option<(u8, u8, u8)> {
@@ -844,6 +853,69 @@ mod tests {
                 .cell((0, 2))
                 .is_some_and(|cell| cell.modifier.contains(Modifier::REVERSED)),
             "every visible non-empty source row flashes"
+        );
+    }
+
+    /// A fade shows under any theme: grounds the terminal owns snap to the
+    /// reverse from half strength, a palette colour on a colour theme starts
+    /// from the theme's own text colour, and a spent fade leaves the cell.
+    #[test]
+    fn a_fade_flash_shows_on_terminal_grounds_and_palette_colours() {
+        let mut editor = Editor::new("$: note(60)\n").unwrap();
+        let area = Rect::new(0, 0, 24, 2);
+        let grid = source_grid(&editor, area, true);
+        editor.set_view_size(usize::from(grid.width), usize::from(grid.height));
+        let map = editor.screen_map(grid).unwrap();
+        let flashed = |theme: &Theme, intensity: f32| {
+            let mut buffer = Buffer::empty(area);
+            buffer.set_style(
+                area,
+                Style::default().fg(theme.foreground).bg(theme.background),
+            );
+            buffer.set_string(4, 0, "$: note(60)", Style::default().fg(Color::Indexed(2)));
+            EvaluationFlash {
+                map: &map,
+                theme,
+                pulse: super::EvaluationPulse {
+                    animation: crate::settings::EvalAnimation::FadeMedium,
+                    progress: 0.5,
+                    intensity,
+                },
+            }
+            .render(area, &mut buffer);
+            buffer[(4, 0)].clone()
+        };
+
+        let terminal = Theme::built_in("terminal").expect("terminal ships");
+        assert!(
+            flashed(&terminal, 0.8)
+                .modifier
+                .contains(Modifier::REVERSED),
+            "a bright fade swaps the line"
+        );
+        let dim = flashed(&terminal, 0.3);
+        assert!(
+            !dim.modifier.contains(Modifier::REVERSED),
+            "a dim fade leaves it"
+        );
+        assert_eq!(dim.fg, Color::Indexed(2));
+
+        let theme = Theme::built_in_default();
+        let washed = flashed(&theme, 0.25);
+        assert_eq!(
+            washed.fg,
+            crate::theme::mix(theme.foreground, theme.background, 0.25),
+            "a palette colour starts from the theme's text colour"
+        );
+        assert_eq!(
+            washed.bg,
+            crate::theme::mix(theme.background, theme.foreground, 0.25)
+        );
+        let spent = flashed(&theme, 0.0);
+        assert_eq!(
+            (spent.fg, spent.bg),
+            (Color::Indexed(2), theme.background),
+            "a spent fade leaves the cell"
         );
     }
 

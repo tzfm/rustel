@@ -22,6 +22,11 @@ pub(crate) trait VimTextSurface {
     fn space_command(&self) -> bool {
         false
     }
+    /// A key the list beside the box answers in Command, so Command leaves
+    /// it to the surface instead of saying how to type.
+    fn list_key(&self, _code: KeyCode) -> bool {
+        false
+    }
     /// The surface's own anchored completion, if it has one.
     fn anchored(&self) -> bool {
         false
@@ -72,6 +77,20 @@ impl VimTextSurface for SetPanel {
         if let Some(search) = self.search.as_mut() {
             search.typing = insert;
         }
+    }
+
+    // A filter standing leaves the list the keys it has without Vim:
+    // Space folds the tapes, Delete asks, a digit opens a strip's score,
+    // `n` starts a tape, and +/- size the panel.
+    fn space_command(&self) -> bool {
+        true
+    }
+
+    fn list_key(&self, code: KeyCode) -> bool {
+        matches!(
+            code,
+            KeyCode::Delete | KeyCode::Char('1'..='9' | 'n' | '+' | '=' | '-' | '_')
+        )
     }
 }
 
@@ -289,6 +308,8 @@ pub(crate) fn handle_text_key(app: &mut App, key: &KeyEvent) -> VimTextKey {
                 // the selected row or toggling a choice. Where it has
                 // none, it is text and Command keeps it out.
                 KeyCode::Char(' ') if surface.space_command() => TextAction::Ignored,
+                // The list's own keys, such as the set panel's Delete.
+                code if surface.list_key(code) => TextAction::Ignored,
                 KeyCode::Char(' ') | KeyCode::Backspace | KeyCode::Delete => {
                     TextAction::Message(typing_hint)
                 }
@@ -1005,5 +1026,41 @@ mod tests {
             app.reference_panel.is_none(),
             "the second Command Esc closes"
         );
+    }
+
+    /// A filter standing over the set list leaves the list its own keys in
+    /// Command, as it does without Vim: Delete asks, Space folds the tapes,
+    /// and a digit opens that strip's score. A letter the list has no use
+    /// for still says how to type.
+    #[test]
+    fn a_standing_set_filter_leaves_the_list_its_keys() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut app = app_over(directory.path());
+        app.new_scene(false);
+        app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+        app.ui_settings.vim_list_navigation = true;
+        app.sync_editor_keybindings();
+        fn panel(app: &App) -> &SetPanel {
+            app.set_panel.as_ref().expect("panel")
+        }
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Home, KeyModifiers::NONE);
+        assert!(!panel(&app).vim_insert, "Esc left Insert");
+        assert_eq!(panel(&app).search.as_ref().expect("filter").query, "f");
+
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(app.status.contains("press i or a"), "{}", app.status);
+        press(&mut app, KeyCode::Delete, KeyModifiers::NONE);
+        assert!(panel(&app).deleting.is_some(), "Delete asks");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(panel(&app).deleting.is_none(), "Esc keeps the score");
+        assert!(panel(&app).search.is_some(), "the filter still stands");
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(panel(&app).sessions_open, "Space opens the tapes");
+        press(&mut app, KeyCode::Char('1'), KeyModifiers::NONE);
+        assert_eq!(app.scenes.current().name(), "first", "1 opens strip 1");
     }
 }

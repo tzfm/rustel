@@ -26,9 +26,9 @@ members = [
 ]
 
 # `cargo build` at the root builds the complete product, the `rustel` binary
-# of `crates/cli`. Its default features include Studio and Hydra, so the path
-# dependency is pulled in even though `rustel-hydra` is not itself a top-level
-# default member. A lean build is `-p rustel --no-default-features`, with
+# of `crates/cli`. Its default features include Studio and Hydra, so the
+# `rustel-hydra` package is pulled in. A lean build is
+# `-p rustel --no-default-features`, with
 # `--features mp3-export` to keep MP3 export.
 default-members = [
     "crates/engine",

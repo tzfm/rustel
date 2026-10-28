@@ -303,14 +303,24 @@ impl App {
                     .iter()
                     .position(|file| file.strip == Some(strip))
                 {
-                    Some(row) => {
-                        panel.selected = panel
-                            .lines
-                            .iter()
-                            .position(|line| *line == SetLine::File(row))
-                            .unwrap_or(panel.selected);
-                        self.open_set_line();
-                    }
+                    Some(row) => match panel
+                        .lines
+                        .iter()
+                        .position(|line| *line == SetLine::File(row))
+                    {
+                        Some(line) => {
+                            panel.selected = line;
+                            self.open_set_line();
+                        }
+                        // A filter hides the row: the strip's score is
+                        // selected the way an Alt digit selects it, never
+                        // the row under the selection. The score takes the
+                        // keyboard, as Enter on its row gives it.
+                        None => {
+                            self.select_strip_by_number(strip);
+                            self.focus = Focus::Editor;
+                        }
+                    },
                     None => self.status = format!("no scene {} on the strip", strip),
                 }
             }
@@ -1192,10 +1202,12 @@ impl App {
 
     /// A Strudel pattern export read into the set already open: every
     /// entry becomes a named score file of the set's folder, listed by
-    /// the set panel and none of them taken up as tabs. A name the set
-    /// already holds - on disk or open on the strip - is skipped and
-    /// counted, never overwritten, so the same file twice brings nothing
-    /// the second time and says so.
+    /// the set panel and none of them taken up as tabs. An entry the set
+    /// already holds under its name - on disk or open on the strip - is
+    /// skipped and counted, so the same file twice brings nothing the
+    /// second time and says so. A name that holds other code goes on to
+    /// `name 2`, `name 3` and so on, the way the folder import keeps two
+    /// names apart, and nothing is overwritten.
     fn import_strudel_into_current(&mut self, path: &std::path::Path) {
         let report = |app: &mut Self, error: String| {
             if let Some((_, picker)) = app.set_prompt.as_mut() {
@@ -1215,14 +1227,50 @@ impl App {
         let mut written = 0usize;
         let mut skipped = 0usize;
         for (name, code) in &scores {
-            let file = directory.join(format!("{name}.{}", crate::scenes::SCENE_EXTENSION));
-            let taken = file.exists() || self.scenes.scores().any(|scene| scene.path == file);
-            if taken {
+            // Whether a file name of the set holds this code - an open
+            // score as it stands, any other as its file reads - or `None`
+            // when the name is free.
+            let holds = |file: &std::path::Path| match self
+                .scenes
+                .scores()
+                .find(|scene| scene.path == file)
+            {
+                Some(scene) => Some(scene.editor.source() == *code),
+                None => file
+                    .exists()
+                    .then(|| std::fs::read_to_string(file).is_ok_and(|text| text == *code)),
+            };
+            let mut file = directory.join(format!("{name}.{}", crate::scenes::SCENE_EXTENSION));
+            let mut suffix = 2;
+            let held = loop {
+                match holds(&file) {
+                    Some(false) => {
+                        file = directory.join(format!(
+                            "{name} {suffix}.{}",
+                            crate::scenes::SCENE_EXTENSION
+                        ));
+                        suffix += 1;
+                    }
+                    held => break held,
+                }
+            };
+            if held == Some(true) {
                 skipped += 1;
                 continue;
             }
-            match std::fs::write(&file, code) {
-                Ok(()) => written += 1,
+            // A new file only: a file another program made since the look
+            // above is never overwritten.
+            let created = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&file)
+                .and_then(|mut new| std::io::Write::write_all(&mut new, code.as_bytes()));
+            match created {
+                Ok(()) => {
+                    // An import lands in the folder, not on the strip.
+                    self.note_own_write(&file);
+                    written += 1;
+                }
                 Err(error) => {
                     return report(self, format!("cannot import {}: {error}", path.display()));
                 }
@@ -2097,6 +2145,36 @@ mod tests {
             assert_eq!(app.focus, Focus::Editor);
         }
 
+        /// A digit opens its strip's score while a filter hides the score's
+        /// row, and the row under the selection stays a file.
+        #[test]
+        fn a_digit_opens_its_strip_when_a_filter_hides_the_row() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.new_scene(false);
+            // A file of the folder, not open on the strip.
+            std::fs::write(directory.path().join("spare.strudel"), "// spare\n").expect("spare");
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            // `sp` keeps spare alone, and first holds strip 1.
+            press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(
+                app.set_panel
+                    .as_ref()
+                    .unwrap()
+                    .selected_file()
+                    .unwrap()
+                    .name,
+                "spare"
+            );
+            press(&mut app, KeyCode::Char('1'), KeyModifiers::NONE);
+            assert_eq!(app.scenes.current().name(), "first", "strip 1 opened");
+            assert_eq!(app.scenes.score_count(), 2, "spare was not opened");
+            assert_eq!(app.focus, Focus::Editor);
+        }
+
         /// The details block stands at the panel's foot and follows the
         /// selection: the selected score's detail is there with no key
         /// and nothing to close. Vim mode changes none of it, the panel
@@ -2311,6 +2389,40 @@ mod tests {
             assert!(app.set_panel.as_ref().unwrap().search.is_none());
         }
 
+        /// A chord passes the search box while it types, in Vim's Insert
+        /// as outside it: ^B hides the panel rather than typing `b` into
+        /// the query. Ctrl with Alt is AltGr on a legacy terminal, and it
+        /// still types.
+        #[test]
+        fn a_chord_passes_the_typing_search_box_and_altgr_still_types() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            for vim in [false, true] {
+                if vim {
+                    app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+                    app.sync_editor_keybindings();
+                }
+                press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+                press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+                assert!(app.set_search_typing(), "vim {vim}: the box types");
+                press(
+                    &mut app,
+                    KeyCode::Char('@'),
+                    KeyModifiers::CONTROL | KeyModifiers::ALT,
+                );
+                assert_eq!(
+                    app.set_panel
+                        .as_ref()
+                        .and_then(|panel| panel.search.as_ref())
+                        .map(|search| search.query.as_str()),
+                    Some("@"),
+                    "vim {vim}: AltGr typed"
+                );
+                press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+                assert!(app.set_panel.is_none(), "vim {vim}: ^B hid the panel");
+            }
+        }
+
         /// Backspace over a filter standing edits the query, never the
         /// file: the hand's way back into the box can press it any
         /// number of times without arming a delete, where Delete still
@@ -2365,6 +2477,40 @@ mod tests {
                 app.set_panel.as_ref().unwrap().deleting.is_some(),
                 "Delete asks, as it always did"
             );
+        }
+
+        /// A delete asked under a filter is withdrawn when a prompt drops
+        /// the filter: the line it was asked on names another score once
+        /// the list is whole, so Enter after the prompt deletes nothing.
+        #[test]
+        fn a_prompt_that_drops_the_filter_withdraws_an_armed_delete() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.new_scene(false);
+            std::fs::write(directory.path().join("spare.strudel"), "// spare\n").expect("spare");
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Delete, KeyModifiers::NONE);
+            assert!(app.status.starts_with("delete spare"), "{}", app.status);
+
+            app.dispatch_menu_action(crate::menu::MenuAction::RenameSet)
+                .expect("menu");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.set_prompt.is_none(), "the prompt closed");
+            assert!(
+                app.set_panel.as_ref().unwrap().deleting.is_none(),
+                "the question was withdrawn"
+            );
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            for name in ["first", "scene 1", "spare"] {
+                assert!(
+                    directory.path().join(format!("{name}.strudel")).is_file(),
+                    "{name} is still on disk"
+                );
+            }
         }
 
         /// Delete in the panel asks and Enter answers: an open score off the
@@ -2604,8 +2750,8 @@ mod tests {
         /// File > Import patterns… reads an export into the set
         /// already open: one named score file an entry, in the set's own
         /// folder with no tab taken up, and a name the set already holds
-        /// skipped and counted, never overwritten. The same file twice
-        /// says there is nothing new in it.
+        /// never overwritten. The same file twice says there is nothing
+        /// new in it.
         #[test]
         fn importing_strudel_patterns_adds_them_to_the_open_set() {
             let directory = tempfile::tempdir().expect("temp dir");
@@ -2615,7 +2761,8 @@ mod tests {
             std::fs::create_dir_all(&home).expect("home");
             let mut app = app_over(&home);
             app.prefs.sets_directory = Some(sets.display().to_string());
-            // The set holds `first`; the export's `first` must lose to it.
+            // The set holds `first`, and the export's `first` holds other code
+            // and lands beside it.
             let starter = std::fs::read_to_string(home.join("first.strudel")).expect("starter");
 
             std::fs::write(
@@ -2642,11 +2789,7 @@ mod tests {
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
 
             assert!(app.set_prompt.is_none(), "the prompt closed");
-            assert_eq!(
-                app.status, "imported 2 patterns into home - 1 skipped, already in the set",
-                "{}",
-                app.status
-            );
+            assert_eq!(app.status, "imported 3 patterns into home");
             assert_eq!(
                 std::fs::read_to_string(home.join("night drive.strudel")).unwrap(),
                 "// @title night drive\n$: s(\"bd\")"
@@ -2661,6 +2804,10 @@ mod tests {
                 "the set's own score was not overwritten"
             );
             assert_eq!(
+                std::fs::read_to_string(home.join("first 2.strudel")).unwrap(),
+                "$: s(\"cp\")"
+            );
+            assert_eq!(
                 app.scenes.score_count(),
                 1,
                 "the import writes files, not tabs"
@@ -2670,6 +2817,65 @@ mod tests {
             app.open_set_prompt(SetPrompt::ImportStrudel);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
             assert_eq!(app.status, "no new patterns - all 3 are already in home");
+        }
+
+        /// An import keeps every entry whose name the set holds with other
+        /// code: two strudel.cc exports both number their patterns from
+        /// one, and one export can hold two versions of a title. Each
+        /// lands under the next free name, nothing is overwritten, and the
+        /// same file again still brings nothing new.
+        #[test]
+        fn an_import_keeps_the_entries_whose_names_hold_other_code() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let sets = directory.path().join("sets");
+            std::fs::create_dir_all(&sets).expect("sets");
+            let home = directory.path().join("home");
+            std::fs::create_dir_all(&home).expect("home");
+            let mut app = app_over(&home);
+            app.prefs.sets_directory = Some(sets.display().to_string());
+            let import = |app: &mut App, export: &str| {
+                std::fs::write(sets.join("gig.json"), export).expect("export");
+                app.open_set_prompt(SetPrompt::ImportStrudel);
+                press(app, KeyCode::Enter, KeyModifiers::NONE);
+            };
+            let read = |name: &str| {
+                std::fs::read_to_string(home.join(format!("{name}.strudel"))).expect(name)
+            };
+
+            import(
+                &mut app,
+                r#"{
+                  "XKOBdiQB6vMm": { "code": "$: s(\"bd\")", "created_at": 10 },
+                  "ALGnQXNiUsZ4": { "code": "$: s(\"cp\")", "created_at": 20 }
+                }"#,
+            );
+            assert_eq!(app.status, "imported 2 patterns into home");
+            let later = r#"{
+              "SkySkxWlk9OI": { "code": "$: s(\"hh\")", "created_at": 10 },
+              "V1StGXR8_Z5j": { "code": "$: s(\"oh\")", "created_at": 20 }
+            }"#;
+            import(&mut app, later);
+            assert_eq!(app.status, "imported 2 patterns into home");
+            assert_eq!(read("pattern 1"), "$: s(\"bd\")", "not overwritten");
+            assert_eq!(read("pattern 2"), "$: s(\"cp\")", "not overwritten");
+            assert_eq!(read("pattern 1 2"), "$: s(\"hh\")");
+            assert_eq!(read("pattern 2 2"), "$: s(\"oh\")");
+            import(&mut app, later);
+            assert_eq!(app.status, "no new patterns - all 2 are already in home");
+
+            import(
+                &mut app,
+                r#"{
+                  "kZ4_hT9pQw2x": { "code": "// @title night drive\n$: s(\"bd\")", "created_at": 10 },
+                  "Q7rT2mW9xLp4": { "code": "// @title night drive\n$: s(\"bd*2\")", "created_at": 20 }
+                }"#,
+            );
+            assert_eq!(app.status, "imported 2 patterns into home");
+            assert_eq!(read("night drive"), "// @title night drive\n$: s(\"bd\")");
+            assert_eq!(
+                read("night drive 2"),
+                "// @title night drive\n$: s(\"bd*2\")"
+            );
         }
 
         /// File > Export patterns… writes the set's scores as one pattern

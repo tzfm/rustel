@@ -357,6 +357,7 @@ impl App {
         // the folder. A scene that cannot be written stays open: its text is
         // nowhere else, and the save error says why.
         let scene = self.scenes.current();
+        let path = scene.path.clone();
         if scene.dirty {
             let (id, revision, source) = (
                 scene.id,
@@ -374,6 +375,8 @@ impl App {
                 return;
             }
         }
+        // The file stays as the tab leaves it, with the saves of its own.
+        self.note_own_write(&path);
         if self.scenes.score_count() == 1 {
             // Keep a score available while closing the old one normally.
             let current = self.scenes.current_index();

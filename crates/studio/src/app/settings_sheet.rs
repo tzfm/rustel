@@ -716,8 +716,7 @@ impl App {
                 let opacity_changed = settings.backdrop_opacity
                     != self.ui_settings.backdrop_opacity
                     || settings.interface_opacity != self.ui_settings.interface_opacity
-                    || settings.editor_opacity != self.ui_settings.editor_opacity
-                    || settings.beat_line != self.ui_settings.beat_line;
+                    || settings.editor_opacity != self.ui_settings.editor_opacity;
                 // The second Enter on an open preview, turning the switch on
                 // now that the picture has already answered what it looks
                 // like. Worth its own line: the generic "settings kept"
@@ -2101,6 +2100,43 @@ mod tests {
             assert_eq!(app.prefs.load_mode.as_deref(), Some("async"));
             press(&mut app, KeyCode::Right, KeyModifiers::NONE);
             assert_eq!(app.worker.master().load_mode(), LoadMode::Wait);
+        }
+
+        /// A chosen beat line is kept on its own, and claims none of the
+        /// opacities: the next theme still suggests those.
+        #[test]
+        fn choosing_a_beat_line_leaves_the_opacities_to_the_theme() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 120, 40);
+            app.prefs.follow_theme_opacity();
+            let mut sheet = SettingsSheet::default();
+            sheet.show_page(crate::settings::SettingsPage::Appearance);
+            app.settings_sheet = Some(sheet);
+            app.focus = Focus::Panel(PanelKind::Settings);
+            // Down onto the beat line, past the menu, header and footer rows.
+            for _ in 0..3 {
+                press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+            }
+            let before = app.ui_settings.beat_line;
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+            assert_ne!(
+                app.ui_settings.beat_line, before,
+                "the row is the beat line"
+            );
+            assert_eq!(
+                app.prefs.beat_line.as_deref(),
+                Some(app.ui_settings.beat_line.key())
+            );
+            assert_eq!(
+                (
+                    app.prefs.backdrop_opacity,
+                    app.prefs.interface_opacity,
+                    app.prefs.editor_opacity
+                ),
+                (None, None, None),
+                "the theme's suggested opacities were claimed"
+            );
         }
     }
 }

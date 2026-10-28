@@ -1010,6 +1010,7 @@ impl StudioPrefs {
         self.show_menu = Some(settings.show_menu);
         self.show_header = Some(settings.show_header);
         self.show_footer = Some(settings.show_footer);
+        self.beat_line = Some(settings.beat_line.key().to_owned());
         // `sample_sources` is NOT written here. The sheet edits the rows in
         // place, through `set_sample_sources`, because a source is a thing
         // you added rather than a switch you flipped: rebuilding the list
@@ -1028,7 +1029,6 @@ impl StudioPrefs {
         self.backdrop_opacity = Some(settings.backdrop_opacity);
         self.interface_opacity = Some(settings.interface_opacity);
         self.editor_opacity = Some(settings.editor_opacity);
-        self.beat_line = Some(settings.beat_line.key().to_owned());
     }
 
     /// The learnt shortcuts, restored from the file. The overrides live
@@ -2047,7 +2047,7 @@ mod tests {
                 ..Default::default()
             };
             let mut prefs = StudioPrefs::default();
-            prefs.claim_opacities(&settings);
+            prefs.set_ui_settings(&settings);
             let encoded = serde_json::to_value(&prefs).unwrap();
             assert_eq!(encoded["beat_line"], key);
             let restored: StudioPrefs = serde_json::from_value(encoded).unwrap();

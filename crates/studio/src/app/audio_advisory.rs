@@ -18,7 +18,7 @@ const RECOVERY: Duration = Duration::from_secs(5);
 const MAX_SAMPLE_GAP: Duration = Duration::from_secs(1);
 
 pub(super) const MESSAGE: &str =
-    "Audio struggling · try raising audio out latency in Settings → Advanced";
+    "Audio struggling · try raising audio out latency in Settings → General";
 
 /// Changes to these stream properties reset the observation baseline.
 /// Include rate and buffer size because recycling can retain the stream ID.

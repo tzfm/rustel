@@ -151,16 +151,11 @@ fn dispatch_builtin(app: &mut App, key: KeyEvent) -> Result<bool, RuntimeError> 
             .get_text()
             .ok()
             .filter(|text| !text.is_empty());
-        // A copy from another surface is newer than the register. When the
-        // two agree, Vim's own put keeps its linewise and visual rules.
-        if clipboard
-            .as_deref()
-            .is_some_and(|text| register.as_deref() != Some(text))
-        {
-            app.dispatch_editor(Command::Paste)?;
-            app.focus = Focus::Editor;
-            app.dirty_frame = true;
-            return Ok(true);
+        // A copy from another surface is newer than the register, so it
+        // becomes the register. Vim's own put then keeps its linewise and
+        // visual rules for it.
+        if let Some(text) = clipboard.filter(|text| register.as_deref() != Some(text.as_str())) {
+            app.editor_mut().set_vim_register(text);
         }
     }
     let register = app.editor().vim_register().map(str::to_owned);

@@ -289,6 +289,8 @@ impl SetPanel {
         }
         self.lines = lines;
         self.selected = self.selected.min(self.lines.len().saturating_sub(1));
+        // A delete is armed by line, and the line can name another row now.
+        self.deleting = None;
     }
 
     pub fn move_by(&mut self, delta: isize) {

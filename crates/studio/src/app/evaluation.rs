@@ -315,8 +315,20 @@ impl App {
         }
         // While another score plays, the typing pause applies nothing: an
         // edit of a score the set is not playing stays in its file until
-        // the player asks for it with the evaluate key.
+        // the player asks for it with the evaluate key. The score that key
+        // sent last, held for its sounds or armed for its line, is the one
+        // the set is about to play.
+        let latest = self.pending_evaluation.as_ref().or_else(|| {
+            self.inflight
+                .values()
+                .max_by_key(|pending| pending.request_id)
+        });
+        let on_its_way = match latest {
+            Some(pending) => pending.scene == scene.id,
+            None => self.armed_scene == Some(scene.id),
+        };
         if !external
+            && !on_its_way
             && self
                 .audible_scene
                 .is_some_and(|playing| playing != scene.id)
@@ -1583,6 +1595,37 @@ mod tests {
             assert!(
                 !queued_by(&app, other).is_empty(),
                 "the evaluate key runs the edited score"
+            );
+
+            // Until it lands, the pressed score is the one the set is about
+            // to play, and an edit of it applies by itself.
+            app.dispatch_editor(Command::PasteText("$: s(\"hh\")\n".into()))
+                .expect("edit the score on its way");
+            app.auto_evaluate();
+            assert!(
+                queued_by(&app, other)
+                    .iter()
+                    .any(|pending| pending.source.contains("hh")),
+                "the score on its way takes the pause"
+            );
+
+            // A newer press of a third score is the one that lands, so an
+            // edit of the earlier one waits for a press of its own.
+            app.new_scene(false);
+            app.dispatch_editor(Command::PasteText("$: s(\"cp*2\")\n".into()))
+                .expect("a third score");
+            app.dispatch_editor(Command::Evaluate)
+                .expect("the newer press");
+            let earlier = app.scenes.index_of(other).expect("the earlier score");
+            app.select_scene(earlier);
+            app.dispatch_editor(Command::PasteText("$: s(\"bd*2\")\n".into()))
+                .expect("edit the earlier score");
+            app.auto_evaluate();
+            assert!(
+                !queued_by(&app, other)
+                    .iter()
+                    .any(|pending| pending.source.contains("bd*2")),
+                "the earlier score waits for its press"
             );
         }
 
