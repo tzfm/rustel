@@ -81,6 +81,7 @@
 - `talkit('hello there')` speaks text in a score, the way `s("...")` plays a sample. Single quotes speak one phrase, and double quotes are mini-notation, so `talkit("my name is")` speaks one word per event. A note sets the pitch the voice starts on, so `note("c3 e3 g3").talkit('la')` sings three notes. An options object sets the 20 voices, pitch, speed, quality, effort and language, each as a pattern, as in `talkit('hola mundo', { v: "little-robot", l: "es" })`, and Studio completes their values. Talkit is experimental. See [Talkit](https://github.com/tzfm/rustel/blob/main/docs/talkit.md).
 - The `talkit` command speaks text through the default output device or writes a WAV file. It carries the parameter model of the old Talk It! program, with the 20 voices, pitch, speed, natural, monotone and sung quality, normal, breathy and whispered effort, English and Spanish rules, and numbers read as words. Its sounds, timing, intonation and English readings are measured from the original engine, and it speaks as that engine does, in 8-bit steps at 11.025 kHz. See [Talkit](https://github.com/tzfm/rustel/blob/main/docs/talkit.md).
 - The left and right arrows turn a trust row on or off, as Space does, so the Trust page changes values the way the settings rows do.
+- Apple Terminal no longer shows a line of the studio's startup questions after the studio quits. The terminal printed the questions it could not read, `pp` and a graphics query, on the shell's screen. The studio now erases them.
 
 ### Sound changes
 
