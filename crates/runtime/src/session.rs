@@ -900,6 +900,7 @@ pub struct Session {
     /// Floor a host puts under a live replacement's takeover headroom, from
     /// how long its producer's turns actually take. Zero keeps the default
     /// response-time pricing (see [`Self::set_replacement_headroom_floor`]).
+    #[cfg(any(feature = "device-audio", test))]
     replacement_headroom_floor: Duration,
     /// The sample rate of the last live schedule, in Hz. The producer
     /// converts a takeover time to the takeover frame at this rate, and
@@ -1187,6 +1188,7 @@ impl Session {
             audio_input_channels: None,
             schedule_lead: 0.0,
             continuity_margin: None,
+            #[cfg(any(feature = "device-audio", test))]
             replacement_headroom_floor: Duration::ZERO,
             live_sample_rate: None,
             requery_takeover_time: None,
