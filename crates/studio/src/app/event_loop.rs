@@ -340,7 +340,13 @@ impl App {
     ) -> Result<(), RuntimeError> {
         // This thread paints; the audio callback and the engine producer keep
         // their deadlines. On a machine without spare cores the frame loop
-        // stands below them (see `background`).
+        // stands below them (see `background`). The host connection must be
+        // built BEFORE the demotion: this loop's probe threads are born
+        // demoted, the connection thread inherits its creator's priority,
+        // and the audio callback rides that thread - a host first built
+        // below would put the sound below the workers this demotion is
+        // meant to order below the sound.
+        rustel_audio::prime_playback_host();
         crate::background::demote();
         let mut raw_paste_continuation = false;
         while !self.quit {

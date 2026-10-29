@@ -1893,28 +1893,26 @@ fn with_preferred_host<T>(
     use_host(&cpal::default_host())
 }
 
-/// Build the cached playback host now, at the calling thread's priority.
+/// Build the cached playback host in the background, at the calling
+/// thread's priority.
 ///
 /// The host's connection hands its work to a fresh thread that carries no
 /// name, and a thread with no name inherits its creator's scheduling
 /// priority and name. The audio callback later rides that thread, so a
-/// host first built by a demoted background worker - a device probe -
-/// puts the sound itself below the workers around it for the life of the
-/// process. A caller that demotes a thread and then asks for devices must
-/// prime the host first, while the thread still stands at its normal
-/// priority; the helper thread here also gives the connection a name of
-/// its own instead of the probe's.
+/// host first built by a demoted worker - a device probe spawned by a
+/// demoted frame loop - puts the sound itself below the workers around it
+/// for the life of the process. Call this while the calling thread still
+/// stands at its normal priority; the helper here carries that priority
+/// and the name `audio-host` over to the connection, and the call returns
+/// without waiting for it.
 pub fn prime_playback_host() {
     // A failed priming leaves the host to be built by the next caller at
-    // its own priority; the probe still demotes and enumerates either way.
-    let primed = std::thread::Builder::new()
+    // its own priority; nothing here waits on the helper.
+    let _ = std::thread::Builder::new()
         .name("audio-host".into())
         .spawn(|| {
             let _ = with_preferred_host(|_| Ok::<(), DevicePlaybackError>(()));
         });
-    if let Ok(handle) = primed {
-        let _ = handle.join();
-    }
 }
 
 fn build_stream(
