@@ -40,12 +40,17 @@ pub(super) struct FindState {
     pattern: String,
     direction: FindDirection,
     last_pattern: Option<String>,
+    /// The direction the last search ran in. `n` follows it, whatever a
+    /// prompt closed since then asked for.
+    last_direction: FindDirection,
     count: usize,
     keep_open: bool,
     /// Where the find bar opened. As-you-type searches start here so the
     /// caret does not walk forward with every keystroke.
     anchor: usize,
-    last_match: Option<Range<usize>>,
+    /// The caret the last match left, and that match. A search from that
+    /// caret walks on past the whole match.
+    last_match: Option<(usize, Range<usize>)>,
     message: Option<&'static str>,
 }
 
@@ -72,6 +77,15 @@ impl Editor {
 
     pub(crate) fn find_open(&self) -> bool {
         self.find.open
+    }
+
+    /// Where the find bar opened, after `edits`.
+    pub(super) fn find_anchor_through(&self, edits: &[super::Edit]) -> usize {
+        super::map_offset(ByteOffset(self.find.anchor), edits, true).0
+    }
+
+    pub(super) fn find_set_anchor(&mut self, anchor: usize) {
+        self.find.anchor = anchor;
     }
 
     pub(crate) fn find_cancel(&mut self) {
@@ -163,9 +177,9 @@ impl Editor {
             return;
         };
         let direction = if reverse {
-            self.find.direction.opposite()
+            self.find.last_direction.opposite()
         } else {
-            self.find.direction
+            self.find.last_direction
         };
         match self.find_apply(&pattern, direction, count.max(1)) {
             Ok(()) => self.find.message = None,
@@ -241,6 +255,7 @@ impl Editor {
         let count = self.find.count.max(1);
         self.find.pattern = pattern.clone();
         self.find.last_pattern = Some(pattern.clone());
+        self.find.last_direction = direction;
         self.find.count = 0;
         match self.find_apply(&pattern, direction, count) {
             Ok(()) => {
@@ -271,7 +286,8 @@ impl Editor {
             .find
             .last_match
             .as_ref()
-            .filter(|found| found.start == caret);
+            .filter(|(left, _)| *left == caret)
+            .map(|(_, found)| found);
         let (origin, strict) = match (continuing, direction) {
             (Some(found), FindDirection::Forward) => (found.end, false),
             (Some(found), FindDirection::Backward) => (found.start, false),
@@ -324,7 +340,11 @@ impl Editor {
         };
         self.set_selection(selection)
             .map_err(|_| FindError::NoMatch)?;
-        self.find.last_match = Some(start.0..end.0);
+        // Vim's Normal keeps the caret on a character, so a match that
+        // starts on a line break leaves it on the one before.
+        self.normalize_after_input()
+            .map_err(|_| FindError::NoMatch)?;
+        self.find.last_match = Some((self.primary_selection().head.0, start.0..end.0));
         self.reveal_selection();
         Ok(())
     }
@@ -539,6 +559,51 @@ mod tests {
             ));
             assert!(!editor.find_open());
             assert_eq!(editor.primary_selection(), Selection::caret(ByteOffset(0)));
+        }
+
+        /// A Vim match that starts on a line break leaves the caret on the
+        /// last character of its line, where Normal keeps it, and `n` walks
+        /// on from there. `n` once found the same match again and again.
+        #[test]
+        fn n_walks_on_from_a_match_on_a_line_break() {
+            let mut editor = editor("ab\ncd ef");
+            editor.set_keybindings(crate::editor::EditorKeybindings::Vim);
+            let head = |editor: &Editor| editor.primary_selection().head.0;
+            jump(&mut editor, r"\s", FindDirection::Forward);
+            assert_eq!(head(&editor), 1, "the caret rests on the b");
+            let n = crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('n'),
+                crossterm::event::KeyModifiers::NONE,
+            );
+            editor
+                .vim_key(n, crate::editor::HistoryMoment(0), None)
+                .expect("n");
+            assert_eq!(head(&editor), 5, "n finds the space");
+            editor
+                .vim_key(n, crate::editor::HistoryMoment(0), None)
+                .expect("n");
+            assert_eq!(head(&editor), 1, "and wraps to the line break");
+        }
+
+        /// A `?` closed with Esc never searched, so `n` keeps the direction
+        /// of the search that ran. The cancelled prompt once turned it.
+        #[test]
+        fn a_cancelled_search_keeps_the_direction_of_n() {
+            let mut editor = editor("foo foo foo");
+            editor.set_keybindings(crate::editor::EditorKeybindings::Vim);
+            jump(&mut editor, "foo", FindDirection::Forward);
+            assert_eq!(editor.primary_selection().head, ByteOffset(4));
+            editor.begin_find(FindDirection::Backward, false, 0);
+            editor.find_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            editor.repeat_find(false, 1);
+            assert_eq!(
+                editor.primary_selection().head,
+                ByteOffset(8),
+                "n still searches forward"
+            );
         }
     }
 }

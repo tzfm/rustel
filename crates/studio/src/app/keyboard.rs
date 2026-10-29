@@ -226,7 +226,7 @@ impl App {
     }
 
     /// Whether the panel has a text field that owns held typing keys.
-    fn panel_is_typing(&self, kind: PanelKind) -> bool {
+    pub(super) fn panel_is_typing(&self, kind: PanelKind) -> bool {
         // The set prompt types whether the vim surface below it answers
         // or not.
         if kind == PanelKind::Set && self.set_prompt.is_some() {
@@ -256,6 +256,12 @@ impl App {
                 .knobs_panel
                 .as_ref()
                 .is_some_and(|panel| panel.adding.is_some() || panel.editing.is_some()),
+            // The vst page's filter, while its letters build it.
+            #[cfg(feature = "vst")]
+            PanelKind::Settings => self
+                .settings_sheet
+                .as_ref()
+                .is_some_and(|sheet| sheet.shows_vst() && sheet.vst_filter.is_typing()),
             _ => false,
         }
     }
@@ -558,8 +564,12 @@ impl App {
             if self.editor_accepts_raw_paste()
                 && self.editor().find_open()
                 && self.find_global_chord(key));
+        // A clicked slider keeps the keys its status promises until it is
+        // let go, in Vim as outside it. They go on to `armed_slider_key`.
+        let slider_key = matches!(&terminal_event, Event::Key(key) if self.armed_slider_takes(key));
         let quit_was_armed = self.quit_armed;
         if !find_global
+            && !slider_key
             && allow_modal_keys
             && self.editor_accepts_raw_paste()
             && let Event::Key(key) = &terminal_event
@@ -574,12 +584,33 @@ impl App {
             }
             return Ok(());
         }
-        let non_key_interrupt = matches!(&terminal_event, Event::Paste(_) | Event::FocusLost)
-            || matches!(&terminal_event, Event::Mouse(mouse) if mouse.kind != MouseEventKind::Moved);
-        if non_key_interrupt {
+        // A pointer press interrupts. A release or a drag carries on a
+        // gesture its press began, and the press already interrupted.
+        // Counted again, the release of a click on Edit > Find closed the
+        // find bar that same click had opened. The wheel only moves the
+        // view, and focus leaving the window is no input, so neither ends
+        // a mode or closes a prompt. Focus loss still sends a held mapping
+        // prefix on.
+        let pointer_press = matches!(&terminal_event, Event::Mouse(mouse)
+            if matches!(mouse.kind, MouseEventKind::Down(_)));
+        let paste = matches!(&terminal_event, Event::Paste(_));
+        if pointer_press || paste || matches!(&terminal_event, Event::FocusLost) {
             super::vim::flush_pending(self)?;
         }
-        let interrupts_key_mode = non_key_interrupt
+        // Vim's `:` line takes a paste as typed text, as the find bar does.
+        if let Event::Paste(text) = &terminal_event
+            && allow_modal_keys
+            && self.editor_accepts_raw_paste()
+            && self.editor_mut().vim_command_paste(text)
+        {
+            self.dirty_frame = true;
+            return Ok(());
+        }
+        // A paste is text. Where typed text lands it joins the insert and
+        // its undo step. Elsewhere it ends a pending command, and Visual,
+        // whose selection it replaces.
+        let interrupts_key_mode = pointer_press
+            || (paste && !self.editor().accepts_typed_text())
             || matches!(&terminal_event, Event::Key(key)
                 if key.kind != KeyEventKind::Release
                     && (key.modifiers.intersects(
@@ -1059,7 +1090,7 @@ impl App {
             // keys on they are list keys, not typing. An arrow with no
             // target still belongs to the panel: letting it through would
             // move a caret the reader cannot see.
-            if super::vim::panel_takes_list_navigation(kind)
+            if super::vim::panel_takes_list_navigation(self, kind)
                 && let Some(alias) = self.list_navigation_alias(key)
             {
                 let _ = self.dispatch_panel_key(kind, alias.code, false, false, false)?;
@@ -1531,7 +1562,7 @@ impl App {
                 || (text_key(key.code) && self.panel_is_typing(kind))
             {
                 self.dispatch_panel_key(kind, key.code, primary, shift, alt)?;
-            } else if super::vim::panel_takes_list_navigation(kind)
+            } else if super::vim::panel_takes_list_navigation(self, kind)
                 && !self.panel_is_typing(kind)
                 && let Some(alias) = self.list_navigation_alias(key)
                 && (panel_repeat_is_safe(kind, alias.code)
@@ -2744,6 +2775,44 @@ mod tests {
             assert_eq!(legacy(KeyCode::Char('.')), None);
         }
 
+        /// A held letter keeps typing the vst page's filter. In Vim a held
+        /// `j` does not turn into ↓, which would end the filter and move.
+        #[cfg(feature = "vst")]
+        #[test]
+        fn a_held_letter_keeps_typing_the_vst_filter() {
+            use crossterm::event::{KeyEvent, KeyEventKind};
+            let directory = tempfile::tempdir().expect("temp dir");
+            let mut app = app_over(directory.path());
+            app.frame = Rect::new(0, 0, 140, 40);
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.toggle_settings_sheet();
+            app.settings_sheet
+                .as_mut()
+                .expect("sheet open")
+                .show_page(crate::settings::SettingsPage::Vst);
+            app.focus = Focus::Panel(PanelKind::Settings);
+            press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+            let selected = app.settings_sheet.as_ref().expect("sheet open").selected;
+            app.handle_terminal_event(Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('j'),
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            )))
+            .expect("repeat");
+            assert_eq!(
+                app.vst_filter,
+                crate::settings::VstFilter::Typing("jj".into()),
+                "the repeat typed"
+            );
+            assert_eq!(
+                app.settings_sheet.as_ref().expect("sheet open").selected,
+                selected,
+                "the cursor stayed"
+            );
+        }
+
         /// A held key belongs to the prompt that took its press: repeats of
         /// Backspace erase in the field and never reach the score, and a
         /// held letter keeps typing there.
@@ -2947,6 +3016,80 @@ mod tests {
             })
             .expect("composed release");
             assert_eq!(app.editor().source(), source);
+        }
+
+        /// The line of the caret, counted from zero.
+        fn caret_line(app: &App) -> usize {
+            let head = app.editor().primary_selection().head.0;
+            app.editor().source()[..head].matches('\n').count()
+        }
+
+        /// The wheel changes no Vim mode. A `:` line waiting for its number
+        /// and a V-LINE selection both carry on after a wheel step. The
+        /// wheel once closed the one and turned the other character-wise.
+        #[test]
+        fn a_wheel_step_keeps_the_vim_command_line_and_visual_line() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let source = (1..=50).map(|n| format!("// {n}\n")).collect::<String>();
+            let (mut app, _scene) = plain_app(directory.path(), &source);
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            let editor = app.regions.panes[0].editor;
+            let wheel = |app: &mut App| {
+                mouse(app, MouseEventKind::ScrollDown, editor.x + 2, editor.y + 1);
+            };
+
+            type_text(&mut app, ":42");
+            wheel(&mut app);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(caret_line(&app), 41, ":42 went to line 42");
+
+            type_text(&mut app, "V");
+            wheel(&mut app);
+            type_text(&mut app, "yp");
+            assert!(
+                app.editor().source().contains("// 42\n// 42\n// 43\n"),
+                "the put stays linewise"
+            );
+        }
+
+        /// A paste while Vim's `:` line is open types into it, as typing
+        /// does. It once closed the line and went into the score.
+        #[test]
+        fn a_paste_types_into_the_vim_command_line() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let source = (1..=50).map(|n| format!("// {n}\n")).collect::<String>();
+            let (mut app, _scene) = plain_app(directory.path(), &source);
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            let score = app.editor().source();
+            type_text(&mut app, ":");
+            app.handle_terminal_event(Event::Paste("42".into()))
+                .expect("paste handled");
+            assert_eq!(app.editor().vim_label().as_deref(), Some(":42"));
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(app.editor().source(), score);
+            assert_eq!(caret_line(&app), 41, ":42 went to line 42");
+        }
+
+        /// A paste in Vim's Insert is part of that insert, so Esc and one
+        /// `u` take all of it back. The paste once split the insert into
+        /// three undo steps.
+        #[test]
+        fn a_paste_in_insert_undoes_with_the_rest_of_the_insert() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "// score\n");
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            let score = app.editor().source();
+            type_text(&mut app, "iab");
+            app.handle_terminal_event(Event::Paste("XY".into()))
+                .expect("paste handled");
+            type_text(&mut app, "cd");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert_eq!(app.editor().source(), format!("abXYcd{score}"));
+            type_text(&mut app, "u");
+            assert_eq!(app.editor().source(), score);
         }
     }
 

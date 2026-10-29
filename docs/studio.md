@@ -950,9 +950,9 @@ The theme picker and the export sheet use the same modes. `j` and `k` move
 the list or the form, `i` or `a` type, and Esc returns to Command. On the
 export sheet, `h` and `l` change a choice or a number, and Space toggles a
 choice. In Command mode, `p` pastes the clipboard into the search or form
-and enters Insert. Insert mappings from your vimrc and the shipped defaults
-apply in these fields too. The shipped `jk` mapping leaves Insert in the
-search.
+and enters Insert. Insert types every letter at once, `j` and `k` included,
+as Vim's own command line does. The insert mappings of the score, such as the
+shipped `jk`, do not reach these fields. Esc leaves Insert.
 
 ### Custom Vim mappings
 

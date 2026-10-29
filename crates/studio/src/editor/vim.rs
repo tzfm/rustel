@@ -11,8 +11,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::{
-    ByteOffset, Edit, EditOrigin, Editor, EditorError, FindDirection, HistoryMoment, Selection,
-    SelectionSet, Transaction, normalize_paste_line_endings,
+    ByteOffset, Edit, EditOrigin, Editor, EditorError, FindDirection, HistoryMoment, Revision,
+    Selection, SelectionSet, Transaction, document::line_ending_len, normalize_paste_line_endings,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -104,7 +104,12 @@ pub(super) struct VimState {
     motion_blocked: bool,
     register: String,
     linewise_register: bool,
+    /// How many times a yank, delete or put has filled the register, so
+    /// the same text yanked again still counts as the newest copy.
+    register_writes: u64,
     insert_moment: HistoryMoment,
+    /// The indent `o`, `O` or `cc` copied, and the revision that holds it.
+    autoindent: Option<(Revision, Range<ByteOffset>)>,
 }
 
 impl Editor {
@@ -117,6 +122,7 @@ impl Editor {
             keybindings,
             register: std::mem::take(&mut self.vim.register),
             linewise_register: self.vim.linewise_register,
+            register_writes: self.vim.register_writes,
             ..VimState::default()
         };
         self.close_history_group();
@@ -165,6 +171,38 @@ impl Editor {
     pub(crate) fn set_vim_register(&mut self, text: String) {
         self.vim.linewise_register = text.ends_with(['\n', '\r']);
         self.vim.register = text;
+    }
+
+    /// Visual's two ends after `edits`, mapped the way the selection maps
+    /// its own.
+    pub(super) fn vim_visual_through(&self, edits: &[Edit]) -> Option<(ByteOffset, ByteOffset)> {
+        let Mode::Visual { anchor, head, .. } = self.vim.mode else {
+            return None;
+        };
+        let forward = anchor <= head;
+        Some((
+            super::map_offset(anchor, edits, !forward),
+            super::map_offset(head, edits, forward),
+        ))
+    }
+
+    pub(super) fn vim_set_visual_ends(&mut self, ends: Option<(ByteOffset, ByteOffset)>) {
+        if let (Some(ends), Mode::Visual { anchor, head, .. }) = (ends, &mut self.vim.mode) {
+            (*anchor, *head) = ends;
+        }
+    }
+
+    /// How many times Vim itself has filled the register. Text taken in
+    /// from the clipboard does not count.
+    pub(crate) fn vim_register_writes(&self) -> u64 {
+        self.vim.register_writes
+    }
+
+    /// A yank, delete or put fills the register.
+    fn vim_fill_register(&mut self, text: String, linewise: bool) {
+        self.vim.register = text;
+        self.vim.linewise_register = linewise;
+        self.vim.register_writes = self.vim.register_writes.wrapping_add(1);
     }
 
     /// Show a short Vim message in the footer's editor label.
@@ -249,6 +287,10 @@ impl Editor {
         self.vim.g = false;
         self.vim.command = None;
         self.vim.message = None;
+        // The indent `o` copied is taken back only within its own undo
+        // step. Once that step is closed it stays, so one undo still takes
+        // the whole line.
+        self.vim.autoindent = None;
         self.close_history_group();
     }
 
@@ -261,30 +303,41 @@ impl Editor {
         }
     }
 
+    /// Leave every key mode for a prompt that searches the score. Vim
+    /// searches from Normal, as its `/` does, so Insert ends the way Esc
+    /// ends it, and `n` walks the matches after Enter.
+    pub(crate) fn leave_key_mode_for_find(&mut self) -> Result<(), EditorError> {
+        self.interrupt_key_mode();
+        if self.vim.keybindings == EditorKeybindings::Vim && self.vim.mode == Mode::Insert {
+            self.vim_escape()?;
+        }
+        Ok(())
+    }
+
+    /// A paste while `:` waits for its command types into the command
+    /// line, as its keys do. `false` when no command line is open.
+    pub(crate) fn vim_command_paste(&mut self, text: &str) -> bool {
+        if self.vim.command.is_none() {
+            return false;
+        }
+        for character in text.chars() {
+            self.vim_command_type(character);
+        }
+        true
+    }
+
     /// After any input in Normal mode, the caret rests on a character, not
     /// past the end of its line. A caret that already rests on one is left
-    /// alone: normalizing it brings it into view, and a wheel scroll that
-    /// never touched the caret was pulled straight back to it.
+    /// alone, and so is a view the wheel scrolled away from it.
     pub(crate) fn normalize_after_input(&mut self) -> Result<(), EditorError> {
         if self.vim.keybindings == EditorKeybindings::Vim
             && self.vim.mode == Mode::Normal
             && self.selections.len() == 1
             && self.primary_selection().is_empty()
-            && self.vim_caret_past_line_end()?
         {
             self.vim_normalize_caret()?;
         }
         Ok(())
-    }
-
-    /// Whether the caret sits past the last character of a line that has
-    /// one, where Normal mode never leaves it.
-    fn vim_caret_past_line_end(&self) -> Result<bool, EditorError> {
-        let head = self.primary_selection().head;
-        let range = self
-            .document
-            .line_content_range(self.document.line_of(head)?);
-        Ok(head >= range.end && range.end > range.start)
     }
 
     pub(super) fn mode_history_transaction(
@@ -301,10 +354,12 @@ impl Editor {
                     | EditOrigin::Delete
                     | EditOrigin::Newline
                     | EditOrigin::Indent
+                    | EditOrigin::Paste
             )
         {
-            // Insert mode keeps one undo step across pauses and line breaks.
-            transaction.origin = EditOrigin::Control;
+            // Insert mode keeps one undo step across pauses, line breaks
+            // and pastes. A slider or knob edit between keeps its own.
+            transaction.origin = EditOrigin::Insert;
             self.vim.insert_moment
         } else {
             moment
@@ -516,13 +571,15 @@ impl Editor {
         if let Some(operator) = operator {
             if let Mode::Visual { linewise, .. } = self.vim.mode {
                 let range = self.primary_selection().ordered();
-                self.vim_apply_operator(operator, range, linewise, moment)?;
+                let start = range.start;
+                self.vim_apply_operator(operator, range, linewise, start, moment)?;
             } else if let Some((pending, count)) = self.vim.operator.take() {
                 if pending == operator {
                     let count = count.saturating_mul(self.vim_take_count());
-                    let line = self.document.line_of(self.vim_head())?;
+                    let head = self.vim_head();
+                    let line = self.document.line_of(head)?;
                     let range = self.vim_line_range(line, line.saturating_add(count - 1));
-                    self.vim_apply_operator(operator, range, true, moment)?;
+                    self.vim_apply_operator(operator, range, true, head, moment)?;
                 } else {
                     self.vim_cancel_pending();
                 }
@@ -544,7 +601,7 @@ impl Editor {
                 let range = self.document.line_content_range(line);
                 let target = match character {
                     'a' => self.document.next_grapheme_boundary(head)?.min(range.end),
-                    'I' => self.document.first_non_whitespace(line),
+                    'I' => self.document.indent_end(line),
                     'A' => range.end,
                     _ => head,
                 };
@@ -563,8 +620,19 @@ impl Editor {
                 };
                 let head = self.vim_head();
                 let line = self.document.line_of(head)?;
-                let (range, linewise) = if let Mode::Visual { linewise, .. } = self.vim.mode {
-                    (self.primary_selection().ordered(), linewise)
+                let (range, linewise) = if let Mode::Visual {
+                    anchor, linewise, ..
+                } = self.vim.mode
+                {
+                    if character == 'x' {
+                        (self.primary_selection().ordered(), linewise)
+                    } else {
+                        // Visual D, X, Y and C take the highlighted lines
+                        // whole, as in Vim.
+                        let first = self.document.line_of(anchor.min(head))?;
+                        let last = self.document.line_of(anchor.max(head))?;
+                        (self.vim_line_range(first, last), true)
+                    }
                 } else if character == 'Y' {
                     (
                         self.vim_line_range(line, line.saturating_add(count - 1)),
@@ -592,7 +660,13 @@ impl Editor {
                     let target = self.vim_motion_target(motion, count, true)?.0;
                     (head.min(target)..head.max(target), false)
                 };
-                self.vim_apply_operator(operator, range, linewise, moment)?;
+                // Y keeps the caret where it is, as yy does.
+                let start = if linewise && self.vim.mode == Mode::Normal {
+                    head
+                } else {
+                    range.start
+                };
+                self.vim_apply_operator(operator, range, linewise, start, moment)?;
             }
             'p' | 'P' => self.vim_put(character == 'P', count, moment)?,
             'r' => {
@@ -600,10 +674,7 @@ impl Editor {
             }
             'u' => {
                 self.vim_escape()?;
-                for _ in 0..count.min(self.undo_depth()) {
-                    self.undo()?;
-                }
-                self.vim_normalize_caret()?;
+                self.vim_undo(count)?;
             }
             '/' | '?' if self.vim.mode == Mode::Normal => {
                 self.vim_escape()?;
@@ -631,10 +702,7 @@ impl Editor {
             KeyCode::Enter => {
                 let command = self.vim.command.take().unwrap_or_default();
                 match command.trim() {
-                    "u" | "undo" => {
-                        self.undo()?;
-                        self.vim_normalize_caret()?;
-                    }
+                    "u" | "undo" => self.vim_undo(1)?,
                     "red" | "redo" => {
                         self.redo()?;
                         self.vim_normalize_caret()?;
@@ -654,17 +722,33 @@ impl Editor {
                     self.vim.command = None;
                 }
             }
-            KeyCode::Char(character) => {
-                if let Some(command) = self.vim.command.as_mut()
-                    && command.len() < 64
-                    && !character.is_control()
-                {
-                    command.push(character);
-                }
-            }
+            KeyCode::Char(character) => self.vim_command_type(character),
             _ => {}
         }
         Ok(())
+    }
+
+    fn vim_command_type(&mut self, character: char) {
+        if let Some(command) = self.vim.command.as_mut()
+            && command.len() < 64
+            && !character.is_control()
+        {
+            command.push(character);
+        }
+    }
+
+    /// Undo `count` steps. An undo brings back the selection its change
+    /// was made from, and Normal keeps a caret at its start, where Vim
+    /// puts the cursor.
+    fn vim_undo(&mut self, count: usize) -> Result<(), EditorError> {
+        let steps = count.min(self.undo_depth());
+        for _ in 0..steps {
+            self.undo()?;
+        }
+        if steps > 0 {
+            self.vim_place_caret(self.primary_selection().ordered().start)?;
+        }
+        self.vim_normalize_caret()
     }
 
     fn vim_head(&self) -> ByteOffset {
@@ -685,6 +769,7 @@ impl Editor {
     }
 
     fn vim_escape(&mut self) -> Result<(), EditorError> {
+        self.vim_drop_unused_indent()?;
         let head = self.vim_head();
         let target = if self.vim.mode == Mode::Insert {
             let start = self.document.line_start(self.document.line_of(head)?);
@@ -694,10 +779,21 @@ impl Editor {
         };
         self.vim.mode = Mode::Normal;
         self.vim_cancel_pending();
-        self.vim_place_caret(target)?;
+        // Esc moves the caret out of Insert or Visual. A caret already in
+        // place stays, and so does a view the wheel scrolled away from it.
+        let selection = self.primary_selection();
+        if self.selections.len() > 1 || selection.anchor != target || selection.head != target {
+            self.vim_place_caret(target)?;
+        } else {
+            // The column j and k aim for is where the caret rests now, as
+            // after a move.
+            self.selections.set_single(Selection::caret(target));
+        }
         self.vim_normalize_caret()
     }
 
+    /// Rest the caret on a character, and bring it into view when that
+    /// moved it. A caret that did not move leaves the view where it is.
     fn vim_normalize_caret(&mut self) -> Result<(), EditorError> {
         if matches!(self.vim.mode, Mode::Visual { .. }) {
             return Ok(());
@@ -717,7 +813,9 @@ impl Editor {
             head: target,
             goal_column: goal,
         });
-        self.ensure_primary_visible();
+        if target != head {
+            self.ensure_primary_visible();
+        }
         Ok(())
     }
 
@@ -784,6 +882,11 @@ impl Editor {
             }
             return Ok(());
         }
+        // The pointer picked characters, not lines. V-LINE gives way, or
+        // its whole lines would stand for a range it never selected.
+        if matches!(self.vim.mode, Mode::Visual { linewise: true, .. }) {
+            self.vim.mode = Mode::Normal;
+        }
         self.vim_selection_to_visual()?;
         Ok(())
     }
@@ -823,14 +926,23 @@ impl Editor {
         Ok(())
     }
 
+    /// Run `operator` over `range`. A yank leaves the caret at `start`, the
+    /// start of the text as Vim takes it: where a motion back ended, or the
+    /// caret itself on the first line of a linewise command.
     fn vim_apply_operator(
         &mut self,
         operator: Operator,
-        mut range: Range<ByteOffset>,
+        range: Range<ByteOffset>,
         linewise: bool,
+        start: ByteOffset,
         moment: HistoryMoment,
     ) -> Result<(), EditorError> {
         self.vim_cancel_pending();
+        let (mut range, linewise) = if linewise || matches!(self.vim.mode, Mode::Visual { .. }) {
+            (range, linewise)
+        } else {
+            self.vim_exclusive_range(range)?
+        };
         let mut register = self.document.slice(range.clone())?;
         let ending = self.preferred_line_ending();
         let has_line_ending = range.start < range.end
@@ -838,22 +950,16 @@ impl Editor {
         if linewise && !has_line_ending {
             register.push_str(&ending);
         }
-        let original_head = if matches!(self.vim.mode, Mode::Visual { .. }) {
-            range.start
-        } else {
-            self.vim_head()
-        };
         self.vim.mode = Mode::Normal;
         if (range.is_empty() && !linewise || self.document.len_bytes() == 0)
             && operator != Operator::Change
         {
-            self.vim_place_caret(original_head)?;
+            self.vim_place_caret(start)?;
             return self.vim_normalize_caret();
         }
         if operator == Operator::Yank {
-            self.vim.register = register;
-            self.vim.linewise_register = linewise;
-            self.vim_place_caret(original_head)?;
+            self.vim_fill_register(register, linewise);
+            self.vim_place_caret(start)?;
             self.vim_normalize_caret()?;
             return Ok(());
         }
@@ -888,16 +994,63 @@ impl Editor {
                 .with_selection(SelectionSet::single(target)),
             moment,
         )?;
-        self.vim.register = register;
-        self.vim.linewise_register = linewise;
-        if operator != Operator::Change {
-            self.vim_normalize_caret()?;
+        self.vim_fill_register(register, linewise);
+        if operator == Operator::Change {
+            self.vim_note_autoindent(indent_bytes);
+        } else {
             if linewise {
-                let line = self.document.line_of(self.vim_head())?;
-                self.vim_place_caret(self.document.first_non_whitespace(line))?;
+                let line = self
+                    .document
+                    .line_of(self.vim_head())?
+                    .min(self.vim_last_line());
+                self.vim_place_caret(self.document.indent_end(line))?;
             }
+            self.vim_normalize_caret()?;
         }
         Ok(())
+    }
+
+    /// An exclusive range that ends where a later line starts stops at the
+    /// end of the line before. One that begins at or before the text of its
+    /// first line takes those lines whole instead, as Vim's `:h exclusive`
+    /// says. So `dw` on an empty line deletes the line.
+    fn vim_exclusive_range(
+        &self,
+        range: Range<ByteOffset>,
+    ) -> Result<(Range<ByteOffset>, bool), EditorError> {
+        let first = self.document.line_of(range.start)?;
+        let last = self.document.line_of(range.end)?;
+        if last == first || range.end != self.document.line_start(last) {
+            Ok((range, false))
+        } else if range.start <= self.document.indent_end(first) {
+            Ok((self.vim_line_range(first, last - 1), true))
+        } else {
+            Ok((
+                range.start..self.document.line_content_range(last - 1).end,
+                false,
+            ))
+        }
+    }
+
+    /// Remember the indent of `indent` bytes just copied before the caret.
+    fn vim_note_autoindent(&mut self, indent: usize) {
+        let head = self.primary_selection().head;
+        self.vim.autoindent =
+            (indent > 0).then(|| (self.document.revision(), ByteOffset(head.0 - indent)..head));
+    }
+
+    /// Take back the indent `o`, `O` or `cc` copied when nothing was typed
+    /// after it, as Vim drops an unused autoindent. It is part of the
+    /// insert, so one undo takes the line with it.
+    fn vim_drop_unused_indent(&mut self) -> Result<(), EditorError> {
+        match self.vim.autoindent.take() {
+            Some((revision, indent)) if revision == self.document.revision() => self
+                .apply_transaction(
+                    Transaction::new(EditOrigin::Insert).replace(Edit::new(indent, String::new())),
+                    self.vim.insert_moment,
+                ),
+            _ => Ok(()),
+        }
     }
 
     fn vim_open_line(&mut self, above: bool, moment: HistoryMoment) -> Result<(), EditorError> {
@@ -929,7 +1082,9 @@ impl Editor {
                 .replace(Edit::new(at..at, text))
                 .with_selection(SelectionSet::single(target)),
             moment,
-        )
+        )?;
+        self.vim_note_autoindent(indent.len());
+        Ok(())
     }
 
     /// `r{char}`: replace one character, or a count of them, without
@@ -1078,7 +1233,7 @@ impl Editor {
                 if !self.vim.linewise_register && has_line_ending {
                     text.push_str(&ending);
                 } else if self.vim.linewise_register && !has_line_ending {
-                    text.truncate(text.len().saturating_sub(ending.len()));
+                    text.truncate(text.len() - line_ending_len(&text));
                 }
                 range.start
             } else if self.vim.linewise_register {
@@ -1089,15 +1244,16 @@ impl Editor {
             };
             (range, target)
         } else if self.vim.linewise_register {
+            let line = line.min(self.vim_last_line());
             let (at, prefix) = if self.document.len_bytes() == 0 {
-                text.truncate(text.len().saturating_sub(ending.len()));
+                text.truncate(text.len() - line_ending_len(&text));
                 (ByteOffset::ZERO, 0)
             } else if before {
                 (self.document.line_start(line), 0)
             } else if line + 1 < self.document.line_count() {
                 (self.document.line_start(line + 1), 0)
             } else {
-                text.truncate(text.len().saturating_sub(ending.len()));
+                text.truncate(text.len() - line_ending_len(&text));
                 text.insert_str(0, &ending);
                 (ByteOffset(self.document.len_bytes()), ending.len())
             };
@@ -1122,13 +1278,12 @@ impl Editor {
         )?;
         if linewise_put {
             let line = self.document.line_of(target)?;
-            self.vim_place_caret(self.document.first_non_whitespace(line))?;
+            self.vim_place_caret(self.document.indent_end(line))?;
         } else if target > ByteOffset::ZERO {
             self.vim_place_caret(self.document.previous_grapheme_boundary(target)?)?;
         }
         if let Some((register, linewise)) = replaced_register {
-            self.vim.register = register;
-            self.vim.linewise_register = linewise;
+            self.vim_fill_register(register, linewise);
         }
         self.vim_normalize_caret()
     }
@@ -1173,6 +1328,243 @@ mod tests {
             .document
             .line_of(editor.primary_selection().head)
             .expect("line")
+    }
+
+    /// A Vim editor on `source` with the caret at `caret`, after `keys`.
+    fn typed(source: &str, caret: usize, keys: &str) -> Editor {
+        let mut editor = Editor::new(source).expect("editor");
+        editor.set_keybindings(EditorKeybindings::Vim);
+        editor
+            .set_selection(Selection::caret(ByteOffset(caret)))
+            .expect("caret");
+        type_keys(&mut editor, keys);
+        editor
+    }
+
+    fn type_keys(editor: &mut Editor, keys: &str) {
+        for character in keys.chars() {
+            press(editor, KeyCode::Char(character), KeyModifiers::NONE);
+        }
+    }
+
+    fn head(editor: &Editor) -> usize {
+        editor.primary_selection().head.0
+    }
+
+    /// `p` puts a linewise register that ends in a Unicode line break. The
+    /// break was cut by its byte count and split inside the character.
+    #[test]
+    fn p_puts_lines_that_end_in_a_unicode_line_break() {
+        for separator in ['\u{2028}', '\u{0085}', '\u{2029}'] {
+            let source = format!("a{separator}b\nc");
+            let put = typed(&source, 0, "yyGp");
+            assert_eq!(put.source(), format!("{source}\na"), "{separator:?}");
+            let replaced = typed(&source, 0, "yyGVp");
+            assert_eq!(
+                replaced.source(),
+                format!("a{separator}b\na"),
+                "{separator:?}"
+            );
+            let alone = typed(&format!("a{separator}"), 0, "ddp");
+            assert_eq!(alone.source(), "a", "{separator:?}");
+        }
+    }
+
+    /// `dw` and `cw` stop at the end of the line where their last word ends,
+    /// as in Vim. They once took the line break and the next line's start.
+    #[test]
+    fn dw_and_cw_stop_at_the_end_of_the_line() {
+        assert_eq!(typed("foo   \nbar", 3, "dw").source(), "foo\nbar");
+        assert_eq!(typed("\n\n\nbar", 0, "dw").source(), "\n\nbar");
+        assert_eq!(typed("foo bar\nbaz", 0, "2dw").source(), "\nbaz");
+        let mut editor = typed("\nbar", 0, "cw");
+        assert!(editor.vim_is_insert());
+        editor
+            .dispatch(
+                super::super::Command::InsertText("x".into()),
+                HistoryMoment(0),
+                &mut super::super::MemoryClipboard::default(),
+            )
+            .expect("type");
+        assert_eq!(editor.source(), "x\nbar");
+    }
+
+    /// `di(` and `ci(` on a block of whole lines take the lines inside it.
+    /// The line break after the opening bracket and the indent before the
+    /// closing one stay, so `ci(` leaves a line to type on.
+    #[test]
+    fn inner_blocks_over_whole_lines_take_the_lines_inside() {
+        let source = "stack(\n  s(\"bd\"),\n  s(\"hh\")\n)\n";
+        assert_eq!(typed(source, 7, "di(").source(), "stack(\n)\n");
+        let changed = typed(source, 7, "ci(");
+        assert_eq!(changed.source(), "stack(\n  \n)\n");
+        assert!(changed.vim_is_insert());
+        assert_eq!(head(&changed), 9, "the caret waits after the indent");
+        let yanked = typed("{\n  a\n}", 2, "yi{");
+        assert_eq!(yanked.vim_register(), Some("  a\n"));
+        assert!(yanked.vim.linewise_register);
+    }
+
+    /// A counted `cw` from the last character of a word changes through the
+    /// words after it. Only the first word stops short, as in Vim.
+    #[test]
+    fn a_counted_cw_from_a_word_end_changes_every_word() {
+        assert_eq!(typed("a b c", 0, "2cw").source(), " c");
+        assert_eq!(typed("a b c", 0, "c2w").source(), " c");
+        assert_eq!(typed("ab cd ef", 1, "2cw").source(), "a ef");
+    }
+
+    /// Character Visual `D`, `X`, `Y` and `C` take the highlighted lines
+    /// whole, as Vim's do.
+    #[test]
+    fn visual_capital_commands_take_whole_lines() {
+        for keys in ["vlD", "vlX"] {
+            assert_eq!(typed("abc\ndef\n", 0, keys).source(), "def\n", "{keys}");
+        }
+        let yanked = typed("abc\ndef\n", 0, "vlY");
+        assert_eq!(yanked.vim_register(), Some("abc\n"));
+        assert!(yanked.vim.linewise_register);
+        let changed = typed("abc\ndef\n", 0, "vlC");
+        assert_eq!(changed.source(), "\ndef\n");
+        assert!(changed.vim_is_insert());
+    }
+
+    /// `k` on the first line and `j` on the last fail, and the operator
+    /// waiting for them does nothing. It once took the caret's own line.
+    #[test]
+    fn an_operator_with_a_blocked_j_or_k_does_nothing() {
+        for (caret, keys) in [(0, "dk"), (0, "ck"), (2, "dj"), (2, "cj")] {
+            let editor = typed("a\nb", caret, keys);
+            assert_eq!(editor.source(), "a\nb", "{keys}");
+            assert!(editor.vim_is_normal(), "{keys}");
+        }
+        for (caret, keys) in [(0, "yk"), (2, "yj")] {
+            assert_eq!(typed("a\nb", caret, keys).vim_register(), None, "{keys}");
+        }
+    }
+
+    /// The empty line after a final line break is drawn, but Vim's motions
+    /// and operators end on the line before it, as Vim has no such line.
+    #[test]
+    fn the_line_after_a_final_line_break_is_not_a_vim_line() {
+        assert_eq!(head(&typed("a\nb\n", 0, "G")), 2);
+        assert_eq!(head(&typed("a\nb\n", 0, "j")), 2);
+        assert_eq!(head(&typed("a\nb\n", 2, "j")), 2);
+        assert_eq!(head(&typed("a\nbc\n", 2, "w")), 3);
+        assert_eq!(typed("a\nb\n", 0, "Gdd").source(), "a\n");
+        assert_eq!(typed("a\nb\n", 2, "dj").source(), "a\nb\n");
+        assert_eq!(typed("a\nb\n", 2, "ddp").source(), "a\nb\n");
+    }
+
+    /// `$` keeps `j` and `k` at the end of each line, as Vim's goal column
+    /// past the line end does.
+    #[test]
+    fn dollar_keeps_j_and_k_at_the_line_end() {
+        let mut editor = typed("ab\nabcdef\nabc\n", 0, "$j");
+        assert_eq!(head(&editor), 8);
+        type_keys(&mut editor, "j");
+        assert_eq!(head(&editor), 12);
+        type_keys(&mut editor, "kk");
+        assert_eq!(head(&editor), 1);
+    }
+
+    /// `w` and `b` stop on an empty line, as Vim counts it as a word.
+    #[test]
+    fn w_and_b_stop_on_an_empty_line() {
+        assert_eq!(head(&typed("foo\n\nbar", 0, "w")), 4);
+        assert_eq!(head(&typed("foo\n\nbar", 5, "b")), 4);
+        assert_eq!(head(&typed("foo\n\n\nbar", 0, "2w")), 5);
+    }
+
+    /// A yank leaves the caret where the yanked text starts, so a yank
+    /// backward moves it there, as Vim's does.
+    #[test]
+    fn a_yank_leaves_the_caret_at_the_start_of_the_text() {
+        for (source, caret, keys, start) in [
+            ("foo bar", 4, "yb", 0),
+            ("foo bar", 4, "yh", 3),
+            ("foo bar", 4, "y0", 0),
+            ("f(ab)", 3, "yi(", 2),
+            ("x \"ab\"", 4, "ya\"", 1),
+            ("ab\ncd", 4, "yk", 1),
+            ("ab\ncd", 4, "ygg", 0),
+            ("ab\ncd", 1, "yj", 1),
+            ("ab\ncd", 1, "yy", 1),
+        ] {
+            assert_eq!(
+                head(&typed(source, caret, keys)),
+                start,
+                "{keys} in {source:?}"
+            );
+        }
+    }
+
+    /// On a line of only spaces, `^` rests on the last space and `I`
+    /// inserts after them all, as Vim's do.
+    #[test]
+    fn caret_and_capital_i_on_a_line_of_only_spaces() {
+        assert_eq!(head(&typed("    ", 0, "^")), 3);
+        let editor = typed("    ", 0, "I");
+        assert!(editor.vim_is_insert());
+        assert_eq!(head(&editor), 4);
+    }
+
+    /// `o` copies the line's indent. Leaving Insert with nothing typed takes
+    /// it away again, as Vim drops an unused autoindent.
+    #[test]
+    fn escape_after_o_drops_the_unused_indent() {
+        let mut editor = typed("  foo\n", 0, "o");
+        assert_eq!(editor.source(), "  foo\n  \n");
+        press(&mut editor, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(editor.source(), "  foo\n\n");
+        assert_eq!(head(&editor), 6);
+        type_keys(&mut editor, "u");
+        assert_eq!(editor.source(), "  foo\n", "one undo takes the whole line");
+
+        let mut typed_on = typed("  foo\n", 0, "o");
+        typed_on
+            .dispatch(
+                super::super::Command::InsertText("x".into()),
+                HistoryMoment(0),
+                &mut super::super::MemoryClipboard::default(),
+            )
+            .expect("type");
+        press(&mut typed_on, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(typed_on.source(), "  foo\n  x\n", "a used indent stays");
+
+        // A chord or a click between closes the undo step. The indent then
+        // stays, so one undo still takes the whole line.
+        let mut interrupted = typed("  foo\n", 0, "o");
+        interrupted.interrupt_key_mode();
+        press(&mut interrupted, KeyCode::Esc, KeyModifiers::NONE);
+        type_keys(&mut interrupted, "u");
+        assert_eq!(
+            interrupted.source(),
+            "  foo\n",
+            "one undo after an interrupt"
+        );
+    }
+
+    /// Esc resets the column j and k aim for even when the caret does not
+    /// move, so j from an empty line lands at the start of the next one.
+    #[test]
+    fn escape_resets_the_column_j_aims_for() {
+        let mut editor = typed("abcdef\n\nabcdefgh\n", 0, "A");
+        // Insert hands ↓ to the editor's own command, as the studio does.
+        let down = editor
+            .vim_insert_command(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .expect("↓ in Insert");
+        editor
+            .dispatch(
+                down,
+                HistoryMoment(0),
+                &mut super::super::MemoryClipboard::default(),
+            )
+            .expect("down");
+        assert_eq!(head(&editor), 7, "↓ reached the empty line");
+        press(&mut editor, KeyCode::Esc, KeyModifiers::NONE);
+        type_keys(&mut editor, "j");
+        assert_eq!(head(&editor), 8, "j kept the column from before Esc");
     }
 
     /// The wheel scrolls a Vim score as it scrolls any other. The input hook
@@ -1379,5 +1771,117 @@ mod tests {
                 "Ctrl+Shift+{code:?} made a selection"
             );
         }
+    }
+
+    /// Esc and the function keys move no caret, so a view the wheel
+    /// scrolled stays where it is. Both once pulled it back to the caret.
+    /// A motion still brings the caret into view.
+    #[test]
+    fn keys_that_move_no_caret_keep_a_wheel_scrolled_view() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut editor = editor();
+        let area = crate::editor::GridRect::new(0, 0, 20, 6);
+        for _ in 0..2 {
+            let map = editor.screen_map(area).expect("map");
+            editor
+                .mouse_event(
+                    MouseEvent {
+                        kind: MouseEventKind::ScrollDown,
+                        column: 0,
+                        row: 0,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &map,
+                    HistoryMoment(0),
+                )
+                .expect("wheel");
+            editor.normalize_after_input().expect("normalize");
+        }
+        let top = editor.viewport().top_row;
+        assert!(top > 0, "the wheel scrolled");
+        for code in [KeyCode::F(5), KeyCode::F(8), KeyCode::Esc] {
+            press(&mut editor, code, KeyModifiers::NONE);
+            editor.normalize_after_input().expect("normalize");
+            assert_eq!(editor.viewport().top_row, top, "{code:?} moved the view");
+        }
+        press(&mut editor, KeyCode::Char('j'), KeyModifiers::NONE);
+        let view = editor.viewport();
+        assert_eq!(line(&editor), 1);
+        assert!(
+            view.top_row <= 1 && 1 < view.top_row + view.page_rows,
+            "a motion brings the caret into view"
+        );
+    }
+
+    /// A mouse selection made in V-LINE covers the characters it covers,
+    /// and Visual becomes character-wise to match. V-LINE once stayed on,
+    /// so `d` mixed the mouse's range with whole lines: it deleted the
+    /// wrong text, or overflowed on a last line with no line break.
+    #[test]
+    fn a_mouse_selection_in_visual_line_becomes_character_wise() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        for (source, from, to, left, register) in [
+            ("abc\ndef", 1, 7, "a", "bc\ndef"),
+            ("abc\ndef\n", 5, 6, "abc\ndf\n", "e"),
+        ] {
+            let mut editor = Editor::new(source).expect("editor");
+            editor.set_keybindings(EditorKeybindings::Vim);
+            editor.set_page_rows(6);
+            press(&mut editor, KeyCode::Char('V'), KeyModifiers::NONE);
+            let area = crate::editor::GridRect::new(0, 0, 20, 6);
+            for (kind, offset) in [
+                (MouseEventKind::Down(MouseButton::Left), from),
+                (MouseEventKind::Drag(MouseButton::Left), to),
+                (MouseEventKind::Up(MouseButton::Left), to),
+            ] {
+                let map = editor.screen_map(area).expect("map");
+                let cell = map.cell_for_offset(ByteOffset(offset)).expect("cell");
+                editor
+                    .mouse_event(
+                        MouseEvent {
+                            kind,
+                            column: cell.x,
+                            row: cell.y,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &map,
+                        HistoryMoment(0),
+                    )
+                    .expect("mouse");
+            }
+            assert_eq!(
+                editor.vim_label().as_deref(),
+                Some("VISUAL"),
+                "{source:?}: the mode matches the selection"
+            );
+            press(&mut editor, KeyCode::Char('d'), KeyModifiers::NONE);
+            assert_eq!(editor.source(), left, "{source:?}");
+            assert_eq!(editor.vim.register, register, "{source:?}");
+            assert!(!editor.vim.linewise_register, "{source:?}");
+        }
+    }
+
+    /// `u` after a Visual change puts the caret where the change began,
+    /// as Vim does, and so does `:undo`. Both once left it at the end of
+    /// the old selection.
+    #[test]
+    fn undo_after_a_visual_change_puts_the_caret_at_its_start() {
+        let mut editor = Editor::new("abc def").expect("editor");
+        editor.set_keybindings(EditorKeybindings::Vim);
+        for character in ['v', 'e', 'd'] {
+            press(&mut editor, KeyCode::Char(character), KeyModifiers::NONE);
+        }
+        assert_eq!(editor.source(), " def");
+        press(&mut editor, KeyCode::Char('u'), KeyModifiers::NONE);
+        assert_eq!(editor.source(), "abc def");
+        assert_eq!(editor.primary_selection(), Selection::caret(ByteOffset(0)));
+        press(&mut editor, KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(editor.source(), " def");
+        for character in [':', 'u'] {
+            press(&mut editor, KeyCode::Char(character), KeyModifiers::NONE);
+        }
+        press(&mut editor, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(editor.source(), "abc def");
+        assert_eq!(editor.primary_selection(), Selection::caret(ByteOffset(0)));
     }
 }

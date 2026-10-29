@@ -450,7 +450,7 @@ impl App {
         }
         // A callee or graph input under the caret takes precedence over
         // the enclosing call. Other argument values keep the call's help.
-        let caret = self.editor().primary_selection().head;
+        let caret = self.name_caret();
         let word = self.word_range_at_caret();
         let code = rustel_runtime::lint::code_only(&source);
         let named_entry = word.as_ref().filter(|(name, range)| {
@@ -2422,6 +2422,43 @@ mod tests {
         use crate::app::tests::support::*;
         use crate::app::*;
         use crate::editor::{MemoryClipboard, Selection};
+
+        /// In Vim an entry opened from the search leaves Insert, so the list
+        /// it goes back to rests in Command and `j` walks instead of typing.
+        #[test]
+        fn a_reference_entry_goes_back_to_the_list_in_vim_command() {
+            use crate::reference::ReferenceMode;
+            for back in [KeyCode::Esc, KeyCode::Char('h')] {
+                let directory = tempfile::tempdir().expect("temp dir");
+                let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+                app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+                app.sync_editor_keybindings();
+                app.toggle_reference_browse();
+                press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+                type_text(&mut app, "fast");
+                press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+                assert!(
+                    matches!(
+                        app.reference_panel.as_ref().expect("panel").mode,
+                        ReferenceMode::Entry { .. }
+                    ),
+                    "{back:?}: Enter opened the entry"
+                );
+
+                press(&mut app, back, KeyModifiers::NONE);
+                let panel = app.reference_panel.as_ref().expect("panel");
+                assert!(
+                    matches!(panel.mode, ReferenceMode::Browse),
+                    "{back:?}: back in the list"
+                );
+                assert!(!panel.vim_insert(), "{back:?}: the list rests in Command");
+                let selected = panel.selected;
+                press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+                let panel = app.reference_panel.as_ref().expect("panel");
+                assert_eq!(panel.query, "fast", "{back:?}: j did not type");
+                assert_ne!(panel.selected, selected, "{back:?}: j walked the list");
+            }
+        }
 
         #[test]
         fn ctrl_d_explains_the_function_while_editing_its_arguments() {

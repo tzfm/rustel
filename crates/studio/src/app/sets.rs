@@ -359,8 +359,14 @@ impl App {
             // While a filter stands, Backspace takes the box back up and
             // deletes from the query. The key a hand reaches for to fix a
             // query must never arm a delete of the file under it - a
-            // second press would confirm it. Delete keeps that arm.
-            KeyCode::Backspace if panel.search.is_some() => panel.resume_search(),
+            // second press would confirm it. Delete keeps that arm. In Vim
+            // the box types only in Insert, so it takes Insert back up too.
+            KeyCode::Backspace if panel.search.is_some() => {
+                panel.resume_search();
+                if vim {
+                    panel.vim_insert = true;
+                }
+            }
             // The key the desk has for it: Delete, or the Mac's delete,
             // which a terminal sends as Backspace.
             KeyCode::Delete | KeyCode::Backspace => self.ask_delete_set_line(),
@@ -2479,6 +2485,82 @@ mod tests {
                 app.set_panel.as_ref().unwrap().deleting.is_some(),
                 "Delete asks, as it always did"
             );
+        }
+
+        /// In Vim, Backspace over a standing filter takes the box back up
+        /// in Insert and deletes from the query, as it does outside Vim.
+        #[test]
+        fn backspace_takes_a_standing_filter_back_up_in_vim() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            std::fs::write(directory.path().join("spare.strudel"), "// spare\n").expect("spare");
+            let mut app = app_over(directory.path());
+            app.new_scene(false);
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+            press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+            type_text(&mut app, "sp");
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(!app.set_panel.as_ref().unwrap().vim_insert, "Command");
+
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+            {
+                let panel = app.set_panel.as_ref().unwrap();
+                assert_eq!(panel.search.as_ref().unwrap().query, "s");
+                assert!(panel.vim_insert, "the box is in Insert again");
+                assert!(panel.deleting.is_none(), "no delete was armed");
+            }
+            press(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+            assert_eq!(
+                app.set_panel
+                    .as_ref()
+                    .unwrap()
+                    .search
+                    .as_ref()
+                    .unwrap()
+                    .query,
+                "sp",
+                "the next letter types"
+            );
+        }
+
+        /// In Vim a key the box's modes take withdraws a pending delete, as
+        /// any other key does. After `i`, `a` or `/` and then Esc, Enter has
+        /// no question left to confirm.
+        #[test]
+        fn a_vim_mode_key_withdraws_a_pending_score_delete() {
+            for key in ['i', 'a', '/'] {
+                let directory = tempfile::tempdir().expect("temp dir");
+                std::fs::write(directory.path().join("spare.strudel"), "// spare\n")
+                    .expect("spare");
+                let mut app = app_over(directory.path());
+                app.new_scene(false);
+                app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+                app.sync_editor_keybindings();
+                press(&mut app, KeyCode::Char('b'), KeyModifiers::CONTROL);
+                press(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+                type_text(&mut app, "sp");
+                press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+                press(&mut app, KeyCode::Home, KeyModifiers::NONE);
+                press(&mut app, KeyCode::Delete, KeyModifiers::NONE);
+                assert!(
+                    app.status.starts_with("delete spare"),
+                    "{key}: {}",
+                    app.status
+                );
+
+                press(&mut app, KeyCode::Char(key), KeyModifiers::NONE);
+                assert!(
+                    app.set_panel.as_ref().unwrap().deleting.is_none(),
+                    "{key} withdrew the question"
+                );
+                press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+                press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+                assert!(
+                    directory.path().join("spare.strudel").is_file(),
+                    "{key}: the score is still on disk"
+                );
+            }
         }
 
         /// A delete asked under a filter is withdrawn when a prompt drops

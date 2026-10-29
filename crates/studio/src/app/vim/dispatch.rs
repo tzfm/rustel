@@ -61,7 +61,7 @@ fn remote_sheet_key(app: &App, _key: &KeyEvent) -> bool {
 
 /// A learnt studio chord on a key the Vim layer would take wins, as the
 /// player asked. A pending Vim command keeps its key.
-fn learned_layer_shortcut(app: &App, key: &KeyEvent) -> bool {
+pub(crate) fn learned_layer_shortcut(app: &App, key: &KeyEvent) -> bool {
     key.kind == KeyEventKind::Press
         && !app.editor().vim_has_pending_command()
         && app.keybinds.override_action_for(key).is_some()
@@ -94,10 +94,16 @@ pub(crate) fn flush_pending(app: &mut App) -> Result<(), RuntimeError> {
 /// mapping prefix or Insert must not change what a pad or knob does.
 pub(crate) fn interrupt(app: &mut App) -> Result<(), RuntimeError> {
     flush_pending(app)?;
+    leave_key_modes(app);
+    Ok(())
+}
+
+/// Leave Visual and drop a pending command in every score, as a studio
+/// chord does before its action.
+fn leave_key_modes(app: &mut App) {
     for scene in app.scenes.scenes_mut() {
         scene.editor.interrupt_key_mode();
     }
-    Ok(())
 }
 
 fn drain_mappings(app: &mut App, force: bool) -> Result<(), RuntimeError> {
@@ -116,9 +122,11 @@ fn drain_mappings(app: &mut App, force: bool) -> Result<(), RuntimeError> {
                     }
                 }
                 crate::vim_config::VimMappedKey::Action(action) => {
-                    // A Studio action is not a Vim motion. A pending
-                    // operator must not wait for the next key.
-                    app.editor_mut().vim_cancel_pending();
+                    // A Studio action is not a Vim motion. It leaves Vim
+                    // as its chord does, so a pending operator does not
+                    // wait for the next key and Visual does not outlive
+                    // an edit.
+                    leave_key_modes(app);
                     app.dispatch_bind_action(action, false)?;
                 }
             }
@@ -158,7 +166,7 @@ fn dispatch_builtin(app: &mut App, key: KeyEvent) -> Result<bool, RuntimeError> 
             app.editor_mut().set_vim_register(text);
         }
     }
-    let register = app.editor().vim_register().map(str::to_owned);
+    let register_writes = app.editor().vim_register_writes();
     let before = app.editor().revision();
     let previous_caret = app.editor().primary_selection().head.0;
     let moment = app.moment();
@@ -191,15 +199,19 @@ fn dispatch_builtin(app: &mut App, key: KeyEvent) -> Result<bool, RuntimeError> 
         handled = true;
     }
     if !handled && let Some(command) = app.editor().vim_insert_command(key) {
+        // Typing lets a clicked slider go, as it does outside Vim.
+        if edits_document(&command) {
+            app.armed_slider = None;
+        }
         app.dispatch_editor(command)?;
         return Ok(true);
     }
     if handled {
         // A yank or delete fills the register. Keep the clipboard in step,
-        // so p pastes the newest copy from any surface.
-        let register_now = app.editor().vim_register().map(str::to_owned);
-        if register_now.as_deref() != register.as_deref()
-            && let Some(text) = register_now
+        // so p pastes the newest copy from any surface, even when the same
+        // text was yanked before.
+        if app.editor().vim_register_writes() != register_writes
+            && let Some(text) = app.editor().vim_register().map(str::to_owned)
         {
             let _ = app.clipboard.set_text(text);
         }
@@ -223,4 +235,169 @@ fn dispatch_builtin(app: &mut App, key: KeyEvent) -> Result<bool, RuntimeError> 
 /// generic; the Vim package owns only the mapping source.
 pub(crate) fn mappings(app: &App) -> std::sync::Arc<crate::vim_config::VimMappings> {
     app.vim_config.mappings()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::tests::support::*;
+    use crate::editor::{Editor, Selection};
+    use crate::vim_config::VimMappings;
+
+    /// A score in Vim Normal with the caret at its start, beneath the
+    /// shipped mappings and `vimrc`.
+    fn vim_app(directory: &std::path::Path, source: &str, vimrc: &str) -> App {
+        let mut app = app_over(directory);
+        app.scenes.current_mut().editor = Editor::new(source).expect("editor");
+        app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+        app.vim_config
+            .set_mappings_for_test(VimMappings::parse_with_defaults(vimrc).expect("mappings"));
+        app.sync_editor_keybindings();
+        app.editor_mut()
+            .set_selection(Selection::caret(ByteOffset(0)))
+            .expect("caret");
+        app.focus = Focus::Editor;
+        app
+    }
+
+    fn typed(app: &mut App, keys: &str) {
+        for character in keys.chars() {
+            let modifiers = if character.is_ascii_uppercase() {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::NONE
+            };
+            press(app, KeyCode::Char(character), modifiers);
+        }
+    }
+
+    /// A mapped panel action runs as its chord does where the keyboard
+    /// is, learnt chord or not, and says so when it has no use here.
+    #[test]
+    fn a_mapped_panel_action_runs_as_its_chord_does() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut app = vim_app(
+            directory.path(),
+            "$: s(\"sine\")\n",
+            "nnoremap <Space>T <Action:focus-timeline>\n",
+        );
+        let tape = write_tape(
+            directory.path(),
+            "2026-09-08T12-00-00",
+            &[(0.0, "$: s(\"sine\")"), (2.0, "$: s(\"sine\") // two")],
+        );
+        app.open_replay_tab(&tape);
+        app.sync_editor_keybindings();
+        app.frame = Rect::new(0, 0, 120, 30);
+        let mut regions = view::regions(app.frame, false, 1, false, false, None, None);
+        app.split_replay_timelines(&mut regions);
+        app.regions = regions;
+        assert!(app.timeline_visible(), "the tape shows its timeline");
+
+        app.focus = Focus::Editor;
+        typed(&mut app, " T");
+        assert_eq!(app.focus, Focus::Timeline, "Space T focuses the timeline");
+
+        let chord = crate::keybinds::KeyCombo::parse("ctrl+shift+f8").expect("chord");
+        app.learn_keybind(BindAction::FocusTimeline, Some(chord));
+        app.focus = Focus::Editor;
+        typed(&mut app, " T");
+        assert_eq!(
+            app.focus,
+            Focus::Timeline,
+            "the mapping follows the learnt chord"
+        );
+
+        app.focus = Focus::Editor;
+        app.regions.panes[0].timeline = Rect::default();
+        typed(&mut app, " T");
+        assert_eq!(app.focus, Focus::Editor);
+        assert!(
+            app.status.contains(BindAction::FocusTimeline.label()),
+            "{}",
+            app.status
+        );
+    }
+
+    /// A mapped action leaves Visual as its chord does. `Vjgc` and
+    /// `Vj` with Ctrl+/ end in the same text, mode and caret, and so do
+    /// the keys after them.
+    #[test]
+    fn a_mapped_comment_leaves_visual_as_its_chord_does() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let run = |source: &str, mapped: bool, after: &[(KeyCode, KeyModifiers)]| {
+            let mut app = vim_app(directory.path(), source, "");
+            typed(&mut app, "Vj");
+            if mapped {
+                typed(&mut app, "gc");
+            } else {
+                press(&mut app, KeyCode::Char('/'), KeyModifiers::CONTROL);
+            }
+            let mut seen = vec![(
+                app.editor().source(),
+                app.editor().vim_label(),
+                app.editor().primary_selection(),
+            )];
+            for (code, modifiers) in after {
+                press(&mut app, *code, *modifiers);
+                seen.push((
+                    app.editor().source(),
+                    app.editor().vim_label(),
+                    app.editor().primary_selection(),
+                ));
+            }
+            assert!(
+                app.errors.get(ErrorOwner::Editor).is_none(),
+                "{:?}",
+                app.errors.get(ErrorOwner::Editor)
+            );
+            seen
+        };
+        let keys = [
+            (KeyCode::Char('j'), KeyModifiers::NONE),
+            (KeyCode::Esc, KeyModifiers::NONE),
+            (KeyCode::Char('x'), KeyModifiers::NONE),
+        ];
+        let chord = run("a\nb\nc\n", false, &keys);
+        assert_eq!(
+            chord[0].0, "// a\n// b\nc\n",
+            "the chord comments two lines"
+        );
+        assert_eq!(run("a\nb\nc\n", true, &keys), chord);
+
+        let keys = [
+            (KeyCode::Char('d'), KeyModifiers::CONTROL),
+            (KeyCode::Char('x'), KeyModifiers::NONE),
+        ];
+        let chord = run("// a\n// b\n", false, &keys);
+        assert_eq!(chord[0].0, "a\nb\n", "the chord uncomments two lines");
+        assert_eq!(run("// a\n// b\n", true, &keys), chord);
+    }
+
+    /// A yank is the newest copy even when the register already holds the
+    /// same text: a copy made elsewhere in between must not win the put.
+    #[test]
+    fn the_same_yank_again_is_the_newest_copy() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut app = vim_app(
+            directory.path(),
+            "x
+y
+",
+            "",
+        );
+        typed(&mut app, "yy");
+        assert_eq!(app.clipboard.get_text().expect("yank"), "x\n");
+        app.clipboard
+            .set_text("foo".into())
+            .expect("a copy elsewhere");
+        typed(&mut app, "yy");
+        assert_eq!(
+            app.clipboard.get_text().expect("yank again"),
+            "x\n",
+            "the second yank did not reach the clipboard"
+        );
+        typed(&mut app, "p");
+        assert_eq!(app.editor().source(), "x\nx\ny\n");
+    }
 }

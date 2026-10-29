@@ -10,9 +10,18 @@ use super::*;
 impl App {
     pub(super) fn refresh_editor_shortcut_hints(&mut self) {
         let editor_focused = self.editor_accepts_raw_paste();
+        // A learnt chord the Vim layer gives way to keeps its hint.
+        let learnt: Vec<_> = BindAction::ALL
+            .into_iter()
+            .filter_map(|action| self.keybinds.override_for(action))
+            .filter(|chord| super::vim::learned_layer_shortcut(self, &chord.event()))
+            .collect();
         let editor = &self.scenes.current().editor;
-        self.keybinds
-            .filter_editor_hints(|key| editor_focused && editor.claims_key(key));
+        self.keybinds.filter_editor_hints(|key| {
+            editor_focused
+                && editor.claims_key(key)
+                && !learnt.iter().any(|chord| chord.matches(key))
+        });
     }
 
     /// What this press means to the chord table, as an editor command, for
@@ -338,8 +347,31 @@ impl App {
             | Do::RenameFile
             | Do::DeleteSample
             | Do::TrimSample
-            | Do::FocusTimeline => Ok(false),
+            | Do::FocusTimeline => {
+                self.press_panel_chord(action)?;
+                Ok(true)
+            }
         }
+    }
+
+    /// A panel action from a mapping or a pad, which has no press of its
+    /// own: its chord is pressed where the keyboard is now, the learnt
+    /// chord or the Alt letter. The status says so when the action has
+    /// no use here.
+    fn press_panel_chord(&mut self, action: BindAction) -> Result<(), RuntimeError> {
+        let Some(letter) = action.panel_letter() else {
+            return Ok(());
+        };
+        if self.panel_action_at(letter) != Some(action) {
+            self.status = format!("{} · not available here", action.label());
+            self.dirty_frame = true;
+            return Ok(());
+        }
+        let chord = self.keybinds.override_for(action).map_or_else(
+            || KeyEvent::new(KeyCode::Char(letter), KeyModifiers::ALT),
+            super::super::keybinds::KeyCombo::event,
+        );
+        self.route_terminal_event(Event::Key(chord), false)
     }
 
     /// The panel action an Alt letter means where the keyboard is now.
@@ -1123,6 +1155,22 @@ mod tests {
 
         fn custom(app: &mut App, number: u8) {
             press(app, KeyCode::F(number), KeyModifiers::CONTROL);
+        }
+
+        /// A learnt Ctrl+U wins over the Vim page motion, so the status
+        /// names it while Vim Normal has the keyboard.
+        #[test]
+        fn a_learnt_vim_page_key_keeps_its_hint() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = app(directory.path());
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.keybinds
+                .learn(BindAction::Wrap, KeyCombo::parse("ctrl+u"));
+            let wrap = app.ui_settings.wrap;
+            press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+            assert_ne!(app.ui_settings.wrap, wrap, "the learnt chord toggles wrap");
+            assert!(app.status.contains("^U"), "{}", app.status);
         }
 
         #[test]

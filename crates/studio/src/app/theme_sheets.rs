@@ -1631,6 +1631,46 @@ mod tests {
             );
         }
 
+        /// In Vim the Esc that leaves Insert calls a pending theme delete
+        /// off, as any other key does. The next Ctrl+D asks again.
+        #[test]
+        fn the_esc_that_leaves_vim_insert_calls_a_theme_delete_off() {
+            let _theme_dir = THEME_DIR_LOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let directory = tempfile::tempdir().expect("temp dir");
+            let themes = directory.path().join("themes");
+            std::fs::create_dir_all(&themes).expect("theme directory");
+            std::fs::write(themes.join("a-yours.json"), "{}").expect("theme file");
+            let _scoped = ScopedThemeDir::set(&themes);
+            let mut app = app_over(directory.path());
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.toggle_theme_picker();
+            press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            type_text(&mut app, "a-yours");
+            assert_eq!(
+                app.theme_picker
+                    .as_ref()
+                    .expect("picker open")
+                    .selected_name(),
+                Some("a-yours")
+            );
+
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert!(app.status.contains("again"), "asks first: {}", app.status);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            let picker = app.theme_picker.as_ref().expect("picker open");
+            assert!(!picker.vim_insert(), "Esc left Insert");
+            assert_eq!(picker.deleting, None, "Esc called the delete off");
+            press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+            assert!(
+                themes.join("a-yours.json").is_file(),
+                "the file stays after a fresh Ctrl+D"
+            );
+            assert!(app.status.contains("again"), "asks again: {}", app.status);
+        }
+
         /// A theme of the player's own saved under a name the studio ships
         /// too stays theirs: the editor opens it under its name, a new
         /// theme from it is no built-in's variation, and the modified d

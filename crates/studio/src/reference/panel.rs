@@ -568,6 +568,8 @@ impl ReferencePanel {
             Tab::Samples => {
                 self.sound_query.push_str(&addition);
                 self.sound_selected = 0;
+                // The rows move under a trim armed on one of them.
+                self.confirm_trim = None;
                 self.refresh_sounds();
             }
             #[cfg(feature = "vst")]
@@ -869,11 +871,7 @@ impl ReferencePanel {
             let Some(index) = self.selected_result() else {
                 return false;
             };
-            self.mode = ReferenceMode::Entry {
-                index,
-                scroll: 0,
-                from_browse: true,
-            };
+            self.open_entry(index);
             return true;
         }
         if self.tab == Tab::Scales {
@@ -1380,11 +1378,7 @@ impl ReferencePanel {
                 .unwrap_or(PanelAction::Nothing),
             ReferenceMode::Browse => match self.selected_result() {
                 Some(index) => {
-                    self.mode = ReferenceMode::Entry {
-                        index,
-                        scroll: 0,
-                        from_browse: true,
-                    };
+                    self.open_entry(index);
                     PanelAction::Nothing
                 }
                 None => PanelAction::Nothing,
@@ -1394,6 +1388,18 @@ impl ReferencePanel {
                 .map(|entry| PanelAction::Insert(entry.spelling_for(&self.query).to_owned()))
                 .unwrap_or(PanelAction::Nothing),
         }
+    }
+
+    /// The page of the list's entry `index`, opened from the list. A page
+    /// has no search box, so Vim's Insert ends here, the way a tab change
+    /// ends it, and the list it goes back to rests in Command.
+    fn open_entry(&mut self, index: usize) {
+        self.mode = ReferenceMode::Entry {
+            index,
+            scroll: 0,
+            from_browse: true,
+        };
+        self.vim_insert = false;
     }
 
     /// Esc: back to the list an entry was opened from, or close.

@@ -393,43 +393,57 @@ impl App {
         None
     }
 
-    /// The keys an armed slider takes, whatever else is open: ←/→ step it -
-    /// a notch, or with ⇧ the control's own step - held keys included,
-    /// and Esc lets it go. Anything else is not its business.
-    pub(super) fn armed_slider_key(&mut self, key: &crossterm::event::KeyEvent) -> bool {
-        let Some((scene, call_from)) = self.armed_slider else {
-            return false;
-        };
+    /// Whether an armed slider takes this key, whatever else is open: ←/→
+    /// held or pressed, Enter and Esc. Anything else is not its business.
+    /// A Vim command in progress keeps them: its Esc cancels it, and an
+    /// operator waits for its motion.
+    pub(super) fn armed_slider_takes(&self, key: &crossterm::event::KeyEvent) -> bool {
         let primary = key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        match key.code {
-            KeyCode::Enter if !primary && !alt && key.kind == KeyEventKind::Press => {
-                self.open_precision_slider(scene, call_from);
-                true
+        self.armed_slider.is_some()
+            && !self.editor().vim_key_in_progress()
+            && match key.code {
+                KeyCode::Enter => !primary && !alt && key.kind == KeyEventKind::Press,
+                KeyCode::Left | KeyCode::Right => {
+                    !primary && !alt && key.kind != KeyEventKind::Release
+                }
+                KeyCode::Esc => key.kind == KeyEventKind::Press,
+                _ => false,
             }
-            KeyCode::Left | KeyCode::Right if !primary && !alt => {
+    }
+
+    /// The keys an armed slider takes. ←/→ step it by a notch, or with ⇧
+    /// by the control's own step. Enter expands it and Esc lets it go.
+    pub(super) fn armed_slider_key(&mut self, key: &crossterm::event::KeyEvent) -> bool {
+        let Some((scene, call_from)) = self.armed_slider else {
+            return false;
+        };
+        if !self.armed_slider_takes(key) {
+            return false;
+        }
+        match key.code {
+            KeyCode::Enter => self.open_precision_slider(scene, call_from),
+            KeyCode::Esc => {
+                self.armed_slider = None;
+                self.status = "slider let go".to_owned();
+                self.dirty_frame = true;
+            }
+            _ => {
                 let direction = if key.code == KeyCode::Right {
                     1.0
                 } else {
                     -1.0
                 };
+                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
                 match self.live_chip_at(scene, call_from) {
                     Some(chip) => self.nudge_live_slider(scene, &chip, direction, shift),
                     None => self.armed_slider = None,
                 }
-                true
             }
-            KeyCode::Esc if key.kind == KeyEventKind::Press => {
-                self.armed_slider = None;
-                self.status = "slider let go".to_owned();
-                self.dirty_frame = true;
-                true
-            }
-            _ => false,
         }
+        true
     }
 
     pub(super) fn slider_at_caret(&self) -> Option<LiveChip> {
@@ -3235,6 +3249,174 @@ mod tests {
                 app.editor().primary_selection().head.0,
                 caret,
                 "the caret stayed put"
+            );
+        }
+
+        /// A clicked slider takes ←/→, Enter and Esc in Vim, in Normal and
+        /// in Insert, as the status promises and as it does outside Vim.
+        /// Vim once had them first: → moved the caret, Enter moved down or
+        /// broke the line, and Esc left the slider armed.
+        #[test]
+        fn an_armed_slider_takes_its_keys_in_vim() {
+            for insert in [false, true] {
+                let directory = tempfile::tempdir().expect("temp dir");
+                let (mut app, scene, call) = slider_app(directory.path());
+                app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+                app.sync_editor_keybindings();
+                if insert {
+                    press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+                }
+                let click = |app: &mut App| {
+                    let (x, _, row) = lay_out(app, scene, call);
+                    mouse(app, MouseEventKind::Down(MouseButton::Left), x + 1, row);
+                    mouse(app, MouseEventKind::Up(MouseButton::Left), x + 1, row);
+                    assert_eq!(app.armed_slider, Some((scene, call)), "the click armed it");
+                };
+                click(&mut app);
+                let caret = app.editor().primary_selection().head.0;
+                let clicked = value(&app, scene, call);
+                press(&mut app, KeyCode::Right, KeyModifiers::NONE);
+                assert!(
+                    value(&app, scene, call) > clicked,
+                    "→ stepped the slider (insert: {insert})"
+                );
+                assert_eq!(
+                    app.editor().primary_selection().head.0,
+                    caret,
+                    "→ moved the caret (insert: {insert})"
+                );
+                press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+                assert_eq!(app.armed_slider, None, "Esc lets go (insert: {insert})");
+                assert_eq!(
+                    app.editor().vim_is_insert(),
+                    insert,
+                    "Esc let go of the slider only"
+                );
+                click(&mut app);
+                let source = app.editor().source();
+                press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+                assert!(
+                    app.slider_precision.is_some(),
+                    "Enter expands the slider (insert: {insert})"
+                );
+                assert_eq!(app.editor().source(), source, "insert: {insert}");
+                assert_eq!(
+                    app.editor().primary_selection().head.0,
+                    caret,
+                    "Enter moved the caret (insert: {insert})"
+                );
+            }
+        }
+
+        /// Typing into the score lets a clicked slider go in Vim's Insert,
+        /// as it does outside Vim, so the arrows move the caret again. The
+        /// slider once stayed armed through the typing.
+        #[test]
+        fn typing_in_vim_insert_lets_an_armed_slider_go() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene, call) = slider_app(directory.path());
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            let (x, _, row) = lay_out(&mut app, scene, call);
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                x + 1,
+                row,
+            );
+            mouse(&mut app, MouseEventKind::Up(MouseButton::Left), x + 1, row);
+            assert_eq!(app.armed_slider, Some((scene, call)), "the click armed it");
+            // The caret is at the start, so the call moves one byte on.
+            press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+            assert_eq!(app.armed_slider, None, "typing let the slider go");
+            let clicked = value(&app, scene, call + 1);
+            press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+            assert_eq!(
+                app.editor().primary_selection().head.0,
+                0,
+                "← moved the caret"
+            );
+            assert_eq!(
+                value(&app, scene, call + 1),
+                clicked,
+                "← left the slider be"
+            );
+        }
+
+        /// Typing in Vim's Insert after a slider moved is an undo step of
+        /// its own. It once joined the slider's step, so `u` took the
+        /// slider's value back with the typing.
+        #[test]
+        fn insert_typing_after_a_slider_change_undoes_alone() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene, call) = slider_app(directory.path());
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            for character in "Ax".chars() {
+                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+            }
+            let (x, _, row) = lay_out(&mut app, scene, call);
+            mouse(&mut app, MouseEventKind::ScrollUp, x + 1, row);
+            let moved = app.editor().source();
+            assert_ne!(
+                moved,
+                format!("{}x\n", SOURCE.trim_end()),
+                "the wheel moved the slider"
+            );
+            press(&mut app, KeyCode::Char('z'), KeyModifiers::NONE);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            press(&mut app, KeyCode::Char('u'), KeyModifiers::NONE);
+            assert_eq!(app.editor().source(), moved, "u took back the typing only");
+        }
+
+        /// A clicked slider leaves Esc and the arrows to a Vim command in
+        /// progress. Esc cancels the operator, so the next motion only moves.
+        #[test]
+        fn a_vim_command_in_progress_keeps_its_keys_from_an_armed_slider() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let source = "$: s(\"bd\").gain(slider(0.5, 0, 1, 0.0001))\n// two\n";
+            let (mut app, scene, call) = slider_app_with_source(directory.path(), source);
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            let (x, _, row) = lay_out(&mut app, scene, call);
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                x + 1,
+                row,
+            );
+            mouse(&mut app, MouseEventKind::Up(MouseButton::Left), x + 1, row);
+            assert_eq!(app.armed_slider, Some((scene, call)), "the click armed it");
+            let before = app.editor().source();
+            for code in [KeyCode::Char('d'), KeyCode::Esc, KeyCode::Char('j')] {
+                press(&mut app, code, KeyModifiers::NONE);
+            }
+            assert_eq!(app.editor().source(), before, "Esc cancelled the d");
+        }
+
+        /// A wheel step over a slider while Visual stands edits the score,
+        /// and Visual's ends follow that edit. They once stayed where they
+        /// were, so `D` took the slider's line instead of the selected one.
+        #[test]
+        fn visual_follows_a_slider_edit_under_it() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let source = "$: s(\"bd\").gain(slider(0.5, 0, 1, 0.0001))\n// two\n";
+            let (mut app, scene, call) = slider_app_with_source(directory.path(), source);
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            for character in "jV".chars() {
+                press(&mut app, KeyCode::Char(character), KeyModifiers::NONE);
+            }
+            let (x, _, row) = lay_out(&mut app, scene, call);
+            mouse(&mut app, MouseEventKind::ScrollUp, x + 1, row);
+            let moved = app.editor().source();
+            assert_ne!(moved, source, "the wheel moved the slider");
+            press(&mut app, KeyCode::Char('D'), KeyModifiers::SHIFT);
+            assert_eq!(
+                app.editor().source(),
+                moved.replacen("// two\n", "", 1),
+                "D took the selected line and kept the slider's"
             );
         }
     }

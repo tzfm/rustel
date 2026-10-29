@@ -26,9 +26,14 @@ impl App {
         use super::super::terminal::CaretShape;
         // Vim shapes follow the mode: a block in Normal and Visual, a bar
         // in Insert. The setting and its blink do not apply, so typing
-        // cannot restart a blink phase on every key.
+        // cannot restart a blink phase on every key. A focused panel holds
+        // the one caret, so its field's mode decides there, not the score's.
         if self.editor().uses_modal_keys() {
-            return if self.editor().accepts_typed_text() {
+            let typing = match self.focus {
+                Focus::Panel(kind) => self.panel_is_typing(kind),
+                Focus::Editor | Focus::Timeline => self.editor().accepts_typed_text(),
+            };
+            return if typing {
                 CaretShape::SteadyBar
             } else {
                 CaretShape::SteadyBlock
@@ -479,6 +484,39 @@ mod tests {
 
         use crate::app::*;
         use crate::editor::MemoryClipboard;
+
+        /// In Vim a panel field typing in Insert shows the bar, whatever mode
+        /// the score rests in, and Command shows the block. Default editing
+        /// keeps the theme's shape.
+        #[test]
+        fn a_panel_field_in_vim_insert_shows_the_bar_caret() {
+            use crate::app::tests::support::{plain_app, press};
+            use crate::terminal::CaretShape;
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, _scene) = plain_app(directory.path(), "// one\n");
+            app.ui_settings.caret_shape = CaretShape::BlinkingBlock;
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            app.toggle_reference_browse();
+            assert!(!app.editor().accepts_typed_text(), "the score is in Normal");
+            assert_eq!(app.editor_cursor_shape(), CaretShape::SteadyBlock);
+
+            press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+            assert!(app.reference_panel.as_ref().expect("panel").vim_insert());
+            assert_eq!(
+                app.editor_cursor_shape(),
+                CaretShape::SteadyBar,
+                "the search types in Insert"
+            );
+
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Default;
+            app.sync_editor_keybindings();
+            assert_eq!(
+                app.editor_cursor_shape(),
+                app.theme.caret_shape(CaretShape::BlinkingBlock),
+                "Default keeps the theme's shape"
+            );
+        }
 
         /// A rendered control is one block: the caret warps over it instead of
         /// resting inside, where it used to silently un-render the widget and

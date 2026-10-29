@@ -51,7 +51,7 @@ use layout::{
     HorizontalLayoutCache, VirtualRows, display_column_of_offset_cached,
     offset_at_display_column_cached,
 };
-use selection::map_offset_shapes;
+use selection::{map_offset, map_offset_shapes};
 
 pub const DEFAULT_MAX_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
 /// Line-comment marker. Scores are JavaScript, so this is not configurable.
@@ -807,6 +807,11 @@ impl Editor {
             .selection_after
             .clone()
             .unwrap_or_else(|| before.map_through(&transaction.edits));
+        // Offsets kept beside the selection follow the edit with it, so an
+        // edit Vim did not make, such as a slider's, leaves them on the same
+        // text.
+        let visual = self.vim_visual_through(&transaction.edits);
+        let find_anchor = self.find_anchor_through(&transaction.edits);
         // Rope clones share storage. Applying to a candidate gives a public
         // malformed transaction a true all-or-nothing boundary.
         let mut candidate = self.document.clone();
@@ -833,6 +838,8 @@ impl Editor {
             std::slice::from_ref(&edit_shapes),
         );
         self.selections = after;
+        self.vim_set_visual_ends(visual);
+        self.find_set_anchor(find_anchor);
         self.history.record(entry);
         self.virtual_rows = virtual_rows;
         self.drag = None;
@@ -892,7 +899,8 @@ impl Editor {
     }
 
     fn paste_text(&mut self, text: &str, moment: HistoryMoment) -> Result<(), EditorError> {
-        self.history.close_group();
+        // A paste is an undo step of its own, as its origin never joins
+        // another. A Vim insert folds it into the insert's one step.
         let line_ending = self.preferred_line_ending();
         let text = normalize_paste_line_endings(text, &line_ending);
         self.replace_selections(&text, EditOrigin::Paste, moment)

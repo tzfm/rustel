@@ -22,6 +22,9 @@ pub enum EditOrigin {
     /// A control such as an inline slider rewriting its own literal. One
     /// drag is many edits and should undo as one.
     Control,
+    /// Text a modal editor's insert takes in, from entering it to leaving
+    /// it. The whole insert undoes as one step, apart from a control's.
+    Insert,
     Programmatic,
 }
 
@@ -29,7 +32,7 @@ impl EditOrigin {
     fn may_coalesce(self) -> bool {
         matches!(
             self,
-            Self::Typing | Self::Backspace | Self::Delete | Self::Control
+            Self::Typing | Self::Backspace | Self::Delete | Self::Control | Self::Insert
         )
     }
 }
