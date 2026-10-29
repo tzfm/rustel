@@ -1049,6 +1049,11 @@ struct App {
     /// Whether the log has already said the picture was made smaller, so
     /// it is said once and not on every step down.
     pixel_budget_said: bool,
+    /// How long pixel frames have been taking, a sixteenth of each new one,
+    /// and since when that has been quick: the picture budget moves on
+    /// these, never on one frame.
+    pixel_pace: Duration,
+    pixel_quick_since: Option<Instant>,
     /// The mapping slot the settings sheet is waiting to learn.
     mapping_learn: Option<usize>,
     /// The keybind learn the settings sheet is holding. While one is
@@ -1765,6 +1770,8 @@ impl App {
             mixer_selection: None,
             pixel_budget: super::graphics::PIXEL_CEILING,
             pixel_budget_said: false,
+            pixel_pace: Self::FRESH_PACE,
+            pixel_quick_since: None,
             mapping_learn: None,
             keybind_learn: None,
             keybinds: prefs.keybinds(),

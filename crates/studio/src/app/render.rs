@@ -156,6 +156,12 @@ impl App {
     /// How long a frame may take before the pictures in it are made
     /// smaller, and how quick it has to be for them to grow again.
     const SLOW_FRAME: Duration = Duration::from_millis(20);
+    /// Where the pace of a new picture size starts: inside the band, so the
+    /// frame that sends every picture afresh at that size does not decide
+    /// alone.
+    pub(super) const FRESH_PACE: Duration = Duration::from_millis(15);
+    /// How long the pace stays quick before the pictures grow again.
+    const QUICK_SPELL: Duration = Duration::from_secs(2);
 
     /// Keep the pictures at a size this terminal can actually carry.
     ///
@@ -164,18 +170,31 @@ impl App {
     /// of the pictures sets the frame rate. Terminals differ at this by more
     /// than an order of magnitude, and so do window sizes and what the
     /// score has on screen, so rather than guess, this measures what a
-    /// whole frame actually cost and moves the size: a third off when
-    /// frames run long, an eighth back on when they run comfortably short,
-    /// between a floor that still looks like a picture and the ceiling
-    /// above. One number, shared: the Hydra backdrop is asked for at it,
-    /// and every canvas in the frame takes a share of it. It settles within
-    /// a second or two of opening, and a resize starts it over.
-    pub(super) fn watch_pixel_frame(&mut self, frame: Duration) {
-        let budget = if frame > Self::SLOW_FRAME {
+    /// whole frame actually cost and moves the size: a third off when the
+    /// pace runs long, an eighth back on after it has run comfortably short
+    /// for a while, between a floor that still looks like a picture and the
+    /// ceiling above. One number, shared: the Hydra backdrop is asked for at
+    /// it, and every canvas in the frame takes a share of it. It settles
+    /// within a second or two of opening, and a resize starts it over.
+    ///
+    /// Every move redraws every picture at another size, so the size
+    /// follows the pace of many frames and never one frame. Moved on each
+    /// frame, a short frame grew the pictures and the next long one shrank
+    /// them, and a widget went wider and narrower many times a second.
+    pub(super) fn watch_pixel_frame(&mut self, frame: Duration, now: Instant) {
+        // A sixteenth of each frame goes into the pace: a long frame now and
+        // then moves it a little, and a run of them moves it past the line.
+        self.pixel_pace = (self.pixel_pace * 15 + frame) / 16;
+        let budget = if self.pixel_pace > Self::SLOW_FRAME {
             self.pixel_budget * 2 / 3
-        } else if frame * 2 < Self::SLOW_FRAME {
+        } else if self.pixel_pace * 2 < Self::SLOW_FRAME {
+            let since = *self.pixel_quick_since.get_or_insert(now);
+            if now.saturating_duration_since(since) < Self::QUICK_SPELL {
+                return;
+            }
             self.pixel_budget + self.pixel_budget / 8
         } else {
+            self.pixel_quick_since = None;
             return;
         }
         .clamp(
@@ -200,9 +219,12 @@ impl App {
         }
     }
 
-    /// The measured size, to the renderer and to Hydra.
+    /// The measured size, to the renderer and to Hydra. A new size is
+    /// measured afresh: the pace so far was the old size's.
     pub(super) fn set_pixel_budget(&mut self, pixels: u64) {
         self.pixel_budget = pixels;
+        self.pixel_pace = Self::FRESH_PACE;
+        self.pixel_quick_since = None;
         super::super::graphics::set_pixel_budget(pixels);
         #[cfg(feature = "hydra")]
         self.sync_hydra_frame_size();
@@ -292,7 +314,7 @@ impl App {
         // and rasterising every canvas are the other two thirds of what the
         // budget governs, and they happen above.
         if shipped_pixels {
-            self.watch_pixel_frame(drawing.elapsed());
+            self.watch_pixel_frame(drawing.elapsed(), Instant::now());
         }
         Ok(())
     }
@@ -2557,14 +2579,26 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let mut app = crate::app::tests::support::app_over(directory.path());
             let ceiling = crate::graphics::PIXEL_CEILING;
+            let start = Instant::now();
+            let mut drawn = 0u32;
+            // Frames a sixtieth of a second apart, each taking `took` ms.
+            let mut frame = |app: &mut App, took: u64| {
+                let now = start + Duration::from_millis(16) * drawn;
+                app.watch_pixel_frame(Duration::from_millis(took), now);
+                drawn += 1;
+            };
             assert_eq!(app.pixel_budget, ceiling, "as fine as it goes");
-            app.watch_pixel_frame(Duration::from_millis(15));
+            frame(&mut app, 15);
             assert_eq!(
                 app.pixel_budget, ceiling,
                 "a frame inside the band moves nothing"
             );
-            app.watch_pixel_frame(Duration::from_millis(40));
-            assert!(app.pixel_budget < ceiling, "a slow frame lowers it");
+            frame(&mut app, 40);
+            assert_eq!(app.pixel_budget, ceiling, "one slow frame moves nothing");
+            for _ in 0..10 {
+                frame(&mut app, 40);
+            }
+            assert!(app.pixel_budget < ceiling, "a run of slow frames lowers it");
             assert_eq!(
                 crate::graphics::pixel_budget(),
                 app.pixel_budget,
@@ -2583,8 +2617,8 @@ mod tests {
                 .iter()
                 .filter(|line| line.kind == "rendering")
                 .count();
-            for _ in 0..40 {
-                app.watch_pixel_frame(Duration::from_millis(40));
+            for _ in 0..200 {
+                frame(&mut app, 40);
             }
             assert!(
                 app.pixel_budget >= crate::graphics::PIXEL_FLOOR,
@@ -2599,13 +2633,39 @@ mod tests {
                 said,
                 "it is said once, not on every step"
             );
-            for _ in 0..200 {
-                app.watch_pixel_frame(Duration::from_millis(1));
+            for _ in 0..3_000 {
+                frame(&mut app, 1);
             }
             assert_eq!(
                 app.pixel_budget, ceiling,
                 "a terminal that keeps up gets the fine picture back"
             );
+        }
+
+        /// Frames as a busy studio draws them, mostly short with a long one
+        /// now and then, leave the pictures their size. Moved on each frame,
+        /// the size grew on the short frames and shrank on the long ones, and
+        /// every picture went wider and narrower many times a second.
+        #[test]
+        fn a_long_frame_now_and_then_leaves_the_pictures_their_size() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = crate::app::tests::support::app_over(directory.path());
+            let half = crate::graphics::PIXEL_CEILING / 2;
+            app.set_pixel_budget(half);
+            let start = Instant::now();
+            // Two and a half seconds at 240 frames a second.
+            for index in 0..600u32 {
+                let took = match index {
+                    _ if index % 10 == 9 => 40,
+                    _ if index % 7 == 6 => 12,
+                    _ => 5,
+                };
+                app.watch_pixel_frame(
+                    Duration::from_millis(took),
+                    start + Duration::from_micros(4_167) * index,
+                );
+                assert_eq!(app.pixel_budget, half, "the size moved at frame {index}");
+            }
         }
 
         /// Every docked panel, including the mixer desk, must be named to the
