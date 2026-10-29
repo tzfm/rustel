@@ -60,6 +60,7 @@
 - Each pane in a split has its own colour, and a click on a tab moves the caret to that pane.
 - Studio reloads scores when another program saves them.
 - Vim keys work in many more places: lists, menus, search boxes, find, paste, replace and half-page moves. Default Vim mappings ship under your vimrc.
+- The mouse wheel and the trackpad scroll a score in Vim mode. Each step of a scroll was pulled back to the caret, so the score barely moved.
 - Mac Option keys type their character, so Option+4 on an ISO layout types $.
 - The prebakes open from the Options menu.
 - `register()` can replace any built-in name, as on strudel.cc. The log notes each replacement once, and the built-in comes back when the call is removed.

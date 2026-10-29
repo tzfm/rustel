@@ -261,15 +261,30 @@ impl Editor {
         }
     }
 
+    /// After any input in Normal mode, the caret rests on a character, not
+    /// past the end of its line. A caret that already rests on one is left
+    /// alone: normalizing it brings it into view, and a wheel scroll that
+    /// never touched the caret was pulled straight back to it.
     pub(crate) fn normalize_after_input(&mut self) -> Result<(), EditorError> {
         if self.vim.keybindings == EditorKeybindings::Vim
             && self.vim.mode == Mode::Normal
             && self.selections.len() == 1
             && self.primary_selection().is_empty()
+            && self.vim_caret_past_line_end()?
         {
             self.vim_normalize_caret()?;
         }
         Ok(())
+    }
+
+    /// Whether the caret sits past the last character of a line that has
+    /// one, where Normal mode never leaves it.
+    fn vim_caret_past_line_end(&self) -> Result<bool, EditorError> {
+        let head = self.primary_selection().head;
+        let range = self
+            .document
+            .line_content_range(self.document.line_of(head)?);
+        Ok(head >= range.end && range.end > range.start)
     }
 
     pub(super) fn mode_history_transaction(
@@ -1158,6 +1173,37 @@ mod tests {
             .document
             .line_of(editor.primary_selection().head)
             .expect("line")
+    }
+
+    /// The wheel scrolls a Vim score as it scrolls any other. The input hook
+    /// after it once brought the caret back into view, so every step of a
+    /// trackpad swipe was undone before the next one.
+    #[test]
+    fn the_wheel_scrolls_away_from_the_caret_in_normal_mode() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut editor = editor();
+        let area = crate::editor::GridRect::new(0, 0, 20, 6);
+        for _ in 0..2 {
+            let map = editor.screen_map(area).expect("map");
+            editor
+                .mouse_event(
+                    MouseEvent {
+                        kind: MouseEventKind::ScrollDown,
+                        column: 0,
+                        row: 0,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &map,
+                    HistoryMoment(0),
+                )
+                .expect("wheel");
+            editor.normalize_after_input().expect("normalize");
+        }
+        assert_eq!(line(&editor), 0, "the caret stays where it was");
+        assert!(
+            editor.viewport().top_row > 0,
+            "the view stays where the wheel put it"
+        );
     }
 
     #[test]
