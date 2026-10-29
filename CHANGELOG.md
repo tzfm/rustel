@@ -81,6 +81,7 @@
 - The `talkit` command speaks text through the default output device or writes a WAV file. It carries the parameter model of the old Talk It! program, with the 20 voices, pitch, speed, natural, monotone and sung quality, normal, breathy and whispered effort, English and Spanish rules, and numbers read as words. Its sounds, timing, intonation and English readings are measured from the original engine, and it speaks as that engine does, in 8-bit steps at 11.025 kHz. See [Talkit](https://github.com/tzfm/rustel/blob/main/docs/talkit.md).
 - The left and right arrows turn a trust row on or off, as Space does, so the Trust page changes values the way the settings rows do.
 - Apple Terminal no longer shows a line of the studio's startup questions after the studio quits. The terminal printed the questions it could not read, `pp` and a graphics query, on the shell's screen. The studio now erases them.
+- Pictures drawn with Kitty pixels no longer wobble. The size they were drawn at moved on every frame, so a widget, a visualizer or the Hydra backdrop went wider and narrower many times a second. The size now follows many frames, and one slow frame moves nothing.
 
 ### Sound changes
 
