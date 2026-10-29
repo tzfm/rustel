@@ -2769,11 +2769,7 @@ impl ScalarBackend {
                             delay_frames,
                             loop_frames,
                         } => {
-                            // One slot read per frame: the same lookup served
-                            // three branches below, and the audio thread can
-                            // never see the bank change mid-frame.
-                            let decoded = bank.get(*sample);
-                            if decoded.is_none() {
+                            if bank.get(*sample).is_none() {
                                 // The slot was emptied under the voice - an
                                 // uninstall landed. Silence for the rest of the
                                 // block, and the voice ends with it: the id may
@@ -2786,9 +2782,10 @@ impl ScalarBackend {
                                 (0.0, 0.0)
                             } else if let Some((loop_start, loop_end)) = *loop_frames
                                 && loop_end > loop_start
-                                && *increment * f64::from(sample_pitch)
-                                    > loop_end.min(decoded.expect("checked").frames() as f64)
-                                        - loop_start
+                                && bank.get(*sample).is_some_and(|decoded| {
+                                    *increment * f64::from(sample_pitch)
+                                        > loop_end.min(decoded.frames() as f64) - loop_start
+                                })
                             {
                                 // While the step is longer than the loop, its
                                 // end clamped to the buffer, the voice is
@@ -2796,22 +2793,27 @@ impl ScalarBackend {
                                 // buffer source does.
                                 (0.0, 0.0)
                             } else {
-                                let decoded = decoded.expect("checked");
-                                let wave = if *reversed {
-                                    let last = (decoded.frames().max(1) - 1) as f64;
-                                    let read = last - *position;
-                                    if read < 0.0 {
-                                        None
-                                    } else {
-                                        decoded.stereo_at_reversed_with_mode(
-                                            read,
-                                            sample_resampling_mode,
-                                        )
-                                    }
-                                } else {
-                                    decoded.stereo_at_with_mode(*position, sample_resampling_mode)
-                                }
-                                .unwrap_or((0.0, 0.0));
+                                let wave = bank
+                                    .get(*sample)
+                                    .and_then(|decoded| {
+                                        if *reversed {
+                                            let last = (decoded.frames().max(1) - 1) as f64;
+                                            let read = last - *position;
+                                            if read < 0.0 {
+                                                return None;
+                                            }
+                                            decoded.stereo_at_reversed_with_mode(
+                                                read,
+                                                sample_resampling_mode,
+                                            )
+                                        } else {
+                                            decoded.stereo_at_with_mode(
+                                                *position,
+                                                sample_resampling_mode,
+                                            )
+                                        }
+                                    })
+                                    .unwrap_or((0.0, 0.0));
                                 *position += *increment * f64::from(sample_pitch);
                                 if let Some((loop_start, loop_end)) = loop_frames
                                     && *position >= *loop_end
