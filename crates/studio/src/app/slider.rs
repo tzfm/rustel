@@ -3395,6 +3395,31 @@ mod tests {
             assert_eq!(app.editor().source(), before, "Esc cancelled the d");
         }
 
+        /// Visual's head on a digit the wheel rewrites stays on the last
+        /// character of the band, so `l` grows the band by one character.
+        /// The head once landed one past the band and `l` took two.
+        #[test]
+        fn a_visual_head_inside_a_slider_edit_stays_on_the_band() {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let (mut app, scene, call) = slider_app(directory.path());
+            app.ui_settings.editor_keybindings = crate::editor::EditorKeybindings::Vim;
+            app.sync_editor_keybindings();
+            // Laying the pill out puts the caret at the start, so it comes
+            // first.
+            let (x, _, row) = lay_out(&mut app, scene, call);
+            let digit = call + "slider(".len();
+            app.editor_mut()
+                .set_selection(crate::editor::Selection::caret(ByteOffset(digit)))
+                .expect("caret on the literal");
+            press(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+            mouse(&mut app, MouseEventKind::ScrollUp, x + 1, row);
+            let band = app.editor().primary_selection().ordered();
+            press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
+            let grown = app.editor().primary_selection().ordered();
+            assert_eq!(grown.start, band.start);
+            assert_eq!(grown.end.0, band.end.0 + 1, "l took one character");
+        }
+
         /// A wheel step over a slider while Visual stands edits the score,
         /// and Visual's ends follow that edit. They once stayed where they
         /// were, so `D` took the slider's line instead of the selected one.

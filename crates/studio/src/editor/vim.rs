@@ -173,22 +173,45 @@ impl Editor {
         self.vim.register = text;
     }
 
-    /// Visual's two ends after `edits`, mapped the way the selection maps
-    /// its own.
+    /// Visual's two ends after `edits`, the later one still exclusive.
+    /// Both ends are inclusive in Visual: the later one is the last
+    /// character the band covers, so it follows the edit as the band's own
+    /// end does, and [`Self::vim_set_visual_ends`] steps it back onto its
+    /// character once the edit is in.
     pub(super) fn vim_visual_through(&self, edits: &[Edit]) -> Option<(ByteOffset, ByteOffset)> {
         let Mode::Visual { anchor, head, .. } = self.vim.mode else {
             return None;
         };
-        let forward = anchor <= head;
-        Some((
-            super::map_offset(anchor, edits, !forward),
-            super::map_offset(head, edits, forward),
-        ))
+        let (first, last) = (anchor.min(head), anchor.max(head));
+        let end = self.document.next_grapheme_boundary(last).unwrap_or(last);
+        let first = super::map_offset(first, edits, false);
+        let end = super::map_offset(end, edits, true);
+        Some(if anchor <= head {
+            (first, end)
+        } else {
+            (end, first)
+        })
     }
 
     pub(super) fn vim_set_visual_ends(&mut self, ends: Option<(ByteOffset, ByteOffset)>) {
-        if let (Some(ends), Mode::Visual { anchor, head, .. }) = (ends, &mut self.vim.mode) {
-            (*anchor, *head) = ends;
+        let Some((anchor_end, head_end)) = ends else {
+            return;
+        };
+        let (first, end) = (anchor_end.min(head_end), anchor_end.max(head_end));
+        let last = if end > first {
+            self.document
+                .previous_grapheme_boundary(end)
+                .unwrap_or(first)
+                .max(first)
+        } else {
+            first
+        };
+        if let Mode::Visual { anchor, head, .. } = &mut self.vim.mode {
+            (*anchor, *head) = if anchor_end <= head_end {
+                (first, last)
+            } else {
+                (last, first)
+            };
         }
     }
 
@@ -287,10 +310,6 @@ impl Editor {
         self.vim.g = false;
         self.vim.command = None;
         self.vim.message = None;
-        // The indent `o` copied is taken back only within its own undo
-        // step. Once that step is closed it stays, so one undo still takes
-        // the whole line.
-        self.vim.autoindent = None;
         self.close_history_group();
     }
 
@@ -1040,12 +1059,13 @@ impl Editor {
     }
 
     /// Take back the indent `o`, `O` or `cc` copied when nothing was typed
-    /// after it, as Vim drops an unused autoindent. It is part of the
-    /// insert, so one undo takes the line with it.
+    /// after it, as Vim drops an unused autoindent. Nothing has changed
+    /// since that command, so the drop joins its undo step even after a
+    /// click or a chord closed it, and one undo takes the line with it.
     fn vim_drop_unused_indent(&mut self) -> Result<(), EditorError> {
         match self.vim.autoindent.take() {
             Some((revision, indent)) if revision == self.document.revision() => self
-                .apply_transaction(
+                .apply_transaction_into_last_step(
                     Transaction::new(EditOrigin::Insert).replace(Edit::new(indent, String::new())),
                     self.vim.insert_moment,
                 ),
@@ -1351,6 +1371,24 @@ mod tests {
         editor.primary_selection().head.0
     }
 
+    /// A line command made from the drawn line after a final line break
+    /// leaves every real line whole. It once took the line above, the
+    /// whole score when that was its only line.
+    #[test]
+    fn line_commands_from_the_line_past_the_end_keep_the_lines_above() {
+        for (source, caret) in [("ab\ncd\n", 6), ("ab\n", 3)] {
+            let lines = source.trim_end_matches('\n');
+            for keys in ["dd", "cc", "Vd", "yyp"] {
+                let editor = typed(source, caret, keys);
+                assert!(
+                    editor.source().starts_with(lines),
+                    "{keys} on {source:?} gave {:?}",
+                    editor.source()
+                );
+            }
+        }
+    }
+
     /// `p` puts a linewise register that ends in a Unicode line break. The
     /// break was cut by its byte count and split inside the character.
     #[test]
@@ -1532,17 +1570,25 @@ mod tests {
         press(&mut typed_on, KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(typed_on.source(), "  foo\n  x\n", "a used indent stays");
 
-        // A chord or a click between closes the undo step. The indent then
-        // stays, so one undo still takes the whole line.
+        // A chord, a click or Find between closes the undo step. The indent
+        // still goes, and one undo still takes the whole line.
         let mut interrupted = typed("  foo\n", 0, "o");
         interrupted.interrupt_key_mode();
         press(&mut interrupted, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(interrupted.source(), "  foo\n\n", "the indent went");
         type_keys(&mut interrupted, "u");
         assert_eq!(
             interrupted.source(),
             "  foo\n",
             "one undo after an interrupt"
         );
+
+        // Find leaves Insert as Esc does, so the indent goes there too.
+        let mut found = typed("  foo\n", 0, "o");
+        found.leave_key_mode_for_find().expect("find");
+        assert_eq!(found.source(), "  foo\n\n", "Find took the indent back");
+        type_keys(&mut found, "u");
+        assert_eq!(found.source(), "  foo\n", "one undo after Find");
     }
 
     /// Esc resets the column j and k aim for even when the caret does not

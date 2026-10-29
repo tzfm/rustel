@@ -70,7 +70,11 @@ impl Editor {
         self.find.count = count;
         self.find.keep_open = keep_open;
         self.find.message = None;
-        self.find.last_match = None;
+        // Vim's `n` walks on from the last match whatever prompt opens and
+        // closes in between. The find bar starts every search afresh.
+        if keep_open {
+            self.find.last_match = None;
+        }
         self.find.pattern.clear();
         self.find.anchor = self.primary_selection().head.0;
     }
@@ -253,6 +257,11 @@ impl Editor {
         }
         let direction = self.find.direction;
         let count = self.find.count.max(1);
+        // A new Vim pattern searches from the caret, not on from a match of
+        // the old one.
+        if !self.find.keep_open && self.find.last_pattern.as_deref() != Some(pattern.as_str()) {
+            self.find.last_match = None;
+        }
         self.find.pattern = pattern.clone();
         self.find.last_pattern = Some(pattern.clone());
         self.find.last_direction = direction;
@@ -583,6 +592,17 @@ mod tests {
                 .vim_key(n, crate::editor::HistoryMoment(0), None)
                 .expect("n");
             assert_eq!(head(&editor), 1, "and wraps to the line break");
+
+            // A `/` closed with Esc in between leaves the walk where it was.
+            editor.begin_find(FindDirection::Forward, false, 0);
+            editor.find_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            editor
+                .vim_key(n, crate::editor::HistoryMoment(0), None)
+                .expect("n");
+            assert_eq!(head(&editor), 5, "n walks on after a cancelled prompt");
         }
 
         /// A `?` closed with Esc never searched, so `n` keeps the direction

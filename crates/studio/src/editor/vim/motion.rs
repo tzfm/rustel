@@ -301,6 +301,12 @@ impl Editor {
     }
 
     pub(super) fn vim_line_range(&self, first: usize, last: usize) -> Range<ByteOffset> {
+        // The drawn line past the end is not a Vim line, so a command made
+        // from it takes nothing, never the line above.
+        if first > self.vim_last_line() {
+            let start = self.document.line_start(first);
+            return start..start;
+        }
         let last = last.min(self.vim_last_line());
         let end = if last + 1 < self.document.line_count() {
             self.document.line_start(last + 1)

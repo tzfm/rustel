@@ -784,8 +784,27 @@ impl Editor {
 
     pub fn apply_transaction(
         &mut self,
+        transaction: Transaction,
+        moment: HistoryMoment,
+    ) -> Result<(), EditorError> {
+        self.apply_transaction_as(transaction, moment, false)
+    }
+
+    /// [`Self::apply_transaction`], undone together with the step before
+    /// it even when that step was closed.
+    pub(crate) fn apply_transaction_into_last_step(
+        &mut self,
+        transaction: Transaction,
+        moment: HistoryMoment,
+    ) -> Result<(), EditorError> {
+        self.apply_transaction_as(transaction, moment, true)
+    }
+
+    fn apply_transaction_as(
+        &mut self,
         mut transaction: Transaction,
         moment: HistoryMoment,
+        into_last_step: bool,
     ) -> Result<(), EditorError> {
         let moment = self.mode_history_transaction(&mut transaction, moment);
         transaction
@@ -840,7 +859,11 @@ impl Editor {
         self.selections = after;
         self.vim_set_visual_ends(visual);
         self.find_set_anchor(find_anchor);
-        self.history.record(entry);
+        if into_last_step {
+            self.history.fold_into_last(entry);
+        } else {
+            self.history.record(entry);
+        }
         self.virtual_rows = virtual_rows;
         self.drag = None;
         self.ensure_primary_visible();
@@ -899,8 +922,12 @@ impl Editor {
     }
 
     fn paste_text(&mut self, text: &str, moment: HistoryMoment) -> Result<(), EditorError> {
-        // A paste is an undo step of its own, as its origin never joins
-        // another. A Vim insert folds it into the insert's one step.
+        // A paste is an undo step of its own, and it ends the typing before
+        // it even when it pastes nothing. A Vim insert folds it into the
+        // insert's one step instead.
+        if !(self.uses_modal_keys() && self.vim_is_insert()) {
+            self.history.close_group();
+        }
         let line_ending = self.preferred_line_ending();
         let text = normalize_paste_line_endings(text, &line_ending);
         self.replace_selections(&text, EditOrigin::Paste, moment)
@@ -3227,5 +3254,21 @@ mod tests {
             .unwrap();
         dispatch(&mut editor, Command::InsertText("$: ".into()), 0);
         assert_eq!(editor.map_offset_since(evaluated, anchor), Some(anchor + 3));
+    }
+
+    /// A paste ends the typing before it, even an empty one, so the typing
+    /// on each side undoes on its own.
+    #[test]
+    fn an_empty_paste_still_ends_the_typing_before_it() {
+        let mut editor = Editor::new("").unwrap();
+        dispatch(&mut editor, Command::InsertText("a".into()), 0);
+        dispatch(&mut editor, Command::PasteText(String::new()), 10);
+        dispatch(&mut editor, Command::InsertText("b".into()), 20);
+        dispatch(&mut editor, Command::Undo, 30);
+        assert_eq!(
+            editor.source(),
+            "a",
+            "one undo took the typing on both sides"
+        );
     }
 }

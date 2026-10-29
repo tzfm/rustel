@@ -296,6 +296,22 @@ impl History {
         }))
     }
 
+    /// Add `entry` to the newest undo step even when that step was closed:
+    /// an edit that finishes the step before it, such as taking back an
+    /// indent nothing used.
+    pub(crate) fn fold_into_last(&mut self, entry: HistoryEntry) {
+        if self.undo.is_empty() {
+            self.record(entry);
+            return;
+        }
+        self.drop_redo();
+        self.retained_bytes = self.retained_bytes.saturating_add(entry.retained_bytes);
+        let group = self.undo.last_mut().expect("checked above");
+        group.retained_bytes = group.retained_bytes.saturating_add(entry.retained_bytes);
+        group.entries.push(entry);
+        self.enforce_bounds();
+    }
+
     fn drop_redo(&mut self) {
         for group in self.redo.drain(..) {
             self.retained_bytes = self.retained_bytes.saturating_sub(group.retained_bytes);
