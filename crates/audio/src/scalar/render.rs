@@ -1621,6 +1621,12 @@ impl ScalarBackend {
                     },
                     coarse_hold: [0.0; 2],
                     fx_mod_hold: FxParamHold::default(),
+                    quantum_cache_loaded: false,
+                    cached_transient_open: false,
+                    cached_filter_lfo_alive: false,
+                    cached_source_open: false,
+                    cached_lfo_live: false,
+                    cached_note_alive: false,
                     source_gone: false,
                 };
                 // A takeover cut's horizon: a pending onset of the OUTGOING
@@ -1952,36 +1958,53 @@ impl ScalarBackend {
                     // each note opens unmodulated for up to one quantum, and
                     // the envelope clock reads quantum starts.
                     let quantum_start = abs & !127;
-                    // Compare against the fractional onset, not its rounded
-                    // frame. An onset at frame 127.6 rounds to 128 but must
-                    // still open the transient gate at quantum 128.
-                    let transient_open =
-                        (quantum_start as f64) > v.start_frame as f64 - f64::from(v.onset_lead);
-                    // Filter LFOs stop contributing at the hap's hold end.
-                    // Other modulators can run until release ends. Neither end
-                    // is based on the sample slice's potentially longer duration.
-                    let filter_lfo_alive =
-                        lfo_quantum_alive(quantum_start, sr, v.controls.filter_lfo_end_secs);
-                    // LFOs and the pulse, wavetable and supersaw oscillators
-                    // share the f32-rounded begin gate. The transient shaper
-                    // uses the fractional-frame comparison above instead.
-                    let source_open =
-                        lfo_quantum_open(quantum_start, sr, v.controls.worklet_begin_secs);
-                    let lfo_live = source_open
-                        && lfo_quantum_alive(quantum_start, sr, v.controls.lfo_end_secs);
+                    // All five gates below are functions of the quantum
+                    // start and voice fields that hold still within a
+                    // quantum, so they are computed once per quantum start
+                    // and read from the voice's cache on the other 127
+                    // frames. The cache also loads on the voice's first
+                    // frame, whatever the alignment.
+                    if abs & 127 == 0 || !v.quantum_cache_loaded {
+                        v.quantum_cache_loaded = true;
+                        // Compare against the fractional onset, not its
+                        // rounded frame. An onset at frame 127.6 rounds to
+                        // 128 but must still open the transient gate at
+                        // quantum 128.
+                        v.cached_transient_open =
+                            (quantum_start as f64) > v.start_frame as f64 - f64::from(v.onset_lead);
+                        // Filter LFOs stop contributing at the hap's hold
+                        // end. Other modulators can run until release ends.
+                        // Neither end is based on the sample slice's
+                        // potentially longer duration.
+                        v.cached_filter_lfo_alive =
+                            lfo_quantum_alive(quantum_start, sr, v.controls.filter_lfo_end_secs);
+                        // LFOs and the pulse, wavetable and supersaw
+                        // oscillators share the f32-rounded begin gate. The
+                        // transient shaper uses the fractional-frame
+                        // comparison above instead.
+                        v.cached_source_open =
+                            lfo_quantum_open(quantum_start, sr, v.controls.worklet_begin_secs);
+                        v.cached_lfo_live = v.cached_source_open
+                            && lfo_quantum_alive(quantum_start, sr, v.controls.lfo_end_secs);
+                        v.cached_note_alive = note_end_alive(
+                            quantum_start,
+                            v.start_frame,
+                            v.onset_lead,
+                            v.hap_duration_secs,
+                            v.controls.modulator_release_secs,
+                            sr,
+                        );
+                    }
+                    let transient_open = v.cached_transient_open;
+                    let filter_lfo_alive = v.cached_filter_lfo_alive;
+                    let source_open = v.cached_source_open;
+                    let lfo_live = v.cached_lfo_live;
+                    let note_alive = v.cached_note_alive;
                     let mut mod_adds = if v.has_param_modulators && lfo_live {
                         Some(ModAdds::default())
                     } else {
                         None
                     };
-                    let note_alive = note_end_alive(
-                        quantum_start,
-                        v.start_frame,
-                        v.onset_lead,
-                        v.hap_duration_secs,
-                        v.controls.modulator_release_secs,
-                        sr,
-                    );
                     // Parameter and bus modulators stop at hold plus release;
                     // their target parameters then keep their base values.
                     if let Some(mod_adds) = mod_adds.as_mut() {
